@@ -27,7 +27,7 @@
 extern crate net_ipv6 as ipv6;
 extern crate net_types as types;
 
-use types::{ntohs, Ipv6Addr, MacAddr};
+use types::{Ipv6Addr, MacAddr, ntohs};
 
 /// ICMPv6 message types we recognize.
 pub mod msg {
@@ -81,9 +81,15 @@ pub fn build_echo_reply(
     }
     out[0] = msg::ECHO_REPLY;
     out[1] = 0; // code
-    out[2] = 0; out[3] = 0; // checksum placeholder
+    out[2] = 0;
+    out[3] = 0; // checksum placeholder
     out[4..request_body.len()].copy_from_slice(&request_body[4..]);
-    let cksum = ipv6::pseudo_checksum(src, dst, ipv6::next_header::ICMPV6, &out[..request_body.len()]);
+    let cksum = ipv6::pseudo_checksum(
+        src,
+        dst,
+        ipv6::next_header::ICMPV6,
+        &out[..request_body.len()],
+    );
     out[2..4].copy_from_slice(&cksum.to_ne_bytes());
     Some(request_body.len())
 }
@@ -128,9 +134,12 @@ pub fn build_neighbor_advertisement(
     }
     out[0] = msg::NEIGHBOR_ADVERTISEMENT;
     out[1] = 0;
-    out[2] = 0; out[3] = 0; // checksum placeholder
+    out[2] = 0;
+    out[3] = 0; // checksum placeholder
     out[4] = FLAG_SOLICITED | FLAG_OVERRIDE;
-    out[5] = 0; out[6] = 0; out[7] = 0; // reserved
+    out[5] = 0;
+    out[6] = 0;
+    out[7] = 0; // reserved
     out[8..24].copy_from_slice(&target.octets);
     // Target Link-Layer Address option (type 2, length 1 = 8 bytes).
     out[24] = opt::TARGET_LINK_LAYER_ADDRESS;
@@ -157,7 +166,8 @@ pub fn build_neighbor_solicitation(
     }
     out[0] = msg::NEIGHBOR_SOLICITATION;
     out[1] = 0;
-    out[2] = 0; out[3] = 0;
+    out[2] = 0;
+    out[3] = 0;
     out[4..8].copy_from_slice(&[0, 0, 0, 0]); // reserved
     out[8..24].copy_from_slice(&target.octets);
     out[24] = opt::SOURCE_LINK_LAYER_ADDRESS;
@@ -183,7 +193,8 @@ pub fn build_router_solicitation(
     }
     out[0] = msg::ROUTER_SOLICITATION;
     out[1] = 0;
-    out[2] = 0; out[3] = 0;
+    out[2] = 0;
+    out[3] = 0;
     out[4..8].copy_from_slice(&[0, 0, 0, 0]); // reserved
     out[8] = opt::SOURCE_LINK_LAYER_ADDRESS;
     out[9] = 1;
@@ -217,9 +228,15 @@ pub fn parse_neighbor_solicitation(body: &[u8]) -> Result<NeighborSolicitation<'
     }
     let mut target_octets = [0u8; 16];
     target_octets.copy_from_slice(&body[8..24]);
-    let target = Ipv6Addr { octets: target_octets };
+    let target = Ipv6Addr {
+        octets: target_octets,
+    };
     let src_lla = parse_lla_option(&body[NS_BODY_LEN..], opt::SOURCE_LINK_LAYER_ADDRESS);
-    Ok(NeighborSolicitation { target, src_lla, raw: body })
+    Ok(NeighborSolicitation {
+        target,
+        src_lla,
+        raw: body,
+    })
 }
 
 /// Parsed view of an incoming Router Advertisement (RFC 4861 §4.2)
@@ -313,11 +330,7 @@ pub fn find_prefix_info(options: &[u8]) -> Option<PrefixInfo> {
 
 /// Verify an inbound ICMPv6 message's checksum against the IPv6
 /// pseudo-header. Returns Ok(()) when valid.
-pub fn verify_checksum(
-    src: &Ipv6Addr,
-    dst: &Ipv6Addr,
-    body: &[u8],
-) -> Result<(), IcmpError> {
+pub fn verify_checksum(src: &Ipv6Addr, dst: &Ipv6Addr, body: &[u8]) -> Result<(), IcmpError> {
     if ipv6::pseudo_checksum(src, dst, ipv6::next_header::ICMPV6, body) != 0 {
         return Err(IcmpError::BadChecksum);
     }
@@ -328,9 +341,13 @@ fn parse_lla_option(mut bytes: &[u8], wanted: u8) -> Option<MacAddr> {
     while bytes.len() >= 8 {
         let ty = bytes[0];
         let len_units = bytes[1];
-        if len_units == 0 { return None; }
+        if len_units == 0 {
+            return None;
+        }
         let total = (len_units as usize) * 8;
-        if bytes.len() < total { return None; }
+        if bytes.len() < total {
+            return None;
+        }
         if ty == wanted && total >= 8 {
             return Some(MacAddr {
                 bytes: [bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]],
@@ -359,14 +376,16 @@ mod tests {
         }
     }
     fn dev_mac() -> MacAddr {
-        MacAddr { bytes: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56] }
+        MacAddr {
+            bytes: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
+        }
     }
 
     #[test]
     fn echo_reply_round_trip() {
         let req: [u8; 16] = [
-            128, 0, 0, 0,           // type, code, cksum=0
-            0x12, 0x34, 0, 1,       // identifier, sequence
+            128, 0, 0, 0, // type, code, cksum=0
+            0x12, 0x34, 0, 1, // identifier, sequence
             b'p', b'i', b'n', b'g', b'_', b'd', b'a', b't', // 8 bytes data
         ];
         let mut out = [0u8; 32];
@@ -418,8 +437,9 @@ mod tests {
         let mut body = [0u8; 16 + 32];
         body[0] = msg::ROUTER_ADVERTISEMENT;
         body[4] = 64; // cur hop limit
-        body[5] = 0;  // flags
-        body[6] = 0x07; body[7] = 0x08; // router_lifetime = 1800s
+        body[5] = 0; // flags
+        body[6] = 0x07;
+        body[7] = 0x08; // router_lifetime = 1800s
         // Prefix Information at offset 16.
         body[16] = opt::PREFIX_INFORMATION;
         body[17] = 4; // length in 8-byte units → 32 bytes total

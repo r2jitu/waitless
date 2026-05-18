@@ -197,7 +197,11 @@ impl HeapStorage {
     /// `[offset..offset+len]`.
     pub(crate) fn new(storage: Box<[u8]>, offset: u32, len: u32) -> Self {
         debug_assert!(offset as usize + len as usize <= storage.len());
-        HeapStorage { storage, offset, len }
+        HeapStorage {
+            storage,
+            offset,
+            len,
+        }
     }
 
     pub(crate) fn data_mut(&mut self) -> Option<&mut [u8]> {
@@ -449,8 +453,7 @@ impl ExternalOwned {
         }
         // SAFETY: bounds checked above; exclusive access via `&mut self`.
         unsafe {
-            core::slice::from_raw_parts_mut(self.base.as_ptr().add(end), n)
-                .copy_from_slice(data);
+            core::slice::from_raw_parts_mut(self.base.as_ptr().add(end), n).copy_from_slice(data);
         }
         self.len += n as u32;
         Ok(())
@@ -608,8 +611,7 @@ impl BorrowedView {
         // SAFETY: bounds checked above; exclusive access; `borrow`
         // caller guaranteed no concurrent mutation.
         unsafe {
-            core::slice::from_raw_parts_mut(self.base.as_ptr().add(end), n)
-                .copy_from_slice(data);
+            core::slice::from_raw_parts_mut(self.base.as_ptr().add(end), n).copy_from_slice(data);
         }
         self.len += n as u32;
         Ok(())

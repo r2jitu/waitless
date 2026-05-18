@@ -25,16 +25,22 @@ class TlsPrimitiveTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         # 20 s covers TCG under heavy crypto; native is ~1 s.
         cls.serial = run_variant_and_capture(
-            "test_tls", marker="TLS TESTS:", timeout=20.0,
+            "test_tls",
+            marker="TLS TESTS:",
+            timeout=20.0,
         )
 
     def test_all_primitives_passed(self) -> None:
-        self.assertIn("TLS TESTS: ALL PASSED", self.serial,
-                      "TLS primitives smoke test did not report ALL PASSED")
+        self.assertIn(
+            "TLS TESTS: ALL PASSED",
+            self.serial,
+            "TLS primitives smoke test did not report ALL PASSED",
+        )
 
     def test_no_subtest_failures(self) -> None:
-        self.assertNotIn("[tls] FAIL", self.serial,
-                         "one or more TLS subtests reported FAIL")
+        self.assertNotIn(
+            "[tls] FAIL", self.serial, "one or more TLS subtests reported FAIL"
+        )
 
 
 if __name__ == "__main__":

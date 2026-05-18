@@ -177,89 +177,92 @@ _push() {
 
 case "$cmd" in
 
-    status)
-        _gcloud describe "$GCP_INSTANCE" \
-            --format='table(name,status,networkInterfaces[0].accessConfigs[0].natIP:label=EXTERNAL_IP)'
-        ;;
+status)
+    _gcloud describe "$GCP_INSTANCE" \
+        --format='table(name,status,networkInterfaces[0].accessConfigs[0].natIP:label=EXTERNAL_IP)'
+    ;;
 
-    start)
-        echo "==> Starting instance..."
-        _gcloud start "$GCP_INSTANCE"
-        echo "    Waiting for SSH..."
-        sleep 5
-        ip=$(_update_ssh_ip)
-        # Drop any stale known_hosts entries — GCE re-rolls the external
-        # IP on every start so the old fingerprint is almost always wrong
-        # for the new host. Wipe entries under BOTH the new IP and the
-        # SSH alias (`gcp`); ssh records hostnames as listed in the SSH
-        # config, so depending on prior connections either could be cached.
-        ssh-keygen -R "$ip" >/dev/null 2>&1 || true
-        ssh-keygen -R "$SSH_HOST" >/dev/null 2>&1 || true
-        # First-touch trust: accept and pin the new host key on the next
-        # connection, then close. Retry: SSH on the freshly-started
-        # instance can still be unavailable after the initial 5 s sleep
-        # (cloud-init / sshd boot lags), and a single failed connect
-        # leaves nothing pinned, so the next user command sees
-        # "Host key verification failed".
-        for _ in $(seq 1 10); do
-            if ssh -o StrictHostKeyChecking=accept-new \
-                   -o ConnectTimeout=5 \
-                   -o BatchMode=yes \
-                   "$SSH_HOST" true >/dev/null 2>&1; then
-                break
-            fi
-            sleep 2
-        done
-        echo "    External IP: $ip (SSH config updated)"
-        echo "    Connect: ssh $SSH_HOST"
-        ;;
-
-    stop)
-        echo "==> Stopping instance..."
-        _gcloud stop "$GCP_INSTANCE"
-        ;;
-
-    ip)
-        _ext_ip
-        ;;
-
-    ssh)
-        exec ssh "$SSH_HOST"
-        ;;
-
-    run)
-        if ! command -v socat >/dev/null 2>&1; then
-            echo "error: 'socat' not found — install it first:" >&2
-            case "$(uname -s)" in
-                Darwin) echo "  brew install socat" >&2 ;;
-                Linux)  echo "  sudo apt install socat   # Debian/Ubuntu" >&2
-                        echo "  sudo dnf install socat   # Fedora/RHEL" >&2 ;;
-            esac
-            exit 1
+start)
+    echo "==> Starting instance..."
+    _gcloud start "$GCP_INSTANCE"
+    echo "    Waiting for SSH..."
+    sleep 5
+    ip=$(_update_ssh_ip)
+    # Drop any stale known_hosts entries — GCE re-rolls the external
+    # IP on every start so the old fingerprint is almost always wrong
+    # for the new host. Wipe entries under BOTH the new IP and the
+    # SSH alias (`gcp`); ssh records hostnames as listed in the SSH
+    # config, so depending on prior connections either could be cached.
+    ssh-keygen -R "$ip" >/dev/null 2>&1 || true
+    ssh-keygen -R "$SSH_HOST" >/dev/null 2>&1 || true
+    # First-touch trust: accept and pin the new host key on the next
+    # connection, then close. Retry: SSH on the freshly-started
+    # instance can still be unavailable after the initial 5 s sleep
+    # (cloud-init / sshd boot lags), and a single failed connect
+    # leaves nothing pinned, so the next user command sees
+    # "Host key verification failed".
+    for _ in $(seq 1 10); do
+        if ssh -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=5 \
+            -o BatchMode=yes \
+            "$SSH_HOST" true >/dev/null 2>&1; then
+            break
         fi
+        sleep 2
+    done
+    echo "    External IP: $ip (SSH config updated)"
+    echo "    Connect: ssh $SSH_HOST"
+    ;;
 
-        _build; _push
-        ext_ip=$(_update_ssh_ip)
-        _replace_remote_vm
-        _setup_remote_tap_nat
+stop)
+    echo "==> Stopping instance..."
+    _gcloud stop "$GCP_INSTANCE"
+    ;;
 
-        # tap+vhost-net replaces user-mode networking so the device
-        # actually has per-queue host workers (real MQ; the guest
-        # negotiates max_virtqueue_pairs from the device's config and
-        # promotes to N pairs in activate_multi_queue()). The fixed
-        # GUEST_MAC pins dnsmasq's lease to GUEST_IP so the kernel
-        # always comes up at the same address, and iptables PREROUTING
-        # DNAT (set up by _setup_remote_tap_nat) forwards external
-        # :80/:443 there.
-        #
-        # The serial chardev is a unix-domain socket forwarded over SSH;
-        # local socat drives the tty in raw mode. wait=on blocks qemu's
-        # main loop at chardev init until the first client connects, so
-        # local socat captures the very first boot line — the tradeoff
-        # is we can't probe /health from the remote launcher (the guest
-        # hasn't started yet); readiness is the user's eyeballs on the
-        # interactive console.
-        ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$(_cpus)" "$GUEST_MAC" <<'REMOTE'
+ip)
+    _ext_ip
+    ;;
+
+ssh)
+    exec ssh "$SSH_HOST"
+    ;;
+
+run)
+    if ! command -v socat >/dev/null 2>&1; then
+        echo "error: 'socat' not found — install it first:" >&2
+        case "$(uname -s)" in
+        Darwin) echo "  brew install socat" >&2 ;;
+        Linux)
+            echo "  sudo apt install socat   # Debian/Ubuntu" >&2
+            echo "  sudo dnf install socat   # Fedora/RHEL" >&2
+            ;;
+        esac
+        exit 1
+    fi
+
+    _build
+    _push
+    ext_ip=$(_update_ssh_ip)
+    _replace_remote_vm
+    _setup_remote_tap_nat
+
+    # tap+vhost-net replaces user-mode networking so the device
+    # actually has per-queue host workers (real MQ; the guest
+    # negotiates max_virtqueue_pairs from the device's config and
+    # promotes to N pairs in activate_multi_queue()). The fixed
+    # GUEST_MAC pins dnsmasq's lease to GUEST_IP so the kernel
+    # always comes up at the same address, and iptables PREROUTING
+    # DNAT (set up by _setup_remote_tap_nat) forwards external
+    # :80/:443 there.
+    #
+    # The serial chardev is a unix-domain socket forwarded over SSH;
+    # local socat drives the tty in raw mode. wait=on blocks qemu's
+    # main loop at chardev init until the first client connects, so
+    # local socat captures the very first boot line — the tradeoff
+    # is we can't probe /health from the remote launcher (the guest
+    # hasn't started yet); readiness is the user's eyeballs on the
+    # interactive console.
+    ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$(_cpus)" "$GUEST_MAC" <<'REMOTE'
 set -euo pipefail
 QEMU_PATTERN="$1"; MEMORY="$2"; CPUS="$3"; GUEST_MAC="$4"
 
@@ -303,62 +306,66 @@ echo "ERROR: serial socket not created after 8s" >&2
 exit 1
 REMOTE
 
-        LOCAL_SOCK="/tmp/gcp-webserver-$$.sock"
-        SSH_CTRL="/tmp/gcp-run-ctrl-$$"
-        rm -f "$LOCAL_SOCK" "$SSH_CTRL"
+    LOCAL_SOCK="/tmp/gcp-webserver-$$.sock"
+    SSH_CTRL="/tmp/gcp-run-ctrl-$$"
+    rm -f "$LOCAL_SOCK" "$SSH_CTRL"
 
-        _gcp_run_cleanup() {
-            trap - EXIT INT TERM
-            echo ""
-            # If the VM is still alive the user detached via Ctrl-] (or
-            # something killed socat before the kernel shut down): kill
-            # it explicitly. If the VM already exited on its own — the
-            # Ctrl-C → ACPI S5 path — _kill_remote_vm is a no-op but we
-            # still print a friendly message.
-            if ssh "$SSH_HOST" "pgrep -f '$QEMU_PATTERN'" >/dev/null 2>&1; then
-                echo "==> Stopping remote VM..."
-                _kill_remote_vm
-            else
-                echo "==> VM exited."
-            fi
-            ssh -O exit -S "$SSH_CTRL" "$SSH_HOST" 2>/dev/null || true
-            rm -f "$LOCAL_SOCK" "$SSH_CTRL"
-        }
-        trap '_gcp_run_cleanup' EXIT INT TERM
-
-        # Background SSH ControlMaster with a single unix-socket tunnel
-        # for the guest serial. HTTP/HTTPS aren't tunneled — they bind
-        # publicly on the instance and are reachable at the external IP.
-        ssh -fN \
-            -o ControlMaster=yes \
-            -o ControlPath="$SSH_CTRL" \
-            -o ExitOnForwardFailure=yes \
-            -L "${LOCAL_SOCK}:/tmp/webserver.sock" \
-            "$SSH_HOST"
-
-        for _ in $(seq 1 20); do
-            [[ -S "$LOCAL_SOCK" ]] && break
-            sleep 0.1
-        done
-        [[ -S "$LOCAL_SOCK" ]] || { echo "ERROR: local socket forward not established" >&2; exit 1; }
-
-        echo "==> Running on GCP with KVM..."
-        echo "    HTTP:   http://${ext_ip}/"
-        echo "    HTTPS:  https://${ext_ip}/  (self-signed — curl -k)"
-        echo "    Serial: interactive (Ctrl-C → VM graceful shutdown; Ctrl-] → detach)"
+    _gcp_run_cleanup() {
+        trap - EXIT INT TERM
         echo ""
-        # rawer = no ICANON/ECHO/ISIG/IEXTEN/OPOST etc — pure byte relay.
-        # escape=0x1d = Ctrl-] disconnects socat without forwarding the byte.
-        socat -,rawer,escape=0x1d UNIX-CONNECT:"$LOCAL_SOCK" || true
-        ;;
+        # If the VM is still alive the user detached via Ctrl-] (or
+        # something killed socat before the kernel shut down): kill
+        # it explicitly. If the VM already exited on its own — the
+        # Ctrl-C → ACPI S5 path — _kill_remote_vm is a no-op but we
+        # still print a friendly message.
+        if ssh "$SSH_HOST" "pgrep -f '$QEMU_PATTERN'" >/dev/null 2>&1; then
+            echo "==> Stopping remote VM..."
+            _kill_remote_vm
+        else
+            echo "==> VM exited."
+        fi
+        ssh -O exit -S "$SSH_CTRL" "$SSH_HOST" 2>/dev/null || true
+        rm -f "$LOCAL_SOCK" "$SSH_CTRL"
+    }
+    trap '_gcp_run_cleanup' EXIT INT TERM
 
-    test)
-        _build; _push
+    # Background SSH ControlMaster with a single unix-socket tunnel
+    # for the guest serial. HTTP/HTTPS aren't tunneled — they bind
+    # publicly on the instance and are reachable at the external IP.
+    ssh -fN \
+        -o ControlMaster=yes \
+        -o ControlPath="$SSH_CTRL" \
+        -o ExitOnForwardFailure=yes \
+        -L "${LOCAL_SOCK}:/tmp/webserver.sock" \
+        "$SSH_HOST"
 
-        _update_ssh_ip > /dev/null 2>&1 || true
+    for _ in $(seq 1 20); do
+        [[ -S "$LOCAL_SOCK" ]] && break
+        sleep 0.1
+    done
+    [[ -S "$LOCAL_SOCK" ]] || {
+        echo "ERROR: local socket forward not established" >&2
+        exit 1
+    }
 
-        echo "==> Running tests on GCP with KVM..."
-        ssh "$SSH_HOST" bash -s "$TEST_PORT" <<'REMOTE'
+    echo "==> Running on GCP with KVM..."
+    echo "    HTTP:   http://${ext_ip}/"
+    echo "    HTTPS:  https://${ext_ip}/  (self-signed — curl -k)"
+    echo "    Serial: interactive (Ctrl-C → VM graceful shutdown; Ctrl-] → detach)"
+    echo ""
+    # rawer = no ICANON/ECHO/ISIG/IEXTEN/OPOST etc — pure byte relay.
+    # escape=0x1d = Ctrl-] disconnects socat without forwarding the byte.
+    socat -,rawer,escape=0x1d UNIX-CONNECT:"$LOCAL_SOCK" || true
+    ;;
+
+test)
+    _build
+    _push
+
+    _update_ssh_ip >/dev/null 2>&1 || true
+
+    echo "==> Running tests on GCP with KVM..."
+    ssh "$SSH_HOST" bash -s "$TEST_PORT" <<'REMOTE'
 set -euo pipefail
 PORT="$1"
 UDP_PORT=$((PORT + 1))
@@ -443,16 +450,17 @@ echo ""
 [[ $FAILURES -eq 0 ]] && echo "ALL TESTS PASSED" && exit 0
 echo "$FAILURES TEST(S) FAILED"; tail -40 "$VM_LOG_EARLY" "$VM_LOG" >&2; exit 1
 REMOTE
-        ;;
+    ;;
 
-    serve)
-        _build; _push
-        ext_ip=$(_update_ssh_ip)
-        _replace_remote_vm
-        _setup_remote_tap_nat
+serve)
+    _build
+    _push
+    ext_ip=$(_update_ssh_ip)
+    _replace_remote_vm
+    _setup_remote_tap_nat
 
-        echo "==> Launching detached KVM on GCP (public :80/:443)..."
-        ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$(_cpus)" "$GUEST_MAC" "$GUEST_IP" <<'REMOTE'
+    echo "==> Launching detached KVM on GCP (public :80/:443)..."
+    ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$(_cpus)" "$GUEST_MAC" "$GUEST_IP" <<'REMOTE'
 set -euo pipefail
 QEMU_PATTERN="$1"; MEMORY="$2"; CPUS="$3"; GUEST_MAC="$4"; GUEST_IP="$5"
 
@@ -493,24 +501,24 @@ tail -40 /tmp/webserver.log >&2 || true
 exit 1
 REMOTE
 
-        echo ""
-        echo "==> Public endpoints:"
-        echo "     HTTP:  http://${ext_ip}/"
-        echo "     HTTPS: https://${ext_ip}/   (self-signed dev cert — curl -k)"
-        echo ""
-        echo "    Serial log: ssh ${SSH_HOST} 'sudo tail -f /tmp/webserver.log'"
-        echo "    Stop VM:    ./scripts/gcp.sh kill"
-        echo "    Stop inst:  ./scripts/gcp.sh stop"
-        ;;
+    echo ""
+    echo "==> Public endpoints:"
+    echo "     HTTP:  http://${ext_ip}/"
+    echo "     HTTPS: https://${ext_ip}/   (self-signed dev cert — curl -k)"
+    echo ""
+    echo "    Serial log: ssh ${SSH_HOST} 'sudo tail -f /tmp/webserver.log'"
+    echo "    Stop VM:    ./scripts/gcp.sh kill"
+    echo "    Stop inst:  ./scripts/gcp.sh stop"
+    ;;
 
-    kill)
-        echo "==> Stopping remote VM..."
-        _kill_remote_vm
-        echo "    (GCP instance still running; use './scripts/gcp.sh stop' to halt it.)"
-        ;;
+kill)
+    echo "==> Stopping remote VM..."
+    _kill_remote_vm
+    echo "    (GCP instance still running; use './scripts/gcp.sh stop' to halt it.)"
+    ;;
 
-    help|*)
-        cat <<'USAGE'
+help | *)
+    cat <<'USAGE'
 Usage: ./scripts/gcp.sh <command>
 
 Commands:
@@ -532,5 +540,5 @@ Environment:
   UNIKERNEL_MEMORY=128         VM memory in MB
   UNIKERNEL_CPUS=<nproc>        vCPU count (default: all host cores)
 USAGE
-        ;;
+    ;;
 esac

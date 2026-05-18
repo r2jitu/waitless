@@ -73,15 +73,9 @@ pub fn parse_options(opts: &[u8]) -> ParsedOptions {
         let val = &opts[i + 2..i + 2 + len];
 
         match code {
-            OPT_SUBNET if val.len() >= 4 => {
-                out.subnet = Some([val[0], val[1], val[2], val[3]])
-            }
-            OPT_ROUTER if val.len() >= 4 => {
-                out.gateway = Some([val[0], val[1], val[2], val[3]])
-            }
-            OPT_DNS if val.len() >= 4 => {
-                out.dns = Some([val[0], val[1], val[2], val[3]])
-            }
+            OPT_SUBNET if val.len() >= 4 => out.subnet = Some([val[0], val[1], val[2], val[3]]),
+            OPT_ROUTER if val.len() >= 4 => out.gateway = Some([val[0], val[1], val[2], val[3]]),
+            OPT_DNS if val.len() >= 4 => out.dns = Some([val[0], val[1], val[2], val[3]]),
             OPT_MSG_TYPE if val.len() >= 1 => out.msg_type = val[0],
             OPT_SERVER_ID if val.len() >= 4 => {
                 out.server_id = Some([val[0], val[1], val[2], val[3]])
@@ -101,10 +95,7 @@ pub fn parse_options(opts: &[u8]) -> ParsedOptions {
 ///
 /// The returned `yiaddr` is the "your" address from the reply — the
 /// IP the server is offering / acknowledging.
-pub fn validate_header(
-    dhcp_bytes: &[u8],
-    expected_xid_be: [u8; 4],
-) -> Option<[u8; 4]> {
+pub fn validate_header(dhcp_bytes: &[u8], expected_xid_be: [u8; 4]) -> Option<[u8; 4]> {
     // DHCP fixed header is 240 bytes (236 BOOTP + 4 magic cookie).
     if dhcp_bytes.len() < 240 {
         return None;
@@ -121,7 +112,12 @@ pub fn validate_header(
         return None;
     }
     // yiaddr at offset 16..20 (4 bytes).
-    Some([dhcp_bytes[16], dhcp_bytes[17], dhcp_bytes[18], dhcp_bytes[19]])
+    Some([
+        dhcp_bytes[16],
+        dhcp_bytes[17],
+        dhcp_bytes[18],
+        dhcp_bytes[19],
+    ])
 }
 
 #[cfg(test)]
@@ -135,12 +131,8 @@ mod tests {
         // Typical DHCP OFFER from dnsmasq: msg_type(53)=OFFER,
         // subnet(1), router(3), dns(6), server_id(54), end(255).
         let opts: &[u8] = &[
-            53, 1, MSG_OFFER,
-            1, 4, 255, 255, 255, 0,
-            3, 4, 10, 20, 30, 1,
-            6, 4, 10, 20, 30, 1,
-            54, 4, 10, 20, 30, 2,
-            255,
+            53, 1, MSG_OFFER, 1, 4, 255, 255, 255, 0, 3, 4, 10, 20, 30, 1, 6, 4, 10, 20, 30, 1, 54,
+            4, 10, 20, 30, 2, 255,
         ];
         let got = parse_options(opts);
         assert_eq!(
@@ -183,11 +175,9 @@ mod tests {
     fn tolerates_pad_bytes_between_options() {
         // RFC 2132: Pad (0x00) may appear between options as alignment.
         let opts: &[u8] = &[
-            0, 0,                  // pad pad
-            53, 1, MSG_OFFER,
-            0,                     // pad
-            1, 4, 255, 255, 255, 0,
-            255,
+            0, 0, // pad pad
+            53, 1, MSG_OFFER, 0, // pad
+            1, 4, 255, 255, 255, 0, 255,
         ];
         let got = parse_options(opts);
         assert_eq!(got.msg_type, MSG_OFFER);
@@ -199,9 +189,8 @@ mod tests {
         // Option 42 = NTP servers. We don't care but must advance
         // past it correctly and still find options after it.
         let opts: &[u8] = &[
-            42, 4, 10, 0, 0, 3,   // unknown (to us)
-            53, 1, MSG_OFFER,
-            255,
+            42, 4, 10, 0, 0, 3, // unknown (to us)
+            53, 1, MSG_OFFER, 255,
         ];
         let got = parse_options(opts);
         assert_eq!(got.msg_type, MSG_OFFER);
@@ -224,9 +213,10 @@ mod tests {
         // len=10 but only 2 payload bytes remain after the len
         // byte. Walker must stop without reading the bogus bytes.
         let opts: &[u8] = &[
-            53, 1, MSG_OFFER,      // good option
-            1, 10, 1, 2,            // subnet with bogus len=10
-            // (walker stops here; the subnet option is dropped)
+            53, 1, MSG_OFFER, // good option
+            1, 10, 1,
+            2, // subnet with bogus len=10
+               // (walker stops here; the subnet option is dropped)
         ];
         let got = parse_options(opts);
         assert_eq!(got.msg_type, MSG_OFFER);
@@ -249,9 +239,8 @@ mod tests {
         // for a 4-byte IPv4. Must be skipped (not a panic, not a
         // partial-octet IP).
         let opts: &[u8] = &[
-            1, 2, 0xaa, 0xbb,     // subnet with broken short value
-            53, 1, MSG_OFFER,
-            255,
+            1, 2, 0xaa, 0xbb, // subnet with broken short value
+            53, 1, MSG_OFFER, 255,
         ];
         let got = parse_options(opts);
         assert_eq!(got.msg_type, MSG_OFFER);

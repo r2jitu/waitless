@@ -88,7 +88,10 @@ build_disk() {
     # For ARM GCE / Graviton deployment, swap to `:webserver_iso_aarch64`.
     bazel build //apps/webserver:webserver_iso_x86_64
     local iso="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver_iso_x86_64.iso"
-    [ -f "$iso" ] || { echo "ERROR: ISO not produced: $iso" >&2; exit 1; }
+    [ -f "$iso" ] || {
+        echo "ERROR: ISO not produced: $iso" >&2
+        exit 1
+    }
 
     rm -rf "$WORKDIR"
     mkdir -p "$WORKDIR"
@@ -175,8 +178,8 @@ deploy() {
     echo "==> GCP project: $PROJECT   zone: $ZONE   machine: $MACHINE_TYPE"
 
     echo "==> Ensuring GCS bucket: gs://$BUCKET"
-    gsutil ls "gs://$BUCKET" >/dev/null 2>&1 \
-        || gsutil mb -l "${ZONE%-*}" "gs://$BUCKET"
+    gsutil ls "gs://$BUCKET" >/dev/null 2>&1 ||
+        gsutil mb -l "${ZONE%-*}" "gs://$BUCKET"
 
     # Fire the three independent teardown / upload operations in
     # parallel. All are idempotent and safe to run unconditionally.
@@ -185,24 +188,24 @@ deploy() {
     # delete with it below.)
     echo "==> Upload + cleanup (parallel) ..."
     (
-        gsutil -q cp "$TARBALL" "gs://$BUCKET/${TARBALL_NAME}" \
-            && echo "    upload: done"
+        gsutil -q cp "$TARBALL" "gs://$BUCKET/${TARBALL_NAME}" &&
+            echo "    upload: done"
     ) &
     local upload_pid=$!
     (
         gcloud compute instances delete "$NAME" \
             --zone="$ZONE" --project="$PROJECT" --quiet \
-            >/dev/null 2>&1 \
-            && echo "    vm delete: done" \
-            || echo "    vm delete: (not present)"
+            >/dev/null 2>&1 &&
+            echo "    vm delete: done" ||
+            echo "    vm delete: (not present)"
     ) &
     local vm_del_pid=$!
     (
         gcloud compute images delete "$IMAGE_NAME" \
             --project="$PROJECT" --quiet \
-            >/dev/null 2>&1 \
-            && echo "    image delete: done" \
-            || echo "    image delete: (not present)"
+            >/dev/null 2>&1 &&
+            echo "    image delete: done" ||
+            echo "    image delete: (not present)"
     ) &
     local img_del_pid=$!
 
@@ -339,10 +342,10 @@ tail_serial() {
     while true; do
         local out
         out="$(gcloud compute instances get-serial-port-output "$NAME" \
-                  --zone="$ZONE" --project="$PROJECT" --start="$start" 2>/dev/null || true)"
+            --zone="$ZONE" --project="$PROJECT" --start="$start" 2>/dev/null || true)"
         if [ -n "$out" ]; then
             printf '%s' "$out"
-            start=$(( start + ${#out} ))
+            start=$((start + ${#out}))
         fi
         sleep 2
     done
@@ -387,8 +390,8 @@ delete_vm() {
     _require_project
     echo "==> Deleting instance $NAME..."
     gcloud compute instances delete "$NAME" \
-        --zone="$ZONE" --project="$PROJECT" --quiet 2>&1 \
-        || echo "(instance already gone)"
+        --zone="$ZONE" --project="$PROJECT" --quiet 2>&1 ||
+        echo "(instance already gone)"
 }
 
 # Sweep out orphaned images + tarballs from the old timestamped-name
@@ -417,8 +420,8 @@ clean_stale() {
 
     if gsutil ls "gs://$BUCKET" >/dev/null 2>&1; then
         local stale_objs
-        stale_objs="$(gsutil ls "gs://$BUCKET/" 2>/dev/null \
-            | grep -v "/${TARBALL_NAME}\$" || true)"
+        stale_objs="$(gsutil ls "gs://$BUCKET/" 2>/dev/null |
+            grep -v "/${TARBALL_NAME}\$" || true)"
         if [ -n "$stale_objs" ]; then
             local n
             n=$(echo "$stale_objs" | wc -l | tr -d ' ')
@@ -439,9 +442,9 @@ purge() {
     echo "==> Purging VM, images, bucket, and firewall rule in $PROJECT..."
 
     gcloud compute instances delete "$NAME" \
-        --zone="$ZONE" --project="$PROJECT" --quiet 2>/dev/null \
-        && echo "    instance: deleted" \
-        || echo "    instance: (not present)"
+        --zone="$ZONE" --project="$PROJECT" --quiet 2>/dev/null &&
+        echo "    instance: deleted" ||
+        echo "    instance: (not present)"
 
     # Delete every image in the unikernel family. `--filter` keeps us
     # from nuking unrelated images that happen to live in the same
@@ -466,23 +469,32 @@ purge() {
     fi
 
     gcloud compute firewall-rules delete allow-http-unikernel \
-        --project="$PROJECT" --quiet 2>/dev/null \
-        && echo "    firewall: deleted" \
-        || echo "    firewall: (not present)"
+        --project="$PROJECT" --quiet 2>/dev/null &&
+        echo "    firewall: deleted" ||
+        echo "    firewall: (not present)"
 }
 
 case "$MODE" in
-    build-only)  build_disk ;;
-    qemu-test)   build_disk; qemu_test ;;
-    deploy)      build_disk; deploy ;;
-    serial)      read_serial ;;
-    logs)        tail_serial ;;
-    status)      show_status ;;
-    ip)          show_ip ;;
-    stop)        stop_vm ;;
-    start)       start_vm ;;
-    delete)      delete_vm ;;
-    clean-stale) clean_stale ;;
-    purge)       purge ;;
-    *) echo "Usage: $0 {build-only|qemu-test|deploy|serial|logs|status|ip|stop|start|delete|clean-stale|purge}" >&2; exit 1 ;;
+build-only) build_disk ;;
+qemu-test)
+    build_disk
+    qemu_test
+    ;;
+deploy)
+    build_disk
+    deploy
+    ;;
+serial) read_serial ;;
+logs) tail_serial ;;
+status) show_status ;;
+ip) show_ip ;;
+stop) stop_vm ;;
+start) start_vm ;;
+delete) delete_vm ;;
+clean-stale) clean_stale ;;
+purge) purge ;;
+*)
+    echo "Usage: $0 {build-only|qemu-test|deploy|serial|logs|status|ip|stop|start|delete|clean-stale|purge}" >&2
+    exit 1
+    ;;
 esac

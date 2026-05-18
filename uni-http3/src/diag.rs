@@ -7,7 +7,7 @@
 // in `uni::boot_info().boot_args`. Counters are always live so a
 // future stats endpoint can dump them.
 
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// Per-server-counter struct. Fields are named to match the
 /// `h3_drop!` / `h3_event!` reason argument exactly so a grep
@@ -127,8 +127,7 @@ pub enum LogLevel {
 
 const LEVEL_DEFAULT: u8 = LogLevel::Drops as u8;
 static LEVEL: AtomicU8 = AtomicU8::new(LEVEL_DEFAULT);
-static LEVEL_INIT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static LEVEL_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub fn set_log_level(level: LogLevel) {
     LEVEL.store(level as u8, Ordering::Relaxed);
@@ -182,21 +181,57 @@ pub fn should_log_event() -> bool {
 pub fn snapshot() -> [(&'static str, u64); 15] {
     let c = &COUNTERS;
     [
-        ("requests_received", c.requests_received.load(Ordering::Relaxed)),
-        ("requests_handled", c.requests_handled.load(Ordering::Relaxed)),
-        ("recv_buffer_overflow", c.recv_buffer_overflow.load(Ordering::Relaxed)),
-        ("frame_parse_error", c.frame_parse_error.load(Ordering::Relaxed)),
+        (
+            "requests_received",
+            c.requests_received.load(Ordering::Relaxed),
+        ),
+        (
+            "requests_handled",
+            c.requests_handled.load(Ordering::Relaxed),
+        ),
+        (
+            "recv_buffer_overflow",
+            c.recv_buffer_overflow.load(Ordering::Relaxed),
+        ),
+        (
+            "frame_parse_error",
+            c.frame_parse_error.load(Ordering::Relaxed),
+        ),
         ("no_headers_seen", c.no_headers_seen.load(Ordering::Relaxed)),
-        ("qpack_decode_error", c.qpack_decode_error.load(Ordering::Relaxed)),
-        ("qpack_encode_overflow", c.qpack_encode_overflow.load(Ordering::Relaxed)),
+        (
+            "qpack_decode_error",
+            c.qpack_decode_error.load(Ordering::Relaxed),
+        ),
+        (
+            "qpack_encode_overflow",
+            c.qpack_encode_overflow.load(Ordering::Relaxed),
+        ),
         ("responses_sent", c.responses_sent.load(Ordering::Relaxed)),
-        ("peer_uni_streams_seen", c.peer_uni_streams_seen.load(Ordering::Relaxed)),
+        (
+            "peer_uni_streams_seen",
+            c.peer_uni_streams_seen.load(Ordering::Relaxed),
+        ),
         ("unexpected_bidi", c.unexpected_bidi.load(Ordering::Relaxed)),
-        ("read_loop_completed", c.read_loop_completed.load(Ordering::Relaxed)),
-        ("user_handler_invoked", c.user_handler_invoked.load(Ordering::Relaxed)),
-        ("user_handler_returned", c.user_handler_returned.load(Ordering::Relaxed)),
-        ("write_response_completed", c.write_response_completed.load(Ordering::Relaxed)),
-        ("user_handler_polled", c.user_handler_polled.load(Ordering::Relaxed)),
+        (
+            "read_loop_completed",
+            c.read_loop_completed.load(Ordering::Relaxed),
+        ),
+        (
+            "user_handler_invoked",
+            c.user_handler_invoked.load(Ordering::Relaxed),
+        ),
+        (
+            "user_handler_returned",
+            c.user_handler_returned.load(Ordering::Relaxed),
+        ),
+        (
+            "write_response_completed",
+            c.write_response_completed.load(Ordering::Relaxed),
+        ),
+        (
+            "user_handler_polled",
+            c.user_handler_polled.load(Ordering::Relaxed),
+        ),
     ]
 }
 

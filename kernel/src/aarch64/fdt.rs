@@ -114,14 +114,20 @@ fn be32(s: &[u8]) -> u32 {
 // `usize`, so we read the raw bytes ourselves to keep the (type, num) pair.
 #[cfg(target_arch = "aarch64")]
 fn translate_gic_irq(int_type: u32, int_num: u32) -> u32 {
-    if int_type == 0 { int_num + 32 } else { int_num + 16 }
+    if int_type == 0 {
+        int_num + 32
+    } else {
+        int_num + 16
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
 /// Parse `interrupts = <type spi_num flags>` from FDT.
 /// Returns (intid, flags) where flags bit 0 = 1 for edge-triggered.
 fn parse_first_interrupt(prop: &[u8]) -> Option<(u32, u32)> {
-    if prop.len() < 12 { return None; }
+    if prop.len() < 12 {
+        return None;
+    }
     let int_type = be32(prop);
     let int_num = be32(&prop[4..]);
     let flags = be32(&prop[8..]);

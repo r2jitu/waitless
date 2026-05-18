@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 
 // Re-use the QUIC varint codec from //uni-quic — H3 frames use the
 // exact same encoding (RFC 9114 §7).
-use uni_quic::wire::{read_varint, write_varint, WireError};
+use uni_quic::wire::{WireError, read_varint, write_varint};
 
 /// Frame type codes (RFC 9114 §11.2.1 / §7.2).
 pub mod ftype {
@@ -69,7 +69,9 @@ pub enum Frame<'a> {
     GoAway(u64),
     /// Recognised-but-unhandled frame (push, max_push_id, grease,
     /// reserved). Caller skips the bytes.
-    Skipped { ty: u64 },
+    Skipped {
+        ty: u64,
+    },
 }
 
 /// Try to parse one frame from the head of `data`. Returns the
@@ -150,11 +152,7 @@ pub fn append_frame_header(
 /// `IOBuf::prepend` / `append_slice` into the framing IOBuf's
 /// reserved headroom/tailroom) — avoiding the per-request
 /// `Vec<u8>` allocation that the Vec-target variant requires.
-pub fn write_frame_header(
-    ty: u64,
-    body_len: usize,
-    out: &mut [u8],
-) -> Result<usize, FrameError> {
+pub fn write_frame_header(ty: u64, body_len: usize, out: &mut [u8]) -> Result<usize, FrameError> {
     let mut p = 0usize;
     p += write_varint(ty, &mut out[p..])?;
     p += write_varint(body_len as u64, &mut out[p..])?;

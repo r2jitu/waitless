@@ -23,7 +23,9 @@ class PerCoreStateTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.serial = run_variant_and_capture(
-            "test_percpu", marker="Per-core state test complete", timeout=15.0,
+            "test_percpu",
+            marker="Per-core state test complete",
+            timeout=15.0,
         )
 
     def test_each_core_announced(self) -> None:
@@ -32,7 +34,8 @@ class PerCoreStateTest(unittest.TestCase):
         # this line, so we check 1..EXPECTED_CPUS.
         for core in range(1, EXPECTED_CPUS):
             self.assertIn(
-                f"[SMP] core {core} online", self.serial,
+                f"[SMP] core {core} online",
+                self.serial,
                 f"core {core} didn't print its online message",
             )
 

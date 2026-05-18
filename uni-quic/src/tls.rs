@@ -38,19 +38,19 @@
 
 use alloc::vec::Vec;
 
-use p256::ecdsa::{signature::Signer, Signature as EcdsaSignature};
+use p256::ecdsa::{Signature as EcdsaSignature, signature::Signer};
 
-use uni_tls::schedule::{
-    ApplicationSecrets, HandshakeSecrets, KeySchedule, Transcript, X25519ServerKey, HASH_LEN,
-};
 use uni_tls::handshake::{
-    build_certificate, build_certificate_verify, build_encrypted_extensions, build_finished,
-    build_server_hello, encode_handshake, msg_type, parse_finished, parse_handshake,
-    sign_content_server_cert_verify, ClientHello, ParseError,
+    ClientHello, ParseError, build_certificate, build_certificate_verify,
+    build_encrypted_extensions, build_finished, build_server_hello, encode_handshake, msg_type,
+    parse_finished, parse_handshake, sign_content_server_cert_verify,
+};
+use uni_tls::schedule::{
+    ApplicationSecrets, HASH_LEN, HandshakeSecrets, KeySchedule, Transcript, X25519ServerKey,
 };
 
-use uni_tls::keys::{ct_eq_32, derive_finished_key, hmac_sha256};
 use uni_tls::TlsServerConfig;
+use uni_tls::keys::{ct_eq_32, derive_finished_key, hmac_sha256};
 
 // ============================================================================
 // Public types
@@ -370,21 +370,27 @@ impl QuicTls {
         // owned, so it remains valid past the scope.
         let (client_x25519_pub, sid_echo, sid_len, selected_alpn, resume_accept) = {
             let ch = ClientHello::parse(body).map_err(|e| {
-                crate::quic_drop!(unsupported_client,
-                    "ClientHello::parse failed: {:?} body_len={}", e, body.len());
+                crate::quic_drop!(
+                    unsupported_client,
+                    "ClientHello::parse failed: {:?} body_len={}",
+                    e,
+                    body.len()
+                );
                 QuicTlsError::UnsupportedClient
             })?;
             let mut sid = [0u8; 32];
             let n = ch.legacy_session_id.len();
             sid[..n].copy_from_slice(ch.legacy_session_id);
             let pk = ch.x25519_client_pub.ok_or_else(|| {
-                crate::quic_drop!(unsupported_client,
+                crate::quic_drop!(
+                    unsupported_client,
                     "no x25519 in ClientHello key_share (groups offered: {} key_shares: {})",
-                    ch.observed_supported_group_count, ch.observed_key_share_count);
+                    ch.observed_supported_group_count,
+                    ch.observed_key_share_count
+                );
                 QuicTlsError::UnsupportedClient
             })?;
-            self.client_transport_params =
-                ch.quic_transport_parameters.map(|s| s.to_vec());
+            self.client_transport_params = ch.quic_transport_parameters.map(|s| s.to_vec());
             let alpn = ch.alpn_protocol_list.and_then(|list| {
                 let mut h3 = None;
                 let mut first = None;
@@ -419,8 +425,8 @@ impl QuicTls {
 
         // Adopt the resumed schedule (if any) so handshake_traffic_secret
         // derivation downstream uses the PSK-derived early secret.
-        let selected_psk_identity: Option<u16> = resume_accept.as_ref()
-            .map(|r| r.selected_identity);
+        let selected_psk_identity: Option<u16> =
+            resume_accept.as_ref().map(|r| r.selected_identity);
         let resumed = resume_accept.is_some();
         if let Some(ra) = resume_accept {
             let id = ra.selected_identity;
@@ -444,8 +450,11 @@ impl QuicTls {
                 // incoming 0-RTT packets at AEAD open. Surface
                 // the event so an operator can spot replay
                 // attempts vs. the normal accept path.
-                crate::quic_event!(zero_rtt_unresumable,
-                    "reason=replay_cache_hit selected_identity={}", id);
+                crate::quic_event!(
+                    zero_rtt_unresumable,
+                    "reason=replay_cache_hit selected_identity={}",
+                    id
+                );
             }
             crate::quic_event!(tickets_accepted, "selected_identity={}", id);
         }
@@ -471,9 +480,8 @@ impl QuicTls {
         )
         .ok_or(QuicTlsError::Internal)?;
         let mut sh_msg = [0u8; 280];
-        let sh_msg_len =
-            encode_handshake(msg_type::SERVER_HELLO, &sh_body[..sh_len], &mut sh_msg)
-                .ok_or(QuicTlsError::Internal)?;
+        let sh_msg_len = encode_handshake(msg_type::SERVER_HELLO, &sh_body[..sh_len], &mut sh_msg)
+            .ok_or(QuicTlsError::Internal)?;
         self.transcript.update(&sh_msg[..sh_msg_len]);
         self.tx_initial.extend_from_slice(&sh_msg[..sh_msg_len]);
 
@@ -556,8 +564,8 @@ impl QuicTls {
         // (the slowest server-side step in our profile).
         if !resumed {
             let mut cert_body = alloc::vec![0u8; 2048];
-            let cert_body_len = build_certificate(config.cert_der, &mut cert_body)
-                .ok_or(QuicTlsError::Internal)?;
+            let cert_body_len =
+                build_certificate(config.cert_der, &mut cert_body).ok_or(QuicTlsError::Internal)?;
             let mut cert_msg = alloc::vec![0u8; 2100];
             let cert_msg_len = encode_handshake(
                 msg_type::CERTIFICATE,
@@ -566,7 +574,8 @@ impl QuicTls {
             )
             .ok_or(QuicTlsError::Internal)?;
             self.transcript.update(&cert_msg[..cert_msg_len]);
-            self.tx_handshake.extend_from_slice(&cert_msg[..cert_msg_len]);
+            self.tx_handshake
+                .extend_from_slice(&cert_msg[..cert_msg_len]);
 
             let transcript_hash = self.transcript.snapshot();
             let mut sign_content = [0u8; 130];
@@ -599,15 +608,10 @@ impl QuicTls {
         let transcript_for_sfin = self.transcript.snapshot();
         let sf_verify = hmac_sha256(&server_finished_key, &transcript_for_sfin);
         let mut sf_body = [0u8; HASH_LEN];
-        let sf_body_len = build_finished(&sf_verify, &mut sf_body)
-            .ok_or(QuicTlsError::Internal)?;
+        let sf_body_len = build_finished(&sf_verify, &mut sf_body).ok_or(QuicTlsError::Internal)?;
         let mut sf_msg = [0u8; 48];
-        let sf_msg_len = encode_handshake(
-            msg_type::FINISHED,
-            &sf_body[..sf_body_len],
-            &mut sf_msg,
-        )
-        .ok_or(QuicTlsError::Internal)?;
+        let sf_msg_len = encode_handshake(msg_type::FINISHED, &sf_body[..sf_body_len], &mut sf_msg)
+            .ok_or(QuicTlsError::Internal)?;
         self.transcript.update(&sf_msg[..sf_msg_len]);
         self.tx_handshake.extend_from_slice(&sf_msg[..sf_msg_len]);
 
@@ -661,8 +665,7 @@ impl QuicTls {
             .as_ref()
             .ok_or(QuicTlsError::Internal)?;
         let client_finished_key = derive_finished_key(&hs_secrets.client_hs);
-        let expected_verify =
-            hmac_sha256(&client_finished_key, &self.transcript.snapshot());
+        let expected_verify = hmac_sha256(&client_finished_key, &self.transcript.snapshot());
         if !ct_eq_32(client_verify, &expected_verify) {
             self.state = QuicTlsState::Failed;
             return Err(QuicTlsError::BadClientFinished);
@@ -709,8 +712,7 @@ impl QuicTls {
             cipher_suite: uni_tls::handshake::cipher_suite::TLS_AES_128_GCM_SHA256,
         };
         let mut sealed = [0u8; uni_tls::ticket::SEALED_LEN];
-        let n = uni_tls::ticket::seal_ticket(&pt, &mut sealed)
-            .ok_or(QuicTlsError::Internal)?;
+        let n = uni_tls::ticket::seal_ticket(&pt, &mut sealed).ok_or(QuicTlsError::Internal)?;
 
         // RFC 8446 §4.6.1 NewSessionTicket layout, plus the
         // RFC 9001 §4.6.1 `early_data` extension carrying the
@@ -881,7 +883,7 @@ impl core::ops::Deref for RxBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uni_tls::handshake::{cipher_suite, ext_type, named_group, LEGACY_VERSION_TLS12};
+    use uni_tls::handshake::{LEGACY_VERSION_TLS12, cipher_suite, ext_type, named_group};
 
     /// Hand-rolled minimal TLS 1.3 ClientHello body — same shape
     /// the existing `parse_synthetic_client_hello` test in
@@ -897,7 +899,11 @@ mod tests {
             buf.extend_from_slice(body);
         };
         write_ext(&mut ext, ext_type::SUPPORTED_VERSIONS, &[0x02, 0x03, 0x04]);
-        write_ext(&mut ext, ext_type::SUPPORTED_GROUPS, &[0x00, 0x02, 0x00, 0x1d]);
+        write_ext(
+            &mut ext,
+            ext_type::SUPPORTED_GROUPS,
+            &[0x00, 0x02, 0x00, 0x1d],
+        );
         let mut ks = Vec::<u8>::new();
         ks.extend_from_slice(&36u16.to_be_bytes());
         ks.extend_from_slice(&named_group::X25519.to_be_bytes());
@@ -935,10 +941,8 @@ mod tests {
 
     fn dev_config() -> TlsServerConfig {
         // Bundled dev cert + key. Same files the webserver uses.
-        const CERT: &[u8] =
-            include_bytes!("../../apps/webserver/dev_certs/dev_cert.der");
-        const KEY: &[u8] =
-            include_bytes!("../../apps/webserver/dev_certs/dev_key.der");
+        const CERT: &[u8] = include_bytes!("../../apps/webserver/dev_certs/dev_cert.der");
+        const KEY: &[u8] = include_bytes!("../../apps/webserver/dev_certs/dev_key.der");
         TlsServerConfig::from_dev_cert(CERT, KEY).expect("dev cert load")
     }
 
@@ -957,15 +961,21 @@ mod tests {
         let s = q.advance(&cfg).expect("advance after CH");
         assert_eq!(s, QuicTlsState::WaitClientFinished);
         assert!(q.handshake_secrets().is_some(), "hs secrets after SH");
-        assert!(q.application_secrets().is_some(), "ap secrets after server flight");
+        assert!(
+            q.application_secrets().is_some(),
+            "ap secrets after server flight"
+        );
 
         // Initial-level output should contain a ServerHello message.
         let mut buf = [0u8; 512];
         let n = q.pop_handshake(CryptoLevel::Initial, &mut buf);
         assert!(n > 0, "ServerHello bytes available");
         assert_eq!(buf[0], msg_type::SERVER_HELLO);
-        assert_eq!(q.pop_handshake(CryptoLevel::Initial, &mut buf), 0,
-                   "initial buffer drained");
+        assert_eq!(
+            q.pop_handshake(CryptoLevel::Initial, &mut buf),
+            0,
+            "initial buffer drained"
+        );
 
         // Handshake-level output should contain EE + Cert + CV + Finished.
         // The exact bytes depend on the dev cert + ECDSA RNG; just
@@ -986,8 +996,11 @@ mod tests {
         // Push only the first 10 bytes — clearly not a complete CH.
         q.push_handshake(CryptoLevel::Initial, 0, &ch[..10]);
         let s = q.advance(&cfg).expect("advance on partial CH");
-        assert_eq!(s, QuicTlsState::WaitClientHello,
-                   "must remain WaitClientHello on truncated CH");
+        assert_eq!(
+            s,
+            QuicTlsState::WaitClientHello,
+            "must remain WaitClientHello on truncated CH"
+        );
 
         // Push the rest, advance, transition fires.
         q.push_handshake(CryptoLevel::Initial, 10, &ch[10..]);
@@ -1011,4 +1024,3 @@ mod tests {
         assert_eq!(q.state(), QuicTlsState::Failed);
     }
 }
-

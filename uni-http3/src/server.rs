@@ -22,7 +22,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use uni_quic::{quic_listen, QuicConn, QuicListenError};
+use uni_quic::{QuicConn, QuicListenError, quic_listen};
 
 use uni_http::{BodyReader, Method, NullStream, Request, Response};
 
@@ -165,9 +165,7 @@ where
             // task per request, but the conn task already
             // multiplexes; doing it inline keeps lifetimes simple
             // and matches the shape of //uni-http's handle_conn.
-            handle_request(
-                &conn, sid, h.as_ref(), &mut scratch,
-            ).await;
+            handle_request(&conn, sid, h.as_ref(), &mut scratch).await;
         } else if sid & 0x3 == 0x2 {
             // Peer unidirectional streams — control, QPACK
             // encoder, QPACK decoder. We can't actively drain
@@ -355,11 +353,7 @@ impl FramingPool {
 /// the underlying Box<[u8]> and the Arc<FramingPool> from the
 /// raw pointers, pushes the Box back to the pool (or drops if
 /// the pool is full), and lets the Arc strong count decrement.
-unsafe fn framing_pool_drop(
-    base: core::ptr::NonNull<u8>,
-    capacity: u32,
-    ctx: *mut (),
-) {
+unsafe fn framing_pool_drop(base: core::ptr::NonNull<u8>, capacity: u32, ctx: *mut ()) {
     // SAFETY: ctx came from `Arc::into_raw` in `FramingPool::take`;
     // we balance that with `Arc::from_raw` here.
     let pool: alloc::sync::Arc<FramingPool> =
@@ -381,12 +375,8 @@ unsafe fn framing_pool_drop(
     // pool's Arc drops at scope-end too, decrementing the strong count.
 }
 
-async fn handle_request<H>(
-    conn: &QuicConn,
-    sid: u64,
-    handler: &H,
-    scratch: &mut Scratch,
-) where
+async fn handle_request<H>(conn: &QuicConn, sid: u64, handler: &H, scratch: &mut Scratch)
+where
     H: for<'a, 'b> AsyncFn(Request, &'a mut BodyReader<'b, NullStream>) -> Response,
 {
     // Accumulate stream bytes until we have a complete H3 frame
@@ -412,8 +402,13 @@ async fn handle_request<H>(
         let (n, end) = conn.recv(sid, &mut chunk).await;
         if n > 0 {
             if buf.len() + n > RECV_CAP {
-                crate::h3_drop!(recv_buffer_overflow,
-                    "sid={} buf_len={} cap={}", sid, buf.len(), RECV_CAP);
+                crate::h3_drop!(
+                    recv_buffer_overflow,
+                    "sid={} buf_len={} cap={}",
+                    sid,
+                    buf.len(),
+                    RECV_CAP
+                );
                 conn.close_stream(sid);
                 return;
             }
@@ -429,8 +424,13 @@ async fn handle_request<H>(
                 Ok(x) => x,
                 Err(frame::FrameError::Truncated) => break,
                 Err(e) => {
-                    crate::h3_drop!(frame_parse_error,
-                        "sid={} err={:?} buf_len={}", sid, e, buf.len());
+                    crate::h3_drop!(
+                        frame_parse_error,
+                        "sid={} err={:?} buf_len={}",
+                        sid,
+                        e,
+                        buf.len()
+                    );
                     conn.close_stream(sid);
                     return;
                 }
@@ -525,9 +525,13 @@ async fn handle_request<H>(
             &mut value_scratch,
             &mut sink,
         ) {
-            crate::h3_drop!(qpack_decode_error,
+            crate::h3_drop!(
+                qpack_decode_error,
                 "sid={} err={:?} header_len={}",
-                sid, e, headers_value.len());
+                sid,
+                e,
+                headers_value.len()
+            );
             conn.close_stream(sid);
             return;
         }
@@ -635,9 +639,13 @@ fn write_response(
         ) {
             Ok(n) => n,
             Err(_) => {
-                crate::h3_drop!(qpack_encode_overflow,
+                crate::h3_drop!(
+                    qpack_encode_overflow,
                     "sid={} status={} qpack_reserve={}",
-                    sid, resp.status, QPACK_BODY_RESERVE);
+                    sid,
+                    resp.status,
+                    QPACK_BODY_RESERVE
+                );
                 conn.close_stream(sid);
                 return;
             }
@@ -724,4 +732,3 @@ fn format_usize_into(n: usize, buf: &mut [u8; 20]) -> usize {
     }
     i
 }
-

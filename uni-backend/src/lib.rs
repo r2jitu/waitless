@@ -69,12 +69,12 @@ pub struct TcpDiag {
     pub rx_chunk_ring_drain: u64,
 }
 
-#[cfg(target_os = "none")]
-mod unikernel;
 #[cfg(not(target_os = "none"))]
 mod native;
-
 #[cfg(target_os = "none")]
-pub use unikernel::*;
+mod unikernel;
+
 #[cfg(not(target_os = "none"))]
 pub use native::*;
+#[cfg(target_os = "none")]
+pub use unikernel::*;

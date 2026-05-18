@@ -355,11 +355,7 @@ impl IOBufPool {
         // and disjoint from every other live slab; `frame` is a
         // distinct caller slice, so source and dest don't overlap.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                frame.as_ptr(),
-                slab_base.as_ptr(),
-                frame.len(),
-            );
+            core::ptr::copy_nonoverlapping(frame.as_ptr(), slab_base.as_ptr(), frame.len());
         }
 
         // SAFETY:
@@ -556,8 +552,7 @@ mod tests {
         assert_eq!(pool.free_count(), 16);
 
         // Drain the whole pool.
-        let mut slots: Vec<Option<OwnedIOBuf>> =
-            (0..16).map(|_| pool.alloc(b"x")).collect();
+        let mut slots: Vec<Option<OwnedIOBuf>> = (0..16).map(|_| pool.alloc(b"x")).collect();
         assert!(slots.iter().all(Option::is_some), "pool fully drained");
         assert_eq!(pool.free_count(), 0);
 
@@ -572,7 +567,10 @@ mod tests {
 
         // The pool is fully reusable afterward.
         let again: Vec<Option<OwnedIOBuf>> = (0..16).map(|_| pool.alloc(b"x")).collect();
-        assert!(again.iter().all(Option::is_some), "pool reusable post-recycle");
+        assert!(
+            again.iter().all(Option::is_some),
+            "pool reusable post-recycle"
+        );
     }
 
     #[test]
@@ -648,6 +646,10 @@ mod tests {
         assert_eq!(held.len(), SLABS, "drained slab count");
         bases.sort_unstable();
         bases.dedup();
-        assert_eq!(bases.len(), SLABS, "all drained slabs at distinct addresses");
+        assert_eq!(
+            bases.len(),
+            SLABS,
+            "all drained slabs at distinct addresses"
+        );
     }
 }

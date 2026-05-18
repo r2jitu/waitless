@@ -16,8 +16,8 @@ use drivers_infra::mmio_write32;
 use uni_iobuf::{Chain, IOBufDropFn, OwnedIOBuf};
 
 use crate::{
-    BAR2_VA, DEFERRED_KICK, MAX_QUEUE_PAIRS, RX_BUFFER_SIZE,
-    RX_BUF_REPOST_COUNT, RX_BYTES_PER_QP, RX_QUEUES, RxQueue, TX_QUEUES, TxQueue,
+    BAR2_VA, DEFERRED_KICK, MAX_QUEUE_PAIRS, RX_BUF_REPOST_COUNT, RX_BUFFER_SIZE, RX_BYTES_PER_QP,
+    RX_QUEUES, RxQueue, TX_QUEUES, TxQueue,
 };
 
 // ---- DQO_RDA descriptor formats -------------------------------------------
@@ -88,8 +88,7 @@ const GVE_ALT_MISS_COMPL_BIT: u16 = 1 << 15;
 /// TX_PACKETS_PER_QP counter already tracks successful sends; the
 /// device's PKT-completion count just confirms the same fact from
 /// the other side, so the duplication isn't worth the cost.
-pub static DQO_TX_MISS_COMPL: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static DQO_TX_MISS_COMPL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static DQO_TX_REINJECT_COMPL: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
@@ -182,7 +181,9 @@ pub(crate) fn doorbell_write_le(bar2_va: u64, offset: u32, value: u32) {
 /// uses the slot==ring_idx convention; ring positions cycle
 /// implicitly as `done_cnt` advances.
 pub(crate) fn tx_drain(tx: &TxQueue) {
-    if tx.tx_compl_va == 0 || tx.tx_compl_entries == 0 { return; }
+    if tx.tx_compl_va == 0 || tx.tx_compl_entries == 0 {
+        return;
+    }
     let cmask = (tx.tx_compl_entries - 1) as u32;
     let rmask = (tx.ring_entries - 1) as u32;
     let mut head = tx.tx_compl_head.load(Ordering::Relaxed);
@@ -191,20 +192,18 @@ pub(crate) fn tx_drain(tx: &TxQueue) {
     loop {
         let idx = (head & cmask) as usize;
         let desc_ptr = (tx.tx_compl_va as *const u8).wrapping_add(idx * DQO_TX_COMPL_SIZE);
-        let hdr_word = unsafe {
-            ptr::read_volatile(desc_ptr as *const u16)
-        };
+        let hdr_word = unsafe { ptr::read_volatile(desc_ptr as *const u16) };
         let desc_gen = ((hdr_word >> 15) & 1) as u8;
-        if desc_gen != cur_gen { break; }
+        if desc_gen != cur_gen {
+            break;
+        }
         // Mirror of the RX-side fence — bar LLVM from reordering
         // type/tx_head reads ahead of the gen-bit check.
         core::sync::atomic::compiler_fence(Ordering::Acquire);
         let cmpl_type = ((hdr_word >> 11) & 0x7) as u8;
         match cmpl_type {
             DQO_TX_COMPL_TYPE_DESC => {
-                let tx_head = unsafe {
-                    ptr::read_volatile(desc_ptr.add(2) as *const u16)
-                };
+                let tx_head = unsafe { ptr::read_volatile(desc_ptr.add(2) as *const u16) };
                 latest_tx_head = Some(tx_head);
             }
             DQO_TX_COMPL_TYPE_PKT => {
@@ -212,9 +211,7 @@ pub(crate) fn tx_drain(tx: &TxQueue) {
                 // a PKT-typed completion's completion_tag to mean
                 // "this is actually a MISS". Read the tag as u16
                 // and test the high bit.
-                let tag = unsafe {
-                    ptr::read_volatile(desc_ptr.add(2) as *const u16)
-                };
+                let tag = unsafe { ptr::read_volatile(desc_ptr.add(2) as *const u16) };
                 if tag & GVE_ALT_MISS_COMPL_BIT != 0 {
                     DQO_TX_MISS_COMPL.fetch_add(1, Ordering::Relaxed);
                 }
@@ -256,7 +253,8 @@ pub(crate) fn tx_drain(tx: &TxQueue) {
         let tx_head_low = tx_head & mask16;
         let delta = (tx_head_low.wrapping_sub(prev_low) & mask16) as u32;
         if delta > 0 {
-            tx.done_cnt.store(prev.wrapping_add(delta), Ordering::Relaxed);
+            tx.done_cnt
+                .store(prev.wrapping_add(delta), Ordering::Relaxed);
         }
     }
 }
@@ -282,24 +280,39 @@ struct TxClassify {
 }
 
 fn classify_outbound(frame: &[u8]) -> TxClassify {
-    let default = TxClassify { csum: false, path_hash: 0 };
-    if frame.len() < 14 { return default; }
+    let default = TxClassify {
+        csum: false,
+        path_hash: 0,
+    };
+    if frame.len() < 14 {
+        return default;
+    }
     let etype = u16::from_be_bytes([frame[12], frame[13]]);
     let (l4_proto, l4_off, ip_off, ip_hdr_len) = match etype {
         0x0800 => {
-            if frame.len() < 14 + 20 { return default; }
+            if frame.len() < 14 + 20 {
+                return default;
+            }
             let ihl = (frame[14] & 0x0f) as usize;
-            if ihl < 5 { return default; }
+            if ihl < 5 {
+                return default;
+            }
             (frame[14 + 9], 14 + ihl * 4, 14, ihl * 4)
         }
         0x86dd => {
-            if frame.len() < 14 + 40 { return default; }
+            if frame.len() < 14 + 40 {
+                return default;
+            }
             (frame[14 + 6], 14 + 40, 14, 40)
         }
         _ => return default,
     };
-    if !matches!(l4_proto, 6 | 17) { return default; }
-    if l4_off + 4 > frame.len() { return default; }
+    if !matches!(l4_proto, 6 | 17) {
+        return default;
+    }
+    if l4_off + 4 > frame.len() {
+        return default;
+    }
     // Cheap 4-tuple hash: XOR-fold the src/dst IP words with the
     // src/dst port words. Linux uses a Jenkins-style hash; we just
     // need something that distributes across distinct flows.
@@ -307,7 +320,7 @@ fn classify_outbound(frame: &[u8]) -> TxClassify {
     let ip_end = ip_off + ip_hdr_len;
     let ip_addrs_off = match etype {
         0x0800 => ip_off + 12, // IPv4 src+dst at offsets 12-19
-        _      => ip_off + 8,  // IPv6 src at 8-23, dst at 24-39
+        _ => ip_off + 8,       // IPv6 src at 8-23, dst at 24-39
     };
     let addrs_len = if etype == 0x0800 { 8 } else { 32 };
     let mut i = ip_addrs_off;
@@ -323,7 +336,10 @@ fn classify_outbound(frame: &[u8]) -> TxClassify {
     h ^= dp.wrapping_mul(0xc2b2);
     let path_hash = (h ^ (h >> 16)) as u16 & 0x7fff;
     let path_hash = if path_hash == 0 { 0x7fff } else { path_hash };
-    TxClassify { csum: true, path_hash }
+    TxClassify {
+        csum: true,
+        path_hash,
+    }
 }
 
 // ---- TX descriptor builders ------------------------------------------------
@@ -364,7 +380,9 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8]) -> bool {
         return false;
     }
     let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
-    if tx_ptr.is_null() { return false; }
+    if tx_ptr.is_null() {
+        return false;
+    }
     let tx = unsafe { &*tx_ptr };
     let bar2_va = BAR2_VA.load(Ordering::Acquire);
 
@@ -414,7 +432,9 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     let buf_offset = (slot as u32) * (RX_BUFFER_SIZE as u32);
     let buf_va = (tx.qpl_base_va + buf_offset as u64) as *mut u8;
     let buf_phys = tx.qpl_base_phys + buf_offset as u64;
-    unsafe { ptr::copy_nonoverlapping(data.as_ptr(), buf_va, data.len()); }
+    unsafe {
+        ptr::copy_nonoverlapping(data.as_ptr(), buf_va, data.len());
+    }
 
     // Classify the outbound frame: figure out whether the device
     // should do CSUM offload (for TCP/UDP), and compute a path_hash
@@ -433,7 +453,9 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     // prefetch between, seeing a half-written desc.
     let ctx_val: u128 = build_ctx_desc(cls.path_hash);
     let ctx_ptr = (tx.ring_va as *mut u128).wrapping_add(ctx_idx);
-    unsafe { ptr::write_volatile(ctx_ptr, ctx_val); }
+    unsafe {
+        ptr::write_volatile(ctx_ptr, ctx_val);
+    }
 
     // Packet descriptor. RE every 32nd descriptor per the device's
     // GVE_TX_MIN_RE_INTERVAL.
@@ -449,7 +471,9 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     }
     let pkt_val: u128 = build_pkt_desc(buf_phys, flags, slot as u16, data.len() as u16);
     let pkt_ptr = (tx.ring_va as *mut u128).wrapping_add(pkt_idx);
-    unsafe { ptr::write_volatile(pkt_ptr, pkt_val); }
+    unsafe {
+        ptr::write_volatile(pkt_ptr, pkt_val);
+    }
 
     let new_fill = fill_cnt.wrapping_add(2);
     tx.fill_cnt.store(new_fill, Ordering::Release);
@@ -491,7 +515,9 @@ pub(crate) fn post_initial_rx_for_qp(rx: &RxQueue) {
         desc[0..2].copy_from_slice(&(i as u16).to_le_bytes());
         let buf_phys = pool_base_phys + (i as u64) * (RX_BUFFER_SIZE as u64);
         desc[8..16].copy_from_slice(&buf_phys.to_le_bytes());
-        unsafe { ptr::copy_nonoverlapping(desc.as_ptr(), desc_ptr, DQO_RX_DESC_SIZE); }
+        unsafe {
+            ptr::copy_nonoverlapping(desc.as_ptr(), desc_ptr, DQO_RX_DESC_SIZE);
+        }
     }
     rx.fill_cnt.store(initial, Ordering::Release);
     let bar2_va = BAR2_VA.load(Ordering::Acquire);
@@ -557,7 +583,9 @@ unsafe fn dqo_repost(_base: NonNull<u8>, _capacity: u32, ctx: *mut ()) {
     post_desc[8..16].copy_from_slice(&buf_phys.to_le_bytes());
     // SAFETY: `post_idx < ring_entries`, so `post_ptr` addresses
     // one 32-byte descriptor inside the data ring allocated at init.
-    unsafe { ptr::copy_nonoverlapping(post_desc.as_ptr(), post_ptr, DQO_RX_DESC_SIZE); }
+    unsafe {
+        ptr::copy_nonoverlapping(post_desc.as_ptr(), post_ptr, DQO_RX_DESC_SIZE);
+    }
 
     // Doorbell the new masked tail. The fence inside drains the
     // store buffer so the descriptor above is visible to the
@@ -571,9 +599,13 @@ unsafe fn dqo_repost(_base: NonNull<u8>, _capacity: u32, ctx: *mut ()) {
 }
 
 pub(crate) fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, mut callback: F) -> u32 {
-    if qp >= MAX_QUEUE_PAIRS { return 0; }
+    if qp >= MAX_QUEUE_PAIRS {
+        return 0;
+    }
     let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
-    if rx_ptr.is_null() { return 0; }
+    if rx_ptr.is_null() {
+        return 0;
+    }
     let rx = unsafe { &*rx_ptr };
 
     let mask = (rx.ring_entries - 1) as u32;
@@ -593,11 +625,11 @@ pub(crate) fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, mut callback
         // between the two bytes — without this, if the device's TLP
         // updates the cache line exactly between the two byte loads,
         // we'd assemble a half-old/half-new u16.
-        let pkt_word = unsafe {
-            ptr::read_volatile(desc_ptr.add(4) as *const u16)
-        };
+        let pkt_word = unsafe { ptr::read_volatile(desc_ptr.add(4) as *const u16) };
         let desc_gen = ((pkt_word >> 14) & 1) as u8;
-        if desc_gen != cur_gen { break; }
+        if desc_gen != cur_gen {
+            break;
+        }
         // `compiler_fence(Acquire)` is Linux's `dma_rmb()` analog: on
         // x86 it doesn't emit a hardware fence (TSO already orders
         // loads) but it bars LLVM from hoisting the subsequent
@@ -609,13 +641,10 @@ pub(crate) fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, mut callback
         let status = unsafe { ptr::read_volatile(desc_ptr.add(8)) };
         // buf_id at offset 12 — aligned u16 read, same rationale as
         // pkt_word above.
-        let buf_id = unsafe {
-            ptr::read_volatile(desc_ptr.add(12) as *const u16)
-        } as u32;
+        let buf_id = unsafe { ptr::read_volatile(desc_ptr.add(12) as *const u16) } as u32;
 
-        let deliver = buf_id < DQO_RX_POOL_BUFS
-            && (status & DQO_RX_COMPL_STATUS_EOP) != 0
-            && pkt_len > 0;
+        let deliver =
+            buf_id < DQO_RX_POOL_BUFS && (status & DQO_RX_COMPL_STATUS_EOP) != 0 && pkt_len > 0;
         if deliver {
             let buf_va = rx.qpl_base_va + (buf_id as u64) * (RX_BUFFER_SIZE as u64);
             if qp < RX_BYTES_PER_QP.len() {

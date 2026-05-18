@@ -42,7 +42,9 @@ fn now_cycles() -> u64 {
         v
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    { 0 }
+    {
+        0
+    }
 }
 
 /// Cycle-counter frequency in ticks per microsecond.
@@ -83,7 +85,9 @@ fn cycles_per_us() -> u64 {
     3000
 }
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn cycles_per_us() -> u64 { 1 }
+fn cycles_per_us() -> u64 {
+    1
+}
 
 /// Stage identifier. Indexes into `TOTAL` / `WORST`.
 #[derive(Clone, Copy)]
@@ -139,16 +143,30 @@ const STAGE_NAMES: [&[u8]; N_STAGES] = [
 // matching slot; `handshakes` counts completed handshakes so the
 // formatter can compute the mean.
 static TOTAL: [AtomicU64; N_STAGES] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 static WORST: [AtomicU64; N_STAGES] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 static HANDSHAKES: AtomicU64 = AtomicU64::new(0);
 
@@ -177,9 +195,7 @@ pub fn mark(stage: Stage, prev: u64) -> u64 {
     // cross-core writes is the number of cores.
     let mut cur = WORST[idx].load(Ordering::Relaxed);
     while delta > cur {
-        match WORST[idx].compare_exchange_weak(
-            cur, delta, Ordering::Relaxed, Ordering::Relaxed,
-        ) {
+        match WORST[idx].compare_exchange_weak(cur, delta, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(observed) => cur = observed,
         }
@@ -262,8 +278,7 @@ pub fn report(out: &mut [u8]) -> usize {
     }
     w.puts(b"total       ");
     if n_hs > 0 {
-        let mean_total_ns =
-            (grand_total.saturating_mul(1000) / n_hs) / cyc_per_us;
+        let mean_total_ns = (grand_total.saturating_mul(1000) / n_hs) / cyc_per_us;
         w.put_u64(mean_total_ns / 1000);
         w.puts(b".");
         let frac = mean_total_ns % 1000;

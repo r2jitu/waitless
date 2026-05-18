@@ -55,7 +55,9 @@ UDP_PORT = int(os.environ.get("TEST_UDP_PORT", 18007))
 TCP_ECHO_PORT = int(os.environ.get("TEST_TCP_ECHO_PORT", 18009))
 
 
-def _launcher_env(port: int, tls_port: int, udp_port: int, tcp_echo_port: int) -> dict[str, str]:
+def _launcher_env(
+    port: int, tls_port: int, udp_port: int, tcp_echo_port: int
+) -> dict[str, str]:
     """Env vars spanning every launcher variant.
 
     Name convention is `UNIKERNEL_<PROTO>_<GUEST>` — derived from
@@ -80,6 +82,7 @@ def _launcher_env(port: int, tls_port: int, udp_port: int, tcp_echo_port: int) -
         "UNIKERNEL_UDP_7": str(udp_port),
         "UNIKERNEL_TCP_9": str(tcp_echo_port),
     }
+
 
 if not (LAUNCHER.is_file() and os.access(LAUNCHER, os.X_OK)):
     sys.exit(f"ERROR: launcher missing / not executable: {LAUNCHER}")
@@ -134,23 +137,33 @@ class WebserverServiceTest(unittest.TestCase):
     # mis-encrypted, or a content-length disagreement would all
     # surface here as a body-size or boundary mismatch.
     SHELL_PAGES: tuple[tuple[str, str, str], ...] = (
-        ("/",             "Home",          "/\" class=\"active\""),
-        ("/architecture", "Architecture",  "/architecture\" class=\"active\""),
-        ("/network",      "Network",       "/network\" class=\"active\""),
-        ("/tls",          "TLS",           "/tls\" class=\"active\""),
-        ("/quic",         "QUIC",          "/quic\" class=\"active\""),
-        ("/diagnostics",  "Diagnostics",   "/diagnostics\" class=\"active\""),
+        ("/", "Home", '/" class="active"'),
+        ("/architecture", "Architecture", '/architecture" class="active"'),
+        ("/network", "Network", '/network" class="active"'),
+        ("/tls", "TLS", '/tls" class="active"'),
+        ("/quic", "QUIC", '/quic" class="active"'),
+        ("/diagnostics", "Diagnostics", '/diagnostics" class="active"'),
     )
 
     def _assert_full_html(self, body: bytes, title: str, active_marker: str) -> None:
-        self.assertTrue(body.startswith(b"<!DOCTYPE html>"),
-                        f"body doesn't start with doctype: {body[:40]!r}")
-        self.assertTrue(body.rstrip().endswith(b"</html>"),
-                        f"body doesn't end with </html>: ...{body[-60:]!r}")
-        self.assertIn(f"<title>{title} — UniKernel</title>".encode(), body,
-                      f"title missing for {title!r}")
-        self.assertIn(active_marker.encode(), body,
-                      f"active nav marker missing for {active_marker!r}")
+        self.assertTrue(
+            body.startswith(b"<!DOCTYPE html>"),
+            f"body doesn't start with doctype: {body[:40]!r}",
+        )
+        self.assertTrue(
+            body.rstrip().endswith(b"</html>"),
+            f"body doesn't end with </html>: ...{body[-60:]!r}",
+        )
+        self.assertIn(
+            f"<title>{title} — UniKernel</title>".encode(),
+            body,
+            f"title missing for {title!r}",
+        )
+        self.assertIn(
+            active_marker.encode(),
+            body,
+            f"active nav marker missing for {active_marker!r}",
+        )
         # Sanity floor: shell + nav + STYLES + page body is always
         # ≥ 5 KiB. A truncated multi-part body (chunk dropped mid-
         # response) typically lands well below this.
@@ -165,7 +178,7 @@ class WebserverServiceTest(unittest.TestCase):
             self.skipTest("dev_cert.pem missing from runfiles")
         status, body = https_get("/", port=TLS_PORT, ca_file=DEV_CERT)
         self.assertEqual(status, 200)
-        self._assert_full_html(body, "Home", "/\" class=\"active\"")
+        self._assert_full_html(body, "Home", '/" class="active"')
 
     def test_https_all_shell_pages(self) -> None:
         """Walk every page that goes through `shell_body`. Each
@@ -213,7 +226,8 @@ class WebserverServiceTest(unittest.TestCase):
         try:
             with ctx.wrap_socket(sock, server_hostname="unikernel.local") as ssock:
                 self.assertEqual(
-                    ssock.selected_alpn_protocol(), "http/1.1",
+                    ssock.selected_alpn_protocol(),
+                    "http/1.1",
                     "server didn't echo http/1.1 ALPN — "
                     "Chrome will reject this with ERR_SSL_PROTOCOL_ERROR",
                 )
@@ -240,12 +254,15 @@ class WebserverServiceTest(unittest.TestCase):
         if not DEV_CERT.is_file():
             self.skipTest("dev_cert.pem missing from runfiles")
         first_was_fresh, second_was_resumed = https_session_resume_check(
-            port=TLS_PORT, ca_file=DEV_CERT,
+            port=TLS_PORT,
+            ca_file=DEV_CERT,
         )
-        self.assertTrue(first_was_fresh,
-                        "first handshake should be fresh (no cached session)")
-        self.assertTrue(second_was_resumed,
-                        "second handshake should reuse the ticket from #1")
+        self.assertTrue(
+            first_was_fresh, "first handshake should be fresh (no cached session)"
+        )
+        self.assertTrue(
+            second_was_resumed, "second handshake should reuse the ticket from #1"
+        )
 
     # ── HTTP/3 over QUIC ─────────────────────────────────────────
     def test_h3_health(self) -> None:
@@ -346,7 +363,9 @@ class WebserverServiceTest(unittest.TestCase):
         failures = []
         for i in range(n):
             try:
-                status, body = https_get("/diagnostics", port=TLS_PORT, ca_file=DEV_CERT)
+                status, body = https_get(
+                    "/diagnostics", port=TLS_PORT, ca_file=DEV_CERT
+                )
                 if status != 200:
                     failures.append(f"#{i}: status={status}")
                 elif not body.startswith(b"<!DOCTYPE html>"):
@@ -372,8 +391,8 @@ class WebserverServiceTest(unittest.TestCase):
     def _skip_unless_v6_bridge(self) -> None:
         if "hvf" not in LAUNCHER_NAME:
             self.skipTest(
-                "v6 host bridge is HVF-runner only; "
-                f"current launcher={LAUNCHER_NAME}")
+                f"v6 host bridge is HVF-runner only; current launcher={LAUNCHER_NAME}"
+            )
 
     def test_http_health_v6(self) -> None:
         self._skip_unless_v6_bridge()
@@ -387,8 +406,7 @@ class WebserverServiceTest(unittest.TestCase):
         # transport — the verified-cert path is already covered by
         # `test_https_health` over `127.0.0.1`.
         self._skip_unless_v6_bridge()
-        status, body = https_get("/health", host="::1", port=TLS_PORT,
-                                 ca_file=None)
+        status, body = https_get("/health", host="::1", port=TLS_PORT, ca_file=None)
         self.assertEqual(status, 200)
         self.assertIn(b"status", body)
 
@@ -407,7 +425,7 @@ class WebserverServiceTest(unittest.TestCase):
         self._skip_unless_v6_bridge()
         status, body = https_get("/", host="::1", port=TLS_PORT, ca_file=None)
         self.assertEqual(status, 200)
-        self._assert_full_html(body, "Home", "/\" class=\"active\"")
+        self._assert_full_html(body, "Home", '/" class="active"')
 
     def test_udp_echo_v6(self) -> None:
         self._skip_unless_v6_bridge()
@@ -440,8 +458,11 @@ class WebserverServiceTest(unittest.TestCase):
         this assertion specifically guards the *app-visible* surface.
         """
         log = self.launcher.log_path.read_bytes()
-        self.assertIn(b"app: ram=", log,
-                      f"app boot_info line missing from serial log (length={len(log)})")
+        self.assertIn(
+            b"app: ram=",
+            log,
+            f"app boot_info line missing from serial log (length={len(log)})",
+        )
         self.assertIn(b"cpus=", log)
 
 
@@ -455,9 +476,14 @@ class WebserverShutdownTest(unittest.TestCase):
     funnel into the same 0x03 → PSCI/ACPI shutdown path in the guest.
     """
 
-    def _run_shutdown_scenario(self, *, port_offset: int, hammer: bool,
-                                h3_hammer: bool = False,
-                                h3_persistent: bool = False):
+    def _run_shutdown_scenario(
+        self,
+        *,
+        port_offset: int,
+        hammer: bool,
+        h3_hammer: bool = False,
+        h3_persistent: bool = False,
+    ):
         """Boot, optionally hammer HTTP and/or HTTP/3, send ^C, wait for VM
         exit. Returns the captured serial buffer for further assertions."""
         port = PORT + port_offset
@@ -477,14 +503,23 @@ class WebserverShutdownTest(unittest.TestCase):
             )
 
             if hammer:
+
                 def _hammer() -> None:
                     while not stop_hammer[0]:
                         subprocess.run(
-                            ["curl", "-s", "--max-time", "1",
-                             f"http://127.0.0.1:{port}/health"],
+                            [
+                                "curl",
+                                "-s",
+                                "--max-time",
+                                "1",
+                                f"http://127.0.0.1:{port}/health",
+                            ],
                             capture_output=True,
                         )
-                workers = [threading.Thread(target=_hammer, daemon=True) for _ in range(3)]
+
+                workers = [
+                    threading.Thread(target=_hammer, daemon=True) for _ in range(3)
+                ]
                 for w in workers:
                     w.start()
             if h3_hammer:
@@ -502,9 +537,9 @@ class WebserverShutdownTest(unittest.TestCase):
                             h3_get("/health", port=tls_port, timeout=2.0)
                         except Exception:
                             pass
+
                 workers_h3 = [
-                    threading.Thread(target=_h3_hammer, daemon=True)
-                    for _ in range(8)
+                    threading.Thread(target=_h3_hammer, daemon=True) for _ in range(8)
                 ]
                 for w in workers_h3:
                     w.start()
@@ -534,32 +569,46 @@ class WebserverShutdownTest(unittest.TestCase):
                             def __init__(self, *a, **kw):
                                 super().__init__(*a, **kw)
                                 self.h3 = H3Connection(self._quic)
+
                             def quic_event_received(self, event):
-                                for _ in self.h3.handle_event(event): pass
+                                for _ in self.h3.handle_event(event):
+                                    pass
 
                         async def go() -> None:
-                            cfg = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
+                            cfg = QuicConfiguration(
+                                is_client=True, alpn_protocols=H3_ALPN
+                            )
                             cfg.verify_mode = False
                             cfg.idle_timeout = 60
                             async with aclient.connect(
-                                "127.0.0.1", tls_port,
+                                "127.0.0.1",
+                                tls_port,
                                 configuration=cfg,
                                 create_protocol=P,
                                 wait_connected=True,
                             ) as c:
                                 while not stop_hammer[0]:
                                     sid = c._quic.get_next_available_stream_id()
-                                    c.h3.send_headers(stream_id=sid, headers=[
-                                        (b":method", b"GET"),
-                                        (b":scheme", b"https"),
-                                        (b":authority", f"127.0.0.1:{tls_port}".encode()),
-                                        (b":path", b"/diagnostics")],
-                                        end_stream=True)
+                                    c.h3.send_headers(
+                                        stream_id=sid,
+                                        headers=[
+                                            (b":method", b"GET"),
+                                            (b":scheme", b"https"),
+                                            (
+                                                b":authority",
+                                                f"127.0.0.1:{tls_port}".encode(),
+                                            ),
+                                            (b":path", b"/diagnostics"),
+                                        ],
+                                        end_stream=True,
+                                    )
                                     c.transmit()
                                     await asyncio.sleep(0.5)
+
                         asyncio.run(go())
                     except Exception:
                         pass
+
                 persistent_thread = threading.Thread(target=_persistent, daemon=True)
                 persistent_thread.start()
             # Longer dwell when h3-hammering so the test exercises
@@ -591,11 +640,13 @@ class WebserverShutdownTest(unittest.TestCase):
             None,
         )
         self.assertIsNotNone(
-            leak_line, "no HEAP_LEAK_CHECK line in serial log",
+            leak_line,
+            "no HEAP_LEAK_CHECK line in serial log",
         )
         print(f"    {leak_line.decode(errors='replace')}", flush=True)
         self.assertNotIn(
-            b"HEAP_LEAK_CHECK LEAK", leak_line,
+            b"HEAP_LEAK_CHECK LEAK",
+            leak_line,
             "active-traffic shutdown leaked memory — "
             "drain_all_arenas didn't reclaim in-flight task storage",
         )
@@ -629,18 +680,22 @@ class WebserverShutdownTest(unittest.TestCase):
         except ImportError:
             self.skipTest("aioquic not installed")
         buf = self._run_shutdown_scenario(
-            port_offset=300, hammer=False, h3_hammer=True,
+            port_offset=300,
+            hammer=False,
+            h3_hammer=True,
         )
         leak_line = next(
             (line for line in buf.splitlines() if b"HEAP_LEAK_CHECK" in line),
             None,
         )
         self.assertIsNotNone(
-            leak_line, "no HEAP_LEAK_CHECK line in serial log",
+            leak_line,
+            "no HEAP_LEAK_CHECK line in serial log",
         )
         print(f"    {leak_line.decode(errors='replace')}", flush=True)
         self.assertNotIn(
-            b"HEAP_LEAK_CHECK LEAK", leak_line,
+            b"HEAP_LEAK_CHECK LEAK",
+            leak_line,
             "H3-hammer leaked memory — per-conn cleanup regression "
             f"({leak_line.decode(errors='replace')})",
         )
@@ -679,18 +734,22 @@ class WebserverShutdownTest(unittest.TestCase):
         except ImportError:
             self.skipTest("aioquic not installed")
         buf = self._run_shutdown_scenario(
-            port_offset=400, hammer=False, h3_persistent=True,
+            port_offset=400,
+            hammer=False,
+            h3_persistent=True,
         )
         leak_line = next(
             (line for line in buf.splitlines() if b"HEAP_LEAK_CHECK" in line),
             None,
         )
         self.assertIsNotNone(
-            leak_line, "no HEAP_LEAK_CHECK line in serial log",
+            leak_line,
+            "no HEAP_LEAK_CHECK line in serial log",
         )
         print(f"    {leak_line.decode(errors='replace')}", flush=True)
         self.assertNotIn(
-            b"HEAP_LEAK_CHECK LEAK", leak_line,
+            b"HEAP_LEAK_CHECK LEAK",
+            leak_line,
             "H3-persistent leaked memory — Connection didn't drop "
             f"on force-shutdown ({leak_line.decode(errors='replace')})",
         )
@@ -713,7 +772,8 @@ class WebserverShutdownTest(unittest.TestCase):
         )
         print(f"    {leak_line.decode(errors='replace')}", flush=True)
         self.assertNotIn(
-            b"HEAP_LEAK_CHECK LEAK", leak_line,
+            b"HEAP_LEAK_CHECK LEAK",
+            leak_line,
             "idle-shutdown leaked memory — listener teardown regressed",
         )
 
@@ -769,9 +829,11 @@ class WebserverShutdownTest(unittest.TestCase):
             # `shutdown_and_drop`, and a full pty buffer would
             # block those writes (preventing the RST sweep).
             stop_drain = [False]
+
             def _drain_loop() -> None:
                 while not stop_drain[0]:
                     pty_launcher.drain(0.05)
+
             drainer = threading.Thread(target=_drain_loop, daemon=True)
             drainer.start()
 
@@ -785,7 +847,8 @@ class WebserverShutdownTest(unittest.TestCase):
                 tail = s.recv(4096)
                 # `0` bytes = peer FINed cleanly (native).
                 self.assertEqual(
-                    tail, b"",
+                    tail,
+                    b"",
                     f"unexpected post-shutdown payload: {tail[:80]!r}",
                 )
                 close_kind = "FIN"
@@ -795,10 +858,13 @@ class WebserverShutdownTest(unittest.TestCase):
                 stop_drain[0] = True
                 drainer.join(timeout=1.0)
             elapsed = time.monotonic() - t0
-            print(f"    (peer observed {close_kind} in {elapsed*1000:.0f} ms)",
-                  flush=True)
+            print(
+                f"    (peer observed {close_kind} in {elapsed * 1000:.0f} ms)",
+                flush=True,
+            )
             self.assertLess(
-                elapsed, 2.0,
+                elapsed,
+                2.0,
                 f"close took {elapsed:.1f}s — keepalive-timeout shape, "
                 "shutdown isn't closing conns",
             )

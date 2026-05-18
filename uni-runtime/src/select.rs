@@ -172,4 +172,3 @@ where
         Either::Right(()) => None,
     }
 }
-

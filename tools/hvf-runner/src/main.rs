@@ -22,10 +22,10 @@ mod decoder;
 mod fdt;
 mod hvf;
 mod terminal;
+mod userspace_net;
 mod virtio;
 mod virtio_console;
 mod vm;
-mod userspace_net;
 
 use userspace_net::{PortMapping, Proto};
 
@@ -52,15 +52,27 @@ fn usage(prog: &str) {
 fn parse_port_mapping(spec: &str) -> Result<PortMapping, String> {
     let mut parts = spec.splitn(3, ':');
     let proto_s = parts.next().ok_or_else(|| format!("empty mapping"))?;
-    let host_s = parts.next().ok_or_else(|| format!("missing host port in '{spec}'"))?;
-    let guest_s = parts.next().ok_or_else(|| format!("missing guest port in '{spec}'"))?;
+    let host_s = parts
+        .next()
+        .ok_or_else(|| format!("missing host port in '{spec}'"))?;
+    let guest_s = parts
+        .next()
+        .ok_or_else(|| format!("missing guest port in '{spec}'"))?;
     let proto = match proto_s {
         "tcp" => Proto::Tcp,
         "udp" => Proto::Udp,
-        other => return Err(format!("unknown proto '{other}' in '{spec}' (want tcp or udp)")),
+        other => {
+            return Err(format!(
+                "unknown proto '{other}' in '{spec}' (want tcp or udp)"
+            ));
+        }
     };
-    let host: u16 = host_s.parse().map_err(|_| format!("bad host port '{host_s}'"))?;
-    let guest: u16 = guest_s.parse().map_err(|_| format!("bad guest port '{guest_s}'"))?;
+    let host: u16 = host_s
+        .parse()
+        .map_err(|_| format!("bad host port '{host_s}'"))?;
+    let guest: u16 = guest_s
+        .parse()
+        .map_err(|_| format!("bad guest port '{guest_s}'"))?;
     Ok(PortMapping { proto, host, guest })
 }
 
@@ -102,7 +114,9 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             bootargs = v.to_string();
         } else if a == "-p" {
             i += 1;
-            let v = argv.get(i).ok_or_else(|| "-p expects a value".to_string())?;
+            let v = argv
+                .get(i)
+                .ok_or_else(|| "-p expects a value".to_string())?;
             mappings.push(parse_port_mapping(v)?);
         } else if let Some(v) = a.strip_prefix("-p=") {
             mappings.push(parse_port_mapping(v)?);
@@ -120,11 +134,25 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
 
     // Default port forwards if none given: HTTP on 8080→80 and UDP echo on 18080→7.
     if mappings.is_empty() {
-        mappings.push(PortMapping { proto: Proto::Tcp, host: 8080, guest: 80 });
-        mappings.push(PortMapping { proto: Proto::Udp, host: 18080, guest: 7 });
+        mappings.push(PortMapping {
+            proto: Proto::Tcp,
+            host: 8080,
+            guest: 80,
+        });
+        mappings.push(PortMapping {
+            proto: Proto::Udp,
+            host: 18080,
+            guest: 7,
+        });
     }
 
-    Ok(Args { kernel_path, ram_mib, cpu_count, mappings, bootargs })
+    Ok(Args {
+        kernel_path,
+        ram_mib,
+        cpu_count,
+        mappings,
+        bootargs,
+    })
 }
 
 fn main() {
@@ -192,7 +220,10 @@ fn main() {
         }
     });
 
-    eprintln!("==> HVF runner: booting {} ({} MB RAM)", parsed.kernel_path, parsed.ram_mib);
+    eprintln!(
+        "==> HVF runner: booting {} ({} MB RAM)",
+        parsed.kernel_path, parsed.ram_mib
+    );
 
     // Start userspace networking (no vmnet, no root required).
     let vmnet_mac = match userspace_net::start(&parsed.mappings, parsed.cpu_count) {
@@ -204,7 +235,13 @@ fn main() {
     };
 
     // Create and run the VM.
-    let mut vm = match vm::Vm::new_with_config(&parsed.kernel_path, parsed.ram_mib, parsed.cpu_count, vmnet_mac, &parsed.bootargs) {
+    let mut vm = match vm::Vm::new_with_config(
+        &parsed.kernel_path,
+        parsed.ram_mib,
+        parsed.cpu_count,
+        vmnet_mac,
+        &parsed.bootargs,
+    ) {
         Ok(vm) => vm,
         Err(e) => {
             terminal::restore();
@@ -246,5 +283,8 @@ fn os_version() -> u32 {
         return 0;
     }
     let s = std::str::from_utf8(&buf[..len.saturating_sub(1)]).unwrap_or("");
-    s.split('.').next().and_then(|v| v.parse().ok()).unwrap_or(0)
+    s.split('.')
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }

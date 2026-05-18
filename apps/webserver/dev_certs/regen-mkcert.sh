@@ -61,16 +61,16 @@ trap 'rm -rf "$TMP"' EXIT
     cd "$TMP"
     mkcert -ecdsa \
         -cert-file dev_cert.pem \
-        -key-file  dev_key.pem  \
+        -key-file dev_key.pem \
         "${SANS[@]}"
 )
 
 cp "$TMP/dev_cert.pem" dev_cert.pem
-cp "$TMP/dev_key.pem"  dev_key.pem
+cp "$TMP/dev_key.pem" dev_key.pem
 
 echo "==> Exporting DER forms..."
-openssl pkey  -in dev_key.pem  -outform DER -out dev_key.der
-openssl x509  -in dev_cert.pem -outform DER -out dev_cert.der
+openssl pkey -in dev_key.pem -outform DER -out dev_key.der
+openssl x509 -in dev_cert.pem -outform DER -out dev_cert.der
 
 echo
 echo "Files:"

@@ -15,24 +15,24 @@
 
 #![no_std]
 
+extern crate net_arp as arp;
+extern crate net_ethernet as ethernet;
+extern crate net_from_bytes as from_bytes;
+extern crate net_ipv4 as ipv4;
+extern crate net_types as types;
 extern crate uni_kernel;
 extern crate uni_runtime;
-extern crate net_from_bytes as from_bytes;
-extern crate net_types as types;
-extern crate net_ethernet as ethernet;
-extern crate net_arp as arp;
-extern crate net_ipv4 as ipv4;
 
 mod dhcp_parse;
 
+use arp::arp_announce;
+use ethernet::ethernet_our_mac;
 use from_bytes::FromBytes;
+use types::{CONFIG, Ipv4Addr, htonl, htons};
 use uni_kernel::sync::Spinlock;
 use uni_runtime::event::AsyncEvent;
 use uni_runtime::net::UdpSocket;
 use uni_runtime::select::timeout_us;
-use types::{Ipv4Addr, CONFIG, htons, htonl};
-use ethernet::ethernet_our_mac;
-use arp::arp_announce;
 
 /// Fixed DHCP/BOOTP header. 236 bytes + 4-byte magic cookie = 240
 /// bytes. Options follow.
@@ -130,8 +130,7 @@ fn handle_reply(_src_ip: types::IpAddr, src_port: u16, payload: &[u8]) {
         Some(a) => a,
         None => return,
     };
-    let to_addr =
-        |o: [u8; 4]| Ipv4Addr::from(o[0], o[1], o[2], o[3]);
+    let to_addr = |o: [u8; 4]| Ipv4Addr::from(o[0], o[1], o[2], o[3]);
     let yiaddr = to_addr(yiaddr_bytes);
     let parsed = dhcp_parse::parse_options(&payload[240..]);
 
@@ -148,9 +147,15 @@ fn handle_reply(_src_ip: types::IpAddr, src_port: u16, payload: &[u8]) {
             }
             dhcp_parse::MSG_ACK => {
                 state.offered_ip = yiaddr;
-                if let Some(s) = parsed.subnet { state.offered_subnet = to_addr(s); }
-                if let Some(g) = parsed.gateway { state.offered_gateway = to_addr(g); }
-                if let Some(d) = parsed.dns { state.offered_dns = to_addr(d); }
+                if let Some(s) = parsed.subnet {
+                    state.offered_subnet = to_addr(s);
+                }
+                if let Some(g) = parsed.gateway {
+                    state.offered_gateway = to_addr(g);
+                }
+                if let Some(d) = parsed.dns {
+                    state.offered_dns = to_addr(d);
+                }
             }
             // NAK explicitly ignored — no state update, no event
             // set. Phase 2's timeout fires and `discover()` reports
@@ -206,8 +211,14 @@ fn build_payload(tail: &[u8], buf: &mut [u8]) -> usize {
 
 fn build_discover(buf: &mut [u8]) -> usize {
     let tail: [u8; 9] = [
-        53, 1, DHCP_DISCOVER,
-        55, 3, 1, 3, 6,  // param request list: subnet, router, DNS
+        53,
+        1,
+        DHCP_DISCOVER,
+        55,
+        3,
+        1,
+        3,
+        6, // param request list: subnet, router, DNS
         255,
     ];
     build_payload(&tail, buf)
@@ -219,12 +230,20 @@ fn build_request(buf: &mut [u8]) -> usize {
         (s.offered_ip.octets(), s.server_ip.octets())
     };
     let mut tail = [0u8; 21];
-    tail[0] = 53; tail[1] = 1; tail[2] = DHCP_REQUEST;
-    tail[3] = 50; tail[4] = 4;
+    tail[0] = 53;
+    tail[1] = 1;
+    tail[2] = DHCP_REQUEST;
+    tail[3] = 50;
+    tail[4] = 4;
     tail[5..9].copy_from_slice(&offered_ip);
-    tail[9] = 54; tail[10] = 4;
+    tail[9] = 54;
+    tail[10] = 4;
     tail[11..15].copy_from_slice(&server_ip);
-    tail[15] = 55; tail[16] = 3; tail[17] = 1; tail[18] = 3; tail[19] = 6;
+    tail[15] = 55;
+    tail[16] = 3;
+    tail[17] = 1;
+    tail[18] = 3;
+    tail[19] = 6;
     tail[20] = 255;
     build_payload(&tail, buf)
 }
@@ -302,12 +321,23 @@ pub async fn discover() -> bool {
         let mut msg = *b"dhcp: configured IP xxx.xxx.xxx.xxx\n";
         let mut pos = 20;
         for (idx, &b) in o.iter().enumerate() {
-            if b >= 100 { msg[pos] = b'0' + b / 100; pos += 1; }
-            if b >= 10 { msg[pos] = b'0' + (b / 10) % 10; pos += 1; }
-            msg[pos] = b'0' + b % 10; pos += 1;
-            if idx < 3 { msg[pos] = b'.'; pos += 1; }
+            if b >= 100 {
+                msg[pos] = b'0' + b / 100;
+                pos += 1;
+            }
+            if b >= 10 {
+                msg[pos] = b'0' + (b / 10) % 10;
+                pos += 1;
+            }
+            msg[pos] = b'0' + b % 10;
+            pos += 1;
+            if idx < 3 {
+                msg[pos] = b'.';
+                pos += 1;
+            }
         }
-        msg[pos] = b'\n'; pos += 1;
+        msg[pos] = b'\n';
+        pos += 1;
         uni_kernel::serial::puts(&msg[..pos]);
     }
 
@@ -319,10 +349,22 @@ pub async fn discover() -> bool {
 /// Set fallback network config (called from `bringup_static` when
 /// the app opts out of DHCP, or from a failure-retry path).
 pub fn set_fallback_config(
-    ip_a: u8, ip_b: u8, ip_c: u8, ip_d: u8,
-    mask_a: u8, mask_b: u8, mask_c: u8, mask_d: u8,
-    gw_a: u8, gw_b: u8, gw_c: u8, gw_d: u8,
-    dns_a: u8, dns_b: u8, dns_c: u8, dns_d: u8,
+    ip_a: u8,
+    ip_b: u8,
+    ip_c: u8,
+    ip_d: u8,
+    mask_a: u8,
+    mask_b: u8,
+    mask_c: u8,
+    mask_d: u8,
+    gw_a: u8,
+    gw_b: u8,
+    gw_c: u8,
+    gw_d: u8,
+    dns_a: u8,
+    dns_b: u8,
+    dns_c: u8,
+    dns_d: u8,
 ) {
     CONFIG.store(types::NetConfig {
         ip: Ipv4Addr::from(ip_a, ip_b, ip_c, ip_d),

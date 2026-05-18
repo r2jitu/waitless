@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
+use rustls::ClientConfig;
 use rustls::client::Resumption;
 use rustls::pki_types::ServerName;
-use rustls::ClientConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Barrier;
@@ -56,7 +56,12 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerify {
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         use rustls::SignatureScheme::*;
-        vec![ECDSA_NISTP256_SHA256, ED25519, RSA_PSS_SHA256, RSA_PKCS1_SHA256]
+        vec![
+            ECDSA_NISTP256_SHA256,
+            ED25519,
+            RSA_PSS_SHA256,
+            RSA_PKCS1_SHA256,
+        ]
     }
 }
 
@@ -122,27 +127,50 @@ pub async fn run(
             let result = if let Some((connector, server_name)) = tls_setup {
                 let tcp = match TcpStream::connect((&*host, port)).await {
                     Ok(s) => s,
-                    Err(_) => { barrier.wait().await; return (0u64, hist); }
+                    Err(_) => {
+                        barrier.wait().await;
+                        return (0u64, hist);
+                    }
                 };
                 let _ = tcp.set_nodelay(true);
                 let stream = match connector.connect(server_name.clone(), tcp).await {
                     Ok(s) => s,
-                    Err(_) => { barrier.wait().await; return (0u64, hist); }
+                    Err(_) => {
+                        barrier.wait().await;
+                        return (0u64, hist);
+                    }
                 };
                 barrier.wait().await;
                 let deadline = Instant::now() + duration;
-                run_loop(stream, &request, deadline, sample_latency,
-                         &mut hist, &mut count).await
+                run_loop(
+                    stream,
+                    &request,
+                    deadline,
+                    sample_latency,
+                    &mut hist,
+                    &mut count,
+                )
+                .await
             } else {
                 let tcp = match TcpStream::connect((&*host, port)).await {
                     Ok(s) => s,
-                    Err(_) => { barrier.wait().await; return (0u64, hist); }
+                    Err(_) => {
+                        barrier.wait().await;
+                        return (0u64, hist);
+                    }
                 };
                 let _ = tcp.set_nodelay(true);
                 barrier.wait().await;
                 let deadline = Instant::now() + duration;
-                run_loop(tcp, &request, deadline, sample_latency,
-                         &mut hist, &mut count).await
+                run_loop(
+                    tcp,
+                    &request,
+                    deadline,
+                    sample_latency,
+                    &mut hist,
+                    &mut count,
+                )
+                .await
             };
             let _ = result;
             (count, hist)
@@ -183,7 +211,11 @@ where
 {
     let mut buf = vec![0u8; 1024];
     while Instant::now() < deadline {
-        let t0 = if sample_latency { Some(Instant::now()) } else { None };
+        let t0 = if sample_latency {
+            Some(Instant::now())
+        } else {
+            None
+        };
         if stream.write_all(request).await.is_err() {
             return false;
         }
@@ -254,7 +286,9 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
     let nl = needle.len();
     let mut i = 0;
     while i + nl <= n {
-        let matches = headers[i..i + nl].iter().zip(needle.iter())
+        let matches = headers[i..i + nl]
+            .iter()
+            .zip(needle.iter())
             .all(|(a, b)| a.eq_ignore_ascii_case(b));
         if matches {
             let rest = &headers[i + nl..];

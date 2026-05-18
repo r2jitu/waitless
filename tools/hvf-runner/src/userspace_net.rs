@@ -60,8 +60,8 @@
 // comment inline.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crate::hvf;
 use crate::virtio;
@@ -80,10 +80,22 @@ const BROADCAST_IP: [u8; 4] = [255, 255, 255, 255];
 /// echo ICMPv6 pings, so the kernel-side IPv6 stack can be
 /// exercised without a full v6 NAT bring-up.
 const GW_IPV6: [u8; 16] = [
-    0xfe, 0x80, 0, 0, 0, 0, 0, 0,
-    GW_MAC[0] ^ 0x02, GW_MAC[1], GW_MAC[2],
-    0xff, 0xfe,
-    GW_MAC[3], GW_MAC[4], GW_MAC[5],
+    0xfe,
+    0x80,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    GW_MAC[0] ^ 0x02,
+    GW_MAC[1],
+    GW_MAC[2],
+    0xff,
+    0xfe,
+    GW_MAC[3],
+    GW_MAC[4],
+    GW_MAC[5],
 ];
 
 /// Protocol for a user-specified port forward.
@@ -258,7 +270,10 @@ fn make_wake_pipe() -> Result<WakePipe, String> {
         libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK);
         libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
     }
-    Ok(WakePipe { read_fd: fds[0], write_fd: fds[1] })
+    Ok(WakePipe {
+        read_fd: fds[0],
+        write_fd: fds[1],
+    })
 }
 
 /// Doorbell every registered vCPU. Used by the stdin reader thread
@@ -270,7 +285,9 @@ pub fn wake_all_vcpus() {
     if let Some(pipes) = VCPU_WAKE_PIPES.get() {
         let buf = [0u8; 1];
         for p in pipes {
-            unsafe { libc::write(p.write_fd, buf.as_ptr() as *const _, 1); }
+            unsafe {
+                libc::write(p.write_fd, buf.as_ptr() as *const _, 1);
+            }
         }
         for i in 0..pipes.len() {
             crate::vm::wake_vcpu(i);
@@ -393,7 +410,7 @@ impl IpAddrPair {
                 buf[2..4].copy_from_slice(&ip_total.to_be_bytes());
                 buf[4..8].copy_from_slice(&[0, 0, 0x40, 0]);
                 buf[8] = 64; // TTL
-                buf[9] = 6;  // protocol = TCP
+                buf[9] = 6; // protocol = TCP
                 buf[10..12].fill(0); // checksum placeholder
                 buf[12..16].copy_from_slice(&src);
                 buf[16..20].copy_from_slice(&dst);
@@ -404,7 +421,7 @@ impl IpAddrPair {
             IpAddrPair::V6 { src, dst } => {
                 buf[..4].copy_from_slice(&0x6000_0000u32.to_be_bytes());
                 buf[4..6].copy_from_slice(&(tcp_len as u16).to_be_bytes());
-                buf[6] = 6;  // next_header = TCP
+                buf[6] = 6; // next_header = TCP
                 buf[7] = 64; // hop limit
                 buf[8..24].copy_from_slice(&src);
                 buf[24..40].copy_from_slice(&dst);
@@ -486,15 +503,27 @@ struct OutboundUdp {
 fn bind_listen(host_port: u16) -> Result<i32, String> {
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
-        if fd < 0 { return Err(format!("tcp socket(): {}", std::io::Error::last_os_error())); }
+        if fd < 0 {
+            return Err(format!("tcp socket(): {}", std::io::Error::last_os_error()));
+        }
         let one: i32 = 1;
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
-                         &one as *const _ as *const _, 4);
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &one as *const _ as *const _,
+            4,
+        );
         let mut addr: libc::sockaddr_in = std::mem::zeroed();
         addr.sin_family = libc::AF_INET as u8;
         addr.sin_port = host_port.to_be();
         addr.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
-        if libc::bind(fd, &addr as *const _ as *const _, std::mem::size_of_val(&addr) as u32) < 0 {
+        if libc::bind(
+            fd,
+            &addr as *const _ as *const _,
+            std::mem::size_of_val(&addr) as u32,
+        ) < 0
+        {
             let e = std::io::Error::last_os_error();
             libc::close(fd);
             return Err(format!("tcp bind({host_port}): {e}"));
@@ -521,13 +550,26 @@ fn bind_listen_v6(host_port: u16) -> Result<i32, String> {
     unsafe {
         let fd = libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0);
         if fd < 0 {
-            return Err(format!("tcp v6 socket(): {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "tcp v6 socket(): {}",
+                std::io::Error::last_os_error()
+            ));
         }
         let one: i32 = 1;
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
-                         &one as *const _ as *const _, 4);
-        libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY,
-                         &one as *const _ as *const _, 4);
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &one as *const _ as *const _,
+            4,
+        );
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &one as *const _ as *const _,
+            4,
+        );
         let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
         addr.sin6_family = libc::AF_INET6 as u8;
         addr.sin6_port = host_port.to_be();
@@ -535,7 +577,12 @@ fn bind_listen_v6(host_port: u16) -> Result<i32, String> {
         // bind so non-loopback v6 traffic doesn't accidentally hit
         // the relay.
         addr.sin6_addr.s6_addr[15] = 1;
-        if libc::bind(fd, &addr as *const _ as *const _, std::mem::size_of_val(&addr) as u32) < 0 {
+        if libc::bind(
+            fd,
+            &addr as *const _ as *const _,
+            std::mem::size_of_val(&addr) as u32,
+        ) < 0
+        {
             let e = std::io::Error::last_os_error();
             libc::close(fd);
             return Err(format!("tcp v6 bind([::1]:{host_port}): {e}"));
@@ -554,23 +601,50 @@ fn bind_listen_v6(host_port: u16) -> Result<i32, String> {
 fn open_udp_sibling(host_port: u16) -> Result<i32, String> {
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
-        if fd < 0 { return Err(format!("udp socket(): {}", std::io::Error::last_os_error())); }
+        if fd < 0 {
+            return Err(format!("udp socket(): {}", std::io::Error::last_os_error()));
+        }
         let one: i32 = 1;
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
-                         &one as *const _ as *const _, 4);
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT,
-                         &one as *const _ as *const _, 4);
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &one as *const _ as *const _,
+            4,
+        );
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            &one as *const _ as *const _,
+            4,
+        );
         // Big buffers so bursty UDP doesn't drop at the host kernel.
         let bufsz: i32 = 16 * 1024 * 1024;
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
-                         &bufsz as *const _ as *const _, 4);
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
-                         &bufsz as *const _ as *const _, 4);
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &bufsz as *const _ as *const _,
+            4,
+        );
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &bufsz as *const _ as *const _,
+            4,
+        );
         let mut addr: libc::sockaddr_in = std::mem::zeroed();
         addr.sin_family = libc::AF_INET as u8;
         addr.sin_port = host_port.to_be();
         addr.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
-        if libc::bind(fd, &addr as *const _ as *const _, std::mem::size_of_val(&addr) as u32) < 0 {
+        if libc::bind(
+            fd,
+            &addr as *const _ as *const _,
+            std::mem::size_of_val(&addr) as u32,
+        ) < 0
+        {
             let e = std::io::Error::last_os_error();
             libc::close(fd);
             return Err(format!("udp bind({host_port}): {e}"));
@@ -589,20 +663,48 @@ fn open_udp_sibling_v6(host_port: u16) -> Result<i32, String> {
     unsafe {
         let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
         if fd < 0 {
-            return Err(format!("udp v6 socket(): {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "udp v6 socket(): {}",
+                std::io::Error::last_os_error()
+            ));
         }
         let one: i32 = 1;
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
-                         &one as *const _ as *const _, 4);
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT,
-                         &one as *const _ as *const _, 4);
-        libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY,
-                         &one as *const _ as *const _, 4);
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &one as *const _ as *const _,
+            4,
+        );
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            &one as *const _ as *const _,
+            4,
+        );
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &one as *const _ as *const _,
+            4,
+        );
         let bufsz: i32 = 16 * 1024 * 1024;
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
-                         &bufsz as *const _ as *const _, 4);
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
-                         &bufsz as *const _ as *const _, 4);
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &bufsz as *const _ as *const _,
+            4,
+        );
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &bufsz as *const _ as *const _,
+            4,
+        );
         let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
         addr.sin6_family = libc::AF_INET6 as u8;
         addr.sin6_port = host_port.to_be();
@@ -610,7 +712,12 @@ fn open_udp_sibling_v6(host_port: u16) -> Result<i32, String> {
         // accidentally hit the relay; mirrors the v4 `127.0.0.1`
         // bind. `s6_addr[15] = 1` is `::1`.
         addr.sin6_addr.s6_addr[15] = 1;
-        if libc::bind(fd, &addr as *const _ as *const _, std::mem::size_of_val(&addr) as u32) < 0 {
+        if libc::bind(
+            fd,
+            &addr as *const _ as *const _,
+            std::mem::size_of_val(&addr) as u32,
+        ) < 0
+        {
             let e = std::io::Error::last_os_error();
             libc::close(fd);
             return Err(format!("udp v6 bind([::1]:{host_port}): {e}"));
@@ -650,14 +757,20 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
         match m.proto {
             Proto::Tcp => {
                 let fd = bind_listen(m.host)?;
-                listens.push(TcpListen { fd, guest_port: m.guest, family: IpFamily::V4 });
+                listens.push(TcpListen {
+                    fd,
+                    guest_port: m.guest,
+                    family: IpFamily::V4,
+                });
                 // IPv6 sibling on the same host port — failure is
                 // non-fatal (e.g. ::1 not configured): we keep the
                 // v4 listener and the mapping just doesn't carry
                 // v6 traffic into the guest.
                 match bind_listen_v6(m.host) {
                     Ok(fd6) => listens.push(TcpListen {
-                        fd: fd6, guest_port: m.guest, family: IpFamily::V6,
+                        fd: fd6,
+                        guest_port: m.guest,
+                        family: IpFamily::V6,
                     }),
                     Err(e) => eprintln!("  warning: {e}"),
                 }
@@ -677,7 +790,10 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
                 match open_udp_sibling(m.host) {
                     Ok(fd) => {
                         let fds = vec![fd; cpu_count.max(1)];
-                        relay_table.push(UdpRelayFds { guest_port: m.guest, fds });
+                        relay_table.push(UdpRelayFds {
+                            guest_port: m.guest,
+                            fds,
+                        });
                     }
                     Err(e) => eprintln!("  warning: {e}"),
                 }
@@ -687,7 +803,10 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
                 match open_udp_sibling_v6(m.host) {
                     Ok(fd) => {
                         let fds = vec![fd; cpu_count.max(1)];
-                        relay_table_v6.push(UdpRelayFds { guest_port: m.guest, fds });
+                        relay_table_v6.push(UdpRelayFds {
+                            guest_port: m.guest,
+                            fds,
+                        });
                     }
                     Err(e) => eprintln!("  warning: {e}"),
                 }
@@ -759,7 +878,10 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
         eprintln!("  UDP relay:  localhost:{} -> guest:{}", m.host, m.guest);
     }
     if let Some(first_tcp) = mappings.iter().find(|m| m.proto == Proto::Tcp) {
-        eprintln!("  Benchmark:  wrk -t1 -c1 -d10s http://localhost:{}/health", first_tcp.host);
+        eprintln!(
+            "  Benchmark:  wrk -t1 -c1 -d10s http://localhost:{}/health",
+            first_tcp.host
+        );
     }
     eprintln!();
 
@@ -790,39 +912,48 @@ pub fn process_tx_queue(queue_idx: u32) {
         static TX_LAST_MAP: Cell<[u16; 9]> = const { Cell::new([0u16; 9]) };
     }
     let tx = virtio::queue_snapshot(queue_idx as usize);
-    if !tx.ready { return; }
+    if !tx.ready {
+        return;
+    }
 
     // Map queue_idx to a slot in the per-thread last array (TX queues: 1,3,5,7,... → slots 0..8)
     let slot = (queue_idx / 2) as usize;
-    if slot >= 9 { return; }
+    if slot >= 9 {
+        return;
+    }
 
     // Remember which vCPU we're processing for — `handle_udp` uses it
     // to pick its per-vCPU TX socket.
     CURRENT_VCPU.with(|c| c.set(slot));
 
-    let avail_idx = unsafe {
-        core::ptr::read_volatile(tx.gpa_to_host(tx.avail_addr + 2) as *const u16)
-    };
+    let avail_idx =
+        unsafe { core::ptr::read_volatile(tx.gpa_to_host(tx.avail_addr + 2) as *const u16) };
     let mut lasts = TX_LAST_MAP.with(|c| c.get());
     let mut last = lasts[slot];
-    if last == avail_idx { return; }
+    if last == avail_idx {
+        return;
+    }
 
     while last != avail_idx {
         let ring_idx = last & (tx.qsize - 1);
         let desc_idx = unsafe {
             core::ptr::read_volatile(
-                tx.gpa_to_host(tx.avail_addr + 4 + ring_idx as u64 * 2) as *const u16)
+                tx.gpa_to_host(tx.avail_addr + 4 + ring_idx as u64 * 2) as *const u16
+            )
         };
         let (addr, len) = unsafe {
             let dp = tx.gpa_to_host(tx.desc_addr + desc_idx as u64 * 16);
-            (core::ptr::read_unaligned(dp as *const u64),
-             core::ptr::read_unaligned(dp.add(8) as *const u32) as usize)
+            (
+                core::ptr::read_unaligned(dp as *const u64),
+                core::ptr::read_unaligned(dp.add(8) as *const u32) as usize,
+            )
         };
         if len > VIRTIO_NET_HDR_SIZE {
             let frame = unsafe {
                 std::slice::from_raw_parts(
                     tx.gpa_to_host(addr).add(VIRTIO_NET_HDR_SIZE),
-                    len - VIRTIO_NET_HDR_SIZE)
+                    len - VIRTIO_NET_HDR_SIZE,
+                )
             };
             handle_guest_tx(frame);
         }
@@ -832,14 +963,18 @@ pub fn process_tx_queue(queue_idx: u32) {
             let entry = tx.gpa_to_host(tx.used_addr + 4 + (used_idx & (tx.qsize - 1)) as u64 * 8);
             core::ptr::write_unaligned(entry as *mut u32, desc_idx as u32);
             core::ptr::write_unaligned(entry.add(4) as *mut u32, len as u32);
-            core::ptr::write_volatile(tx.gpa_to_host(tx.used_addr + 2) as *mut u16,
-                used_idx.wrapping_add(1));
+            core::ptr::write_volatile(
+                tx.gpa_to_host(tx.used_addr + 2) as *mut u16,
+                used_idx.wrapping_add(1),
+            );
         }
         last = last.wrapping_add(1);
     }
     lasts[slot] = last;
     TX_LAST_MAP.with(|c| c.set(lasts));
-    unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack));
+    }
     // No SPI assert here — ACK frames queued in TX_REPLIES will be
     // injected by the IO thread, which asserts SPI after injection.
     // Asserting here caused a spurious interrupt (guest polls, finds
@@ -873,17 +1008,15 @@ pub fn vcpu_poll(vcpu_id: usize, timeout_ms: i32) -> bool {
         Some(v) => v,
         None => return false,
     };
-    if vcpu_id >= ios.len() { return false; }
+    if vcpu_id >= ios.len() {
+        return false;
+    }
     let cpu_count = CPU_COUNT.load(Ordering::Acquire);
     let mut io = ios[vcpu_id].lock().unwrap();
     poll_worker_iteration(&mut io, cpu_count, timeout_ms)
 }
 
-fn poll_worker_iteration(
-    io: &mut IoState,
-    cpu_count: usize,
-    timeout_ms: i32,
-) -> bool {
+fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) -> bool {
     let id = io.id;
     let single_queue = cpu_count <= 1;
     let shared = worker_shared(id);
@@ -893,7 +1026,11 @@ fn poll_worker_iteration(
     // injected from the vCPU thread that owns the queue.
     if !io.primed {
         if id == 0 {
-            shared.tx_replies.lock().unwrap().push_back(build_grat_arp_frame(&io.guest_mac));
+            shared
+                .tx_replies
+                .lock()
+                .unwrap()
+                .push_back(build_grat_arp_frame(&io.guest_mac));
         }
         io.primed = true;
     }
@@ -921,9 +1058,14 @@ fn poll_worker_iteration(
         }
         drop(replies);
         if any {
-            unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+            unsafe {
+                core::arch::asm!("dsb sy", options(nostack));
+            }
             if single_queue {
-                unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
+                unsafe {
+                    hvf::hv_gic_set_spi(35, true);
+                    hvf::hv_gic_set_spi(35, false);
+                }
             }
             any_injected = true;
         }
@@ -946,9 +1088,14 @@ fn poll_worker_iteration(
         }
         drop(fwd);
         if any {
-            unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+            unsafe {
+                core::arch::asm!("dsb sy", options(nostack));
+            }
             if single_queue {
-                unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
+                unsafe {
+                    hvf::hv_gic_set_spi(35, true);
+                    hvf::hv_gic_set_spi(35, false);
+                }
             }
             any_injected = true;
         }
@@ -961,15 +1108,27 @@ fn poll_worker_iteration(
         for c in conns.values_mut() {
             if c.state == ConnState::Established && !c.pending.is_empty() && qsnap.ready {
                 let p = std::mem::take(&mut c.pending);
-                inject_data_frames(c, &p, &GUEST_MAC, &qsnap, &mut io.rx_last, &mut io.frame_buf);
+                inject_data_frames(
+                    c,
+                    &p,
+                    &GUEST_MAC,
+                    &qsnap,
+                    &mut io.rx_last,
+                    &mut io.frame_buf,
+                );
                 flushed = true;
             }
         }
         drop(conns);
         if flushed {
-            unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+            unsafe {
+                core::arch::asm!("dsb sy", options(nostack));
+            }
             if single_queue {
-                unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
+                unsafe {
+                    hvf::hv_gic_set_spi(35, true);
+                    hvf::hv_gic_set_spi(35, false);
+                }
             }
             any_injected = true;
         }
@@ -984,7 +1143,9 @@ fn poll_worker_iteration(
     io.pollfds.clear();
     io.conn_ports.clear();
     io.pollfds.push(libc::pollfd {
-        fd: io.wake_pipe_read, events: libc::POLLIN, revents: 0,
+        fd: io.wake_pipe_read,
+        events: libc::POLLIN,
+        revents: 0,
     });
     io.conn_ports.push(0);
     // UDP fds are no longer polled per-vCPU; the dedicated UDP
@@ -994,7 +1155,11 @@ fn poll_worker_iteration(
     let listen_slot_start = io.pollfds.len();
     let listens: &[TcpListen] = LISTENS.get().map(|v| v.as_slice()).unwrap_or(&[]);
     for l in listens {
-        io.pollfds.push(libc::pollfd { fd: l.fd, events: libc::POLLIN, revents: 0 });
+        io.pollfds.push(libc::pollfd {
+            fd: l.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
         io.conn_ports.push(0);
     }
     // Outbound UDP NAT fds — guest-initiated UDP flows we forwarded
@@ -1003,11 +1168,17 @@ fn poll_worker_iteration(
     // `conn_ports` records the GUEST src_port so the reply frame
     // can carry the right (src=last_dst, dst=guest_src) addressing.
     let outbound_slot_start = io.pollfds.len();
-    let outbound_drain: Vec<(u16, OutboundUdp)> = io.outbound_udp.iter()
+    let outbound_drain: Vec<(u16, OutboundUdp)> = io
+        .outbound_udp
+        .iter()
         .map(|(&port, &o)| (port, o))
         .collect();
     for (gport, o) in &outbound_drain {
-        io.pollfds.push(libc::pollfd { fd: o.fd, events: libc::POLLIN, revents: 0 });
+        io.pollfds.push(libc::pollfd {
+            fd: o.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
         io.conn_ports.push(*gport);
     }
     let fixed_slots = io.pollfds.len();
@@ -1015,17 +1186,22 @@ fn poll_worker_iteration(
         let conns = shared.conns.lock().unwrap();
         for c in conns.values() {
             io.pollfds.push(libc::pollfd {
-                fd: if c.host_fd >= 0 && c.state < ConnState::Closed { c.host_fd } else { -1 },
-                events: libc::POLLIN, revents: 0,
+                fd: if c.host_fd >= 0 && c.state < ConnState::Closed {
+                    c.host_fd
+                } else {
+                    -1
+                },
+                events: libc::POLLIN,
+                revents: 0,
             });
             io.conn_ports.push(c.src_port);
         }
     }
 
-    let ready = unsafe {
-        libc::poll(io.pollfds.as_mut_ptr(), io.pollfds.len() as u32, timeout_ms)
-    };
-    if ready <= 0 { return any_injected; }
+    let ready = unsafe { libc::poll(io.pollfds.as_mut_ptr(), io.pollfds.len() as u32, timeout_ms) };
+    if ready <= 0 {
+        return any_injected;
+    }
 
     // ── Drain wake pipe doorbell ───────────────────────────────────
     // The bytes are signals from another thread (the accept thread, or
@@ -1037,10 +1213,10 @@ fn poll_worker_iteration(
     if io.pollfds[0].revents & libc::POLLIN != 0 {
         let mut tmp = [0u8; 64];
         loop {
-            let n = unsafe {
-                libc::read(io.wake_pipe_read, tmp.as_mut_ptr() as *mut _, tmp.len())
-            };
-            if n <= 0 { break; }
+            let n = unsafe { libc::read(io.wake_pipe_read, tmp.as_mut_ptr() as *mut _, tmp.len()) };
+            if n <= 0 {
+                break;
+            }
         }
         any_injected = true;
     }
@@ -1076,16 +1252,20 @@ fn poll_worker_iteration(
                 continue;
             }
             loop {
-                let client_fd = unsafe {
-                    libc::accept(listen.fd, std::ptr::null_mut(), std::ptr::null_mut())
-                };
-                if client_fd < 0 { break; }
+                let client_fd =
+                    unsafe { libc::accept(listen.fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+                if client_fd < 0 {
+                    break;
+                }
                 unsafe {
                     libc::fcntl(client_fd, libc::F_SETFL, libc::O_NONBLOCK);
                     let one: i32 = 1;
                     libc::setsockopt(
-                        client_fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,
-                        &one as *const _ as *const _, 4,
+                        client_fd,
+                        libc::IPPROTO_TCP,
+                        libc::TCP_NODELAY,
+                        &one as *const _ as *const _,
+                        4,
                     );
                 }
                 // Flow-hash-aware src_port selection (v4 only): pick
@@ -1100,22 +1280,32 @@ fn poll_worker_iteration(
                 // Tier 1 is on the v4 fast path only), so v6
                 // accepts skip the loop and grab the next free port.
                 let src_port = match listen.family {
-                    IpFamily::V4 => alloc_src_port_for_vcpu(
-                        io.id, cpu_count, listen.guest_port,
-                    ),
+                    IpFamily::V4 => alloc_src_port_for_vcpu(io.id, cpu_count, listen.guest_port),
                     IpFamily::V6 => alloc_src_port(),
                 };
                 let frame = build_tcp_reply(
-                    listen.family, src_port, listen.guest_port,
-                    1000, 0, 0x02, &[],
+                    listen.family,
+                    src_port,
+                    listen.guest_port,
+                    1000,
+                    0,
+                    0x02,
+                    &[],
                 );
                 shared.tx_replies.lock().unwrap().push_back(frame);
-                shared.conns.lock().unwrap().insert(src_port, ProxyConn {
-                    host_fd: client_fd, src_port, guest_port: listen.guest_port,
-                    my_seq: 1001, peer_ack: 0,
-                    state: ConnState::SynSent, pending: Vec::new(),
-                    family: listen.family,
-                });
+                shared.conns.lock().unwrap().insert(
+                    src_port,
+                    ProxyConn {
+                        host_fd: client_fd,
+                        src_port,
+                        guest_port: listen.guest_port,
+                        my_seq: 1001,
+                        peer_ack: 0,
+                        state: ConnState::SynSent,
+                        pending: Vec::new(),
+                        family: listen.family,
+                    },
+                );
                 accepted_any = true;
             }
         }
@@ -1135,9 +1325,14 @@ fn poll_worker_iteration(
             }
             drop(replies);
             if any_injected {
-                unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+                unsafe {
+                    core::arch::asm!("dsb sy", options(nostack));
+                }
                 if single_queue {
-                    unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
+                    unsafe {
+                        hvf::hv_gic_set_spi(35, true);
+                        hvf::hv_gic_set_spi(35, false);
+                    }
                 }
             }
         }
@@ -1151,23 +1346,15 @@ fn poll_worker_iteration(
     // it to `tx_replies` for injection on the next iteration.
     if !outbound_drain.is_empty() {
         for (i, (gport, o)) in outbound_drain.iter().enumerate() {
-            if io.pollfds[outbound_slot_start + i].revents
-                & (libc::POLLIN | libc::POLLHUP)
-                == 0
-            {
+            if io.pollfds[outbound_slot_start + i].revents & (libc::POLLIN | libc::POLLHUP) == 0 {
                 continue;
             }
             loop {
                 let mut buf = [0u8; 1500];
-                let n = unsafe {
-                    libc::recv(
-                        o.fd,
-                        buf.as_mut_ptr() as *mut _,
-                        buf.len(),
-                        0,
-                    )
-                };
-                if n <= 0 { break; }
+                let n = unsafe { libc::recv(o.fd, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
+                if n <= 0 {
+                    break;
+                }
                 let payload = &buf[..n as usize];
                 let frame = build_udp_frame_in(
                     &io.guest_mac,
@@ -1192,7 +1379,14 @@ fn poll_worker_iteration(
     const HDR_LEN_V6: usize = VIRTIO_NET_HDR_SIZE + 14 + 40 + 20;
     const MAX_PAYLOAD_V4: usize = 1460;
     const MAX_PAYLOAD_V6: usize = 1440;
-    struct ConnSnap { port: u16, guest_port: u16, fd: i32, seq: u32, ack: u32, family: IpFamily }
+    struct ConnSnap {
+        port: u16,
+        guest_port: u16,
+        fd: i32,
+        seq: u32,
+        ack: u32,
+        family: IpFamily,
+    }
 
     if qsnap.ready {
         let snaps: Vec<ConnSnap> = {
@@ -1204,34 +1398,50 @@ fn poll_worker_iteration(
                     conns.get(&port).and_then(|c| {
                         if c.host_fd >= 0 && c.state == ConnState::Established {
                             Some(ConnSnap {
-                                port, guest_port: c.guest_port, fd: c.host_fd,
-                                seq: c.my_seq, ack: c.peer_ack, family: c.family,
+                                port,
+                                guest_port: c.guest_port,
+                                fd: c.host_fd,
+                                seq: c.my_seq,
+                                ack: c.peer_ack,
+                                family: c.family,
                             })
-                        } else { None }
+                        } else {
+                            None
+                        }
                     })
                 })
                 .collect()
         };
 
-        struct RxResult { port: u16, seq_advance: u32, eof: bool }
+        struct RxResult {
+            port: u16,
+            seq_advance: u32,
+            eof: bool,
+        }
         let mut results: Vec<RxResult> = Vec::new();
         let mut injected = false;
 
         for cs in &snaps {
-            if !qsnap.ready { continue; }
+            if !qsnap.ready {
+                continue;
+            }
 
             let avail_idx = unsafe {
                 core::ptr::read_volatile(qsnap.gpa_to_host(qsnap.avail_addr + 2) as *const u16)
             };
-            if io.rx_last == avail_idx { continue; }
+            if io.rx_last == avail_idx {
+                continue;
+            }
             let ring_idx = io.rx_last & (qsnap.qsize - 1);
             let desc_idx = unsafe {
                 core::ptr::read_volatile(
-                    qsnap.gpa_to_host(qsnap.avail_addr + 4 + ring_idx as u64 * 2) as *const u16)
+                    qsnap.gpa_to_host(qsnap.avail_addr + 4 + ring_idx as u64 * 2) as *const u16,
+                )
             };
             let buf_addr = unsafe {
                 core::ptr::read_unaligned(
-                    qsnap.gpa_to_host(qsnap.desc_addr + desc_idx as u64 * 16) as *const u64)
+                    qsnap.gpa_to_host(qsnap.desc_addr + desc_idx as u64 * 16) as *const u64
+                )
             };
             let guest_buf = qsnap.gpa_to_host(buf_addr);
 
@@ -1243,30 +1453,55 @@ fn poll_worker_iteration(
             let n = unsafe { libc::read(cs.fd, payload_ptr as *mut _, max_payload) };
             if n <= 0 {
                 if n == 0 {
-                    results.push(RxResult { port: cs.port, seq_advance: 0, eof: true });
+                    results.push(RxResult {
+                        port: cs.port,
+                        seq_advance: 0,
+                        eof: true,
+                    });
                 }
                 continue;
             }
             let payload_len = n as usize;
 
             let addrs = match cs.family {
-                IpFamily::V4 => IpAddrPair::V4 { src: GW_IP, dst: VM_IP },
-                IpFamily::V6 => IpAddrPair::V6 { src: GW_IPV6, dst: VM_IPV6 },
+                IpFamily::V4 => IpAddrPair::V4 {
+                    src: GW_IP,
+                    dst: VM_IP,
+                },
+                IpFamily::V6 => IpAddrPair::V6 {
+                    src: GW_IPV6,
+                    dst: VM_IPV6,
+                },
             };
             let total = write_tcp_frame_around_payload(
-                guest_buf, &GUEST_MAC, &addrs,
-                cs.port, cs.guest_port, cs.seq, cs.ack, 0x18, payload_len);
+                guest_buf,
+                &GUEST_MAC,
+                &addrs,
+                cs.port,
+                cs.guest_port,
+                cs.seq,
+                cs.ack,
+                0x18,
+                payload_len,
+            );
 
             let used_idx = io.rx_last;
             unsafe {
-                let entry = qsnap.gpa_to_host(qsnap.used_addr + 4 + (used_idx & (qsnap.qsize - 1)) as u64 * 8);
+                let entry = qsnap
+                    .gpa_to_host(qsnap.used_addr + 4 + (used_idx & (qsnap.qsize - 1)) as u64 * 8);
                 core::ptr::write_unaligned(entry as *mut u32, desc_idx as u32);
                 core::ptr::write_unaligned(entry.add(4) as *mut u32, total as u32);
-                core::ptr::write_volatile(qsnap.gpa_to_host(qsnap.used_addr + 2) as *mut u16,
-                    used_idx.wrapping_add(1));
+                core::ptr::write_volatile(
+                    qsnap.gpa_to_host(qsnap.used_addr + 2) as *mut u16,
+                    used_idx.wrapping_add(1),
+                );
             }
             io.rx_last = io.rx_last.wrapping_add(1);
-            results.push(RxResult { port: cs.port, seq_advance: payload_len as u32, eof: false });
+            results.push(RxResult {
+                port: cs.port,
+                seq_advance: payload_len as u32,
+                eof: false,
+            });
             injected = true;
         }
 
@@ -1275,14 +1510,23 @@ fn poll_worker_iteration(
             for r in &results {
                 if let Some(c) = conns.get_mut(&r.port) {
                     if r.eof {
-                        let frame = build_tcp_reply(c.family,
-                            c.src_port, c.guest_port, c.my_seq, c.peer_ack, 0x11, &[]);
+                        let frame = build_tcp_reply(
+                            c.family,
+                            c.src_port,
+                            c.guest_port,
+                            c.my_seq,
+                            c.peer_ack,
+                            0x11,
+                            &[],
+                        );
                         c.my_seq = c.my_seq.wrapping_add(1);
                         c.state = ConnState::Closed;
                         // Mirror the guest-initiated FIN path in handle_tcp:
                         // drop the host fd now so the kernel socket leaves
                         // CLOSE_WAIT instead of leaking until process exit.
-                        unsafe { libc::close(c.host_fd); }
+                        unsafe {
+                            libc::close(c.host_fd);
+                        }
                         c.host_fd = -1;
                         inject_frame(frame.as_slice(), &qsnap, &mut io.rx_last);
                         injected = true;
@@ -1294,9 +1538,14 @@ fn poll_worker_iteration(
         }
 
         if injected {
-            unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+            unsafe {
+                core::arch::asm!("dsb sy", options(nostack));
+            }
             if single_queue {
-                unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
+                unsafe {
+                    hvf::hv_gic_set_spi(35, true);
+                    hvf::hv_gic_set_spi(35, false);
+                }
             }
             any_injected = true;
         }
@@ -1304,14 +1553,24 @@ fn poll_worker_iteration(
         // RX queue not ready — buffer data in pending.
         let mut conns = shared.conns.lock().unwrap();
         for i in fixed_slots..io.pollfds.len() {
-            if io.pollfds[i].revents & (libc::POLLIN | libc::POLLHUP) == 0 { continue; }
+            if io.pollfds[i].revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+                continue;
+            }
             let port = io.conn_ports[i];
             if let Some(c) = conns.get_mut(&port) {
-                if c.host_fd < 0 { continue; }
+                if c.host_fd < 0 {
+                    continue;
+                }
                 let n = unsafe {
-                    libc::read(c.host_fd, io.read_buf.as_mut_ptr() as *mut _, io.read_buf.len())
+                    libc::read(
+                        c.host_fd,
+                        io.read_buf.as_mut_ptr() as *mut _,
+                        io.read_buf.len(),
+                    )
                 };
-                if n > 0 { c.pending.extend_from_slice(&io.read_buf[..n as usize]); }
+                if n > 0 {
+                    c.pending.extend_from_slice(&io.read_buf[..n as usize]);
+                }
             }
         }
     }
@@ -1333,7 +1592,11 @@ fn alloc_src_port() -> u16 {
     let mut p = NEXT_PROXY_SRC_PORT.fetch_add(1, Ordering::Relaxed);
     if p >= 60000 {
         let _ = NEXT_PROXY_SRC_PORT.compare_exchange(
-            p + 1, 40000, Ordering::Relaxed, Ordering::Relaxed);
+            p + 1,
+            40000,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
         p = NEXT_PROXY_SRC_PORT.fetch_add(1, Ordering::Relaxed);
     }
     p
@@ -1395,11 +1658,7 @@ fn flow_hash_for_guest(
 ///
 /// For `cpu_count == 1` there's only one bucket and every port
 /// matches; the loop body finishes on the first try.
-fn alloc_src_port_for_vcpu(
-    target_vcpu: usize,
-    cpu_count: usize,
-    dst_port: u16,
-) -> u16 {
+fn alloc_src_port_for_vcpu(target_vcpu: usize, cpu_count: usize, dst_port: u16) -> u16 {
     if cpu_count <= 1 {
         return alloc_src_port();
     }
@@ -1530,9 +1789,7 @@ fn udp_listener_loop(fds: Vec<ListenerFd>) {
         // idle — so a long timeout is fine. The wake-on-event
         // path is the kernel's: a single packet arrival wakes
         // poll instantly.
-        let ready = unsafe {
-            libc::poll(pollfds.as_mut_ptr(), pollfds.len() as u32, 1000)
-        };
+        let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as u32, 1000) };
         if ready <= 0 {
             continue;
         }
@@ -1544,20 +1801,12 @@ fn udp_listener_loop(fds: Vec<ListenerFd>) {
             // Reset for next poll iteration.
             pollfds[i].revents = 0;
             match f.family {
-                IpFamily::V4 => listener_drain_v4(
-                    f.fd,
-                    f.guest_port,
-                    cpu_count,
-                    &mut read_buf,
-                    &mut frame_buf,
-                ),
-                IpFamily::V6 => listener_drain_v6(
-                    f.fd,
-                    f.guest_port,
-                    cpu_count,
-                    &mut read_buf,
-                    &mut frame_buf,
-                ),
+                IpFamily::V4 => {
+                    listener_drain_v4(f.fd, f.guest_port, cpu_count, &mut read_buf, &mut frame_buf)
+                }
+                IpFamily::V6 => {
+                    listener_drain_v6(f.fd, f.guest_port, cpu_count, &mut read_buf, &mut frame_buf)
+                }
             }
         }
     }
@@ -1684,12 +1933,7 @@ fn fnv1a_32(bytes: &[u8]) -> u32 {
 /// give for free. macOS UDP shared-fd recv distributes by
 /// recvfrom race — so we recover affinity by routing in user
 /// space after the recv.
-fn target_vcpu_v4(
-    client_ip: u32,
-    client_port: u16,
-    guest_port: u16,
-    cpu_count: usize,
-) -> usize {
+fn target_vcpu_v4(client_ip: u32, client_port: u16, guest_port: u16, cpu_count: usize) -> usize {
     if cpu_count <= 1 {
         return 0;
     }
@@ -1756,32 +2000,36 @@ fn forward_frame_to_vcpu(target_vcpu: usize, frame: &[u8]) {
 // `listener_drain_v4` upstream.
 
 fn inject_frame(frame: &[u8], snap: &virtio::QueueSnapshot, rx_last: &mut u16) -> bool {
-    let avail_idx = unsafe {
-        core::ptr::read_volatile(snap.gpa_to_host(snap.avail_addr + 2) as *const u16)
-    };
+    let avail_idx =
+        unsafe { core::ptr::read_volatile(snap.gpa_to_host(snap.avail_addr + 2) as *const u16) };
     let last = *rx_last;
-    if last == avail_idx { return false; }
+    if last == avail_idx {
+        return false;
+    }
     let ring_idx = last & (snap.qsize - 1);
     let desc_idx = unsafe {
         core::ptr::read_volatile(
-            snap.gpa_to_host(snap.avail_addr + 4 + ring_idx as u64 * 2) as *const u16)
+            snap.gpa_to_host(snap.avail_addr + 4 + ring_idx as u64 * 2) as *const u16
+        )
     };
     let addr = unsafe {
         core::ptr::read_unaligned(
-            snap.gpa_to_host(snap.desc_addr + desc_idx as u64 * 16) as *const u64)
+            snap.gpa_to_host(snap.desc_addr + desc_idx as u64 * 16) as *const u64
+        )
     };
     unsafe {
         core::ptr::copy_nonoverlapping(frame.as_ptr(), snap.gpa_to_host(addr), frame.len());
     }
-    let used_idx = unsafe {
-        core::ptr::read_volatile(snap.gpa_to_host(snap.used_addr + 2) as *const u16)
-    };
+    let used_idx =
+        unsafe { core::ptr::read_volatile(snap.gpa_to_host(snap.used_addr + 2) as *const u16) };
     unsafe {
         let entry = snap.gpa_to_host(snap.used_addr + 4 + (used_idx & (snap.qsize - 1)) as u64 * 8);
         core::ptr::write_unaligned(entry as *mut u32, desc_idx as u32);
         core::ptr::write_unaligned(entry.add(4) as *mut u32, frame.len() as u32);
-        core::ptr::write_volatile(snap.gpa_to_host(snap.used_addr + 2) as *mut u16,
-            used_idx.wrapping_add(1));
+        core::ptr::write_volatile(
+            snap.gpa_to_host(snap.used_addr + 2) as *mut u16,
+            used_idx.wrapping_add(1),
+        );
         // Flush the cache line containing used->idx so the guest PE sees it.
         // Apple Silicon HVF should be cache-coherent, but empirically the
         // guest reads stale used->idx on secondary queues without this.
@@ -1797,34 +2045,54 @@ fn inject_frame(frame: &[u8], snap: &virtio::QueueSnapshot, rx_last: &mut u16) -
     true
 }
 
-fn inject_data_frames(c: &mut ProxyConn, data: &[u8], mac: &[u8; 6],
-                      snap: &virtio::QueueSnapshot, rx_last: &mut u16,
-                      frame_buf: &mut [u8; 2048]) {
+fn inject_data_frames(
+    c: &mut ProxyConn,
+    data: &[u8],
+    mac: &[u8; 6],
+    snap: &virtio::QueueSnapshot,
+    rx_last: &mut u16,
+    frame_buf: &mut [u8; 2048],
+) {
     let max_chunk = match c.family {
         IpFamily::V4 => 1460,
         IpFamily::V6 => 1440,
     };
     let addrs = match c.family {
-        IpFamily::V4 => IpAddrPair::V4 { src: GW_IP, dst: VM_IP },
-        IpFamily::V6 => IpAddrPair::V6 { src: GW_IPV6, dst: VM_IPV6 },
+        IpFamily::V4 => IpAddrPair::V4 {
+            src: GW_IP,
+            dst: VM_IP,
+        },
+        IpFamily::V6 => IpAddrPair::V6 {
+            src: GW_IPV6,
+            dst: VM_IPV6,
+        },
     };
     let mut off = 0;
     while off < data.len() {
         let chunk = (data.len() - off).min(max_chunk);
-        let len = write_tcp_frame(frame_buf, mac, &addrs,
-            c.src_port, c.guest_port, c.my_seq, c.peer_ack, 0x18,
-            &data[off..off + chunk]);
+        let len = write_tcp_frame(
+            frame_buf,
+            mac,
+            &addrs,
+            c.src_port,
+            c.guest_port,
+            c.my_seq,
+            c.peer_ack,
+            0x18,
+            &data[off..off + chunk],
+        );
         c.my_seq = c.my_seq.wrapping_add(chunk as u32);
         off += chunk;
         inject_frame(&frame_buf[..len], snap, rx_last);
     }
 }
 
-
 // ── Guest TX (vCPU thread) ──────────────────────────────────────────────────
 
 fn handle_guest_tx(frame: &[u8]) {
-    if frame.len() < 14 { return; }
+    if frame.len() < 14 {
+        return;
+    }
     let guest_mac: [u8; 6] = frame[6..12].try_into().unwrap_or([0; 6]);
     match u16::from_be_bytes([frame[12], frame[13]]) {
         0x0806 => handle_arp(&frame[14..]),
@@ -1844,17 +2112,23 @@ fn handle_guest_tx(frame: &[u8]) {
 // keyed off the conn's / relay's `family` tag.
 
 fn handle_ipv6(ip: &[u8], guest_mac: [u8; 6]) {
-    if ip.len() < 40 { return; }
+    if ip.len() < 40 {
+        return;
+    }
     let payload_len = u16::from_be_bytes([ip[4], ip[5]]) as usize;
     let next_header = ip[6];
-    if 40 + payload_len > ip.len() { return; }
+    if 40 + payload_len > ip.len() {
+        return;
+    }
     let src_ip: [u8; 16] = ip[8..24].try_into().unwrap_or([0; 16]);
     let dst_ip: [u8; 16] = ip[24..40].try_into().unwrap_or([0; 16]);
     let payload = &ip[40..40 + payload_len];
 
     match next_header {
         58 => {
-            if payload.is_empty() { return; }
+            if payload.is_empty() {
+                return;
+            }
             match payload[0] {
                 128 => bounce_icmpv6_echo(src_ip, dst_ip, payload, guest_mac),
                 135 => reply_neighbor_solicitation(src_ip, payload, guest_mac),
@@ -1893,36 +2167,61 @@ fn build_udp_frame_v6(
     debug_assert!(total <= buf.len());
     buf[..VIRTIO_NET_HDR_SIZE].fill(0);
     let mut o = VIRTIO_NET_HDR_SIZE;
-    buf[o..o+6].copy_from_slice(dst_mac); o += 6;
-    buf[o..o+6].copy_from_slice(&GW_MAC); o += 6;
-    buf[o..o+2].copy_from_slice(&0x86ddu16.to_be_bytes()); o += 2;
+    buf[o..o + 6].copy_from_slice(dst_mac);
+    o += 6;
+    buf[o..o + 6].copy_from_slice(&GW_MAC);
+    o += 6;
+    buf[o..o + 2].copy_from_slice(&0x86ddu16.to_be_bytes());
+    o += 2;
     // IPv6 header.
-    buf[o..o+4].copy_from_slice(&0x6000_0000u32.to_be_bytes()); o += 4;
-    buf[o..o+2].copy_from_slice(&(udp_len as u16).to_be_bytes()); o += 2;
-    buf[o] = 17; o += 1; // next_header = UDP
-    buf[o] = 64; o += 1; // hop limit
-    buf[o..o+16].copy_from_slice(src_ip); o += 16;
-    buf[o..o+16].copy_from_slice(dst_ip); o += 16;
+    buf[o..o + 4].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+    o += 4;
+    buf[o..o + 2].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    o += 2;
+    buf[o] = 17;
+    o += 1; // next_header = UDP
+    buf[o] = 64;
+    o += 1; // hop limit
+    buf[o..o + 16].copy_from_slice(src_ip);
+    o += 16;
+    buf[o..o + 16].copy_from_slice(dst_ip);
+    o += 16;
     // UDP header + payload first (with checksum=0), then patch in
     // the pseudo-header checksum over header+payload.
     let us = o;
-    buf[o..o+2].copy_from_slice(&src_port.to_be_bytes()); o += 2;
-    buf[o..o+2].copy_from_slice(&dst_port.to_be_bytes()); o += 2;
-    buf[o..o+2].copy_from_slice(&(udp_len as u16).to_be_bytes()); o += 2;
-    buf[o..o+2].fill(0); o += 2; // checksum placeholder
-    buf[o..o+payload.len()].copy_from_slice(payload);
-    let cksum = ipv6_pseudo_checksum(src_ip, dst_ip, 17, &buf[us..us+udp_len]);
-    buf[us+6..us+8].copy_from_slice(&cksum.to_be_bytes());
+    buf[o..o + 2].copy_from_slice(&src_port.to_be_bytes());
+    o += 2;
+    buf[o..o + 2].copy_from_slice(&dst_port.to_be_bytes());
+    o += 2;
+    buf[o..o + 2].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    o += 2;
+    buf[o..o + 2].fill(0);
+    o += 2; // checksum placeholder
+    buf[o..o + payload.len()].copy_from_slice(payload);
+    let cksum = ipv6_pseudo_checksum(src_ip, dst_ip, 17, &buf[us..us + udp_len]);
+    buf[us + 6..us + 8].copy_from_slice(&cksum.to_be_bytes());
     total
 }
 
 /// VM IPv6 link-local — derived from `GUEST_MAC` via modified
 /// EUI-64 (mirrors what the unikernel computes at boot).
 const VM_IPV6: [u8; 16] = [
-    0xfe, 0x80, 0, 0, 0, 0, 0, 0,
-    GUEST_MAC[0] ^ 0x02, GUEST_MAC[1], GUEST_MAC[2],
-    0xff, 0xfe,
-    GUEST_MAC[3], GUEST_MAC[4], GUEST_MAC[5],
+    0xfe,
+    0x80,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    GUEST_MAC[0] ^ 0x02,
+    GUEST_MAC[1],
+    GUEST_MAC[2],
+    0xff,
+    0xfe,
+    GUEST_MAC[3],
+    GUEST_MAC[4],
+    GUEST_MAC[5],
 ];
 
 /// Worker-side IPv6 UDP RX. Reads from the AF_INET6 sibling fd,
@@ -1942,16 +2241,20 @@ const VM_IPV6: [u8; 16] = [
 ///     runner; other outbound v6 patterns aren't a real use case
 ///     for us right now.
 fn handle_udp_v6(udp: &[u8], _src_ip: [u8; 16], _dst_ip: [u8; 16]) {
-    if udp.len() < 8 { return; }
+    if udp.len() < 8 {
+        return;
+    }
     let src_port = u16::from_be_bytes([udp[0], udp[1]]);
     let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
     let payload = &udp[8..];
-    if payload.is_empty() { return; }
+    if payload.is_empty() {
+        return;
+    }
 
     let vcpu_id = CURRENT_VCPU.with(|c| c.get());
-    let inbound = UDP_RELAYS_V6.get().and_then(|table| {
-        table.iter().find(|r| r.guest_port == src_port)
-    });
+    let inbound = UDP_RELAYS_V6
+        .get()
+        .and_then(|table| table.iter().find(|r| r.guest_port == src_port));
     let relay = match inbound {
         Some(r) => r,
         None => return,
@@ -1966,9 +2269,14 @@ fn handle_udp_v6(udp: &[u8], _src_ip: [u8; 16], _dst_ip: [u8; 16]) {
     };
     if let Some(addr) = client_addr {
         unsafe {
-            libc::sendto(fd, payload.as_ptr() as *const _, payload.len(),
-                0, &addr as *const _ as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_in6>() as u32);
+            libc::sendto(
+                fd,
+                payload.as_ptr() as *const _,
+                payload.len(),
+                0,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in6>() as u32,
+            );
         }
     }
 }
@@ -2012,19 +2320,30 @@ fn build_ipv6_frame(
     out: &mut [u8],
 ) -> usize {
     let total = VIRTIO_NET_HDR_SIZE + 14 + 40 + payload.len();
-    if out.len() < total { return 0; }
+    if out.len() < total {
+        return 0;
+    }
     let mut o = VIRTIO_NET_HDR_SIZE;
-    out[o..o+6].copy_from_slice(dst_mac); o += 6;
-    out[o..o+6].copy_from_slice(&GW_MAC); o += 6;
-    out[o..o+2].copy_from_slice(&0x86ddu16.to_be_bytes()); o += 2;
+    out[o..o + 6].copy_from_slice(dst_mac);
+    o += 6;
+    out[o..o + 6].copy_from_slice(&GW_MAC);
+    o += 6;
+    out[o..o + 2].copy_from_slice(&0x86ddu16.to_be_bytes());
+    o += 2;
     // IPv6 fixed header.
-    out[o..o+4].copy_from_slice(&0x6000_0000u32.to_be_bytes()); o += 4;
-    out[o..o+2].copy_from_slice(&(payload.len() as u16).to_be_bytes()); o += 2;
-    out[o] = next_header; o += 1;
-    out[o] = hop_limit; o += 1;
-    out[o..o+16].copy_from_slice(src_ip); o += 16;
-    out[o..o+16].copy_from_slice(dst_ip); o += 16;
-    out[o..o+payload.len()].copy_from_slice(payload);
+    out[o..o + 4].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+    o += 4;
+    out[o..o + 2].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+    o += 2;
+    out[o] = next_header;
+    o += 1;
+    out[o] = hop_limit;
+    o += 1;
+    out[o..o + 16].copy_from_slice(src_ip);
+    o += 16;
+    out[o..o + 16].copy_from_slice(dst_ip);
+    o += 16;
+    out[o..o + payload.len()].copy_from_slice(payload);
     total
 }
 
@@ -2032,24 +2351,35 @@ fn build_ipv6_frame(
 /// address. The VM's IPv6 stack drives this on bring-up to learn
 /// the gateway MAC (mirrors how it ARP-resolves `GW_IP` for v4).
 fn reply_neighbor_solicitation(src_ip: [u8; 16], ns: &[u8], guest_mac: [u8; 6]) {
-    if ns.len() < 24 { return; }
+    if ns.len() < 24 {
+        return;
+    }
     let target: [u8; 16] = ns[8..24].try_into().unwrap_or([0; 16]);
-    if target != GW_IPV6 { return; }
+    if target != GW_IPV6 {
+        return;
+    }
     // Build NA: type=136, code=0, cksum=0, flags(S|O), reserved[3], target[16],
     //           TLLA option (type=2, len=1, GW_MAC[6]).
     let mut na = [0u8; 32];
-    na[0] = 136; na[1] = 0;
+    na[0] = 136;
+    na[1] = 0;
     na[4] = 0x60; // S=1, O=1 (no Router flag)
     na[8..24].copy_from_slice(&GW_IPV6);
-    na[24] = 2; na[25] = 1;
+    na[24] = 2;
+    na[25] = 1;
     na[26..32].copy_from_slice(&GW_MAC);
     let cksum = ipv6_pseudo_checksum(&GW_IPV6, &src_ip, 58, &na);
     na[2..4].copy_from_slice(&cksum.to_be_bytes());
 
     let mut frame = [0u8; MAX_REPLY_FRAME];
     let n = build_ipv6_frame(&guest_mac, &GW_IPV6, &src_ip, 58, 255, &na, &mut frame);
-    if n == 0 { return; }
-    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0 };
+    if n == 0 {
+        return;
+    }
+    let mut f = TxFrame {
+        data: [0u8; MAX_REPLY_FRAME],
+        len: 0,
+    };
     f.data[..n].copy_from_slice(&frame[..n]);
     f.len = n as u16;
     my_worker_shared().tx_replies.lock().unwrap().push_back(f);
@@ -2060,52 +2390,83 @@ fn reply_neighbor_solicitation(src_ip: [u8; 16], ns: &[u8], guest_mac: [u8; 6]) 
 /// gateway, so `ping6 fe80::aabb:ccff:fedd:eeff` from inside the
 /// VM gets replies even when no real host is reachable.
 fn bounce_icmpv6_echo(src_ip: [u8; 16], dst_ip: [u8; 16], echo_req: &[u8], guest_mac: [u8; 6]) {
-    if echo_req.len() < 8 { return; }
+    if echo_req.len() < 8 {
+        return;
+    }
     let mut reply = vec![0u8; echo_req.len()];
     reply.copy_from_slice(echo_req);
     reply[0] = 129; // Echo Reply
     reply[1] = 0;
-    reply[2] = 0; reply[3] = 0; // checksum placeholder
+    reply[2] = 0;
+    reply[3] = 0; // checksum placeholder
     let _ = dst_ip; // dst was us (or a multicast we joined); reply src = us.
     let cksum = ipv6_pseudo_checksum(&GW_IPV6, &src_ip, 58, &reply);
     reply[2..4].copy_from_slice(&cksum.to_be_bytes());
 
     let mut frame = [0u8; MAX_REPLY_FRAME];
     let n = build_ipv6_frame(&guest_mac, &GW_IPV6, &src_ip, 58, 64, &reply, &mut frame);
-    if n == 0 { return; }
-    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0 };
+    if n == 0 {
+        return;
+    }
+    let mut f = TxFrame {
+        data: [0u8; MAX_REPLY_FRAME],
+        len: 0,
+    };
     f.data[..n].copy_from_slice(&frame[..n]);
     f.len = n as u16;
     my_worker_shared().tx_replies.lock().unwrap().push_back(f);
 }
 
 fn handle_arp(arp: &[u8]) {
-    if arp.len() < 28 { return; }
-    if u16::from_be_bytes([arp[6], arp[7]]) != 1 { return; }
-    if arp[24..28] != GW_IP { return; }
+    if arp.len() < 28 {
+        return;
+    }
+    if u16::from_be_bytes([arp[6], arp[7]]) != 1 {
+        return;
+    }
+    if arp[24..28] != GW_IP {
+        return;
+    }
     let guest_mac: [u8; 6] = arp[8..14].try_into().unwrap_or([0; 6]);
-    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, };
+    let mut f = TxFrame {
+        data: [0u8; MAX_REPLY_FRAME],
+        len: 0,
+    };
     {
         let b = &mut f.data;
         let mut o = VIRTIO_NET_HDR_SIZE; // virtio-net hdr (zeroed)
-        b[o..o+6].copy_from_slice(&guest_mac); o += 6;
-        b[o..o+6].copy_from_slice(&GW_MAC); o += 6;
-        b[o..o+2].copy_from_slice(&0x0806u16.to_be_bytes()); o += 2;
-        b[o..o+2].copy_from_slice(&1u16.to_be_bytes()); o += 2;
-        b[o..o+2].copy_from_slice(&0x0800u16.to_be_bytes()); o += 2;
-        b[o] = 6; b[o+1] = 4; o += 2;
-        b[o..o+2].copy_from_slice(&2u16.to_be_bytes()); o += 2;
-        b[o..o+6].copy_from_slice(&GW_MAC); o += 6;
-        b[o..o+4].copy_from_slice(&GW_IP); o += 4;
-        b[o..o+6].copy_from_slice(&arp[8..14]); o += 6;
-        b[o..o+4].copy_from_slice(&arp[14..18]); o += 4;
+        b[o..o + 6].copy_from_slice(&guest_mac);
+        o += 6;
+        b[o..o + 6].copy_from_slice(&GW_MAC);
+        o += 6;
+        b[o..o + 2].copy_from_slice(&0x0806u16.to_be_bytes());
+        o += 2;
+        b[o..o + 2].copy_from_slice(&1u16.to_be_bytes());
+        o += 2;
+        b[o..o + 2].copy_from_slice(&0x0800u16.to_be_bytes());
+        o += 2;
+        b[o] = 6;
+        b[o + 1] = 4;
+        o += 2;
+        b[o..o + 2].copy_from_slice(&2u16.to_be_bytes());
+        o += 2;
+        b[o..o + 6].copy_from_slice(&GW_MAC);
+        o += 6;
+        b[o..o + 4].copy_from_slice(&GW_IP);
+        o += 4;
+        b[o..o + 6].copy_from_slice(&arp[8..14]);
+        o += 6;
+        b[o..o + 4].copy_from_slice(&arp[14..18]);
+        o += 4;
         f.len = o as u16;
     }
     my_worker_shared().tx_replies.lock().unwrap().push_back(f);
 }
 
 fn handle_ipv4(ip: &[u8]) {
-    if ip.len() < 20 { return; }
+    if ip.len() < 20 {
+        return;
+    }
     let ihl = ((ip[0] & 0x0f) as usize) * 4;
     let src_ip: [u8; 4] = ip[12..16].try_into().unwrap_or([0; 4]);
     let dst_ip: [u8; 4] = ip[16..20].try_into().unwrap_or([0; 4]);
@@ -2117,20 +2478,33 @@ fn handle_ipv4(ip: &[u8]) {
 }
 
 fn handle_tcp(family: IpFamily, tcp: &[u8]) {
-    if tcp.len() < 20 { return; }
+    if tcp.len() < 20 {
+        return;
+    }
     let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
     let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
     let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
     let data_offset = ((tcp[12] >> 4) as usize) * 4;
     let flags = tcp[13];
-    let payload = if tcp.len() > data_offset { &tcp[data_offset..] } else { &[] };
+    let payload = if tcp.len() > data_offset {
+        &tcp[data_offset..]
+    } else {
+        &[]
+    };
 
     // The vCPU only processes conns that its paired worker accepted, so
     // the lookup is scoped to this worker's local `conns` map.
     let shared = my_worker_shared();
 
     // Snapshot connection state under brief lock — don't hold across write().
-    struct TxSnap { fd: i32, port: u16, guest_port: u16, seq: u32, ack: u32, state: ConnState }
+    struct TxSnap {
+        fd: i32,
+        port: u16,
+        guest_port: u16,
+        seq: u32,
+        ack: u32,
+        state: ConnState,
+    }
     let snap = {
         let mut conns = shared.conns.lock().unwrap();
         if flags & 0x04 != 0 {
@@ -2141,10 +2515,15 @@ fn handle_tcp(family: IpFamily, tcp: &[u8]) {
                     // default FIN-ACK dance, mirroring what the guest
                     // just sent. Without this the host TCP socket
                     // sits in ESTABLISHED until keepalive (minutes).
-                    let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+                    let linger = libc::linger {
+                        l_onoff: 1,
+                        l_linger: 0,
+                    };
                     unsafe {
                         libc::setsockopt(
-                            c.host_fd, libc::SOL_SOCKET, libc::SO_LINGER,
+                            c.host_fd,
+                            libc::SOL_SOCKET,
+                            libc::SO_LINGER,
                             &linger as *const _ as *const _,
                             std::mem::size_of::<libc::linger>() as u32,
                         );
@@ -2157,11 +2536,16 @@ fn handle_tcp(family: IpFamily, tcp: &[u8]) {
             return;
         }
         let c = match conns.get_mut(&dst_port) {
-            Some(c) => c, None => return,
+            Some(c) => c,
+            None => return,
         };
         let s = TxSnap {
-            fd: c.host_fd, port: c.src_port, guest_port: c.guest_port,
-            seq: c.my_seq, ack: c.peer_ack, state: c.state,
+            fd: c.host_fd,
+            port: c.src_port,
+            guest_port: c.guest_port,
+            seq: c.my_seq,
+            ack: c.peer_ack,
+            state: c.state,
         };
         // Update state eagerly (before dropping lock).
         match c.state {
@@ -2179,7 +2563,9 @@ fn handle_tcp(family: IpFamily, tcp: &[u8]) {
                     c.peer_ack = c.peer_ack.wrapping_add(1);
                     c.my_seq = c.my_seq.wrapping_add(1);
                     c.state = ConnState::Closed;
-                    unsafe { libc::close(c.host_fd); }
+                    unsafe {
+                        libc::close(c.host_fd);
+                    }
                     c.host_fd = -1;
                 }
             }
@@ -2193,11 +2579,15 @@ fn handle_tcp(family: IpFamily, tcp: &[u8]) {
         let mut written = 0usize;
         while written < payload.len() {
             let n = unsafe {
-                libc::write(snap.fd,
+                libc::write(
+                    snap.fd,
                     payload.as_ptr().add(written) as *const _,
-                    payload.len() - written)
+                    payload.len() - written,
+                )
             };
-            if n <= 0 { break; }
+            if n <= 0 {
+                break;
+            }
             written += n as usize;
         }
     }
@@ -2208,22 +2598,20 @@ fn handle_tcp(family: IpFamily, tcp: &[u8]) {
         ConnState::SynSent => {
             if flags & 0x12 == 0x12 {
                 let ack = seq.wrapping_add(1);
-                let f = build_tcp_reply(family,
-                    snap.port, snap.guest_port, snap.seq, ack, 0x10, &[]);
+                let f =
+                    build_tcp_reply(family, snap.port, snap.guest_port, snap.seq, ack, 0x10, &[]);
                 replies.push_back(f);
             }
         }
         ConnState::Established => {
             if !payload.is_empty() {
                 let ack = seq.wrapping_add(payload.len() as u32);
-                let f = build_tcp_reply(family,
-                    snap.port, src_port, snap.seq, ack, 0x10, &[]);
+                let f = build_tcp_reply(family, snap.port, src_port, snap.seq, ack, 0x10, &[]);
                 replies.push_back(f);
             }
             if flags & 0x01 != 0 {
                 let ack = snap.ack.wrapping_add(1);
-                let f = build_tcp_reply(family,
-                    snap.port, src_port, snap.seq, ack, 0x11, &[]);
+                let f = build_tcp_reply(family, snap.port, src_port, snap.seq, ack, 0x11, &[]);
                 replies.push_back(f);
             }
         }
@@ -2232,7 +2620,9 @@ fn handle_tcp(family: IpFamily, tcp: &[u8]) {
 }
 
 fn handle_udp(udp: &[u8], _src_ip: [u8; 4], dst_ip: [u8; 4]) {
-    if udp.len() < 8 { return; }
+    if udp.len() < 8 {
+        return;
+    }
     let src_port = u16::from_be_bytes([udp[0], udp[1]]);
     let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
     // DHCP: guest port 68 → server port 67.
@@ -2241,15 +2631,17 @@ fn handle_udp(udp: &[u8], _src_ip: [u8; 4], dst_ip: [u8; 4]) {
         return;
     }
     let payload = &udp[8..];
-    if payload.is_empty() { return; }
+    if payload.is_empty() {
+        return;
+    }
 
     // First try the inbound-relay reply path: the guest is replying
     // to a client whose datagram came in via one of our `-p udp:H:G`
     // mappings. Match by `src_port == guest_port` of a relay entry.
     let vcpu_id = CURRENT_VCPU.with(|c| c.get());
-    let inbound = UDP_RELAYS.get().and_then(|table| {
-        table.iter().find(|r| r.guest_port == src_port)
-    });
+    let inbound = UDP_RELAYS
+        .get()
+        .and_then(|table| table.iter().find(|r| r.guest_port == src_port));
     if let Some(relay) = inbound {
         // Per-vCPU sibling fd; fall back to sibling 0 if the
         // vCPU id is out of range (shouldn't happen).
@@ -2263,9 +2655,14 @@ fn handle_udp(udp: &[u8], _src_ip: [u8; 4], dst_ip: [u8; 4]) {
         };
         if let Some(addr) = client_addr {
             unsafe {
-                libc::sendto(fd, payload.as_ptr() as *const _, payload.len(),
-                    0, &addr as *const _ as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in>() as u32);
+                libc::sendto(
+                    fd,
+                    payload.as_ptr() as *const _,
+                    payload.len(),
+                    0,
+                    &addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as u32,
+                );
             }
         }
         return;
@@ -2288,12 +2685,7 @@ fn handle_udp(udp: &[u8], _src_ip: [u8; 4], dst_ip: [u8; 4]) {
 /// (`dst_ip`, `dst_port`) so when the host's reply lands on the fd
 /// we can rebuild a UDP frame that the guest will accept (`src_ip`
 /// = original dst, `src_port` = original dst_port, `dst` = guest).
-fn handle_udp_outbound(
-    guest_src_port: u16,
-    dst_ip: [u8; 4],
-    dst_port: u16,
-    payload: &[u8],
-) {
+fn handle_udp_outbound(guest_src_port: u16, dst_ip: [u8; 4], dst_port: u16, payload: &[u8]) {
     let vcpu_id = CURRENT_VCPU.with(|c| c.get());
     let vcpu_ios = match VCPU_IOS.get() {
         Some(v) => v,
@@ -2311,14 +2703,19 @@ fn handle_udp_outbound(
         }
         None => unsafe {
             let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
-            if fd < 0 { return; }
+            if fd < 0 {
+                return;
+            }
             let flags = libc::fcntl(fd, libc::F_GETFL, 0);
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            io.outbound_udp.insert(guest_src_port, OutboundUdp {
-                fd,
-                last_dst_ip: dst_ip,
-                last_dst_port: dst_port,
-            });
+            io.outbound_udp.insert(
+                guest_src_port,
+                OutboundUdp {
+                    fd,
+                    last_dst_ip: dst_ip,
+                    last_dst_port: dst_port,
+                },
+            );
             fd
         },
     };
@@ -2356,56 +2753,87 @@ fn handle_udp_outbound(
 }
 
 fn handle_dhcp(bootp: &[u8]) {
-    if bootp.len() < 240 { return; }
+    if bootp.len() < 240 {
+        return;
+    }
     let mut msg_type: u8 = 0;
     let mut i = 240;
     while i < bootp.len() {
         let opt = bootp[i];
-        if opt == 255 { break; } if opt == 0 { i += 1; continue; }
-        if i + 1 >= bootp.len() { break; }
+        if opt == 255 {
+            break;
+        }
+        if opt == 0 {
+            i += 1;
+            continue;
+        }
+        if i + 1 >= bootp.len() {
+            break;
+        }
         let len = bootp[i + 1] as usize;
-        if i + 2 + len > bootp.len() { break; }
-        if opt == 53 && len >= 1 { msg_type = bootp[i + 2]; }
+        if i + 2 + len > bootp.len() {
+            break;
+        }
+        if opt == 53 && len >= 1 {
+            msg_type = bootp[i + 2];
+        }
         i += 2 + len;
     }
-    if msg_type != 1 && msg_type != 3 { return; }
+    if msg_type != 1 && msg_type != 3 {
+        return;
+    }
     let reply_type: u8 = if msg_type == 1 { 2 } else { 5 };
     let guest_mac: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
     // Build DHCP reply directly in a TxFrame (cold path, boot only).
-    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, };
+    let mut f = TxFrame {
+        data: [0u8; MAX_REPLY_FRAME],
+        len: 0,
+    };
     let b = &mut f.data;
     let mut o = VIRTIO_NET_HDR_SIZE; // skip virtio-net hdr (zeroed)
-    b[o..o+6].fill(0xff); o += 6; b[o..o+6].copy_from_slice(&GW_MAC); o += 6;
-    b[o..o+2].copy_from_slice(&0x0800u16.to_be_bytes()); o += 2;
-    let ip_start = o; o += 20; // IP header (filled below)
-    let udp_start = o; o += 8; // UDP header (filled below)
-    let bp = o; o += 236; // BOOTP reply
-    b[bp] = 2; b[bp+1] = 1; b[bp+2] = 6;
-    b[bp+4..bp+8].copy_from_slice(&bootp[4..8]);
-    b[bp+16..bp+20].copy_from_slice(&VM_IP); b[bp+20..bp+24].copy_from_slice(&GW_IP);
-    b[bp+28..bp+34].copy_from_slice(&guest_mac);
+    b[o..o + 6].fill(0xff);
+    o += 6;
+    b[o..o + 6].copy_from_slice(&GW_MAC);
+    o += 6;
+    b[o..o + 2].copy_from_slice(&0x0800u16.to_be_bytes());
+    o += 2;
+    let ip_start = o;
+    o += 20; // IP header (filled below)
+    let udp_start = o;
+    o += 8; // UDP header (filled below)
+    let bp = o;
+    o += 236; // BOOTP reply
+    b[bp] = 2;
+    b[bp + 1] = 1;
+    b[bp + 2] = 6;
+    b[bp + 4..bp + 8].copy_from_slice(&bootp[4..8]);
+    b[bp + 16..bp + 20].copy_from_slice(&VM_IP);
+    b[bp + 20..bp + 24].copy_from_slice(&GW_IP);
+    b[bp + 28..bp + 34].copy_from_slice(&guest_mac);
     // DHCP options
     let opts: &[u8] = &[
-        99,130,83,99, 53,1,reply_type,
-        54,4,GW_IP[0],GW_IP[1],GW_IP[2],GW_IP[3],
-        51,4,0,1,0x51,0x80, 1,4,255,255,255,0,
-        3,4,GW_IP[0],GW_IP[1],GW_IP[2],GW_IP[3],
-        6,4,10,0,2,3, 255,
+        99, 130, 83, 99, 53, 1, reply_type, 54, 4, GW_IP[0], GW_IP[1], GW_IP[2], GW_IP[3], 51, 4,
+        0, 1, 0x51, 0x80, 1, 4, 255, 255, 255, 0, 3, 4, GW_IP[0], GW_IP[1], GW_IP[2], GW_IP[3], 6,
+        4, 10, 0, 2, 3, 255,
     ];
-    b[o..o+opts.len()].copy_from_slice(opts); o += opts.len();
+    b[o..o + opts.len()].copy_from_slice(opts);
+    o += opts.len();
     // Fill UDP header
     let ul = (o - udp_start) as u16;
-    b[udp_start..udp_start+2].copy_from_slice(&67u16.to_be_bytes());
-    b[udp_start+2..udp_start+4].copy_from_slice(&68u16.to_be_bytes());
-    b[udp_start+4..udp_start+6].copy_from_slice(&ul.to_be_bytes());
+    b[udp_start..udp_start + 2].copy_from_slice(&67u16.to_be_bytes());
+    b[udp_start + 2..udp_start + 4].copy_from_slice(&68u16.to_be_bytes());
+    b[udp_start + 4..udp_start + 6].copy_from_slice(&ul.to_be_bytes());
     // Fill IP header
     let it = (o - ip_start) as u16;
-    b[ip_start] = 0x45; b[ip_start+2..ip_start+4].copy_from_slice(&it.to_be_bytes());
-    b[ip_start+6] = 0x40; b[ip_start+8] = 64; b[ip_start+9] = 17;
-    b[ip_start+12..ip_start+16].copy_from_slice(&GW_IP);
-    b[ip_start+16..ip_start+20].copy_from_slice(&BROADCAST_IP);
-    let cs = ipv4_checksum(&b[ip_start..ip_start+20]);
-    b[ip_start+10..ip_start+12].copy_from_slice(&cs.to_be_bytes());
+    b[ip_start] = 0x45;
+    b[ip_start + 2..ip_start + 4].copy_from_slice(&it.to_be_bytes());
+    b[ip_start + 6] = 0x40;
+    b[ip_start + 8] = 64;
+    b[ip_start + 9] = 17;
+    b[ip_start + 12..ip_start + 16].copy_from_slice(&GW_IP);
+    b[ip_start + 16..ip_start + 20].copy_from_slice(&BROADCAST_IP);
+    let cs = ipv4_checksum(&b[ip_start..ip_start + 20]);
+    b[ip_start + 10..ip_start + 12].copy_from_slice(&cs.to_be_bytes());
     f.len = o as u16;
     my_worker_shared().tx_replies.lock().unwrap().push_back(f);
 }
@@ -2413,20 +2841,35 @@ fn handle_dhcp(bootp: &[u8]) {
 // ── Packet construction ─────────────────────────────────────────────────────
 
 fn build_grat_arp_frame(mac: &[u8; 6]) -> TxFrame {
-    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, };
+    let mut f = TxFrame {
+        data: [0u8; MAX_REPLY_FRAME],
+        len: 0,
+    };
     let b = &mut f.data;
     let mut o = VIRTIO_NET_HDR_SIZE; // virtio-net hdr (zeroed)
-    b[o..o+6].fill(0xff); o += 6;
-    b[o..o+6].copy_from_slice(&GW_MAC); o += 6;
-    b[o..o+2].copy_from_slice(&0x0806u16.to_be_bytes()); o += 2;
-    b[o..o+2].copy_from_slice(&1u16.to_be_bytes()); o += 2;
-    b[o..o+2].copy_from_slice(&0x0800u16.to_be_bytes()); o += 2;
-    b[o] = 6; b[o+1] = 4; o += 2;
-    b[o..o+2].copy_from_slice(&2u16.to_be_bytes()); o += 2;
-    b[o..o+6].copy_from_slice(&GW_MAC); o += 6;
-    b[o..o+4].copy_from_slice(&GW_IP); o += 4;
-    b[o..o+6].copy_from_slice(mac); o += 6;
-    b[o..o+4].copy_from_slice(&GW_IP); o += 4;
+    b[o..o + 6].fill(0xff);
+    o += 6;
+    b[o..o + 6].copy_from_slice(&GW_MAC);
+    o += 6;
+    b[o..o + 2].copy_from_slice(&0x0806u16.to_be_bytes());
+    o += 2;
+    b[o..o + 2].copy_from_slice(&1u16.to_be_bytes());
+    o += 2;
+    b[o..o + 2].copy_from_slice(&0x0800u16.to_be_bytes());
+    o += 2;
+    b[o] = 6;
+    b[o + 1] = 4;
+    o += 2;
+    b[o..o + 2].copy_from_slice(&2u16.to_be_bytes());
+    o += 2;
+    b[o..o + 6].copy_from_slice(&GW_MAC);
+    o += 6;
+    b[o..o + 4].copy_from_slice(&GW_IP);
+    o += 4;
+    b[o..o + 6].copy_from_slice(mac);
+    o += 6;
+    b[o..o + 4].copy_from_slice(&GW_IP);
+    o += 4;
     f.len = o as u16;
     f
 }
@@ -2448,9 +2891,17 @@ fn build_grat_arp_frame(mac: &[u8; 6]) -> TxFrame {
 /// into `buf` starting at offset 0 and return the byte count
 /// written. `addrs` selects v4 vs v6 layout + checksum form;
 /// `dst_mac` is the guest MAC (we always use `GW_MAC` as source).
-fn write_tcp_frame(buf: &mut [u8], dst_mac: &[u8; 6], addrs: &IpAddrPair,
-    src_port: u16, dst_port: u16, seq: u32, ack: u32,
-    flags: u8, payload: &[u8]) -> usize {
+fn write_tcp_frame(
+    buf: &mut [u8],
+    dst_mac: &[u8; 6],
+    addrs: &IpAddrPair,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+) -> usize {
     let tcp_len = 20 + payload.len();
     let total = VIRTIO_NET_HDR_SIZE + 14 + addrs.ip_hdr_len() + tcp_len;
     debug_assert!(total <= buf.len());
@@ -2458,9 +2909,12 @@ fn write_tcp_frame(buf: &mut [u8], dst_mac: &[u8; 6], addrs: &IpAddrPair,
     // virtio-net header (12 zero bytes) + Ethernet header.
     buf[..VIRTIO_NET_HDR_SIZE].fill(0);
     let mut o = VIRTIO_NET_HDR_SIZE;
-    buf[o..o + 6].copy_from_slice(dst_mac); o += 6;
-    buf[o..o + 6].copy_from_slice(&GW_MAC); o += 6;
-    buf[o..o + 2].copy_from_slice(&addrs.ethertype().to_be_bytes()); o += 2;
+    buf[o..o + 6].copy_from_slice(dst_mac);
+    o += 6;
+    buf[o..o + 6].copy_from_slice(&GW_MAC);
+    o += 6;
+    buf[o..o + 2].copy_from_slice(&addrs.ethertype().to_be_bytes());
+    o += 2;
 
     // IP header (family-specific layout + v4 csum).
     let ip_len = addrs.ip_hdr_len();
@@ -2484,9 +2938,17 @@ fn write_tcp_frame(buf: &mut [u8], dst_mac: &[u8; 6], addrs: &IpAddrPair,
 /// straight into guest RAM). Only the prefix headers are written
 /// here, then the TCP checksum is patched over header + payload.
 /// Returns total frame length.
-fn write_tcp_frame_around_payload(buf: *mut u8, dst_mac: &[u8; 6],
-    addrs: &IpAddrPair, src_port: u16, dst_port: u16,
-    seq: u32, ack: u32, flags: u8, payload_len: usize) -> usize {
+fn write_tcp_frame_around_payload(
+    buf: *mut u8,
+    dst_mac: &[u8; 6],
+    addrs: &IpAddrPair,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload_len: usize,
+) -> usize {
     let tcp_len = 20 + payload_len;
     let hdr_total = VIRTIO_NET_HDR_SIZE + 14 + addrs.ip_hdr_len() + 20;
     let total = hdr_total + payload_len;
@@ -2495,8 +2957,9 @@ fn write_tcp_frame_around_payload(buf: *mut u8, dst_mac: &[u8; 6],
     // caller's read(2). SAFETY: caller guarantees `buf[..hdr_total
     // + payload_len]` is a valid mutable region in guest RAM.
     let prefix = unsafe { std::slice::from_raw_parts_mut(buf, hdr_total) };
-    write_tcp_headers_only(prefix, dst_mac, addrs, src_port, dst_port,
-                           seq, ack, flags, tcp_len);
+    write_tcp_headers_only(
+        prefix, dst_mac, addrs, src_port, dst_port, seq, ack, flags, tcp_len,
+    );
     // Patch the TCP checksum over [TCP-hdr || payload].
     let tcp_start = VIRTIO_NET_HDR_SIZE + 14 + addrs.ip_hdr_len();
     let tcp_seg = unsafe { std::slice::from_raw_parts(buf.add(tcp_start), tcp_len) };
@@ -2512,8 +2975,7 @@ fn write_tcp_frame_around_payload(buf: *mut u8, dst_mac: &[u8; 6],
 /// checksum field zeroed for the caller to patch once payload is
 /// in place.
 #[inline]
-fn write_tcp_header(buf: &mut [u8], src_port: u16, dst_port: u16,
-                    seq: u32, ack: u32, flags: u8) {
+fn write_tcp_header(buf: &mut [u8], src_port: u16, dst_port: u16, seq: u32, ack: u32, flags: u8) {
     buf[0..2].copy_from_slice(&src_port.to_be_bytes());
     buf[2..4].copy_from_slice(&dst_port.to_be_bytes());
     buf[4..8].copy_from_slice(&seq.to_be_bytes());
@@ -2527,14 +2989,25 @@ fn write_tcp_header(buf: &mut [u8], src_port: u16, dst_port: u16,
 /// Write `[virtio_net_hdr | Eth | IP | TCP]` into `buf[..hdr_total]`,
 /// with the TCP checksum left as zero. Caller patches the
 /// checksum once the payload is in place.
-fn write_tcp_headers_only(buf: &mut [u8], dst_mac: &[u8; 6],
-                          addrs: &IpAddrPair, src_port: u16, dst_port: u16,
-                          seq: u32, ack: u32, flags: u8, tcp_len: usize) {
+fn write_tcp_headers_only(
+    buf: &mut [u8],
+    dst_mac: &[u8; 6],
+    addrs: &IpAddrPair,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    tcp_len: usize,
+) {
     buf[..VIRTIO_NET_HDR_SIZE].fill(0);
     let mut o = VIRTIO_NET_HDR_SIZE;
-    buf[o..o + 6].copy_from_slice(dst_mac); o += 6;
-    buf[o..o + 6].copy_from_slice(&GW_MAC); o += 6;
-    buf[o..o + 2].copy_from_slice(&addrs.ethertype().to_be_bytes()); o += 2;
+    buf[o..o + 6].copy_from_slice(dst_mac);
+    o += 6;
+    buf[o..o + 6].copy_from_slice(&GW_MAC);
+    o += 6;
+    buf[o..o + 2].copy_from_slice(&addrs.ethertype().to_be_bytes());
+    o += 2;
     let ip_len = addrs.ip_hdr_len();
     addrs.write_ip_header(&mut buf[o..o + ip_len], tcp_len);
     o += ip_len;
@@ -2544,47 +3017,99 @@ fn write_tcp_headers_only(buf: &mut [u8], dst_mac: &[u8; 6],
 /// `TxFrame` wrapper: stack-only allocation, fills with
 /// `write_tcp_frame` and returns the populated frame. Used by
 /// `build_tcp_reply` to avoid heap churn on every reply.
-fn build_tcp_frame_fixed(dst_mac: &[u8; 6], addrs: &IpAddrPair,
-    src_port: u16, dst_port: u16, seq: u32, ack: u32,
-    flags: u8, payload: &[u8]) -> TxFrame {
-    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0 };
-    f.len = write_tcp_frame(&mut f.data, dst_mac, addrs,
-        src_port, dst_port, seq, ack, flags, payload) as u16;
+fn build_tcp_frame_fixed(
+    dst_mac: &[u8; 6],
+    addrs: &IpAddrPair,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+) -> TxFrame {
+    let mut f = TxFrame {
+        data: [0u8; MAX_REPLY_FRAME],
+        len: 0,
+    };
+    f.len = write_tcp_frame(
+        &mut f.data,
+        dst_mac,
+        addrs,
+        src_port,
+        dst_port,
+        seq,
+        ack,
+        flags,
+        payload,
+    ) as u16;
     f
 }
 
 /// Family-aware reply-frame builder. Both `GW_*`/`VM_*` constants
 /// and `GUEST_MAC` are runner-fixed, so the family alone fully
 /// determines which addressing pair to use.
-fn build_tcp_reply(family: IpFamily,
-    src_port: u16, dst_port: u16, seq: u32, ack: u32,
-    flags: u8, payload: &[u8]) -> TxFrame {
+fn build_tcp_reply(
+    family: IpFamily,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+) -> TxFrame {
     let addrs = match family {
-        IpFamily::V4 => IpAddrPair::V4 { src: GW_IP, dst: VM_IP },
-        IpFamily::V6 => IpAddrPair::V6 { src: GW_IPV6, dst: VM_IPV6 },
+        IpFamily::V4 => IpAddrPair::V4 {
+            src: GW_IP,
+            dst: VM_IP,
+        },
+        IpFamily::V6 => IpAddrPair::V6 {
+            src: GW_IPV6,
+            dst: VM_IPV6,
+        },
     };
-    build_tcp_frame_fixed(&GUEST_MAC, &addrs, src_port, dst_port,
-                          seq, ack, flags, payload)
+    build_tcp_frame_fixed(
+        &GUEST_MAC, &addrs, src_port, dst_port, seq, ack, flags, payload,
+    )
 }
 
 /// Build a guest-bound UDP frame using the saved outbound-NAT
 /// destination as the apparent source. Used by the outbound-UDP
 /// reply drain to synthesise replies the guest's IP stack will
 /// accept (matching the original destination 4-tuple).
-fn build_udp_frame_in(dst_mac: &[u8; 6],
-    src_ip: [u8; 4], src_port: u16,
-    guest_dst_port: u16, payload: &[u8]) -> TxFrame {
-    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, };
-    f.len = build_udp_frame(&mut f.data, dst_mac,
-        src_ip, VM_IP, src_port, guest_dst_port, payload) as u16;
+fn build_udp_frame_in(
+    dst_mac: &[u8; 6],
+    src_ip: [u8; 4],
+    src_port: u16,
+    guest_dst_port: u16,
+    payload: &[u8],
+) -> TxFrame {
+    let mut f = TxFrame {
+        data: [0u8; MAX_REPLY_FRAME],
+        len: 0,
+    };
+    f.len = build_udp_frame(
+        &mut f.data,
+        dst_mac,
+        src_ip,
+        VM_IP,
+        src_port,
+        guest_dst_port,
+        payload,
+    ) as u16;
     f
 }
 
 /// Build a UDP frame: [virtio_net_hdr 12B][Eth 14B][IP 20B][UDP 8B][payload].
 /// Returns total frame length written into `buf`.
-fn build_udp_frame(buf: &mut [u8], dst_mac: &[u8; 6],
-    src_ip: [u8; 4], dst_ip: [u8; 4],
-    src_port: u16, dst_port: u16, payload: &[u8]) -> usize {
+fn build_udp_frame(
+    buf: &mut [u8],
+    dst_mac: &[u8; 6],
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> usize {
     let udp_len = 8 + payload.len();
     let ip_total = 20 + udp_len;
     let total = VIRTIO_NET_HDR_SIZE + 14 + ip_total;
@@ -2595,63 +3120,111 @@ fn build_udp_frame(buf: &mut [u8], dst_mac: &[u8; 6],
     let mut o = VIRTIO_NET_HDR_SIZE;
 
     // Ethernet header.
-    buf[o..o+6].copy_from_slice(dst_mac); o += 6;
-    buf[o..o+6].copy_from_slice(&GW_MAC); o += 6;
-    buf[o..o+2].copy_from_slice(&0x0800u16.to_be_bytes()); o += 2;
+    buf[o..o + 6].copy_from_slice(dst_mac);
+    o += 6;
+    buf[o..o + 6].copy_from_slice(&GW_MAC);
+    o += 6;
+    buf[o..o + 2].copy_from_slice(&0x0800u16.to_be_bytes());
+    o += 2;
 
     // IPv4 header.
     let is = o;
-    buf[o] = 0x45; buf[o+1] = 0; o += 2;
-    buf[o..o+2].copy_from_slice(&(ip_total as u16).to_be_bytes()); o += 2;
-    buf[o..o+4].copy_from_slice(&[0,0,0x40,0]); o += 4; // id=0, DF, frag=0
-    buf[o] = 64; buf[o+1] = 17; o += 2; // TTL=64, protocol=UDP
-    buf[o..o+2].fill(0); o += 2; // checksum placeholder
-    buf[o..o+4].copy_from_slice(&src_ip); o += 4;
-    buf[o..o+4].copy_from_slice(&dst_ip); o += 4;
-    let cs = ipv4_checksum(&buf[is..is+20]);
-    buf[is+10] = (cs >> 8) as u8; buf[is+11] = (cs & 0xff) as u8;
+    buf[o] = 0x45;
+    buf[o + 1] = 0;
+    o += 2;
+    buf[o..o + 2].copy_from_slice(&(ip_total as u16).to_be_bytes());
+    o += 2;
+    buf[o..o + 4].copy_from_slice(&[0, 0, 0x40, 0]);
+    o += 4; // id=0, DF, frag=0
+    buf[o] = 64;
+    buf[o + 1] = 17;
+    o += 2; // TTL=64, protocol=UDP
+    buf[o..o + 2].fill(0);
+    o += 2; // checksum placeholder
+    buf[o..o + 4].copy_from_slice(&src_ip);
+    o += 4;
+    buf[o..o + 4].copy_from_slice(&dst_ip);
+    o += 4;
+    let cs = ipv4_checksum(&buf[is..is + 20]);
+    buf[is + 10] = (cs >> 8) as u8;
+    buf[is + 11] = (cs & 0xff) as u8;
 
     // UDP header.
     let us = o;
-    buf[o..o+2].copy_from_slice(&src_port.to_be_bytes()); o += 2;
-    buf[o..o+2].copy_from_slice(&dst_port.to_be_bytes()); o += 2;
-    buf[o..o+2].copy_from_slice(&(udp_len as u16).to_be_bytes()); o += 2;
-    buf[o..o+2].fill(0); o += 2; // checksum placeholder
-    buf[o..o+payload.len()].copy_from_slice(payload);
-    let uc = udp_checksum(&src_ip, &dst_ip, &buf[us..us+udp_len]);
-    buf[us+6] = (uc >> 8) as u8; buf[us+7] = (uc & 0xff) as u8;
+    buf[o..o + 2].copy_from_slice(&src_port.to_be_bytes());
+    o += 2;
+    buf[o..o + 2].copy_from_slice(&dst_port.to_be_bytes());
+    o += 2;
+    buf[o..o + 2].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    o += 2;
+    buf[o..o + 2].fill(0);
+    o += 2; // checksum placeholder
+    buf[o..o + payload.len()].copy_from_slice(payload);
+    let uc = udp_checksum(&src_ip, &dst_ip, &buf[us..us + udp_len]);
+    buf[us + 6] = (uc >> 8) as u8;
+    buf[us + 7] = (uc & 0xff) as u8;
 
     total
 }
 
 fn udp_checksum(si: &[u8; 4], di: &[u8; 4], seg: &[u8]) -> u16 {
     let mut s: u32 = 0;
-    s += ((si[0] as u32)<<8)|si[1] as u32; s += ((si[2] as u32)<<8)|si[3] as u32;
-    s += ((di[0] as u32)<<8)|di[1] as u32; s += ((di[2] as u32)<<8)|di[3] as u32;
+    s += ((si[0] as u32) << 8) | si[1] as u32;
+    s += ((si[2] as u32) << 8) | si[3] as u32;
+    s += ((di[0] as u32) << 8) | di[1] as u32;
+    s += ((di[2] as u32) << 8) | di[3] as u32;
     s += 17; // protocol = UDP
     s += seg.len() as u32;
     let mut i = 0;
-    while i+1 < seg.len() { s += ((seg[i] as u32)<<8)|seg[i+1] as u32; i += 2; }
-    if i < seg.len() { s += (seg[i] as u32) << 8; }
-    while s >> 16 != 0 { s = (s & 0xffff) + (s >> 16); }
+    while i + 1 < seg.len() {
+        s += ((seg[i] as u32) << 8) | seg[i + 1] as u32;
+        i += 2;
+    }
+    if i < seg.len() {
+        s += (seg[i] as u32) << 8;
+    }
+    while s >> 16 != 0 {
+        s = (s & 0xffff) + (s >> 16);
+    }
     let r = !(s as u16);
     // UDP checksum of 0x0000 is transmitted as 0xFFFF (RFC 768).
     if r == 0 { 0xffff } else { r }
 }
 
 fn ipv4_checksum(h: &[u8]) -> u16 {
-    let mut s: u32 = 0; let mut i = 0;
-    while i+1 < h.len() { s += ((h[i] as u32) << 8) | h[i+1] as u32; i += 2; }
-    if i < h.len() { s += (h[i] as u32) << 8; }
-    while s >> 16 != 0 { s = (s & 0xffff) + (s >> 16); } !(s as u16)
+    let mut s: u32 = 0;
+    let mut i = 0;
+    while i + 1 < h.len() {
+        s += ((h[i] as u32) << 8) | h[i + 1] as u32;
+        i += 2;
+    }
+    if i < h.len() {
+        s += (h[i] as u32) << 8;
+    }
+    while s >> 16 != 0 {
+        s = (s & 0xffff) + (s >> 16);
+    }
+    !(s as u16)
 }
 
 fn tcp_checksum(si: &[u8; 4], di: &[u8; 4], seg: &[u8]) -> u16 {
     let mut s: u32 = 0;
-    s += ((si[0] as u32)<<8)|si[1] as u32; s += ((si[2] as u32)<<8)|si[3] as u32;
-    s += ((di[0] as u32)<<8)|di[1] as u32; s += ((di[2] as u32)<<8)|di[3] as u32;
-    s += 6; s += seg.len() as u32; let mut i = 0;
-    while i+1 < seg.len() { s += ((seg[i] as u32)<<8)|seg[i+1] as u32; i += 2; }
-    if i < seg.len() { s += (seg[i] as u32) << 8; }
-    while s >> 16 != 0 { s = (s & 0xffff) + (s >> 16); } !(s as u16)
+    s += ((si[0] as u32) << 8) | si[1] as u32;
+    s += ((si[2] as u32) << 8) | si[3] as u32;
+    s += ((di[0] as u32) << 8) | di[1] as u32;
+    s += ((di[2] as u32) << 8) | di[3] as u32;
+    s += 6;
+    s += seg.len() as u32;
+    let mut i = 0;
+    while i + 1 < seg.len() {
+        s += ((seg[i] as u32) << 8) | seg[i + 1] as u32;
+        i += 2;
+    }
+    if i < seg.len() {
+        s += (seg[i] as u32) << 8;
+    }
+    while s >> 16 != 0 {
+        s = (s & 0xffff) + (s >> 16);
+    }
+    !(s as u16)
 }

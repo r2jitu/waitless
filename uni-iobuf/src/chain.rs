@@ -65,7 +65,10 @@ enum Repr<B: IOBufRead> {
     /// O(1). After pops or `clear`, `parts` may transiently hold 0
     /// or 1 entries: the `VecDeque` allocation is kept for reuse
     /// rather than demoted back to `Single` / `Empty`.
-    Many { parts: VecDeque<B>, total_len: usize },
+    Many {
+        parts: VecDeque<B>,
+        total_len: usize,
+    },
 }
 
 /// `VecDeque` capacity reserved when a `Single` chain first upgrades
@@ -608,7 +611,14 @@ mod tests {
         // offset 0 + len cap fits the capacity.
         unsafe {
             let base = NonNull::new_unchecked(raw as *mut u8);
-            OwnedIOBuf::wrap_owned(base, cap, 0, cap, free_box as IOBufDropFn, core::ptr::null_mut())
+            OwnedIOBuf::wrap_owned(
+                base,
+                cap,
+                0,
+                cap,
+                free_box as IOBufDropFn,
+                core::ptr::null_mut(),
+            )
         }
     }
 

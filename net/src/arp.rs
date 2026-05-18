@@ -2,18 +2,18 @@
 
 #![no_std]
 
-extern crate uni_kernel;
+extern crate net_ethernet as ethernet;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
-extern crate net_ethernet as ethernet;
 extern crate uni_drivers;
 extern crate uni_iobuf;
+extern crate uni_kernel;
 
-use uni_iobuf::{Chain, OwnedIOBuf};
+use ethernet::{ETHERTYPE_ARP, ethernet_our_mac, ethernet_parse, ethernet_send};
 use from_bytes::FromBytes;
+use types::{CONFIG, Ipv4Addr, MacAddr, htons, ntohs};
+use uni_iobuf::{Chain, OwnedIOBuf};
 use uni_kernel::sync::Spinlock;
-use types::{MacAddr, Ipv4Addr, CONFIG, htons, ntohs};
-use ethernet::{ethernet_our_mac, ethernet_send, ethernet_parse, ETHERTYPE_ARP};
 
 const ARP_CACHE_SIZE: usize = 64;
 
@@ -106,11 +106,19 @@ impl ArpCache {
         }
         for entry in &mut self.entries {
             if !entry.valid {
-                *entry = ArpEntry { ip, mac, valid: true };
+                *entry = ArpEntry {
+                    ip,
+                    mac,
+                    valid: true,
+                };
                 return;
             }
         }
-        self.entries[0] = ArpEntry { ip, mac, valid: true };
+        self.entries[0] = ArpEntry {
+            ip,
+            mac,
+            valid: true,
+        };
     }
 }
 
@@ -144,8 +152,7 @@ struct ArpFastSlot {
 }
 
 /// Per-core fast cache slots, sized to actual core count at boot.
-static ARP_FAST: uni_kernel::percpu::PerWorker<ArpFastSlot> =
-    uni_kernel::percpu::PerWorker::new();
+static ARP_FAST: uni_kernel::percpu::PerWorker<ArpFastSlot> = uni_kernel::percpu::PerWorker::new();
 
 /// Allocate the per-core ARP fast cache. Called from the net stack's
 /// init path on the BSP after `uni_kernel::percpu::init` has set
@@ -219,7 +226,6 @@ fn arp_fast_store(ip: Ipv4Addr, mac: MacAddr) {
     slot.mac.store(pack_mac(mac), Ordering::Relaxed);
     slot.ip.store(ip.addr, Ordering::Release);
 }
-
 
 fn arp_request(target_ip: Ipv4Addr) {
     let our_mac = ethernet_our_mac();

@@ -5,9 +5,9 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::serial;
-use crate::mm;
 use super::exceptions;
+use crate::mm;
+use crate::serial;
 
 /// Per-core stack size: 64KB (16 pages).
 const AP_STACK_SIZE: usize = 64 * 1024;
@@ -108,7 +108,9 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
 
         // Start the AP at the assembly trampoline (handles MMU + VBAR setup).
         // stack_top passed as context_id (x0 when AP starts).
-        unsafe extern "C" { fn ap_trampoline(); }
+        unsafe extern "C" {
+            fn ap_trampoline();
+        }
         // Cast through a function pointer first; rust 1.93+ rejects
         // casting a function item directly to an integer.
         let entry = ap_trampoline as unsafe extern "C" fn() as u64;
@@ -144,7 +146,9 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
         let before = NUM_CORES_ONLINE.load(Ordering::Acquire);
         let _ = psci_cpu_on(i as u64, entry, stack_top);
         for _ in 0..500 {
-            if NUM_CORES_ONLINE.load(Ordering::Acquire) > before { break; }
+            if NUM_CORES_ONLINE.load(Ordering::Acquire) > before {
+                break;
+            }
             crate::time::udelay(100); // 100 µs × 500 = 50 ms cap
         }
         if NUM_CORES_ONLINE.load(Ordering::Acquire) <= before {
@@ -179,9 +183,15 @@ unsafe extern "C" fn ap_entry(_stack_top: u64) -> ! {
         let id = cpu_id();
         let mut buf = [0u8; 24];
         let mut pos = 0;
-        for &b in b"[SMP] core " { buf[pos] = b; pos += 1; }
+        for &b in b"[SMP] core " {
+            buf[pos] = b;
+            pos += 1;
+        }
         pos += fmt_u32(&mut buf[pos..], id);
-        for &b in b" online\n" { buf[pos] = b; pos += 1; }
+        for &b in b" online\n" {
+            buf[pos] = b;
+            pos += 1;
+        }
         serial::puts(&buf[..pos]);
 
         // Enter the unified kernel event loop.

@@ -8,8 +8,8 @@ extern crate alloc;
 
 extern crate uni_net_driver;
 pub use uni_net_driver::{
-    linked_ethernet_drivers, register_ethernet_driver, DhcpError, EthernetDriverReg,
-    NetError, NicError, NicDiagOps, NicIdleOps, NicOps,
+    DhcpError, EthernetDriverReg, NetError, NicDiagOps, NicError, NicIdleOps, NicOps,
+    linked_ethernet_drivers, register_ethernet_driver,
 };
 
 // Bare-metal pulls the full net umbrella; native uses POSIX sockets.
@@ -152,7 +152,14 @@ impl Net {
     ) -> Result<Net, NetError> {
         match Self::enable(NetBringUp::Dhcp).await {
             Ok(n) => Ok(n),
-            Err(_) => Self::enable(NetBringUp::Static { ip, gateway, netmask }).await,
+            Err(_) => {
+                Self::enable(NetBringUp::Static {
+                    ip,
+                    gateway,
+                    netmask,
+                })
+                .await
+            }
         }
     }
 
@@ -245,7 +252,11 @@ async fn bringup(cfg: NetBringUp) -> Result<(), NetError> {
                 Err(NetError::Dhcp(DhcpError::Timeout))
             }
         }
-        NetBringUp::Static { ip, gateway, netmask } => {
+        NetBringUp::Static {
+            ip,
+            gateway,
+            netmask,
+        } => {
             uni_net_stack::bringup_static(
                 to_net_ipv4(ip),
                 to_net_ipv4(gateway),

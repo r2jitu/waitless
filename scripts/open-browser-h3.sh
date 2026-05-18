@@ -45,19 +45,25 @@ URL=""
 
 for arg in "$@"; do
     case "$arg" in
-        --browser=*) BROWSER="${arg#--browser=}" ;;
-        --port=*)    PORT="${arg#--port=}" ;;
-        --url=*)     URL="${arg#--url=}" ;;
-        *) echo "unknown arg: $arg" >&2; exit 1 ;;
+    --browser=*) BROWSER="${arg#--browser=}" ;;
+    --port=*) PORT="${arg#--port=}" ;;
+    --url=*) URL="${arg#--url=}" ;;
+    *)
+        echo "unknown arg: $arg" >&2
+        exit 1
+        ;;
     esac
 done
 URL="${URL:-https://localhost:${PORT}/}"
 
 case "$BROWSER" in
-    arc)    APP="/Applications/Arc.app/Contents/MacOS/Arc" ;;
-    chrome) APP="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ;;
-    edge)   APP="/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" ;;
-    *) echo "unknown browser: $BROWSER (try arc / chrome / edge)" >&2; exit 1 ;;
+arc) APP="/Applications/Arc.app/Contents/MacOS/Arc" ;;
+chrome) APP="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ;;
+edge) APP="/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" ;;
+*)
+    echo "unknown browser: $BROWSER (try arc / chrome / edge)" >&2
+    exit 1
+    ;;
 esac
 
 if [[ ! -x "$APP" ]]; then
@@ -79,9 +85,9 @@ if [[ ! -f "$DEV_CERT" ]]; then
 fi
 SPKI_HASH=$(
     openssl x509 -in "$DEV_CERT" -pubkey -noout |
-    openssl pkey -pubin -outform der |
-    openssl dgst -sha256 -binary |
-    base64
+        openssl pkey -pubin -outform der |
+        openssl dgst -sha256 -binary |
+        base64
 )
 
 echo "Launching $BROWSER with forced QUIC for localhost:$PORT" >&2

@@ -7,24 +7,22 @@
 // dedicated acceptor, no pipes — mirrors the unikernel's per-core
 // model.
 
+use atomic_fn::AtomicFn;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicUsize, Ordering};
 use std::task::Waker;
-use atomic_fn::AtomicFn;
 
 /// Re-export of the shared runtime's executor surface — apps
 /// reach these via `uni::runtime::{spawn,sleep_us,Sleep,…}`.
 pub mod runtime {
-    pub use uni_runtime::{
-        has_pending, sleep_us, spawn, tick, Sleep,
-    };
+    pub use uni_runtime::{Sleep, has_pending, sleep_us, spawn, tick};
 }
 
-mod udp;
 mod tcp;
+mod udp;
 
 // ============================================================================
 // libc FFI declarations
@@ -78,12 +76,10 @@ const TCP_NODELAY: i32 = 0x01;
 #[cfg(target_os = "linux")]
 const TCP_NODELAY: i32 = 1;
 
-
 #[cfg(target_os = "linux")]
 const MSG_NOSIGNAL: i32 = 0x4000;
 #[cfg(target_os = "macos")]
 const MSG_NOSIGNAL: i32 = 0;
-
 
 #[cfg(target_os = "macos")]
 const EAGAIN: i32 = 35;
@@ -175,10 +171,22 @@ unsafe extern "C" {
     fn recv(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
     fn send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
     fn writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> isize;
-    fn recvfrom(fd: i32, buf: *mut u8, len: usize, flags: i32,
-                addr: *mut SockAddrIn, addrlen: *mut u32) -> isize;
-    fn sendto(fd: i32, buf: *const u8, len: usize, flags: i32,
-              addr: *const SockAddrIn, addrlen: u32) -> isize;
+    fn recvfrom(
+        fd: i32,
+        buf: *mut u8,
+        len: usize,
+        flags: i32,
+        addr: *mut SockAddrIn,
+        addrlen: *mut u32,
+    ) -> isize;
+    fn sendto(
+        fd: i32,
+        buf: *const u8,
+        len: usize,
+        flags: i32,
+        addr: *const SockAddrIn,
+        addrlen: u32,
+    ) -> isize;
     fn close(fd: i32) -> i32;
     fn shutdown(fd: i32, how: i32) -> i32;
     fn setsockopt(fd: i32, level: i32, name: i32, val: *const i32, len: u32) -> i32;
@@ -188,8 +196,14 @@ unsafe extern "C" {
     #[cfg(target_os = "macos")]
     fn kqueue() -> i32;
     #[cfg(target_os = "macos")]
-    fn kevent(kq: i32, changelist: *const Kevent, nchanges: i32,
-              eventlist: *mut Kevent, nevents: i32, timeout: *const Timespec) -> i32;
+    fn kevent(
+        kq: i32,
+        changelist: *const Kevent,
+        nchanges: i32,
+        eventlist: *mut Kevent,
+        nevents: i32,
+        timeout: *const Timespec,
+    ) -> i32;
 
     #[cfg(target_os = "linux")]
     fn epoll_create1(flags: i32) -> i32;
@@ -198,14 +212,23 @@ unsafe extern "C" {
     #[cfg(target_os = "linux")]
     fn epoll_wait(epfd: i32, events: *mut EpollEvent, maxevents: i32, timeout: i32) -> i32;
 
-    fn pthread_create(thread: *mut PthreadT, attr: *const u8,
-                      start: extern "C" fn(*mut u8) -> *mut u8, arg: *mut u8) -> i32;
+    fn pthread_create(
+        thread: *mut PthreadT,
+        attr: *const u8,
+        start: extern "C" fn(*mut u8) -> *mut u8,
+        arg: *mut u8,
+    ) -> i32;
     fn pthread_join(thread: PthreadT, retval: *mut *mut u8) -> i32;
     fn sysconf(name: i32) -> i64;
 
     #[cfg(target_os = "macos")]
-    fn sysctlbyname(name: *const u8, oldp: *mut u8, oldlenp: *mut usize,
-                    newp: *const u8, newlen: usize) -> i32;
+    fn sysctlbyname(
+        name: *const u8,
+        oldp: *mut u8,
+        oldlenp: *mut usize,
+        newp: *const u8,
+        newlen: usize,
+    ) -> i32;
 
     #[cfg(target_os = "macos")]
     fn __error() -> *mut i32;
@@ -216,9 +239,13 @@ unsafe extern "C" {
 fn errno() -> i32 {
     unsafe {
         #[cfg(target_os = "macos")]
-        { *__error() }
+        {
+            *__error()
+        }
         #[cfg(target_os = "linux")]
-        { *__errno_location() }
+        {
+            *__errno_location()
+        }
     }
 }
 
@@ -227,7 +254,10 @@ fn errno() -> i32 {
 /// launchers by `variants.bzl`, so `UNIKERNEL_TCP_80=18080
 /// :<app>_native` and `… :<app>_hvf` both bind to the same host port.
 fn read_port_env(proto: &str, guest_port: u16) -> Option<u16> {
-    std::env::var(format!("UNIKERNEL_{proto}_{guest_port}")).ok()?.parse().ok()
+    std::env::var(format!("UNIKERNEL_{proto}_{guest_port}"))
+        .ok()?
+        .parse()
+        .ok()
 }
 
 fn set_nonblocking(fd: i32) {
@@ -255,8 +285,14 @@ pub fn host_ram_bytes() -> usize {
         let mut val: u64 = 0;
         let mut len = std::mem::size_of::<u64>();
         let name = b"hw.memsize\0".as_ptr();
-        if sysctlbyname(name, &mut val as *mut u64 as *mut u8, &mut len,
-                        std::ptr::null(), 0) == 0 {
+        if sysctlbyname(
+            name,
+            &mut val as *mut u64 as *mut u8,
+            &mut len,
+            std::ptr::null(),
+            0,
+        ) == 0
+        {
             return val as usize;
         }
         0
@@ -274,7 +310,9 @@ pub fn host_ram_bytes() -> usize {
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    { 0 }
+    {
+        0
+    }
 }
 
 // ============================================================================
@@ -330,7 +368,7 @@ impl NativeConn {
 /// ready — no dedicated RX thread, matches HVF's inline-poll design.
 struct ThreadState {
     conns: [NativeConn; CONNS_PER_THREAD],
-    eq_fd: i32,  // kqueue (macOS) or epoll (Linux) fd
+    eq_fd: i32, // kqueue (macOS) or epoll (Linux) fd
     thread_id: u32,
     /// Sparse port → fd table for `udp_send`. 65536 `AtomicI32`
     /// entries (-1 means "no fd for this port on this thread"),
@@ -374,7 +412,9 @@ impl ThreadState {
         self.udp_send_fd.store(raw, Ordering::Release);
         // SAFETY: single-writer at boot before workers spawn, then
         // single-writer on this thread for runtime updates.
-        unsafe { *self.udp_dispatch.get() = Some(HashMap::new()); }
+        unsafe {
+            *self.udp_dispatch.get() = Some(HashMap::new());
+        }
     }
 
     /// Register `(fd, app_port)` on this thread's UDP fast-path
@@ -414,9 +454,7 @@ impl ThreadState {
                 // entry is still our fd (a concurrent rebind may
                 // have replaced it).
                 let entry = &*table.add(app_port as usize);
-                let _ = entry.compare_exchange(
-                    fd, -1, Ordering::AcqRel, Ordering::Acquire,
-                );
+                let _ = entry.compare_exchange(fd, -1, Ordering::AcqRel, Ordering::Acquire);
             }
         }
         // SAFETY: same single-writer invariant as `add_udp_binding`.
@@ -430,9 +468,13 @@ impl ThreadState {
     fn init_event_queue(&mut self) {
         unsafe {
             #[cfg(target_os = "macos")]
-            { self.eq_fd = kqueue(); }
+            {
+                self.eq_fd = kqueue();
+            }
             #[cfg(target_os = "linux")]
-            { self.eq_fd = epoll_create1(0); }
+            {
+                self.eq_fd = epoll_create1(0);
+            }
         }
     }
 
@@ -441,15 +483,21 @@ impl ThreadState {
             #[cfg(target_os = "macos")]
             {
                 let ev = Kevent {
-                    ident: fd as usize, filter: EVFILT_READ,
-                    flags: EV_ADD, fflags: 0, data: 0,
+                    ident: fd as usize,
+                    filter: EVFILT_READ,
+                    flags: EV_ADD,
+                    fflags: 0,
+                    data: 0,
                     udata: fd as *mut u8,
                 };
                 kevent(self.eq_fd, &ev, 1, ptr::null_mut(), 0, ptr::null());
             }
             #[cfg(target_os = "linux")]
             {
-                let mut ev = EpollEvent { events: EPOLLIN, data: fd as u64 };
+                let mut ev = EpollEvent {
+                    events: EPOLLIN,
+                    data: fd as u64,
+                };
                 epoll_ctl(self.eq_fd, EPOLL_CTL_ADD, fd, &mut ev);
             }
         }
@@ -460,8 +508,12 @@ impl ThreadState {
             #[cfg(target_os = "macos")]
             {
                 let ev = Kevent {
-                    ident: fd as usize, filter: EVFILT_READ,
-                    flags: EV_DELETE, fflags: 0, data: 0, udata: ptr::null_mut(),
+                    ident: fd as usize,
+                    filter: EVFILT_READ,
+                    flags: EV_DELETE,
+                    fflags: 0,
+                    data: 0,
+                    udata: ptr::null_mut(),
                 };
                 kevent(self.eq_fd, &ev, 1, ptr::null_mut(), 0, ptr::null());
             }
@@ -485,8 +537,11 @@ impl ThreadState {
             #[cfg(target_os = "macos")]
             {
                 let ev = Kevent {
-                    ident: fd as usize, filter: EVFILT_WRITE,
-                    flags: EV_ADD | EV_CLEAR, fflags: 0, data: 0,
+                    ident: fd as usize,
+                    filter: EVFILT_WRITE,
+                    flags: EV_ADD | EV_CLEAR,
+                    fflags: 0,
+                    data: 0,
                     udata: fd as *mut u8,
                 };
                 kevent(self.eq_fd, &ev, 1, ptr::null_mut(), 0, ptr::null());
@@ -507,14 +562,21 @@ impl ThreadState {
             #[cfg(target_os = "macos")]
             {
                 let ev = Kevent {
-                    ident: fd as usize, filter: EVFILT_WRITE,
-                    flags: EV_DELETE, fflags: 0, data: 0, udata: ptr::null_mut(),
+                    ident: fd as usize,
+                    filter: EVFILT_WRITE,
+                    flags: EV_DELETE,
+                    fflags: 0,
+                    data: 0,
+                    udata: ptr::null_mut(),
                 };
                 kevent(self.eq_fd, &ev, 1, ptr::null_mut(), 0, ptr::null());
             }
             #[cfg(target_os = "linux")]
             {
-                let mut ev = EpollEvent { events: EPOLLIN, data: fd as u64 };
+                let mut ev = EpollEvent {
+                    events: EPOLLIN,
+                    data: fd as u64,
+                };
                 epoll_ctl(self.eq_fd, EPOLL_CTL_MOD, fd, &mut ev);
             }
         }
@@ -589,29 +651,50 @@ impl ThreadState {
             {
                 let mut events = [std::mem::zeroed::<Kevent>(); MAX_EVENTS];
                 let ts = if timeout_ms > 0 {
-                    Timespec { tv_sec: 0, tv_nsec: timeout_ms as i64 * 1_000_000 }
+                    Timespec {
+                        tv_sec: 0,
+                        tv_nsec: timeout_ms as i64 * 1_000_000,
+                    }
                 } else {
-                    Timespec { tv_sec: 0, tv_nsec: 0 }
+                    Timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    }
                 };
-                let n = kevent(self.eq_fd, ptr::null(), 0,
-                               events.as_mut_ptr(), MAX_EVENTS as i32, &ts);
+                let n = kevent(
+                    self.eq_fd,
+                    ptr::null(),
+                    0,
+                    events.as_mut_ptr(),
+                    MAX_EVENTS as i32,
+                    &ts,
+                );
                 for i in 0..n.max(0) as usize {
                     let fd = events[i].udata as i32;
                     let is_write = events[i].filter == EVFILT_WRITE;
-                    if self.dispatch_ready_fd(fd, is_write) { udp_work = true; }
+                    if self.dispatch_ready_fd(fd, is_write) {
+                        udp_work = true;
+                    }
                 }
             }
             #[cfg(target_os = "linux")]
             {
                 let mut events = [std::mem::zeroed::<EpollEvent>(); MAX_EVENTS];
-                let n = epoll_wait(self.eq_fd, events.as_mut_ptr(), MAX_EVENTS as i32, timeout_ms);
+                let n = epoll_wait(
+                    self.eq_fd,
+                    events.as_mut_ptr(),
+                    MAX_EVENTS as i32,
+                    timeout_ms,
+                );
                 for i in 0..n.max(0) as usize {
                     let fd = events[i].data as i32;
                     let flags = events[i].events;
                     // epoll may signal both read and write in one event;
                     // dispatch once per direction.
                     if flags & EPOLLIN != 0 {
-                        if self.dispatch_ready_fd(fd, false) { udp_work = true; }
+                        if self.dispatch_ready_fd(fd, false) {
+                            udp_work = true;
+                        }
                     }
                     if flags & EPOLLOUT != 0 {
                         self.dispatch_ready_fd(fd, true);
@@ -693,8 +776,14 @@ fn drain_udp_sibling(fd: i32, app_port: u16) {
         let mut src_addr: SockAddrIn = unsafe { std::mem::zeroed() };
         let mut addr_len = std::mem::size_of::<SockAddrIn>() as u32;
         let n = unsafe {
-            recvfrom(fd, buf.as_mut_ptr(), RECV_CAP, 0,
-                     &mut src_addr, &mut addr_len)
+            recvfrom(
+                fd,
+                buf.as_mut_ptr(),
+                RECV_CAP,
+                0,
+                &mut src_addr,
+                &mut addr_len,
+            )
         };
         if n <= 0 {
             break;
@@ -723,9 +812,9 @@ struct ThreadsCell(UnsafeCell<[ThreadState; MAX_THREADS]>);
 // SAFETY: each worker mutates only its own slot; BSP-only init
 // populates all slots before workers start.
 unsafe impl Sync for ThreadsCell {}
-static THREADS: ThreadsCell = ThreadsCell(
-    UnsafeCell::new([const { ThreadState::new(0) }; MAX_THREADS])
-);
+static THREADS: ThreadsCell = ThreadsCell(UnsafeCell::new(
+    [const { ThreadState::new(0) }; MAX_THREADS],
+));
 
 /// Populated once by `init_native` from UNIKERNEL_CPUS / num_cpus;
 /// then read by all worker paths. Atomic so cross-thread reads are
@@ -751,18 +840,17 @@ unsafe extern "C" fn sigint_handler(_sig: i32) {
 
 /// Native UDP backend vtable. `bind`/`unbind` open and close the
 /// per-port SO_REUSEPORT sibling fds; `send` is the `sendto` path.
-static NATIVE_UDP_BACKEND: uni_runtime::net::UdpBackend =
-    uni_runtime::net::UdpBackend {
-        bind: Some(udp::udp_backend_bind),
-        unbind: Some(udp::udp_backend_unbind),
-        send: udp::udp_send,
-        // Native uses the OS sendto(); no driver TX pool, no
-        // L2/L3/L4 headers to fill. Callers' `acquire_tx_buf` and
-        // `send_to_with_l2_headroom` fall back to plain `send`.
-        acquire_tx_buf: None,
-        send_via_tx_handle: None,
-        send_with_l2_headroom: None,
-    };
+static NATIVE_UDP_BACKEND: uni_runtime::net::UdpBackend = uni_runtime::net::UdpBackend {
+    bind: Some(udp::udp_backend_bind),
+    unbind: Some(udp::udp_backend_unbind),
+    send: udp::udp_send,
+    // Native uses the OS sendto(); no driver TX pool, no
+    // L2/L3/L4 headers to fill. Callers' `acquire_tx_buf` and
+    // `send_to_with_l2_headroom` fall back to plain `send`.
+    acquire_tx_buf: None,
+    send_via_tx_handle: None,
+    send_with_l2_headroom: None,
+};
 
 fn init_native() {
     unsafe {
@@ -828,8 +916,7 @@ pub fn log(msg: &[u8]) {
     // workers writing concurrently; per-line atomic for AT_LINE_START
     // so we only emit a timestamp once at the start of each line.
     static BOOT_START: Mutex<Option<Instant>> = Mutex::new(None);
-    static AT_LINE_START: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(true);
+    static AT_LINE_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
     static LOCK: Mutex<()> = Mutex::new(());
 
     let _g = LOCK.lock().unwrap();
@@ -855,8 +942,14 @@ pub fn log(msg: &[u8]) {
                 let mut tmp = [0u8; 10];
                 let mut len = 0;
                 let mut s = secs;
-                while s > 0 { tmp[len] = b'0' + (s % 10) as u8; s /= 10; len += 1; }
-                for i in 0..len { out.push(tmp[len - 1 - i]); }
+                while s > 0 {
+                    tmp[len] = b'0' + (s % 10) as u8;
+                    s /= 10;
+                    len += 1;
+                }
+                for i in 0..len {
+                    out.push(tmp[len - 1 - i]);
+                }
             }
             out.push(b'.');
             out.push(b'0' + (us_part / 100_000) as u8);
@@ -874,7 +967,9 @@ pub fn log(msg: &[u8]) {
             AT_LINE_START.store(true, Ordering::Relaxed);
         }
     }
-    unsafe { write(2, out.as_ptr(), out.len()); }
+    unsafe {
+        write(2, out.as_ptr(), out.len());
+    }
 }
 
 pub fn check_shutdown() -> bool {
@@ -989,7 +1084,9 @@ pub fn run_worker(worker_id: u32) {
     }
 
     loop {
-        if check_shutdown() { break; }
+        if check_shutdown() {
+            break;
+        }
 
         let mut did_work = false;
 
@@ -997,19 +1094,25 @@ pub fn run_worker(worker_id: u32) {
         let n = IO_POLL_COUNT.load(Ordering::Acquire).min(IO_POLL_MAX);
         for i in 0..n {
             if let Some(f) = IO_POLL[i].load() {
-                if f(worker_id) { did_work = true; }
+                if f(worker_id) {
+                    did_work = true;
+                }
             }
         }
 
         // 2. App service callback
         if let Some(f) = get_service() {
-            if f(worker_id) { did_work = true; }
+            if f(worker_id) {
+                did_work = true;
+            }
         }
 
         // 2a. Async runtime: every worker advances its own timer
         // list and polls its own arena — same per-core pattern as
         // the unikernel, driven by `//uni-runtime` under the hood.
-        if uni_runtime::tick(worker_id) { did_work = true; }
+        if uni_runtime::tick(worker_id) {
+            did_work = true;
+        }
 
         // 3. Idle if no work
         if !did_work {
@@ -1035,8 +1138,12 @@ extern "C" fn worker_thread(arg: *mut u8) -> *mut u8 {
 
     // Workers call the same service_core() as the unikernel APs.
     // The Server is set up by the main thread before workers start.
-    unsafe extern "C" { fn native_worker_loop(thread_id: u32); }
-    unsafe { native_worker_loop(tid); }
+    unsafe extern "C" {
+        fn native_worker_loop(thread_id: u32);
+    }
+    unsafe {
+        native_worker_loop(tid);
+    }
     ptr::null_mut()
 }
 
@@ -1066,12 +1173,20 @@ pub fn run(config: RunConfig) -> i32 {
     // stderr is fine, untagged.
     let host_cpus = num_cpus();
     let ram_mb = host_ram_bytes() / (1024 * 1024);
-    let arch = if cfg!(target_arch = "aarch64") { "aarch64" }
-               else if cfg!(target_arch = "x86_64") { "x86_64" }
-               else { "unknown" };
-    let os = if cfg!(target_os = "macos") { "darwin" }
-             else if cfg!(target_os = "linux") { "linux" }
-             else { "posix" };
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        "unknown"
+    };
+    let os = if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "posix"
+    };
     log(b"UniKernel v0.1.0 (native)\n");
     log(format!("platform: {} ({})\n", os, arch).as_bytes());
     log(format!("cpu: {} \u{00d7} host\n", host_cpus).as_bytes());
@@ -1129,9 +1244,15 @@ pub extern "C" fn native_worker_loop(thread_id: u32) {
 // rx_used_cursors}` so cross-platform callers see the same names and return
 // zeros here.
 
-pub fn net_rx_counts() -> [u64; 8] { [0; 8] }
-pub fn net_num_queue_pairs() -> u16 { 1 }
-pub fn net_rx_used_cursors() -> [(u16, u16); 8] { [(0, 0); 8] }
+pub fn net_rx_counts() -> [u64; 8] {
+    [0; 8]
+}
+pub fn net_num_queue_pairs() -> u16 {
+    1
+}
+pub fn net_rx_used_cursors() -> [(u16, u16); 8] {
+    [(0, 0); 8]
+}
 
 // `tx_diag` mirrors the unikernel side's `Option`-returning accessor.
 // Re-export the same `TxDiag` shape from `uni_net_driver` so callers
@@ -1139,28 +1260,42 @@ pub fn net_rx_used_cursors() -> [(u16, u16); 8] { [(0, 0); 8] }
 pub use uni_net_driver::TxDescLogEntry as NetTxDescLogEntry;
 pub use uni_net_driver::TxDiag as NetTxDiag;
 pub const NET_DIAG_QP_CAP: usize = uni_net_driver::DIAG_QP_CAP;
-pub fn net_tx_diag() -> Option<NetTxDiag> { None }
-pub fn net_tx_desc_log_snapshot(_out: &mut [NetTxDescLogEntry]) -> usize { 0 }
+pub fn net_tx_diag() -> Option<NetTxDiag> {
+    None
+}
+pub fn net_tx_desc_log_snapshot(_out: &mut [NetTxDescLogEntry]) -> usize {
+    0
+}
 
 /// Native stub for the gve NIC-driver counters — gve is a
 /// bare-metal-only driver, so there is nothing to report. Mirrors
 /// the unikernel side's `gve_diag()` so cross-platform callers
 /// (`uni::diagnostics::gve_diag`) see one type on both backends.
-pub fn gve_diag() -> crate::GveDiag { crate::GveDiag::default() }
+pub fn gve_diag() -> crate::GveDiag {
+    crate::GveDiag::default()
+}
 
 /// Native stub for the TCP/IP-stack counters — the bare-metal
 /// `net` stack isn't linked on native. Mirrors `unikernel::tcp_diag`.
-pub fn tcp_diag() -> crate::TcpDiag { crate::TcpDiag::default() }
+pub fn tcp_diag() -> crate::TcpDiag {
+    crate::TcpDiag::default()
+}
 
 // ---- Diag-capture stubs (native has no kernel panic to capture) ----
 
 pub fn diag_append(_bytes: &[u8]) {}
 pub fn diag_append_hex(_value: u64) {}
 pub fn diag_append_hex_u8(_value: u8) {}
-pub fn diag_snapshot(_out: &mut [u8]) -> usize { 0 }
-pub fn diag_captured_len() -> usize { 0 }
+pub fn diag_snapshot(_out: &mut [u8]) -> usize {
+    0
+}
+pub fn diag_captured_len() -> usize {
+    0
+}
 pub fn diag_reset() {}
 
 // ---- Heap stats ------------------------------------------------------------
 
-pub fn heap_stats() -> super::HeapStats { super::HeapStats::default() }
+pub fn heap_stats() -> super::HeapStats {
+    super::HeapStats::default()
+}

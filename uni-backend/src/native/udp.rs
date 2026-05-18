@@ -46,8 +46,7 @@ struct UdpBinding {
 }
 
 fn udp_bindings() -> &'static Mutex<HashMap<u16, UdpBinding>> {
-    static UDP_BINDINGS: OnceLock<Mutex<HashMap<u16, UdpBinding>>> =
-        OnceLock::new();
+    static UDP_BINDINGS: OnceLock<Mutex<HashMap<u16, UdpBinding>>> = OnceLock::new();
     UDP_BINDINGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -60,7 +59,9 @@ fn udp_bindings() -> &'static Mutex<HashMap<u16, UdpBinding>> {
 fn open_udp_sibling(bind_port: u16, reuseport: bool) -> i32 {
     unsafe {
         let fd = socket(AF_INET, SOCK_DGRAM, 0);
-        if fd < 0 { return -1; }
+        if fd < 0 {
+            return -1;
+        }
 
         let opt: i32 = 1;
         if reuseport {
@@ -120,7 +121,9 @@ pub(super) fn udp_backend_unbind(app_port: u16) {
             continue;
         }
         threads[worker_id].remove_udp_binding(fd, app_port);
-        unsafe { close(fd); }
+        unsafe {
+            close(fd);
+        }
     }
 }
 
@@ -152,16 +155,23 @@ fn open_udp_relay(app_port: u16, owner_worker: Option<u32>) -> Result<(), ()> {
         Some(w) => {
             // Single-owner: one socket on the owning worker.
             let w = w as usize;
-            if w >= MAX_THREADS { return Err(()); }
+            if w >= MAX_THREADS {
+                return Err(());
+            }
             let fd = open_udp_sibling(bind_port, false);
-            if fd < 0 { return Err(()); }
+            if fd < 0 {
+                return Err(());
+            }
             fds[w] = fd;
         }
     }
 
     // Publish into the global metadata map (used only by unbind to
     // enumerate which fds to close).
-    udp_bindings().lock().unwrap().insert(app_port, UdpBinding { fds });
+    udp_bindings()
+        .lock()
+        .unwrap()
+        .insert(app_port, UdpBinding { fds });
 
     // Wire up per-thread fast-path tables + event queues.
     let threads = unsafe { &*THREADS.0.get() };
@@ -207,7 +217,9 @@ pub(super) fn udp_send(dst_ip: uni_runtime::ip::IpAddr, src_port: u16, dst_port:
         if send_fd < 0 {
             // No binding — create ephemeral socket
             send_fd = socket(AF_INET, SOCK_DGRAM, 0);
-            if send_fd < 0 { return; }
+            if send_fd < 0 {
+                return;
+            }
         }
 
         let dst_addr = SockAddrIn {
@@ -229,7 +241,13 @@ pub(super) fn udp_send(dst_ip: uni_runtime::ip::IpAddr, src_port: u16, dst_port:
             sin_zero: [0; 8],
         };
 
-        sendto(send_fd, data.as_ptr(), data.len(), 0,
-               &dst_addr, std::mem::size_of::<SockAddrIn>() as u32);
+        sendto(
+            send_fd,
+            data.as_ptr(),
+            data.len(),
+            0,
+            &dst_addr,
+            std::mem::size_of::<SockAddrIn>() as u32,
+        );
     }
 }

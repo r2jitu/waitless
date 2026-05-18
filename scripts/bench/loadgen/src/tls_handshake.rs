@@ -102,9 +102,7 @@ pub async fn run(
     // doesn't actually validate against is fine here.
     let server_name: ServerName<'static> = ServerName::try_from("localhost").unwrap();
 
-    let request = format!(
-        "GET {endpoint} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
-    );
+    let request = format!("GET {endpoint} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",);
     let request: Arc<[u8]> = Arc::from(request.into_bytes().into_boxed_slice());
 
     let host: Arc<str> = Arc::from(host.to_string().into_boxed_str());
@@ -129,15 +127,8 @@ pub async fn run(
             while Instant::now() < deadline {
                 let t0 = Instant::now();
                 let post_warmup = t0 >= measure_start;
-                if !do_one_handshake(
-                    &connector,
-                    &server_name,
-                    &host,
-                    port,
-                    &request,
-                    &mut buf,
-                )
-                .await
+                if !do_one_handshake(&connector, &server_name, &host, port, &request, &mut buf)
+                    .await
                 {
                     continue;
                 }
@@ -164,7 +155,12 @@ pub async fn run(
     let elapsed = duration; // measurement window length
     let p50 = combined.value_at_quantile(0.50);
     let p99 = combined.value_at_quantile(0.99);
-    WorkloadResult { ops: total, elapsed, p50_us: p50, p99_us: p99 }
+    WorkloadResult {
+        ops: total,
+        elapsed,
+        p50_us: p50,
+        p99_us: p99,
+    }
 }
 
 async fn do_one_handshake(
@@ -197,8 +193,11 @@ async fn do_one_handshake(
         _ => return false,
     };
 
-    if timeout(PER_OP_TIMEOUT, tls.write_all(request)).await
-        .ok().and_then(|r| r.ok()).is_none()
+    if timeout(PER_OP_TIMEOUT, tls.write_all(request))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .is_none()
     {
         return false;
     }

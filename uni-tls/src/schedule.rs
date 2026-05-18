@@ -63,7 +63,9 @@ pub fn secure_zero(buf: &mut [u8]) {
     for b in buf.iter_mut() {
         // SAFETY: `b` is a mutable reference to one byte owned by this
         // slice; write_volatile with `0u8` is always valid.
-        unsafe { core::ptr::write_volatile(b, 0); }
+        unsafe {
+            core::ptr::write_volatile(b, 0);
+        }
     }
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
@@ -86,12 +88,7 @@ pub fn secure_zero(buf: &mut [u8]) {
 /// We serialise into a fixed stack buffer: `2 + 1 + (6+label) + 1 + context`.
 /// The longest label used by TLS 1.3 is "application traffic" at 19 bytes,
 /// so `[u8; 64]` is plenty with room to spare.
-fn build_hkdf_label(
-    out_len: u16,
-    label_suffix: &[u8],
-    context: &[u8],
-    buf: &mut [u8],
-) -> usize {
+fn build_hkdf_label(out_len: u16, label_suffix: &[u8], context: &[u8], buf: &mut [u8]) -> usize {
     const PREFIX: &[u8] = b"tls13 ";
     let full_label_len = PREFIX.len() + label_suffix.len();
     let total = 2 + 1 + full_label_len + 1 + context.len();
@@ -166,7 +163,9 @@ pub struct Transcript {
 
 impl Transcript {
     pub fn new() -> Self {
-        Transcript { hasher: Sha256::new() }
+        Transcript {
+            hasher: Sha256::new(),
+        }
     }
 
     pub fn update(&mut self, data: &[u8]) {
@@ -294,12 +293,7 @@ impl TrafficKey {
     /// scratch and then encrypting in place, encrypt-while-
     /// copying in a single pass through `dst`. `dst` must be at
     /// least as long as the sum of `src_parts`' lengths.
-    pub fn seal_chain<'a, I>(
-        &mut self,
-        aad: &[u8],
-        src_parts: I,
-        dst: &mut [u8],
-    ) -> [u8; 16]
+    pub fn seal_chain<'a, I>(&mut self, aad: &[u8], src_parts: I, dst: &mut [u8]) -> [u8; 16]
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
@@ -317,7 +311,6 @@ impl TrafficKey {
         Ok(())
     }
 }
-
 
 // ============================================================================
 // TLS 1.3 key schedule
@@ -434,7 +427,10 @@ impl KeySchedule {
         // 3. client_hs_traffic = Derive-Secret(handshake_secret, "c hs traffic", transcript)
         let client_hs = derive_secret(&self.secret, b"c hs traffic", transcript);
         let server_hs = derive_secret(&self.secret, b"s hs traffic", transcript);
-        HandshakeSecrets { client_hs, server_hs }
+        HandshakeSecrets {
+            client_hs,
+            server_hs,
+        }
     }
 
     /// Compute the TLS 1.3 resumption_master_secret without
@@ -455,10 +451,7 @@ impl KeySchedule {
 
     /// Transition from the Handshake stage to the Application stage.
     /// `transcript` is the hash through ServerFinished.
-    pub fn enter_application(
-        &mut self,
-        transcript: &[u8; HASH_LEN],
-    ) -> ApplicationSecrets {
+    pub fn enter_application(&mut self, transcript: &[u8; HASH_LEN]) -> ApplicationSecrets {
         // 1. derived = Derive-Secret(handshake_secret, "derived", "")
         let derived = derive_secret(&self.secret, b"derived", &empty_transcript_hash());
         // 2. master_secret = HKDF-Extract(derived, 0)

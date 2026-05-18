@@ -47,9 +47,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::crypto::{
-    apply_hp_mask, derive_aes128_keys, derive_initial_keys,
-    derive_initial_secrets, next_traffic_secret, packet_nonce, AES_KEY_LEN,
-    HP_MASK_LEN, HP_SAMPLE_LEN, NONCE_LEN, TAG_LEN,
+    AES_KEY_LEN, HP_MASK_LEN, HP_SAMPLE_LEN, NONCE_LEN, TAG_LEN, apply_hp_mask, derive_aes128_keys,
+    derive_initial_keys, derive_initial_secrets, next_traffic_secret, packet_nonce,
 };
 // Cached cipher state per `DirKeys` (see the struct doc comment for
 // the rationale). Same trait imports `crypto.rs` uses; reaching for
@@ -62,15 +61,15 @@ use crate::crypto::{
 // `aead::KeyInit` into scope is enough — `cipher::KeyInit` is
 // re-exported through the `aes_gcm::aes::cipher` module the AEAD
 // uses internally and no second alias is needed.
-use aes_gcm::aead::{generic_array::GenericArray, AeadInPlace, KeyInit};
-use aes_gcm::aes::cipher::BlockEncrypt;
-use aes_gcm::aes::Aes128;
-use aes_gcm::Aes128Gcm;
-use crate::frame::{parse_frame, write_ack, write_crypto, Frame};
+use crate::frame::{Frame, parse_frame, write_ack, write_crypto};
 use crate::wire::{
-    decode_packet_number, long_packet_type, parse_initial_header, parse_long_header_preamble,
-    read_varint, write_varint, FIXED_BIT, HEADER_FORM_LONG, QUIC_VERSION_1,
+    FIXED_BIT, HEADER_FORM_LONG, QUIC_VERSION_1, decode_packet_number, long_packet_type,
+    parse_initial_header, parse_long_header_preamble, read_varint, write_varint,
 };
+use aes_gcm::Aes128Gcm;
+use aes_gcm::aead::{AeadInPlace, KeyInit, generic_array::GenericArray};
+use aes_gcm::aes::Aes128;
+use aes_gcm::aes::cipher::BlockEncrypt;
 
 use crate::tls::{CryptoLevel, QuicTls, QuicTlsError, QuicTlsState};
 use core::mem::ManuallyDrop;
@@ -124,7 +123,10 @@ impl ConnectionId {
         let mut buf = [0u8; 20];
         let n = bytes.len().min(20);
         buf[..n].copy_from_slice(&bytes[..n]);
-        ConnectionId { bytes: buf, len: n as u8 }
+        ConnectionId {
+            bytes: buf,
+            len: n as u8,
+        }
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -175,11 +177,7 @@ impl DirKeys {
     /// Build a fresh `DirKeys` from raw key bytes — the AES
     /// `Aes128Gcm` and `Aes128` ciphers are constructed once here
     /// and then reused for every subsequent seal / open / hp_mask.
-    fn new(
-        aead_key: &[u8; AES_KEY_LEN],
-        iv: &[u8; NONCE_LEN],
-        hp_key: &[u8; AES_KEY_LEN],
-    ) -> Self {
+    fn new(aead_key: &[u8; AES_KEY_LEN], iv: &[u8; NONCE_LEN], hp_key: &[u8; AES_KEY_LEN]) -> Self {
         DirKeys {
             aead_cipher: Aes128Gcm::new(GenericArray::from_slice(aead_key)),
             iv: *iv,
@@ -439,9 +437,7 @@ impl DatagramBuf {
     /// for submission. Only succeeds for the `TxSlot` variant;
     /// `Heap`-variant returns the buf back via `Err(self)` so
     /// the caller can fall back to a slice-shaped send.
-    pub fn into_tx_handle(
-        self,
-    ) -> Result<(uni_net_driver::TxBufHandle, usize), Self> {
+    pub fn into_tx_handle(self) -> Result<(uni_net_driver::TxBufHandle, usize), Self> {
         match self {
             DatagramBuf::TxSlot { handle, vec } => {
                 let len = vec.len();
@@ -692,7 +688,6 @@ pub struct Connection {
     /// native). On native this pool IS the hot path.
     outbound_pool: Vec<Vec<u8>>,
 
-
     /// Per-stream receive state, keyed by stream ID. Lazily
     /// inserted on the first STREAM frame.
     recv_streams: alloc::collections::BTreeMap<u64, crate::streams::RecvStream>,
@@ -750,9 +745,11 @@ impl Drop for Connection {
         // output is the cheapest way to spot a leaked conn:
         // every `conns_allocated` should have a matching
         // `conns_dropped`.
-        crate::quic_event!(conns_dropped,
+        crate::quic_event!(
+            conns_dropped,
             "local_cid={}",
-            crate::endpoint::hex8(self.local_cid.as_slice()));
+            crate::endpoint::hex8(self.local_cid.as_slice())
+        );
     }
 }
 
@@ -958,9 +955,7 @@ impl Connection {
         let peer_ms = self
             .tls
             .client_transport_params()
-            .and_then(|bytes| {
-                crate::transport_params::parse_client_params(bytes).ok()
-            })
+            .and_then(|bytes| crate::transport_params::parse_client_params(bytes).ok())
             .map(|p| p.max_idle_timeout_ms)
             .unwrap_or(0);
         // RFC 9000 §18.2: a value of 0 means no timeout — treat
@@ -990,8 +985,7 @@ impl Connection {
     /// outbound queue.
     fn record_bytes_sent(&mut self, n: u64) {
         if !self.path_validated {
-            self.bytes_sent_pre_validation =
-                self.bytes_sent_pre_validation.saturating_add(n);
+            self.bytes_sent_pre_validation = self.bytes_sent_pre_validation.saturating_add(n);
         }
     }
 
@@ -1093,8 +1087,9 @@ impl Connection {
         // bytes received from the peer's address count toward our
         // 3× send credit, including ones that fail to decrypt.
         if !self.path_validated {
-            self.bytes_received_pre_validation =
-                self.bytes_received_pre_validation.saturating_add(datagram.len() as u64);
+            self.bytes_received_pre_validation = self
+                .bytes_received_pre_validation
+                .saturating_add(datagram.len() as u64);
         }
         let mut p = 0usize;
         while p < datagram.len() {
@@ -1175,11 +1170,7 @@ impl Connection {
                     .recv_streams
                     .get(sid)
                     .map_or(false, |r| r.is_closed() && r.buffer.is_empty());
-                if recv_done {
-                    Some(*sid)
-                } else {
-                    None
-                }
+                if recv_done { Some(*sid) } else { None }
             })
             .collect();
         for sid in candidates {
@@ -1278,13 +1269,8 @@ impl Connection {
             //   * The Vec's allocation (`handle.data_ptr`) is NOT
             //     allocator-managed; ManuallyDrop suppresses
             //     Vec::Drop's dealloc.
-            let mut vec: Vec<u8> = unsafe {
-                Vec::from_raw_parts(
-                    handle.data_ptr,
-                    0,
-                    handle.data_cap as usize,
-                )
-            };
+            let mut vec: Vec<u8> =
+                unsafe { Vec::from_raw_parts(handle.data_ptr, 0, handle.data_cap as usize) };
             // Zero-fill the headroom; the encoder doesn't read it
             // (writes start at vec.len()), but the backend fills
             // headers there at submit time and may read for
@@ -1368,10 +1354,7 @@ impl Connection {
     /// Snapshot a recv stream's interior state for diagnostics.
     /// Returns `None` if the stream doesn't exist (already reaped
     /// or never created). Used by the stuck-handler watchdog.
-    pub fn recv_stream_state(
-        &self,
-        sid: u64,
-    ) -> Option<crate::streams::RecvStreamState> {
+    pub fn recv_stream_state(&self, sid: u64) -> Option<crate::streams::RecvStreamState> {
         self.recv_streams.get(&sid).map(|s| s.debug_state())
     }
 
@@ -1452,8 +1435,12 @@ impl Connection {
 
     fn process_long_header_packet(&mut self, bytes: &mut [u8]) -> Result<usize, ConnError> {
         let preamble = parse_long_header_preamble(bytes).map_err(|_| {
-            crate::quic_drop!(long_header_parse,
-                "size={} first={:#x}", bytes.len(), bytes.first().copied().unwrap_or(0));
+            crate::quic_drop!(
+                long_header_parse,
+                "size={} first={:#x}",
+                bytes.len(),
+                bytes.first().copied().unwrap_or(0)
+            );
             ConnError::Wire
         })?;
         match preamble.long_type {
@@ -1509,15 +1496,21 @@ impl Connection {
                 // packets × ~1500 bytes ≈ 24 KiB/conn worst case.
                 const PENDING_ZERO_RTT_CAP: usize = 16;
                 if self.pending_zero_rtt.len() < PENDING_ZERO_RTT_CAP {
-                    self.pending_zero_rtt.push(bytes[..total_packet_len].to_vec());
-                    crate::quic_event!(zero_rtt_buffered,
+                    self.pending_zero_rtt
+                        .push(bytes[..total_packet_len].to_vec());
+                    crate::quic_event!(
+                        zero_rtt_buffered,
                         "size={} pending={} local_cid={}",
-                        total_packet_len, self.pending_zero_rtt.len(),
-                        crate::endpoint::hex8(self.local_cid.as_slice()));
+                        total_packet_len,
+                        self.pending_zero_rtt.len(),
+                        crate::endpoint::hex8(self.local_cid.as_slice())
+                    );
                 } else {
-                    crate::quic_drop!(bad_state,
+                    crate::quic_drop!(
+                        bad_state,
                         "0-RTT buffer full ({} packets), dropping new",
-                        PENDING_ZERO_RTT_CAP);
+                        PENDING_ZERO_RTT_CAP
+                    );
                 }
                 return Ok(total_packet_len);
             }
@@ -1545,10 +1538,13 @@ impl Connection {
                 .map_or(pn, |x| x.max(pn)),
         );
         self.application_space.ack_pending = true;
-        crate::quic_event!(zero_rtt_accepted,
+        crate::quic_event!(
+            zero_rtt_accepted,
             "pn={} payload_len={} local_cid={}",
-            pn, payload_end - payload_start,
-            crate::endpoint::hex8(self.local_cid.as_slice()));
+            pn,
+            payload_end - payload_start,
+            crate::endpoint::hex8(self.local_cid.as_slice())
+        );
         Ok(total_packet_len)
     }
 
@@ -1558,8 +1554,7 @@ impl Connection {
         // immutable borrow on `bytes` ends before we reborrow it
         // mutably for in-place HP/AEAD work.
         let (header_pn_offset, total_packet_len) = {
-            let header =
-                parse_initial_header(bytes).map_err(|_| ConnError::Wire)?;
+            let header = parse_initial_header(bytes).map_err(|_| ConnError::Wire)?;
             // Late retransmit Initial after we've already discarded
             // Initial keys (RFC 9001 §4.9.1). Skip past it; both
             // sides have moved on, the peer's PN ACK accounting
@@ -1569,9 +1564,12 @@ impl Connection {
                 if total > bytes.len() {
                     return Err(ConnError::Wire);
                 }
-                crate::quic_event!(late_initial_dropped,
+                crate::quic_event!(
+                    late_initial_dropped,
                     "size={} dcid={}",
-                    total, crate::endpoint::hex8(header.preamble.dcid));
+                    total,
+                    crate::endpoint::hex8(header.preamble.dcid)
+                );
                 return Ok(total);
             }
             if self.initial_recv.is_none() {
@@ -1619,9 +1617,8 @@ impl Connection {
         let payload = &buf[payload_start..payload_end];
         self.dispatch_frames(CryptoLevel::Initial, payload)?;
 
-        self.initial_space.largest_recv_pn = Some(
-            self.initial_space.largest_recv_pn.map_or(pn, |x| x.max(pn)),
-        );
+        self.initial_space.largest_recv_pn =
+            Some(self.initial_space.largest_recv_pn.map_or(pn, |x| x.max(pn)));
         self.initial_space.ack_pending = true;
         Ok(total_packet_len)
     }
@@ -1643,9 +1640,12 @@ impl Connection {
         // confirmed). Skip past it; counterpart of the late-Initial
         // path in `process_initial`.
         if self.handshake_keys_discarded {
-            crate::quic_event!(late_handshake_dropped,
+            crate::quic_event!(
+                late_handshake_dropped,
                 "size={} dcid={}",
-                total_packet_len, crate::endpoint::hex8(preamble.dcid));
+                total_packet_len,
+                crate::endpoint::hex8(preamble.dcid)
+            );
             return Ok(total_packet_len);
         }
 
@@ -1762,9 +1762,7 @@ impl Connection {
         // Same approach the Initial/Handshake path already uses
         // (see `decrypt_long_header`).
         let nonce = packet_nonce(&recv_keys_cur.iv, pn);
-        let tag: [u8; TAG_LEN] = buf[payload_end..]
-            .try_into()
-            .map_err(|_| ConnError::Wire)?;
+        let tag: [u8; TAG_LEN] = buf[payload_end..].try_into().map_err(|_| ConnError::Wire)?;
         let (aad_part, rest_part) = buf.split_at_mut(payload_start);
         let aad: &[u8] = aad_part;
         let payload_slice = &mut rest_part[..payload_end - payload_start];
@@ -1778,8 +1776,12 @@ impl Connection {
                 Ok(()) => {
                     // Successful key update — rotate and re-derive.
                     self.rotate_recv_keys();
-                    crate::quic_event!(key_updates_accepted,
-                        "new_phase={} pn={}", self.recv_key_phase, pn);
+                    crate::quic_event!(
+                        key_updates_accepted,
+                        "new_phase={} pn={}",
+                        self.recv_key_phase,
+                        pn
+                    );
                     Ok(())
                 }
                 Err(()) => {
@@ -1803,9 +1805,14 @@ impl Connection {
             }
         };
         aead_result.map_err(|_| {
-            crate::quic_drop!(aead_decrypt_failed,
+            crate::quic_drop!(
+                aead_decrypt_failed,
                 "1-RTT pn={} kp={} our_kp={} payload_len={}",
-                pn, pkt_kp, self.recv_key_phase, payload_end - payload_start);
+                pn,
+                pkt_kp,
+                self.recv_key_phase,
+                payload_end - payload_start
+            );
             ConnError::Decrypt
         })?;
         crate::diag::COUNTERS.aead_open_bytes.fetch_add(
@@ -1869,8 +1876,7 @@ impl Connection {
             // Reuse HP from the new-current keys (HP is invariant
             // across KU per §6.1).
             if let Some(cur) = self.application_recv.as_ref() {
-                self.application_recv_next =
-                    Some(DirKeys::from_aes128_reuse_hp(&next_aes128, cur));
+                self.application_recv_next = Some(DirKeys::from_aes128_reuse_hp(&next_aes128, cur));
             }
         }
     }
@@ -1988,32 +1994,35 @@ impl Connection {
         // payload+tag a borrow of the other.
         let aad_end = pn_offset + pn_length;
         let payload_end = buf.len() - TAG_LEN;
-        let tag: [u8; TAG_LEN] = buf[payload_end..]
-            .try_into()
-            .map_err(|_| ConnError::Wire)?;
+        let tag: [u8; TAG_LEN] = buf[payload_end..].try_into().map_err(|_| ConnError::Wire)?;
         let nonce = packet_nonce(&keys.iv, full_pn);
         let (aad_part, rest_part) = buf.split_at_mut(aad_end);
         let aad: &[u8] = aad_part;
         let payload_slice = &mut rest_part[..payload_end - aad_end];
         keys.aead_open(&nonce, aad, payload_slice, &tag)
             .map_err(|_| {
-                crate::quic_drop!(aead_decrypt_failed,
-                    "pn={} payload_len={}", full_pn, payload_end - aad_end);
+                crate::quic_drop!(
+                    aead_decrypt_failed,
+                    "pn={} payload_len={}",
+                    full_pn,
+                    payload_end - aad_end
+                );
                 ConnError::Decrypt
             })?;
         Ok(full_pn)
     }
 
-    fn dispatch_frames(
-        &mut self,
-        level: CryptoLevel,
-        mut payload: &[u8],
-    ) -> Result<(), ConnError> {
+    fn dispatch_frames(&mut self, level: CryptoLevel, mut payload: &[u8]) -> Result<(), ConnError> {
         while !payload.is_empty() {
             let (frame, consumed) = parse_frame(payload).map_err(|e| {
-                crate::quic_drop!(unknown_frame,
+                crate::quic_drop!(
+                    unknown_frame,
                     "level={:?} err={:?} first={:#x} rem={}",
-                    level, e, payload[0], payload.len());
+                    level,
+                    e,
+                    payload[0],
+                    payload.len()
+                );
                 ConnError::Wire
             })?;
             match frame {
@@ -2044,7 +2053,12 @@ impl Connection {
                 Frame::HandshakeDone => {
                     // Server only — clients don't send this.
                 }
-                Frame::Stream { stream_id, offset, data, fin } => {
+                Frame::Stream {
+                    stream_id,
+                    offset,
+                    data,
+                    fin,
+                } => {
                     if matches!(level, CryptoLevel::OneRtt) {
                         // Late STREAM-frame retransmit for a stream
                         // we've already finished and reaped: drop
@@ -2169,9 +2183,11 @@ impl Connection {
             if self.early_recv.is_none() {
                 let recv = derive_aes128_keys(et);
                 self.early_recv = Some(DirKeys::from_aes128(&recv));
-                crate::quic_event!(early_keys_derived,
+                crate::quic_event!(
+                    early_keys_derived,
                     "local_cid={}",
-                    crate::endpoint::hex8(self.local_cid.as_slice()));
+                    crate::endpoint::hex8(self.local_cid.as_slice())
+                );
                 // Replay any 0-RTT packets that arrived before
                 // the keys were ready. process_zero_rtt is the
                 // canonical handler — call it on each buffered
@@ -2182,8 +2198,7 @@ impl Connection {
                     if let Err(e) = self.process_zero_rtt(&mut pkt) {
                         // Don't propagate — replay failures are
                         // best-effort and shouldn't kill the conn.
-                        crate::quic_drop!(other_wire,
-                            "0-RTT replay error: {:?}", e);
+                        crate::quic_drop!(other_wire, "0-RTT replay error: {:?}", e);
                     }
                 }
             }
@@ -2216,10 +2231,8 @@ impl Connection {
                 let next_secret = next_traffic_secret(&ap.client_ap);
                 let next_aes128 = derive_aes128_keys(&next_secret);
                 let cur_recv = self.application_recv.as_ref().unwrap();
-                self.application_recv_next = Some(DirKeys::from_aes128_reuse_hp(
-                    &next_aes128,
-                    cur_recv,
-                ));
+                self.application_recv_next =
+                    Some(DirKeys::from_aes128_reuse_hp(&next_aes128, cur_recv));
             }
         }
         // `Failed` is terminal — never resurrect it. Without this
@@ -2240,9 +2253,11 @@ impl Connection {
             // Edge-trigger the event so a flapping flush_outbound
             // doesn't double-count.
             if !matches!(self.state, ConnState::Established) {
-                crate::quic_event!(handshakes_completed,
+                crate::quic_event!(
+                    handshakes_completed,
                     "local_cid={}",
-                    crate::endpoint::hex8(self.local_cid.as_slice()));
+                    crate::endpoint::hex8(self.local_cid.as_slice())
+                );
                 // If the handshake completed WITHOUT resumption
                 // (no early_recv ever derived), we'll never be
                 // able to decrypt buffered 0-RTT packets — drop
@@ -2250,9 +2265,11 @@ impl Connection {
                 // teardown. Common when a peer optimistically sent
                 // 0-RTT with a stale ticket from a previous boot.
                 if !self.pending_zero_rtt.is_empty() && self.early_recv.is_none() {
-                    crate::quic_event!(zero_rtt_unresumable,
+                    crate::quic_event!(
+                        zero_rtt_unresumable,
                         "dropped={} reason=resumption_rejected",
-                        self.pending_zero_rtt.len());
+                        self.pending_zero_rtt.len()
+                    );
                     self.pending_zero_rtt.clear();
                 }
             }
@@ -2471,7 +2488,11 @@ impl Connection {
         crypto_bytes: &[u8],
         emit_ack: bool,
     ) -> Result<(), ConnError> {
-        let send_keys = self.initial_send.as_ref().ok_or(ConnError::BadState)?.clone();
+        let send_keys = self
+            .initial_send
+            .as_ref()
+            .ok_or(ConnError::BadState)?
+            .clone();
         let pn = self.initial_space.next_send_pn;
         self.initial_space.next_send_pn += 1;
 
@@ -2521,7 +2542,17 @@ impl Connection {
 
         let ack_eliciting = !crypto_bytes.is_empty();
         let byte_count = (total_end - header_start) as u32;
-        self.seal_packet(out, header_start, pn_offset, payload_offset, payload_len, total_end, pn, &send_keys, true)?;
+        self.seal_packet(
+            out,
+            header_start,
+            pn_offset,
+            payload_offset,
+            payload_len,
+            total_end,
+            pn,
+            &send_keys,
+            true,
+        )?;
         self.record_sent_packet(CryptoLevel::Initial, pn, ack_eliciting, byte_count);
         Ok(())
     }
@@ -2574,7 +2605,17 @@ impl Connection {
 
         let ack_eliciting = !crypto_bytes.is_empty();
         let byte_count = (total_end - header_start) as u32;
-        self.seal_packet(out, header_start, pn_offset, payload_offset, payload_len, total_end, pn, &send_keys, true)?;
+        self.seal_packet(
+            out,
+            header_start,
+            pn_offset,
+            payload_offset,
+            payload_len,
+            total_end,
+            pn,
+            &send_keys,
+            true,
+        )?;
         self.record_sent_packet(CryptoLevel::Handshake, pn, ack_eliciting, byte_count);
         Ok(())
     }
@@ -2679,9 +2720,12 @@ impl Connection {
             out.truncate(start + n);
             self.one_rtt_crypto_offset += crypto_n as u64;
             ack_eliciting = true;
-            crate::quic_event!(tickets_emitted,
-                "size={} local_cid={}", crypto_n,
-                crate::endpoint::hex8(self.local_cid.as_slice()));
+            crate::quic_event!(
+                tickets_emitted,
+                "size={} local_cid={}",
+                crypto_n,
+                crate::endpoint::hex8(self.local_cid.as_slice())
+            );
         }
 
         // Drain pending STREAM data, directly into `out`. Use
@@ -2793,8 +2837,15 @@ impl Connection {
             out.extend_from_slice(&[0u8; TAG_LEN]);
             let total_end = out.len();
             return self.seal_packet(
-                out, header_start, pn_offset, payload_offset, payload_len, total_end, pn,
-                &send_keys, false,
+                out,
+                header_start,
+                pn_offset,
+                payload_offset,
+                payload_len,
+                total_end,
+                pn,
+                &send_keys,
+                false,
             );
         }
 
@@ -2823,8 +2874,15 @@ impl Connection {
             out.extend_from_slice(&[0u8; TAG_LEN]);
             let total_end = out.len();
             return self.seal_packet(
-                out, header_start, pn_offset, payload_offset, payload_len, total_end, pn,
-                &send_keys, true,
+                out,
+                header_start,
+                pn_offset,
+                payload_offset,
+                payload_len,
+                total_end,
+                pn,
+                &send_keys,
+                true,
             );
         }
 
@@ -2854,8 +2912,15 @@ impl Connection {
             out.extend_from_slice(&[0u8; TAG_LEN]);
             let total_end = out.len();
             return self.seal_packet(
-                out, header_start, pn_offset, payload_offset, payload_len, total_end, pn,
-                &send_keys, true,
+                out,
+                header_start,
+                pn_offset,
+                payload_offset,
+                payload_len,
+                total_end,
+                pn,
+                &send_keys,
+                true,
             );
         }
 
@@ -2903,8 +2968,15 @@ impl Connection {
                 let total_end = out.len();
                 let byte_count = (total_end - header_start) as u32;
                 self.seal_packet(
-                    out, header_start, pn_offset, payload_offset, payload_len, total_end, pn,
-                    &send_keys, false,
+                    out,
+                    header_start,
+                    pn_offset,
+                    payload_offset,
+                    payload_len,
+                    total_end,
+                    pn,
+                    &send_keys,
+                    false,
                 )?;
                 self.record_sent_packet(CryptoLevel::OneRtt, pn, true, byte_count);
             }
@@ -2937,8 +3009,15 @@ impl Connection {
                 let total_end = out.len();
                 let byte_count = (total_end - header_start) as u32;
                 self.seal_packet(
-                    out, header_start, pn_offset, payload_offset, payload_len, total_end, pn,
-                    &send_keys, true,
+                    out,
+                    header_start,
+                    pn_offset,
+                    payload_offset,
+                    payload_len,
+                    total_end,
+                    pn,
+                    &send_keys,
+                    true,
                 )?;
                 self.record_sent_packet(CryptoLevel::Handshake, pn, true, byte_count);
             }
@@ -2972,8 +3051,15 @@ impl Connection {
                 let total_end = out.len();
                 let byte_count = (total_end - header_start) as u32;
                 self.seal_packet(
-                    out, header_start, pn_offset, payload_offset, payload_len, total_end, pn,
-                    &send_keys, true,
+                    out,
+                    header_start,
+                    pn_offset,
+                    payload_offset,
+                    payload_len,
+                    total_end,
+                    pn,
+                    &send_keys,
+                    true,
                 )?;
                 self.record_sent_packet(CryptoLevel::Initial, pn, true, byte_count);
             }
@@ -3028,7 +3114,12 @@ impl Connection {
 
         let pn_length = 4usize;
         let (head, rest) = out.split_at_mut(pn_offset);
-        apply_hp_mask(&mut head[header_start], &mut rest[..pn_length], &mask, is_long);
+        apply_hp_mask(
+            &mut head[header_start],
+            &mut rest[..pn_length],
+            &mask,
+            is_long,
+        );
         Ok(())
     }
 
@@ -3280,7 +3371,13 @@ impl Connection {
             None => return,
         };
         let mut tmp = [0u8; 32];
-        if let Ok(n) = write_ack(largest, /* delay */ 0, /* first_range */ 0, &[], &mut tmp) {
+        if let Ok(n) = write_ack(
+            largest,
+            /* delay */ 0,
+            /* first_range */ 0,
+            &[],
+            &mut tmp,
+        ) {
             frames.extend_from_slice(&tmp[..n]);
         }
     }
@@ -3351,8 +3448,8 @@ mod tests {
     #[test]
     fn end_to_end_self_handshake() {
         use uni_tls::handshake::{
-            cipher_suite, ext_type, named_group, msg_type as mt, LEGACY_VERSION_TLS12,
-            VERSION_TLS13,
+            LEGACY_VERSION_TLS12, VERSION_TLS13, cipher_suite, ext_type, msg_type as mt,
+            named_group,
         };
 
         // 1. Build a TLS ClientHello as the client would.
@@ -3364,22 +3461,29 @@ mod tests {
             buf.extend_from_slice(body);
         };
         write_ext(&mut ext, ext_type::SUPPORTED_VERSIONS, &[0x02, 0x03, 0x04]);
-        write_ext(&mut ext, ext_type::SUPPORTED_GROUPS, &[0x00, 0x02, 0x00, 0x1d]);
+        write_ext(
+            &mut ext,
+            ext_type::SUPPORTED_GROUPS,
+            &[0x00, 0x02, 0x00, 0x1d],
+        );
         let mut ks = Vec::<u8>::new();
         ks.extend_from_slice(&36u16.to_be_bytes());
         ks.extend_from_slice(&named_group::X25519.to_be_bytes());
         ks.extend_from_slice(&32u16.to_be_bytes());
         ks.extend_from_slice(&client_pub);
         write_ext(&mut ext, ext_type::KEY_SHARE, &ks);
-        write_ext(&mut ext, ext_type::SIGNATURE_ALGORITHMS, &[0x00, 0x02, 0x04, 0x03]);
+        write_ext(
+            &mut ext,
+            ext_type::SIGNATURE_ALGORITHMS,
+            &[0x00, 0x02, 0x04, 0x03],
+        );
 
         let mut ch_body = Vec::<u8>::new();
         ch_body.extend_from_slice(&LEGACY_VERSION_TLS12.to_be_bytes());
         ch_body.extend_from_slice(&[0x11u8; 32]);
         ch_body.push(0);
         ch_body.extend_from_slice(&2u16.to_be_bytes());
-        ch_body
-            .extend_from_slice(&cipher_suite::TLS_AES_128_GCM_SHA256.to_be_bytes());
+        ch_body.extend_from_slice(&cipher_suite::TLS_AES_128_GCM_SHA256.to_be_bytes());
         ch_body.push(1);
         ch_body.push(0);
         ch_body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
@@ -3443,11 +3547,9 @@ mod tests {
         let aad = packet[..payload_offset].to_vec();
         let nonce = packet_nonce(&client_dirkeys.iv, pn);
         {
-            let payload_slice =
-                &mut packet[payload_offset..payload_offset + payload.len()];
+            let payload_slice = &mut packet[payload_offset..payload_offset + payload.len()];
             let tag = client_dirkeys.aead_seal(&nonce, &aad, payload_slice);
-            packet[payload_offset + payload.len()
-                ..payload_offset + payload.len() + TAG_LEN]
+            packet[payload_offset + payload.len()..payload_offset + payload.len() + TAG_LEN]
                 .copy_from_slice(&tag);
         }
 
@@ -3463,7 +3565,8 @@ mod tests {
         let local_cid = ConnectionId::new(&[0xab; 8]);
         let mut conn = Connection::new_server(local_cid, [0x42u8; 32]);
         let cfg = dev_config();
-        conn.process_datagram(&mut packet, &cfg).expect("process inbound Initial");
+        conn.process_datagram(&mut packet, &cfg)
+            .expect("process inbound Initial");
 
         // The server should have moved into Connecting and queued
         // an outbound datagram with the server flight.
@@ -3486,16 +3589,14 @@ mod tests {
         let pre = parse_long_header_preamble(reply).unwrap();
         assert_eq!(pre.long_type, long_packet_type::INITIAL);
         assert_eq!(pre.dcid, &client_scid[..]); // server echoes our SCID
-        assert_eq!(pre.scid, &[0xab; 8][..]);   // server's local CID
+        assert_eq!(pre.scid, &[0xab; 8][..]); // server's local CID
         // Continue parsing to find pn_offset.
         let initial_hdr = parse_initial_header(reply).unwrap();
         let init_total = initial_hdr.pn_offset + initial_hdr.length as usize;
         let mut init_buf = reply[..init_total].to_vec();
-        let _pn = conn.unprotect_and_decrypt(
-            &mut init_buf,
-            initial_hdr.pn_offset,
-            &server_initial_dk,
-        ).expect("decrypt server Initial");
+        let _pn = conn
+            .unprotect_and_decrypt(&mut init_buf, initial_hdr.pn_offset, &server_initial_dk)
+            .expect("decrypt server Initial");
 
         // Second packet (after Initial) should be Handshake.
         let handshake_pkt = &reply[init_total..];
@@ -3515,10 +3616,8 @@ mod tests {
     }
 
     fn dev_config() -> TlsServerConfig {
-        const CERT: &[u8] =
-            include_bytes!("../../apps/webserver/dev_certs/dev_cert.der");
-        const KEY: &[u8] =
-            include_bytes!("../../apps/webserver/dev_certs/dev_key.der");
+        const CERT: &[u8] = include_bytes!("../../apps/webserver/dev_certs/dev_cert.der");
+        const KEY: &[u8] = include_bytes!("../../apps/webserver/dev_certs/dev_key.der");
         TlsServerConfig::from_dev_cert(CERT, KEY).expect("dev cert load")
     }
 

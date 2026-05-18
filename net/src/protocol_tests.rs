@@ -4,9 +4,15 @@
 // Run: bazel test //net:protocol_tests
 
 // Inline byte-order helpers (avoid dep on net_types which has panic=abort)
-fn htons(h: u16) -> u16 { h.to_be() }
-fn ntohs(n: u16) -> u16 { u16::from_be(n) }
-fn ntohl(n: u32) -> u32 { u32::from_be(n) }
+fn htons(h: u16) -> u16 {
+    h.to_be()
+}
+fn ntohs(n: u16) -> u16 {
+    u16::from_be(n)
+}
+fn ntohl(n: u32) -> u32 {
+    u32::from_be(n)
+}
 
 fn checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
@@ -70,11 +76,11 @@ struct ArpPacket {
 #[test]
 fn arp_request_encoding() {
     let pkt = ArpPacket {
-        hw_type: htons(1),        // Ethernet
+        hw_type: htons(1),         // Ethernet
         proto_type: htons(0x0800), // IPv4
         hw_len: 6,
         proto_len: 4,
-        operation: htons(1),      // Request
+        operation: htons(1), // Request
         sender_mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
         sender_ip: [10, 0, 2, 15],
         target_mac: [0; 6],
@@ -103,9 +109,9 @@ fn arp_reply_decode() {
         0x06, 0x04, // hw_len=6, proto_len=4
         0x00, 0x02, // operation = 2 (reply)
         0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, // sender_mac
-        10, 0, 2, 2,                          // sender_ip
-        0x52, 0x54, 0x00, 0x12, 0x34, 0x56,  // target_mac
-        10, 0, 2, 15,                          // target_ip
+        10, 0, 2, 2, // sender_ip
+        0x52, 0x54, 0x00, 0x12, 0x34, 0x56, // target_mac
+        10, 0, 2, 15, // target_ip
     ];
     let operation = ntohs(u16::from_ne_bytes([data[6], data[7]]));
     assert_eq!(operation, 2);
@@ -119,12 +125,12 @@ fn arp_reply_decode() {
 fn ipv4_header_parse() {
     // Minimal IPv4 header: version=4, IHL=5, total_len=40, proto=6 (TCP)
     let hdr: [u8; 20] = [
-        0x45, 0x00,       // version=4, IHL=5, TOS=0
-        0x00, 0x28,       // total_length=40 (big-endian)
-        0x00, 0x01,       // identification
-        0x40, 0x00,       // flags=DF, fragment_offset=0
-        0x40, 0x06,       // TTL=64, protocol=6 (TCP)
-        0x00, 0x00,       // checksum (0 for test)
+        0x45, 0x00, // version=4, IHL=5, TOS=0
+        0x00, 0x28, // total_length=40 (big-endian)
+        0x00, 0x01, // identification
+        0x40, 0x00, // flags=DF, fragment_offset=0
+        0x40, 0x06, // TTL=64, protocol=6 (TCP)
+        0x00, 0x00, // checksum (0 for test)
         0x0A, 0x00, 0x02, 0x0F, // src = 10.0.2.15
         0x0A, 0x00, 0x02, 0x02, // dst = 10.0.2.2
     ];
@@ -138,18 +144,15 @@ fn ipv4_header_parse() {
     assert_eq!(total_len, 40);
     assert_eq!(protocol, 6); // TCP
     assert_eq!(&hdr[12..16], &[10, 0, 2, 15]); // src
-    assert_eq!(&hdr[16..20], &[10, 0, 2, 2]);  // dst
+    assert_eq!(&hdr[16..20], &[10, 0, 2, 2]); // dst
 }
 
 #[test]
 fn ipv4_header_checksum_valid() {
     // Same header with computed checksum — verify it
     let mut hdr: [u8; 20] = [
-        0x45, 0x00, 0x00, 0x28,
-        0x00, 0x01, 0x40, 0x00,
-        0x40, 0x06, 0x00, 0x00,
-        0x0A, 0x00, 0x02, 0x0F,
-        0x0A, 0x00, 0x02, 0x02,
+        0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 0x0A, 0x00, 0x02,
+        0x0F, 0x0A, 0x00, 0x02, 0x02,
     ];
     let cksum = checksum(&hdr);
     hdr[10] = (cksum & 0xFF) as u8;
@@ -163,10 +166,8 @@ fn ipv4_reject_version6() {
     // Version 6 should be rejected by IPv4 parser
     let hdr: [u8; 20] = [
         0x65, 0x00, 0x00, 0x28, // version=6 (invalid for IPv4)
-        0x00, 0x01, 0x40, 0x00,
-        0x40, 0x06, 0x00, 0x00,
-        0x0A, 0x00, 0x02, 0x0F,
-        0x0A, 0x00, 0x02, 0x02,
+        0x00, 0x01, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 0x0A, 0x00, 0x02, 0x0F, 0x0A, 0x00, 0x02,
+        0x02,
     ];
     let version = hdr[0] >> 4;
     assert_ne!(version, 4);
@@ -178,14 +179,14 @@ fn ipv4_reject_version6() {
 fn tcp_syn_segment_parse() {
     // TCP SYN: src_port=12345, dst_port=80, seq=1000, flags=SYN
     let seg: [u8; 20] = [
-        0x30, 0x39,       // src_port = 12345 (big-endian)
-        0x00, 0x50,       // dst_port = 80
+        0x30, 0x39, // src_port = 12345 (big-endian)
+        0x00, 0x50, // dst_port = 80
         0x00, 0x00, 0x03, 0xE8, // seq = 1000
         0x00, 0x00, 0x00, 0x00, // ack = 0
-        0x50, 0x02,       // data_offset=5 (20 bytes), flags=SYN (0x02)
-        0xFF, 0xFF,       // window = 65535
-        0x00, 0x00,       // checksum
-        0x00, 0x00,       // urgent
+        0x50, 0x02, // data_offset=5 (20 bytes), flags=SYN (0x02)
+        0xFF, 0xFF, // window = 65535
+        0x00, 0x00, // checksum
+        0x00, 0x00, // urgent
     ];
     let src_port = ntohs(u16::from_ne_bytes([seg[0], seg[1]]));
     let dst_port = ntohs(u16::from_ne_bytes([seg[2], seg[3]]));
@@ -224,8 +225,8 @@ fn dhcp_magic_cookie() {
 fn dhcp_option_parsing() {
     // DHCP options: message type (53), subnet mask (1), end (255)
     let opts: [u8; 9] = [
-        53, 1, 2,                   // option 53 (message type), len=1, value=2 (OFFER)
-        1, 4, 255, 255, 255, 0,     // option 1 (subnet mask), len=4, value=255.255.255.0
+        53, 1, 2, // option 53 (message type), len=1, value=2 (OFFER)
+        1, 4, 255, 255, 255, 0, // option 1 (subnet mask), len=4, value=255.255.255.0
     ];
     // Parse option 53
     assert_eq!(opts[0], 53);
@@ -233,8 +234,8 @@ fn dhcp_option_parsing() {
     assert_eq!(opts[2], 2); // DHCP OFFER
 
     // Parse option 1
-    assert_eq!(opts[3], 1);  // subnet mask option
-    assert_eq!(opts[4], 4);  // length
+    assert_eq!(opts[3], 1); // subnet mask option
+    assert_eq!(opts[4], 4); // length
     assert_eq!(&opts[5..9], &[255, 255, 255, 0]);
 }
 
@@ -246,10 +247,15 @@ fn dhcp_option_end_marker() {
     while i < opts.len() {
         match opts[i] {
             255 => break,
-            0 => { i += 1; continue; }
+            0 => {
+                i += 1;
+                continue;
+            }
             53 => {
                 let len = opts[i + 1] as usize;
-                if len >= 1 { msg_type = opts[i + 2]; }
+                if len >= 1 {
+                    msg_type = opts[i + 2];
+                }
                 i += 2 + len;
             }
             _ => {

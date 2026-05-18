@@ -143,8 +143,12 @@ mod tests {
 
     type Handler = fn(u32) -> u32;
 
-    fn double(x: u32) -> u32 { x.wrapping_mul(2) }
-    fn triple(x: u32) -> u32 { x.wrapping_mul(3) }
+    fn double(x: u32) -> u32 {
+        x.wrapping_mul(2)
+    }
+    fn triple(x: u32) -> u32 {
+        x.wrapping_mul(3)
+    }
 
     #[test]
     fn null_loads_none() {

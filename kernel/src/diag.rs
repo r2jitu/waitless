@@ -38,7 +38,10 @@ struct Capture {
 }
 
 impl Capture {
-    const EMPTY: Self = Capture { bytes: [0; CAPTURE_LEN], len: 0 };
+    const EMPTY: Self = Capture {
+        bytes: [0; CAPTURE_LEN],
+        len: 0,
+    };
 
     fn append(&mut self, src: &[u8]) {
         let space = CAPTURE_LEN.saturating_sub(self.len);
@@ -64,7 +67,11 @@ pub fn append_hex(value: u64) {
     let mut buf = [0u8; 16];
     for i in 0..16 {
         let nibble = ((value >> ((15 - i) * 4)) & 0xF) as u8;
-        buf[i] = if nibble < 10 { b'0' + nibble } else { b'a' + (nibble - 10) };
+        buf[i] = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + (nibble - 10)
+        };
     }
     append(&buf);
 }

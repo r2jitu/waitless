@@ -13,7 +13,9 @@ extern crate app;
 // This one exists only to satisfy the compiler for the binary crate root.
 // --allow-multiple-definition at link time resolves the duplicate.
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_eh_personality() {}

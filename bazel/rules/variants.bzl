@@ -247,7 +247,9 @@ def _iso_impl(ctx):
         ctx.label.name + ".iso",
     )
     helpers_co = _symlink_into_outdir(
-        ctx, ctx.file.helpers, ctx.label.name + ".helpers.sh",
+        ctx,
+        ctx.file.helpers,
+        ctx.label.name + ".helpers.sh",
     )
     launcher = _expand_launcher(ctx, {
         "%ISO%": iso.basename,
@@ -306,7 +308,9 @@ def _qemu_impl(ctx):
         ctx.label.name + ".img",
     )
     helpers_co = _symlink_into_outdir(
-        ctx, ctx.file.helpers, ctx.label.name + ".helpers.sh",
+        ctx,
+        ctx.file.helpers,
+        ctx.label.name + ".helpers.sh",
     )
     launcher = _expand_launcher(ctx, {
         "%ELF%": elf.basename,
@@ -752,6 +756,7 @@ def unikernel_app_test(name, app_base, test_rule, extra_data = None, variants = 
         # archs). Lets `--test_tag_filters=hvf` / `=qemu` /
         # `=qemu_aarch64` all work.
         variant_tags = caller_tags + [suffix] + list(spec.extra_test_tags)
+
         # `os:none` → `@platforms//:incompatible` so `//...` under a
         # unikernel target platform silently skips these py_test
         # targets instead of failing toolchain resolution (there's

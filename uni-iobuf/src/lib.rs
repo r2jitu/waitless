@@ -172,11 +172,7 @@ impl IOBuf {
     /// at the front and `tailroom` at the end. Total allocation is
     /// `headroom + payload_capacity + tailroom`; the visible payload
     /// starts empty (`len = 0`) at offset `headroom`.
-    pub fn new_with_reserved(
-        headroom: usize,
-        payload_capacity: usize,
-        tailroom: usize,
-    ) -> Self {
+    pub fn new_with_reserved(headroom: usize, payload_capacity: usize, tailroom: usize) -> Self {
         let cap = headroom + payload_capacity + tailroom;
         // Zero-fill: nobody reads headroom / tailroom, but the
         // allocator's free-list returns this memory eventually so
@@ -247,12 +243,7 @@ impl IOBuf {
     ///     while this IOBuf exists.
     ///   * If multiple IOBufs view the same storage, their visible
     ///     regions do not overlap when any is mutated.
-    pub unsafe fn borrow(
-        base: NonNull<u8>,
-        capacity: u32,
-        offset: u32,
-        len: u32,
-    ) -> Self {
+    pub unsafe fn borrow(base: NonNull<u8>, capacity: u32, offset: u32, len: u32) -> Self {
         IOBuf {
             inner: Inner::Borrowed(BorrowedView::new(base, capacity, offset, len)),
         }
@@ -702,8 +693,8 @@ mod tests {
         use crate::{Chain, IOBufDropFn, OwnedIOBuf};
         use core::ptr::NonNull;
         use std::boxed::Box;
-        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::thread;
 
         /// Stand-in for a NIC's RX ring: a fixed buffer region plus
@@ -723,8 +714,10 @@ mod tests {
         /// installed by `mock_poll_qp`, reclaimed exactly once here.
         unsafe fn mock_repost(base: NonNull<u8>, capacity: u32, ctx: *mut ()) {
             let nic: Arc<MockNic> = unsafe { Arc::from_raw(ctx as *const MockNic) };
-            nic.last_base.store(base.as_ptr() as usize, Ordering::Relaxed);
-            nic.last_capacity.store(capacity as usize, Ordering::Relaxed);
+            nic.last_base
+                .store(base.as_ptr() as usize, Ordering::Relaxed);
+            nic.last_capacity
+                .store(capacity as usize, Ordering::Relaxed);
             nic.repost_count.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -771,7 +764,11 @@ mod tests {
             // from the cross-core RX path.
             let mut captured: Option<Chain<OwnedIOBuf>> = None;
             mock_poll_qp(&nic, 1400, |chain| {
-                assert_eq!(chain.part_count(), 1, "single-buffer frame is a 1-part chain");
+                assert_eq!(
+                    chain.part_count(),
+                    1,
+                    "single-buffer frame is a 1-part chain"
+                );
                 assert_eq!(chain.total_len(), 1400);
                 captured = Some(chain);
             });
@@ -914,8 +911,7 @@ mod tests {
         let released = Arc::new(AtomicBool::new(false));
 
         unsafe fn cb(_base: NonNull<u8>, _cap: u32, ctx: *mut ()) {
-            let arc: Arc<AtomicBool> =
-                unsafe { Arc::from_raw(ctx as *const AtomicBool) };
+            let arc: Arc<AtomicBool> = unsafe { Arc::from_raw(ctx as *const AtomicBool) };
             arc.store(true, Ordering::SeqCst);
         }
 
@@ -928,8 +924,7 @@ mod tests {
             // callback reconstructs the Arc from ctx and lets it drop.
             // `wrap_owned` produces an `OwnedIOBuf`; widen it to the
             // mutable `IOBuf` this test exercises.
-            let mut buf =
-                IOBuf::from(unsafe { OwnedIOBuf::wrap_owned(ptr, 32, 5, 8, cb, ctx) });
+            let mut buf = IOBuf::from(unsafe { OwnedIOBuf::wrap_owned(ptr, 32, 5, 8, cb, ctx) });
             assert_eq!(buf.data(), b"abcdefgh");
             assert_eq!(buf.headroom(), 5);
             assert_eq!(buf.tailroom(), 19);
@@ -1057,8 +1052,7 @@ mod tests {
 
         let released = Arc::new(AtomicBool::new(false));
         unsafe fn cb(_base: NonNull<u8>, _cap: u32, ctx: *mut ()) {
-            let arc: Arc<AtomicBool> =
-                unsafe { Arc::from_raw(ctx as *const AtomicBool) };
+            let arc: Arc<AtomicBool> = unsafe { Arc::from_raw(ctx as *const AtomicBool) };
             arc.store(true, Ordering::SeqCst);
         }
 
@@ -1111,8 +1105,7 @@ mod tests {
 
         let released = Arc::new(AtomicBool::new(false));
         unsafe fn cb(_base: NonNull<u8>, _cap: u32, ctx: *mut ()) {
-            let arc: Arc<AtomicBool> =
-                unsafe { Arc::from_raw(ctx as *const AtomicBool) };
+            let arc: Arc<AtomicBool> = unsafe { Arc::from_raw(ctx as *const AtomicBool) };
             arc.store(true, Ordering::SeqCst);
         }
 
@@ -1133,7 +1126,10 @@ mod tests {
             let widened: IOBuf = owned.into();
             assert!(matches!(widened.inner, Inner::External(_)));
             assert_eq!(widened.data(), b"owned-rx");
-            assert!(!released.load(Ordering::SeqCst), "drop callback not yet run");
+            assert!(
+                !released.load(Ordering::SeqCst),
+                "drop callback not yet run"
+            );
         }
         // The widened IOBuf dropped at scope end → the original
         // drop_fn fires exactly once: widening kept it intact.

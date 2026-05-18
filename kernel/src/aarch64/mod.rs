@@ -3,7 +3,7 @@
 // FDT (device tree) parsing, MMU page table management,
 // and GIC exception/interrupt handling.
 
+pub mod exceptions;
 pub mod fdt;
 pub mod mmu;
-pub mod exceptions;
 pub mod smp;

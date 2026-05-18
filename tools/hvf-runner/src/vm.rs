@@ -49,14 +49,14 @@
 
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::decoder;
 use crate::fdt;
 use crate::hvf::*;
-use crate::virtio_console;
 use crate::virtio;
+use crate::virtio_console;
 
 // ── Global vCPU handles for IO thread wakeup ────────────────────────────────
 // Stored as AtomicU64 so the IO thread can read without locking.
@@ -73,14 +73,18 @@ static VCPU_HANDLES: [AtomicU64; MAX_VCPUS] = {
 /// `vcpu_poll(0)` before re-entering the guest, which picks up the
 /// new conn from `WORKERS[id].conns`.
 pub fn wake_vcpu(core_id: usize) {
-    if core_id >= MAX_VCPUS { return; }
+    if core_id >= MAX_VCPUS {
+        return;
+    }
     let handle = VCPU_HANDLES[core_id].load(Ordering::Acquire);
     if handle != 0 {
         // SAFETY: `hv_vcpus_exit` is the one HVF FFI that's allowed
         // from a thread other than the vCPU's owner (module contract
         // invariant 2). The pointer is a stack local holding the
         // `handle` we just loaded; it's valid for the call duration.
-        unsafe { hv_vcpus_exit(&handle as *const u64 as *const _, 1); }
+        unsafe {
+            hv_vcpus_exit(&handle as *const u64 as *const _, 1);
+        }
     }
 }
 
@@ -123,12 +127,11 @@ const VIRTIO_CONSOLE_SPI: u32 = 4; // INTID 36, currently unused
 /// covers .text + .data + .bss) gets the runner out of the static-
 /// sizing business: as long as the kernel honestly reports its
 /// memory footprint in the header, the DTB is always placed past it.
-const DTB_GAP: u64 = 0x10_0000;            // 1 MB gap past kernel BSS
-const DTB_ALIGN: u64 = 0x10_0000;          // 1 MB align (DTB cells expect this)
+const DTB_GAP: u64 = 0x10_0000; // 1 MB gap past kernel BSS
+const DTB_ALIGN: u64 = 0x10_0000; // 1 MB align (DTB cells expect this)
 
 /// Offset of `image_size` (u64) in the Linux ARM64 Image header.
 const IMAGE_HEADER_SIZE_OFFSET: usize = 0x10;
-
 
 // PSCI function IDs (SMC64 convention).
 const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
@@ -227,15 +230,16 @@ impl Vm {
                 let _ = unsafe { hv_vm_config_set_ipa_size(vm_cfg, max_ipa) };
             }
         }
-        check(unsafe { hv_vm_create(vm_cfg) })
-            .map_err(|e| format!("hv_vm_create: {e}"))?;
+        check(unsafe { hv_vm_create(vm_cfg) }).map_err(|e| format!("hv_vm_create: {e}"))?;
 
         // 2. Allocate guest RAM.
         let mut ram_ptr: *mut c_void = ptr::null_mut();
         check(unsafe { hv_vm_allocate(&mut ram_ptr, ram_mapped, 0) })
             .map_err(|e| format!("hv_vm_allocate: {e}"))?;
         let ram_host = ram_ptr as *mut u8;
-        unsafe { ptr::write_bytes(ram_host, 0, ram_mapped); }
+        unsafe {
+            ptr::write_bytes(ram_host, 0, ram_mapped);
+        }
 
         // 3. Map RAM into guest IPA space.
         check(unsafe {
@@ -254,10 +258,16 @@ impl Vm {
         let mut ecam_ptr: *mut c_void = ptr::null_mut();
         let rc = unsafe { hv_vm_allocate(&mut ecam_ptr, ecam_size, 0) };
         if rc == HV_SUCCESS && !ecam_ptr.is_null() {
-            unsafe { ptr::write_bytes(ecam_ptr as *mut u8, 0xff, ecam_size); }
+            unsafe {
+                ptr::write_bytes(ecam_ptr as *mut u8, 0xff, ecam_size);
+            }
             let _ = unsafe {
-                hv_vm_map(ecam_ptr, 0x40_1000_0000, ecam_size,
-                          HV_MEMORY_READ | HV_MEMORY_WRITE)
+                hv_vm_map(
+                    ecam_ptr,
+                    0x40_1000_0000,
+                    ecam_size,
+                    HV_MEMORY_READ | HV_MEMORY_WRITE,
+                )
             };
         }
 
@@ -270,8 +280,7 @@ impl Vm {
             .map_err(|e| format!("gic dist base: {e}"))?;
         check(unsafe { hv_gic_config_set_redistributor_base(gic_cfg, GICR_BASE) })
             .map_err(|e| format!("gic redist base: {e}"))?;
-        check(unsafe { hv_gic_create(gic_cfg) })
-            .map_err(|e| format!("hv_gic_create: {e}"))?;
+        check(unsafe { hv_gic_create(gic_cfg) }).map_err(|e| format!("hv_gic_create: {e}"))?;
 
         // 5. Create vCPU 0 only. Secondary vCPUs are created on their
         // own threads during PSCI CPU_ON — HVF requires hv_vcpu_create
@@ -308,7 +317,9 @@ impl Vm {
         if cpu_count > 1 {
             let intid = 32 + VIRTIO_MMIO_SPI; // SPI 3 → INTID 35
             let irouter_off = (0x6000 + intid * 8) as u32;
-            unsafe { hv_gic_set_distributor_reg(irouter_off, 0x0); }
+            unsafe {
+                hv_gic_set_distributor_reg(irouter_off, 0x0);
+            }
         }
 
         // 6. Query the redistributor base HVF assigned (for the FDT).
@@ -316,8 +327,8 @@ impl Vm {
         let _ = unsafe { hv_gic_get_redistributor_base(vcpus[0].vcpu, &mut gicr_actual) };
 
         // 7. Load kernel image into guest RAM at offset 0 (entry = RAM_BASE).
-        let kernel = std::fs::read(kernel_path)
-            .map_err(|e| format!("read kernel {kernel_path}: {e}"))?;
+        let kernel =
+            std::fs::read(kernel_path).map_err(|e| format!("read kernel {kernel_path}: {e}"))?;
 
         // Read the Image header's image_size to know how much of guest
         // RAM the kernel will write into (text + data + bss). DTB
@@ -326,7 +337,7 @@ impl Vm {
             u64::from_le_bytes(
                 kernel[IMAGE_HEADER_SIZE_OFFSET..IMAGE_HEADER_SIZE_OFFSET + 8]
                     .try_into()
-                    .unwrap()
+                    .unwrap(),
             )
         } else {
             // No header, fall back to file size (unrealistic for our
@@ -338,7 +349,8 @@ impl Vm {
             return Err(format!(
                 "kernel file ({} bytes) extends past computed DTB offset ({}); \
                  image_size header probably wrong",
-                kernel.len(), dtb_offset,
+                kernel.len(),
+                dtb_offset,
             ));
         }
         if dtb_offset + 64 * 1024 > ram_size_fdt as u64 {
@@ -377,11 +389,7 @@ impl Vm {
         );
         let dtb_guest_addr = RAM_BASE + dtb_offset;
         unsafe {
-            ptr::copy_nonoverlapping(
-                dtb.as_ptr(),
-                ram_host.add(dtb_offset as usize),
-                dtb.len(),
-            );
+            ptr::copy_nonoverlapping(dtb.as_ptr(), ram_host.add(dtb_offset as usize), dtb.len());
         }
 
         // 9. Set initial register state for vCPU 0 only.
@@ -402,17 +410,20 @@ impl Vm {
         vcpus[0].running.store(true, Ordering::Release);
 
         // 10. Initialize the virtio-mmio net device.
-        *virtio::DEVICE.lock().unwrap() = Some(
-            virtio::VirtioNet::new(mac, ram_host, RAM_BASE, cpu_count)
-        );
+        *virtio::DEVICE.lock().unwrap() =
+            Some(virtio::VirtioNet::new(mac, ram_host, RAM_BASE, cpu_count));
 
         // 10b. Initialize the virtio-mmio console device.
-        *virtio_console::DEVICE.lock().unwrap() = Some(
-            virtio_console::VirtioConsole::new(ram_host, RAM_BASE)
-        );
+        *virtio_console::DEVICE.lock().unwrap() =
+            Some(virtio_console::VirtioConsole::new(ram_host, RAM_BASE));
 
         let shutdown = Arc::new(AtomicBool::new(false));
-        Ok(Vm { ram_host, ram_size: ram_mapped, vcpus, shutdown })
+        Ok(Vm {
+            ram_host,
+            ram_size: ram_mapped,
+            vcpus,
+            shutdown,
+        })
     }
 
     /// Run vCPU 0 until the guest executes PSCI SYSTEM_OFF or an
@@ -459,7 +470,9 @@ fn run_vcpu(
 
         // Inject pending vtimer IRQ before entering the guest.
         if vtimer_pending {
-            unsafe { hv_vcpu_set_pending_interrupt(vcpu, 0, true); }
+            unsafe {
+                hv_vcpu_set_pending_interrupt(vcpu, 0, true);
+            }
         }
 
         check(unsafe { hv_vcpu_run(vcpu) })
@@ -472,11 +485,8 @@ fn run_vcpu(
                 let ec = esr_ec(exit.exception.syndrome);
                 match ec {
                     EC_HVC => {
-                        let result = handle_hvc(
-                            vcpu_id, vcpu, exit,
-                            &all_vcpus, &shutdown,
-                            ram, ram_size,
-                        )?;
+                        let result =
+                            handle_hvc(vcpu_id, vcpu, exit, &all_vcpus, &shutdown, ram, ram_size)?;
                         if result {
                             return Ok(());
                         }
@@ -540,7 +550,9 @@ fn run_vcpu(
                     let istatus = (cntv_ctl >> 1) & 1;
                     let imask = (cntv_ctl >> 2) & 1;
                     if enabled == 0 || imask != 0 || istatus == 0 {
-                        unsafe { hv_vcpu_set_vtimer_mask(vcpu, false); }
+                        unsafe {
+                            hv_vcpu_set_vtimer_mask(vcpu, false);
+                        }
                         vtimer_masked = false;
                         vtimer_pending = false;
                     }
@@ -555,7 +567,8 @@ fn run_vcpu(
             }
             _ => {
                 return Err(format!(
-                    "cpu {vcpu_id}: unknown exit reason: {}", exit.reason
+                    "cpu {vcpu_id}: unknown exit reason: {}",
+                    exit.reason
                 ));
             }
         }
@@ -584,9 +597,7 @@ fn handle_hvc(
             shutdown.store(true, Ordering::Release);
             for vi in all_vcpus.iter() {
                 if vi.running.load(Ordering::Acquire) {
-                    let _ = unsafe {
-                        hv_vcpus_exit(&vi.vcpu as *const _, 1)
-                    };
+                    let _ = unsafe { hv_vcpus_exit(&vi.vcpu as *const _, 1) };
                 }
             }
             return Ok(true);
@@ -634,7 +645,9 @@ fn handle_hvc(
                         VCPU_HANDLES[target_id].store(new_vcpu, Ordering::Release);
                         // Set MPIDR.
                         let mpidr = 0x8000_0000u64 | (target_id as u64);
-                        unsafe { hv_vcpu_set_sys_reg(new_vcpu, HvSysReg::MpidrEl1, mpidr); }
+                        unsafe {
+                            hv_vcpu_set_sys_reg(new_vcpu, HvSysReg::MpidrEl1, mpidr);
+                        }
                         // Set initial registers.
                         unsafe {
                             hv_vcpu_set_reg(new_vcpu, HvReg::Pc, entry_point);
@@ -703,14 +716,13 @@ fn handle_mmio(
     let pc = get_reg(vcpu, HvReg::Pc);
 
     // Fetch the faulting instruction from host-side guest RAM.
-    let pc_offset = pc.checked_sub(RAM_BASE)
+    let pc_offset = pc
+        .checked_sub(RAM_BASE)
         .ok_or_else(|| format!("PC 0x{pc:x} outside guest RAM"))?;
     if pc_offset as usize + 4 > ram_size {
         return Err(format!("PC 0x{pc:x} past end of guest RAM"));
     }
-    let instr = unsafe {
-        ptr::read_unaligned(ram_host.add(pc_offset as usize) as *const u32)
-    };
+    let instr = unsafe { ptr::read_unaligned(ram_host.add(pc_offset as usize) as *const u32) };
 
     // Decode.
     let access = decoder::decode(instr).ok_or_else(|| {
@@ -721,16 +733,16 @@ fn handle_mmio(
     })?;
 
     // Route by IPA to the correct device.
-    if fault_ipa >= VIRTIO_CONSOLE_BASE
-        && fault_ipa < VIRTIO_CONSOLE_BASE + VIRTIO_CONSOLE_SIZE
-    {
+    if fault_ipa >= VIRTIO_CONSOLE_BASE && fault_ipa < VIRTIO_CONSOLE_BASE + VIRTIO_CONSOLE_SIZE {
         let offset = fault_ipa - VIRTIO_CONSOLE_BASE;
         let mut tx_kicked = false;
         {
             let mut dev_lock = virtio_console::DEVICE.lock().unwrap();
             let dev = dev_lock.as_mut().unwrap();
             if access.is_write {
-                let val = if access.rt == 31 { 0 } else {
+                let val = if access.rt == 31 {
+                    0
+                } else {
                     get_reg(vcpu, HvReg::gpr(access.rt as u32)) as u32
                 };
                 if dev.write(offset, val) {
@@ -752,7 +764,9 @@ fn handle_mmio(
         // GIC distributor MMIO.
         let offset = (fault_ipa - GICD_BASE) as u32;
         if access.is_write {
-            let val = if access.rt == 31 { 0 } else {
+            let val = if access.rt == 31 {
+                0
+            } else {
                 get_reg(vcpu, HvReg::gpr(access.rt as u32))
             };
             unsafe { hv_gic_set_distributor_reg(offset, val) };
@@ -769,7 +783,9 @@ fn handle_mmio(
         // 0x20000-byte frame: 0x10000 RD_base + 0x10000 SGI_base).
         let offset = (fault_ipa - GICR_BASE) as u32;
         if access.is_write {
-            let val = if access.rt == 31 { 0 } else {
+            let val = if access.rt == 31 {
+                0
+            } else {
                 get_reg(vcpu, HvReg::gpr(access.rt as u32))
             };
             unsafe { hv_gic_set_redistributor_reg(vcpu, offset, val) };
@@ -780,9 +796,7 @@ fn handle_mmio(
                 set_reg(vcpu, HvReg::gpr(access.rt as u32), val);
             }
         }
-    } else if fault_ipa >= VIRTIO_MMIO_BASE
-        && fault_ipa < VIRTIO_MMIO_BASE + VIRTIO_MMIO_SIZE
-    {
+    } else if fault_ipa >= VIRTIO_MMIO_BASE && fault_ipa < VIRTIO_MMIO_BASE + VIRTIO_MMIO_SIZE {
         let offset = fault_ipa - VIRTIO_MMIO_BASE;
 
         let mut notify_queue: Option<u32> = None;
@@ -790,7 +804,9 @@ fn handle_mmio(
             let mut dev_lock = virtio::DEVICE.lock().unwrap();
             let dev = dev_lock.as_mut().unwrap();
             if access.is_write {
-                let val = if access.rt == 31 { 0 } else {
+                let val = if access.rt == 31 {
+                    0
+                } else {
                     get_reg(vcpu, HvReg::gpr(access.rt as u32)) as u32
                 };
                 if dev.write(offset, val) {

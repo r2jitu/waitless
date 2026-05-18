@@ -29,7 +29,7 @@ extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 
 use from_bytes::FromBytes;
-use types::{htons, ntohs, Ipv6Addr};
+use types::{Ipv6Addr, htons, ntohs};
 
 /// EtherType for IPv6 (RFC 2464).
 pub const ETHERTYPE_IPV6: u16 = 0x86dd;
@@ -171,12 +171,7 @@ pub fn ipv6_receive<'a>(data: &'a [u8], our_addrs: &[Ipv6Addr]) -> Option<Ipv6Pa
 /// 3 zero bytes || u8 next-header || upper-layer payload. Returns
 /// the one's-complement sum suitable for placement in the
 /// upper-layer checksum field.
-pub fn pseudo_checksum(
-    src: &Ipv6Addr,
-    dst: &Ipv6Addr,
-    next_header: u8,
-    payload: &[u8],
-) -> u16 {
+pub fn pseudo_checksum(src: &Ipv6Addr, dst: &Ipv6Addr, next_header: u8, payload: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     // src + dst (each 16 bytes = 8 u16 words).
     for chunk in src.octets.chunks(2).chain(dst.octets.chunks(2)) {
@@ -228,8 +223,7 @@ mod tests {
         };
         let payload = &[0xde, 0xad, 0xbe, 0xef];
         let mut buf = [0u8; HEADER_LEN + 4];
-        let n =
-            ipv6_build(&src, &dst, next_header::ICMPV6, 255, payload, &mut buf).expect("build");
+        let n = ipv6_build(&src, &dst, next_header::ICMPV6, 255, payload, &mut buf).expect("build");
         assert_eq!(n, HEADER_LEN + 4);
 
         let pkt = ipv6_receive(&buf, &[dst]).expect("parse");
@@ -284,10 +278,12 @@ mod tests {
         // identifier=0x1234, sequence=0x0001, data="abcdefg".
         let mut payload = [0u8; 15];
         payload[0] = 128; // type
-        payload[1] = 0;   // code
+        payload[1] = 0; // code
         // checksum (bytes 2-3) left zero
-        payload[4] = 0x12; payload[5] = 0x34;
-        payload[6] = 0x00; payload[7] = 0x01;
+        payload[4] = 0x12;
+        payload[5] = 0x34;
+        payload[6] = 0x00;
+        payload[7] = 0x01;
         payload[8..15].copy_from_slice(b"abcdefg");
 
         let cksum = pseudo_checksum(&src, &dst, next_header::ICMPV6, &payload);

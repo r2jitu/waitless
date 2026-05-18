@@ -203,7 +203,12 @@ fn main() -> std::io::Result<()> {
 
     let result = match args.workload {
         Workload::TlsHandshake {
-            host, port, endpoint, duration_secs, warmup_secs, parallelism,
+            host,
+            port,
+            endpoint,
+            duration_secs,
+            warmup_secs,
+            parallelism,
         } => runtime.block_on(tls_handshake::run(
             &host,
             port,
@@ -213,7 +218,12 @@ fn main() -> std::io::Result<()> {
             parallelism,
         )),
         Workload::TlsResume {
-            host, port, endpoint, duration_secs, warmup_secs, parallelism,
+            host,
+            port,
+            endpoint,
+            duration_secs,
+            warmup_secs,
+            parallelism,
         } => runtime.block_on(tls_resume::run(
             &host,
             port,
@@ -223,7 +233,12 @@ fn main() -> std::io::Result<()> {
             parallelism,
         )),
         Workload::H3Health {
-            host, port, endpoint, duration_secs, warmup_secs, parallelism,
+            host,
+            port,
+            endpoint,
+            duration_secs,
+            warmup_secs,
+            parallelism,
         } => runtime.block_on(h3_health::run(
             &host,
             port,
@@ -233,7 +248,12 @@ fn main() -> std::io::Result<()> {
             parallelism,
         )),
         Workload::HttpClose {
-            host, port, endpoint, duration_secs, warmup_secs, parallelism,
+            host,
+            port,
+            endpoint,
+            duration_secs,
+            warmup_secs,
+            parallelism,
         } => runtime.block_on(http_close::run(
             &host,
             port,
@@ -243,7 +263,11 @@ fn main() -> std::io::Result<()> {
             parallelism,
         )),
         Workload::TcpEcho {
-            host, port, duration_secs, connections, msg_size,
+            host,
+            port,
+            duration_secs,
+            connections,
+            msg_size,
         } => runtime.block_on(tcp_echo::run(
             &host,
             port,
@@ -252,7 +276,13 @@ fn main() -> std::io::Result<()> {
             msg_size,
         )),
         Workload::HttpUpload {
-            host, port, endpoint, duration_secs, connections, msg_size, tls,
+            host,
+            port,
+            endpoint,
+            duration_secs,
+            connections,
+            msg_size,
+            tls,
         } => runtime.block_on(http_upload::run(
             &host,
             port,
@@ -263,7 +293,12 @@ fn main() -> std::io::Result<()> {
             tls,
         )),
         Workload::Gateway {
-            host, port, backend_port, duration_secs, connections, msg_size,
+            host,
+            port,
+            backend_port,
+            duration_secs,
+            connections,
+            msg_size,
         } => runtime.block_on(gateway::run(
             &host,
             port,

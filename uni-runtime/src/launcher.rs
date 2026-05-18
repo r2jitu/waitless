@@ -171,7 +171,8 @@ impl LaunchTable {
         // registration — every worker tick reads it via
         // `fire_pending`, and we want that path branch-free.
         // `ensure_init` is idempotent + race-safe.
-        self.fired.ensure_init(num_workers(), |_| AtomicUsize::new(0));
+        self.fired
+            .ensure_init(num_workers(), |_| AtomicUsize::new(0));
         let i = self.count.fetch_add(1, Ordering::AcqRel);
         if i >= MAX_LAUNCHERS {
             return usize::MAX;

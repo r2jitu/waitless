@@ -37,7 +37,7 @@
 // (no-std declaration is in lib.rs. `wire` is now this crate's
 // sibling module rather than a separate crate.)
 
-use crate::wire::{read_varint, write_varint, WireError};
+use crate::wire::{WireError, read_varint, write_varint};
 
 // ============================================================================
 // Frame type bytes (RFC 9000 §19)
@@ -137,7 +137,10 @@ pub enum Frame<'a> {
     },
     /// CRYPTO frame — TLS handshake bytes for the current packet
     /// number space (Initial/Handshake/1-RTT).
-    Crypto { offset: u64, data: &'a [u8] },
+    Crypto {
+        offset: u64,
+        data: &'a [u8],
+    },
     Stream {
         stream_id: u64,
         offset: u64,
@@ -219,9 +222,7 @@ pub fn parse_frame(data: &[u8]) -> Result<(Frame<'_>, usize), FrameError> {
             parse_stream(rest, b, frame_total_offset)
         }
         ftype::CONNECTION_CLOSE_TRANSPORT => parse_close_transport(rest, frame_total_offset),
-        ftype::CONNECTION_CLOSE_APPLICATION => {
-            parse_close_application(rest, frame_total_offset)
-        }
+        ftype::CONNECTION_CLOSE_APPLICATION => parse_close_application(rest, frame_total_offset),
         ftype::HANDSHAKE_DONE => Ok((Frame::HandshakeDone, 1)),
         ftype::NEW_TOKEN => skip_var_len_field(rest, t, frame_total_offset),
         // RESET_STREAM (RFC 9000 §19.4): three varints — stream id,
@@ -249,9 +250,7 @@ pub fn parse_frame(data: &[u8]) -> Result<(Frame<'_>, usize), FrameError> {
             skip_two_varints(rest, t, frame_total_offset)
         }
         ftype::NEW_CONNECTION_ID => skip_new_connection_id(rest, t, frame_total_offset),
-        ftype::PATH_CHALLENGE | ftype::PATH_RESPONSE => {
-            skip_fixed(rest, t, 8, frame_total_offset)
-        }
+        ftype::PATH_CHALLENGE | ftype::PATH_RESPONSE => skip_fixed(rest, t, 8, frame_total_offset),
         other => Err(FrameError::UnknownFrameType(other)),
     }
 }
@@ -356,7 +355,10 @@ fn parse_ack<'a>(
         p += n2;
     }
     let ranges_bytes = &body[ranges_start..p];
-    let ranges = AckRanges { bytes: ranges_bytes, count: range_count };
+    let ranges = AckRanges {
+        bytes: ranges_bytes,
+        count: range_count,
+    };
 
     let ecn = if is_ecn {
         let (ect0, n) = read_varint(&body[p..])?;
@@ -441,7 +443,12 @@ fn parse_stream<'a>(
     p += len_consumed;
 
     Ok((
-        Frame::Stream { stream_id, offset, data, fin },
+        Frame::Stream {
+            stream_id,
+            offset,
+            data,
+            fin,
+        },
         header_consumed + p,
     ))
 }
@@ -741,7 +748,12 @@ mod tests {
         let n = write_stream(7, 4, true, b"hello", &mut buf).unwrap();
         let (f, parsed_n) = parse_frame(&buf[..n]).unwrap();
         match f {
-            Frame::Stream { stream_id, offset, data, fin } => {
+            Frame::Stream {
+                stream_id,
+                offset,
+                data,
+                fin,
+            } => {
                 assert_eq!(stream_id, 7);
                 assert_eq!(offset, 4);
                 assert!(fin);
@@ -830,12 +842,12 @@ mod tests {
         out[0] = ftype::ACK_ECN;
         let mut p = 1;
         p += write_varint(50, &mut out[p..]).unwrap(); // largest
-        p += write_varint(0, &mut out[p..]).unwrap();  // delay
-        p += write_varint(0, &mut out[p..]).unwrap();  // range_count
-        p += write_varint(2, &mut out[p..]).unwrap();  // first_ack_range
-        p += write_varint(7, &mut out[p..]).unwrap();  // ect0
-        p += write_varint(8, &mut out[p..]).unwrap();  // ect1
-        p += write_varint(9, &mut out[p..]).unwrap();  // ce
+        p += write_varint(0, &mut out[p..]).unwrap(); // delay
+        p += write_varint(0, &mut out[p..]).unwrap(); // range_count
+        p += write_varint(2, &mut out[p..]).unwrap(); // first_ack_range
+        p += write_varint(7, &mut out[p..]).unwrap(); // ect0
+        p += write_varint(8, &mut out[p..]).unwrap(); // ect1
+        p += write_varint(9, &mut out[p..]).unwrap(); // ce
         let (f, n) = parse_frame(&out[..p]).unwrap();
         assert_eq!(n, p);
         match f {
@@ -880,7 +892,12 @@ mod tests {
         let (f, n) = parse_frame(&out[..p]).unwrap();
         assert_eq!(n, p);
         match f {
-            Frame::Stream { stream_id, offset, data, fin } => {
+            Frame::Stream {
+                stream_id,
+                offset,
+                data,
+                fin,
+            } => {
                 assert_eq!(stream_id, 7);
                 assert_eq!(offset, 42);
                 assert_eq!(data, body);
@@ -902,7 +919,12 @@ mod tests {
         let (f, n) = parse_frame(&out[..total]).unwrap();
         assert_eq!(n, total);
         match f {
-            Frame::Stream { stream_id, offset, data, fin } => {
+            Frame::Stream {
+                stream_id,
+                offset,
+                data,
+                fin,
+            } => {
                 assert_eq!(stream_id, 0);
                 assert_eq!(offset, 0);
                 assert_eq!(data, body);
@@ -919,7 +941,11 @@ mod tests {
         let (f, parsed_n) = parse_frame(&out[..n]).unwrap();
         assert_eq!(parsed_n, n);
         match f {
-            Frame::ConnectionCloseTransport { error_code, frame_type, reason } => {
+            Frame::ConnectionCloseTransport {
+                error_code,
+                frame_type,
+                reason,
+            } => {
                 assert_eq!(error_code, 0x42);
                 assert_eq!(frame_type, 0x06);
                 assert_eq!(reason, b"oops");

@@ -23,7 +23,7 @@
 // The counters are always live so a future `/debug/quic_stats`
 // endpoint can dump them on demand without code changes.
 
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// One atomic counter per drop / event reason. Cheap to read in bulk
 /// for a stats dump, cheap to increment on the hot path.
@@ -346,8 +346,7 @@ static LEVEL: AtomicU8 = AtomicU8::new(LEVEL_DEFAULT);
 /// Whether we've parsed `boot_info().boot_args` yet. First macro
 /// invocation triggers the parse; subsequent calls hit the cached
 /// `LEVEL` directly.
-static LEVEL_INIT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static LEVEL_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Override the log level explicitly. Useful for tests, benchmarks,
 /// or when an app wants to force-enable verbose logging without
@@ -423,45 +422,120 @@ pub fn snapshot() -> [(&'static str, u64); 40] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
-        ("unknown_long_header", c.unknown_long_header.load(Ordering::Relaxed)),
-        ("unknown_short_header", c.unknown_short_header.load(Ordering::Relaxed)),
+        (
+            "unknown_long_header",
+            c.unknown_long_header.load(Ordering::Relaxed),
+        ),
+        (
+            "unknown_short_header",
+            c.unknown_short_header.load(Ordering::Relaxed),
+        ),
         ("slot_table_full", c.slot_table_full.load(Ordering::Relaxed)),
         ("rng_failed", c.rng_failed.load(Ordering::Relaxed)),
-        ("long_header_parse", c.long_header_parse.load(Ordering::Relaxed)),
-        ("initial_header_parse", c.initial_header_parse.load(Ordering::Relaxed)),
-        ("aead_decrypt_failed", c.aead_decrypt_failed.load(Ordering::Relaxed)),
+        (
+            "long_header_parse",
+            c.long_header_parse.load(Ordering::Relaxed),
+        ),
+        (
+            "initial_header_parse",
+            c.initial_header_parse.load(Ordering::Relaxed),
+        ),
+        (
+            "aead_decrypt_failed",
+            c.aead_decrypt_failed.load(Ordering::Relaxed),
+        ),
         ("unknown_frame", c.unknown_frame.load(Ordering::Relaxed)),
         ("bad_state", c.bad_state.load(Ordering::Relaxed)),
-        ("late_initial_dropped", c.late_initial_dropped.load(Ordering::Relaxed)),
-        ("late_handshake_dropped", c.late_handshake_dropped.load(Ordering::Relaxed)),
+        (
+            "late_initial_dropped",
+            c.late_initial_dropped.load(Ordering::Relaxed),
+        ),
+        (
+            "late_handshake_dropped",
+            c.late_handshake_dropped.load(Ordering::Relaxed),
+        ),
         ("other_wire", c.other_wire.load(Ordering::Relaxed)),
-        ("unsupported_client", c.unsupported_client.load(Ordering::Relaxed)),
+        (
+            "unsupported_client",
+            c.unsupported_client.load(Ordering::Relaxed),
+        ),
         ("tls_internal", c.tls_internal.load(Ordering::Relaxed)),
         ("conns_allocated", c.conns_allocated.load(Ordering::Relaxed)),
         ("conns_dropped", c.conns_dropped.load(Ordering::Relaxed)),
-        ("initial_dcid_hit", c.initial_dcid_hit.load(Ordering::Relaxed)),
-        ("handshakes_completed", c.handshakes_completed.load(Ordering::Relaxed)),
+        (
+            "initial_dcid_hit",
+            c.initial_dcid_hit.load(Ordering::Relaxed),
+        ),
+        (
+            "handshakes_completed",
+            c.handshakes_completed.load(Ordering::Relaxed),
+        ),
         ("tickets_emitted", c.tickets_emitted.load(Ordering::Relaxed)),
-        ("tickets_accepted", c.tickets_accepted.load(Ordering::Relaxed)),
-        ("early_keys_derived", c.early_keys_derived.load(Ordering::Relaxed)),
-        ("zero_rtt_accepted", c.zero_rtt_accepted.load(Ordering::Relaxed)),
-        ("key_updates_accepted", c.key_updates_accepted.load(Ordering::Relaxed)),
-        ("zero_rtt_buffered", c.zero_rtt_buffered.load(Ordering::Relaxed)),
-        ("zero_rtt_unresumable", c.zero_rtt_unresumable.load(Ordering::Relaxed)),
+        (
+            "tickets_accepted",
+            c.tickets_accepted.load(Ordering::Relaxed),
+        ),
+        (
+            "early_keys_derived",
+            c.early_keys_derived.load(Ordering::Relaxed),
+        ),
+        (
+            "zero_rtt_accepted",
+            c.zero_rtt_accepted.load(Ordering::Relaxed),
+        ),
+        (
+            "key_updates_accepted",
+            c.key_updates_accepted.load(Ordering::Relaxed),
+        ),
+        (
+            "zero_rtt_buffered",
+            c.zero_rtt_buffered.load(Ordering::Relaxed),
+        ),
+        (
+            "zero_rtt_unresumable",
+            c.zero_rtt_unresumable.load(Ordering::Relaxed),
+        ),
         ("idle_timeouts", c.idle_timeouts.load(Ordering::Relaxed)),
-        ("connection_closes_emitted", c.connection_closes_emitted.load(Ordering::Relaxed)),
-        ("packets_lost_threshold", c.packets_lost_threshold.load(Ordering::Relaxed)),
-        ("packets_lost_time", c.packets_lost_time.load(Ordering::Relaxed)),
+        (
+            "connection_closes_emitted",
+            c.connection_closes_emitted.load(Ordering::Relaxed),
+        ),
+        (
+            "packets_lost_threshold",
+            c.packets_lost_threshold.load(Ordering::Relaxed),
+        ),
+        (
+            "packets_lost_time",
+            c.packets_lost_time.load(Ordering::Relaxed),
+        ),
         ("pto_probes_sent", c.pto_probes_sent.load(Ordering::Relaxed)),
-        ("recv_streams_created", c.recv_streams_created.load(Ordering::Relaxed)),
-        ("send_streams_created", c.send_streams_created.load(Ordering::Relaxed)),
+        (
+            "recv_streams_created",
+            c.recv_streams_created.load(Ordering::Relaxed),
+        ),
+        (
+            "send_streams_created",
+            c.send_streams_created.load(Ordering::Relaxed),
+        ),
         ("streams_reaped", c.streams_reaped.load(Ordering::Relaxed)),
-        ("inbox_full_drops", c.inbox_full_drops.load(Ordering::Relaxed)),
-        ("conn_task_iterations", c.conn_task_iterations.load(Ordering::Relaxed)),
+        (
+            "inbox_full_drops",
+            c.inbox_full_drops.load(Ordering::Relaxed),
+        ),
+        (
+            "conn_task_iterations",
+            c.conn_task_iterations.load(Ordering::Relaxed),
+        ),
         ("flush_calls", c.flush_calls.load(Ordering::Relaxed)),
         ("datagrams_sent", c.datagrams_sent.load(Ordering::Relaxed)),
-        ("datagrams_processed", c.datagrams_processed.load(Ordering::Relaxed)),
-        ("anti_amp_throttled", c.anti_amp_throttled.load(Ordering::Relaxed)),
+        (
+            "datagrams_processed",
+            c.datagrams_processed.load(Ordering::Relaxed),
+        ),
+        (
+            "anti_amp_throttled",
+            c.anti_amp_throttled.load(Ordering::Relaxed),
+        ),
     ]
 }
 

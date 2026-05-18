@@ -33,7 +33,9 @@ mod serial {
         fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     }
     pub fn puts(bytes: &[u8]) {
-        unsafe { let _ = write(2, bytes.as_ptr(), bytes.len()); }
+        unsafe {
+            let _ = write(2, bytes.as_ptr(), bytes.len());
+        }
     }
 }
 

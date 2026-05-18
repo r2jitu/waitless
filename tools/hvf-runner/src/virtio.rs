@@ -150,8 +150,12 @@ unsafe impl Sync for QueueSnapshot {}
 impl QueueSnapshot {
     pub const EMPTY: Self = QueueSnapshot {
         ram_host: std::ptr::null_mut(),
-        ram_base: 0, desc_addr: 0, avail_addr: 0, used_addr: 0,
-        qsize: 0, ready: false,
+        ram_base: 0,
+        desc_addr: 0,
+        avail_addr: 0,
+        used_addr: 0,
+        qsize: 0,
+        ready: false,
     };
 
     #[inline]
@@ -171,7 +175,10 @@ static QUEUE_SNAPS: [OnceLock<QueueSnapshot>; MAX_QUEUES] = {
 
 pub fn queue_snapshot(index: usize) -> QueueSnapshot {
     if index < MAX_QUEUES {
-        QUEUE_SNAPS[index].get().copied().unwrap_or(QueueSnapshot::EMPTY)
+        QUEUE_SNAPS[index]
+            .get()
+            .copied()
+            .unwrap_or(QueueSnapshot::EMPTY)
     } else {
         QueueSnapshot::EMPTY
     }
@@ -221,11 +228,13 @@ impl VirtioNet {
                     // (we're a userspace TCP proxy, not a NIC), so the
                     // gso fields are advisory — but advertising them lets
                     // the guest collapse its per-MSS frame-build loop.
-                    0 => VIRTIO_NET_F_CSUM
-                        | VIRTIO_NET_F_MAC
-                        | VIRTIO_NET_F_HOST_TSO4
-                        | VIRTIO_NET_F_MQ
-                        | VIRTIO_NET_F_CTRL_VQ,
+                    0 => {
+                        VIRTIO_NET_F_CSUM
+                            | VIRTIO_NET_F_MAC
+                            | VIRTIO_NET_F_HOST_TSO4
+                            | VIRTIO_NET_F_MQ
+                            | VIRTIO_NET_F_CTRL_VQ
+                    }
                     1 => 1, // VIRTIO_F_VERSION_1 (bit 0 of word 1 = feature bit 32)
                     _ => 0,
                 }
@@ -233,7 +242,11 @@ impl VirtioNet {
             QUEUE_NUM_MAX => QUEUE_SIZE,
             QUEUE_READY => {
                 let qi = self.queue_sel as usize;
-                if qi < self.num_queues { self.queues[qi].ready as u32 } else { 0 }
+                if qi < self.num_queues {
+                    self.queues[qi].ready as u32
+                } else {
+                    0
+                }
             }
             STATUS => self.status,
             INTERRUPT_STATUS => {
@@ -277,9 +290,7 @@ impl VirtioNet {
             // Device config: per-queue used_idx at offset 0x110 (RX=q0), 0x114 (TX=q1)
             // Returns used_idx[0] | (used_idx[1] << 16) as a single 32-bit read.
             // Guest reads this via MMIO to bypass dcache coherency issues.
-            0x110 => {
-                self.used_idx[0] as u32 | ((self.used_idx[1] as u32) << 16)
-            }
+            0x110 => self.used_idx[0] as u32 | ((self.used_idx[1] as u32) << 16),
             _ => 0,
         }
     }
@@ -291,12 +302,16 @@ impl VirtioNet {
             DRIVER_FEATURES_SEL => self.driver_features_sel = value,
             DRIVER_FEATURES => {
                 let sel = self.driver_features_sel as usize;
-                if sel < 2 { self.driver_features[sel] = value; }
+                if sel < 2 {
+                    self.driver_features[sel] = value;
+                }
             }
             QUEUE_SEL => self.queue_sel = value,
             QUEUE_NUM => {
                 let qi = self.queue_sel as usize;
-                if qi < self.num_queues { self.queues[qi].num = value; }
+                if qi < self.num_queues {
+                    self.queues[qi].num = value;
+                }
             }
             QUEUE_READY => {
                 let qi = self.queue_sel as usize;
@@ -327,27 +342,39 @@ impl VirtioNet {
             }
             QUEUE_DESC_LOW => {
                 let qi = self.queue_sel as usize;
-                if qi < self.num_queues { self.queues[qi].desc_lo = value; }
+                if qi < self.num_queues {
+                    self.queues[qi].desc_lo = value;
+                }
             }
             QUEUE_DESC_HIGH => {
                 let qi = self.queue_sel as usize;
-                if qi < self.num_queues { self.queues[qi].desc_hi = value; }
+                if qi < self.num_queues {
+                    self.queues[qi].desc_hi = value;
+                }
             }
             QUEUE_DRIVER_LOW => {
                 let qi = self.queue_sel as usize;
-                if qi < self.num_queues { self.queues[qi].driver_lo = value; }
+                if qi < self.num_queues {
+                    self.queues[qi].driver_lo = value;
+                }
             }
             QUEUE_DRIVER_HIGH => {
                 let qi = self.queue_sel as usize;
-                if qi < self.num_queues { self.queues[qi].driver_hi = value; }
+                if qi < self.num_queues {
+                    self.queues[qi].driver_hi = value;
+                }
             }
             QUEUE_DEVICE_LOW => {
                 let qi = self.queue_sel as usize;
-                if qi < self.num_queues { self.queues[qi].device_lo = value; }
+                if qi < self.num_queues {
+                    self.queues[qi].device_lo = value;
+                }
             }
             QUEUE_DEVICE_HIGH => {
                 let qi = self.queue_sel as usize;
-                if qi < self.num_queues { self.queues[qi].device_hi = value; }
+                if qi < self.num_queues {
+                    self.queues[qi].device_hi = value;
+                }
             }
             STATUS => {
                 self.status = value;
@@ -368,7 +395,9 @@ impl VirtioNet {
             INTERRUPT_ACK => {
                 self.interrupt_status &= !value;
                 if self.interrupt_status == 0 {
-                    unsafe { crate::hvf::hv_gic_set_spi(35, false); }
+                    unsafe {
+                        crate::hvf::hv_gic_set_spi(35, false);
+                    }
                 }
             }
             QUEUE_NOTIFY => {
@@ -390,26 +419,29 @@ impl VirtioNet {
 /// Called from the vCPU thread on QUEUE_NOTIFY with the ctrl queue index.
 pub fn handle_ctrl_queue() {
     let snap = queue_snapshot(ctrl_queue_index());
-    if !snap.ready { return; }
+    if !snap.ready {
+        return;
+    }
 
     // Read avail_idx
-    let avail_idx = unsafe {
-        core::ptr::read_volatile(snap.gpa_to_host(snap.avail_addr + 2) as *const u16)
-    };
+    let avail_idx =
+        unsafe { core::ptr::read_volatile(snap.gpa_to_host(snap.avail_addr + 2) as *const u16) };
 
     // We need to track our own last-seen avail index.
     // For the ctrl queue, we use used_idx from the device as our "last" tracker.
-    let used_idx = unsafe {
-        core::ptr::read_volatile(snap.gpa_to_host(snap.used_addr + 2) as *const u16)
-    };
-    if used_idx == avail_idx { return; }
+    let used_idx =
+        unsafe { core::ptr::read_volatile(snap.gpa_to_host(snap.used_addr + 2) as *const u16) };
+    if used_idx == avail_idx {
+        return;
+    }
 
     let mut last = used_idx;
     while last != avail_idx {
         let ring_idx = last & (snap.qsize - 1);
         let first_desc_idx = unsafe {
             core::ptr::read_volatile(
-                snap.gpa_to_host(snap.avail_addr + 4 + ring_idx as u64 * 2) as *const u16)
+                snap.gpa_to_host(snap.avail_addr + 4 + ring_idx as u64 * 2) as *const u16
+            )
         };
 
         // Walk the descriptor chain.
@@ -449,7 +481,10 @@ pub fn handle_ctrl_queue() {
                 if copy > 0 {
                     unsafe {
                         core::ptr::copy_nonoverlapping(
-                            snap.gpa_to_host(addr), cmd_bytes.as_mut_ptr().add(cmd_len), copy);
+                            snap.gpa_to_host(addr),
+                            cmd_bytes.as_mut_ptr().add(cmd_len),
+                            copy,
+                        );
                     }
                     cmd_len += copy;
                 }
@@ -482,13 +517,13 @@ pub fn handle_ctrl_queue() {
 
         // Update used ring
         unsafe {
-            let entry = snap.gpa_to_host(
-                snap.used_addr + 4 + (last & (snap.qsize - 1)) as u64 * 8);
+            let entry = snap.gpa_to_host(snap.used_addr + 4 + (last & (snap.qsize - 1)) as u64 * 8);
             core::ptr::write_unaligned(entry as *mut u32, first_desc_idx as u32);
             core::ptr::write_unaligned(entry.add(4) as *mut u32, total_len);
             core::ptr::write_volatile(
                 snap.gpa_to_host(snap.used_addr + 2) as *mut u16,
-                last.wrapping_add(1));
+                last.wrapping_add(1),
+            );
         }
         last = last.wrapping_add(1);
     }

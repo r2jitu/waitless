@@ -24,8 +24,8 @@
 
 #![no_std]
 
-extern crate uni_kernel;
 extern crate net_types as types;
+extern crate uni_kernel;
 
 use types::{Ipv6Addr, MacAddr};
 use uni_kernel::sync::Spinlock;
@@ -87,13 +87,21 @@ impl NdpCache {
         // Empty slot → install.
         for e in &mut self.entries {
             if !e.valid {
-                *e = NdpEntry { ip, mac, valid: true };
+                *e = NdpEntry {
+                    ip,
+                    mac,
+                    valid: true,
+                };
                 return;
             }
         }
         // Cache full — FIFO evict.
         let idx = self.next_evict;
-        self.entries[idx] = NdpEntry { ip, mac, valid: true };
+        self.entries[idx] = NdpEntry {
+            ip,
+            mac,
+            valid: true,
+        };
         self.next_evict = (idx + 1) % NDP_CACHE_SIZE;
     }
 }

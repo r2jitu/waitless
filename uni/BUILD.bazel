@@ -20,8 +20,8 @@ rust_library(
     deps = [
         "//uni-backend",
         "//uni-net",
-        "//uni-worker",
         "//uni-runtime",
+        "//uni-worker",
     ] + select({
         "//bazel/platforms:native": [],
         "//conditions:default": ["//kernel"],

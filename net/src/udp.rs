@@ -7,20 +7,20 @@
 
 #![no_std]
 
-extern crate uni_runtime;
-extern crate uni_drivers;
-extern crate uni_net_driver;
-extern crate net_from_bytes as from_bytes;
-extern crate net_types as types;
 extern crate net_dst_mac as dst_mac;
 extern crate net_ethernet as ethernet;
+extern crate net_from_bytes as from_bytes;
 extern crate net_ipv4 as ipv4;
 extern crate net_ipv6 as ipv6;
 extern crate net_ipv6_send as ipv6_send;
+extern crate net_types as types;
+extern crate uni_drivers;
+extern crate uni_net_driver;
+extern crate uni_runtime;
 
 use from_bytes::FromBytes;
-use types::{IpAddr, CONFIG, tcp_checksum, tcp_checksum_v6, tcp_pseudo_partial, htons, ntohs};
 use ipv4::PROTO_UDP;
+use types::{CONFIG, IpAddr, htons, ntohs, tcp_checksum, tcp_checksum_v6, tcp_pseudo_partial};
 
 #[repr(C, packed)]
 struct UdpHeader {
@@ -62,14 +62,15 @@ pub fn send(dst_ip: IpAddr, src_port: u16, dst_port: u16, data: &[u8]) {
 //   v6: [ETH 14][IPv6 40][UDP 8][payload ≤ 1452]  → ≤ 1514 B
 
 const ETH_HDR_LEN: usize = 14;
-const IPV4_HDR_LEN: usize = ipv4::HEADER_LEN;       // 20
-const IPV6_HDR_LEN: usize = ipv6::HEADER_LEN;       // 40
+const IPV4_HDR_LEN: usize = ipv4::HEADER_LEN; // 20
+const IPV6_HDR_LEN: usize = ipv6::HEADER_LEN; // 40
 const UDP_HDR_LEN: usize = 8;
 
 /// Total stack-buffer size used by `send_to_addr`. Sized so a v6
 /// frame ([14 + 40 + 8 + 1452]) fits; v4 uses fewer header bytes
 /// so its payload slot is larger.
-const FRAME_BUF_LEN: usize = uni_runtime::net::MAX_L2_HEADROOM + (1500 - IPV6_HDR_LEN - UDP_HDR_LEN);
+const FRAME_BUF_LEN: usize =
+    uni_runtime::net::MAX_L2_HEADROOM + (1500 - IPV6_HDR_LEN - UDP_HDR_LEN);
 // = 62 + 1452 = 1514. Same total bound for both families.
 
 /// Zero-copy UDP send. Caller pre-supplies a frame buffer where
@@ -88,12 +89,7 @@ const FRAME_BUF_LEN: usize = uni_runtime::net::MAX_L2_HEADROOM + (1500 - IPV6_HD
 /// headroom`) to skip the per-packet UDP-wrap memcpy. ARP/NDP
 /// miss drops the packet — UDP is fire-and-forget; the application
 /// layer (QUIC retransmits, DNS retries) handles loss.
-pub fn send_with_l2_headroom(
-    dst: IpAddr,
-    src_port: u16,
-    dst_port: u16,
-    frame: &mut [u8],
-) {
+pub fn send_with_l2_headroom(dst: IpAddr, src_port: u16, dst_port: u16, frame: &mut [u8]) {
     use uni_runtime::net::MAX_L2_HEADROOM;
     debug_assert!(frame.len() >= MAX_L2_HEADROOM);
 
@@ -139,9 +135,7 @@ pub fn send_with_l2_headroom(
         let ip_slot = core::slice::from_raw_parts_mut(p.add(ip_off), ip_hdr_len);
         match dst {
             IpAddr::V4(d) => {
-                udp_hdr.checksum = tcp_checksum(
-                    CONFIG.ip(), d, PROTO_UDP, p.add(udp_off), udp_len,
-                );
+                udp_hdr.checksum = tcp_checksum(CONFIG.ip(), d, PROTO_UDP, p.add(udp_off), udp_len);
                 ipv4::fill_header(ip_slot, CONFIG.ip(), d, PROTO_UDP, ip_total);
             }
             IpAddr::V6(d) => {
@@ -149,12 +143,13 @@ pub fn send_with_l2_headroom(
                 // global lands. Most peers accept this for short-
                 // lived response-path traffic.
                 let src = types::Ipv6Addr::ANY;
-                udp_hdr.checksum = tcp_checksum_v6(
-                    &src, &d, ipv6::next_header::UDP, p.add(udp_off), udp_len,
-                );
+                udp_hdr.checksum =
+                    tcp_checksum_v6(&src, &d, ipv6::next_header::UDP, p.add(udp_off), udp_len);
                 ipv6::fill_header(
                     ip_slot,
-                    &src, &d, ipv6::next_header::UDP,
+                    &src,
+                    &d,
+                    ipv6::next_header::UDP,
                     ipv6::DEFAULT_HOP_LIMIT,
                     udp_len as u16,
                 );
@@ -171,10 +166,8 @@ pub fn send_with_l2_headroom(
         );
 
         // Ship the contiguous frame from the family-correct offset.
-        let frame_slice = core::slice::from_raw_parts(
-            p.add(prefix_skip),
-            frame.len() - prefix_skip,
-        );
+        let frame_slice =
+            core::slice::from_raw_parts(p.add(prefix_skip), frame.len() - prefix_skip);
         uni_drivers::net::send(frame_slice);
     }
 }
@@ -247,11 +240,7 @@ pub fn send_via_tx_handle(
             // starts at slot.data[0] (where the driver's submit_tx
             // expects it). Overlapping move — use ptr::copy.
             if matches!(dst, IpAddr::V4(_)) {
-                core::ptr::copy(
-                    p.add(MAX_L2_HEADROOM),
-                    p.add(actual_headroom),
-                    payload_len,
-                );
+                core::ptr::copy(p.add(MAX_L2_HEADROOM), p.add(actual_headroom), payload_len);
             }
 
             // UDP header at (eth + ip) offset.
@@ -277,8 +266,10 @@ pub fn send_via_tx_handle(
                         match convention {
                             uni_drivers::net::CsumStampConvention::PseudoHeaderPartial => {
                                 tcp_pseudo_partial(
-                                    IpAddr::V4(CONFIG.ip()), IpAddr::V4(d),
-                                    PROTO_UDP, udp_len,
+                                    IpAddr::V4(CONFIG.ip()),
+                                    IpAddr::V4(d),
+                                    PROTO_UDP,
+                                    udp_len,
                                 )
                             }
                             uni_drivers::net::CsumStampConvention::Zero => 0,
@@ -294,8 +285,10 @@ pub fn send_via_tx_handle(
                         match convention {
                             uni_drivers::net::CsumStampConvention::PseudoHeaderPartial => {
                                 tcp_pseudo_partial(
-                                    IpAddr::V6(src), IpAddr::V6(d),
-                                    ipv6::next_header::UDP, udp_len,
+                                    IpAddr::V6(src),
+                                    IpAddr::V6(d),
+                                    ipv6::next_header::UDP,
+                                    udp_len,
                                 )
                             }
                             uni_drivers::net::CsumStampConvention::Zero => 0,
@@ -305,7 +298,9 @@ pub fn send_via_tx_handle(
                     };
                     ipv6::fill_header(
                         ip_slot,
-                        &src, &d, ipv6::next_header::UDP,
+                        &src,
+                        &d,
+                        ipv6::next_header::UDP,
                         ipv6::DEFAULT_HOP_LIMIT,
                         udp_len as u16,
                     );
@@ -377,7 +372,9 @@ pub fn send_to_addr(dst: IpAddr, src_port: u16, dst_port: u16, data: &[u8]) {
 /// inbox slot — synchronous w.r.t. this call, so the borrow is
 /// released before we return.
 pub fn udp_receive(src_ip: IpAddr, _dst_ip: IpAddr, segment: &[u8]) {
-    let Some(hdr) = UdpHeader::try_ref_from(segment) else { return };
+    let Some(hdr) = UdpHeader::try_ref_from(segment) else {
+        return;
+    };
     let dst_port = ntohs(hdr.dst_port);
     let src_port = ntohs(hdr.src_port);
     let udp_len = ntohs(hdr.length) as usize;

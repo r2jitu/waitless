@@ -7,9 +7,10 @@
 [ "$1" = "-flavor" ] && shift 2
 
 # PATH contains the Rust toolchain bin dir. Find gcc-ld/ld.lld there.
-IFS=: read -ra DIRS <<< "$PATH"
+IFS=: read -ra DIRS <<<"$PATH"
 for dir in "${DIRS[@]}"; do
     [ -x "$dir/gcc-ld/ld.lld" ] && exec "$dir/gcc-ld/ld.lld" "$@"
 done
 
-echo "error: ld.lld not found on PATH" >&2; exit 1
+echo "error: ld.lld not found on PATH" >&2
+exit 1

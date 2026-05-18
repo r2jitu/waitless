@@ -52,7 +52,9 @@ static ASYNC_TCP_COUNT: AtomicUsize = AtomicUsize::new(0);
 fn make_listener(port: u16) -> i32 {
     unsafe {
         let fd = socket(AF_INET, SOCK_STREAM, 0);
-        if fd < 0 { return -1; }
+        if fd < 0 {
+            return -1;
+        }
 
         let opt: i32 = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, 4);
@@ -74,10 +76,12 @@ fn make_listener(port: u16) -> i32 {
         };
 
         if bind(fd, &addr, std::mem::size_of::<SockAddrIn>() as u32) < 0 {
-            close(fd); return -1;
+            close(fd);
+            return -1;
         }
         if listen(fd, 128) < 0 {
-            close(fd); return -1;
+            close(fd);
+            return -1;
         }
         fd
     }
@@ -95,10 +99,7 @@ fn async_tcp_listen_hook(app_port: u16) -> Result<(), ()> {
             return Err(());
         }
         let idx = count;
-        (*ASYNC_TCP_LISTENERS.0.get())[idx] = Some(AsyncTcpListener {
-            app_port,
-            fd,
-        });
+        (*ASYNC_TCP_LISTENERS.0.get())[idx] = Some(AsyncTcpListener { app_port, fd });
         ASYNC_TCP_COUNT.store(idx + 1, Ordering::Release);
 
         // Register the shared fd in every worker's event queue.
@@ -252,8 +253,15 @@ fn native_tcp_do_recv(handle: *mut (), generation: u16, buf: &mut [u8]) -> usize
             return 0;
         }
         let n = recv(fd, buf.as_mut_ptr(), buf.len(), 0);
-        if n < 0 { (*c).has_pending_data = false; return 0; }
-        if n == 0 { (*c).closed = true; (*c).has_pending_data = false; return 0; }
+        if n < 0 {
+            (*c).has_pending_data = false;
+            return 0;
+        }
+        if n == 0 {
+            (*c).closed = true;
+            (*c).has_pending_data = false;
+            return 0;
+        }
         (*c).has_pending_data = false;
         n as usize
     }
@@ -271,10 +279,7 @@ fn native_tcp_do_recv(handle: *mut (), generation: u16, buf: &mut [u8]) -> usize
 /// instead of `None`, so handlers (and `BodyReader`) can use the
 /// `recv_chunk` API on every backend without a `recv` fallback.
 /// `into_owned()` on the resulting `Heap` IOBuf is then zero-copy.
-fn native_tcp_do_recv_chunk(
-    handle: *mut (),
-    generation: u16,
-) -> Option<uni_iobuf::IOBuf> {
+fn native_tcp_do_recv_chunk(handle: *mut (), generation: u16) -> Option<uni_iobuf::IOBuf> {
     unsafe {
         let (c, live) = check_gen(handle, generation);
         if !live {
@@ -367,10 +372,16 @@ fn native_tcp_try_send_chain(
         const IOV_INLINE: usize = 8;
         let part_count = chain.part_count();
         if part_count <= IOV_INLINE {
-            let mut iov = [IoVec { iov_base: ptr::null(), iov_len: 0 }; IOV_INLINE];
+            let mut iov = [IoVec {
+                iov_base: ptr::null(),
+                iov_len: 0,
+            }; IOV_INLINE];
             for (i, part) in chain.iter().enumerate() {
                 let data = part.data();
-                iov[i] = IoVec { iov_base: data.as_ptr(), iov_len: data.len() };
+                iov[i] = IoVec {
+                    iov_base: data.as_ptr(),
+                    iov_len: data.len(),
+                };
             }
             let n = writev(fd, iov.as_ptr(), part_count as i32);
             if n < 0 {
@@ -486,7 +497,9 @@ fn native_tcp_clear_send_waker(handle: *mut (), generation: u16) {
 
 fn tcp_close(handle: *mut (), generation: u16) {
     let c = handle as *mut NativeConn;
-    if c.is_null() { return; }
+    if c.is_null() {
+        return;
+    }
     // SAFETY: stream handles point into per-worker `NativeConn`
     // pools — the `!Send` marker on `TcpStream` keeps cross-worker
     // closes out, and the generation check rejects a stale stream
@@ -502,44 +515,43 @@ fn tcp_close(handle: *mut (), generation: u16) {
 
 /// Native TCP backend vtable. Wired into the runtime by
 /// `init_native`.
-pub(super) static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend =
-    uni_runtime::net::TcpBackend {
-        listen: async_tcp_listen_hook,
-        accept: async_tcp_accept_hook,
-        unlisten: Some(async_tcp_unlisten_hook),
-        has_data: native_tcp_has_data,
-        do_recv: native_tcp_do_recv,
-        register_recv_waker: native_tcp_register_recv_waker,
-        clear_recv_waker: native_tcp_clear_recv_waker,
-        // Native (POSIX `recv`) already copies into the user buf in
-        // one shot at the syscall boundary — no benefit to wiring a
-        // bare-metal-style direct-copy slot. Leave both `None` and
-        // `TcpRecv::poll` falls through to `do_recv` after the
-        // wake.
-        set_recv_buf_slot: None,
-        clear_recv_buf_slot: None,
-        // Zero-copy chunk recv (RX items F/H). `do_recv_chunk` is
-        // wired (not `None`) so `TcpStream::recv_chunk` resolves to
-        // a real chunk on native — handlers get one uniform API
-        // across bare-metal and native; see `native_tcp_do_recv_chunk`
-        // for why native still pays the syscall copy. The
-        // `set/clear_chunk_buf_slot` hooks stay `None`: they are the
-        // bare-metal "stash the device RX buffer" request, and
-        // native has no per-conn ring to bypass — `do_recv_chunk`
-        // just does the `recv` when called.
-        do_recv_chunk: Some(native_tcp_do_recv_chunk),
-        set_chunk_buf_slot: None,
-        clear_chunk_buf_slot: None,
-        close: tcp_close,
-        try_send: native_tcp_try_send_chain,
-        register_send_waker: native_tcp_register_send_waker,
-        clear_send_waker: native_tcp_clear_send_waker,
-        // Native (POSIX SOCK_STREAM) doesn't expose a TX-pool
-        // slot to write into — the kernel owns that region.
-        // Callers fall back to the regular `try_send` chain path.
-        try_send_tso: None,
-        shutdown_all: None,
-    };
+pub(super) static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend = uni_runtime::net::TcpBackend {
+    listen: async_tcp_listen_hook,
+    accept: async_tcp_accept_hook,
+    unlisten: Some(async_tcp_unlisten_hook),
+    has_data: native_tcp_has_data,
+    do_recv: native_tcp_do_recv,
+    register_recv_waker: native_tcp_register_recv_waker,
+    clear_recv_waker: native_tcp_clear_recv_waker,
+    // Native (POSIX `recv`) already copies into the user buf in
+    // one shot at the syscall boundary — no benefit to wiring a
+    // bare-metal-style direct-copy slot. Leave both `None` and
+    // `TcpRecv::poll` falls through to `do_recv` after the
+    // wake.
+    set_recv_buf_slot: None,
+    clear_recv_buf_slot: None,
+    // Zero-copy chunk recv (RX items F/H). `do_recv_chunk` is
+    // wired (not `None`) so `TcpStream::recv_chunk` resolves to
+    // a real chunk on native — handlers get one uniform API
+    // across bare-metal and native; see `native_tcp_do_recv_chunk`
+    // for why native still pays the syscall copy. The
+    // `set/clear_chunk_buf_slot` hooks stay `None`: they are the
+    // bare-metal "stash the device RX buffer" request, and
+    // native has no per-conn ring to bypass — `do_recv_chunk`
+    // just does the `recv` when called.
+    do_recv_chunk: Some(native_tcp_do_recv_chunk),
+    set_chunk_buf_slot: None,
+    clear_chunk_buf_slot: None,
+    close: tcp_close,
+    try_send: native_tcp_try_send_chain,
+    register_send_waker: native_tcp_register_send_waker,
+    clear_send_waker: native_tcp_clear_send_waker,
+    // Native (POSIX SOCK_STREAM) doesn't expose a TX-pool
+    // slot to write into — the kernel owns that region.
+    // Callers fall back to the regular `try_send` chain path.
+    try_send_tso: None,
+    shutdown_all: None,
+};
 
 /// Pump the worker's event queue non-blockingly. Flips
 /// `has_pending_data` on any TCP conn that became readable and

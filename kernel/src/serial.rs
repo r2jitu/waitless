@@ -103,7 +103,9 @@ mod x86 {
     /// GCE). Caller holds SERIAL_TX_LOCK.
     pub unsafe fn puts_raw(ptr: *const u8, len: usize) {
         if USE_VIRTIO_CONSOLE.load(Ordering::Acquire) {
-            unsafe { virtio_console_puts(ptr, len); }
+            unsafe {
+                virtio_console_puts(ptr, len);
+            }
             return;
         }
         // 16550 fallback. We MUST throttle to LSR bit 5 (FIFO
@@ -120,12 +122,12 @@ mod x86 {
         let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
         let mut written = 0;
         while written < bytes.len() {
-            unsafe {
-                while (inb(COM1 + LSR) & 0x20) == 0 {}
-            }
+            unsafe { while (inb(COM1 + LSR) & 0x20) == 0 {} }
             let n = (bytes.len() - written).min(16);
             for j in 0..n {
-                unsafe { outb(COM1 + THR, bytes[written + j]); }
+                unsafe {
+                    outb(COM1 + THR, bytes[written + j]);
+                }
             }
             written += n;
         }
@@ -133,7 +135,9 @@ mod x86 {
 
     pub unsafe fn try_getc() -> i32 {
         if USE_VIRTIO_CONSOLE.load(Ordering::Acquire) {
-            unsafe extern "C" { fn virtio_console_try_getc() -> i32; }
+            unsafe extern "C" {
+                fn virtio_console_try_getc() -> i32;
+            }
             return unsafe { virtio_console_try_getc() };
         }
         unsafe {
@@ -171,16 +175,16 @@ mod aarch64 {
     // accessed; the rest are reserved-but-named for clarity.
     #[repr(C)]
     struct Pl011Regs {
-        dr: ReadWrite<u32>,            // 0x000 Data register
-        _rsr_ecr: u32,                 // 0x004 Receive Status / Error Clear
-        _reserved0: [u32; 4],          // 0x008–0x014
-        fr: ReadOnly<u32>,             // 0x018 Flag register
-        _reserved1: u32,               // 0x01C
-        _ilpr: u32,                    // 0x020
-        ibrd: WriteOnly<u32>,          // 0x024 Integer baud rate divisor
-        fbrd: WriteOnly<u32>,          // 0x028 Fractional baud rate divisor
-        lcr_h: WriteOnly<u32>,         // 0x02C Line control
-        cr: ReadWrite<u32>,            // 0x030 Control
+        dr: ReadWrite<u32>,    // 0x000 Data register
+        _rsr_ecr: u32,         // 0x004 Receive Status / Error Clear
+        _reserved0: [u32; 4],  // 0x008–0x014
+        fr: ReadOnly<u32>,     // 0x018 Flag register
+        _reserved1: u32,       // 0x01C
+        _ilpr: u32,            // 0x020
+        ibrd: WriteOnly<u32>,  // 0x024 Integer baud rate divisor
+        fbrd: WriteOnly<u32>,  // 0x028 Fractional baud rate divisor
+        lcr_h: WriteOnly<u32>, // 0x02C Line control
+        cr: ReadWrite<u32>,    // 0x030 Control
     }
 
     const FR_RXFE: u32 = 1 << 4; // RX FIFO empty
@@ -198,7 +202,9 @@ mod aarch64 {
         /// to expose PL011 too (with a non-standard 8-byte-per-write
         /// fast path) but has migrated to virtio-console; this branch
         /// is now QEMU-only.
-        Pl011 { base: u64 },
+        Pl011 {
+            base: u64,
+        },
         Virtio,
     }
 
@@ -222,8 +228,8 @@ mod aarch64 {
 
     fn pl011_init(base: u64) {
         let r = pl011_at(base);
-        r.cr.write(0);                      // disable UART
-        r.ibrd.write(13);                   // 115200 @ 24 MHz
+        r.cr.write(0); // disable UART
+        r.ibrd.write(13); // 115200 @ 24 MHz
         r.fbrd.write(1);
         r.lcr_h.write((3 << 5) | (1 << 4)); // 8N1, FIFO on
         r.cr.write(CR_UARTEN | CR_TXE | CR_RXE);
@@ -237,7 +243,9 @@ mod aarch64 {
             // its `-machine virt` always advertises one).
             if fdt.uart_base != 0 {
                 pl011_init(fdt.uart_base);
-                BACKEND.init(SerialBackend::Pl011 { base: fdt.uart_base });
+                BACKEND.init(SerialBackend::Pl011 {
+                    base: fdt.uart_base,
+                });
                 return;
             }
 
@@ -268,12 +276,14 @@ mod aarch64 {
     /// SERIAL_TX_LOCK.
     pub unsafe fn puts_raw(bytes: &[u8]) {
         match BACKEND.try_get() {
-            Some(SerialBackend::Virtio) => {
-                unsafe { virtio_console_puts(bytes.as_ptr(), bytes.len()); }
-            }
+            Some(SerialBackend::Virtio) => unsafe {
+                virtio_console_puts(bytes.as_ptr(), bytes.len());
+            },
             Some(SerialBackend::Pl011 { base }) => {
                 let r = pl011_at(*base);
-                for &b in bytes { r.dr.write(b as u32); }
+                for &b in bytes {
+                    r.dr.write(b as u32);
+                }
             }
             None => {}
         }
@@ -299,7 +309,8 @@ mod aarch64 {
 // Common serial API
 // ============================================================================
 
-static SHUTDOWN_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static SHUTDOWN_REQUESTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Serial-write spinlock. Serialises whole `puts`/`putc` calls so
 /// multi-core log output isn't interleaved or torn (the underlying
@@ -316,8 +327,7 @@ static SERIAL_TX_LOCK: crate::sync::Spinlock<()> = crate::sync::Spinlock::new(()
 /// line. Used to drive the "[N.NNN] " timestamp prefix that every
 /// serial line gets — same Linux-`dmesg` shape, ms-precision.
 /// Mutated only under SERIAL_TX_LOCK.
-static AT_LINE_START: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(true);
+static AT_LINE_START: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
 /// Stack-buffered writer used by `puts` and `LockedWriter::write_str`.
 /// Appends bytes with `\r\n` + timestamp-prefix handling into a
@@ -333,7 +343,10 @@ struct LineBuf {
 
 impl LineBuf {
     fn new() -> Self {
-        Self { buf: [0u8; SERIAL_BUF_SIZE], pos: 0 }
+        Self {
+            buf: [0u8; SERIAL_BUF_SIZE],
+            pos: 0,
+        }
     }
 
     fn append(&mut self, b: u8) {
@@ -365,8 +378,14 @@ impl LineBuf {
             let mut tmp = [0u8; 10];
             let mut len = 0;
             let mut s = secs;
-            while s > 0 { tmp[len] = b'0' + (s % 10) as u8; s /= 10; len += 1; }
-            for i in 0..len { self.append(tmp[len - 1 - i]); }
+            while s > 0 {
+                tmp[len] = b'0' + (s % 10) as u8;
+                s /= 10;
+                len += 1;
+            }
+            for i in 0..len {
+                self.append(tmp[len - 1 - i]);
+            }
         }
         self.append(b'.');
         self.append(b'0' + (us_part / 100_000) as u8);
@@ -391,11 +410,15 @@ impl LineBuf {
     }
 
     fn flush(&mut self) {
-        if self.pos == 0 { return; }
+        if self.pos == 0 {
+            return;
+        }
         // SAFETY: caller holds SERIAL_TX_LOCK; `puts_raw` is the
         // arch-specific batched-write path (multi-byte MMIO on HVF,
         // per-byte fallback on QEMU PL011 / x86 16550).
-        unsafe { arch_puts_raw(&self.buf[..self.pos]); }
+        unsafe {
+            arch_puts_raw(&self.buf[..self.pos]);
+        }
         self.pos = 0;
     }
 }
@@ -433,12 +456,11 @@ struct EarlyBuf {
     active: bool,
 }
 
-static EARLY_BUF: crate::sync::Spinlock<EarlyBuf> =
-    crate::sync::Spinlock::new(EarlyBuf {
-        data: [0; EARLY_BUF_CAP],
-        len: 0,
-        active: true,
-    });
+static EARLY_BUF: crate::sync::Spinlock<EarlyBuf> = crate::sync::Spinlock::new(EarlyBuf {
+    data: [0; EARLY_BUF_CAP],
+    len: 0,
+    active: true,
+});
 
 /// Direct emit through the arch-specific backend, bypassing the
 /// early-boot buffer. Used by `flush_early_buf` and the panic
@@ -446,9 +468,13 @@ static EARLY_BUF: crate::sync::Spinlock<EarlyBuf> =
 #[inline]
 unsafe fn direct_emit(bytes: &[u8]) {
     #[cfg(target_arch = "aarch64")]
-    unsafe { aarch64::puts_raw(bytes); }
+    unsafe {
+        aarch64::puts_raw(bytes);
+    }
     #[cfg(target_arch = "x86_64")]
-    unsafe { x86::puts_raw(bytes.as_ptr(), bytes.len()); }
+    unsafe {
+        x86::puts_raw(bytes.as_ptr(), bytes.len());
+    }
 }
 
 /// Arch-specific batched write. Caller holds SERIAL_TX_LOCK.
@@ -472,7 +498,9 @@ unsafe fn arch_puts_raw(bytes: &[u8]) {
             }
         }
     }
-    unsafe { direct_emit(bytes); }
+    unsafe {
+        direct_emit(bytes);
+    }
 }
 
 /// Drain the early-boot buffer through the now-chosen backend
@@ -484,17 +512,23 @@ unsafe fn arch_puts_raw(bytes: &[u8]) {
 pub fn flush_early_buf() {
     let _guard = SERIAL_TX_LOCK.lock();
     let mut buf = EARLY_BUF.lock();
-    if !buf.active { return; }
+    if !buf.active {
+        return;
+    }
     buf.active = false;
     let len = buf.len;
-    if len == 0 { return; }
+    if len == 0 {
+        return;
+    }
     // Copy out so we can drop the lock before the (potentially
     // slow) emit — `direct_emit` may take milliseconds on the
     // 16550 fallback path.
     let mut local = [0u8; EARLY_BUF_CAP];
     local[..len].copy_from_slice(&buf.data[..len]);
     drop(buf);
-    unsafe { direct_emit(&local[..len]); }
+    unsafe {
+        direct_emit(&local[..len]);
+    }
 }
 
 pub fn init() {
@@ -559,7 +593,11 @@ pub fn print_hex(v: u64) {
     buf[1] = b'x';
     for i in 0..16 {
         let nib = ((v >> (60 - i * 4)) & 0xf) as u8;
-        buf[2 + i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+        buf[2 + i] = if nib < 10 {
+            b'0' + nib
+        } else {
+            b'a' + nib - 10
+        };
     }
     puts(&buf);
 }
@@ -567,9 +605,13 @@ pub fn print_hex(v: u64) {
 pub fn try_getc() -> i32 {
     unsafe {
         #[cfg(target_arch = "x86_64")]
-        { x86::try_getc() }
+        {
+            x86::try_getc()
+        }
         #[cfg(target_arch = "aarch64")]
-        { aarch64::try_getc() }
+        {
+            aarch64::try_getc()
+        }
     }
 }
 
@@ -582,7 +624,8 @@ pub fn check_shutdown() -> bool {
         if c < 0 {
             break;
         }
-        if c == 0x03 { // Ctrl-C
+        if c == 0x03 {
+            // Ctrl-C
             SHUTDOWN_REQUESTED.store(true, core::sync::atomic::Ordering::Relaxed);
             return true;
         }
@@ -593,7 +636,9 @@ pub fn check_shutdown() -> bool {
 // x86_64-specific: RX interrupt support for idle wakeup on Ctrl-C
 #[cfg(target_arch = "x86_64")]
 pub fn enable_rx_irq() {
-    unsafe { x86::enable_rx_irq(); }
+    unsafe {
+        x86::enable_rx_irq();
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

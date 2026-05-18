@@ -36,83 +36,87 @@ mod aarch64 {
 
     pub unsafe fn map_device_range(phys_base: u64, size: u64) {
         unsafe {
-        if size == 0 {
-            return;
-        }
-
-        // Align phys_base down to 2MB, adjust size
-        let base_2m = phys_base & !0x1F_FFFF_u64;
-        let end = (phys_base + size + 0x1F_FFFF) & !0x1F_FFFF_u64;
-
-        // Process each 1GB region that overlaps [base_2m, end)
-        let gb_start = base_2m & !0x3FFF_FFFF_u64; // 1GB-aligned
-        let mut gb = gb_start;
-        while gb < end {
-            let l1_idx = (gb >> 30) as usize;
-            if l1_idx >= 512 {
-                gb += 1 << 30;
-                continue;
+            if size == 0 {
+                return;
             }
 
-            // Skip if already in the first 4GB (mapped as normal-cached by
-            // boot.S; the hypervisor's Stage-2 tables override the attribute
-            // to device for MMIO regions without guest involvement).
-            if l1_idx < 4 {
-                gb += 1 << 30;
-                continue;
-            }
+            // Align phys_base down to 2MB, adjust size
+            let base_2m = phys_base & !0x1F_FFFF_u64;
+            let end = (phys_base + size + 0x1F_FFFF) & !0x1F_FFFF_u64;
 
-            // Check if L1 entry already has a table descriptor (from previous call)
-            let l1_entry = boot_l1_table[l1_idx];
-            let l2: *mut u64;
-
-            if (l1_entry & 0x3) == 0x3 {
-                // Already a table descriptor — reuse the L2 table
-                l2 = (l1_entry & !0xFFF_u64) as *mut u64;
-            } else {
-                // Allocate a fresh 4 KB-aligned L2 table from the heap.
-                // `map_device_range` only runs after `mm::init` has set
-                // up the talc heap, so this is safe; on aarch64 phys ==
-                // virt (identity-mapped), so the returned address works
-                // both as the descriptor target and as a writable pointer.
-                let l2_phys = mm::alloc_pages(1);
-                if l2_phys == 0 {
-                    return; // heap exhausted
+            // Process each 1GB region that overlaps [base_2m, end)
+            let gb_start = base_2m & !0x3FFF_FFFF_u64; // 1GB-aligned
+            let mut gb = gb_start;
+            while gb < end {
+                let l1_idx = (gb >> 30) as usize;
+                if l1_idx >= 512 {
+                    gb += 1 << 30;
+                    continue;
                 }
-                l2 = l2_phys as *mut u64;
-                // alloc_pages does not zero — clear the table before use.
-                core::ptr::write_bytes(l2, 0, 512);
 
-                // If there was a block descriptor, preserve it by filling
-                // the L2 table with equivalent 2MB blocks
-                if (l1_entry & 0x1) != 0 {
-                    let block_pa = l1_entry & !0x3FFF_FFFF_u64;
-                    let block_attrs = l1_entry & 0xFFF;
-                    for i in 0..512 {
-                        *l2.add(i) = (block_pa + (i as u64) * (2 << 20)) | block_attrs;
+                // Skip if already in the first 4GB (mapped as normal-cached by
+                // boot.S; the hypervisor's Stage-2 tables override the attribute
+                // to device for MMIO regions without guest involvement).
+                if l1_idx < 4 {
+                    gb += 1 << 30;
+                    continue;
+                }
+
+                // Check if L1 entry already has a table descriptor (from previous call)
+                let l1_entry = boot_l1_table[l1_idx];
+                let l2: *mut u64;
+
+                if (l1_entry & 0x3) == 0x3 {
+                    // Already a table descriptor — reuse the L2 table
+                    l2 = (l1_entry & !0xFFF_u64) as *mut u64;
+                } else {
+                    // Allocate a fresh 4 KB-aligned L2 table from the heap.
+                    // `map_device_range` only runs after `mm::init` has set
+                    // up the talc heap, so this is safe; on aarch64 phys ==
+                    // virt (identity-mapped), so the returned address works
+                    // both as the descriptor target and as a writable pointer.
+                    let l2_phys = mm::alloc_pages(1);
+                    if l2_phys == 0 {
+                        return; // heap exhausted
                     }
+                    l2 = l2_phys as *mut u64;
+                    // alloc_pages does not zero — clear the table before use.
+                    core::ptr::write_bytes(l2, 0, 512);
+
+                    // If there was a block descriptor, preserve it by filling
+                    // the L2 table with equivalent 2MB blocks
+                    if (l1_entry & 0x1) != 0 {
+                        let block_pa = l1_entry & !0x3FFF_FFFF_u64;
+                        let block_attrs = l1_entry & 0xFFF;
+                        for i in 0..512 {
+                            *l2.add(i) = (block_pa + (i as u64) * (2 << 20)) | block_attrs;
+                        }
+                    }
+
+                    // Point L1 entry at the new L2 table
+                    boot_l1_table[l1_idx] = (l2 as u64) | L1_TABLE_DESC;
                 }
 
-                // Point L1 entry at the new L2 table
-                boot_l1_table[l1_idx] = (l2 as u64) | L1_TABLE_DESC;
+                // Fill in the device entries for the 2MB blocks within this 1GB region
+                let range_start = if base_2m > gb { base_2m } else { gb };
+                let range_end = if end < gb + (1 << 30) {
+                    end
+                } else {
+                    gb + (1 << 30)
+                };
+
+                let mut addr = range_start;
+                while addr < range_end {
+                    let l2_idx = ((addr - gb) >> 21) as usize;
+                    *l2.add(l2_idx) = addr | L2_DEVICE_BLOCK;
+                    addr += 2 << 20;
+                }
+
+                gb += 1 << 30;
             }
 
-            // Fill in the device entries for the 2MB blocks within this 1GB region
-            let range_start = if base_2m > gb { base_2m } else { gb };
-            let range_end = if end < gb + (1 << 30) { end } else { gb + (1 << 30) };
-
-            let mut addr = range_start;
-            while addr < range_end {
-                let l2_idx = ((addr - gb) >> 21) as usize;
-                *l2.add(l2_idx) = addr | L2_DEVICE_BLOCK;
-                addr += 2 << 20;
-            }
-
-            gb += 1 << 30;
-        }
-
-        // Ensure table writes are visible, then invalidate TLB
-        asm!("dsb sy", "tlbi vmalle1", "dsb sy", "isb", options(nostack));
+            // Ensure table writes are visible, then invalidate TLB
+            asm!("dsb sy", "tlbi vmalle1", "dsb sy", "isb", options(nostack));
         }
     }
 }
@@ -125,7 +129,9 @@ mod aarch64 {
 /// On x86_64, this is a no-op (all physical memory is identity-mapped).
 pub fn map_device_range(phys_base: u64, size: u64) {
     #[cfg(target_arch = "aarch64")]
-    unsafe { aarch64::map_device_range(phys_base, size); }
+    unsafe {
+        aarch64::map_device_range(phys_base, size);
+    }
     #[cfg(not(target_arch = "aarch64"))]
     {
         let _ = (phys_base, size);

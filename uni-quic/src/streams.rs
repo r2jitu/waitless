@@ -484,8 +484,7 @@ impl SendStream {
         crate::frame::append_stream_header(stream_id, offset, fin, n, frames_out)?;
         {
             let head = self.outbound.front().unwrap();
-            frames_out
-                .extend_from_slice(&head.data()[self.head_consumed..self.head_consumed + n]);
+            frames_out.extend_from_slice(&head.data()[self.head_consumed..self.head_consumed + n]);
         }
         self.advance_head(n);
         self.send_offset += n as u64;

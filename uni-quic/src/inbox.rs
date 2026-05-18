@@ -263,9 +263,7 @@ const NULL_SLOT: u16 = 0xFFFF;
 fn ip_key(ip: uni::runtime::IpAddr) -> u128 {
     match ip {
         uni::runtime::IpAddr::V4(a) => a.addr as u128,
-        uni::runtime::IpAddr::V6(a) => {
-            (1u128 << 127) | u128::from_be_bytes(a.octets)
-        }
+        uni::runtime::IpAddr::V6(a) => (1u128 << 127) | u128::from_be_bytes(a.octets),
     }
 }
 
@@ -538,9 +536,7 @@ impl SlotTable {
         // has ≤1 dcid registered per conn.
         self.initial_dcids
             .borrow_mut()
-            .retain(|_, (slot_idx, slot_gen)| {
-                !(*slot_idx == idx && *slot_gen == generation)
-            });
+            .retain(|_, (slot_idx, slot_gen)| !(*slot_idx == idx && *slot_gen == generation));
         // Push onto the free list. Don't bump generation here —
         // that happens on the next `allocate`, so reads racing
         // against a free-then-realloc cycle still see a coherent
@@ -688,7 +684,11 @@ mod tests {
         // alloc is O(1)).
         drop(inbox1);
         assert!(table.lookup(idx, gen1).is_none());
-        assert_eq!(table.live_count(), 1, "slot still allocated until explicit free");
+        assert_eq!(
+            table.live_count(),
+            1,
+            "slot still allocated until explicit free"
+        );
 
         // Conn task exit handoff — returns the slot to the free list.
         table.free_slot(idx, gen1);
@@ -720,8 +720,10 @@ mod tests {
         // slot stays allocated; lookup misses but alloc still sees
         // no free.
         drop(i1);
-        assert!(table.allocate(ip(3)).is_none(),
-                "drop alone doesn't free; allocate should still miss");
+        assert!(
+            table.allocate(ip(3)).is_none(),
+            "drop alone doesn't free; allocate should still miss"
+        );
         table.free_slot(a, ga);
         assert!(table.allocate(ip(3)).is_some());
     }

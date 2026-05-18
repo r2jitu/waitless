@@ -22,29 +22,33 @@ struct ApicReg<T: Copy> {
 
 impl<T: Copy> ApicReg<T> {
     #[inline(always)]
-    fn read(&self) -> T { self.val.read() }
+    fn read(&self) -> T {
+        self.val.read()
+    }
     #[inline(always)]
-    fn write(&self, v: T) { self.val.write(v); }
+    fn write(&self, v: T) {
+        self.val.write(v);
+    }
 }
 
 #[repr(C)]
 struct ApicRegs {
-    _r0:        [ApicReg<u32>; 2],   // 0x000..0x020
-    id:         ApicReg<u32>,        // 0x020
-    version:    ApicReg<u32>,        // 0x030
-    _r1:        [ApicReg<u32>; 4],   // 0x040..0x080
-    tpr:        ApicReg<u32>,        // 0x080
-    _r2:        [ApicReg<u32>; 2],   // 0x090..0x0B0
-    eoi:        ApicReg<u32>,        // 0x0B0
-    _r3:        [ApicReg<u32>; 3],   // 0x0C0..0x0F0
-    svr:        ApicReg<u32>,        // 0x0F0
-    _r4:        [ApicReg<u32>; 32],  // 0x100..0x300
-    icr_lo:     ApicReg<u32>,        // 0x300
-    icr_hi:     ApicReg<u32>,        // 0x310
-    lvt_timer:  ApicReg<u32>,        // 0x320
-    _r5:        [ApicReg<u32>; 2],   // 0x330..0x350
-    lvt_lint0:  ApicReg<u32>,        // 0x350
-    lvt_lint1:  ApicReg<u32>,        // 0x360
+    _r0: [ApicReg<u32>; 2],  // 0x000..0x020
+    id: ApicReg<u32>,        // 0x020
+    version: ApicReg<u32>,   // 0x030
+    _r1: [ApicReg<u32>; 4],  // 0x040..0x080
+    tpr: ApicReg<u32>,       // 0x080
+    _r2: [ApicReg<u32>; 2],  // 0x090..0x0B0
+    eoi: ApicReg<u32>,       // 0x0B0
+    _r3: [ApicReg<u32>; 3],  // 0x0C0..0x0F0
+    svr: ApicReg<u32>,       // 0x0F0
+    _r4: [ApicReg<u32>; 32], // 0x100..0x300
+    icr_lo: ApicReg<u32>,    // 0x300
+    icr_hi: ApicReg<u32>,    // 0x310
+    lvt_timer: ApicReg<u32>, // 0x320
+    _r5: [ApicReg<u32>; 2],  // 0x330..0x350
+    lvt_lint0: ApicReg<u32>, // 0x350
+    lvt_lint1: ApicReg<u32>, // 0x360
 }
 
 // Compile-time layout assertions — every named register lands at the
@@ -224,4 +228,3 @@ pub unsafe fn send_sipi_broadcast(vector: u8) {
     l.icr_lo.write(0x000C4600 | vector as u32);
     wait_ipi_idle(l);
 }
-

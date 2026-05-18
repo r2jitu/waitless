@@ -121,8 +121,8 @@ pub fn decode_field_section_into<S: FieldSink>(
             }
             let (idx, n) = read_prefixed_int(bytes, 6)?;
             bytes = &bytes[n..];
-            let entry = static_table::lookup(idx as usize)
-                .ok_or(QpackError::StaticIndexOutOfRange)?;
+            let entry =
+                static_table::lookup(idx as usize).ok_or(QpackError::StaticIndexOutOfRange)?;
             // Both name and value live in the program's static
             // QPACK table — pass borrowed slices straight to the
             // sink without touching the scratch.
@@ -135,8 +135,8 @@ pub fn decode_field_section_into<S: FieldSink>(
             }
             let (idx, n) = read_prefixed_int(bytes, 4)?;
             bytes = &bytes[n..];
-            let entry = static_table::lookup(idx as usize)
-                .ok_or(QpackError::StaticIndexOutOfRange)?;
+            let entry =
+                static_table::lookup(idx as usize).ok_or(QpackError::StaticIndexOutOfRange)?;
             let (value_len, n) = read_string_into(bytes, 7, value_scratch)?;
             bytes = &bytes[n..];
             sink.on_field(entry.name, &value_scratch[..value_len]);
@@ -177,9 +177,7 @@ pub fn decode_field_section(input: &[u8]) -> Result<Vec<Field>, QpackError> {
             // signal, so we re-derive via lookup. Rare path — only
             // called from tests and the legacy API; the hot path
             // doesn't go through this.
-            let (n, v) = if let Some(idx) =
-                static_table::find_exact(name, value)
-            {
+            let (n, v) = if let Some(idx) = static_table::find_exact(name, value) {
                 if let Some(entry) = static_table::lookup(idx as usize) {
                     (
                         alloc::borrow::Cow::Borrowed(entry.name),
@@ -281,8 +279,8 @@ fn read_string_into(
     let raw = &buf[n..n + len];
     let bytes_total = n + len;
     if h {
-        let decoded_len = huffman::decode_into_slice(raw, out)
-            .map_err(|_| QpackError::HuffmanFailed)?;
+        let decoded_len =
+            huffman::decode_into_slice(raw, out).map_err(|_| QpackError::HuffmanFailed)?;
         Ok((decoded_len, bytes_total))
     } else {
         if raw.len() > out.len() {

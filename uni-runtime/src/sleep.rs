@@ -71,11 +71,13 @@ impl Future for Sleep {
             this.waker = Some(cx.waker().clone());
             let self_ptr: *const Sleep = this;
             let cc = CurrentWorker::enter();
-            if WHEELS.with_mut(&cc, |w| w.insert(Timer {
-                deadline: this.deadline,
-                func: sleep_fire,
-                arg: self_ptr as usize,
-            })) {
+            if WHEELS.with_mut(&cc, |w| {
+                w.insert(Timer {
+                    deadline: this.deadline,
+                    func: sleep_fire,
+                    arg: self_ptr as usize,
+                })
+            }) {
                 this.timer_scheduled = true;
             }
         }

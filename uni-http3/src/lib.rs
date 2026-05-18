@@ -43,4 +43,4 @@ pub mod qpack;
 pub mod server;
 pub mod static_table;
 
-pub use server::{listen, ListenError};
+pub use server::{ListenError, listen};

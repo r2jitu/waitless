@@ -7,11 +7,11 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "uni-driver-gve",
     srcs = [
-        "src/lib.rs",
         "src/adminq.rs",
         "src/diag.rs",
         "src/dqo.rs",
         "src/gqi.rs",
+        "src/lib.rs",
     ],
     crate_name = "uni_driver_gve",
     target_compatible_with = ["@platforms//os:none"],

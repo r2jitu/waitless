@@ -8,7 +8,10 @@
 
 set -euo pipefail
 
-die() { echo "ERROR: $*" >&2; exit 1; }
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
 
 # Progress logging is off by default so genrule invocations stay
 # silent on success (Bazel mirrors every stdout/stderr byte under
@@ -23,11 +26,22 @@ LIMINE_CONF=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --arch) ARCH="$2"; shift 2 ;;
-        --conf) LIMINE_CONF="$2"; shift 2 ;;
-        *) if [[ -z "$KERNEL_ELF" ]]; then KERNEL_ELF="$1"
-           elif [[ -z "$OUTPUT_ISO" ]]; then OUTPUT_ISO="$1"
-           fi; shift ;;
+    --arch)
+        ARCH="$2"
+        shift 2
+        ;;
+    --conf)
+        LIMINE_CONF="$2"
+        shift 2
+        ;;
+    *)
+        if [[ -z "$KERNEL_ELF" ]]; then
+            KERNEL_ELF="$1"
+        elif [[ -z "$OUTPUT_ISO" ]]; then
+            OUTPUT_ISO="$1"
+        fi
+        shift
+        ;;
     esac
 done
 
@@ -116,7 +130,7 @@ log "[ISO] Creating Limine ISO..."
 
 XORRISO_ARGS=(
     -as mkisofs
-    -R -J  # Rock Ridge + Joliet extensions
+    -R -J # Rock Ridge + Joliet extensions
 )
 
 # BIOS boot (El Torito) — only for x86_64

@@ -19,9 +19,9 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "uni-aes-gcm",
     srcs = [
-        "src/lib.rs",
         "src/aes_gcm.rs",
         "src/ghash_batch.rs",
+        "src/lib.rs",
     ],
     crate_name = "uni_aes_gcm",
     rustc_flags = select({

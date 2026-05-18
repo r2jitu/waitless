@@ -18,11 +18,11 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "app",
     srcs = ["src/main.rs"],
-    crate_root = "src/main.rs",
     compile_data = [
         "//apps/webserver/dev_certs:dev_cert.der",
         "//apps/webserver/dev_certs:dev_key.der",
     ],
+    crate_root = "src/main.rs",
     deps = [
         "//uni",
         "//uni-http",
@@ -106,11 +106,11 @@ unikernel_app_test(
     timeout = "short",
     srcs = ["test_mc.py"],
     app_base = "webserver",
-    variants = ["hvf"],
     tags = [
         "exclusive",
         "local",
     ],
     test_rule = py_test,
+    variants = ["hvf"],
     deps = ["//scripts:test_helpers"],
 )

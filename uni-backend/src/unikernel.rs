@@ -15,10 +15,10 @@ pub fn check_shutdown() -> bool {
 // ---- Net stack re-exports (TCP/UDP + driver diagnostics) ------------------
 
 pub use uni_drivers::net::{
+    DIAG_QP_CAP as NET_DIAG_QP_CAP, TxDescLogEntry as NetTxDescLogEntry, TxDiag as NetTxDiag,
     num_queue_pairs as net_num_queue_pairs, rx_counts as net_rx_counts,
     rx_used_cursors as net_rx_used_cursors, tx_desc_log_snapshot as net_tx_desc_log_snapshot,
-    tx_diag as net_tx_diag, TxDescLogEntry as NetTxDescLogEntry, TxDiag as NetTxDiag,
-    DIAG_QP_CAP as NET_DIAG_QP_CAP,
+    tx_diag as net_tx_diag,
 };
 
 /// gve NIC driver diagnostic counters (RX-path items B/H — see
@@ -32,9 +32,8 @@ pub use uni_drivers::net::{
 /// in app code, breaks the native build.
 pub fn gve_diag() -> crate::GveDiag {
     use core::sync::atomic::Ordering::Relaxed;
-    let sum = |a: &[core::sync::atomic::AtomicU64]| -> u64 {
-        a.iter().map(|c| c.load(Relaxed)).sum()
-    };
+    let sum =
+        |a: &[core::sync::atomic::AtomicU64]| -> u64 { a.iter().map(|c| c.load(Relaxed)).sum() };
     crate::GveDiag {
         dqo_tx_miss_compl: uni_driver_gve::dqo::DQO_TX_MISS_COMPL.load(Relaxed),
         dqo_tx_reinject_compl: uni_driver_gve::dqo::DQO_TX_REINJECT_COMPL.load(Relaxed),
@@ -96,7 +95,7 @@ pub fn cycles_per_us() -> u64 {
 // ---- Async runtime re-exports ---------------------------------------------
 
 pub mod runtime {
-    pub use uni_runtime::{sleep_us, spawn, Sleep};
+    pub use uni_runtime::{Sleep, sleep_us, spawn};
 }
 
 // ---- Heap stats -----------------------------------------------------------

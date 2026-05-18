@@ -47,12 +47,11 @@ use core::task::Waker;
 
 use uni_worker::{CurrentWorker, PerWorker};
 
-
-pub mod udp;
 pub mod tcp;
+pub mod udp;
 
-pub use udp::*;
 pub use tcp::*;
+pub use udp::*;
 
 // ---- SpinLock (waker cell) --------------------------------------------------
 
@@ -166,8 +165,7 @@ pub(crate) fn install_worker_task(
 // `uni-runtime/src/launcher.rs` for the ownership / tombstone /
 // monotonic-counter invariants that back the table.
 
-static NET_LAUNCHERS: crate::launcher::LaunchTable =
-    crate::launcher::LaunchTable::new();
+static NET_LAUNCHERS: crate::launcher::LaunchTable = crate::launcher::LaunchTable::new();
 
 #[inline]
 pub(crate) fn register_net_launcher(launcher: crate::launcher::Launcher) -> usize {

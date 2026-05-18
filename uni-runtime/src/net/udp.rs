@@ -155,8 +155,7 @@ impl WorkerInbox {
         }
         debug_assert!(capacity.is_power_of_two());
         debug_assert!(capacity > 0);
-        let mut buf: alloc::vec::Vec<Datagram> =
-            alloc::vec::Vec::with_capacity(capacity);
+        let mut buf: alloc::vec::Vec<Datagram> = alloc::vec::Vec::with_capacity(capacity);
         for _ in 0..capacity {
             buf.push(Datagram::ZERO);
         }
@@ -171,12 +170,7 @@ impl WorkerInbox {
     /// `payload` into the next slot. Returns `false` (and drops
     /// the payload) when the inbox ring is full — equivalent to
     /// NIC-level packet loss, recovered by application retry.
-    fn try_push(
-        &self,
-        src_ip: IpAddr,
-        src_port: u16,
-        payload: &[u8],
-    ) -> bool {
+    fn try_push(&self, src_ip: IpAddr, src_port: u16, payload: &[u8]) -> bool {
         let slots_ptr = self.slots.load(Ordering::Acquire);
         if slots_ptr.is_null() {
             return false;
@@ -331,8 +325,7 @@ impl UdpState {
     }
 }
 
-static UDP_REGISTRY: [UdpState; MAX_UDP_SOCKETS] =
-    [const { UdpState::new() }; MAX_UDP_SOCKETS];
+static UDP_REGISTRY: [UdpState; MAX_UDP_SOCKETS] = [const { UdpState::new() }; MAX_UDP_SOCKETS];
 
 // ---- Ephemeral port pool (per-worker) ---------------------------------------
 //
@@ -420,8 +413,7 @@ unsafe impl Sync for EphPool {}
 impl EphPool {
     fn new() -> Self {
         EphPool {
-            chunks: [const { AtomicPtr::new(core::ptr::null_mut()) };
-                     MAX_CHUNKS_PER_WORKER],
+            chunks: [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CHUNKS_PER_WORKER],
             bookkeeping: UnsafeCell::new(EphBookkeeping {
                 free_list: alloc::vec::Vec::new(),
                 next_alloc: 0,
@@ -523,8 +515,7 @@ pub struct UdpBackend {
     /// Used by the QUIC encoder's `take_datagram_buf` to write
     /// packet bytes straight into a TX-pool slot — saves the
     /// driver-side memcpy that the slice-based `send` path pays.
-    pub acquire_tx_buf:
-        Option<fn() -> Option<uni_net_driver::TxBufHandle>>,
+    pub acquire_tx_buf: Option<fn() -> Option<uni_net_driver::TxBufHandle>>,
     /// Optional submit-via-TX-handle entry. Caller has filled
     /// `handle.data_mut()[MAX_L2_HEADROOM..MAX_L2_HEADROOM+payload_len]`
     /// with the UDP payload; the backend fills the L2/L3/L4
@@ -560,9 +551,8 @@ pub struct UdpBackend {
     /// `udp::send_to_addr → ipv4_send → ethernet_send → driver`
     /// memcpy chain. Bare-metal sets this; native leaves it `None`
     /// (the OS does the wrap on `sendto`).
-    pub send_with_l2_headroom: Option<
-        fn(dst_ip: IpAddr, src_port: u16, dst_port: u16, frame: &mut [u8]),
-    >,
+    pub send_with_l2_headroom:
+        Option<fn(dst_ip: IpAddr, src_port: u16, dst_port: u16, frame: &mut [u8])>,
 }
 
 /// Max bytes a caller of `UdpSocket::send_to_with_l2_headroom`
@@ -596,8 +586,7 @@ pub fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
     f()
 }
 
-static UDP_BACKEND: AtomicPtr<UdpBackend> =
-    AtomicPtr::new(core::ptr::null_mut());
+static UDP_BACKEND: AtomicPtr<UdpBackend> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Install the UDP backend. Call once at boot, before any
 /// `UdpSocket::bind` / `send_to`. Safe to call more than once —
@@ -711,9 +700,7 @@ fn release_eph_slot(worker: u32, slot_idx: u32) {
     let chunk = pool.chunks[chunk_idx].load(Ordering::Acquire);
     if !chunk.is_null() {
         // SAFETY: chunks once published live for the process lifetime.
-        let slot = unsafe {
-            &(*chunk).slots[(slot_idx as usize) % EPH_CHUNK_SIZE]
-        };
+        let slot = unsafe { &(*chunk).slots[(slot_idx as usize) % EPH_CHUNK_SIZE] };
         slot.port.store(0, Ordering::Release);
     }
     // Push slot index to the free list (owner-only access).
@@ -740,7 +727,9 @@ impl UdpSocket {
                 .compare_exchange(0, port, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                state.inboxes.ensure_init(num_workers(), |_| WorkerInbox::new());
+                state
+                    .inboxes
+                    .ensure_init(num_workers(), |_| WorkerInbox::new());
                 for w in 0..num_workers() {
                     let inbox = state.inboxes.at(w);
                     if !inbox.ensure_alloc(SERVER_INBOX_CAPACITY) {
@@ -881,7 +870,10 @@ impl UdpSocket {
 
         Ok(UdpSocket {
             port,
-            slot: SlotRef::Ephemeral { worker: me, slot_idx },
+            slot: SlotRef::Ephemeral {
+                worker: me,
+                slot_idx,
+            },
             released: AtomicBool::new(false),
         })
     }
@@ -1027,7 +1019,6 @@ impl UdpSocket {
             }
         }
     }
-
 }
 
 /// `bind(port).map(|s| s.run(body))` in one call. The 80%-case
@@ -1044,7 +1035,6 @@ where
 }
 
 impl UdpSocket {
-
     /// Spawn `body` once per worker. Each invocation gets its own
     /// `Arc<UdpSocket>` clone and typically loops on `recv_from`
     /// (and replies via `send_to`) to drive the per-worker inbox.
@@ -1085,11 +1075,7 @@ impl UdpSocket {
             // through `spawn_boxed` to skip a redundant `Box::pin`.
             let fut = (ctx_for_launcher.body)(sock);
             if let Ok(h) = crate::spawn_boxed(fut) {
-                install_worker_task(
-                    &ctx_for_launcher.stopping,
-                    &ctx_for_launcher.handles,
-                    h,
-                );
+                install_worker_task(&ctx_for_launcher.stopping, &ctx_for_launcher.handles, h);
             }
         }));
         UdpHandle { ctx, launcher_slot }
@@ -1135,7 +1121,11 @@ impl UdpClient {
     /// slot in the per-worker pool).
     pub fn connect(peer_ip: IpAddr, peer_port: u16) -> Result<UdpClient, UdpBindError> {
         let inner = UdpSocket::open_ephemeral()?;
-        Ok(UdpClient { inner, peer_ip, peer_port })
+        Ok(UdpClient {
+            inner,
+            peer_ip,
+            peer_port,
+        })
     }
 
     /// Send a datagram to the connected peer.
@@ -1152,7 +1142,8 @@ impl UdpClient {
             let n = payload.len().min(buf.len());
             buf[..n].copy_from_slice(&payload[..n]);
             n
-        }).await
+        })
+        .await
     }
 
     /// Zero-copy receive: invoke `f` with a slice borrow of the
@@ -1204,10 +1195,8 @@ impl UdpClient {
 
 // ---- UdpHandle: owning reference returned by `run` --------------------------
 
-type BoxedBody = Box<
-    dyn Fn(Arc<UdpSocket>) -> Pin<Box<dyn Future<Output = ()>>>
-        + Send + Sync + 'static,
->;
+type BoxedBody =
+    Box<dyn Fn(Arc<UdpSocket>) -> Pin<Box<dyn Future<Output = ()>>> + Send + Sync + 'static>;
 
 /// Per-fanout shared state: the socket, the user's body closure,
 /// a stop flag, and one `TaskHandle` slot per worker. Owned by
@@ -1276,9 +1265,7 @@ impl Drop for UdpHandle {
         if !sock.released.swap(true, Ordering::AcqRel) {
             match sock.slot {
                 SlotRef::Server(idx) => {
-                    UDP_REGISTRY[idx as usize]
-                        .port
-                        .store(0, Ordering::Release);
+                    UDP_REGISTRY[idx as usize].port.store(0, Ordering::Release);
                 }
                 SlotRef::Ephemeral { worker, slot_idx } => {
                     release_eph_slot(worker, slot_idx);
@@ -1317,9 +1304,7 @@ impl<'a> Future for UdpRecv<'a> {
         let this = self.get_mut();
         let cc = CurrentWorker::enter();
         let inbox = match this.sock.slot {
-            SlotRef::Server(idx) => {
-                UDP_REGISTRY[idx as usize].inboxes.current(&cc)
-            }
+            SlotRef::Server(idx) => UDP_REGISTRY[idx as usize].inboxes.current(&cc),
             SlotRef::Ephemeral { worker, slot_idx } => {
                 // The recv future is `!Send`, so we're guaranteed
                 // to be on the owning worker (where the slot was
@@ -1372,9 +1357,7 @@ where
         let this = self.get_mut();
         let cc = CurrentWorker::enter();
         let inbox = match this.sock.slot {
-            SlotRef::Server(idx) => {
-                UDP_REGISTRY[idx as usize].inboxes.current(&cc)
-            }
+            SlotRef::Server(idx) => UDP_REGISTRY[idx as usize].inboxes.current(&cc),
             SlotRef::Ephemeral { worker, slot_idx } => {
                 let slot = lookup_eph_position(worker, slot_idx)
                     .expect("ephemeral slot vanished mid-recv");
@@ -1384,7 +1367,9 @@ where
         };
 
         // Fast path: data already in this worker's inbox.
-        let f = this.f.take()
+        let f = this
+            .f
+            .take()
             .expect("UdpRecvInplace polled after completion");
         let f = match inbox.pop_with(f) {
             Ok(r) => return Poll::Ready(r),
@@ -1454,12 +1439,7 @@ fn lookup_eph_position(worker: u32, slot_idx: u32) -> Option<&'static EphSlot> {
 /// the inbox push itself succeeded). `payload` is borrowed for the
 /// duration of the call; bytes are copied into the matched inbox
 /// slot (or dropped on a full ring).
-pub fn deliver_udp(
-    dst_port: u16,
-    src_ip: IpAddr,
-    src_port: u16,
-    payload: &[u8],
-) -> bool {
+pub fn deliver_udp(dst_port: u16, src_ip: IpAddr, src_port: u16, payload: &[u8]) -> bool {
     if let Some(slot) = lookup_eph(dst_port) {
         let _ = slot.inbox.try_push(src_ip, src_port, payload);
         slot.inbox.wake_if_parked();

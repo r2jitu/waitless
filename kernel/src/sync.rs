@@ -180,7 +180,10 @@ mod tests {
         let g = s.try_lock().expect("first try_lock should succeed");
         assert!(s.try_lock().is_none(), "second try_lock should fail");
         drop(g);
-        assert!(s.try_lock().is_some(), "after drop, try_lock should succeed");
+        assert!(
+            s.try_lock().is_some(),
+            "after drop, try_lock should succeed"
+        );
     }
 
     /// Cross-thread stress test: many threads each increment a shared
@@ -250,8 +253,12 @@ mod tests {
                 })
             })
             .collect();
-        for h in writers { h.join().unwrap(); }
-        for h in observers { h.join().unwrap(); }
+        for h in writers {
+            h.join().unwrap();
+        }
+        for h in observers {
+            h.join().unwrap();
+        }
         let g = s.lock();
         assert_eq!(g.0, ((THREADS / 2) * ITERS) as u64);
         assert_eq!(g.0, g.1);

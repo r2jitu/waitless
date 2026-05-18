@@ -344,7 +344,10 @@ pub struct ShortHeader<'a> {
 /// receiver-side connection ID length (negotiated out-of-band; we
 /// pin it at connection-create time). Returns the DCID slice and
 /// the offset where the protected packet number starts.
-pub fn parse_short_header<'a>(data: &'a [u8], dcid_len: usize) -> Result<ShortHeader<'a>, WireError> {
+pub fn parse_short_header<'a>(
+    data: &'a [u8],
+    dcid_len: usize,
+) -> Result<ShortHeader<'a>, WireError> {
     if dcid_len > MAX_CID_LEN {
         return Err(WireError::BadLength);
     }
@@ -380,11 +383,7 @@ pub fn parse_short_header<'a>(data: &'a [u8], dcid_len: usize) -> Result<ShortHe
 /// Mirrors the algorithm from RFC 9000 Appendix A.3 verbatim — pick
 /// the candidate closest to `expected = largest_pn + 1`, with the
 /// half-window distance check to disambiguate wrap edges.
-pub fn decode_packet_number(
-    largest_pn: u64,
-    truncated_pn: u64,
-    truncated_pn_len: usize,
-) -> u64 {
+pub fn decode_packet_number(largest_pn: u64, truncated_pn: u64, truncated_pn_len: usize) -> u64 {
     debug_assert!(matches!(truncated_pn_len, 1 | 2 | 3 | 4));
     let pn_nbits: u64 = (truncated_pn_len as u64) * 8;
     let expected_pn = largest_pn.wrapping_add(1);
@@ -395,13 +394,9 @@ pub fn decode_packet_number(
     // Candidate PN sharing low pn_nbits with `truncated_pn`,
     // closest to `expected_pn`.
     let candidate = (expected_pn & !pn_mask) | truncated_pn;
-    if candidate.wrapping_add(pn_hwin) <= expected_pn
-        && candidate < (1u64 << 62) - pn_win
-    {
+    if candidate.wrapping_add(pn_hwin) <= expected_pn && candidate < (1u64 << 62) - pn_win {
         candidate.wrapping_add(pn_win)
-    } else if candidate > expected_pn.wrapping_add(pn_hwin)
-        && candidate >= pn_win
-    {
+    } else if candidate > expected_pn.wrapping_add(pn_hwin) && candidate >= pn_win {
         candidate.wrapping_sub(pn_win)
     } else {
         candidate
@@ -447,7 +442,11 @@ pub fn encode_packet_number(
     } else {
         4
     };
-    let mask = if len == 4 { u32::MAX } else { (1u32 << (len * 8)) - 1 };
+    let mask = if len == 4 {
+        u32::MAX
+    } else {
+        (1u32 << (len * 8)) - 1
+    };
     let truncated = (pn as u32) & mask;
     for i in 0..len {
         out[i] = ((truncated >> (8 * (len - 1 - i))) & 0xff) as u8;
@@ -469,7 +468,10 @@ mod tests {
     fn varint_rfc_examples_round_trip() {
         // From RFC 9000 §16, table at end of section. (value, bytes)
         let cases: &[(u64, &[u8])] = &[
-            (151_288_809_941_952_652, &[0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c]),
+            (
+                151_288_809_941_952_652,
+                &[0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c],
+            ),
             (494_878_333, &[0x9d, 0x7f, 0x3e, 0x7d]),
             (15_293, &[0x7b, 0xbd]),
             (151, &[0x40, 0x97]),
@@ -492,7 +494,10 @@ mod tests {
     fn varint_rejects_oversize_value() {
         let mut buf = [0u8; 8];
         assert!(write_varint(MAX_VARINT, &mut buf).is_ok());
-        assert_eq!(write_varint(MAX_VARINT + 1, &mut buf), Err(WireError::BadLength));
+        assert_eq!(
+            write_varint(MAX_VARINT + 1, &mut buf),
+            Err(WireError::BadLength)
+        );
     }
 
     #[test]
@@ -727,7 +732,10 @@ mod tests {
         let mut buf = [0u8; 8];
         for (val, expected_len) in cases {
             let n = write_varint(*val, &mut buf).unwrap();
-            assert_eq!(n, *expected_len, "value {val} should encode to {expected_len} bytes");
+            assert_eq!(
+                n, *expected_len,
+                "value {val} should encode to {expected_len} bytes"
+            );
             let (decoded, _) = read_varint(&buf[..n]).unwrap();
             assert_eq!(decoded, *val);
         }

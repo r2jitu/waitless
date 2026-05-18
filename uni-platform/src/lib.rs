@@ -124,8 +124,7 @@ fn now_cycles() -> u64 {
 /// x86_64 TSC rate — published by kernel boot after PIT calibration.
 /// aarch64 reads CNTFRQ_EL0 directly so this static is unused there.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-static X86_TSC_PER_US: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static X86_TSC_PER_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Publish the calibrated TSC rate. Called once from the kernel's
 /// PIT calibration path during boot.
@@ -201,8 +200,7 @@ pub fn now_ticks() -> u64 {
 /// Release-store at boot. Null until set; the runtime treats null
 /// as "no cross-worker wake available, target will pick up on its
 /// next idle-spin tick".
-static WAKE_WORKER_FN: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static WAKE_WORKER_FN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Install the cross-worker wake hook. Called once during boot.
 pub fn set_wake_fn(f: fn(u32)) {

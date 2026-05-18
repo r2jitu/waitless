@@ -49,17 +49,26 @@ argv=("$@")
 while [ $i -lt ${#argv[@]} ]; do
     arg="${argv[$i]}"
     case "$arg" in
-        --no-build) do_build=0 ;;
-        --keep-running) do_stop=0 ;;
-        --cores|--cores=*) have_cores=1; bench_args+=("$arg") ;;
-        --duration|--duration=*) have_duration=1; bench_args+=("$arg") ;;
-        --env) i=$((i+1)); env_arg="${argv[$i]}" ;;
-        --env=*) env_arg="${arg#--env=}" ;;
-        *) bench_args+=("$arg") ;;
+    --no-build) do_build=0 ;;
+    --keep-running) do_stop=0 ;;
+    --cores | --cores=*)
+        have_cores=1
+        bench_args+=("$arg")
+        ;;
+    --duration | --duration=*)
+        have_duration=1
+        bench_args+=("$arg")
+        ;;
+    --env)
+        i=$((i + 1))
+        env_arg="${argv[$i]}"
+        ;;
+    --env=*) env_arg="${arg#--env=}" ;;
+    *) bench_args+=("$arg") ;;
     esac
-    i=$((i+1))
+    i=$((i + 1))
 done
-[ $have_cores    -eq 0 ] && bench_args+=(--cores "$DEFAULT_CORES")
+[ $have_cores -eq 0 ] && bench_args+=(--cores "$DEFAULT_CORES")
 [ $have_duration -eq 0 ] && bench_args+=(--duration "$DEFAULT_DURATION")
 [ -z "$env_arg" ] && env_arg="$DEFAULT_ENV"
 bench_args+=(--env "$env_arg")
@@ -67,7 +76,7 @@ bench_args+=(--env "$env_arg")
 # Decide which binaries we need based on the env list.
 need_kvm=0
 need_native=0
-case ",$env_arg," in *,kvm,*)    need_kvm=1 ;; esac
+case ",$env_arg," in *,kvm,*) need_kvm=1 ;; esac
 case ",$env_arg," in *,native,*) need_native=1 ;; esac
 
 if [ $need_kvm -eq 1 ]; then
@@ -107,12 +116,18 @@ if [ $need_kvm -eq 1 ]; then
     # explicit x86_64 variant and alias it to `webserver.elf` on the
     # remote so KvmEnv's `--elf` path resolves unchanged.
     ELF="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver_qemu_x86_64.elf"
-    [ -f "$ELF" ] || { echo "error: $ELF not found; run without --no-build" >&2; exit 1; }
+    [ -f "$ELF" ] || {
+        echo "error: $ELF not found; run without --no-build" >&2
+        exit 1
+    }
     sync_files+=("$ELF")
 fi
 if [ $need_native -eq 1 ]; then
     NBIN="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver_bin"
-    [ -f "$NBIN" ] || { echo "error: $NBIN not found; run without --no-build" >&2; exit 1; }
+    [ -f "$NBIN" ] || {
+        echo "error: $NBIN not found; run without --no-build" >&2
+        exit 1
+    }
     sync_files+=("$NBIN")
 fi
 
@@ -127,8 +142,8 @@ if [ "$instance_status" = "TERMINATED" ] || [ "$instance_status" = "STOPPED" ]; 
     # fresh host key for the rolled-over external IP.
     for _try in $(seq 1 60); do
         if ssh -o ConnectTimeout=3 -o BatchMode=yes \
-               -o StrictHostKeyChecking=accept-new \
-               "$SSH_HOST" true 2>/dev/null; then
+            -o StrictHostKeyChecking=accept-new \
+            "$SSH_HOST" true 2>/dev/null; then
             break
         fi
         sleep 1

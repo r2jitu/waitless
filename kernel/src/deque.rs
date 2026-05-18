@@ -86,7 +86,9 @@ impl Deque {
         // was previously either uninitialised or read-stale by a thief
         // whose CAS could no longer claim it (top has advanced past it
         // — otherwise the deque would have been full and we returned).
-        unsafe { (*self.buffer[b & MASK].get()).write(task); }
+        unsafe {
+            (*self.buffer[b & MASK].get()).write(task);
+        }
         // Release: make the write visible before advancing bottom.
         self.bottom.store(b + 1, Ordering::Release);
         true
@@ -122,12 +124,9 @@ impl Deque {
 
         // t == b: single element, race with a possible concurrent steal.
         // Resolve via CAS on top. Whichever side advances top owns the value.
-        let result = self.top.compare_exchange(
-            t,
-            t + 1,
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-        );
+        let result = self
+            .top
+            .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed);
         // The deque is now logically empty regardless of the CAS outcome;
         // restore bottom to t+1 so the next push starts fresh.
         self.bottom.store(t + 1, Ordering::Relaxed);
@@ -151,12 +150,9 @@ impl Deque {
         // also a copy, so the bytes are accessed read-only by both sides.
         let task = unsafe { (*self.buffer[t & MASK].get()).assume_init_read() };
         // CAS to claim ownership of this slot.
-        let result = self.top.compare_exchange(
-            t,
-            t + 1,
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-        );
+        let result = self
+            .top
+            .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed);
         if result.is_ok() {
             Some(task)
         } else {
@@ -233,9 +229,9 @@ mod tests {
         d.push(make_task(4));
         // Steal takes from top (FIFO), pop from bottom (LIFO)
         assert_eq!(d.steal().unwrap().arg, 1); // top
-        assert_eq!(d.pop().unwrap().arg, 4);   // bottom
+        assert_eq!(d.pop().unwrap().arg, 4); // bottom
         assert_eq!(d.steal().unwrap().arg, 2); // next from top
-        assert_eq!(d.pop().unwrap().arg, 3);   // next from bottom
+        assert_eq!(d.pop().unwrap().arg, 3); // next from bottom
         assert!(d.is_empty());
     }
 
@@ -323,7 +319,9 @@ mod tests {
         while pushed < N_TASKS {
             // Push a small burst, then pop a few from the bottom.
             for _ in 0..16 {
-                if pushed >= N_TASKS { break; }
+                if pushed >= N_TASKS {
+                    break;
+                }
                 while !d.push(make_task(pushed)) {
                     // Full — drain a few via owner pop.
                     if let Some(t) = d.pop() {
@@ -345,7 +343,9 @@ mod tests {
         }
         OWNER_DONE.store(true, Ordering::Release);
 
-        for th in thieves { th.join().unwrap(); }
+        for th in thieves {
+            th.join().unwrap();
+        }
 
         // Combine results.
         let mut all: Vec<usize> = collected.lock().unwrap().clone();

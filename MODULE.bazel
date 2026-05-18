@@ -36,8 +36,8 @@ register_toolchains("@bazel_tools//tools/python:autodetecting_toolchain")
 # pip-resolution gets the deterministic interpreter it needs.
 python = use_extension("@rules_python//python/extensions:python.bzl", "python")
 python.toolchain(
-    python_version = "3.12",
     is_default = False,
+    python_version = "3.12",
 )
 
 # Pip dependency hub. py_test targets that need a third-party
@@ -125,6 +125,7 @@ register_toolchains("@rust_toolchains//:all")
 hardfloat = use_extension("//bazel/buildstd:extensions.bzl", "hardfloat")
 hardfloat.toolchain(target_json = "//bazel/toolchain:x86_64-unikernel-none.json")
 use_repo(hardfloat, "hardfloat_x86_64_none")
+
 register_toolchains("@hardfloat_x86_64_none//:toolchain")
 
 # ── crates.io dependencies ──────────────────────────────────────────────────

@@ -65,7 +65,7 @@ pub mod transport_params;
 pub mod wire;
 
 pub use conn::{ConnError, ConnState, Connection, ConnectionId, SERVER_CID_LEN};
-pub use endpoint::{quic_listen, QuicConn, QuicListenError, QuicListener};
+pub use endpoint::{QuicConn, QuicListenError, QuicListener, quic_listen};
 pub use inbox::ConnInbox;
 pub use tls::{CryptoLevel, QuicTls, QuicTlsError, QuicTlsState};
 

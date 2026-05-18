@@ -271,5 +271,7 @@ pub fn load_on_ap() {
 /// When an interrupt occurs in ring 3, the CPU switches RSP to this value.
 pub fn set_kernel_stack(stack: u64) {
     // SAFETY: BSP-only; same contract as `init()`.
-    unsafe { (*GDT.0.get()).tss.rsp0 = stack; }
+    unsafe {
+        (*GDT.0.get()).tss.rsp0 = stack;
+    }
 }

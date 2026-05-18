@@ -112,11 +112,15 @@ impl fmt::Display for NetError {
 }
 
 impl From<NicError> for NetError {
-    fn from(e: NicError) -> Self { NetError::Nic(e) }
+    fn from(e: NicError) -> Self {
+        NetError::Nic(e)
+    }
 }
 
 impl From<DhcpError> for NetError {
-    fn from(e: DhcpError) -> Self { NetError::Dhcp(e) }
+    fn from(e: DhcpError) -> Self {
+        NetError::Dhcp(e)
+    }
 }
 
 // ---- Size invariants -------------------------------------------------------
@@ -155,7 +159,9 @@ mod tests {
 
     #[test]
     fn question_mark_lifts_inner_to_outer() {
-        fn inner() -> Result<(), NicError> { Err(NicError::HwFault) }
+        fn inner() -> Result<(), NicError> {
+            Err(NicError::HwFault)
+        }
         fn outer() -> Result<(), NetError> {
             inner()?;
             Ok(())
@@ -165,7 +171,9 @@ mod tests {
 
     #[test]
     fn question_mark_lifts_dhcp_to_net() {
-        fn inner() -> Result<(), DhcpError> { Err(DhcpError::NoOffer) }
+        fn inner() -> Result<(), DhcpError> {
+            Err(DhcpError::NoOffer)
+        }
         fn outer() -> Result<(), NetError> {
             inner()?;
             Ok(())

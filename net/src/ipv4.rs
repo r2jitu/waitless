@@ -2,17 +2,17 @@
 
 #![no_std]
 
-extern crate uni_kernel;
+extern crate net_arp as arp;
+extern crate net_ethernet as ethernet;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
-extern crate net_ethernet as ethernet;
-extern crate net_arp as arp;
+extern crate uni_kernel;
 
-use core::ptr;
-use from_bytes::FromBytes;
-use types::{MacAddr, Ipv4Addr, CONFIG, checksum, htons, ntohs};
-use ethernet::{ethernet_send, ETHERTYPE_IPV4};
 use arp::arp_resolve;
+use core::ptr;
+use ethernet::{ETHERTYPE_IPV4, ethernet_send};
+use from_bytes::FromBytes;
+use types::{CONFIG, Ipv4Addr, MacAddr, checksum, htons, ntohs};
 
 pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
@@ -69,7 +69,9 @@ pub fn init() {
 /// L2 src MAC is the gateway's, not the ip's own MAC).
 pub fn same_subnet(ip: Ipv4Addr) -> bool {
     let mask = CONFIG.subnet_mask().addr;
-    if mask == 0 { return false; }
+    if mask == 0 {
+        return false;
+    }
     let our_ip = CONFIG.ip().addr;
     (ip.addr & mask) == (our_ip & mask)
 }

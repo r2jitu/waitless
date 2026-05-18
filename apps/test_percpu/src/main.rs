@@ -21,8 +21,7 @@ static RESULTS: [AtomicU8; MAX_CORES] = [const { AtomicU8::new(0) }; MAX_CORES];
 // read from each AP → `UnsafeCell` + `unsafe impl Sync`.
 struct TestDataSlot(core::cell::UnsafeCell<[u32; MAX_CORES]>);
 unsafe impl Sync for TestDataSlot {}
-static TEST_DATA: TestDataSlot =
-    TestDataSlot(core::cell::UnsafeCell::new([0xFFFFFFFF; MAX_CORES]));
+static TEST_DATA: TestDataSlot = TestDataSlot(core::cell::UnsafeCell::new([0xFFFFFFFF; MAX_CORES]));
 
 fn test_service(core_id: u32) -> bool {
     // Only run the test once per core
@@ -69,7 +68,9 @@ fn init() {
 
     // Write test data for each core
     for i in 0..num_cores {
-        unsafe { (*TEST_DATA.0.get())[i as usize] = i; }
+        unsafe {
+            (*TEST_DATA.0.get())[i as usize] = i;
+        }
     }
 
     // Register service callback
@@ -91,7 +92,9 @@ fn init() {
                 done += 1;
             }
         }
-        if done >= expected { break; }
+        if done >= expected {
+            break;
+        }
     }
 
     // Print results — include core 0 (its test runs inline, so it's

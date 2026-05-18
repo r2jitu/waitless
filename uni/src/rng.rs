@@ -33,9 +33,7 @@ pub fn fill_bytes(buf: &mut [u8]) {
     let mut offset = 0;
     while offset < buf.len() {
         let chunk = (buf.len() - offset).min(256);
-        let rc = unsafe {
-            getentropy(buf.as_mut_ptr().add(offset) as *mut _, chunk)
-        };
+        let rc = unsafe { getentropy(buf.as_mut_ptr().add(offset) as *mut _, chunk) };
         if rc != 0 {
             // `getentropy` effectively never fails in practice
             // (macOS + Linux both back it with a kernel RNG that's

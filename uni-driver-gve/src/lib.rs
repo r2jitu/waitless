@@ -59,23 +59,23 @@ use uni_iobuf::{Chain, IOBufPool, OwnedIOBuf};
 // `pub` (not `pub(crate)`) so the app's /stats endpoint can read
 // them as `uni_driver_gve::…`.
 pub use diag::{
-    tx_desc_log_snapshot, GQI_RECYCLE_POOL_EXHAUSTED, RX_BUF_REPOST_COUNT, TxDescLogEntry,
+    GQI_RECYCLE_POOL_EXHAUSTED, RX_BUF_REPOST_COUNT, TxDescLogEntry, tx_desc_log_snapshot,
 };
 pub(crate) use diag::{
-    record_tx_desc, tx_desc_kind, RX_BYTES_PER_QP, TX_BIG_ACQUIRES, TX_BIG_FULL_RETURNS,
-    TX_BYTES_PER_QP, TX_PACKETS_PER_QP, TX_SMALL_ACQUIRES, TX_SMALL_FULL_SPINS, TX_SMALL_SCAN_ITERS,
+    RX_BYTES_PER_QP, TX_BIG_ACQUIRES, TX_BIG_FULL_RETURNS, TX_BYTES_PER_QP, TX_PACKETS_PER_QP,
+    TX_SMALL_ACQUIRES, TX_SMALL_FULL_SPINS, TX_SMALL_SCAN_ITERS, record_tx_desc, tx_desc_kind,
 };
 
 use adminq::{
     AdminqCommand, OP_CONFIGURE_DEVICE_RESOURCES, OP_CONFIGURE_RSS, OP_CREATE_RX_QUEUE,
     OP_CREATE_TX_QUEUE, OP_DESCRIBE_DEVICE, OP_REGISTER_PAGE_LIST,
 };
-use drivers_infra::{log, mmio_read32, mmio_write32};
-use drivers_infra::pci;
 use core::ptr;
 use core::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
 };
+use drivers_infra::pci;
+use drivers_infra::{log, mmio_read32, mmio_write32};
 use uni_kernel::mm::{alloc_pages, phys_to_virt};
 use uni_kernel::sync::Spinlock;
 
@@ -411,7 +411,9 @@ pub(crate) static RX_QUEUES: [AtomicPtr<RxQueue>; MAX_QUEUE_PAIRS] =
 #[inline(always)]
 pub(crate) fn host_dma_fence() {
     #[cfg(target_arch = "x86_64")]
-    unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)); }
+    unsafe {
+        core::arch::asm!("sfence", options(nostack, preserves_flags));
+    }
     #[cfg(not(target_arch = "x86_64"))]
     core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
 }
@@ -441,7 +443,10 @@ pub(crate) fn read_be16(src: &[u8], offset: usize) -> u16 {
 #[inline]
 pub(crate) fn read_be32(src: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes([
-        src[offset], src[offset + 1], src[offset + 2], src[offset + 3],
+        src[offset],
+        src[offset + 1],
+        src[offset + 2],
+        src[offset + 3],
     ])
 }
 
@@ -525,7 +530,9 @@ fn init() -> bool {
         return false;
     }
     let adminq_va = phys_to_virt(adminq_phys) as u64;
-    unsafe { ptr::write_bytes(adminq_va as *mut u8, 0, adminq::ADMINQ_SIZE); }
+    unsafe {
+        ptr::write_bytes(adminq_va as *mut u8, 0, adminq::ADMINQ_SIZE);
+    }
 
     // Publish the ring PFN. `adminq_phys >> 12` is what the device
     // expects. Reading it back is how Linux / FreeBSD check the
@@ -585,7 +592,11 @@ fn init() -> bool {
     let (default_nq, max_tx, max_rx) = {
         let st = STATE.lock();
         let s = st.as_ref().unwrap();
-        (s.default_num_queues as u32, s.max_tx_queues, s.max_rx_queues)
+        (
+            s.default_num_queues as u32,
+            s.max_tx_queues,
+            s.max_rx_queues,
+        )
     };
     let num_qp = default_nq
         .min(max_tx)
@@ -641,7 +652,9 @@ fn describe_device() -> bool {
         return false;
     }
     let desc_virt = phys_to_virt(desc_phys);
-    unsafe { ptr::write_bytes(desc_virt, 0, 4096); }
+    unsafe {
+        ptr::write_bytes(desc_virt, 0, 4096);
+    }
 
     // Build the command. DESCRIBE_DEVICE payload (per `gve_adminq.h`):
     //   u8[8..16]  device_descriptor_addr (be64, physical)
@@ -714,9 +727,10 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
         adminq::ADMINQ_SIZE
     };
     for _ in 0..num_options {
-        if offset + 8 > end { break; }
-        let opt_hdr: &[u8] =
-            unsafe { core::slice::from_raw_parts(desc_virt.add(offset), 8) };
+        if offset + 8 > end {
+            break;
+        }
+        let opt_hdr: &[u8] = unsafe { core::slice::from_raw_parts(desc_virt.add(offset), 8) };
         let id = read_be16(opt_hdr, 0);
         let len = read_be16(opt_hdr, 2) as usize;
 
@@ -925,15 +939,27 @@ pub(crate) const PAGE_SIZE: u32 = 4096;
 /// uniqueness across live QPLs, so we pack TX ids into the low
 /// half and RX ids above them. `tx_qpl_id(i)` = i, `rx_qpl_id(i)`
 /// = MAX_QUEUE_PAIRS + i.
-#[inline] fn tx_qpl_id(qp: u32) -> u32 { qp }
-#[inline] fn rx_qpl_id(qp: u32) -> u32 { qp + MAX_QUEUE_PAIRS as u32 }
+#[inline]
+fn tx_qpl_id(qp: u32) -> u32 {
+    qp
+}
+#[inline]
+fn rx_qpl_id(qp: u32) -> u32 {
+    qp + MAX_QUEUE_PAIRS as u32
+}
 
 /// Notification-block ids. TX queues claim the first `num_qp`
 /// slots, RX queues the next `num_qp`. Matches the reference
 /// driver's layout and avoids the "two queues can't share an
 /// ntfy_id" rejection.
-#[inline] fn tx_ntfy_id(qp: u32) -> u32 { qp }
-#[inline] fn rx_ntfy_id(num_qp: u32, qp: u32) -> u32 { num_qp + qp }
+#[inline]
+fn tx_ntfy_id(qp: u32) -> u32 {
+    qp
+}
+#[inline]
+fn rx_ntfy_id(num_qp: u32, qp: u32) -> u32 {
+    num_qp + qp
+}
 
 fn configure_device_resources(bar2_va: u64, num_qp: u32, fmt: QueueFormat) -> bool {
     // Pull the device-advertised counter count out of state. This is
@@ -957,7 +983,9 @@ fn configure_device_resources(bar2_va: u64, num_qp: u32, fmt: QueueFormat) -> bo
         return false;
     }
     let counter_va = phys_to_virt(counter_phys) as u64;
-    unsafe { ptr::write_bytes(counter_va as *mut u8, 0, PAGE_SIZE as usize); }
+    unsafe {
+        ptr::write_bytes(counter_va as *mut u8, 0, PAGE_SIZE as usize);
+    }
 
     // IRQ-db array: one entry per notification block. Each entry is
     // IRQ_DB_STRIDE bytes (a full cache line) to avoid false sharing
@@ -969,7 +997,9 @@ fn configure_device_resources(bar2_va: u64, num_qp: u32, fmt: QueueFormat) -> bo
         return false;
     }
     let irq_db_va = phys_to_virt(irq_db_phys) as u64;
-    unsafe { ptr::write_bytes(irq_db_va as *mut u8, 0, PAGE_SIZE as usize); }
+    unsafe {
+        ptr::write_bytes(irq_db_va as *mut u8, 0, PAGE_SIZE as usize);
+    }
 
     // Build CONFIGURE_DEVICE_RESOURCES. Payload layout (40 bytes
     // at offset 8 of the command):
@@ -994,10 +1024,13 @@ fn configure_device_resources(bar2_va: u64, num_qp: u32, fmt: QueueFormat) -> bo
     cmd.put_be32(28, num_qp * 2);
     cmd.put_be32(32, IRQ_DB_STRIDE);
     cmd.put_be32(36, 0);
-    cmd.set_byte(40, match fmt {
-        QueueFormat::GqiQpl => QF_GQI_QPL,
-        QueueFormat::DqoRda => QF_DQO_RDA,
-    });
+    cmd.set_byte(
+        40,
+        match fmt {
+            QueueFormat::GqiQpl => QF_GQI_QPL,
+            QueueFormat::DqoRda => QF_DQO_RDA,
+        },
+    );
 
     if !adminq::execute_cmd(b"CONFIGURE_DEVICE_RESOURCES", &cmd) {
         return false;
@@ -1036,7 +1069,9 @@ fn build_register_page_list_cmd(
         return None;
     }
     let page_addrs_va = phys_to_virt(page_addrs_phys);
-    unsafe { ptr::write_bytes(page_addrs_va, 0, list_pages * PAGE_SIZE as usize); }
+    unsafe {
+        ptr::write_bytes(page_addrs_va, 0, list_pages * PAGE_SIZE as usize);
+    }
 
     // Fill in the per-page addresses. The QPL is contiguous, so
     // the i-th page is at base_phys + i*4096.
@@ -1044,11 +1079,7 @@ fn build_register_page_list_cmd(
         let page_addr = base_phys + (i as u64) * (PAGE_SIZE as u64);
         let buf = page_addr.to_be_bytes();
         unsafe {
-            ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                (page_addrs_va as *mut u8).add(i * 8),
-                8,
-            );
+            ptr::copy_nonoverlapping(buf.as_ptr(), (page_addrs_va as *mut u8).add(i * 8), 8);
         }
     }
 
@@ -1116,19 +1147,15 @@ fn build_configure_rss_cmd(num_qp: u32) -> Option<AdminqCommand> {
     // cautionary tale in this comment.
     #[cfg(not(rss_key = "microsoft"))]
     let key: [u8; RSS_KEY_SIZE] = [
-        0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
-        0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
-        0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
-        0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
-        0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
+        0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d,
+        0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
+        0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
     ];
     #[cfg(rss_key = "microsoft")]
     let key: [u8; RSS_KEY_SIZE] = [
-        0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2,
-        0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,
-        0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4,
-        0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c,
-        0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
+        0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2, 0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f,
+        0xb0, 0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4, 0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30,
+        0xf2, 0x0c, 0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
     ];
 
     // LUT: 128 entries of be32 queue index. Cycle through the
@@ -1172,7 +1199,9 @@ fn alloc_contig(num_pages: usize) -> (u64, u64) {
         return (0, 0);
     }
     let va = phys_to_virt(phys) as u64;
-    unsafe { ptr::write_bytes(va as *mut u8, 0, num_pages * PAGE_SIZE as usize); }
+    unsafe {
+        ptr::write_bytes(va as *mut u8, 0, num_pages * PAGE_SIZE as usize);
+    }
     (phys, va)
 }
 
@@ -1187,24 +1216,31 @@ fn alloc_contig(num_pages: usize) -> (u64, u64) {
 
 #[derive(Clone, Copy)]
 struct TxAlloc {
-    ring_phys: u64, ring_va: u64,
-    qres_phys: u64, qres_va: u64,
+    ring_phys: u64,
+    ring_va: u64,
+    qres_phys: u64,
+    qres_va: u64,
     /// In GQI_QPL mode this is the QPL backing pages
     /// (TX_QPL_PAGES × 4 KiB). In DQO_RDA mode this is the TX
     /// bounce-buffer pool (DQO_TX_POOL_BUFS × RX_BUFFER_SIZE
     /// rounded up to pages); send() copies the packet here, the
     /// device DMA-reads it via the descriptor's `buf_addr`.
-    qpl_phys: u64, qpl_va: u64,
+    qpl_phys: u64,
+    qpl_va: u64,
     /// DQO_RDA only — TX completion ring backing
     /// (DQO_TX_COMPL_SIZE × ring_entries). 0 in GQI_QPL mode.
-    tx_compl_phys: u64, tx_compl_va: u64,
+    tx_compl_phys: u64,
+    tx_compl_va: u64,
 }
 
 #[derive(Clone, Copy)]
 struct RxAlloc {
-    compl_phys: u64, compl_va: u64,
-    data_phys: u64, data_va: u64,
-    qres_phys: u64, qres_va: u64,
+    compl_phys: u64,
+    compl_va: u64,
+    data_phys: u64,
+    data_va: u64,
+    qres_phys: u64,
+    qres_va: u64,
     /// In GQI_QPL mode this is the QPL backing pages
     /// (RX_QPL_PAGES × 4 KiB) — the device DMA-writes packet
     /// payloads here. In DQO_RDA mode this is the RX buffer pool
@@ -1212,16 +1248,23 @@ struct RxAlloc {
     /// driver posts each buffer's DMA addr to the buffer ring at
     /// `data_va` and the device returns the matching `buf_id` in
     /// the completion at `compl_va`.
-    qpl_phys: u64, qpl_va: u64,
+    qpl_phys: u64,
+    qpl_va: u64,
 }
 
 fn alloc_tx_resources(fmt: QueueFormat) -> Option<TxAlloc> {
     // TX descriptor ring: one page of 16-byte descriptors
     // (TX_RING_ENTRIES = 256). Same shape in both formats.
     let (ring_phys, ring_va) = alloc_contig(1);
-    if ring_phys == 0 { log(b"[gvnic] failed to alloc TX ring\n"); return None; }
+    if ring_phys == 0 {
+        log(b"[gvnic] failed to alloc TX ring\n");
+        return None;
+    }
     let (qres_phys, qres_va) = alloc_contig(1);
-    if qres_phys == 0 { log(b"[gvnic] failed to alloc TX queue_resources\n"); return None; }
+    if qres_phys == 0 {
+        log(b"[gvnic] failed to alloc TX queue_resources\n");
+        return None;
+    }
 
     let (qpl_phys, qpl_va) = match fmt {
         QueueFormat::GqiQpl => {
@@ -1238,7 +1281,10 @@ fn alloc_tx_resources(fmt: QueueFormat) -> Option<TxAlloc> {
             alloc_contig(pages as usize)
         }
     };
-    if qpl_phys == 0 { log(b"[gvnic] failed to alloc TX backing pages\n"); return None; }
+    if qpl_phys == 0 {
+        log(b"[gvnic] failed to alloc TX backing pages\n");
+        return None;
+    }
 
     let (tx_compl_phys, tx_compl_va) = match fmt {
         QueueFormat::DqoRda => {
@@ -1247,13 +1293,25 @@ fn alloc_tx_resources(fmt: QueueFormat) -> Option<TxAlloc> {
             let bytes = (TX_RING_ENTRIES as u32) * (dqo::DQO_TX_COMPL_SIZE as u32);
             let pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
             let (p, v) = alloc_contig(pages as usize);
-            if p == 0 { log(b"[gvnic] failed to alloc TX compl ring\n"); return None; }
+            if p == 0 {
+                log(b"[gvnic] failed to alloc TX compl ring\n");
+                return None;
+            }
             (p, v)
         }
         _ => (0, 0),
     };
 
-    Some(TxAlloc { ring_phys, ring_va, qres_phys, qres_va, qpl_phys, qpl_va, tx_compl_phys, tx_compl_va })
+    Some(TxAlloc {
+        ring_phys,
+        ring_va,
+        qres_phys,
+        qres_va,
+        qpl_phys,
+        qpl_va,
+        tx_compl_phys,
+        tx_compl_va,
+    })
 }
 
 fn alloc_rx_resources(fmt: QueueFormat) -> Option<RxAlloc> {
@@ -1264,7 +1322,10 @@ fn alloc_rx_resources(fmt: QueueFormat) -> Option<RxAlloc> {
     };
     let compl_pages = ((RX_RING_ENTRIES as u32) * compl_desc_size + PAGE_SIZE - 1) / PAGE_SIZE;
     let (compl_phys, compl_va) = alloc_contig(compl_pages as usize);
-    if compl_phys == 0 { log(b"[gvnic] failed to alloc RX completion ring\n"); return None; }
+    if compl_phys == 0 {
+        log(b"[gvnic] failed to alloc RX completion ring\n");
+        return None;
+    }
 
     // RX data ring:
     //   GQI: 8-byte slot ring of QPL offsets.
@@ -1275,10 +1336,16 @@ fn alloc_rx_resources(fmt: QueueFormat) -> Option<RxAlloc> {
     };
     let data_pages = ((RX_RING_ENTRIES as u32) * data_desc_size + PAGE_SIZE - 1) / PAGE_SIZE;
     let (data_phys, data_va) = alloc_contig(data_pages as usize);
-    if data_phys == 0 { log(b"[gvnic] failed to alloc RX data ring\n"); return None; }
+    if data_phys == 0 {
+        log(b"[gvnic] failed to alloc RX data ring\n");
+        return None;
+    }
 
     let (qres_phys, qres_va) = alloc_contig(1);
-    if qres_phys == 0 { log(b"[gvnic] failed to alloc RX queue_resources\n"); return None; }
+    if qres_phys == 0 {
+        log(b"[gvnic] failed to alloc RX queue_resources\n");
+        return None;
+    }
 
     let (qpl_phys, qpl_va) = match fmt {
         QueueFormat::GqiQpl => alloc_contig(RX_QPL_PAGES as usize),
@@ -1291,7 +1358,10 @@ fn alloc_rx_resources(fmt: QueueFormat) -> Option<RxAlloc> {
             alloc_contig(pages as usize)
         }
     };
-    if qpl_phys == 0 { log(b"[gvnic] failed to alloc RX backing pages\n"); return None; }
+    if qpl_phys == 0 {
+        log(b"[gvnic] failed to alloc RX backing pages\n");
+        return None;
+    }
 
     if matches!(fmt, QueueFormat::GqiQpl) {
         // Pre-fill the GQI data-slot ring: slot `i` points at QPL
@@ -1302,11 +1372,7 @@ fn alloc_rx_resources(fmt: QueueFormat) -> Option<RxAlloc> {
             let offset: u64 = (i as u64) * (PAGE_SIZE as u64);
             let bytes = offset.to_be_bytes();
             unsafe {
-                ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    (data_va as *mut u8).add(i * 8),
-                    8,
-                );
+                ptr::copy_nonoverlapping(bytes.as_ptr(), (data_va as *mut u8).add(i * 8), 8);
             }
         }
     }
@@ -1314,7 +1380,16 @@ fn alloc_rx_resources(fmt: QueueFormat) -> Option<RxAlloc> {
     // after CREATE_RX_QUEUE returns the db_offset (the buffer-ring
     // doorbell is what tells the device "buffers are available").
 
-    Some(RxAlloc { compl_phys, compl_va, data_phys, data_va, qres_phys, qres_va, qpl_phys, qpl_va })
+    Some(RxAlloc {
+        compl_phys,
+        compl_va,
+        data_phys,
+        data_va,
+        qres_phys,
+        qres_va,
+        qpl_phys,
+        qpl_va,
+    })
 }
 
 /// CREATE_TX_QUEUE command builder. Payload layout (48 bytes at offset 8):
@@ -1347,10 +1422,13 @@ fn build_create_tx_queue_cmd(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) -> Admi
     cmd.put_be32(8, qp);
     cmd.put_be64(16, alloc.qres_phys);
     cmd.put_be64(24, alloc.ring_phys);
-    cmd.put_be32(32, match fmt {
-        QueueFormat::GqiQpl => tx_qpl_id(qp),
-        QueueFormat::DqoRda => GVE_RAW_ADDRESSING_QPL_ID,
-    });
+    cmd.put_be32(
+        32,
+        match fmt {
+            QueueFormat::GqiQpl => tx_qpl_id(qp),
+            QueueFormat::DqoRda => GVE_RAW_ADDRESSING_QPL_ID,
+        },
+    );
     cmd.put_be32(36, tx_ntfy_id(qp));
     if matches!(fmt, QueueFormat::DqoRda) {
         cmd.put_be64(40, alloc.tx_compl_phys);
@@ -1376,7 +1454,12 @@ fn build_create_tx_queue_cmd(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) -> Admi
 ///   u16  rx_buff_ring_size               — DQO only; 0 in GQI
 ///   u8   enable_rsc
 ///   u8[5] padding
-fn build_create_rx_queue_cmd(qp: u32, alloc: &RxAlloc, num_qp: u32, fmt: QueueFormat) -> AdminqCommand {
+fn build_create_rx_queue_cmd(
+    qp: u32,
+    alloc: &RxAlloc,
+    num_qp: u32,
+    fmt: QueueFormat,
+) -> AdminqCommand {
     {
         let st = STATE.lock();
         if let Some(s) = st.as_ref() {
@@ -1401,10 +1484,13 @@ fn build_create_rx_queue_cmd(qp: u32, alloc: &RxAlloc, num_qp: u32, fmt: QueueFo
     cmd.put_be64(24, alloc.qres_phys);
     cmd.put_be64(32, alloc.compl_phys);
     cmd.put_be64(40, alloc.data_phys);
-    cmd.put_be32(48, match fmt {
-        QueueFormat::GqiQpl => rx_qpl_id(qp),
-        QueueFormat::DqoRda => GVE_RAW_ADDRESSING_QPL_ID,
-    });
+    cmd.put_be32(
+        48,
+        match fmt {
+            QueueFormat::GqiQpl => rx_qpl_id(qp),
+            QueueFormat::DqoRda => GVE_RAW_ADDRESSING_QPL_ID,
+        },
+    );
     cmd.put_be16(52, RX_RING_ENTRIES);
     cmd.put_be16(54, RX_BUFFER_SIZE);
     if matches!(fmt, QueueFormat::DqoRda) {
@@ -1440,7 +1526,10 @@ fn finalize_tx_queue(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) {
             done_cnt: AtomicU32::new(0),
             last_kicked: AtomicU32::new(0),
             tx_compl_va: alloc.tx_compl_va,
-            tx_compl_entries: match fmt { QueueFormat::DqoRda => TX_RING_ENTRIES, _ => 0 },
+            tx_compl_entries: match fmt {
+                QueueFormat::DqoRda => TX_RING_ENTRIES,
+                _ => 0,
+            },
             tx_compl_head: AtomicU32::new(0),
             // Generation starts at 1: the device fills entries with
             // the current generation on each completion, then flips
@@ -1486,9 +1575,10 @@ fn finalize_rx_queue(qp: u32, alloc: &RxAlloc, fmt: QueueFormat) {
     // taking `STATE` so the 512 KiB slab-region allocation +
     // zero-fill doesn't run under the spinlock.
     let rx_pool = match fmt {
-        QueueFormat::GqiQpl => {
-            Some(IOBufPool::new(gqi::GQI_RX_POOL_SLABS, gqi::GQI_RX_SLAB_SIZE))
-        }
+        QueueFormat::GqiQpl => Some(IOBufPool::new(
+            gqi::GQI_RX_POOL_SLABS,
+            gqi::GQI_RX_SLAB_SIZE,
+        )),
         QueueFormat::DqoRda => None,
     };
     let mut st = STATE.lock();
@@ -1517,7 +1607,9 @@ fn finalize_rx_queue(qp: u32, alloc: &RxAlloc, fmt: QueueFormat) {
 /// waits (~3 ms each on GCE) into 2.
 fn create_all_queues_batched(num_qp: u32, fmt: QueueFormat) -> bool {
     let n = num_qp as usize;
-    if n == 0 || n > MAX_QUEUE_PAIRS { return false; }
+    if n == 0 || n > MAX_QUEUE_PAIRS {
+        return false;
+    }
 
     // Phase 0: allocate all per-queue local resources (no admin
     // commands). Order doesn't matter; do TX then RX.
@@ -1525,11 +1617,15 @@ fn create_all_queues_batched(num_qp: u32, fmt: QueueFormat) -> bool {
     let mut rx_allocs: [Option<RxAlloc>; MAX_QUEUE_PAIRS] = [None; MAX_QUEUE_PAIRS];
     for qp in 0..n {
         tx_allocs[qp] = alloc_tx_resources(fmt);
-        if tx_allocs[qp].is_none() { return false; }
+        if tx_allocs[qp].is_none() {
+            return false;
+        }
     }
     for qp in 0..n {
         rx_allocs[qp] = alloc_rx_resources(fmt);
-        if rx_allocs[qp].is_none() { return false; }
+        if rx_allocs[qp].is_none() {
+            return false;
+        }
     }
 
     let mut last_prod = 0u32;
@@ -1543,30 +1639,50 @@ fn create_all_queues_batched(num_qp: u32, fmt: QueueFormat) -> bool {
         let mut rx_rpl_slots = [0usize; MAX_QUEUE_PAIRS];
         for qp in 0..n {
             let alloc = tx_allocs[qp].as_ref().unwrap();
-            let cmd = match build_register_page_list_cmd(tx_qpl_id(qp as u32), alloc.qpl_phys, TX_QPL_PAGES) {
+            let cmd = match build_register_page_list_cmd(
+                tx_qpl_id(qp as u32),
+                alloc.qpl_phys,
+                TX_QPL_PAGES,
+            ) {
                 Some(c) => c,
                 None => return false,
             };
             match adminq::submit_no_wait(&cmd) {
-                Some((slot, prod)) => { tx_rpl_slots[qp] = slot; last_prod = prod; }
+                Some((slot, prod)) => {
+                    tx_rpl_slots[qp] = slot;
+                    last_prod = prod;
+                }
                 None => return false,
             }
         }
         for qp in 0..n {
             let alloc = rx_allocs[qp].as_ref().unwrap();
-            let cmd = match build_register_page_list_cmd(rx_qpl_id(qp as u32), alloc.qpl_phys, RX_QPL_PAGES) {
+            let cmd = match build_register_page_list_cmd(
+                rx_qpl_id(qp as u32),
+                alloc.qpl_phys,
+                RX_QPL_PAGES,
+            ) {
                 Some(c) => c,
                 None => return false,
             };
             match adminq::submit_no_wait(&cmd) {
-                Some((slot, prod)) => { rx_rpl_slots[qp] = slot; last_prod = prod; }
+                Some((slot, prod)) => {
+                    rx_rpl_slots[qp] = slot;
+                    last_prod = prod;
+                }
                 None => return false,
             }
         }
-        if !adminq::kick_and_wait_to(last_prod) { return false; }
+        if !adminq::kick_and_wait_to(last_prod) {
+            return false;
+        }
         for qp in 0..n {
-            if !adminq::check_slot_status(tx_rpl_slots[qp], b"REGISTER_PAGE_LIST tx") { return false; }
-            if !adminq::check_slot_status(rx_rpl_slots[qp], b"REGISTER_PAGE_LIST rx") { return false; }
+            if !adminq::check_slot_status(tx_rpl_slots[qp], b"REGISTER_PAGE_LIST tx") {
+                return false;
+            }
+            if !adminq::check_slot_status(rx_rpl_slots[qp], b"REGISTER_PAGE_LIST rx") {
+                return false;
+            }
         }
     }
 
@@ -1580,14 +1696,21 @@ fn create_all_queues_batched(num_qp: u32, fmt: QueueFormat) -> bool {
     for qp in 0..n {
         let cmd = build_create_tx_queue_cmd(qp as u32, tx_allocs[qp].as_ref().unwrap(), fmt);
         match adminq::submit_no_wait(&cmd) {
-            Some((slot, prod)) => { tx_create_slots[qp] = slot; last_prod = prod; }
+            Some((slot, prod)) => {
+                tx_create_slots[qp] = slot;
+                last_prod = prod;
+            }
             None => return false,
         }
     }
     for qp in 0..n {
-        let cmd = build_create_rx_queue_cmd(qp as u32, rx_allocs[qp].as_ref().unwrap(), num_qp, fmt);
+        let cmd =
+            build_create_rx_queue_cmd(qp as u32, rx_allocs[qp].as_ref().unwrap(), num_qp, fmt);
         match adminq::submit_no_wait(&cmd) {
-            Some((slot, prod)) => { rx_create_slots[qp] = slot; last_prod = prod; }
+            Some((slot, prod)) => {
+                rx_create_slots[qp] = slot;
+                last_prod = prod;
+            }
             None => return false,
         }
     }
@@ -1597,19 +1720,28 @@ fn create_all_queues_batched(num_qp: u32, fmt: QueueFormat) -> bool {
             None => return false,
         };
         match adminq::submit_no_wait(&cmd) {
-            Some((slot, prod)) => { last_prod = prod; Some(slot) }
+            Some((slot, prod)) => {
+                last_prod = prod;
+                Some(slot)
+            }
             None => return false,
         }
     } else {
         None
     };
-    if !adminq::kick_and_wait_to(last_prod) { return false; }
+    if !adminq::kick_and_wait_to(last_prod) {
+        return false;
+    }
     for qp in 0..n {
-        if !adminq::check_slot_status(tx_create_slots[qp], b"CREATE_TX_QUEUE") { return false; }
+        if !adminq::check_slot_status(tx_create_slots[qp], b"CREATE_TX_QUEUE") {
+            return false;
+        }
         finalize_tx_queue(qp as u32, tx_allocs[qp].as_ref().unwrap(), fmt);
     }
     for qp in 0..n {
-        if !adminq::check_slot_status(rx_create_slots[qp], b"CREATE_RX_QUEUE") { return false; }
+        if !adminq::check_slot_status(rx_create_slots[qp], b"CREATE_RX_QUEUE") {
+            return false;
+        }
         finalize_rx_queue(qp as u32, rx_allocs[qp].as_ref().unwrap(), fmt);
     }
     if let Some(slot) = rss_slot {
@@ -1641,7 +1773,9 @@ fn post_initial_rx() {
     let bar2_va = BAR2_VA.load(Ordering::Acquire);
     for qp in 0..MAX_QUEUE_PAIRS {
         let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
-        if rx_ptr.is_null() { continue; }
+        if rx_ptr.is_null() {
+            continue;
+        }
         // SAFETY: pointer published with Release, only null means
         // "not installed". RxQueue's non-atomic fields are only
         // written during init (before this Release); reading them
@@ -1677,7 +1811,9 @@ fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, callback: F) -> u32 {
 #[inline]
 fn current_qp() -> Option<usize> {
     let num_qp = NUM_QP.load(Ordering::Acquire) as u32;
-    if num_qp == 0 { return None; }
+    if num_qp == 0 {
+        return None;
+    }
     let core = uni_kernel::cpu_id();
     Some(if core < num_qp { core as usize } else { 0 })
 }
@@ -1766,9 +1902,13 @@ fn submit_tx_tso(
 /// after each service pass to push whatever `send_on_qp` batched
 /// onto the wire before the CPU sits idle.
 fn flush_tx_kick_if_dirty_qp(qp: usize) -> bool {
-    if qp >= MAX_QUEUE_PAIRS { return false; }
+    if qp >= MAX_QUEUE_PAIRS {
+        return false;
+    }
     let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
-    if tx_ptr.is_null() { return false; }
+    if tx_ptr.is_null() {
+        return false;
+    }
     let tx = unsafe { &*tx_ptr };
     let fill = tx.fill_cnt.load(Ordering::Relaxed);
     let kicked = tx.last_kicked.load(Ordering::Relaxed);
@@ -1809,7 +1949,6 @@ fn flush_all_tx_kicks() {
         flush_tx_kick_if_dirty_qp(qp);
     }
 }
-
 
 /// Turn on batched TX doorbells. Called once by the kernel after
 /// it has wired `flush_tx_kick_if_dirty` into the event loop —
@@ -1908,7 +2047,10 @@ fn poll(callback: fn(Chain<OwnedIOBuf>)) -> usize {
 // ---- Serial logging helpers ------------------------------------------------
 
 fn log_u32(mut v: u32) {
-    if v == 0 { log(b"0"); return; }
+    if v == 0 {
+        log(b"0");
+        return;
+    }
     let mut tmp = [0u8; 10];
     let mut len = 0;
     while v > 0 {
@@ -1917,7 +2059,9 @@ fn log_u32(mut v: u32) {
         len += 1;
     }
     let mut out = [0u8; 10];
-    for i in 0..len { out[i] = tmp[len - 1 - i]; }
+    for i in 0..len {
+        out[i] = tmp[len - 1 - i];
+    }
     log(&out[..len]);
 }
 
@@ -1948,7 +2092,9 @@ fn log_mac(mac: &[u8; 6]) {
         hex(mac[i], &mut pair);
         buf[i * 3] = pair[0];
         buf[i * 3 + 1] = pair[1];
-        if i < 5 { buf[i * 3 + 2] = b':'; }
+        if i < 5 {
+            buf[i * 3 + 2] = b':';
+        }
     }
     log(&buf);
 }
@@ -2007,8 +2153,7 @@ static GVE_OPS: NicOps = NicOps {
     // pseudo-header sum at the L4 checksum field; device adds
     // data and folds).
     csum_tx_offload: || true,
-    csum_stamp_convention:
-        || uni_net_driver::CsumStampConvention::PseudoHeaderPartial,
+    csum_stamp_convention: || uni_net_driver::CsumStampConvention::PseudoHeaderPartial,
     acquire_tx_tso_buf: Some(acquire_tx_tso_buf),
     submit_tx_tso: Some(submit_tx_tso),
     // UDP-GSO via the same TSO descriptor shape with

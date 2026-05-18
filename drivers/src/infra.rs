@@ -12,20 +12,19 @@
 // public APIs are safe where possible.
 
 #![no_std]
-#![allow(dead_code, unused_imports)]  // register constants + arch-conditional imports
+#![allow(dead_code, unused_imports)] // register constants + arch-conditional imports
 
 use core::arch::asm;
 use core::ptr;
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence};
 
 // ============================================================================
 // Kernel crate dependencies — direct Rust calls
 // ============================================================================
 extern crate uni_kernel;
-use uni_kernel::serial;
 #[cfg(target_arch = "aarch64")]
 use uni_kernel::aarch64::mmu::map_device_range;
-
+use uni_kernel::serial;
 
 pub fn log(msg: &[u8]) {
     serial::puts(msg)
@@ -40,7 +39,9 @@ pub fn log(msg: &[u8]) {
 #[inline(always)]
 pub fn dsb_st() {
     #[cfg(target_arch = "aarch64")]
-    unsafe { asm!("dsb st", options(nostack, preserves_flags)); }
+    unsafe {
+        asm!("dsb st", options(nostack, preserves_flags));
+    }
     #[cfg(target_arch = "x86_64")]
     compiler_fence(Ordering::Release);
 }
@@ -48,7 +49,9 @@ pub fn dsb_st() {
 #[inline(always)]
 pub fn dsb_ld() {
     #[cfg(target_arch = "aarch64")]
-    unsafe { asm!("dsb ld", options(nostack, preserves_flags)); }
+    unsafe {
+        asm!("dsb ld", options(nostack, preserves_flags));
+    }
     #[cfg(target_arch = "x86_64")]
     compiler_fence(Ordering::Acquire);
 }
@@ -56,7 +59,9 @@ pub fn dsb_ld() {
 #[inline(always)]
 pub fn dsb_sy() {
     #[cfg(target_arch = "aarch64")]
-    unsafe { asm!("dsb sy", options(nostack, preserves_flags)); }
+    unsafe {
+        asm!("dsb sy", options(nostack, preserves_flags));
+    }
     #[cfg(target_arch = "x86_64")]
     compiler_fence(Ordering::SeqCst);
 }
@@ -100,7 +105,9 @@ pub unsafe fn mmio_read32(addr: u64) -> u32 {
 /// # Safety: addr must be a valid, mapped MMIO address.
 #[inline(always)]
 pub unsafe fn mmio_write32(addr: u64, val: u32) {
-    unsafe { ptr::write_volatile(addr as *mut u32, val); }
+    unsafe {
+        ptr::write_volatile(addr as *mut u32, val);
+    }
 }
 
 /// # Safety: addr must be a valid, mapped MMIO address.
@@ -112,7 +119,9 @@ pub unsafe fn mmio_read16(addr: u64) -> u16 {
 /// # Safety: addr must be a valid, mapped MMIO address.
 #[inline(always)]
 pub unsafe fn mmio_write16(addr: u64, val: u16) {
-    unsafe { ptr::write_volatile(addr as *mut u16, val); }
+    unsafe {
+        ptr::write_volatile(addr as *mut u16, val);
+    }
 }
 
 /// # Safety: addr must be a valid, mapped MMIO address.
@@ -124,7 +133,9 @@ pub unsafe fn mmio_read8(addr: u64) -> u8 {
 /// # Safety: addr must be a valid, mapped MMIO address.
 #[inline(always)]
 pub unsafe fn mmio_write8(addr: u64, val: u8) {
-    unsafe { ptr::write_volatile(addr as *mut u8, val); }
+    unsafe {
+        ptr::write_volatile(addr as *mut u8, val);
+    }
 }
 
 // ---- x86_64 port I/O -------------------------------------------------------
@@ -132,7 +143,9 @@ pub unsafe fn mmio_write8(addr: u64, val: u8) {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn outl(port: u16, val: u32) {
-    unsafe { asm!("out dx, eax", in("dx") port, in("eax") val, options(nostack, preserves_flags)); }
+    unsafe {
+        asm!("out dx, eax", in("dx") port, in("eax") val, options(nostack, preserves_flags));
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -148,7 +161,9 @@ pub unsafe fn inl(port: u16) -> u32 {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn outw(port: u16, val: u16) {
-    unsafe { asm!("out dx, ax", in("dx") port, in("ax") val, options(nostack, preserves_flags)); }
+    unsafe {
+        asm!("out dx, ax", in("dx") port, in("ax") val, options(nostack, preserves_flags));
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -164,7 +179,9 @@ pub unsafe fn inw(port: u16) -> u16 {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn outb(port: u16, val: u8) {
-    unsafe { asm!("out dx, al", in("dx") port, in("al") val, options(nostack, preserves_flags)); }
+    unsafe {
+        asm!("out dx, al", in("dx") port, in("al") val, options(nostack, preserves_flags));
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -184,9 +201,13 @@ pub unsafe fn inb(port: u16) -> u8 {
 pub unsafe fn virtio_read32(base: u64) -> u32 {
     unsafe {
         #[cfg(target_arch = "x86_64")]
-        { inl(base as u16) }
+        {
+            inl(base as u16)
+        }
         #[cfg(target_arch = "aarch64")]
-        { mmio_read32(base) }
+        {
+            mmio_read32(base)
+        }
     }
 }
 
@@ -195,9 +216,13 @@ pub unsafe fn virtio_read32(base: u64) -> u32 {
 pub unsafe fn virtio_write32(base: u64, val: u32) {
     unsafe {
         #[cfg(target_arch = "x86_64")]
-        { outl(base as u16, val) }
+        {
+            outl(base as u16, val)
+        }
         #[cfg(target_arch = "aarch64")]
-        { mmio_write32(base, val) }
+        {
+            mmio_write32(base, val)
+        }
     }
 }
 
@@ -206,9 +231,13 @@ pub unsafe fn virtio_write32(base: u64, val: u32) {
 pub unsafe fn virtio_read16(base: u64) -> u16 {
     unsafe {
         #[cfg(target_arch = "x86_64")]
-        { inw(base as u16) }
+        {
+            inw(base as u16)
+        }
         #[cfg(target_arch = "aarch64")]
-        { mmio_read16(base) }
+        {
+            mmio_read16(base)
+        }
     }
 }
 
@@ -217,9 +246,13 @@ pub unsafe fn virtio_read16(base: u64) -> u16 {
 pub unsafe fn virtio_write16(base: u64, val: u16) {
     unsafe {
         #[cfg(target_arch = "x86_64")]
-        { outw(base as u16, val) }
+        {
+            outw(base as u16, val)
+        }
         #[cfg(target_arch = "aarch64")]
-        { mmio_write16(base, val) }
+        {
+            mmio_write16(base, val)
+        }
     }
 }
 
@@ -228,9 +261,13 @@ pub unsafe fn virtio_write16(base: u64, val: u16) {
 pub unsafe fn virtio_read8(base: u64) -> u8 {
     unsafe {
         #[cfg(target_arch = "x86_64")]
-        { inb(base as u16) }
+        {
+            inb(base as u16)
+        }
         #[cfg(target_arch = "aarch64")]
-        { mmio_read8(base) }
+        {
+            mmio_read8(base)
+        }
     }
 }
 
@@ -239,9 +276,13 @@ pub unsafe fn virtio_read8(base: u64) -> u8 {
 pub unsafe fn virtio_write8(base: u64, val: u8) {
     unsafe {
         #[cfg(target_arch = "x86_64")]
-        { outb(base as u16, val) }
+        {
+            outb(base as u16, val)
+        }
         #[cfg(target_arch = "aarch64")]
-        { mmio_write8(base, val) }
+        {
+            mmio_write8(base, val)
+        }
     }
 }
 
@@ -252,4 +293,3 @@ pub unsafe fn virtio_write8(base: u64, val: u8) {
 pub mod pci;
 pub mod virtio;
 pub mod virtio_console;
-

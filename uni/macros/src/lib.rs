@@ -53,11 +53,7 @@ pub fn init(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // handles registered via `uni::tcp_listen` etc. live in the
     // runtime's leak slot; nothing else needs to happen on the
     // user's part once `init()` returns.
-    let body_call = if is_async {
-        "init().await"
-    } else {
-        "init()"
-    };
+    let body_call = if is_async { "init().await" } else { "init()" };
 
     let output = format!(
         r#"

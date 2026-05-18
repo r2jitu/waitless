@@ -107,14 +107,37 @@ impl HvReg {
     /// X0..X30 as a runtime index. Panics for index > 30.
     pub fn gpr(index: u32) -> Self {
         const GPRS: [HvReg; 31] = [
-            HvReg::X0,  HvReg::X1,  HvReg::X2,  HvReg::X3,
-            HvReg::X4,  HvReg::X5,  HvReg::X6,  HvReg::X7,
-            HvReg::X8,  HvReg::X9,  HvReg::X10, HvReg::X11,
-            HvReg::X12, HvReg::X13, HvReg::X14, HvReg::X15,
-            HvReg::X16, HvReg::X17, HvReg::X18, HvReg::X19,
-            HvReg::X20, HvReg::X21, HvReg::X22, HvReg::X23,
-            HvReg::X24, HvReg::X25, HvReg::X26, HvReg::X27,
-            HvReg::X28, HvReg::X29, HvReg::X30,
+            HvReg::X0,
+            HvReg::X1,
+            HvReg::X2,
+            HvReg::X3,
+            HvReg::X4,
+            HvReg::X5,
+            HvReg::X6,
+            HvReg::X7,
+            HvReg::X8,
+            HvReg::X9,
+            HvReg::X10,
+            HvReg::X11,
+            HvReg::X12,
+            HvReg::X13,
+            HvReg::X14,
+            HvReg::X15,
+            HvReg::X16,
+            HvReg::X17,
+            HvReg::X18,
+            HvReg::X19,
+            HvReg::X20,
+            HvReg::X21,
+            HvReg::X22,
+            HvReg::X23,
+            HvReg::X24,
+            HvReg::X25,
+            HvReg::X26,
+            HvReg::X27,
+            HvReg::X28,
+            HvReg::X29,
+            HvReg::X30,
         ];
         GPRS[index as usize]
     }
@@ -214,20 +237,11 @@ unsafe extern "C" {
     pub fn hv_vm_config_create() -> hv_vm_config_t;
     pub fn hv_vm_config_get_max_ipa_size(out: *mut u32) -> hv_return_t;
     pub fn hv_vm_config_get_default_ipa_size(out: *mut u32) -> hv_return_t;
-    pub fn hv_vm_config_set_ipa_size(
-        config: hv_vm_config_t,
-        ipa_bit_length: u32,
-    ) -> hv_return_t;
+    pub fn hv_vm_config_set_ipa_size(config: hv_vm_config_t, ipa_bit_length: u32) -> hv_return_t;
     pub fn hv_vm_config_get_el2_supported(out: *mut bool) -> hv_return_t;
-    pub fn hv_vm_config_set_el2_enabled(
-        config: hv_vm_config_t,
-        enabled: bool,
-    ) -> hv_return_t;
+    pub fn hv_vm_config_set_el2_enabled(config: hv_vm_config_t, enabled: bool) -> hv_return_t;
     pub fn hv_vm_config_get_default_ipa_granule(out: *mut u32) -> hv_return_t;
-    pub fn hv_vm_config_set_ipa_granule(
-        config: hv_vm_config_t,
-        granule: u32,
-    ) -> hv_return_t;
+    pub fn hv_vm_config_set_ipa_granule(config: hv_vm_config_t, granule: u32) -> hv_return_t;
 
     // vCPU lifecycle
     pub fn hv_vcpu_create(
@@ -242,16 +256,8 @@ unsafe extern "C" {
     // Register access
     pub fn hv_vcpu_get_reg(vcpu: hv_vcpu_t, reg: HvReg, value: *mut u64) -> hv_return_t;
     pub fn hv_vcpu_set_reg(vcpu: hv_vcpu_t, reg: HvReg, value: u64) -> hv_return_t;
-    pub fn hv_vcpu_get_sys_reg(
-        vcpu: hv_vcpu_t,
-        reg: HvSysReg,
-        value: *mut u64,
-    ) -> hv_return_t;
-    pub fn hv_vcpu_set_sys_reg(
-        vcpu: hv_vcpu_t,
-        reg: HvSysReg,
-        value: u64,
-    ) -> hv_return_t;
+    pub fn hv_vcpu_get_sys_reg(vcpu: hv_vcpu_t, reg: HvSysReg, value: *mut u64) -> hv_return_t;
+    pub fn hv_vcpu_set_sys_reg(vcpu: hv_vcpu_t, reg: HvSysReg, value: u64) -> hv_return_t;
 
     // Interrupt injection (fallback — we prefer hv_gic_set_spi with native vGIC)
     pub fn hv_vcpu_set_pending_interrupt(
@@ -291,16 +297,8 @@ unsafe extern "C" {
     pub fn hv_gic_set_distributor_reg(reg: u32, value: u64) -> hv_return_t;
 
     // GIC redistributor register access (per-vCPU).
-    pub fn hv_gic_get_redistributor_reg(
-        vcpu: hv_vcpu_t,
-        reg: u32,
-        value: *mut u64,
-    ) -> hv_return_t;
-    pub fn hv_gic_set_redistributor_reg(
-        vcpu: hv_vcpu_t,
-        reg: u32,
-        value: u64,
-    ) -> hv_return_t;
+    pub fn hv_gic_get_redistributor_reg(vcpu: hv_vcpu_t, reg: u32, value: *mut u64) -> hv_return_t;
+    pub fn hv_gic_set_redistributor_reg(vcpu: hv_vcpu_t, reg: u32, value: u64) -> hv_return_t;
 }
 
 // ─── Error handling ──────────────────────────────────────────────────────────

@@ -212,7 +212,11 @@ mod tests {
         // tests can verify which timer fired; Timer.arg is reserved
         // for the Counters pointer.
         c.last_arg.store(user_arg, Ordering::Relaxed);
-        Timer { deadline, func: bump, arg: c as *const Counters as usize }
+        Timer {
+            deadline,
+            func: bump,
+            arg: c as *const Counters as usize,
+        }
     }
 
     fn bump(arg: usize) {

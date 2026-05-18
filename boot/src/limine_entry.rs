@@ -55,25 +55,30 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     uni_kernel::serial::puts(b"PANIC in limine_entry\n");
     loop {
         #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("wfe", options(nomem, nostack)); }
+        unsafe {
+            core::arch::asm!("wfe", options(nomem, nostack));
+        }
         #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)); }
+        unsafe {
+            core::arch::asm!("cli", "hlt", options(nomem, nostack));
+        }
     }
 }
 
-use uni_kernel::types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
+use uni_kernel::types::{
+    BootInfo, MAX_MEMORY_REGIONS, MEM_AVAILABLE, MEM_RESERVED, MemoryRegion, Protocol,
+};
 
 use limine::BaseRevision;
 use limine::memory_map::EntryType;
 use limine::request::{
-    ExecutableAddressRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker,
-    RequestsStartMarker,
+    ExecutableAddressRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker,
 };
 
 #[cfg(target_arch = "aarch64")]
 use limine::request::DeviceTreeBlobRequest;
 #[cfg(target_arch = "x86_64")]
-use limine::request::{ExecutableCmdlineRequest, RsdpRequest, MpRequest};
+use limine::request::{ExecutableCmdlineRequest, MpRequest, RsdpRequest};
 
 // x86_64 SSE + AVX enable stub — Limine drops us in 64-bit mode
 // with MMU + paging but does NOT enable the OS-level bits the
@@ -104,7 +109,7 @@ core::arch::global_asm!(
     ".align 16",
     ".global limine_stack_bottom",
     "limine_stack_bottom:",
-    "    .space 262144",          // 256 KiB
+    "    .space 262144", // 256 KiB
     ".global limine_stack_top",
     "limine_stack_top:",
     ".section .text",
@@ -117,15 +122,15 @@ core::arch::global_asm!(
     "    mov %rax, %cr4",
     "    mov $1, %eax",
     "    cpuid",
-    "    test $(1 << 26), %ecx",   // CPUID.01h:ECX.XSAVE
+    "    test $(1 << 26), %ecx", // CPUID.01h:ECX.XSAVE
     "    jz 2f",
     "    mov %cr4, %rax",
-    "    or  $(1 << 18), %rax",    // CR4.OSXSAVE
+    "    or  $(1 << 18), %rax", // CR4.OSXSAVE
     "    mov %rax, %cr4",
     "    mov $0xD, %eax",
     "    xor %ecx, %ecx",
     "    cpuid",
-    "    and $0x7, %eax",          // x87|SSE|AVX AND supported
+    "    and $0x7, %eax", // x87|SSE|AVX AND supported
     "    xor %rcx, %rcx",
     "    xor %rdx, %rdx",
     "    xsetbv",
@@ -225,16 +230,22 @@ struct LimineBootInfoCell(core::cell::UnsafeCell<BootInfo>);
 // is called; immutable afterwards.
 unsafe impl Sync for LimineBootInfoCell {}
 
-static LIMINE_BOOT_INFO: LimineBootInfoCell = LimineBootInfoCell(core::cell::UnsafeCell::new(BootInfo {
-    protocol: Protocol::Limine,
-    memory_map_count: 0,
-    memory_map: [MemoryRegion { base: 0, length: 0, region_type: 0, _pad: 0 }; MAX_MEMORY_REGIONS],
-    dtb_addr: 0,
-    kernel_phys_base: 0,
-    kernel_virt_base: 0,
-    hhdm_offset: 0,
-    rsdp_paddr: 0,
-}));
+static LIMINE_BOOT_INFO: LimineBootInfoCell =
+    LimineBootInfoCell(core::cell::UnsafeCell::new(BootInfo {
+        protocol: Protocol::Limine,
+        memory_map_count: 0,
+        memory_map: [MemoryRegion {
+            base: 0,
+            length: 0,
+            region_type: 0,
+            _pad: 0,
+        }; MAX_MEMORY_REGIONS],
+        dtb_addr: 0,
+        kernel_phys_base: 0,
+        kernel_virt_base: 0,
+        hhdm_offset: 0,
+        rsdp_paddr: 0,
+    }));
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn limine_entry() {
@@ -244,7 +255,12 @@ pub unsafe extern "C" fn limine_entry() {
     let mut info = BootInfo {
         protocol: Protocol::Limine,
         memory_map_count: 0,
-        memory_map: [MemoryRegion { base: 0, length: 0, region_type: 0, _pad: 0 }; MAX_MEMORY_REGIONS],
+        memory_map: [MemoryRegion {
+            base: 0,
+            length: 0,
+            region_type: 0,
+            _pad: 0,
+        }; MAX_MEMORY_REGIONS],
         dtb_addr: 0,
         kernel_phys_base: 0,
         kernel_virt_base: 0,
@@ -279,7 +295,9 @@ pub unsafe extern "C" fn limine_entry() {
     if let Some(resp) = MEMORY_MAP_REQUEST.get_response() {
         let mut count = 0i32;
         for entry in resp.entries() {
-            if count as usize >= MAX_MEMORY_REGIONS { break; }
+            if count as usize >= MAX_MEMORY_REGIONS {
+                break;
+            }
             let region_type = match entry.entry_type {
                 EntryType::USABLE => MEM_AVAILABLE,
                 _ => MEM_RESERVED,
@@ -384,4 +402,3 @@ pub unsafe extern "C" fn start_aps_via_limine_mp() -> u32 {
     }
     cpus.len() as u32
 }
-

@@ -8,7 +8,7 @@
 // null branch.
 
 use uni_net_driver::{
-    active_ops, is_installed, linked_ethernet_drivers, set_active_ops, Chain, OwnedIOBuf,
+    Chain, OwnedIOBuf, active_ops, is_installed, linked_ethernet_drivers, set_active_ops,
 };
 
 pub use uni_net_driver::{CsumOffload, CsumStampConvention};
@@ -26,10 +26,18 @@ pub fn init() -> bool {
     false
 }
 
-pub fn get_mac(mac_out: *mut u8) { (active_ops().get_mac)(mac_out) }
-pub fn num_queue_pairs() -> u16 { (active_ops().num_queue_pairs)() }
-pub fn driver_name() -> &'static str { active_ops().name }
-pub fn enable_irq() { (active_ops().enable_irq)() }
+pub fn get_mac(mac_out: *mut u8) {
+    (active_ops().get_mac)(mac_out)
+}
+pub fn num_queue_pairs() -> u16 {
+    (active_ops().num_queue_pairs)()
+}
+pub fn driver_name() -> &'static str {
+    active_ops().name
+}
+pub fn enable_irq() {
+    (active_ops().enable_irq)()
+}
 
 // ---- RX / TX datapath -----------------------------------------------------
 
@@ -49,7 +57,9 @@ pub fn poll_qp(qp: usize, callback: fn(Chain<OwnedIOBuf>)) -> usize {
     (active_ops().poll_qp)(qp, callback)
 }
 
-pub fn send(data: &[u8]) { (active_ops().send)(data) }
+pub fn send(data: &[u8]) {
+    (active_ops().send)(data)
+}
 
 /// Acquire a writable TX buffer from the driver's pool. Caller fills
 /// the returned region in place, then [`submit_tx`]s it for
@@ -187,26 +197,47 @@ pub fn submit_tx_udp_gso(
 
 // ---- Idle / TX-flush knobs -----------------------------------------------
 
-pub fn flush_tx_staging() { (active_ops().flush_tx_staging)() }
-pub fn flush_tx_kick_if_dirty() -> bool { (active_ops().flush_tx_kick_if_dirty)() }
-pub fn enable_deferred_tx_kick() { (active_ops().enable_deferred_tx_kick)() }
-pub fn poke_interrupt_status() { (active_ops().poke_interrupt_status)() }
+pub fn flush_tx_staging() {
+    (active_ops().flush_tx_staging)()
+}
+pub fn flush_tx_kick_if_dirty() -> bool {
+    (active_ops().flush_tx_kick_if_dirty)()
+}
+pub fn enable_deferred_tx_kick() {
+    (active_ops().enable_deferred_tx_kick)()
+}
+pub fn poke_interrupt_status() {
+    (active_ops().poke_interrupt_status)()
+}
 
 /// Presence of `idle` ops is the signal — NAPI-capable drivers
 /// populate it, polling-only drivers leave it `None`.
-pub fn irq_idle_supported() -> bool { active_ops().idle.is_some() }
+pub fn irq_idle_supported() -> bool {
+    active_ops().idle.is_some()
+}
 
 pub fn arm_rx_interrupts() {
-    if let Some(i) = active_ops().idle { (i.arm_rx_interrupts)(); }
+    if let Some(i) = active_ops().idle {
+        (i.arm_rx_interrupts)();
+    }
 }
 pub fn has_pending_rx() -> bool {
-    active_ops().idle.map(|i| (i.has_pending_rx)()).unwrap_or(false)
+    active_ops()
+        .idle
+        .map(|i| (i.has_pending_rx)())
+        .unwrap_or(false)
 }
 pub fn has_pending_tx() -> bool {
-    active_ops().idle.map(|i| (i.has_pending_tx)()).unwrap_or(false)
+    active_ops()
+        .idle
+        .map(|i| (i.has_pending_tx)())
+        .unwrap_or(false)
 }
 pub fn rearm_rx_napi(core_id: u32) -> bool {
-    active_ops().idle.map(|i| (i.rearm_rx_napi)(core_id)).unwrap_or(false)
+    active_ops()
+        .idle
+        .map(|i| (i.rearm_rx_napi)(core_id))
+        .unwrap_or(false)
 }
 
 // ---- Diagnostics (/stats) ------------------------------------------------
@@ -215,7 +246,10 @@ pub fn rx_counts() -> [u64; 8] {
     active_ops().diag.map(|d| (d.rx_counts)()).unwrap_or([0; 8])
 }
 pub fn rx_used_cursors() -> [(u16, u16); 8] {
-    active_ops().diag.map(|d| (d.rx_used_cursors)()).unwrap_or([(0, 0); 8])
+    active_ops()
+        .diag
+        .map(|d| (d.rx_used_cursors)())
+        .unwrap_or([(0, 0); 8])
 }
 
 /// TX-side diagnostics — per-qp packet counts + small/big pool
@@ -224,10 +258,7 @@ pub fn rx_used_cursors() -> [(u16, u16); 8] {
 /// accessor (it's `Option`-shaped on `NicDiagOps` so legacy
 /// drivers compile without filling the struct).
 pub fn tx_diag() -> Option<uni_net_driver::TxDiag> {
-    active_ops()
-        .diag
-        .and_then(|d| d.tx_diag)
-        .map(|f| f())
+    active_ops().diag.and_then(|d| d.tx_diag).map(|f| f())
 }
 
 /// Snapshot the active driver's TX descriptor capture log into the
@@ -242,8 +273,10 @@ pub fn tx_desc_log_snapshot(out: &mut [uni_net_driver::TxDescLogEntry]) -> usize
         .unwrap_or(0)
 }
 
-pub use uni_net_driver::{TxDescLogEntry, TxDiag, DIAG_QP_CAP};
+pub use uni_net_driver::{DIAG_QP_CAP, TxDescLogEntry, TxDiag};
 
 /// Cold-path: used by `uni::Net::enable` to tell "no driver linked"
 /// from "drivers linked but none bound hardware".
-pub fn installed() -> bool { is_installed() }
+pub fn installed() -> bool {
+    is_installed()
+}

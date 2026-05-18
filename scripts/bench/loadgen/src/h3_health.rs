@@ -88,8 +88,8 @@ fn build_client_config() -> ClientConfig {
     // refuses the connection with `H3_NO_ERROR`.
     tls_cfg.alpn_protocols = vec![b"h3".to_vec()];
 
-    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_cfg)
-        .expect("valid QUIC TLS config");
+    let crypto =
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls_cfg).expect("valid QUIC TLS config");
 
     let mut cfg = ClientConfig::new(Arc::new(crypto));
 
@@ -203,14 +203,13 @@ pub async fn run(
             };
 
             let h3_conn = h3_quinn::Connection::new(conn);
-            let (mut driver, mut send_request) =
-                match h3::client::new(h3_conn).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("h3_health[{worker_idx}]: h3 init failed: {e}");
-                        return (count_post, hist);
-                    }
-                };
+            let (mut driver, mut send_request) = match h3::client::new(h3_conn).await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("h3_health[{worker_idx}]: h3 init failed: {e}");
+                    return (count_post, hist);
+                }
+            };
 
             // Drive the H3 connection background task. It pumps
             // QUIC events into the h3 state machine; without this
@@ -235,11 +234,7 @@ pub async fn run(
                 // identical lines. The loadgen's stdout RPS / P50_US
                 // / P99_US line is what the harness consumes; stderr
                 // is for diagnostics only.
-                let mut stream = match timeout(
-                    PER_OP_TIMEOUT,
-                    send_request.send_request(req),
-                )
-                .await
+                let mut stream = match timeout(PER_OP_TIMEOUT, send_request.send_request(req)).await
                 {
                     Ok(Ok(s)) => s,
                     Ok(Err(e)) => {

@@ -39,7 +39,8 @@ pub fn generate(
     let root = fdt.begin_node("").unwrap();
     fdt.property_u32("#address-cells", 2).unwrap();
     fdt.property_u32("#size-cells", 2).unwrap();
-    fdt.property_string("compatible", "linux,dummy-virt").unwrap();
+    fdt.property_string("compatible", "linux,dummy-virt")
+        .unwrap();
 
     // /psci — the guest uses HVC-based PSCI for CPU_ON/SYSTEM_OFF.
     let psci = fdt.begin_node("psci").unwrap();
@@ -66,7 +67,8 @@ pub fn generate(
     // /memory@XXXXXXXX
     let mem = fdt.begin_node(&format!("memory@{ram_base:x}")).unwrap();
     fdt.property_string("device_type", "memory").unwrap();
-    fdt.property_array_u64("reg", &[ram_base, ram_size]).unwrap();
+    fdt.property_array_u64("reg", &[ram_base, ram_size])
+        .unwrap();
     fdt.end_node(mem).unwrap();
 
     // /intc@XXXXXXXX — GICv3
@@ -76,19 +78,21 @@ pub fn generate(
     fdt.property_string("compatible", "arm,gic-v3").unwrap();
     fdt.property_u32("#interrupt-cells", 3).unwrap();
     fdt.property_null("interrupt-controller").unwrap();
-    fdt.property_array_u64("reg", &[
-        gicd_base, 0x1_0000,
-        gicr_base, gicr_size,
-    ]).unwrap();
+    fdt.property_array_u64("reg", &[gicd_base, 0x1_0000, gicr_base, gicr_size])
+        .unwrap();
     fdt.end_node(gic).unwrap();
 
     // /virtio_mmio@XXXXXXXX nodes
     for dev in virtio_devices {
-        let node = fdt.begin_node(&format!("virtio_mmio@{:x}", dev.base)).unwrap();
+        let node = fdt
+            .begin_node(&format!("virtio_mmio@{:x}", dev.base))
+            .unwrap();
         fdt.property_string("compatible", "virtio,mmio").unwrap();
-        fdt.property_array_u64("reg", &[dev.base, dev.size]).unwrap();
+        fdt.property_array_u64("reg", &[dev.base, dev.size])
+            .unwrap();
         // interrupts = <type=0(SPI) spi_number flags=1(edge-rising)>
-        fdt.property_array_u32("interrupts", &[0, dev.spi, 1]).unwrap();
+        fdt.property_array_u32("interrupts", &[0, dev.spi, 1])
+            .unwrap();
         fdt.end_node(node).unwrap();
     }
 
@@ -110,7 +114,8 @@ pub fn generate(
     // automatically when it runs on QEMU instead.
     let yield_node = fdt.begin_node("hvf-yield@9001000").unwrap();
     fdt.property_string("compatible", "hvf,yield").unwrap();
-    fdt.property_array_u64("reg", &[0x0900_1000, 0x1000]).unwrap();
+    fdt.property_array_u64("reg", &[0x0900_1000, 0x1000])
+        .unwrap();
     fdt.end_node(yield_node).unwrap();
 
     fdt.end_node(root).unwrap();

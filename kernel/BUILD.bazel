@@ -5,20 +5,19 @@ package(default_visibility = ["//visibility:public"])
 
 rust_library(
     name = "kernel",
-    crate_name = "uni_kernel",
     srcs = [
         "src/cpu.rs",
         "src/cpu_info.rs",
         "src/deque.rs",
         "src/diag.rs",
         "src/eventloop.rs",
-        "src/runtime.rs",
         "src/lib.rs",
         "src/mm.rs",
         "src/mmio.rs",
         "src/once.rs",
         "src/percpu.rs",
         "src/rng.rs",
+        "src/runtime.rs",
         "src/rx_inbox.rs",
         "src/serial.rs",
         "src/spsc.rs",
@@ -45,6 +44,7 @@ rust_library(
         ],
         "//conditions:default": [],
     }),
+    crate_name = "uni_kernel",
     crate_root = "src/lib.rs",
     # Unikernel-only: links against MMU / APIC / IDT / boot-section
     # code that only makes sense under a bare-metal target. Host

@@ -12,10 +12,10 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "uni-http3",
     srcs = [
-        "src/lib.rs",
         "src/diag.rs",
         "src/frame.rs",
         "src/huffman.rs",
+        "src/lib.rs",
         "src/qpack.rs",
         "src/server.rs",
         "src/static_table.rs",

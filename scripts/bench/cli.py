@@ -50,10 +50,12 @@ def measure_client_cpu():
     finally:
         end = os.times()
         wall = max(time.monotonic() - t0, 1e-6)
-        cpu = ((end.user - start.user)
-               + (end.system - start.system)
-               + (end.children_user - start.children_user)
-               + (end.children_system - start.children_system))
+        cpu = (
+            (end.user - start.user)
+            + (end.system - start.system)
+            + (end.children_user - start.children_user)
+            + (end.children_system - start.children_system)
+        )
         info["cpu_sec"] = cpu
         info["wall_sec"] = wall
         info["cores"] = cpu / wall
@@ -163,16 +165,29 @@ WORKLOADS = [
     #   `_fresh`  — fresh TCP per request (accept-path stress)
     # Δs read off cleanly: `_single` → per-req cost, `default` →
     # parallel scaling, `_fresh` − default → accept-path cost.
-    {"name": "get_tcp_single", "type": "tcp", "endpoint": "/health",
-     "threads": 1, "conns": 1,
-     "desc": "/health × 1 conn (single-flow latency)"},
-    {"name": "get_tcp", "type": "tcp", "endpoint": "/health",
-     "threads_per_core": 1, "conns_per_core": 32,
-     "desc": "/health throughput (32 conn × cpus)"},
-    {"name": "get_tcp_fresh", "type": "http_close", "endpoint": "/health",
-     "parallelism_per_core": 4,
-     "desc": "/health throughput, fresh TCP per request (Connection: close)"},
-
+    {
+        "name": "get_tcp_single",
+        "type": "tcp",
+        "endpoint": "/health",
+        "threads": 1,
+        "conns": 1,
+        "desc": "/health × 1 conn (single-flow latency)",
+    },
+    {
+        "name": "get_tcp",
+        "type": "tcp",
+        "endpoint": "/health",
+        "threads_per_core": 1,
+        "conns_per_core": 32,
+        "desc": "/health throughput (32 conn × cpus)",
+    },
+    {
+        "name": "get_tcp_fresh",
+        "type": "http_close",
+        "endpoint": "/health",
+        "parallelism_per_core": 4,
+        "desc": "/health throughput, fresh TCP per request (Connection: close)",
+    },
     # ── UDP ───────────────────────────────────────────────────────────
     #
     # `echo_udp` measures peak sustained server throughput via a
@@ -186,9 +201,12 @@ WORKLOADS = [
     # source port so SO_REUSEPORT 4-tuple hashing distributes load
     # across server siblings — exercises the NIC's RX hash path
     # together with the UDP socket layer.
-    {"name": "echo_udp", "type": "echo_udp", "endpoint": "",
-     "desc": "UDP echo peak throughput (windowed + adaptive concurrency ramp)"},
-
+    {
+        "name": "echo_udp",
+        "type": "echo_udp",
+        "endpoint": "",
+        "desc": "UDP echo peak throughput (windowed + adaptive concurrency ramp)",
+    },
     # ── HTTPS (TLS 1.3) ───────────────────────────────────────────────
     #
     # `download_64k_tls` exercises TLS bulk encrypt over the bulk-TX
@@ -199,14 +217,22 @@ WORKLOADS = [
     # ECDSA P-256 sign + X25519 ECDHE + key schedule + transcript
     # SHA-256 on every iteration. Δ vs `get_tls_fresh_resume` (in
     # the available tier) reads full-vs-resumed handshake cost.
-    {"name": "download_64k_tls", "type": "https", "endpoint": "/static-64k",
-     "threads_per_core": 1, "conns_per_core": 8, "resp_bytes": 65536,
-     "desc": "/static-64k throughput over TLS (~4 records, multi-segment TX)"},
-    {"name": "get_tls_fresh", "type": "tls_handshake",
-     "endpoint": "/health",
-     "parallelism_per_core": 4,
-     "desc": "TLS 1.3 full handshake + GET + close (4 workers × cpus)"},
-
+    {
+        "name": "download_64k_tls",
+        "type": "https",
+        "endpoint": "/static-64k",
+        "threads_per_core": 1,
+        "conns_per_core": 8,
+        "resp_bytes": 65536,
+        "desc": "/static-64k throughput over TLS (~4 records, multi-segment TX)",
+    },
+    {
+        "name": "get_tls_fresh",
+        "type": "tls_handshake",
+        "endpoint": "/health",
+        "parallelism_per_core": 4,
+        "desc": "TLS 1.3 full handshake + GET + close (4 workers × cpus)",
+    },
     # ── HTTP/3 over QUIC ──────────────────────────────────────────────
     #
     # `download_64k_quic` is the QUIC analogue of
@@ -214,11 +240,14 @@ WORKLOADS = [
     # transport. Δ reads off QUIC encrypt + packet-encode + UDP-emit
     # cost vs TLS record + TCP segmentation cost. No rendering
     # confound on either side — body is a borrowed `&'static [u8]`.
-    {"name": "download_64k_quic", "type": "h3_health",
-     "endpoint": "/static-64k",
-     "parallelism_per_core": 4, "resp_bytes": 65536,
-     "desc": "/static-64k throughput over HTTP/3 (64 KiB body, multi-packet)"},
-
+    {
+        "name": "download_64k_quic",
+        "type": "h3_health",
+        "endpoint": "/static-64k",
+        "parallelism_per_core": 4,
+        "resp_bytes": 65536,
+        "desc": "/static-64k throughput over HTTP/3 (64 KiB body, multi-packet)",
+    },
     # ── Async runtime / sidecar fan-out (guest:9000) ──────────────────
     #
     # Realistic microservice workload: every accepted TCP request at
@@ -241,10 +270,13 @@ WORKLOADS = [
     # is the Andromeda subnet router, not the loadgen VM.
     # Invoke explicitly via `--workload fanout_tcp`; kept off the
     # default set so a full bench doesn't eat the 4c+ TIMEOUT.
-    {"name": "fanout_tcp", "type": "gateway",
-     "conns_per_core": 1500, "tier": "available",
-     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 1500 conn × cpus; bench 1c locally — see comment)"},
-
+    {
+        "name": "fanout_tcp",
+        "type": "gateway",
+        "conns_per_core": 1500,
+        "tier": "available",
+        "desc": "Gateway fan-out (TCP→UDP backend→TCP, 1500 conn × cpus; bench 1c locally — see comment)",
+    },
     # ── Raw TCP echo (guest:9) ────────────────────────────────────────
     #
     # `tcp_echo` round-trips a message off the `tcp_echo` handler —
@@ -267,13 +299,22 @@ WORKLOADS = [
     #     docs/rx-path-optimizations.md — so this measures the RX
     #     half, not yet end-to-end zero-copy.)
     # Both `available` tier — name them explicitly.
-    {"name": "tcp_echo", "type": "tcp_echo",
-     "conns_per_core": 8, "tier": "available", "msg_size": 64,
-     "desc": "TCP echo round-trip latency probe (64 B msg)"},
-    {"name": "tcp_echo_64k", "type": "tcp_echo",
-     "conns_per_core": 8, "tier": "available", "msg_size": 65536,
-     "desc": "TCP echo throughput (64 KiB msg) — surfaces the recv_chunk zero-copy RX path at scale"},
-
+    {
+        "name": "tcp_echo",
+        "type": "tcp_echo",
+        "conns_per_core": 8,
+        "tier": "available",
+        "msg_size": 64,
+        "desc": "TCP echo round-trip latency probe (64 B msg)",
+    },
+    {
+        "name": "tcp_echo_64k",
+        "type": "tcp_echo",
+        "conns_per_core": 8,
+        "tier": "available",
+        "msg_size": 65536,
+        "desc": "TCP echo throughput (64 KiB msg) — surfaces the recv_chunk zero-copy RX path at scale",
+    },
     # ── Bulk RX — POST /discard with sized body ──────────────────────
     #
     # Primary probe for the driver RX path under multi-segment
@@ -284,16 +325,26 @@ WORKLOADS = [
     # Server-side handler `/discard` consumes the body and returns
     # a tiny JSON 200 OK (so the bench cycles fast). 16 conn/core
     # × cpus matches the other `_max`-style scaling.
-    {"name": "upload_32k_tcp", "type": "http_upload",
-     "endpoint": "/discard", "msg_size": 32768,
-     "conns_per_core": 16, "tls": False,
-     "desc": "POST /discard 32 KiB body (16 conn × cpus, plain HTTP)"},
+    {
+        "name": "upload_32k_tcp",
+        "type": "http_upload",
+        "endpoint": "/discard",
+        "msg_size": 32768,
+        "conns_per_core": 16,
+        "tls": False,
+        "desc": "POST /discard 32 KiB body (16 conn × cpus, plain HTTP)",
+    },
     # Same shape over TLS — `upload_32k_tls` ⊖ `upload_32k_tcp`
     # isolates TLS bulk decrypt cost at fixed body size.
-    {"name": "upload_32k_tls", "type": "http_upload",
-     "endpoint": "/discard", "msg_size": 32768,
-     "conns_per_core": 16, "tls": True,
-     "desc": "POST /discard 32 KiB body (16 conn × cpus, over TLS)"},
+    {
+        "name": "upload_32k_tls",
+        "type": "http_upload",
+        "endpoint": "/discard",
+        "msg_size": 32768,
+        "conns_per_core": 16,
+        "tls": True,
+        "desc": "POST /discard 32 KiB body (16 conn × cpus, over TLS)",
+    },
     # Larger bodies — sustained-RX probes. Each overruns the 16 KiB
     # per-conn `rx_ring` many times over, so they exercise the
     # ring-fill → window-backpressure → drain → window-update cycle
@@ -301,61 +352,89 @@ WORKLOADS = [
     # — pre-fix a 256 KiB upload hit the 30 s client timeout). Read
     # the `rx=` MB/s tag rather than req/s here. `available` tier:
     # run with `--workload upload_256k_tcp,upload_1m_tcp`.
-    {"name": "upload_256k_tcp", "type": "http_upload",
-     "endpoint": "/discard", "msg_size": 262144,
-     "conns_per_core": 16, "tls": False, "tier": "available",
-     "desc": "POST /discard 256 KiB body (16 conn × cpus, plain HTTP)"},
-    {"name": "upload_1m_tcp", "type": "http_upload",
-     "endpoint": "/discard", "msg_size": 1048576,
-     "conns_per_core": 16, "tls": False, "tier": "available",
-     "desc": "POST /discard 1 MiB body (16 conn × cpus, plain HTTP)"},
-
+    {
+        "name": "upload_256k_tcp",
+        "type": "http_upload",
+        "endpoint": "/discard",
+        "msg_size": 262144,
+        "conns_per_core": 16,
+        "tls": False,
+        "tier": "available",
+        "desc": "POST /discard 256 KiB body (16 conn × cpus, plain HTTP)",
+    },
+    {
+        "name": "upload_1m_tcp",
+        "type": "http_upload",
+        "endpoint": "/discard",
+        "msg_size": 1048576,
+        "conns_per_core": 16,
+        "tls": False,
+        "tier": "available",
+        "desc": "POST /discard 1 MiB body (16 conn × cpus, plain HTTP)",
+    },
     # ── Bulk TX — GET /static-64k ────────────────────────────────────
     #
     # Plain-HTTP companion to `download_64k_tls`. Same body, no TLS
     # — surfaces TCP TX path regressions (descriptor build, TSO,
     # checksum offload) without TLS encrypt confound.
-    {"name": "download_64k_tcp", "type": "tcp", "endpoint": "/static-64k",
-     "threads_per_core": 1, "conns_per_core": 8, "resp_bytes": 65536,
-     "desc": "/static-64k throughput plain HTTP (~4 segments, multi-segment TX)"},
-
+    {
+        "name": "download_64k_tcp",
+        "type": "tcp",
+        "endpoint": "/static-64k",
+        "threads_per_core": 1,
+        "conns_per_core": 8,
+        "resp_bytes": 65536,
+        "desc": "/static-64k throughput plain HTTP (~4 segments, multi-segment TX)",
+    },
     # ── Available tier (off the default set) ─────────────────────────
-
     # TLS small-record framing throughput. Off by default — `_fresh`
     # variants exercise handshake cost, `download_64k_tls` exercises
     # bulk encrypt; small-body TLS is a poor signal-to-noise probe
     # outside specific record-layer work.
-    {"name": "get_tls", "type": "https", "endpoint": "/health",
-     "threads_per_core": 1, "conns_per_core": 32,
-     "tier": "available",
-     "desc": "/health throughput over TLS (32 conn × cpus, keep-alive)"},
-
+    {
+        "name": "get_tls",
+        "type": "https",
+        "endpoint": "/health",
+        "threads_per_core": 1,
+        "conns_per_core": 32,
+        "tier": "available",
+        "desc": "/health throughput over TLS (32 conn × cpus, keep-alive)",
+    },
     # TLS hot path at minimum concurrency. Δ vs `get_tcp_single` =
     # per-request TLS record overhead at quiescent load. Pairs with
     # `get_tls` (multi-conn throughput).
-    {"name": "get_tls_single", "type": "https", "endpoint": "/health",
-     "threads": 1, "conns": 1,
-     "tier": "available",
-     "desc": "/health × 1 conn over TLS 1.3 (record-layer hot path, latency)"},
-
+    {
+        "name": "get_tls_single",
+        "type": "https",
+        "endpoint": "/health",
+        "threads": 1,
+        "conns": 1,
+        "tier": "available",
+        "desc": "/health × 1 conn over TLS 1.3 (record-layer hot path, latency)",
+    },
     # TLS 1.3 PSK-DHE resumption rate. Δ vs `get_tls_fresh` =
     # cost saved by skipping cert / sign / cert-verify. Off by
     # default — only meaningful when actively working on the PSK
     # resumption path.
-    {"name": "get_tls_fresh_resume", "type": "tls_resume",
-     "endpoint": "/health",
-     "parallelism_per_core": 4,
-     "tier": "available",
-     "desc": "TLS 1.3 PSK-DHE resumed handshake + GET + close (4 workers × cpus)"},
-
+    {
+        "name": "get_tls_fresh_resume",
+        "type": "tls_resume",
+        "endpoint": "/health",
+        "parallelism_per_core": 4,
+        "tier": "available",
+        "desc": "TLS 1.3 PSK-DHE resumed handshake + GET + close (4 workers × cpus)",
+    },
     # Single-flow UDP RTT. Replaces the dropped `udp_sync`; same
     # shape, new name. Off by default — `echo_udp` (throughput
     # sweep) covers the UDP path on every bench.
-    {"name": "echo_udp_single", "type": "udp", "endpoint": "",
-     "senders": 1,
-     "tier": "available",
-     "desc": "UDP echo single-flow latency (1 sender, sync RTT)"},
-
+    {
+        "name": "echo_udp_single",
+        "type": "udp",
+        "endpoint": "",
+        "senders": 1,
+        "tier": "available",
+        "desc": "UDP echo single-flow latency (1 sender, sync RTT)",
+    },
     # IPv6 datapath. Same shape as `get_tcp` but targets [::1] so
     # the v6 header parse + checksum path is exercised. Off by
     # default — the v4 path is the throughput-dominant case; v6 is
@@ -363,84 +442,102 @@ WORKLOADS = [
     # Requires the env to route [::1] to the unikernel (HVF runner
     # binds both v4 and v6 listener sockets; RemoteEnv on GCE needs
     # a v6-enabled subnet — not currently configured).
-    {"name": "get_tcp_v6", "type": "tcp", "endpoint": "/health",
-     "threads_per_core": 1, "conns_per_core": 32,
-     "host_override": "::1",
-     "tier": "available",
-     "desc": "/health throughput over IPv6 (v6 header parse + pseudo-header csum)"},
-
+    {
+        "name": "get_tcp_v6",
+        "type": "tcp",
+        "endpoint": "/health",
+        "threads_per_core": 1,
+        "conns_per_core": 32,
+        "host_override": "::1",
+        "tier": "available",
+        "desc": "/health throughput over IPv6 (v6 header parse + pseudo-header csum)",
+    },
     # ── TODO stubs (registered placeholders, no implementation) ──────
     #
     # Each entry below names a concern we want a bench for but
     # don't have an implementation for yet. They print a `TODO
     # (reason)` row in the per-cores loop so the gap stays
     # visible every run; they never consume bench time.
-
     # TLS-over-TCP 0-RTT cold path. Server-side: TCP record-layer
     # never derives client_early_traffic_secret (uni-tls flag
     # exists, no record-path wire-up). Loadgen: needs 0-RTT mode
     # (ticket cache + early-data send).
-    {"name": "get_tls_fresh_0rtt", "type": "todo",
-     "tier": "todo",
-     "reason": "server: wire up TCP early-data decrypt; loadgen: add 0-RTT mode",
-     "desc": "TLS 1.3 0-RTT (early-data) cold path"},
-
+    {
+        "name": "get_tls_fresh_0rtt",
+        "type": "todo",
+        "tier": "todo",
+        "reason": "server: wire up TCP early-data decrypt; loadgen: add 0-RTT mode",
+        "desc": "TLS 1.3 0-RTT (early-data) cold path",
+    },
     # QUIC 0-RTT cold path. Server-side IS implemented in
     # uni-quic (early-data sentinel + handshake wiring). Blocked
     # on loadgen: needs QUIC 0-RTT send (ticket cache + early data).
-    {"name": "get_quic_fresh_0rtt", "type": "todo",
-     "tier": "todo",
-     "reason": "loadgen: add QUIC 0-RTT send (server side ready)",
-     "desc": "QUIC 0-RTT cold path"},
-
+    {
+        "name": "get_quic_fresh_0rtt",
+        "type": "todo",
+        "tier": "todo",
+        "reason": "loadgen: add QUIC 0-RTT send (server side ready)",
+        "desc": "QUIC 0-RTT cold path",
+    },
     # QUIC fresh handshake (rate). The `download_64k_quic`
     # workload amortizes one handshake over many keep-alive GETs,
     # so handshake-specific regressions are invisible there.
     # Loadgen needs a `--quic-handshake-only` mode (or
     # fresh-conn-per-iter for h3-health).
-    {"name": "get_quic_fresh", "type": "todo",
-     "tier": "todo",
-     "reason": "loadgen: add --quic-handshake-only / fresh-conn-per-iter mode",
-     "desc": "QUIC handshake state machine (cold path)"},
-
+    {
+        "name": "get_quic_fresh",
+        "type": "todo",
+        "tier": "todo",
+        "reason": "loadgen: add --quic-handshake-only / fresh-conn-per-iter mode",
+        "desc": "QUIC handshake state machine (cold path)",
+    },
     # HTTP/3 POST 32 KiB — bulk-RX over QUIC, mirrors
     # upload_32k_tcp/tls but exercises the QUIC packet-decrypt
     # path on the server. Loadgen's h3 client is GET-only today.
-    {"name": "upload_32k_quic", "type": "todo",
-     "tier": "todo",
-     "reason": "loadgen: add HTTP/3 POST subcommand",
-     "desc": "HTTP/3 POST 32 KiB (QUIC RX bulk, packet decrypt)"},
-
+    {
+        "name": "upload_32k_quic",
+        "type": "todo",
+        "tier": "todo",
+        "reason": "loadgen: add HTTP/3 POST subcommand",
+        "desc": "HTTP/3 POST 32 KiB (QUIC RX bulk, packet decrypt)",
+    },
     # HTTP/1.1 pipelining — multiple GETs serialized into one
     # TCP write. Produces back-to-back same-4-tuple segments
     # (the ideal RSC probe — even cleaner than upload_32k_tcp
     # since it doesn't depend on POST body framing). Loadgen
     # needs a `--pipeline N` mode (no existing client speaks it).
-    {"name": "get_tcp_pipeline", "type": "todo",
-     "tier": "todo",
-     "reason": "loadgen: add --pipeline N (serialized GETs per TCP write)",
-     "desc": "HTTP/1.1 pipelined GETs — ideal RSC probe"},
-
+    {
+        "name": "get_tcp_pipeline",
+        "type": "todo",
+        "tier": "todo",
+        "reason": "loadgen: add --pipeline N (serialized GETs per TCP write)",
+        "desc": "HTTP/1.1 pipelined GETs — ideal RSC probe",
+    },
     # TX backpressure: slow-receiver client that drains responses
     # slowly enough to fill the server's TX queue. Tests whether
     # the TX path yields gracefully (vs hanging / leaking) under
     # backpressure. Loadgen needs a throttled-receive mode
     # (--read-rate-bps cap).
-    {"name": "download_64k_tls_slow", "type": "todo",
-     "tier": "todo",
-     "reason": "loadgen: add --read-rate-bps (throttled receive)",
-     "desc": "TX backpressure under slow consumer (64 KiB TLS)"},
-
+    {
+        "name": "download_64k_tls_slow",
+        "type": "todo",
+        "tier": "todo",
+        "reason": "loadgen: add --read-rate-bps (throttled receive)",
+        "desc": "TX backpressure under slow consumer (64 KiB TLS)",
+    },
     # Cold boot to first 200 OK. Out-of-process: needs to start
     # the unikernel VM fresh, time until /health returns 200,
     # tear down. Doesn't fit the per-request bench harness;
     # needs a separate `scripts/bench_cold_boot.sh` wrapper that
     # `gcloud compute instances start`s a stopped instance and
     # polls /health.
-    {"name": "boot_cold", "type": "todo",
-     "tier": "todo",
-     "reason": "needs separate harness: scripts/bench_cold_boot.sh",
-     "desc": "Cold boot to first 200 OK"},
+    {
+        "name": "boot_cold",
+        "type": "todo",
+        "tier": "todo",
+        "reason": "needs separate harness: scripts/bench_cold_boot.sh",
+        "desc": "Cold boot to first 200 OK",
+    },
 ]
 
 
@@ -451,24 +548,41 @@ def main():
     sys.stdout.reconfigure(line_buffering=True)
 
     parser = argparse.ArgumentParser(description="Unikernel benchmark")
-    parser.add_argument("--env", default="qemu",
-                        help="Environments: qemu,hvf,docker,native,all (comma-separated)")
-    parser.add_argument("--cores", default=None,
-                        help="Core counts to test (comma-separated). "
-                             "Default: '1,<host//2>' for local envs, or "
-                             "'1,<host>' when --env includes remote.")
-    parser.add_argument("--workload", default=None,
-                        help="Workload name(s), comma-separated (default: all)")
-    parser.add_argument("--duration", type=int, default=5,
-                        help="Seconds per test (default: 5)")
-    parser.add_argument("--elf", default=None,
-                        help="Pre-built ELF path (kvm env; skips bazel build)")
-    parser.add_argument("--native-bin", default=None,
-                        help="Pre-built native binary path (native env; skips bazel build)")
-    parser.add_argument("--target", default=None,
-                        help="Target IP for --env remote (e.g. the GCE "
-                             "unikernel-webserver internal IP). Required when "
-                             "--env remote is used.")
+    parser.add_argument(
+        "--env",
+        default="qemu",
+        help="Environments: qemu,hvf,docker,native,all (comma-separated)",
+    )
+    parser.add_argument(
+        "--cores",
+        default=None,
+        help="Core counts to test (comma-separated). "
+        "Default: '1,<host//2>' for local envs, or "
+        "'1,<host>' when --env includes remote.",
+    )
+    parser.add_argument(
+        "--workload",
+        default=None,
+        help="Workload name(s), comma-separated (default: all)",
+    )
+    parser.add_argument(
+        "--duration", type=int, default=5, help="Seconds per test (default: 5)"
+    )
+    parser.add_argument(
+        "--elf", default=None, help="Pre-built ELF path (kvm env; skips bazel build)"
+    )
+    parser.add_argument(
+        "--native-bin",
+        default=None,
+        help="Pre-built native binary path (native env; skips bazel build)",
+    )
+    parser.add_argument(
+        "--target",
+        default=None,
+        help="Target IP for --env remote (e.g. the GCE "
+        "unikernel-webserver internal IP). Required when "
+        "--env remote is used.",
+    )
     args = parser.parse_args()
 
     duration = args.duration
@@ -494,9 +608,11 @@ def main():
     else:
         top = _HOST_CPUS if "remote" in env_names else max(1, _HOST_CPUS // 2)
         core_counts = [1] if top <= 1 else [1, top]
-        print(f"--cores not set; defaulting to "
-              f"{','.join(str(c) for c in core_counts)} "
-              f"({_HOST_CPUS}-core host)")
+        print(
+            f"--cores not set; defaulting to "
+            f"{','.join(str(c) for c in core_counts)} "
+            f"({_HOST_CPUS}-core host)"
+        )
 
     # Workload tiers (`tier` field per entry, default = "default"):
     #   "default"   — run on every bench (no --workload override)
@@ -533,8 +649,9 @@ def main():
     # when `--native-bin /path/webserver_bin` is passed. Bench spawns
     # the underlying `:webserver_bin` rust_binary directly, so that's
     # the argv[0] we need to reap.
-    subprocess.run(["pkill", "-9", "-f", r"^\S*/webserver_bin( |$)"],
-                   capture_output=True)
+    subprocess.run(
+        ["pkill", "-9", "-f", r"^\S*/webserver_bin( |$)"], capture_output=True
+    )
     time.sleep(2)
 
     # Create environment instances (build happens before each test group
@@ -574,416 +691,500 @@ def main():
         subprocess.run(["pkill", "-9", "-f", "run-hvf"], capture_output=True)
         # Anchor to argv[0] to avoid matching our own bench.py cmdline when
         # --native-bin /path/webserver_native is passed.
-        subprocess.run(["pkill", "-9", "-f", r"^\S*/webserver_native( |$)"],
-                       capture_output=True)
+        subprocess.run(
+            ["pkill", "-9", "-f", r"^\S*/webserver_native( |$)"], capture_output=True
+        )
 
     try:
-      for env_name, env in envs.items():
-        _current["env"] = env
-        # Rebuild before each environment group (bazel-bin is shared).
-        # RemoteEnv opts out via `needs_build = False` — its binary
-        # is already running on another VM, so the "==> Building …"
-        # print + `build()` call are pure noise.
-        if getattr(env, "needs_build", True):
-            print(f"\n==> Building {env.label}...")
-            env.build()
+        for env_name, env in envs.items():
+            _current["env"] = env
+            # Rebuild before each environment group (bazel-bin is shared).
+            # RemoteEnv opts out via `needs_build = False` — its binary
+            # is already running on another VM, so the "==> Building …"
+            # print + `build()` call are pure noise.
+            if getattr(env, "needs_build", True):
+                print(f"\n==> Building {env.label}...")
+                env.build()
 
-        for cpus in core_counts:
-            if env_name in single_core_only and cpus > 1:
-                continue
-
-            label = env.core_label(cpus)
-            print(f"\n==> {label}")
-
-            consecutive_skips = 0
-            for w in workloads:
-                wname = w["name"]
-                port = next_port()
-
-                bench_port = port
-
-                # Some workloads only make sense at or above a floor
-                # core count — a heavy conn-storm workload pointed at
-                # a too-small scheduler can overrun the accept path
-                # and wedge every subsequent workload at that core
-                # count (the readiness probe never recovers). Mark
-                # those with `min_cpus` and skip cleanly at lower
-                # counts — no SKIP-cascade, no consecutive-skip abort.
-                if cpus < w.get("min_cpus", 0):
-                    print(f"    {wname:<20s} SKIP (needs ≥{w['min_cpus']} cores)")
-                    results[(env_name, cpus, wname)] = (0, "", "")
+            for cpus in core_counts:
+                if env_name in single_core_only and cpus > 1:
                     continue
 
-                proc = start_env_verified(env, cpus, port)
-                _current["proc"] = proc
-                if proc is None:
-                    print(f"    {wname:<20s} SKIP (not ready)")
-                    # Print last few lines of serial log to show why it failed.
-                    # Each env writes its guest serial somewhere different;
-                    # the tail almost always holds the boot panic or the
-                    # last-seen DHCP / network message that explains why
-                    # `wait_http` never reached the guest.
-                    if isinstance(env, HvfEnv):
-                        serial_sources = [
-                            (f"/tmp/hvf_{port}.serial.log", "serial"),
-                            (f"/tmp/hvf_{port}.log", "stderr"),
-                        ]
-                    elif isinstance(env, (KvmEnv, QemuEnv, QemuAarch64Env)):
-                        serial_sources = [
-                            (f"/tmp/bench_{port}.log", "serial"),
-                            (f"/tmp/bench_{port}.qemu.log", "qemu"),
-                        ]
-                    else:
-                        serial_sources = []
-                    for path, label in serial_sources:
-                        try:
-                            with open(path) as lf:
-                                lines = lf.read().strip().splitlines()
-                                if not lines:
-                                    print(f"      {label}: (empty)")
-                                for l in lines[-12:]:
-                                    print(f"      {label}: {l}")
-                        except Exception:
-                            pass
-                    results[(env_name, cpus, wname)] = (0, "", "")
-                    consecutive_skips += 1
-                    if consecutive_skips >= 3:
-                        print(f"    -- 3 consecutive SKIPs on {label}; aborting "
-                              f"this core-count to avoid wedging the bench.")
-                        break
-                    continue
+                label = env.core_label(cpus)
+                print(f"\n==> {label}")
+
                 consecutive_skips = 0
+                for w in workloads:
+                    wname = w["name"]
+                    port = next_port()
 
-                # KvmEnv uses a tap backend with a fixed guest IP/ports
-                # rather than localhost hostfwd; other envs keep the old
-                # localhost+ephemeral-port default.
-                if isinstance(env, (KvmEnv, RemoteEnv)):
-                    wrk_host = env.GUEST_IP
-                    wrk_port = env.GUEST_PORT
-                    tls_target_port = env.GUEST_TLS_PORT
-                    udp_target_port = env.GUEST_UDP_PORT
-                    h3_target_port = getattr(
-                        env, "GUEST_H3_PORT", env.GUEST_TLS_PORT)
-                    tcp_echo_target_port = getattr(
-                        env, "GUEST_TCP_ECHO_PORT", None)
-                    gateway_target_port = getattr(
-                        env, "GUEST_GATEWAY_PORT", None)
-                else:
-                    # 127.0.0.1 explicit, NOT "localhost". macOS
-                    # resolves localhost to both ::1 and 127.0.0.1;
-                    # for 6 000+ concurrent loadgen connects the
-                    # IPv6-first try fails immediately (the unikernel
-                    # listens AF_INET only) but the fallback to IPv4
-                    # adds enough latency per connect to push the
-                    # fanout_tcp workload over its subprocess timeout.
-                    wrk_host = "127.0.0.1"
-                    wrk_port = bench_port
-                    tls_off = getattr(env, 'tls_port_offset', 1000)
-                    tls_target_port = bench_port + tls_off
-                    udp_off = getattr(env, 'udp_port_offset', 1)
-                    udp_target_port = bench_port + udp_off
-                    h3_off = getattr(env, 'h3_port_offset', None)
-                    h3_target_port = (
-                        bench_port + h3_off if h3_off else None)
-                    tcp_echo_off = getattr(env, 'tcp_echo_offset', None)
-                    tcp_echo_target_port = (
-                        bench_port + tcp_echo_off if tcp_echo_off else None)
-                    gateway_off = getattr(env, 'gateway_offset', None)
-                    gateway_target_port = (
-                        bench_port + gateway_off if gateway_off else None)
+                    bench_port = port
 
-                # Per-workload host override (e.g. `get_tcp_v6` pins
-                # the target to `::1` to exercise the IPv6 path
-                # regardless of what the env defaults to).
-                if "host_override" in w:
-                    wrk_host = w["host_override"]
-
-                # Workloads that scale with cpu count compute their final
-                # conn / thread / sender counts here. Static workloads keep
-                # the literal "conns" / "threads" / "senders" fields.
-                conns = w.get("conns", 0)
-                threads = w.get("threads", 0)
-                if "conns_per_core" in w:
-                    conns = w["conns_per_core"] * cpus
-                if "threads_per_core" in w:
-                    # Scale with target cores, but for *local* envs cap
-                    # at half the host count. `wrk` is event-loop
-                    # (epoll/kqueue), not thread-per-conn — one thread
-                    # can comfortably drive 100k req/s, so scaling 1:1
-                    # with target cpus just burns host cores that the
-                    # VM / native binary needs. Keeping this ≤ host/2
-                    # leaves half the host for the server.
-                    #
-                    # `RemoteEnv` is the exception: server and loadgen
-                    # live on separate VMs (the GCE deploy-bench shape),
-                    # so the loadgen is free to use the whole host. The
-                    # prior unconditional cap is exactly what made
-                    # `get_tcp` plateau at cli=4.0cpu on a 8-vCPU
-                    # kvm-vm — both 4c and 8c targets clamped to 4
-                    # client threads and the server's real ceiling
-                    # stayed invisible.
-                    raw = max(1, w["threads_per_core"] * cpus)
-                    cap = _HOST_CPUS if isinstance(env, RemoteEnv) else max(1, _HOST_CPUS // 2)
-                    threads = min(raw, cap)
-                # UDP workloads use a fixed sender count — tying senders
-                # to vCPUs would conflate client-side concurrency with
-                # the server's core count and make scaling curves
-                # impossible to read. udp_bench caps senders at [1, 64].
-                senders = max(1, min(64, w.get("senders", 0)))
-
-                if w["type"] == "todo":
-                    # Stub workload — concern is named in the
-                    # registry but no implementation exists yet.
-                    # Print a TODO row so the bench output makes
-                    # the gap visible every run, and skip to next.
-                    reason = w.get("reason", "not implemented")
-                    print(f"    {wname:<22s} TODO ({reason})")
-                    continue
-                if w["type"] == "tcp":
-                    with measure_client_cpu() as m:
-                        rps, p50, p99 = run_wrk(
-                            wrk_port, w["endpoint"], threads, conns, duration,
-                            host=wrk_host)
-                    results[(env_name, cpus, wname)] = (rps, p50, p99)
-                    client_cpu[(env_name, cpus, wname)] = m["cores"]
-                    print(f"    {wname:<20s} {rps:>10.0f} req/s  "
-                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}"
-                          + _throughput_tag(rps, w.get("resp_bytes", 0), "tx"))
-                elif w["type"] == "http_upload":
-                    # Keep-alive HTTP POST of a sized body to
-                    # /discard. The server reads + discards, returns
-                    # 200 OK. Each iteration drives ~msg_size/MSS
-                    # back-to-back RX segments on one 4-tuple —
-                    # the shape that exposes RX-driver / HW-GRO
-                    # behavior. `tls=True` wraps each conn in TLS;
-                    # the Δ vs the plain version isolates bulk
-                    # decrypt cost at fixed body size.
-                    target_port = tls_target_port if w.get("tls") else wrk_port
-                    with measure_client_cpu() as m:
-                        rps, p50, p99 = run_loadgen_http_upload(
-                            target_port, w["endpoint"], conns, duration,
-                            host=wrk_host, msg_size=w.get("msg_size", 32768),
-                            tls=w.get("tls", False))
-                    results[(env_name, cpus, wname)] = (rps, p50, p99)
-                    client_cpu[(env_name, cpus, wname)] = m["cores"]
-                    print(f"    {wname:<20s} {rps:>10.0f} req/s  "
-                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}"
-                          + _throughput_tag(rps, w.get("msg_size", 32768), "rx"))
-                elif w["type"] == "http_close":
-                    # Accept-rate-bound plain-HTTP workload. Each
-                    # iter is a fresh TCP from a different
-                    # ephemeral port; SO_LINGER={1,0} on the
-                    # loadgen side skips TIME_WAIT so macOS's
-                    # ephemeral pool doesn't exhaust. Pairs with
-                    # `get_tls_fresh` to isolate the crypto
-                    # share of HTTPS handshake throughput.
-                    par = w.get("parallelism_per_core", 4) * cpus
-                    allocs_before = fetch_total_allocs(
-                        wrk_port, host=wrk_host)
-                    with measure_client_cpu() as m:
-                        rps, p50, p99 = run_loadgen_http_close(
-                            wrk_port, w["endpoint"], duration,
-                            host=wrk_host, parallelism=par)
-                    allocs_after = fetch_total_allocs(
-                        wrk_port, host=wrk_host)
-                    results[(env_name, cpus, wname)] = (rps, p50, p99)
-                    client_cpu[(env_name, cpus, wname)] = m["cores"]
-                    alloc_tag = _alloc_tag(allocs_before, allocs_after,
-                                           rps * duration)
-                    print(f"    {wname:<20s} {rps:>10.0f} req/s  "
-                          f"p50={p50}  p99={p99}  "
-                          f"{_cpu_tag(m['cores'])}{alloc_tag}")
-                elif w["type"] == "https":
-                    # wrk over https://. Self-signed dev cert is fine
-                    # because wrk doesn't verify by default.
-                    #
-                    # Two server-side snapshots flank the run:
-                    #   * `/heap` → talc total_allocation_count for
-                    #     the per-request alloc-per-iter readout.
-                    #   * `/stats` → TLS-encrypt byte+cycle counters
-                    #     so we can compute cycles-per-byte of the
-                    #     server-side AEAD hot path directly (vs
-                    #     inferring it from wrk req/s × body size,
-                    #     which is muddied by RTT, TCP windowing,
-                    #     etc.).
-                    allocs_before = fetch_total_allocs(
-                        tls_target_port, host=wrk_host, https=True)
-                    aead_before = fetch_tls_encrypt_stats(
-                        tls_target_port, host=wrk_host, https=True)
-                    with measure_client_cpu() as m:
-                        rps, p50, p99 = run_wrk_https(
-                            tls_target_port, w["endpoint"], threads, conns, duration,
-                            host=wrk_host)
-                    allocs_after = fetch_total_allocs(
-                        tls_target_port, host=wrk_host, https=True)
-                    aead_after = fetch_tls_encrypt_stats(
-                        tls_target_port, host=wrk_host, https=True)
-                    results[(env_name, cpus, wname)] = (rps, p50, p99)
-                    client_cpu[(env_name, cpus, wname)] = m["cores"]
-                    alloc_tag = _alloc_tag(allocs_before, allocs_after,
-                                           rps * duration)
-                    cyb_tag = _cycles_per_byte_tag(aead_before, aead_after)
-                    print(f"    {wname:<20s} {rps:>10.0f} req/s  "
-                          f"p50={p50}  p99={p99}  "
-                          f"{_cpu_tag(m['cores'])}{alloc_tag}{cyb_tag}"
-                          + _throughput_tag(rps, w.get("resp_bytes", 0), "tx"))
-                elif w["type"] == "tls_handshake":
-                    # Connection-per-request: each iteration opens a
-                    # fresh TCP socket, completes the full TLS 1.3
-                    # handshake, sends one GET, reads the response,
-                    # closes. Measures handshake throughput, not
-                    # record-layer throughput. Client parallelism
-                    # scales with server cpus to keep all server
-                    # cores busy (mirrors the _max HTTP workloads).
-                    # Driven by the Rust `loadgen` binary (rustls +
-                    # tokio); falls back to Python if cargo isn't
-                    # installed.
-                    par = w.get("parallelism_per_core", 4) * cpus
-                    # Alloc-count sampling: snapshot total cumulative
-                    # talc allocations before + after the bench. The
-                    # post-bench delta divided by handshakes_completed
-                    # is allocs-per-handshake — the metric that item M
-                    # (conn-state pool) targets. `total_allocation_count`
-                    # is monotonic across the bench window so this is
-                    # only meaningful when nothing else is allocating
-                    # on the server, which is true for the duration of
-                    # a single workload run.
-                    allocs_before = fetch_total_allocs(
-                        tls_target_port, host=wrk_host, https=True)
-                    with measure_client_cpu() as m:
-                        rps, p50, p99 = run_loadgen_tls_handshake(
-                            tls_target_port, w["endpoint"], duration,
-                            host=wrk_host, parallelism=par)
-                    allocs_after = fetch_total_allocs(
-                        tls_target_port, host=wrk_host, https=True)
-                    results[(env_name, cpus, wname)] = (rps, p50, p99)
-                    client_cpu[(env_name, cpus, wname)] = m["cores"]
-                    alloc_tag = _alloc_tag(allocs_before, allocs_after,
-                                           rps * duration)
-                    print(f"    {wname:<20s} {rps:>10.0f} hs/s   "
-                          f"p50={p50}  p99={p99}  "
-                          f"{_cpu_tag(m['cores'])}{alloc_tag}")
-                elif w["type"] == "tls_resume":
-                    # Resumed-handshake hot path: each worker keeps
-                    # its own ticket cache, the first handshake per
-                    # worker is a fresh seed (excluded from the
-                    # histogram), and every subsequent handshake
-                    # offers the cached ticket via pre_shared_key.
-                    # The unikernel matches it, verifies the binder,
-                    # and skips Cert + CertVerify on the server flight
-                    # — the work that dominates fresh-handshake time.
-                    par = w.get("parallelism_per_core", 4) * cpus
-                    allocs_before = fetch_total_allocs(
-                        tls_target_port, host=wrk_host, https=True)
-                    with measure_client_cpu() as m:
-                        rps, p50, p99 = run_loadgen_tls_resume(
-                            tls_target_port, w["endpoint"], duration,
-                            host=wrk_host, parallelism=par)
-                    allocs_after = fetch_total_allocs(
-                        tls_target_port, host=wrk_host, https=True)
-                    results[(env_name, cpus, wname)] = (rps, p50, p99)
-                    client_cpu[(env_name, cpus, wname)] = m["cores"]
-                    alloc_tag = _alloc_tag(allocs_before, allocs_after,
-                                           rps * duration)
-                    print(f"    {wname:<20s} {rps:>10.0f} hs/s   "
-                          f"p50={p50}  p99={p99}  "
-                          f"{_cpu_tag(m['cores'])}{alloc_tag}")
-                elif w["type"] == "h3_health":
-                    # HTTP/3 keep-alive throughput. Each worker
-                    # opens its own QUIC connection (one full
-                    # handshake, skipped from the histogram), then
-                    # fires sequential GETs on the keep-alive
-                    # connection. `h3_target_port` is a UDP forward
-                    # to the unikernel's QUIC/H3 listener (guest
-                    # UDP:443) — distinct from `udp_target_port`
-                    # (which forwards UDP echo on guest UDP:7).
-                    if h3_target_port is None:
-                        # Env doesn't expose an H3 port (older env
-                        # without h3_port_offset). Skip rather than
-                        # silently mis-targeting.
-                        results[(env_name, cpus, wname)] = (0.0, "NO_H3_PORT", "NO_H3_PORT")
-                        client_cpu[(env_name, cpus, wname)] = 0.0
-                        print(f"    {wname:<20s} (env has no H3 port — skipped)")
+                    # Some workloads only make sense at or above a floor
+                    # core count — a heavy conn-storm workload pointed at
+                    # a too-small scheduler can overrun the accept path
+                    # and wedge every subsequent workload at that core
+                    # count (the readiness probe never recovers). Mark
+                    # those with `min_cpus` and skip cleanly at lower
+                    # counts — no SKIP-cascade, no consecutive-skip abort.
+                    if cpus < w.get("min_cpus", 0):
+                        print(f"    {wname:<20s} SKIP (needs ≥{w['min_cpus']} cores)")
+                        results[(env_name, cpus, wname)] = (0, "", "")
                         continue
-                    par = w.get("parallelism_per_core", 4) * cpus
-                    with measure_client_cpu() as m:
-                        rps, p50, p99 = run_loadgen_h3_health(
-                            h3_target_port, w["endpoint"], duration,
-                            host=wrk_host, parallelism=par)
-                    results[(env_name, cpus, wname)] = (rps, p50, p99)
-                    client_cpu[(env_name, cpus, wname)] = m["cores"]
-                    print(f"    {wname:<20s} {rps:>10.0f} req/s  "
-                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}"
-                          + _throughput_tag(rps, w.get("resp_bytes", 0), "tx"))
-                elif w["type"] == "udp":
-                    # Let wait_http's TCP teardown settle before firing a
-                    # UDP burst — without this the first sender very
-                    # occasionally wins a race against vhost-net's
-                    # per-queue worker thread and the test records 0.
-                    time.sleep(0.5)
-                    with measure_client_cpu() as m:
-                        pps, p50, p99 = _udp_with_retry(
-                            udp_target_port, senders, duration, wrk_host)
-                    results[(env_name, cpus, wname)] = (pps, p50, p99)
-                    client_cpu[(env_name, cpus, wname)] = m["cores"]
-                    print(f"    {wname:<20s} {pps:>10.0f} pkt/s  "
-                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
-                elif w["type"] == "echo_udp":
-                    time.sleep(0.5)
-                    # Windowed mode with adaptive concurrency ramp:
-                    # probe per-thread slot counts [32..512] and pick
-                    # the level where throughput plateaus, so each
-                    # platform gets the concurrency that actually
-                    # exposes its ceiling without over-pressuring it.
-                    with measure_client_cpu() as m:
-                        pps, loss_pct, p50, p99, best_n = echo_udp_concurrent(
-                            udp_target_port, duration, wrk_host,
-                            client_cpus=cpus)
-                    results[(env_name, cpus, wname)] = (pps, p50, p99)
-                    client_cpu[(env_name, cpus, wname)] = m["cores"]
-                    print(f"    {wname:<20s} {pps:>10.0f} pkt/s  "
-                          f"({best_n}x{cpus} in-flight, {loss_pct:.1f}% loss)  "
-                          f"{_cpu_tag(m['cores'])}")
-                elif w["type"] == "tcp_echo":
-                    if tcp_echo_target_port is None:
-                        print(f"    {wname:<20s} SKIP (env has no tcp_echo port)")
-                        continue
-                    time.sleep(0.5)
-                    # Driven by the Rust `loadgen` binary (tokio +
-                    # native sockets); falls back to Python if cargo
-                    # isn't installed.
-                    with measure_client_cpu() as m:
-                        rps, p50, p99 = run_loadgen_tcp_echo(
-                            tcp_echo_target_port, conns, duration,
-                            host=wrk_host, msg_size=w.get("msg_size", 64))
-                    results[(env_name, cpus, wname)] = (rps, p50, p99)
-                    client_cpu[(env_name, cpus, wname)] = m["cores"]
-                    print(f"    {wname:<20s} {rps:>10.0f} msg/s  "
-                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
-                elif w["type"] == "gateway":
-                    if gateway_target_port is None:
-                        print(f"    {wname:<20s} SKIP (env has no gateway port)")
-                        continue
-                    time.sleep(0.5)
-                    # Backend port is the unikernel-side hard-coded
-                    # `GATEWAY_BACKEND_PORT`. Loadgen hosts the echo
-                    # task on this port so the unikernel can fan out
-                    # to it directly (under QEMU NAT / HVF user
-                    # networking, the host is reachable via the
-                    # gateway IP DHCP gives us).
-                    backend_port = 7777
-                    msg_size = w.get("msg_size", 32)
-                    with measure_client_cpu() as m:
-                        rps, p50, p99 = run_loadgen_gateway(
-                            gateway_target_port, backend_port, conns,
-                            duration, host=wrk_host, msg_size=msg_size)
-                    results[(env_name, cpus, wname)] = (rps, p50, p99)
-                    client_cpu[(env_name, cpus, wname)] = m["cores"]
-                    print(f"    {wname:<20s} {rps:>10.0f} req/s  "
-                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
 
-                env.stop(proc)
-                _current["proc"] = None
+                    proc = start_env_verified(env, cpus, port)
+                    _current["proc"] = proc
+                    if proc is None:
+                        print(f"    {wname:<20s} SKIP (not ready)")
+                        # Print last few lines of serial log to show why it failed.
+                        # Each env writes its guest serial somewhere different;
+                        # the tail almost always holds the boot panic or the
+                        # last-seen DHCP / network message that explains why
+                        # `wait_http` never reached the guest.
+                        if isinstance(env, HvfEnv):
+                            serial_sources = [
+                                (f"/tmp/hvf_{port}.serial.log", "serial"),
+                                (f"/tmp/hvf_{port}.log", "stderr"),
+                            ]
+                        elif isinstance(env, (KvmEnv, QemuEnv, QemuAarch64Env)):
+                            serial_sources = [
+                                (f"/tmp/bench_{port}.log", "serial"),
+                                (f"/tmp/bench_{port}.qemu.log", "qemu"),
+                            ]
+                        else:
+                            serial_sources = []
+                        for path, label in serial_sources:
+                            try:
+                                with open(path) as lf:
+                                    lines = lf.read().strip().splitlines()
+                                    if not lines:
+                                        print(f"      {label}: (empty)")
+                                    for l in lines[-12:]:
+                                        print(f"      {label}: {l}")
+                            except Exception:
+                                pass
+                        results[(env_name, cpus, wname)] = (0, "", "")
+                        consecutive_skips += 1
+                        if consecutive_skips >= 3:
+                            print(
+                                f"    -- 3 consecutive SKIPs on {label}; aborting "
+                                f"this core-count to avoid wedging the bench."
+                            )
+                            break
+                        continue
+                    consecutive_skips = 0
+
+                    # KvmEnv uses a tap backend with a fixed guest IP/ports
+                    # rather than localhost hostfwd; other envs keep the old
+                    # localhost+ephemeral-port default.
+                    if isinstance(env, (KvmEnv, RemoteEnv)):
+                        wrk_host = env.GUEST_IP
+                        wrk_port = env.GUEST_PORT
+                        tls_target_port = env.GUEST_TLS_PORT
+                        udp_target_port = env.GUEST_UDP_PORT
+                        h3_target_port = getattr(
+                            env, "GUEST_H3_PORT", env.GUEST_TLS_PORT
+                        )
+                        tcp_echo_target_port = getattr(env, "GUEST_TCP_ECHO_PORT", None)
+                        gateway_target_port = getattr(env, "GUEST_GATEWAY_PORT", None)
+                    else:
+                        # 127.0.0.1 explicit, NOT "localhost". macOS
+                        # resolves localhost to both ::1 and 127.0.0.1;
+                        # for 6 000+ concurrent loadgen connects the
+                        # IPv6-first try fails immediately (the unikernel
+                        # listens AF_INET only) but the fallback to IPv4
+                        # adds enough latency per connect to push the
+                        # fanout_tcp workload over its subprocess timeout.
+                        wrk_host = "127.0.0.1"
+                        wrk_port = bench_port
+                        tls_off = getattr(env, "tls_port_offset", 1000)
+                        tls_target_port = bench_port + tls_off
+                        udp_off = getattr(env, "udp_port_offset", 1)
+                        udp_target_port = bench_port + udp_off
+                        h3_off = getattr(env, "h3_port_offset", None)
+                        h3_target_port = bench_port + h3_off if h3_off else None
+                        tcp_echo_off = getattr(env, "tcp_echo_offset", None)
+                        tcp_echo_target_port = (
+                            bench_port + tcp_echo_off if tcp_echo_off else None
+                        )
+                        gateway_off = getattr(env, "gateway_offset", None)
+                        gateway_target_port = (
+                            bench_port + gateway_off if gateway_off else None
+                        )
+
+                    # Per-workload host override (e.g. `get_tcp_v6` pins
+                    # the target to `::1` to exercise the IPv6 path
+                    # regardless of what the env defaults to).
+                    if "host_override" in w:
+                        wrk_host = w["host_override"]
+
+                    # Workloads that scale with cpu count compute their final
+                    # conn / thread / sender counts here. Static workloads keep
+                    # the literal "conns" / "threads" / "senders" fields.
+                    conns = w.get("conns", 0)
+                    threads = w.get("threads", 0)
+                    if "conns_per_core" in w:
+                        conns = w["conns_per_core"] * cpus
+                    if "threads_per_core" in w:
+                        # Scale with target cores, but for *local* envs cap
+                        # at half the host count. `wrk` is event-loop
+                        # (epoll/kqueue), not thread-per-conn — one thread
+                        # can comfortably drive 100k req/s, so scaling 1:1
+                        # with target cpus just burns host cores that the
+                        # VM / native binary needs. Keeping this ≤ host/2
+                        # leaves half the host for the server.
+                        #
+                        # `RemoteEnv` is the exception: server and loadgen
+                        # live on separate VMs (the GCE deploy-bench shape),
+                        # so the loadgen is free to use the whole host. The
+                        # prior unconditional cap is exactly what made
+                        # `get_tcp` plateau at cli=4.0cpu on a 8-vCPU
+                        # kvm-vm — both 4c and 8c targets clamped to 4
+                        # client threads and the server's real ceiling
+                        # stayed invisible.
+                        raw = max(1, w["threads_per_core"] * cpus)
+                        cap = (
+                            _HOST_CPUS
+                            if isinstance(env, RemoteEnv)
+                            else max(1, _HOST_CPUS // 2)
+                        )
+                        threads = min(raw, cap)
+                    # UDP workloads use a fixed sender count — tying senders
+                    # to vCPUs would conflate client-side concurrency with
+                    # the server's core count and make scaling curves
+                    # impossible to read. udp_bench caps senders at [1, 64].
+                    senders = max(1, min(64, w.get("senders", 0)))
+
+                    if w["type"] == "todo":
+                        # Stub workload — concern is named in the
+                        # registry but no implementation exists yet.
+                        # Print a TODO row so the bench output makes
+                        # the gap visible every run, and skip to next.
+                        reason = w.get("reason", "not implemented")
+                        print(f"    {wname:<22s} TODO ({reason})")
+                        continue
+                    if w["type"] == "tcp":
+                        with measure_client_cpu() as m:
+                            rps, p50, p99 = run_wrk(
+                                wrk_port,
+                                w["endpoint"],
+                                threads,
+                                conns,
+                                duration,
+                                host=wrk_host,
+                            )
+                        results[(env_name, cpus, wname)] = (rps, p50, p99)
+                        client_cpu[(env_name, cpus, wname)] = m["cores"]
+                        print(
+                            f"    {wname:<20s} {rps:>10.0f} req/s  "
+                            f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}"
+                            + _throughput_tag(rps, w.get("resp_bytes", 0), "tx")
+                        )
+                    elif w["type"] == "http_upload":
+                        # Keep-alive HTTP POST of a sized body to
+                        # /discard. The server reads + discards, returns
+                        # 200 OK. Each iteration drives ~msg_size/MSS
+                        # back-to-back RX segments on one 4-tuple —
+                        # the shape that exposes RX-driver / HW-GRO
+                        # behavior. `tls=True` wraps each conn in TLS;
+                        # the Δ vs the plain version isolates bulk
+                        # decrypt cost at fixed body size.
+                        target_port = tls_target_port if w.get("tls") else wrk_port
+                        with measure_client_cpu() as m:
+                            rps, p50, p99 = run_loadgen_http_upload(
+                                target_port,
+                                w["endpoint"],
+                                conns,
+                                duration,
+                                host=wrk_host,
+                                msg_size=w.get("msg_size", 32768),
+                                tls=w.get("tls", False),
+                            )
+                        results[(env_name, cpus, wname)] = (rps, p50, p99)
+                        client_cpu[(env_name, cpus, wname)] = m["cores"]
+                        print(
+                            f"    {wname:<20s} {rps:>10.0f} req/s  "
+                            f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}"
+                            + _throughput_tag(rps, w.get("msg_size", 32768), "rx")
+                        )
+                    elif w["type"] == "http_close":
+                        # Accept-rate-bound plain-HTTP workload. Each
+                        # iter is a fresh TCP from a different
+                        # ephemeral port; SO_LINGER={1,0} on the
+                        # loadgen side skips TIME_WAIT so macOS's
+                        # ephemeral pool doesn't exhaust. Pairs with
+                        # `get_tls_fresh` to isolate the crypto
+                        # share of HTTPS handshake throughput.
+                        par = w.get("parallelism_per_core", 4) * cpus
+                        allocs_before = fetch_total_allocs(wrk_port, host=wrk_host)
+                        with measure_client_cpu() as m:
+                            rps, p50, p99 = run_loadgen_http_close(
+                                wrk_port,
+                                w["endpoint"],
+                                duration,
+                                host=wrk_host,
+                                parallelism=par,
+                            )
+                        allocs_after = fetch_total_allocs(wrk_port, host=wrk_host)
+                        results[(env_name, cpus, wname)] = (rps, p50, p99)
+                        client_cpu[(env_name, cpus, wname)] = m["cores"]
+                        alloc_tag = _alloc_tag(
+                            allocs_before, allocs_after, rps * duration
+                        )
+                        print(
+                            f"    {wname:<20s} {rps:>10.0f} req/s  "
+                            f"p50={p50}  p99={p99}  "
+                            f"{_cpu_tag(m['cores'])}{alloc_tag}"
+                        )
+                    elif w["type"] == "https":
+                        # wrk over https://. Self-signed dev cert is fine
+                        # because wrk doesn't verify by default.
+                        #
+                        # Two server-side snapshots flank the run:
+                        #   * `/heap` → talc total_allocation_count for
+                        #     the per-request alloc-per-iter readout.
+                        #   * `/stats` → TLS-encrypt byte+cycle counters
+                        #     so we can compute cycles-per-byte of the
+                        #     server-side AEAD hot path directly (vs
+                        #     inferring it from wrk req/s × body size,
+                        #     which is muddied by RTT, TCP windowing,
+                        #     etc.).
+                        allocs_before = fetch_total_allocs(
+                            tls_target_port, host=wrk_host, https=True
+                        )
+                        aead_before = fetch_tls_encrypt_stats(
+                            tls_target_port, host=wrk_host, https=True
+                        )
+                        with measure_client_cpu() as m:
+                            rps, p50, p99 = run_wrk_https(
+                                tls_target_port,
+                                w["endpoint"],
+                                threads,
+                                conns,
+                                duration,
+                                host=wrk_host,
+                            )
+                        allocs_after = fetch_total_allocs(
+                            tls_target_port, host=wrk_host, https=True
+                        )
+                        aead_after = fetch_tls_encrypt_stats(
+                            tls_target_port, host=wrk_host, https=True
+                        )
+                        results[(env_name, cpus, wname)] = (rps, p50, p99)
+                        client_cpu[(env_name, cpus, wname)] = m["cores"]
+                        alloc_tag = _alloc_tag(
+                            allocs_before, allocs_after, rps * duration
+                        )
+                        cyb_tag = _cycles_per_byte_tag(aead_before, aead_after)
+                        print(
+                            f"    {wname:<20s} {rps:>10.0f} req/s  "
+                            f"p50={p50}  p99={p99}  "
+                            f"{_cpu_tag(m['cores'])}{alloc_tag}{cyb_tag}"
+                            + _throughput_tag(rps, w.get("resp_bytes", 0), "tx")
+                        )
+                    elif w["type"] == "tls_handshake":
+                        # Connection-per-request: each iteration opens a
+                        # fresh TCP socket, completes the full TLS 1.3
+                        # handshake, sends one GET, reads the response,
+                        # closes. Measures handshake throughput, not
+                        # record-layer throughput. Client parallelism
+                        # scales with server cpus to keep all server
+                        # cores busy (mirrors the _max HTTP workloads).
+                        # Driven by the Rust `loadgen` binary (rustls +
+                        # tokio); falls back to Python if cargo isn't
+                        # installed.
+                        par = w.get("parallelism_per_core", 4) * cpus
+                        # Alloc-count sampling: snapshot total cumulative
+                        # talc allocations before + after the bench. The
+                        # post-bench delta divided by handshakes_completed
+                        # is allocs-per-handshake — the metric that item M
+                        # (conn-state pool) targets. `total_allocation_count`
+                        # is monotonic across the bench window so this is
+                        # only meaningful when nothing else is allocating
+                        # on the server, which is true for the duration of
+                        # a single workload run.
+                        allocs_before = fetch_total_allocs(
+                            tls_target_port, host=wrk_host, https=True
+                        )
+                        with measure_client_cpu() as m:
+                            rps, p50, p99 = run_loadgen_tls_handshake(
+                                tls_target_port,
+                                w["endpoint"],
+                                duration,
+                                host=wrk_host,
+                                parallelism=par,
+                            )
+                        allocs_after = fetch_total_allocs(
+                            tls_target_port, host=wrk_host, https=True
+                        )
+                        results[(env_name, cpus, wname)] = (rps, p50, p99)
+                        client_cpu[(env_name, cpus, wname)] = m["cores"]
+                        alloc_tag = _alloc_tag(
+                            allocs_before, allocs_after, rps * duration
+                        )
+                        print(
+                            f"    {wname:<20s} {rps:>10.0f} hs/s   "
+                            f"p50={p50}  p99={p99}  "
+                            f"{_cpu_tag(m['cores'])}{alloc_tag}"
+                        )
+                    elif w["type"] == "tls_resume":
+                        # Resumed-handshake hot path: each worker keeps
+                        # its own ticket cache, the first handshake per
+                        # worker is a fresh seed (excluded from the
+                        # histogram), and every subsequent handshake
+                        # offers the cached ticket via pre_shared_key.
+                        # The unikernel matches it, verifies the binder,
+                        # and skips Cert + CertVerify on the server flight
+                        # — the work that dominates fresh-handshake time.
+                        par = w.get("parallelism_per_core", 4) * cpus
+                        allocs_before = fetch_total_allocs(
+                            tls_target_port, host=wrk_host, https=True
+                        )
+                        with measure_client_cpu() as m:
+                            rps, p50, p99 = run_loadgen_tls_resume(
+                                tls_target_port,
+                                w["endpoint"],
+                                duration,
+                                host=wrk_host,
+                                parallelism=par,
+                            )
+                        allocs_after = fetch_total_allocs(
+                            tls_target_port, host=wrk_host, https=True
+                        )
+                        results[(env_name, cpus, wname)] = (rps, p50, p99)
+                        client_cpu[(env_name, cpus, wname)] = m["cores"]
+                        alloc_tag = _alloc_tag(
+                            allocs_before, allocs_after, rps * duration
+                        )
+                        print(
+                            f"    {wname:<20s} {rps:>10.0f} hs/s   "
+                            f"p50={p50}  p99={p99}  "
+                            f"{_cpu_tag(m['cores'])}{alloc_tag}"
+                        )
+                    elif w["type"] == "h3_health":
+                        # HTTP/3 keep-alive throughput. Each worker
+                        # opens its own QUIC connection (one full
+                        # handshake, skipped from the histogram), then
+                        # fires sequential GETs on the keep-alive
+                        # connection. `h3_target_port` is a UDP forward
+                        # to the unikernel's QUIC/H3 listener (guest
+                        # UDP:443) — distinct from `udp_target_port`
+                        # (which forwards UDP echo on guest UDP:7).
+                        if h3_target_port is None:
+                            # Env doesn't expose an H3 port (older env
+                            # without h3_port_offset). Skip rather than
+                            # silently mis-targeting.
+                            results[(env_name, cpus, wname)] = (
+                                0.0,
+                                "NO_H3_PORT",
+                                "NO_H3_PORT",
+                            )
+                            client_cpu[(env_name, cpus, wname)] = 0.0
+                            print(f"    {wname:<20s} (env has no H3 port — skipped)")
+                            continue
+                        par = w.get("parallelism_per_core", 4) * cpus
+                        with measure_client_cpu() as m:
+                            rps, p50, p99 = run_loadgen_h3_health(
+                                h3_target_port,
+                                w["endpoint"],
+                                duration,
+                                host=wrk_host,
+                                parallelism=par,
+                            )
+                        results[(env_name, cpus, wname)] = (rps, p50, p99)
+                        client_cpu[(env_name, cpus, wname)] = m["cores"]
+                        print(
+                            f"    {wname:<20s} {rps:>10.0f} req/s  "
+                            f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}"
+                            + _throughput_tag(rps, w.get("resp_bytes", 0), "tx")
+                        )
+                    elif w["type"] == "udp":
+                        # Let wait_http's TCP teardown settle before firing a
+                        # UDP burst — without this the first sender very
+                        # occasionally wins a race against vhost-net's
+                        # per-queue worker thread and the test records 0.
+                        time.sleep(0.5)
+                        with measure_client_cpu() as m:
+                            pps, p50, p99 = _udp_with_retry(
+                                udp_target_port, senders, duration, wrk_host
+                            )
+                        results[(env_name, cpus, wname)] = (pps, p50, p99)
+                        client_cpu[(env_name, cpus, wname)] = m["cores"]
+                        print(
+                            f"    {wname:<20s} {pps:>10.0f} pkt/s  "
+                            f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}"
+                        )
+                    elif w["type"] == "echo_udp":
+                        time.sleep(0.5)
+                        # Windowed mode with adaptive concurrency ramp:
+                        # probe per-thread slot counts [32..512] and pick
+                        # the level where throughput plateaus, so each
+                        # platform gets the concurrency that actually
+                        # exposes its ceiling without over-pressuring it.
+                        with measure_client_cpu() as m:
+                            pps, loss_pct, p50, p99, best_n = echo_udp_concurrent(
+                                udp_target_port, duration, wrk_host, client_cpus=cpus
+                            )
+                        results[(env_name, cpus, wname)] = (pps, p50, p99)
+                        client_cpu[(env_name, cpus, wname)] = m["cores"]
+                        print(
+                            f"    {wname:<20s} {pps:>10.0f} pkt/s  "
+                            f"({best_n}x{cpus} in-flight, {loss_pct:.1f}% loss)  "
+                            f"{_cpu_tag(m['cores'])}"
+                        )
+                    elif w["type"] == "tcp_echo":
+                        if tcp_echo_target_port is None:
+                            print(f"    {wname:<20s} SKIP (env has no tcp_echo port)")
+                            continue
+                        time.sleep(0.5)
+                        # Driven by the Rust `loadgen` binary (tokio +
+                        # native sockets); falls back to Python if cargo
+                        # isn't installed.
+                        with measure_client_cpu() as m:
+                            rps, p50, p99 = run_loadgen_tcp_echo(
+                                tcp_echo_target_port,
+                                conns,
+                                duration,
+                                host=wrk_host,
+                                msg_size=w.get("msg_size", 64),
+                            )
+                        results[(env_name, cpus, wname)] = (rps, p50, p99)
+                        client_cpu[(env_name, cpus, wname)] = m["cores"]
+                        print(
+                            f"    {wname:<20s} {rps:>10.0f} msg/s  "
+                            f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}"
+                        )
+                    elif w["type"] == "gateway":
+                        if gateway_target_port is None:
+                            print(f"    {wname:<20s} SKIP (env has no gateway port)")
+                            continue
+                        time.sleep(0.5)
+                        # Backend port is the unikernel-side hard-coded
+                        # `GATEWAY_BACKEND_PORT`. Loadgen hosts the echo
+                        # task on this port so the unikernel can fan out
+                        # to it directly (under QEMU NAT / HVF user
+                        # networking, the host is reachable via the
+                        # gateway IP DHCP gives us).
+                        backend_port = 7777
+                        msg_size = w.get("msg_size", 32)
+                        with measure_client_cpu() as m:
+                            rps, p50, p99 = run_loadgen_gateway(
+                                gateway_target_port,
+                                backend_port,
+                                conns,
+                                duration,
+                                host=wrk_host,
+                                msg_size=msg_size,
+                            )
+                        results[(env_name, cpus, wname)] = (rps, p50, p99)
+                        client_cpu[(env_name, cpus, wname)] = m["cores"]
+                        print(
+                            f"    {wname:<20s} {rps:>10.0f} req/s  "
+                            f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}"
+                        )
+
+                    env.stop(proc)
+                    _current["proc"] = None
     except KeyboardInterrupt:
         print("\nInterrupted — cleaning up...")
         _kill_current()
@@ -1026,12 +1227,18 @@ def main():
     # Scaling columns: one per environment that has multiple core counts
     scaling_envs = []
     for env_name in env_names:
-        env_cores = [c for c in core_counts if not (env_name in single_core_only and c > 1)]
+        env_cores = [
+            c for c in core_counts if not (env_name in single_core_only and c > 1)
+        ]
         if len(env_cores) > 1:
             scaling_envs.append(env_name)
-            hdr += f" {envs[env_name].label[:6]+' ×':>8s}"
+            hdr += f" {envs[env_name].label[:6] + ' ×':>8s}"
     print(hdr)
-    print(f"  {'─'*22}" + f" {'─'*CELL}" * len(columns) + (f" {'─'*8}" * len(scaling_envs)))
+    print(
+        f"  {'─' * 22}"
+        + f" {'─' * CELL}" * len(columns)
+        + (f" {'─' * 8}" * len(scaling_envs))
+    )
 
     def _fmt_cell(val, cores):
         if val <= 0:
@@ -1050,19 +1257,23 @@ def main():
 
         # Per-environment scaling columns
         for env_name in scaling_envs:
-            env_cores = [c for c in core_counts if not (env_name in single_core_only and c > 1)]
+            env_cores = [
+                c for c in core_counts if not (env_name in single_core_only and c > 1)
+            ]
             base = results.get((env_name, env_cores[0], wname), (0,))[0]
             top = results.get((env_name, env_cores[-1], wname), (0,))[0]
             if base > 0:
-                row += f" {top/base:>6.2f}x"
+                row += f" {top / base:>6.2f}x"
             else:
                 row += f" {'N/A':>7s}"
         print(row)
 
     print("=" * (24 + (CELL + 2) * len(columns) + 10))
     print(f"  Duration: {duration}s | /compute: 100K hash iters | /health: static JSON")
-    print(f"  Cell format: `rate (cN.N)` — N.N = CPU cores the load gen used. "
-          f"⚠ = client ≥ 70% of {_HOST_CPUS}-core host (result likely client-bound).")
+    print(
+        f"  Cell format: `rate (cN.N)` — N.N = CPU cores the load gen used. "
+        f"⚠ = client ≥ 70% of {_HOST_CPUS}-core host (result likely client-bound)."
+    )
     if any(c > 1 for c in core_counts):
         print(f"  Multi-core: MTTCG (x86_64) or hardware (HVF/KVM)")
     print("=" * (24 + (CELL + 2) * len(columns) + 10))
@@ -1072,14 +1283,15 @@ def main():
     # default; todo = stub for a concern we don't have a workload
     # for yet (intentional placeholder, never runs).
     if not args.workload:
-        skipped = [w for w in WORKLOADS
-                   if w.get("tier", "default") != "default"]
+        skipped = [w for w in WORKLOADS if w.get("tier", "default") != "default"]
         if skipped:
             available = [w for w in skipped if w.get("tier") == "available"]
             todos = [w for w in skipped if w.get("tier") == "todo"]
             print()
             if available:
-                print(f"  Off by default ({len(available)} — run with --workload <name>):")
+                print(
+                    f"  Off by default ({len(available)} — run with --workload <name>):"
+                )
                 for w in available:
                     print(f"    {w['name']:<22s} {w.get('desc', '')}")
             if todos:

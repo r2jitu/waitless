@@ -574,7 +574,10 @@ mod body_reader_tests {
         let g = block_on(br.chunk()).unwrap();
         assert_eq!(g.data(), prebuf);
         drop(g);
-        assert!(block_on(br.chunk()).is_none(), "NullStream recv_chunk -> None");
+        assert!(
+            block_on(br.chunk()).is_none(),
+            "NullStream recv_chunk -> None"
+        );
         assert_eq!(br.remaining(), 96);
     }
 }
@@ -907,7 +910,6 @@ impl HttpStream for uni::runtime::TcpStream {
     }
 }
 
-
 // ---- Public entry points -----------------------------------------------------
 
 /// Listen for plain HTTP on `port`. The returned `TcpHandle`
@@ -958,10 +960,8 @@ where
 /// Public so transport-specific listeners (HTTPS in `uni_tls`,
 /// HTTP/3 in `uni_http3`) can drive their own `HttpStream` impls
 /// through the same request/response machinery.
-pub async fn serve_conn<S, H>(
-    handler: Arc<H>,
-    mut stream: S,
-) where
+pub async fn serve_conn<S, H>(handler: Arc<H>, mut stream: S)
+where
     S: HttpStream,
     H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, S>) -> Response,
 {
@@ -1024,8 +1024,7 @@ pub async fn serve_conn<S, H>(
 
         // Drain every complete request sitting in the buffer.
         while buf_len > 0 {
-            let body_start =
-                parse_request_with_state(&buf[..buf_len], &mut req, &mut parser_state);
+            let body_start = parse_request_with_state(&buf[..buf_len], &mut req, &mut parser_state);
             if body_start == 0 {
                 break; // need more bytes
             }
@@ -1077,8 +1076,7 @@ pub async fn serve_conn<S, H>(
                     // bytes. If the handler asked for
                     // `Connection: close` we tear down without
                     // draining (the conn is going away anyway).
-                    body_drained_ok = want_close || body.is_empty()
-                        || body.discard().await.is_ok();
+                    body_drained_ok = want_close || body.is_empty() || body.discard().await.is_ok();
                 }
                 if !body_drained_ok {
                     return;
@@ -1406,12 +1404,18 @@ fn host_header_port(host: &[u8]) -> Option<u16> {
     };
     let colon = after_host.iter().position(|&b| b == b':')?;
     let digits = &after_host[colon + 1..];
-    if digits.is_empty() { return None; }
+    if digits.is_empty() {
+        return None;
+    }
     let mut acc: u32 = 0;
     for &b in digits {
-        if !b.is_ascii_digit() { return None; }
+        if !b.is_ascii_digit() {
+            return None;
+        }
         acc = acc * 10 + (b - b'0') as u32;
-        if acc > 65535 { return None; }
+        if acc > 65535 {
+            return None;
+        }
     }
     Some(acc as u16)
 }
@@ -1419,20 +1423,25 @@ fn host_header_port(host: &[u8]) -> Option<u16> {
 #[cfg(test)]
 mod host_port_tests {
     use super::host_header_port;
-    #[test] fn plain_host_with_port() {
+    #[test]
+    fn plain_host_with_port() {
         assert_eq!(host_header_port(b"localhost:8443"), Some(8443));
     }
-    #[test] fn plain_host_no_port() {
+    #[test]
+    fn plain_host_no_port() {
         assert_eq!(host_header_port(b"localhost"), None);
     }
-    #[test] fn ipv6_with_port() {
+    #[test]
+    fn ipv6_with_port() {
         assert_eq!(host_header_port(b"[::1]:8443"), Some(8443));
         assert_eq!(host_header_port(b"[fe80::1%eth0]:443"), Some(443));
     }
-    #[test] fn ipv6_no_port() {
+    #[test]
+    fn ipv6_no_port() {
         assert_eq!(host_header_port(b"[::1]"), None);
     }
-    #[test] fn malformed() {
+    #[test]
+    fn malformed() {
         assert_eq!(host_header_port(b"localhost:"), None);
         assert_eq!(host_header_port(b"localhost:abc"), None);
         assert_eq!(host_header_port(b"localhost:65536"), None);
@@ -1445,7 +1454,7 @@ mod host_port_tests {
 /// tests pin both the value-matching helper and the parser flag.
 #[cfg(test)]
 mod chunked_reject_tests {
-    use super::{parse_request_with_state, transfer_encoding_is_chunked, ParserState, Request};
+    use super::{ParserState, Request, parse_request_with_state, transfer_encoding_is_chunked};
 
     /// Parse one request out of `raw` and report `(body_start,
     /// reject)` — `body_start` is the parser's return value (0
@@ -1484,7 +1493,10 @@ mod chunked_reject_tests {
         let raw = b"POST /upload HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
         let (body_start, reject) = parse(raw);
         assert!(reject, "a chunked-TE request must be flagged for a 400");
-        assert!(body_start > 0, "headers are complete, body_start must be set");
+        assert!(
+            body_start > 0,
+            "headers are complete, body_start must be set"
+        );
     }
 
     #[test]
@@ -1505,7 +1517,10 @@ mod chunked_reject_tests {
     fn plain_content_length_request_is_not_flagged() {
         let raw = b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
         let (body_start, reject) = parse(raw);
-        assert!(!reject, "a normal Content-Length request must not be flagged");
+        assert!(
+            !reject,
+            "a normal Content-Length request must not be flagged"
+        );
         assert!(body_start > 0);
     }
 
@@ -1566,9 +1581,11 @@ fn write_usize(out: &mut [u8; 20], mut n: usize) -> usize {
 /// Returns the absolute index of the terminator within `data`.
 fn find_header_end_from(data: &[u8], start: usize) -> Option<usize> {
     let suffix = data.get(start..)?;
-    suffix.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + start)
+    suffix
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + start)
 }
-
 
 fn parse_usize(data: &[u8]) -> usize {
     let mut n: usize = 0;
@@ -1595,7 +1612,6 @@ fn transfer_encoding_is_chunked(value: &[u8]) -> bool {
         .split(|&b| b == b',')
         .any(|coding| coding.trim_ascii().eq_ignore_ascii_case(b"chunked"))
 }
-
 
 fn status_text(status: i32) -> &'static str {
     match status {

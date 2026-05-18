@@ -411,8 +411,7 @@ impl<'a> ClientHello<'a> {
                         if (observed_supported_group_count as usize)
                             < observed_supported_groups.len()
                         {
-                            observed_supported_groups
-                                [observed_supported_group_count as usize] = g;
+                            observed_supported_groups[observed_supported_group_count as usize] = g;
                             observed_supported_group_count += 1;
                         }
                         j += 2;
@@ -427,11 +426,8 @@ impl<'a> ClientHello<'a> {
                     while !kr2.is_empty() {
                         let group = kr2.read_u16()?;
                         let key_exchange = kr2.read_vector_u16()?;
-                        if (observed_key_share_count as usize)
-                            < observed_key_shares.len()
-                        {
-                            observed_key_shares
-                                [observed_key_share_count as usize] =
+                        if (observed_key_share_count as usize) < observed_key_shares.len() {
+                            observed_key_shares[observed_key_share_count as usize] =
                                 (group, key_exchange.len() as u16);
                             observed_key_share_count += 1;
                         }
@@ -471,9 +467,7 @@ impl<'a> ClientHello<'a> {
                     for &m in modes {
                         match m {
                             psk_ke_mode::PSK_KE => psk_ke_modes |= psk_ke_mode::FLAG_PSK_KE,
-                            psk_ke_mode::PSK_DHE_KE => {
-                                psk_ke_modes |= psk_ke_mode::FLAG_PSK_DHE_KE
-                            }
+                            psk_ke_mode::PSK_DHE_KE => psk_ke_modes |= psk_ke_mode::FLAG_PSK_DHE_KE,
                             // Unknown modes: ignore for forward-compat.
                             _ => {}
                         }
@@ -669,7 +663,11 @@ pub fn build_server_hello(
     //   supported_versions: 2 + 2 + 2 = 6
     //   key_share:          2 + 2 + 2 + 2 + 32 = 40
     //   pre_shared_key:     2 + 2 + 2 = 6 (resumption only)
-    let psk_ext_len: u16 = if selected_psk_identity.is_some() { 6 } else { 0 };
+    let psk_ext_len: u16 = if selected_psk_identity.is_some() {
+        6
+    } else {
+        0
+    };
     let ext_total: u16 = 6 + 40 + psk_ext_len;
     let sid_len = legacy_session_id_echo.len();
     let total = 2 + 32 + 1 + sid_len + 2 + 1 + 2 + ext_total as usize;
@@ -747,10 +745,7 @@ pub fn build_server_hello(
 ///
 /// Returns bytes written, or `None` if `out` is too small or the
 /// total extensions length exceeds `0xffff`.
-pub fn build_encrypted_extensions(
-    extras: &[(u16, &[u8])],
-    out: &mut [u8],
-) -> Option<usize> {
+pub fn build_encrypted_extensions(extras: &[(u16, &[u8])], out: &mut [u8]) -> Option<usize> {
     let body_len: usize = extras.iter().map(|(_, d)| 4 + d.len()).sum();
     if body_len > 0xffff || out.len() < 2 + body_len {
         return None;
@@ -838,10 +833,7 @@ pub fn build_certificate(cert_der: &[u8], out: &mut [u8]) -> Option<usize> {
 ///
 /// Returns the exact bytes that must be fed into the signature function.
 /// Output length = 64 + 33 + 1 + HASH_LEN = 130.
-pub fn sign_content_server_cert_verify(
-    transcript_hash: &[u8; HASH_LEN],
-    out: &mut [u8; 130],
-) {
+pub fn sign_content_server_cert_verify(transcript_hash: &[u8; HASH_LEN], out: &mut [u8; 130]) {
     // 64 bytes of 0x20 padding
     out[0..64].fill(0x20);
     // Context string — exactly as quoted in the RFC.
@@ -870,10 +862,7 @@ pub fn sign_content_server_cert_verify(
 ///
 /// Caller is responsible for actually computing the signature (we don't
 /// want this module to depend on `p256`; that's `//uni-tls`'s job).
-pub fn build_certificate_verify(
-    signature: &[u8],
-    out: &mut [u8],
-) -> Option<usize> {
+pub fn build_certificate_verify(signature: &[u8], out: &mut [u8]) -> Option<usize> {
     let total = 2 + 2 + signature.len();
     if out.len() < total || signature.len() > 0xffff {
         return None;
@@ -970,10 +959,7 @@ pub fn build_new_session_ticket(
 ///
 /// `out` must have at least 6 bytes; returns `Some(6)` on success,
 /// `None` if the buffer is too small.
-pub fn build_server_pre_shared_key_ext(
-    selected_identity: u16,
-    out: &mut [u8],
-) -> Option<usize> {
+pub fn build_server_pre_shared_key_ext(selected_identity: u16, out: &mut [u8]) -> Option<usize> {
     if out.len() < 6 {
         return None;
     }
@@ -1139,8 +1125,7 @@ mod tests {
         let sid = [];
         let server_pub = [0xccu8; 32];
         let mut out = [0u8; 256];
-        let n = build_server_hello(&random, &sid, &server_pub, Some(0x1234), &mut out)
-            .unwrap();
+        let n = build_server_hello(&random, &sid, &server_pub, Some(0x1234), &mut out).unwrap();
         // Without PSK: 86 bytes (server_hello_layout test).
         // With PSK: +6 bytes for the pre_shared_key extension envelope.
         assert_eq!(n, 92);
@@ -1243,8 +1228,7 @@ mod tests {
     fn encrypted_extensions_with_quic_transport_parameters() {
         // Two-byte body, ext_type = 0x0039.
         let blob = [0xab, 0xcd];
-        let extras: &[(u16, &[u8])] =
-            &[(ext_type::QUIC_TRANSPORT_PARAMETERS, &blob)];
+        let extras: &[(u16, &[u8])] = &[(ext_type::QUIC_TRANSPORT_PARAMETERS, &blob)];
         let mut out = [0u8; 16];
         let n = build_encrypted_extensions(extras, &mut out).unwrap();
         // body = ext_type(2) + ext_len(2) + blob(2) = 6 → total = 2 + 6.
@@ -1274,9 +1258,7 @@ mod tests {
     #[test]
     fn certificate_single_entry_layout() {
         // 10-byte fake cert DER.
-        let cert_der = [
-            0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce, 0x00, 0x01,
-        ];
+        let cert_der = [0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce, 0x00, 0x01];
         let mut out = [0u8; 64];
         let n = build_certificate(&cert_der, &mut out).unwrap();
 
@@ -1417,10 +1399,7 @@ mod tests {
     /// `pre_shared_key` extension): `(identities..., binders...)`.
     /// Each identity is `(opaque_bytes, obfuscated_age)`. Each
     /// binder is its raw HMAC bytes (32–255).
-    fn encode_offered_psks(
-        identities: &[(&[u8], u32)],
-        binders: &[&[u8]],
-    ) -> Vec<u8> {
+    fn encode_offered_psks(identities: &[(&[u8], u32)], binders: &[&[u8]]) -> Vec<u8> {
         let mut idents_body = vec![];
         for (identity, age) in identities {
             idents_body.extend_from_slice(&(identity.len() as u16).to_be_bytes());
@@ -1444,10 +1423,7 @@ mod tests {
     fn parse_psk_extensions_and_capture_binders_offset() {
         let identity_bytes = b"ticket-blob-12345";
         let binder_bytes = [0x55u8; 32];
-        let psk_body = encode_offered_psks(
-            &[(identity_bytes, 0xdead_beef)],
-            &[&binder_bytes[..]],
-        );
+        let psk_body = encode_offered_psks(&[(identity_bytes, 0xdead_beef)], &[&binder_bytes[..]]);
 
         // psk_key_exchange_modes: u8 length=1, modes=[1 (psk_dhe_ke)]
         let kem_body = [0x01u8, 0x01];
@@ -1472,8 +1448,10 @@ mod tests {
         assert_eq!(psk.binders[0], &binder_bytes[..]);
 
         // psk_key_exchange_modes captured (psk_dhe_ke set, psk_ke not).
-        assert_eq!(parsed.psk_ke_modes & psk_ke_mode::FLAG_PSK_DHE_KE,
-                   psk_ke_mode::FLAG_PSK_DHE_KE);
+        assert_eq!(
+            parsed.psk_ke_modes & psk_ke_mode::FLAG_PSK_DHE_KE,
+            psk_ke_mode::FLAG_PSK_DHE_KE
+        );
         assert_eq!(parsed.psk_ke_modes & psk_ke_mode::FLAG_PSK_KE, 0);
 
         // binders_offset must point at the u16 binders-length prefix.
@@ -1487,10 +1465,7 @@ mod tests {
         let kem_envelope_len = 4 + kem_body.len(); // 4 hdr + 2 body = 6
         let psk_body_offset_in_trailing = kem_envelope_len + 4; // +4 psk hdr
         let idents_body_len = 2 + identity_bytes.len() + 4; // u16 len + identity + u32 age
-        let expected = trailing_offset
-            + psk_body_offset_in_trailing
-            + 2
-            + idents_body_len;
+        let expected = trailing_offset + psk_body_offset_in_trailing + 2 + idents_body_len;
         assert_eq!(psk.binders_offset, expected, "binders_offset mismatch");
 
         // Confirm body[..binders_offset] ends at the byte BEFORE the
@@ -1502,10 +1477,7 @@ mod tests {
     #[test]
     fn parse_psk_rejects_non_last() {
         // pre_shared_key followed by another extension is illegal.
-        let psk_body = encode_offered_psks(
-            &[(b"x", 0)],
-            &[&[0x11u8; 32][..]],
-        );
+        let psk_body = encode_offered_psks(&[(b"x", 0)], &[&[0x11u8; 32][..]]);
         let kem_body = [0x01u8, 0x01];
         let mut tmp = [0u8; 4096];
         let mut q = 0;
@@ -1513,45 +1485,45 @@ mod tests {
         q = write_ext(&mut tmp, q, ext_type::PRE_SHARED_KEY, &psk_body);
         q = write_ext(&mut tmp, q, ext_type::PSK_KEY_EXCHANGE_MODES, &kem_body);
 
-        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes(
-            [0xb2; 32], [0x77; 32], &tmp[..q]);
-        assert!(matches!(ClientHello::parse(&ch), Err(ParseError::BadExtension)));
+        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes([0xb2; 32], [0x77; 32], &tmp[..q]);
+        assert!(matches!(
+            ClientHello::parse(&ch),
+            Err(ParseError::BadExtension)
+        ));
     }
 
     #[test]
     fn parse_psk_rejects_count_mismatch() {
         // Two identities but only one binder.
-        let psk_body = encode_offered_psks(
-            &[(b"id1", 1), (b"id2", 2)],
-            &[&[0x33u8; 32][..]],
-        );
+        let psk_body = encode_offered_psks(&[(b"id1", 1), (b"id2", 2)], &[&[0x33u8; 32][..]]);
         let kem_body = [0x01u8, 0x01];
         let mut tmp = [0u8; 4096];
         let mut q = 0;
         q = write_ext(&mut tmp, q, ext_type::PSK_KEY_EXCHANGE_MODES, &kem_body);
         q = write_ext(&mut tmp, q, ext_type::PRE_SHARED_KEY, &psk_body);
 
-        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes(
-            [0xc3; 32], [0x77; 32], &tmp[..q]);
-        assert!(matches!(ClientHello::parse(&ch), Err(ParseError::BadExtension)));
+        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes([0xc3; 32], [0x77; 32], &tmp[..q]);
+        assert!(matches!(
+            ClientHello::parse(&ch),
+            Err(ParseError::BadExtension)
+        ));
     }
 
     #[test]
     fn parse_psk_rejects_short_binder() {
         // Binder must be 32–255 bytes; 16 is too short.
-        let psk_body = encode_offered_psks(
-            &[(b"id", 0)],
-            &[&[0x44u8; 16][..]],
-        );
+        let psk_body = encode_offered_psks(&[(b"id", 0)], &[&[0x44u8; 16][..]]);
         let kem_body = [0x01u8, 0x01];
         let mut tmp = [0u8; 4096];
         let mut q = 0;
         q = write_ext(&mut tmp, q, ext_type::PSK_KEY_EXCHANGE_MODES, &kem_body);
         q = write_ext(&mut tmp, q, ext_type::PRE_SHARED_KEY, &psk_body);
 
-        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes(
-            [0xd4; 32], [0x77; 32], &tmp[..q]);
-        assert!(matches!(ClientHello::parse(&ch), Err(ParseError::BadExtension)));
+        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes([0xd4; 32], [0x77; 32], &tmp[..q]);
+        assert!(matches!(
+            ClientHello::parse(&ch),
+            Err(ParseError::BadExtension)
+        ));
     }
 
     #[test]
@@ -1560,8 +1532,7 @@ mod tests {
         let kem_body = [0x02u8, 0x00, 0x01]; // [psk_ke, psk_dhe_ke]
         let mut tmp = [0u8; 64];
         let q = write_ext(&mut tmp, 0, ext_type::PSK_KEY_EXCHANGE_MODES, &kem_body);
-        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes(
-            [0xe5; 32], [0x77; 32], &tmp[..q]);
+        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes([0xe5; 32], [0x77; 32], &tmp[..q]);
         let parsed = ClientHello::parse(&ch).unwrap();
         assert_eq!(
             parsed.psk_ke_modes,
@@ -1576,17 +1547,18 @@ mod tests {
         let kem_body = [0x00u8]; // length=0
         let mut tmp = [0u8; 64];
         let q = write_ext(&mut tmp, 0, ext_type::PSK_KEY_EXCHANGE_MODES, &kem_body);
-        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes(
-            [0xe6; 32], [0x77; 32], &tmp[..q]);
-        assert!(matches!(ClientHello::parse(&ch), Err(ParseError::BadExtension)));
+        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes([0xe6; 32], [0x77; 32], &tmp[..q]);
+        assert!(matches!(
+            ClientHello::parse(&ch),
+            Err(ParseError::BadExtension)
+        ));
     }
 
     #[test]
     fn parse_no_psk_means_psk_none() {
         // Existing-shape ClientHello (no PSK extensions) still parses
         // and reports no PSK offer.
-        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes(
-            [0xf7; 32], [0x77; 32], &[]);
+        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes([0xf7; 32], [0x77; 32], &[]);
         let parsed = ClientHello::parse(&ch).unwrap();
         assert!(parsed.psk.is_none());
         assert_eq!(parsed.psk_ke_modes, 0);
@@ -1599,8 +1571,7 @@ mod tests {
         let nonce = [0x01u8, 0x02];
         let ticket = [0x99u8; 10];
         let mut out = [0u8; 64];
-        let n = build_new_session_ticket(600, 0xdead_beef, &nonce, &ticket, &[], &mut out)
-            .unwrap();
+        let n = build_new_session_ticket(600, 0xdead_beef, &nonce, &ticket, &[], &mut out).unwrap();
 
         // Layout: 4 + 4 + 1 + 2 + 2 + 10 + 2 = 25
         assert_eq!(n, 25);
@@ -1623,8 +1594,7 @@ mod tests {
     fn new_session_ticket_rejects_oversize_nonce() {
         let big_nonce = [0u8; 256];
         let mut out = [0u8; 1024];
-        assert!(build_new_session_ticket(60, 0, &big_nonce, &[1, 2, 3], &[], &mut out)
-            .is_none());
+        assert!(build_new_session_ticket(60, 0, &big_nonce, &[1, 2, 3], &[], &mut out).is_none());
     }
 
     #[test]

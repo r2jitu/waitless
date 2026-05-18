@@ -63,7 +63,9 @@ async fn init() {
             Err(f) => {
                 uni::println!(
                     "aead-kat: FAIL at byte {}: expected=0x{:02x} got=0x{:02x}",
-                    f.first_diverge_at, f.expected, f.actual,
+                    f.first_diverge_at,
+                    f.expected,
+                    f.actual,
                 );
                 diag::diag_append(b"aead-kat: FAIL at byte ");
                 diag::diag_append_hex(f.first_diverge_at as u64);
@@ -96,7 +98,9 @@ async fn init() {
             Err(f) => {
                 uni::println!(
                     "aead-fast-kat: FAIL at byte {}: expected=0x{:02x} got=0x{:02x}",
-                    f.first_diverge_at, f.expected, f.actual,
+                    f.first_diverge_at,
+                    f.expected,
+                    f.actual,
                 );
                 diag::diag_append(b"aead-fast-kat: FAIL at byte ");
                 diag::diag_append_hex(f.first_diverge_at as u64);
@@ -122,17 +126,24 @@ async fn init() {
     uni::println!("listen udp://:7 (echo)");
     uni::tcp_listen(9, tcp_echo).expect("tcp echo bind");
     uni::println!("listen tcp://:9 (echo)");
-    uni::tcp_listen(GATEWAY_PORT, move |s| gateway(s, backend_ip))
-        .expect("gateway bind");
-    uni::println!("listen tcp://:{} (gateway → udp://{}.{}.{}.{}:{})",
+    uni::tcp_listen(GATEWAY_PORT, move |s| gateway(s, backend_ip)).expect("gateway bind");
+    uni::println!(
+        "listen tcp://:{} (gateway → udp://{}.{}.{}.{}:{})",
         GATEWAY_PORT,
-        backend_ip[0], backend_ip[1], backend_ip[2], backend_ip[3],
-        GATEWAY_BACKEND_PORT);
+        backend_ip[0],
+        backend_ip[1],
+        backend_ip[2],
+        backend_ip[3],
+        GATEWAY_BACKEND_PORT
+    );
     uni_http::listen(HTTP_PORT, handle_request).expect("http bind");
     uni::println!("listen tcp://:{} (http)", HTTP_PORT);
 
     let h3_up = match uni_http3::listen(
-        HTTPS_PORT, handle_request_h3, DEV_CERT_DER, DEV_KEY_PKCS8_DER,
+        HTTPS_PORT,
+        handle_request_h3,
+        DEV_CERT_DER,
+        DEV_KEY_PKCS8_DER,
     ) {
         Ok(()) => {
             uni::println!("listen udp://:{} (h3, TLS_AES_128_GCM_SHA256)", HTTPS_PORT);
@@ -154,9 +165,15 @@ async fn init() {
         install_alt_svc_for_h3(HTTPS_PORT);
     }
     match uni_tls::listen(
-        HTTPS_PORT, handle_request_https, DEV_CERT_DER, DEV_KEY_PKCS8_DER,
+        HTTPS_PORT,
+        handle_request_https,
+        DEV_CERT_DER,
+        DEV_KEY_PKCS8_DER,
     ) {
-        Ok(()) => uni::println!("listen tcp://:{} (https, TLS_AES_128_GCM_SHA256)", HTTPS_PORT),
+        Ok(()) => uni::println!(
+            "listen tcp://:{} (https, TLS_AES_128_GCM_SHA256)",
+            HTTPS_PORT
+        ),
         Err(_) => uni::println!("[WARN] https disabled (cert/key invalid)"),
     }
 }
@@ -179,8 +196,7 @@ async fn init() {
 /// Acquire to pair with `install_alt_svc_for_h3`'s store.
 static ALT_SVC_PTR: core::sync::atomic::AtomicPtr<u8> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-static ALT_SVC_LEN: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static ALT_SVC_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 fn install_alt_svc_for_h3(port: u16) {
     let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(32);
@@ -201,8 +217,7 @@ fn install_alt_svc_for_h3(port: u16) {
     }
     buf.extend_from_slice(&tmp[..len]);
     buf.extend_from_slice(b"\"; ma=86400");
-    let leaked: &'static [u8] =
-        alloc::boxed::Box::leak(buf.into_boxed_slice());
+    let leaked: &'static [u8] = alloc::boxed::Box::leak(buf.into_boxed_slice());
     ALT_SVC_LEN.store(leaked.len(), core::sync::atomic::Ordering::Relaxed);
     ALT_SVC_PTR.store(
         leaked.as_ptr() as *mut u8,
@@ -248,10 +263,7 @@ async fn handle_request_https<S: uni_http::HttpStream>(
 /// between them means the future was constructed but never
 /// polled, which would be a runtime/scheduler bug rather than
 /// handler-internal work.
-async fn handle_request_h3(
-    req: Request,
-    body: &mut uni_http::BufferedBody<'_>,
-) -> Response {
+async fn handle_request_h3(req: Request, body: &mut uni_http::BufferedBody<'_>) -> Response {
     uni_http3::diag::bump(&uni_http3::diag::COUNTERS.user_handler_polled);
     handle_request(&req, body).await
 }
@@ -277,12 +289,7 @@ async fn tcp_echo(mut stream: TcpStream) {
         // TX with no intermediate copy on bare-metal. Contrast the
         // old `recv` + `send_bytes`: device buf → `buf` → TX,
         // two copies.
-        let guard = match uni::runtime::timeout_us(
-            30_000_000,
-            stream.recv_chunk(),
-        )
-        .await
-        {
+        let guard = match uni::runtime::timeout_us(30_000_000, stream.recv_chunk()).await {
             Some(Some(g)) => g,
             // inner `None`: peer close / EOF. outer `None`: idle
             // timeout. Either ends the connection.
@@ -300,13 +307,23 @@ async fn gateway(mut stream: TcpStream, backend_ip: [u8; 4]) {
     let backend = uni::runtime::IpAddr::V4(uni::runtime::Ipv4Addr {
         addr: u32::from_ne_bytes(backend_ip),
     });
-    let Ok(udp) = UdpClient::connect(backend, GATEWAY_BACKEND_PORT) else { return; };
+    let Ok(udp) = UdpClient::connect(backend, GATEWAY_BACKEND_PORT) else {
+        return;
+    };
     let mut buf = [0u8; GATEWAY_MSG_SIZE];
     loop {
-        if stream.recv_exact(&mut buf).await.is_err() { return; }
-        if udp.send(&buf).is_err() { return; }
-        if udp.recv(&mut buf).await != GATEWAY_MSG_SIZE { return; }
-        if stream.send_bytes(&buf).await.is_err() { return; }
+        if stream.recv_exact(&mut buf).await.is_err() {
+            return;
+        }
+        if udp.send(&buf).is_err() {
+            return;
+        }
+        if udp.recv(&mut buf).await != GATEWAY_MSG_SIZE {
+            return;
+        }
+        if stream.send_bytes(&buf).await.is_err() {
+            return;
+        }
     }
 }
 
@@ -318,15 +335,15 @@ async fn handle_request<S: uni_http::HttpStream>(
 ) -> Response {
     match req.path() {
         // ── HTML pages ───────────────────────────────────────────
-        b"/"             => page_home(),
+        b"/" => page_home(),
         b"/architecture" => page_architecture(),
-        b"/network"      => page_network(),
-        b"/tls"          => page_tls(),
-        b"/quic"         => page_quic(),
-        b"/diagnostics"  => page_diagnostics(),
+        b"/network" => page_network(),
+        b"/tls" => page_tls(),
+        b"/quic" => page_quic(),
+        b"/diagnostics" => page_diagnostics(),
 
         // ── JSON / text data endpoints (kept for tests + tooling) ─
-        b"/health"       => Response::ok(b"application/json", HEALTH_JSON),
+        b"/health" => Response::ok(b"application/json", HEALTH_JSON),
 
         // ── Static bulk-throughput endpoints ─────────────────────
         //
@@ -340,14 +357,14 @@ async fn handle_request<S: uni_http::HttpStream>(
         // body rendering. `/diagnostics`-style dynamic pages
         // bundle real CPU work per request and don't surface the
         // wire ceiling.
-        b"/static-16k"   => Response::ok(b"application/octet-stream", STATIC_16K_BYTES),
-        b"/static-64k"   => Response::ok(b"application/octet-stream", STATIC_64K_BYTES),
-        b"/static-256k"  => Response::ok(b"application/octet-stream", STATIC_256K_BYTES),
-        b"/static-1m"    => Response::ok(b"application/octet-stream", STATIC_1M_BYTES),
+        b"/static-16k" => Response::ok(b"application/octet-stream", STATIC_16K_BYTES),
+        b"/static-64k" => Response::ok(b"application/octet-stream", STATIC_64K_BYTES),
+        b"/static-256k" => Response::ok(b"application/octet-stream", STATIC_256K_BYTES),
+        b"/static-1m" => Response::ok(b"application/octet-stream", STATIC_1M_BYTES),
 
-        b"/stats"        => stats_response(),
-        b"/heap"         => heap_response(),
-        b"/quic_stats"   => quic_stats_response(),
+        b"/stats" => stats_response(),
+        b"/heap" => heap_response(),
+        b"/quic_stats" => quic_stats_response(),
         b"/compute" => {
             core::hint::black_box(compute_work());
             Response::ok(b"application/json", b"{\"status\":\"computed\"}")
@@ -372,17 +389,17 @@ async fn handle_request<S: uni_http::HttpStream>(
             }
             Response::ok(b"application/json", b"{\"status\":\"discarded\"}")
         }
-        b"/tls_profile"       => tls_profile_response(),
+        b"/tls_profile" => tls_profile_response(),
         b"/tls_profile_reset" => {
             uni_tls::tls_profile_reset();
             Response::ok(b"text/plain; charset=utf-8", b"tls profile reset\n")
         }
-        b"/diag-panic"        => diag_panic_response(),
-        b"/diag-panic-reset"  => {
+        b"/diag-panic" => diag_panic_response(),
+        b"/diag-panic-reset" => {
             uni::diagnostics::diag_reset();
             Response::ok(b"text/plain; charset=utf-8", b"diag reset\n")
         }
-        b"/diag-gve"          => diag_gve_response(),
+        b"/diag-gve" => diag_gve_response(),
 
         _ => Response::not_found(),
     }
@@ -392,7 +409,9 @@ fn log_boot_info() {
     let bi = uni::boot_info();
     uni::println!(
         "app: ram={}MB cpus={} nics={}",
-        bi.ram_bytes / (1024 * 1024), bi.num_cpus, bi.nics.len(),
+        bi.ram_bytes / (1024 * 1024),
+        bi.num_cpus,
+        bi.nics.len(),
     );
 }
 
@@ -488,7 +507,8 @@ const SHELL_HEAD_AFTER_TITLE: &[u8] = b" \xE2\x80\x94 UniKernel</title>";
 /// Between STYLES and the nav block (which the active-link
 /// loop builds dynamically because of the `class="active"`
 /// flip).
-const SHELL_AFTER_STYLES: &[u8] = b"</head><body><nav><a class=\"brand\" href=\"/\">\xE2\xAC\xA2 UniKernel</a>";
+const SHELL_AFTER_STYLES: &[u8] =
+    b"</head><body><nav><a class=\"brand\" href=\"/\">\xE2\xAC\xA2 UniKernel</a>";
 /// Static between nav and main.
 const SHELL_NAV_MAIN: &[u8] = b"</nav><main>";
 /// Static suffix from the close of `<main>` through `</html>`.
@@ -528,7 +548,11 @@ fn shell_body(active: &str, title: &str, body: IOBufChain) -> IOBufChain {
     {
         let mut w = nav_buf.writer();
         for (path, label) in NAV {
-            let class = if *path == active { " class=\"active\"" } else { "" };
+            let class = if *path == active {
+                " class=\"active\""
+            } else {
+                ""
+            };
             let _ = write!(w, "<a href=\"{}\"{}>{}</a>", path, class, label);
         }
     }
@@ -551,7 +575,10 @@ fn shell_body(active: &str, title: &str, body: IOBufChain) -> IOBufChain {
 }
 
 fn html_response(active: &str, title: &str, body: impl Into<uni_http::IOBufChain>) -> Response {
-    Response::ok(b"text/html; charset=utf-8", shell_body(active, title, body.into()))
+    Response::ok(
+        b"text/html; charset=utf-8",
+        shell_body(active, title, body.into()),
+    )
 }
 
 // ---- Page bodies ------------------------------------------------------------
@@ -813,34 +840,51 @@ fn page_diagnostics() -> Response {
     {
         let mut w = body.writer();
 
-        let _ = w.write_str("\
+        let _ = w.write_str(
+            "\
 <h1>Diagnostics</h1>\
 <p class=\"lead\">Live counters from the unikernel. This page \
 auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
-<meta http-equiv=\"refresh\" content=\"5\">");
+<meta http-equiv=\"refresh\" content=\"5\">",
+        );
 
         // ── Heap ──────────────────────────────────────────────────────
         let heap = uni::diagnostics::heap_stats();
         let _ = w.write_str("<h2>Heap</h2><table>");
         let _ = w.write_str("<tr><th>Field</th><th>Value</th></tr>");
-        let _ = write!(w,
+        let _ = write!(
+            w,
             "<tr><td>allocated</td><td class=\"num\">{} B ({} KiB)</td></tr>",
-            heap.allocated_bytes, heap.allocated_bytes / 1024);
-        let _ = write!(w,
+            heap.allocated_bytes,
+            heap.allocated_bytes / 1024
+        );
+        let _ = write!(
+            w,
             "<tr><td>available</td><td class=\"num\">{} B ({} KiB)</td></tr>",
-            heap.available_bytes, heap.available_bytes / 1024);
-        let _ = write!(w,
+            heap.available_bytes,
+            heap.available_bytes / 1024
+        );
+        let _ = write!(
+            w,
             "<tr><td>claimed (heap size)</td><td class=\"num\">{} B ({} KiB)</td></tr>",
-            heap.claimed_bytes, heap.claimed_bytes / 1024);
-        let _ = write!(w,
+            heap.claimed_bytes,
+            heap.claimed_bytes / 1024
+        );
+        let _ = write!(
+            w,
             "<tr><td>live allocations</td><td class=\"num\">{}</td></tr>",
-            heap.allocation_count);
-        let _ = write!(w,
+            heap.allocation_count
+        );
+        let _ = write!(
+            w,
             "<tr><td>fragments</td><td class=\"num\">{}</td></tr>",
-            heap.fragment_count);
-        let _ = write!(w,
+            heap.fragment_count
+        );
+        let _ = write!(
+            w,
             "<tr><td>total allocations (lifetime)</td><td class=\"num\">{}</td></tr>",
-            heap.total_allocation_count);
+            heap.total_allocation_count
+        );
         let _ = w.write_str("</table>");
         let _ = w.write_str("<p><a href=\"/heap\"><code>/heap</code></a> · raw JSON</p>");
 
@@ -850,15 +894,23 @@ auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
         let nqp = uni::diagnostics::net_num_queue_pairs() as usize;
         let nqp_clamped = nqp.min(counts.len()).min(cursors.len());
         let _ = w.write_str("<h2>NIC RX queues</h2>");
-        let _ = write!(w, "<p>{} queue pair{} negotiated.</p>",
-            nqp, if nqp == 1 { "" } else { "s" });
-        let _ = w.write_str("<table><tr><th>Queue</th><th>Frames RX'd</th>\
-<th>Used (device)</th><th>Used (driver)</th></tr>");
+        let _ = write!(
+            w,
+            "<p>{} queue pair{} negotiated.</p>",
+            nqp,
+            if nqp == 1 { "" } else { "s" }
+        );
+        let _ = w.write_str(
+            "<table><tr><th>Queue</th><th>Frames RX'd</th>\
+<th>Used (device)</th><th>Used (driver)</th></tr>",
+        );
         for i in 0..nqp_clamped {
-            let _ = write!(w,
+            let _ = write!(
+                w,
                 "<tr><td>{}</td><td class=\"num\">{}</td>\
 <td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
-                i, counts[i], cursors[i].0, cursors[i].1);
+                i, counts[i], cursors[i].0, cursors[i].1
+            );
         }
         let _ = w.write_str("</table>");
         let _ = w.write_str("<p><a href=\"/stats\"><code>/stats</code></a> · raw JSON</p>");
@@ -867,9 +919,11 @@ auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
         let _ = w.write_str("<h2>QUIC events &amp; drops</h2>");
         let _ = w.write_str("<table><tr><th>Counter</th><th>Value</th></tr>");
         for (name, value) in uni_quic::diag::snapshot() {
-            let _ = write!(w,
+            let _ = write!(
+                w,
                 "<tr><td><code>{}</code></td><td class=\"num\">{}</td></tr>",
-                name, value);
+                name, value
+            );
         }
         let _ = w.write_str("</table>");
 
@@ -877,21 +931,25 @@ auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
         let _ = w.write_str("<h2>HTTP/3 events &amp; drops</h2>");
         let _ = w.write_str("<table><tr><th>Counter</th><th>Value</th></tr>");
         for (name, value) in uni_http3::diag::snapshot() {
-            let _ = write!(w,
+            let _ = write!(
+                w,
                 "<tr><td><code>{}</code></td><td class=\"num\">{}</td></tr>",
-                name, value);
+                name, value
+            );
         }
         let _ = w.write_str("</table>");
-        let _ = w.write_str("<p><a href=\"/quic_stats\"><code>/quic_stats</code></a> · raw JSON · ");
-        let _ = w.write_str("<a href=\"/tls_profile\"><code>/tls_profile</code></a> · TLS handshake timing</p>");
+        let _ =
+            w.write_str("<p><a href=\"/quic_stats\"><code>/quic_stats</code></a> · raw JSON · ");
+        let _ = w.write_str(
+            "<a href=\"/tls_profile\"><code>/tls_profile</code></a> · TLS handshake timing</p>",
+        );
     }
     html_response("/diagnostics", "Diagnostics", body)
 }
 
 // ---- JSON / text data endpoints --------------------------------------------
 
-const HEALTH_JSON: &[u8] =
-    b"{\"status\":\"ok\",\"runtime\":\"unikernel\",\"version\":\"0.1.0\"}";
+const HEALTH_JSON: &[u8] = b"{\"status\":\"ok\",\"runtime\":\"unikernel\",\"version\":\"0.1.0\"}";
 
 /// Static bulk-throughput bodies. All-zero payloads sized for
 /// bench workloads that measure data-plane throughput
@@ -957,7 +1015,11 @@ fn rss_chi_squared_x100(observed: &[u64]) -> u64 {
     }
     let mut acc: u64 = 0;
     for &o in observed {
-        let diff = if o > expected { o - expected } else { expected - o };
+        let diff = if o > expected {
+            o - expected
+        } else {
+            expected - o
+        };
         // (diff² / expected) — at bench scale (≤ 10⁷ packets/q),
         // diff² fits in u64 with margin (10¹⁴ vs u64 max 1.8×10¹⁹).
         let term = diff.saturating_mul(diff) / expected;
@@ -1153,7 +1215,11 @@ fn stats_response() -> Response {
         emit_json_array(&mut w, "core_busy_cycles", &busy_cyc[..nc]);
         let _ = w.write_str(",");
         emit_json_array(&mut w, "core_idle_cycles", &idle_cyc[..nc]);
-        let _ = write!(w, ",\"cycles_per_us\":{}", uni::diagnostics::cycles_per_us());
+        let _ = write!(
+            w,
+            ",\"cycles_per_us\":{}",
+            uni::diagnostics::cycles_per_us()
+        );
 
         // gve NIC-driver counters, via `uni::diagnostics::gve_diag`
         // — NOT a direct `uni_driver_gve` reference: the gve driver
@@ -1214,10 +1280,7 @@ fn stats_response() -> Response {
             w,
             ",\"tcp_syn_rx\":{},\"tcp_synack_tx\":{}\
               ,\"rx_chunk_stash_hits\":{},\"rx_chunk_ring_drain\":{}",
-            tcp.syn_rx,
-            tcp.synack_tx,
-            tcp.rx_chunk_stash_hits,
-            tcp.rx_chunk_ring_drain,
+            tcp.syn_rx, tcp.synack_tx, tcp.rx_chunk_stash_hits, tcp.rx_chunk_ring_drain,
         );
 
         // ---- AEAD throughput (TLS + QUIC) ----
@@ -1232,14 +1295,18 @@ fn stats_response() -> Response {
         // overhead dominates).
         let (tls_enc_b, tls_enc_r, tls_enc_cyc, tls_dec_b, tls_dec_r, tls_dec_cyc) =
             uni_tls::record::encrypt_stats();
-        let qenc_b = uni_quic::diag::COUNTERS.aead_seal_bytes.load(
-            core::sync::atomic::Ordering::Relaxed);
-        let qenc_p = uni_quic::diag::COUNTERS.aead_seal_packets.load(
-            core::sync::atomic::Ordering::Relaxed);
-        let qdec_b = uni_quic::diag::COUNTERS.aead_open_bytes.load(
-            core::sync::atomic::Ordering::Relaxed);
-        let qdec_p = uni_quic::diag::COUNTERS.aead_open_packets.load(
-            core::sync::atomic::Ordering::Relaxed);
+        let qenc_b = uni_quic::diag::COUNTERS
+            .aead_seal_bytes
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let qenc_p = uni_quic::diag::COUNTERS
+            .aead_seal_packets
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let qdec_b = uni_quic::diag::COUNTERS
+            .aead_open_bytes
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let qdec_p = uni_quic::diag::COUNTERS
+            .aead_open_packets
+            .load(core::sync::atomic::Ordering::Relaxed);
         let _ = write!(
             w,
             ",\"tls_encrypt_bytes\":{},\
@@ -1252,9 +1319,16 @@ fn stats_response() -> Response {
               \"quic_aead_seal_packets\":{},\
               \"quic_aead_open_bytes\":{},\
               \"quic_aead_open_packets\":{}",
-            tls_enc_b, tls_enc_r, tls_enc_cyc,
-            tls_dec_b, tls_dec_r, tls_dec_cyc,
-            qenc_b, qenc_p, qdec_b, qdec_p,
+            tls_enc_b,
+            tls_enc_r,
+            tls_enc_cyc,
+            tls_dec_b,
+            tls_dec_r,
+            tls_dec_cyc,
+            qenc_b,
+            qenc_p,
+            qdec_b,
+            qdec_p,
         );
 
         let _ = w.write_str("}");
@@ -1269,11 +1343,16 @@ fn heap_response() -> Response {
     // place path in `TlsStream::send` applies for HTTPS.
     let s = uni::diagnostics::heap_stats();
     let mut body = uni_http::body_iobuf(256);
-    let _ = write!(body.writer(),
+    let _ = write!(
+        body.writer(),
         "{{\"allocated_bytes\":{},\"available_bytes\":{},\"claimed_bytes\":{},\
          \"allocation_count\":{},\"fragment_count\":{},\"total_allocation_count\":{}}}",
-        s.allocated_bytes, s.available_bytes, s.claimed_bytes,
-        s.allocation_count, s.fragment_count, s.total_allocation_count,
+        s.allocated_bytes,
+        s.available_bytes,
+        s.claimed_bytes,
+        s.allocation_count,
+        s.fragment_count,
+        s.total_allocation_count,
     );
     Response::ok(&b"application/json"[..], body)
 }
@@ -1291,7 +1370,9 @@ fn quic_stats_response() -> Response {
         let _ = w.write_str("{");
         let mut first = true;
         for (name, value) in uni_quic::diag::snapshot() {
-            if !first { let _ = w.write_str(","); }
+            if !first {
+                let _ = w.write_str(",");
+            }
             first = false;
             let _ = write!(w, "\"{}\":{}", name, value);
         }
@@ -1353,7 +1434,10 @@ fn diag_gve_response() -> Response {
     let mut body = uni_http::body_iobuf(CAP);
     {
         let mut w = body.writer();
-        let _ = writeln!(w, "# gve TX descriptor capture (last {n} entries, oldest first)");
+        let _ = writeln!(
+            w,
+            "# gve TX descriptor capture (last {n} entries, oldest first)"
+        );
         let _ = writeln!(w, "# kind: 0=STD 1=TSO_PKT 2=SEG");
         for e in &entries {
             let _ = write!(w, "seq={:08} qp={} kind={} bytes=", e.seq, e.qp, e.kind);

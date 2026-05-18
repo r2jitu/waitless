@@ -164,7 +164,9 @@ unsafe fn inb(port: u16) -> u8 {
 /// Small I/O delay by writing to port 0x80 (POST diagnostic port).
 #[inline(always)]
 fn io_wait() {
-    unsafe { outb(0x80, 0); }
+    unsafe {
+        outb(0x80, 0);
+    }
 }
 
 // ============================================================================
@@ -247,94 +249,94 @@ unsafe fn set_idt_entry(vector: usize, handler_addr: u64, selector: u16, ist: u8
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
     unsafe {
-    let vector = (*frame).vector as usize;
+        let vector = (*frame).vector as usize;
 
-    // Dispatch to registered handler if one exists
-    if let Some(handler) = (*IDT.0.get()).handlers[vector] {
-        handler(frame);
-        // Send EOI for hardware IRQs (vectors 32-47) via PIC
+        // Dispatch to registered handler if one exists
+        if let Some(handler) = (*IDT.0.get()).handlers[vector] {
+            handler(frame);
+            // Send EOI for hardware IRQs (vectors 32-47) via PIC
+            if vector >= 32 && vector < 48 {
+                if vector >= 40 {
+                    outb(PIC2_CMD, 0x20); // Slave PIC EOI
+                }
+                outb(PIC1_CMD, 0x20); // Master PIC EOI
+            } else if vector >= 48 {
+                // APIC vector — send APIC EOI
+                super::apic::eoi();
+            }
+            return;
+        }
+
+        // No handler registered — handle defaults
+
+        // For hardware IRQs without handlers, just send EOI (spurious/unhandled)
         if vector >= 32 && vector < 48 {
             if vector >= 40 {
-                outb(PIC2_CMD, 0x20); // Slave PIC EOI
+                outb(PIC2_CMD, 0x20);
             }
-            outb(PIC1_CMD, 0x20); // Master PIC EOI
-        } else if vector >= 48 {
-            // APIC vector — send APIC EOI
+            outb(PIC1_CMD, 0x20);
+            return;
+        }
+
+        // APIC vectors without handlers: send EOI and return
+        if vector >= 48 {
             super::apic::eoi();
+            return;
         }
-        return;
-    }
 
-    // No handler registered — handle defaults
+        // Unhandled CPU exception — capture diagnostic, print it, halt
+        // the offending core. Other cores keep running and can read the
+        // capture via `/diag-panic` — critical when serial-port-output is
+        // not externally accessible (sandboxed GCE deploys).
+        if vector < 32 {
+            let rip = (*frame).rip;
+            let err = (*frame).error_code;
+            let rsp = (*frame).rsp;
+            let rflags = (*frame).rflags;
+            let mut cr2: u64;
+            asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
 
-    // For hardware IRQs without handlers, just send EOI (spurious/unhandled)
-    if vector >= 32 && vector < 48 {
-        if vector >= 40 {
-            outb(PIC2_CMD, 0x20);
+            // Capture into the in-band diag buffer first so it lands
+            // even on systems where the serial sink is silently
+            // dropped. We use the byte-oriented `append*` helpers to
+            // avoid pulling in `core::fmt` from a potentially-corrupt
+            // execution context.
+            crate::diag::append(b"\n!!! UNHANDLED EXCEPTION on cpu ");
+            crate::diag::append_u32(crate::cpu_id());
+            crate::diag::append(b" !!!\n  vector=0x");
+            crate::diag::append_hex(vector as u64);
+            crate::diag::append(b" err=0x");
+            crate::diag::append_hex(err);
+            crate::diag::append(b"\n  rip=0x");
+            crate::diag::append_hex(rip);
+            crate::diag::append(b" rsp=0x");
+            crate::diag::append_hex(rsp);
+            crate::diag::append(b"\n  rflags=0x");
+            crate::diag::append_hex(rflags);
+            crate::diag::append(b" cr2=0x");
+            crate::diag::append_hex(cr2);
+            crate::diag::append(b"\n");
+
+            // Mirror to serial for the case where the operator HAS
+            // serial access — same bytes either way.
+            crate::serial::puts(b"\n!!! UNHANDLED EXCEPTION !!!\n");
+            crate::serial::puts(b"  vector=");
+            crate::serial::print_hex(vector as u64);
+            crate::serial::puts(b" err=");
+            crate::serial::print_hex(err);
+            crate::serial::puts(b"\n  rip=");
+            crate::serial::print_hex(rip);
+            crate::serial::puts(b" rsp=");
+            crate::serial::print_hex(rsp);
+            crate::serial::puts(b"\n  rflags=");
+            crate::serial::print_hex(rflags);
+            crate::serial::puts(b" cr2=");
+            crate::serial::print_hex(cr2);
+            crate::serial::puts(b"\nSystem halted.\n");
+            loop {
+                asm!("cli", "hlt", options(nomem, nostack));
+            }
         }
-        outb(PIC1_CMD, 0x20);
-        return;
-    }
-
-    // APIC vectors without handlers: send EOI and return
-    if vector >= 48 {
-        super::apic::eoi();
-        return;
-    }
-
-    // Unhandled CPU exception — capture diagnostic, print it, halt
-    // the offending core. Other cores keep running and can read the
-    // capture via `/diag-panic` — critical when serial-port-output is
-    // not externally accessible (sandboxed GCE deploys).
-    if vector < 32 {
-        let rip = (*frame).rip;
-        let err = (*frame).error_code;
-        let rsp = (*frame).rsp;
-        let rflags = (*frame).rflags;
-        let mut cr2: u64;
-        asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
-
-        // Capture into the in-band diag buffer first so it lands
-        // even on systems where the serial sink is silently
-        // dropped. We use the byte-oriented `append*` helpers to
-        // avoid pulling in `core::fmt` from a potentially-corrupt
-        // execution context.
-        crate::diag::append(b"\n!!! UNHANDLED EXCEPTION on cpu ");
-        crate::diag::append_u32(crate::cpu_id());
-        crate::diag::append(b" !!!\n  vector=0x");
-        crate::diag::append_hex(vector as u64);
-        crate::diag::append(b" err=0x");
-        crate::diag::append_hex(err);
-        crate::diag::append(b"\n  rip=0x");
-        crate::diag::append_hex(rip);
-        crate::diag::append(b" rsp=0x");
-        crate::diag::append_hex(rsp);
-        crate::diag::append(b"\n  rflags=0x");
-        crate::diag::append_hex(rflags);
-        crate::diag::append(b" cr2=0x");
-        crate::diag::append_hex(cr2);
-        crate::diag::append(b"\n");
-
-        // Mirror to serial for the case where the operator HAS
-        // serial access — same bytes either way.
-        crate::serial::puts(b"\n!!! UNHANDLED EXCEPTION !!!\n");
-        crate::serial::puts(b"  vector=");
-        crate::serial::print_hex(vector as u64);
-        crate::serial::puts(b" err=");
-        crate::serial::print_hex(err);
-        crate::serial::puts(b"\n  rip=");
-        crate::serial::print_hex(rip);
-        crate::serial::puts(b" rsp=");
-        crate::serial::print_hex(rsp);
-        crate::serial::puts(b"\n  rflags=");
-        crate::serial::print_hex(rflags);
-        crate::serial::puts(b" cr2=");
-        crate::serial::print_hex(cr2);
-        crate::serial::puts(b"\nSystem halted.\n");
-        loop {
-            asm!("cli", "hlt", options(nomem, nostack));
-        }
-    }
     }
 }
 

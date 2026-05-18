@@ -108,7 +108,11 @@ impl TcpStream {
     /// conn is ready.
     #[inline]
     pub const fn from_raw(handle: *mut (), generation: u16) -> Self {
-        TcpStream { handle, generation, _not_send: PhantomData }
+        TcpStream {
+            handle,
+            generation,
+            _not_send: PhantomData,
+        }
     }
 
     #[inline]
@@ -225,10 +229,7 @@ impl TcpStream {
     /// opaque-handle aliasing is invisible to the borrow checker —
     /// the exclusive borrow is what serialises sends per stream.
     #[inline]
-    pub fn send<'a>(
-        &'a mut self,
-        chain: &'a mut uni_iobuf::IOBufChain,
-    ) -> TcpSendChain<'a> {
+    pub fn send<'a>(&'a mut self, chain: &'a mut uni_iobuf::IOBufChain) -> TcpSendChain<'a> {
         TcpSendChain::new(self.handle, self.generation, chain)
     }
 
@@ -254,11 +255,7 @@ impl TcpStream {
     /// known is fine. The backend short-circuits to `None`
     /// (without acquiring a slot or running the closure) when
     /// `min_payload <= mss` — see [`TcpBackend::try_send_tso`].
-    pub fn try_send_tso<F>(
-        &mut self,
-        min_payload: usize,
-        mut fill: F,
-    ) -> Option<Result<usize, ()>>
+    pub fn try_send_tso<F>(&mut self, min_payload: usize, mut fill: F) -> Option<Result<usize, ()>>
     where
         F: FnMut(&mut [u8]) -> Result<usize, ()>,
     {
@@ -331,8 +328,7 @@ impl TcpState {
     }
 }
 
-static TCP_REGISTRY: [TcpState; MAX_TCP_LISTENERS] =
-    [const { TcpState::new() }; MAX_TCP_LISTENERS];
+static TCP_REGISTRY: [TcpState; MAX_TCP_LISTENERS] = [const { TcpState::new() }; MAX_TCP_LISTENERS];
 
 // ---- Backend vtable (TCP) ---------------------------------------------------
 
@@ -373,8 +369,7 @@ pub struct TcpBackend {
     /// Store this waker. Called before the final has-data re-check;
     /// the backend de-dupes with `Waker::will_wake`. A stale `gen`
     /// fires `waker` immediately.
-    pub register_recv_waker:
-        fn(handle: *mut (), generation: u16, waker: &Waker),
+    pub register_recv_waker: fn(handle: *mut (), generation: u16, waker: &Waker),
     /// Drop the stored recv waker. Called after Ready. Stale `gen`
     /// is a no-op.
     pub clear_recv_waker: fn(handle: *mut (), generation: u16),
@@ -391,12 +386,7 @@ pub struct TcpBackend {
     /// dangling pointer that the next `tcp_receive` would write
     /// into. Native backends leave both `None` — POSIX `recv()`
     /// already copies in one shot at the syscall boundary.
-    pub set_recv_buf_slot: Option<fn(
-        handle: *mut (),
-        generation: u16,
-        ptr: *mut u8,
-        cap: u16,
-    )>,
+    pub set_recv_buf_slot: Option<fn(handle: *mut (), generation: u16, ptr: *mut u8, cap: u16)>,
     pub clear_recv_buf_slot: Option<fn(handle: *mut (), generation: u16)>,
 
     /// Optional zero-copy chunk-recv path — the backing for
@@ -419,8 +409,7 @@ pub struct TcpBackend {
     /// `clear_recv_waker`) are reused — readiness is a conn-level
     /// signal, and a conn never has both a `recv` and a
     /// `recv_chunk` future parked at once.
-    pub do_recv_chunk:
-        Option<fn(handle: *mut (), generation: u16) -> Option<uni_iobuf::IOBuf>>,
+    pub do_recv_chunk: Option<fn(handle: *mut (), generation: u16) -> Option<uni_iobuf::IOBuf>>,
     pub set_chunk_buf_slot: Option<fn(handle: *mut (), generation: u16)>,
     pub clear_chunk_buf_slot: Option<fn(handle: *mut (), generation: u16)>,
 
@@ -463,8 +452,7 @@ pub struct TcpBackend {
     ) -> Result<usize, ()>,
     /// Park `waker` on the conn's send slot; a subsequent writable
     /// event fires it. Stale `gen` fires immediately.
-    pub register_send_waker:
-        fn(handle: *mut (), generation: u16, waker: &Waker),
+    pub register_send_waker: fn(handle: *mut (), generation: u16, waker: &Waker),
     /// Drop the stored send waker.
     pub clear_send_waker: fn(handle: *mut (), generation: u16),
 
@@ -494,12 +482,14 @@ pub struct TcpBackend {
     /// some hardware TSO — gve in particular — silently drops
     /// payloads at or below MSS, so the gate is correctness-load-
     /// bearing in those backends.)
-    pub try_send_tso: Option<fn(
-        handle: *mut (),
-        generation: u16,
-        min_payload: usize,
-        fill: &mut dyn FnMut(&mut [u8]) -> Result<usize, ()>,
-    ) -> Option<Result<usize, ()>>>,
+    pub try_send_tso: Option<
+        fn(
+            handle: *mut (),
+            generation: u16,
+            min_payload: usize,
+            fill: &mut dyn FnMut(&mut [u8]) -> Result<usize, ()>,
+        ) -> Option<Result<usize, ()>>,
+    >,
 
     /// Optional. RST every connection currently in the backend's
     /// pool — called once at shutdown so peers see an immediate
@@ -509,8 +499,7 @@ pub struct TcpBackend {
     pub shutdown_all: Option<fn()>,
 }
 
-static TCP_BACKEND: AtomicPtr<TcpBackend> =
-    AtomicPtr::new(core::ptr::null_mut());
+static TCP_BACKEND: AtomicPtr<TcpBackend> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Install the TCP backend. Call once at boot.
 pub fn register_tcp_backend(b: &'static TcpBackend) {
@@ -598,7 +587,9 @@ impl TcpListener {
                 .compare_exchange(0, port, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                state.wakers.ensure_init(num_workers(), |_| SpinLock::new(None));
+                state
+                    .wakers
+                    .ensure_init(num_workers(), |_| SpinLock::new(None));
                 for w in 0..num_workers() {
                     *state.wakers.at(w).lock() = None;
                 }
@@ -681,21 +672,15 @@ impl TcpListener {
                     let _ = crate::spawn_boxed(fut);
                 }
             }) {
-                install_worker_task(
-                    &ctx_for_launcher.stopping,
-                    &ctx_for_launcher.handles,
-                    h,
-                );
+                install_worker_task(&ctx_for_launcher.stopping, &ctx_for_launcher.handles, h);
             }
         }));
         TcpHandle { ctx, launcher_slot }
     }
 }
 
-type BoxedAcceptBody = Box<
-    dyn Fn(TcpStream) -> Pin<Box<dyn Future<Output = ()>>>
-        + Send + Sync + 'static,
->;
+type BoxedAcceptBody =
+    Box<dyn Fn(TcpStream) -> Pin<Box<dyn Future<Output = ()>>> + Send + Sync + 'static>;
 
 /// Per-fanout shared state for `TcpListener::run`. Shape mirrors
 /// `UdpFanoutCtx`; separated because the two reactors register
@@ -816,7 +801,12 @@ pub struct TcpRecv<'a> {
 impl<'a> TcpRecv<'a> {
     #[inline]
     pub fn new(handle: *mut (), generation: u16, buf: &'a mut [u8]) -> Self {
-        TcpRecv { handle, generation, buf, _not_send: PhantomData }
+        TcpRecv {
+            handle,
+            generation,
+            buf,
+            _not_send: PhantomData,
+        }
     }
 }
 
@@ -930,7 +920,10 @@ impl<'a> RecvChunkGuard<'a> {
     /// stay generic over the stream.
     #[inline]
     pub fn new(iobuf: uni_iobuf::IOBuf) -> Self {
-        RecvChunkGuard { iobuf, _borrow: PhantomData }
+        RecvChunkGuard {
+            iobuf,
+            _borrow: PhantomData,
+        }
     }
 
     /// The chunk's bytes, read in place. Zero copy. Callers that
@@ -1070,11 +1063,7 @@ pub struct TcpSendChain<'a> {
 
 impl<'a> TcpSendChain<'a> {
     #[inline]
-    pub fn new(
-        handle: *mut (),
-        generation: u16,
-        chain: &'a mut uni_iobuf::IOBufChain,
-    ) -> Self {
+    pub fn new(handle: *mut (), generation: u16, chain: &'a mut uni_iobuf::IOBufChain) -> Self {
         TcpSendChain {
             handle,
             generation,

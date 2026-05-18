@@ -180,7 +180,11 @@ impl VirtioConsole {
             QUEUE_NUM_MAX => QUEUE_SIZE_MAX,
             QUEUE_READY => {
                 let qi = self.queue_sel as usize;
-                if qi < NUM_QUEUES { self.queues[qi].ready as u32 } else { 0 }
+                if qi < NUM_QUEUES {
+                    self.queues[qi].ready as u32
+                } else {
+                    0
+                }
             }
             STATUS => self.status,
             INTERRUPT_STATUS => {
@@ -205,40 +209,58 @@ impl VirtioConsole {
             DRIVER_FEATURES_SEL => self.driver_features_sel = value,
             DRIVER_FEATURES => {
                 let sel = self.driver_features_sel as usize;
-                if sel < 2 { self.driver_features[sel] = value; }
+                if sel < 2 {
+                    self.driver_features[sel] = value;
+                }
             }
             QUEUE_SEL => self.queue_sel = value,
             QUEUE_NUM => {
                 let qi = self.queue_sel as usize;
-                if qi < NUM_QUEUES { self.queues[qi].num = value; }
+                if qi < NUM_QUEUES {
+                    self.queues[qi].num = value;
+                }
             }
             QUEUE_READY => {
                 let qi = self.queue_sel as usize;
-                if qi < NUM_QUEUES { self.queues[qi].ready = value != 0; }
+                if qi < NUM_QUEUES {
+                    self.queues[qi].ready = value != 0;
+                }
             }
             QUEUE_DESC_LOW => {
                 let qi = self.queue_sel as usize;
-                if qi < NUM_QUEUES { self.queues[qi].desc_lo = value; }
+                if qi < NUM_QUEUES {
+                    self.queues[qi].desc_lo = value;
+                }
             }
             QUEUE_DESC_HIGH => {
                 let qi = self.queue_sel as usize;
-                if qi < NUM_QUEUES { self.queues[qi].desc_hi = value; }
+                if qi < NUM_QUEUES {
+                    self.queues[qi].desc_hi = value;
+                }
             }
             QUEUE_DRIVER_LOW => {
                 let qi = self.queue_sel as usize;
-                if qi < NUM_QUEUES { self.queues[qi].driver_lo = value; }
+                if qi < NUM_QUEUES {
+                    self.queues[qi].driver_lo = value;
+                }
             }
             QUEUE_DRIVER_HIGH => {
                 let qi = self.queue_sel as usize;
-                if qi < NUM_QUEUES { self.queues[qi].driver_hi = value; }
+                if qi < NUM_QUEUES {
+                    self.queues[qi].driver_hi = value;
+                }
             }
             QUEUE_DEVICE_LOW => {
                 let qi = self.queue_sel as usize;
-                if qi < NUM_QUEUES { self.queues[qi].device_lo = value; }
+                if qi < NUM_QUEUES {
+                    self.queues[qi].device_lo = value;
+                }
             }
             QUEUE_DEVICE_HIGH => {
                 let qi = self.queue_sel as usize;
-                if qi < NUM_QUEUES { self.queues[qi].device_hi = value; }
+                if qi < NUM_QUEUES {
+                    self.queues[qi].device_hi = value;
+                }
             }
             STATUS => {
                 self.status = value;
@@ -246,7 +268,9 @@ impl VirtioConsole {
                     self.driver_features = [0; 2];
                     self.queue_sel = 0;
                     self.interrupt_status = 0;
-                    for q in &mut self.queues { *q = Default::default(); }
+                    for q in &mut self.queues {
+                        *q = Default::default();
+                    }
                 }
                 if value & STATUS_FEATURES_OK != 0 {
                     self.status |= STATUS_FEATURES_OK;
@@ -270,24 +294,27 @@ impl VirtioConsole {
         // last_avail/used_idx updates) without aliasing a borrow of
         // self.queues.
         let q = &self.queues[TX_QUEUE];
-        if !q.ready { return; }
+        if !q.ready {
+            return;
+        }
         let qsize = q.num as u16;
-        if qsize == 0 || (qsize & (qsize - 1)) != 0 { return; }
+        if qsize == 0 || (qsize & (qsize - 1)) != 0 {
+            return;
+        }
         let desc_addr = q.desc_addr();
         let avail_addr = q.avail_addr();
         let used_addr = q.used_addr();
         let mut last = q.last_avail;
         let mut used_idx = q.used_idx;
 
-        let avail_idx = unsafe {
-            std::ptr::read_volatile(self.gpa_to_host(avail_addr + 2) as *const u16)
-        };
+        let avail_idx =
+            unsafe { std::ptr::read_volatile(self.gpa_to_host(avail_addr + 2) as *const u16) };
 
         while last != avail_idx {
             let ring_slot = last & (qsize - 1);
             let first_desc = unsafe {
                 std::ptr::read_volatile(
-                    self.gpa_to_host(avail_addr + 4 + ring_slot as u64 * 2) as *const u16,
+                    self.gpa_to_host(avail_addr + 4 + ring_slot as u64 * 2) as *const u16
                 )
             };
 
@@ -311,7 +338,9 @@ impl VirtioConsole {
                 }
                 total_len += len;
 
-                if flags & VRING_DESC_F_NEXT == 0 { break; }
+                if flags & VRING_DESC_F_NEXT == 0 {
+                    break;
+                }
                 desc_idx = next;
             }
 
@@ -332,10 +361,7 @@ impl VirtioConsole {
             q.last_avail = last;
             q.used_idx = used_idx;
             unsafe {
-                std::ptr::write_volatile(
-                    self.gpa_to_host(used_addr + 2) as *mut u16,
-                    used_idx,
-                );
+                std::ptr::write_volatile(self.gpa_to_host(used_addr + 2) as *mut u16, used_idx);
             }
         }
 
@@ -348,7 +374,9 @@ impl VirtioConsole {
 
     fn append_tx(&mut self, bytes: &[u8]) {
         for &b in bytes {
-            if b == 0 { continue; } // null-terminator from packed writes
+            if b == 0 {
+                continue;
+            } // null-terminator from packed writes
             self.tx_pending.push(b);
             // Flush eagerly on newline for line-buffered console feel.
             // 256 bytes is the upper bound — anything bigger and we'd
@@ -360,7 +388,9 @@ impl VirtioConsole {
     }
 
     fn flush_tx(&mut self) {
-        if self.tx_pending.is_empty() { return; }
+        if self.tx_pending.is_empty() {
+            return;
+        }
         let _ = std::io::stdout().write_all(&self.tx_pending);
         let _ = std::io::stdout().flush();
         self.tx_pending.clear();
@@ -373,9 +403,13 @@ impl VirtioConsole {
     /// the bytes in `RX_BUF` for the next cycle.
     fn process_rx(&mut self) {
         let q = &self.queues[RX_QUEUE];
-        if !q.ready { return; }
+        if !q.ready {
+            return;
+        }
         let qsize = q.num as u16;
-        if qsize == 0 || (qsize & (qsize - 1)) != 0 { return; }
+        if qsize == 0 || (qsize & (qsize - 1)) != 0 {
+            return;
+        }
         let desc_addr = q.desc_addr();
         let avail_addr = q.avail_addr();
         let used_addr = q.used_addr();
@@ -383,20 +417,23 @@ impl VirtioConsole {
         let mut used_idx = q.used_idx;
 
         let mut buf = RX_BUF.lock().unwrap();
-        if buf.is_empty() { return; }
+        if buf.is_empty() {
+            return;
+        }
 
-        let avail_idx = unsafe {
-            std::ptr::read_volatile(self.gpa_to_host(avail_addr + 2) as *const u16)
-        };
+        let avail_idx =
+            unsafe { std::ptr::read_volatile(self.gpa_to_host(avail_addr + 2) as *const u16) };
         let mut pushed = 0;
 
         while last != avail_idx {
-            let Some(byte) = buf.pop_front() else { break; };
+            let Some(byte) = buf.pop_front() else {
+                break;
+            };
 
             let ring_slot = last & (qsize - 1);
             let first_desc = unsafe {
                 std::ptr::read_volatile(
-                    self.gpa_to_host(avail_addr + 4 + ring_slot as u64 * 2) as *const u16,
+                    self.gpa_to_host(avail_addr + 4 + ring_slot as u64 * 2) as *const u16
                 )
             };
 
@@ -404,7 +441,9 @@ impl VirtioConsole {
             // and points at a 1-byte buffer in the kernel's rx_bufs.
             let dp = self.gpa_to_host(desc_addr + first_desc as u64 * 16);
             let addr = unsafe { std::ptr::read_unaligned(dp as *const u64) };
-            unsafe { std::ptr::write_volatile(self.gpa_to_host(addr), byte); }
+            unsafe {
+                std::ptr::write_volatile(self.gpa_to_host(addr), byte);
+            }
 
             let used_slot = used_idx & (qsize - 1);
             unsafe {
@@ -428,10 +467,7 @@ impl VirtioConsole {
                 // first via `read_volatile` then dereferences the
                 // payload without its own incoming barrier).
                 core::arch::asm!("dsb sy", options(nostack));
-                std::ptr::write_volatile(
-                    self.gpa_to_host(used_addr + 2) as *mut u16,
-                    used_idx,
-                );
+                std::ptr::write_volatile(self.gpa_to_host(used_addr + 2) as *mut u16, used_idx);
                 core::arch::asm!("dsb sy", options(nostack));
             }
         }

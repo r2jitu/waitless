@@ -199,12 +199,7 @@ fn init_heap(info: &BootInfo, kern_end_phys: u64) {
         }
         let after_kern = align_up_page(kern_end);
         if after_kern < rend {
-            total_claimed += claim_phys(
-                &mut heap,
-                info.hhdm_offset,
-                after_kern,
-                rend - after_kern,
-            );
+            total_claimed += claim_phys(&mut heap, info.hhdm_offset, after_kern, rend - after_kern);
         }
     }
     drop(heap);
@@ -234,7 +229,11 @@ fn claim_phys(heap: &mut Talc<ErrOnOom>, hhdm: u64, phys: u64, size: u64) -> u64
         if heap.claim(span).is_ok() {
             size
         } else {
-            klog!("  Heap: talc::claim failed at {:#x} ({} bytes)\n", phys, size);
+            klog!(
+                "  Heap: talc::claim failed at {:#x} ({} bytes)\n",
+                phys,
+                size
+            );
             0
         }
     }
@@ -278,10 +277,7 @@ pub fn alloc_pages(count: usize) -> u64 {
     if count == 0 {
         return 0;
     }
-    let layout = match Layout::from_size_align(
-        count * PAGE_SIZE as usize,
-        PAGE_SIZE as usize,
-    ) {
+    let layout = match Layout::from_size_align(count * PAGE_SIZE as usize, PAGE_SIZE as usize) {
         Ok(l) => l,
         Err(_) => return 0,
     };

@@ -69,8 +69,7 @@ pub fn init_boot_info(p: BootInfoParams) {
     // Box::leak gives us a `&'static [NicInfo]` from a heap-allocated
     // backing store. Called exactly once per boot, so the leak is
     // bounded by the lifetime of the kernel itself.
-    let nics_slice: &'static [NicInfo] =
-        Box::leak(p.nics.into_boxed_slice());
+    let nics_slice: &'static [NicInfo] = Box::leak(p.nics.into_boxed_slice());
     BOOT_INFO.init(BootInfo {
         ram_bytes: p.ram_bytes,
         num_cpus: p.num_cpus,

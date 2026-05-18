@@ -12,40 +12,32 @@ extern crate uni_net_driver;
 use core::arch::asm;
 use core::ptr;
 use core::ptr::NonNull;
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
 use uni_iobuf::{Chain, IOBufDropFn, OwnedIOBuf};
 
+use drivers_infra::pci::{enable_bus_mastering_inner, find_device, pci_device, read_config};
+use drivers_infra::virtio::{
+    MMIO_BASE, MMIO_DEVICE_CONFIG, MMIO_DEVICE_FEATURES_SEL, MMIO_DEVICE_ID,
+    MMIO_DRIVER_FEATURES_SEL, MMIO_GUEST_FEATURES, MMIO_GUEST_PAGE_SIZE, MMIO_HOST_FEATURES,
+    MMIO_INTERRUPT_ACK, MMIO_INTERRUPT_STATUS, MMIO_MAGIC, MMIO_MAGIC_VALUE, MMIO_STATUS,
+    MMIO_VERSION, STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED,
+    STATUS_FEATURES_OK, VIRTIO_F_USED_IDX_MMIO, VIRTIO_NET_F_CSUM, VIRTIO_NET_F_CTRL_VQ,
+    VIRTIO_NET_F_HOST_TSO4, VIRTIO_NET_F_MAC, VIRTIO_NET_F_MQ, VIRTIO_NET_F_MRG_RXBUF,
+    VIRTIO_NET_F_STATUS, VIRTIO_NET_RX_OFFLOAD_MASK, VIRTIO_RING_F_EVENT_IDX, VREG_DEVICE_CONFIG,
+    VREG_DEVICE_FEATURES, VREG_DEVICE_STATUS, VREG_GUEST_FEATURES, VREG_ISR_STATUS,
+    VirtioPciDevice, Virtqueue, vpci_device, vpci_enable_queue, vpci_find,
+    vpci_get_queue_notify_off, vpci_get_queue_size, vpci_get_status, vpci_msix_enable,
+    vpci_msix_write_entry, vpci_queue_notify_addr, vpci_read_dev_cfg8, vpci_read_dev_cfg16,
+    vpci_read_features, vpci_read_isr, vpci_reset, vpci_select_queue, vpci_set_config_msix_vector,
+    vpci_set_queue_addrs, vpci_set_queue_msix_vector, vpci_set_status, vpci_write_features,
+};
 use drivers_infra::{
-    log, dsb_st,
-    virtio_read32, virtio_write32, virtio_read16, virtio_read8, virtio_write8,
+    dsb_st, log, virtio_read8, virtio_read16, virtio_read32, virtio_write8, virtio_write32,
 };
 #[cfg(target_arch = "aarch64")]
 use uni_kernel::aarch64::{exceptions, fdt};
-use drivers_infra::pci::{pci_device, read_config, find_device, enable_bus_mastering_inner};
-use drivers_infra::virtio::{
-    vpci_device, Virtqueue, VirtioPciDevice,
-    vpci_find, vpci_reset, vpci_set_status, vpci_get_status,
-    vpci_read_features, vpci_write_features,
-    vpci_select_queue, vpci_get_queue_size, vpci_get_queue_notify_off,
-    vpci_queue_notify_addr, vpci_set_queue_addrs, vpci_enable_queue,
-    vpci_read_dev_cfg8, vpci_read_dev_cfg16, vpci_read_isr,
-    vpci_set_queue_msix_vector, vpci_set_config_msix_vector,
-    vpci_msix_enable, vpci_msix_write_entry,
-    STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FEATURES_OK, STATUS_FAILED,
-    VIRTIO_NET_F_CSUM, VIRTIO_NET_F_HOST_TSO4, VIRTIO_NET_RX_OFFLOAD_MASK,
-    VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_STATUS,
-    VIRTIO_NET_F_MQ, VIRTIO_NET_F_CTRL_VQ,
-    VIRTIO_RING_F_EVENT_IDX, VIRTIO_F_USED_IDX_MMIO,
-    VREG_DEVICE_FEATURES, VREG_GUEST_FEATURES, VREG_DEVICE_STATUS, VREG_ISR_STATUS,
-    VREG_DEVICE_CONFIG,
-    MMIO_BASE, MMIO_MAGIC_VALUE, MMIO_VERSION, MMIO_DEVICE_ID,
-    MMIO_HOST_FEATURES, MMIO_DEVICE_FEATURES_SEL,
-    MMIO_GUEST_FEATURES, MMIO_DRIVER_FEATURES_SEL, MMIO_GUEST_PAGE_SIZE,
-    MMIO_STATUS, MMIO_DEVICE_CONFIG, MMIO_MAGIC,
-    MMIO_INTERRUPT_STATUS, MMIO_INTERRUPT_ACK,
-};
-use uni_kernel::mm::{kmalloc, virt_to_phys, phys_to_virt};
+use uni_kernel::mm::{kmalloc, phys_to_virt, virt_to_phys};
 
 // ============================================================================
 // VirtIO-net constants and types
@@ -169,8 +161,13 @@ impl TxBufBig {
 pub(crate) enum Transport {
     None,
     #[cfg(target_arch = "aarch64")]
-    Mmio { base: u64, is_v2: bool },
-    ModernPci { vpci_idx: usize },
+    Mmio {
+        base: u64,
+        is_v2: bool,
+    },
+    ModernPci {
+        vpci_idx: usize,
+    },
 }
 
 // ============================================================================
@@ -237,11 +234,9 @@ struct WorkerTxPool {
 impl WorkerTxPool {
     const ZEROED: Self = WorkerTxPool {
         small: [const { TxBufSmall::ZERO }; TX_POOL_SMALL_SIZE],
-        small_used: [const { core::sync::atomic::AtomicBool::new(false) };
-            TX_POOL_SMALL_SIZE],
+        small_used: [const { core::sync::atomic::AtomicBool::new(false) }; TX_POOL_SMALL_SIZE],
         big: ptr::null_mut(),
-        big_used: [const { core::sync::atomic::AtomicBool::new(false) };
-            TX_POOL_BIG_SIZE],
+        big_used: [const { core::sync::atomic::AtomicBool::new(false) }; TX_POOL_BIG_SIZE],
     };
 }
 
@@ -270,9 +265,9 @@ struct NetDevice {
     /// Captured at `init_qp_storage` time from
     /// `uni_kernel::percpu::num_cores()`.
     num_workers: usize,
-    ctrl_queue: Virtqueue,              // Control VQ for multi-queue commands
+    ctrl_queue: Virtqueue, // Control VQ for multi-queue commands
     mac: [u8; 6],
-    num_queue_pairs: u16,               // 1 = single-queue, >1 = multi-queue
+    num_queue_pairs: u16, // 1 = single-queue, >1 = multi-queue
     /// Number of queue pairs the device has negotiated capacity for.
     /// Usually equals `num_queue_pairs` once init completes; the
     /// split exists because `activate_multi_queue` sends
@@ -282,7 +277,7 @@ struct NetDevice {
     negotiated_queue_pairs: u16,
     irq_idle_available: bool,
     guest_features: u32,
-    has_mq: bool,                       // VIRTIO_NET_F_MQ negotiated
+    has_mq: bool, // VIRTIO_NET_F_MQ negotiated
     /// VIRTIO_NET_F_HOST_TSO4 + VIRTIO_NET_F_CSUM negotiated. When
     /// true, the TCP layer can hand us a single super-segment up
     /// to MAX_ETH_FRAME bytes with `gso_type=TCPV4` + `gso_size=MSS`
@@ -290,7 +285,7 @@ struct NetDevice {
     /// host-side. Saves the per-MSS frame-build loop in
     /// `async_try_send_chain`.
     has_tso4: bool,
-    irq_edge: bool,                     // SPI is edge-triggered (from FDT)
+    irq_edge: bool, // SPI is edge-triggered (from FDT)
 }
 
 impl NetDevice {
@@ -319,7 +314,7 @@ impl NetDevice {
 /// re-allocating (ownership during driver re-init is not well-
 /// defined). Returns `false` on OOM.
 unsafe fn init_qp_storage(num_pairs: usize, has_tso: bool) -> bool {
-    use alloc::alloc::{alloc, Layout};
+    use alloc::alloc::{Layout, alloc};
     if num_pairs == 0 {
         return false;
     }
@@ -461,11 +456,11 @@ fn num_queue_pairs() -> u16 {
 // ---- Modern PCI init (VirtIO 1.0+) -----------------------------------------
 
 fn init_pci_modern() -> bool {
-    let vpci_idx = match vpci_find(1) { // virtio device type 1 = net
+    let vpci_idx = match vpci_find(1) {
+        // virtio device type 1 = net
         Some(i) => i,
         None => return false,
     };
-
 
     let dev_snap = vpci_device(vpci_idx);
     let dev = &dev_snap;
@@ -489,16 +484,16 @@ fn init_pci_modern() -> bool {
     let guest_features = dev_features & !VIRTIO_NET_RX_OFFLOAD_MASK;
 
     // Check for multi-queue support
-    let has_mq = (dev_features & VIRTIO_NET_F_MQ) != 0
-              && (dev_features & VIRTIO_NET_F_CTRL_VQ) != 0;
+    let has_mq =
+        (dev_features & VIRTIO_NET_F_MQ) != 0 && (dev_features & VIRTIO_NET_F_CTRL_VQ) != 0;
     // Check for TSOv4 support. Requires both VIRTIO_NET_F_CSUM (so the
     // device computes the per-segment TCP/IP checksum we don't bother
     // with on TSO sends) AND VIRTIO_NET_F_HOST_TSO4 (so the device can
     // segment a super-segment we hand it). When both are negotiated the
     // TCP layer can collapse its per-MSS frame-build loop into a single
     // submit_tx_tso call.
-    let has_tso4 = (dev_features & VIRTIO_NET_F_CSUM) != 0
-                && (dev_features & VIRTIO_NET_F_HOST_TSO4) != 0;
+    let has_tso4 =
+        (dev_features & VIRTIO_NET_F_CSUM) != 0 && (dev_features & VIRTIO_NET_F_HOST_TSO4) != 0;
 
     vpci_write_features(dev, 0, guest_features);
     vpci_write_features(dev, 1, 1); // VIRTIO_F_VERSION_1
@@ -593,7 +588,9 @@ fn init_pci_modern() -> bool {
             let ctrl_notify = vpci_queue_notify_addr(dev, ctrl_notify_off);
             // SAFETY: single-threaded boot init.
             let ctrl_init = unsafe {
-                (*ndev()).ctrl_queue.init_pci_modern(ctrl_qsize, ctrl_notify, ctrl_qi)
+                (*ndev())
+                    .ctrl_queue
+                    .init_pci_modern(ctrl_qsize, ctrl_notify, ctrl_qi)
             };
             let ctrl_addrs = match ctrl_init {
                 Some(a) => a,
@@ -616,13 +613,17 @@ fn init_pci_modern() -> bool {
     // EVENT_IDX
     if (guest_features & VIRTIO_RING_F_EVENT_IDX) != 0 {
         for pair in 0..num_pairs as usize {
-            unsafe { (*rx_q(pair)).event_idx = true; }
+            unsafe {
+                (*rx_q(pair)).event_idx = true;
+            }
         }
     }
 
     // Read MAC
     for i in 0..6u32 {
-        unsafe { (*ndev()).mac[i as usize] = vpci_read_dev_cfg8(dev, i); }
+        unsafe {
+            (*ndev()).mac[i as usize] = vpci_read_dev_cfg8(dev, i);
+        }
     }
 
     // Allocate and populate RX buffers for all queue pairs.
@@ -646,11 +647,15 @@ fn init_pci_modern() -> bool {
     }
 
     // DRIVER_OK
-    vpci_set_status(dev, STATUS_ACKNOWLEDGE | STATUS_DRIVER |
-                         STATUS_FEATURES_OK | STATUS_DRIVER_OK);
+    vpci_set_status(
+        dev,
+        STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
+    );
 
     for pair in 0..num_pairs as usize {
-        unsafe { (*rx_q(pair)).kick(); }
+        unsafe {
+            (*rx_q(pair)).kick();
+        }
     }
 
     unsafe {
@@ -721,7 +726,12 @@ struct CtrlMqBufCell(core::cell::UnsafeCell<CtrlMqBuf>);
 unsafe impl Sync for CtrlMqBufCell {}
 
 static CTRL_MQ_BUF: CtrlMqBufCell = CtrlMqBufCell(core::cell::UnsafeCell::new(CtrlMqBuf {
-    hdr_class: 0, hdr_cmd: 0, data: [0; 2], _pad: [0; 4], ack: 0, _tail: [0; 7],
+    hdr_class: 0,
+    hdr_cmd: 0,
+    data: [0; 2],
+    _pad: [0; 4],
+    ack: 0,
+    _tail: [0; 7],
 }));
 
 /// Send VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET to activate N queue pairs.
@@ -739,7 +749,7 @@ fn ctrl_mq_set_pairs(num_pairs: u16) {
         // Write into the static buffer (guaranteed low-memory / contiguous).
         let buf_ptr = CTRL_MQ_BUF.0.get();
         (*buf_ptr).hdr_class = 4; // VIRTIO_NET_CTRL_MQ
-        (*buf_ptr).hdr_cmd = 0;   // VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET
+        (*buf_ptr).hdr_cmd = 0; // VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET
         (*buf_ptr).data = num_pairs.to_le_bytes();
         (*buf_ptr).ack = 0xFF;
 
@@ -753,17 +763,19 @@ fn ctrl_mq_set_pairs(num_pairs: u16) {
         // separate, matches what legacy Linux virtio-net actually
         // sends for `virtio_net_ctrl_simple_hdr`.
         let hdrdata_phys = virt_to_phys(&(*buf_ptr).hdr_class as *const u8);
-        let ack_phys     = virt_to_phys(&(*buf_ptr).ack as *const u8);
+        let ack_phys = virt_to_phys(&(*buf_ptr).ack as *const u8);
 
         (*ndev()).ctrl_queue.add_chain(&[
             (hdrdata_phys, 4, false), // readable: class + cmd + num_pairs
-            (ack_phys,     1, true),  // writable: ack byte
+            (ack_phys, 1, true),      // writable: ack byte
         ]);
         (*ndev()).ctrl_queue.kick();
 
         // Wait for completion.
         for _ in 0..1_000_000u32 {
-            if (*ndev()).ctrl_queue.used().is_some() { break; }
+            if (*ndev()).ctrl_queue.used().is_some() {
+                break;
+            }
         }
         let _ = (*ndev()).ctrl_queue.used();
 
@@ -778,7 +790,6 @@ fn ctrl_mq_set_pairs(num_pairs: u16) {
     }
 }
 
-
 // ---- MMIO init (aarch64 QEMU) ----------------------------------------------
 
 #[cfg(target_arch = "aarch64")]
@@ -792,7 +803,9 @@ fn init_mmio() -> bool {
         if fdt.virtio_count > 0 {
             for i in 0..fdt.virtio_count as usize {
                 let candidate = fdt.virtio_bases[i];
-                if virtio_read32(candidate + MMIO_MAGIC_VALUE) != MMIO_MAGIC { continue; }
+                if virtio_read32(candidate + MMIO_MAGIC_VALUE) != MMIO_MAGIC {
+                    continue;
+                }
                 if virtio_read32(candidate + MMIO_DEVICE_ID) == 1 {
                     io_base = candidate;
                     break;
@@ -804,7 +817,9 @@ fn init_mmio() -> bool {
         if io_base == 0 {
             for slot in 0..32u64 {
                 let candidate = MMIO_BASE + slot * 0x200;
-                if virtio_read32(candidate + MMIO_MAGIC_VALUE) != MMIO_MAGIC { continue; }
+                if virtio_read32(candidate + MMIO_MAGIC_VALUE) != MMIO_MAGIC {
+                    continue;
+                }
                 if virtio_read32(candidate + MMIO_DEVICE_ID) == 1 {
                     io_base = candidate;
                     break;
@@ -813,21 +828,28 @@ fn init_mmio() -> bool {
         }
     }
 
-    if io_base == 0 { return false; }
+    if io_base == 0 {
+        return false;
+    }
 
     let ver = unsafe { virtio_read32(io_base + MMIO_VERSION) };
     let is_v2 = ver == 2;
-    if ver != 1 && ver != 2 { return false; }
-
+    if ver != 1 && ver != 2 {
+        return false;
+    }
 
     // Reset
-    unsafe { virtio_write32(io_base + MMIO_STATUS, 0); }
+    unsafe {
+        virtio_write32(io_base + MMIO_STATUS, 0);
+    }
 
     // ACKNOWLEDGE + DRIVER
     unsafe {
         virtio_write32(io_base + MMIO_STATUS, STATUS_ACKNOWLEDGE as u32);
-        virtio_write32(io_base + MMIO_STATUS,
-                       (STATUS_ACKNOWLEDGE | STATUS_DRIVER) as u32);
+        virtio_write32(
+            io_base + MMIO_STATUS,
+            (STATUS_ACKNOWLEDGE | STATUS_DRIVER) as u32,
+        );
     }
 
     // Feature negotiation
@@ -839,31 +861,47 @@ fn init_mmio() -> bool {
         if is_v2 {
             virtio_write32(io_base + MMIO_DEVICE_FEATURES_SEL, 0);
             let dev_features = virtio_read32(io_base + MMIO_HOST_FEATURES);
-            if (dev_features & VIRTIO_NET_F_CSUM) != 0 { guest_features |= VIRTIO_NET_F_CSUM; }
-            if (dev_features & VIRTIO_NET_F_MAC) != 0 { guest_features |= VIRTIO_NET_F_MAC; }
-            if (dev_features & VIRTIO_NET_F_HOST_TSO4) != 0 { guest_features |= VIRTIO_NET_F_HOST_TSO4; }
-            if (dev_features & VIRTIO_NET_F_STATUS) != 0 { guest_features |= VIRTIO_NET_F_STATUS; }
-            if (dev_features & VIRTIO_NET_F_MRG_RXBUF) != 0 { guest_features |= VIRTIO_NET_F_MRG_RXBUF; }
+            if (dev_features & VIRTIO_NET_F_CSUM) != 0 {
+                guest_features |= VIRTIO_NET_F_CSUM;
+            }
+            if (dev_features & VIRTIO_NET_F_MAC) != 0 {
+                guest_features |= VIRTIO_NET_F_MAC;
+            }
+            if (dev_features & VIRTIO_NET_F_HOST_TSO4) != 0 {
+                guest_features |= VIRTIO_NET_F_HOST_TSO4;
+            }
+            if (dev_features & VIRTIO_NET_F_STATUS) != 0 {
+                guest_features |= VIRTIO_NET_F_STATUS;
+            }
+            if (dev_features & VIRTIO_NET_F_MRG_RXBUF) != 0 {
+                guest_features |= VIRTIO_NET_F_MRG_RXBUF;
+            }
             if (dev_features & VIRTIO_F_USED_IDX_MMIO) != 0 {
                 guest_features |= VIRTIO_F_USED_IDX_MMIO;
                 has_used_idx_mmio = true;
             }
-            if (dev_features & VIRTIO_NET_F_MQ) != 0 { guest_features |= VIRTIO_NET_F_MQ; }
-            if (dev_features & VIRTIO_NET_F_CTRL_VQ) != 0 { guest_features |= VIRTIO_NET_F_CTRL_VQ; }
+            if (dev_features & VIRTIO_NET_F_MQ) != 0 {
+                guest_features |= VIRTIO_NET_F_MQ;
+            }
+            if (dev_features & VIRTIO_NET_F_CTRL_VQ) != 0 {
+                guest_features |= VIRTIO_NET_F_CTRL_VQ;
+            }
             has_mq = (guest_features & VIRTIO_NET_F_MQ) != 0
-                  && (guest_features & VIRTIO_NET_F_CTRL_VQ) != 0;
+                && (guest_features & VIRTIO_NET_F_CTRL_VQ) != 0;
             // TSOv4 needs both CSUM (host computes per-segment cksums)
             // and HOST_TSO4 (device segments super-segments); both
             // negotiated → TCP layer can collapse its per-MSS loop.
             has_tso4 = (guest_features & VIRTIO_NET_F_CSUM) != 0
-                    && (guest_features & VIRTIO_NET_F_HOST_TSO4) != 0;
+                && (guest_features & VIRTIO_NET_F_HOST_TSO4) != 0;
             virtio_write32(io_base + MMIO_DRIVER_FEATURES_SEL, 0);
             virtio_write32(io_base + MMIO_GUEST_FEATURES, guest_features);
             virtio_write32(io_base + MMIO_DRIVER_FEATURES_SEL, 1);
             virtio_write32(io_base + MMIO_GUEST_FEATURES, 0);
 
-            virtio_write32(io_base + MMIO_STATUS,
-                           (STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK) as u32);
+            virtio_write32(
+                io_base + MMIO_STATUS,
+                (STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK) as u32,
+            );
             if (virtio_read32(io_base + MMIO_STATUS) & STATUS_FEATURES_OK as u32) == 0 {
                 log(b"virtio_net: device rejected features\n");
                 virtio_write32(io_base + MMIO_STATUS, STATUS_FAILED as u32);
@@ -871,9 +909,15 @@ fn init_mmio() -> bool {
             }
         } else {
             let dev_features = virtio_read32(io_base + MMIO_HOST_FEATURES);
-            if (dev_features & VIRTIO_NET_F_MAC) != 0 { guest_features |= VIRTIO_NET_F_MAC; }
-            if (dev_features & VIRTIO_NET_F_STATUS) != 0 { guest_features |= VIRTIO_NET_F_STATUS; }
-            if (dev_features & VIRTIO_NET_F_MRG_RXBUF) != 0 { guest_features |= VIRTIO_NET_F_MRG_RXBUF; }
+            if (dev_features & VIRTIO_NET_F_MAC) != 0 {
+                guest_features |= VIRTIO_NET_F_MAC;
+            }
+            if (dev_features & VIRTIO_NET_F_STATUS) != 0 {
+                guest_features |= VIRTIO_NET_F_STATUS;
+            }
+            if (dev_features & VIRTIO_NET_F_MRG_RXBUF) != 0 {
+                guest_features |= VIRTIO_NET_F_MRG_RXBUF;
+            }
             virtio_write32(io_base + MMIO_GUEST_FEATURES, guest_features);
             virtio_write32(io_base + MMIO_GUEST_PAGE_SIZE, 4096);
         }
@@ -918,7 +962,10 @@ fn init_mmio() -> bool {
     if has_mq && num_pairs > 1 {
         let ctrl_qi = (2 * max_pairs) as u16;
         unsafe {
-            if !(*ndev()).ctrl_queue.init_legacy(io_base, ctrl_qi, true, is_v2) {
+            if !(*ndev())
+                .ctrl_queue
+                .init_legacy(io_base, ctrl_qi, true, is_v2)
+            {
                 log(b"virtio_net: failed to init ctrl queue, falling back to 1 pair\n");
                 has_mq = false;
             }
@@ -941,7 +988,9 @@ fn init_mmio() -> bool {
     for pair in 0..num_pairs as usize {
         for i in 0..RX_BUFFERS {
             let alloc = kmalloc(BUFFER_SIZE as usize + RX_IP_ALIGN);
-            if alloc.is_null() { return false; }
+            if alloc.is_null() {
+                return false;
+            }
             let buf = unsafe { alloc.add(RX_IP_ALIGN) };
             unsafe {
                 ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
@@ -950,16 +999,25 @@ fn init_mmio() -> bool {
                 (*rx_q(pair)).add_buf(buf_phys, BUFFER_SIZE, 0, 1);
             }
         }
-        unsafe { (*rx_q(pair)).kick(); }
+        unsafe {
+            (*rx_q(pair)).kick();
+        }
     }
 
     // DRIVER_OK
     let mut final_status = (STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK) as u32;
-    if is_v2 { final_status |= STATUS_FEATURES_OK as u32; }
-    unsafe { virtio_write32(io_base + MMIO_STATUS, final_status); }
+    if is_v2 {
+        final_status |= STATUS_FEATURES_OK as u32;
+    }
+    unsafe {
+        virtio_write32(io_base + MMIO_STATUS, final_status);
+    }
 
     unsafe {
-        (*ndev()).transport = Transport::Mmio { base: io_base, is_v2 };
+        (*ndev()).transport = Transport::Mmio {
+            base: io_base,
+            is_v2,
+        };
         (*ndev()).guest_features = guest_features;
         (*ndev()).num_queue_pairs = 1;
         (*ndev()).negotiated_queue_pairs = num_pairs;
@@ -1097,8 +1155,7 @@ fn irq_handler(_irq: u32) {
 
 /// Set when `init()` has returned `true`. Read via `probe_ok()` below;
 /// do not read directly.
-static PROBE_OK: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static PROBE_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn init() -> bool {
     #[cfg(target_arch = "aarch64")]
@@ -1133,9 +1190,13 @@ fn get_mac(mac_out: *mut u8) {
 /// submits via the unified `submit_tx` path. Used by ARP/NDP/etc.
 /// callers that don't fill in place.
 fn send_slice(data: &[u8]) {
-    if data.is_empty() { return; }
+    if data.is_empty() {
+        return;
+    }
     unsafe {
-        if let Transport::None = (*ndev()).transport { return; }
+        if let Transport::None = (*ndev()).transport {
+            return;
+        }
     }
     let frame_len = data.len().min(MAX_ETH_FRAME_SMALL);
     let mut handle = match acquire_tx_buf() {
@@ -1217,12 +1278,12 @@ fn release_tx_slot(token: u64) {
         return;
     }
     match pool {
-        POOL_ID_SMALL if slot < TX_POOL_SMALL_SIZE => {
-            unsafe { (*wpool(worker)).small_used[slot].store(false, Ordering::Release); }
-        }
-        POOL_ID_BIG if slot < TX_POOL_BIG_SIZE => {
-            unsafe { (*wpool(worker)).big_used[slot].store(false, Ordering::Release); }
-        }
+        POOL_ID_SMALL if slot < TX_POOL_SMALL_SIZE => unsafe {
+            (*wpool(worker)).small_used[slot].store(false, Ordering::Release);
+        },
+        POOL_ID_BIG if slot < TX_POOL_BIG_SIZE => unsafe {
+            (*wpool(worker)).big_used[slot].store(false, Ordering::Release);
+        },
         _ => {}
     }
 }
@@ -1289,7 +1350,9 @@ fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
         // then drain and re-scan. Each full sweep counts as one
         // saturation event for `tx_diag`.
         TX_SMALL_FULL_SPINS.fetch_add(1, Ordering::Relaxed);
-        unsafe { (*tx_q(qp)).flush_kick(); }
+        unsafe {
+            (*tx_q(qp)).flush_kick();
+        }
         tx_drain_qp_locked(qp);
         compiler_fence(Ordering::SeqCst);
     }
@@ -1349,13 +1412,13 @@ fn submit_tx(
     // from the small pool (big-pool slots flow through
     // `TxTsoBufHandle` + `submit_tx_tso`). Defensive bound checks
     // for slot/worker index only.
-    if slot >= TX_POOL_SMALL_SIZE
-        || worker >= unsafe { (*ndev()).num_workers }
-    {
+    if slot >= TX_POOL_SMALL_SIZE || worker >= unsafe { (*ndev()).num_workers } {
         return;
     }
     if frame_len == 0 || frame_len > MAX_ETH_FRAME_SMALL {
-        unsafe { (*wpool(worker)).small_used[slot].store(false, Ordering::Release); }
+        unsafe {
+            (*wpool(worker)).small_used[slot].store(false, Ordering::Release);
+        }
         return;
     }
 
@@ -1440,13 +1503,13 @@ fn submit_tx_tso(
     let (worker, slot, _pool) = decode_token(handle.0.driver_token);
     core::mem::forget(handle); // see `submit_tx` for rationale
 
-    if slot >= TX_POOL_BIG_SIZE
-        || worker >= unsafe { (*ndev()).num_workers }
-    {
+    if slot >= TX_POOL_BIG_SIZE || worker >= unsafe { (*ndev()).num_workers } {
         return;
     }
     if frame_len == 0 || frame_len > MAX_ETH_FRAME_BIG {
-        unsafe { (*wpool(worker)).big_used[slot].store(false, Ordering::Release); }
+        unsafe {
+            (*wpool(worker)).big_used[slot].store(false, Ordering::Release);
+        }
         return;
     }
 
@@ -1454,7 +1517,9 @@ fn submit_tx_tso(
     if big_ptr.is_null() {
         // Pool was deallocated mid-flight (shouldn't happen on
         // a live device). Release the slot bit anyway.
-        unsafe { (*wpool(worker)).big_used[slot].store(false, Ordering::Release); }
+        unsafe {
+            (*wpool(worker)).big_used[slot].store(false, Ordering::Release);
+        }
         return;
     }
 
@@ -1531,11 +1596,15 @@ fn flush_tx_staging() {
     if qp_needs_lock() {
         let _g = TX_LOCK.lock();
         for qp in 0..nqp {
-            unsafe { (*tx_q(qp)).flush_kick(); }
+            unsafe {
+                (*tx_q(qp)).flush_kick();
+            }
         }
     } else {
         for qp in 0..nqp {
-            unsafe { (*tx_q(qp)).flush_kick(); }
+            unsafe {
+                (*tx_q(qp)).flush_kick();
+            }
         }
     }
 }
@@ -1557,7 +1626,6 @@ fn poke_interrupt_status() {
         }
     }
 }
-
 
 /// Per-queue RX counters. Incremented once per consumed frame.
 /// Read via `rx_counts()` from app code (e.g. the /stats handler)
@@ -1599,16 +1667,11 @@ static TX_BYTES_PER_QP: [core::sync::atomic::AtomicU64; DIAG_QP_CAP] =
 /// lengths the callback receives.
 static RX_BYTES_PER_QP: [core::sync::atomic::AtomicU64; DIAG_QP_CAP] =
     [const { core::sync::atomic::AtomicU64::new(0) }; DIAG_QP_CAP];
-static TX_SMALL_FULL_SPINS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-static TX_SMALL_SCAN_ITERS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-static TX_SMALL_ACQUIRES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-static TX_BIG_FULL_RETURNS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-static TX_BIG_ACQUIRES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static TX_SMALL_FULL_SPINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TX_SMALL_SCAN_ITERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TX_SMALL_ACQUIRES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TX_BIG_FULL_RETURNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TX_BIG_ACQUIRES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn tx_diag() -> uni_net_driver::TxDiag {
     use core::sync::atomic::Ordering::Relaxed;
@@ -1675,19 +1738,14 @@ fn rx_used_cursors() -> [(u16, u16); DIAG_QP_CAP] {
     // page-fault in the kernel. `negotiated_queue_pairs` caps the
     // loop at what the `init_pci_modern` / `init_mmio` paths wired
     // up; the diag-array bound is what fits in the public API tuple.
-    let n = unsafe { (*ndev()).negotiated_queue_pairs as usize }
-        .min(DIAG_QP_CAP);
+    let n = unsafe { (*ndev()).negotiated_queue_pairs as usize }.min(DIAG_QP_CAP);
     unsafe {
         for i in 0..n {
-            out[i] = (
-                (*rx_q(i)).used_idx(),
-                (*rx_q(i)).last_used_cursor(),
-            );
+            out[i] = ((*rx_q(i)).used_idx(), (*rx_q(i)).last_used_cursor());
         }
     }
     out
 }
-
 
 /// Maximum frames per batch poll.
 const BATCH_SIZE: usize = 32;
@@ -1696,18 +1754,25 @@ const BATCH_SIZE: usize = 32;
 /// a length prefix: [len: u16][frame data][len: u16][frame data]...
 struct RxBatch {
     pub data: [u8; BATCH_SIZE * 1600], // worst case: 32 × 1514-byte frames
-    pub len: usize,                     // bytes used in data
-    pub count: usize,                   // number of frames
+    pub len: usize,                    // bytes used in data
+    pub count: usize,                  // number of frames
 }
 
 impl RxBatch {
     pub const fn new() -> Self {
-        RxBatch { data: [0; BATCH_SIZE * 1600], len: 0, count: 0 }
+        RxBatch {
+            data: [0; BATCH_SIZE * 1600],
+            len: 0,
+            count: 0,
+        }
     }
 
     /// Iterate over frames in the batch.
     pub fn iter(&self) -> RxBatchIter<'_> {
-        RxBatchIter { data: &self.data[..self.len], pos: 0 }
+        RxBatchIter {
+            data: &self.data[..self.len],
+            pos: 0,
+        }
     }
 }
 
@@ -1719,10 +1784,14 @@ struct RxBatchIter<'a> {
 impl<'a> Iterator for RxBatchIter<'a> {
     type Item = &'a [u8];
     fn next(&mut self) -> Option<&'a [u8]> {
-        if self.pos + 2 > self.data.len() { return None; }
+        if self.pos + 2 > self.data.len() {
+            return None;
+        }
         let len = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]) as usize;
         self.pos += 2;
-        if self.pos + len > self.data.len() { return None; }
+        if self.pos + len > self.data.len() {
+            return None;
+        }
         let frame = &self.data[self.pos..self.pos + len];
         self.pos += len;
         Some(frame)
@@ -1740,7 +1809,9 @@ fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
     batch.count = 0;
 
     unsafe {
-        if let Transport::None = (*ndev()).transport { return; }
+        if let Transport::None = (*ndev()).transport {
+            return;
+        }
     }
 
     // Drain TX completions. Tier 1 owns qp per core (no lock needed),
@@ -1769,7 +1840,10 @@ fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
                     batch.data[batch.len + 1] = len_bytes[1];
                     let frame_data = buf.add(VIRTIO_NET_HDR_SIZE);
                     core::ptr::copy_nonoverlapping(
-                        frame_data, batch.data.as_mut_ptr().add(batch.len + 2), frame_len);
+                        frame_data,
+                        batch.data.as_mut_ptr().add(batch.len + 2),
+                        frame_len,
+                    );
                     batch.len += 2 + frame_len;
                     batch.count += 1;
                 }
@@ -1795,7 +1869,11 @@ fn enable_irq() {
             match (*ndev()).transport {
                 Transport::ModernPci { vpci_idx } if fdt.gic_dist_base != 0 => {
                     let slot = pci_device(vpci_device(vpci_idx).pci_idx).slot;
-                    let intid = if (slot as usize) < 8 { fdt.pci_irqs[slot as usize] } else { 0 };
+                    let intid = if (slot as usize) < 8 {
+                        fdt.pci_irqs[slot as usize]
+                    } else {
+                        0
+                    };
                     if intid != 0 {
                         (*rx_q(0)).enable_interrupts();
                         exceptions::register_irq(intid, irq_handler);
@@ -1905,9 +1983,7 @@ fn init_msix_x86(dev: &VirtioPciDevice, num_pairs: usize) {
 /// next iteration. Fires on the target vCPU because the MSI address
 /// was programmed with that vCPU's LAPIC id.
 #[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn msix_rx_isr_trampoline(
-    _frame: *mut uni_kernel::x86_64::idt::InterruptFrame,
-) {
+unsafe extern "C" fn msix_rx_isr_trampoline(_frame: *mut uni_kernel::x86_64::idt::InterruptFrame) {
     IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
 }
 
@@ -1916,7 +1992,9 @@ fn irq_idle_supported() -> bool {
 }
 
 fn arm_rx_interrupts() {
-    unsafe { (*rx_q(0)).enable_interrupts(); }
+    unsafe {
+        (*rx_q(0)).enable_interrupts();
+    }
 }
 
 fn has_pending_rx() -> bool {
@@ -1952,14 +2030,18 @@ fn rearm_rx_napi(core_id: u32) -> bool {
 fn enable_deferred_tx_kick() {
     let nqp = unsafe { (*ndev()).num_queue_pairs } as usize;
     for qp in 0..nqp {
-        unsafe { (*tx_q(qp)).set_deferred_kick(true); }
+        unsafe {
+            (*tx_q(qp)).set_deferred_kick(true);
+        }
     }
 }
 
 /// Flush deferred TX kick — issues one MMIO notify for all batched TX.
 /// Only kicks if new buffers were added since last flush (kick_dirty).
 fn flush_tx_kick() {
-    unsafe { (*tx_q(0)).flush_kick(); }
+    unsafe {
+        (*tx_q(0)).flush_kick();
+    }
 }
 
 /// Flush only if dirty. Returns true if a kick was issued.
@@ -2035,11 +2117,15 @@ unsafe fn virtio_rx_repost(base: NonNull<u8>, _capacity: u32, ctx: *mut ()) {
     let buf = base.as_ptr();
     // SAFETY: `buf` is the RX buffer start; the virtio-net header
     // occupies its first VIRTIO_NET_HDR_SIZE bytes.
-    unsafe { ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE); }
+    unsafe {
+        ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
+    }
     // SAFETY: `qp < negotiated_queue_pairs`, so `rx_q(qp)` /
     // `qps(qp)` are in bounds; `add_buf` is serialised by the
     // per-qp `rx_lock` `rx_repost` takes.
-    unsafe { rx_repost(qp, virt_to_phys(buf)); }
+    unsafe {
+        rx_repost(qp, virt_to_phys(buf));
+    }
     if qp < DIAG_QP_CAP {
         RX_BUF_REPOST_COUNT[qp].fetch_add(1, Ordering::Relaxed);
     }
@@ -2086,7 +2172,9 @@ unsafe fn rx_used_locked(qp: usize) -> Option<(u32, *mut u8)> {
 /// chain drops.
 fn poll_qp(qp: usize, callback: fn(Chain<OwnedIOBuf>)) -> usize {
     unsafe {
-        if let Transport::None = (*ndev()).transport { return 0; }
+        if let Transport::None = (*ndev()).transport {
+            return 0;
+        }
     }
 
     if IRQ_PENDING.swap(false, core::sync::atomic::Ordering::Acquire) {
@@ -2111,10 +2199,8 @@ fn poll_qp(qp: usize, callback: fn(Chain<OwnedIOBuf>)) -> usize {
             if used_len > VIRTIO_NET_HDR_SIZE as u32 {
                 let frame_len = (used_len - VIRTIO_NET_HDR_SIZE as u32) as usize;
                 if qp < DIAG_QP_CAP {
-                    RX_BYTES_PER_QP[qp].fetch_add(
-                        frame_len as u64,
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
+                    RX_BYTES_PER_QP[qp]
+                        .fetch_add(frame_len as u64, core::sync::atomic::Ordering::Relaxed);
                 }
                 // Wrap the descriptor buffer as an owned one-part
                 // IOBufChain — visible payload is the frame past
@@ -2166,10 +2252,7 @@ fn poll_qp(qp: usize, callback: fn(Chain<OwnedIOBuf>)) -> usize {
             }
         }
         if count > 0 && qp < DIAG_QP_CAP {
-            RX_COUNTS[qp].fetch_add(
-                count as u64,
-                core::sync::atomic::Ordering::Relaxed,
-            );
+            RX_COUNTS[qp].fetch_add(count as u64, core::sync::atomic::Ordering::Relaxed);
         }
     }
     count

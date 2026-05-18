@@ -58,7 +58,9 @@ impl<T: Copy + Zero> Ring<T> {
         // perform the release-store on `tail` below. The acquire-load on
         // `head` above ensures the consumer is finished with this slot
         // (the previous wrap of it) before we overwrite.
-        unsafe { *self.buffer[tail & MASK].get() = item; }
+        unsafe {
+            *self.buffer[tail & MASK].get() = item;
+        }
         self.tail.store(tail + 1, Ordering::Release);
         true
     }

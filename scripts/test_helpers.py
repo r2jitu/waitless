@@ -33,6 +33,7 @@ from typing import Optional
 
 # ── Runfiles ────────────────────────────────────────────────────────────────
 
+
 def runfiles_root() -> Path:
     """Locate `_main/` in the current test's runfiles tree."""
     rf = os.environ.get("RUNFILES_DIR") or os.environ.get("TEST_SRCDIR")
@@ -42,6 +43,7 @@ def runfiles_root() -> Path:
 
 
 # ── Launcher lifecycle ──────────────────────────────────────────────────────
+
 
 @dataclass
 class Launcher:
@@ -94,14 +96,18 @@ def spawn_backgrounded(
         proc = subprocess.Popen(
             [str(launcher_path)],
             env=full_env,
-            stdout=log_fd, stderr=log_fd,
+            stdout=log_fd,
+            stderr=log_fd,
             stdin=subprocess.DEVNULL,
         )
     return Launcher(proc=proc, log_path=log_path)
 
 
 def run_variant_and_capture(
-    package: str, *, marker: str, timeout: float,
+    package: str,
+    *,
+    marker: str,
+    timeout: float,
 ) -> str:
     """Spawn the `LAUNCHER_NAME` variant in `apps/<package>`, wait for
     `marker`, terminate, and return the captured serial log.
@@ -113,6 +119,7 @@ def run_variant_and_capture(
     inside this function.
     """
     import unittest  # local — this helper is only used in test setUp paths.
+
     launcher_name = os.environ["LAUNCHER_NAME"]
     launcher_path = runfiles_root() / "apps" / package / launcher_name
     if not (launcher_path.is_file() and os.access(launcher_path, os.X_OK)):
@@ -120,9 +127,7 @@ def run_variant_and_capture(
     launcher = spawn_backgrounded(launcher_path, log_prefix=launcher_name)
     try:
         if not wait_for_marker(launcher, marker, timeout=timeout):
-            raise RuntimeError(
-                f"guest never printed {marker!r} within {timeout}s"
-            )
+            raise RuntimeError(f"guest never printed {marker!r} within {timeout}s")
         launcher.terminate()
         return launcher.log_path.read_text(errors="replace")
     finally:
@@ -147,6 +152,7 @@ def wait_for_marker(launcher: Launcher, marker: str, *, timeout: float) -> bool:
 
 
 # ── PTY launcher (for stdin-sensitive tests: Ctrl-C, log-based) ─────────────
+
 
 class PtyLauncher:
     """Launch a program under a pseudo-terminal.
@@ -224,8 +230,13 @@ class PtyLauncher:
 
 # ── Probes ──────────────────────────────────────────────────────────────────
 
+
 def http_get(
-    path: str, *, host: str = "127.0.0.1", port: int, timeout: float = 3.0,
+    path: str,
+    *,
+    host: str = "127.0.0.1",
+    port: int,
+    timeout: float = 3.0,
 ) -> tuple[int, bytes]:
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
@@ -237,7 +248,10 @@ def http_get(
 
 
 def h3_get(
-    path: str, *, host: str = "127.0.0.1", port: int,
+    path: str,
+    *,
+    host: str = "127.0.0.1",
+    port: int,
     timeout: float = 6.0,
 ) -> tuple[int, bytes]:
     """HTTP/3 GET via `aioquic`. Returns `(status, body)` like `http_get`.
@@ -262,6 +276,7 @@ def h3_get(
         from aioquic.quic.events import QuicEvent
     except ImportError as exc:
         import unittest
+
         raise unittest.SkipTest(f"aioquic not installed: {exc}")
 
     class H3Probe(QuicConnectionProtocol):
@@ -290,7 +305,8 @@ def h3_get(
         cfg.verify_mode = False  # accept self-signed dev cert
         cfg.idle_timeout = timeout
         async with aclient.connect(
-            host, port,
+            host,
+            port,
             configuration=cfg,
             create_protocol=H3Probe,
             wait_connected=True,
@@ -298,10 +314,12 @@ def h3_get(
             sid = client._quic.get_next_available_stream_id()
             client.h3.send_headers(
                 stream_id=sid,
-                headers=[(b":method", b"GET"),
-                         (b":scheme", b"https"),
-                         (b":authority", f"{host}:{port}".encode()),
-                         (b":path", path.encode())],
+                headers=[
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", f"{host}:{port}".encode()),
+                    (b":path", path.encode()),
+                ],
                 end_stream=True,
             )
             client.transmit()
@@ -312,8 +330,12 @@ def h3_get(
 
 
 def https_get(
-    path: str, *, host: str = "127.0.0.1", port: int,
-    ca_file: Optional[Path] = None, sni: str = "unikernel.local",
+    path: str,
+    *,
+    host: str = "127.0.0.1",
+    port: int,
+    ca_file: Optional[Path] = None,
+    sni: str = "unikernel.local",
     timeout: float = 5.0,
 ) -> tuple[int, bytes]:
     if ca_file is not None:
@@ -330,8 +352,12 @@ def https_get(
 
 
 def https_session_resume_check(
-    *, host: str = "127.0.0.1", port: int, ca_file: Optional[Path] = None,
-    sni: str = "unikernel.local", timeout: float = 5.0,
+    *,
+    host: str = "127.0.0.1",
+    port: int,
+    ca_file: Optional[Path] = None,
+    sni: str = "unikernel.local",
+    timeout: float = 5.0,
 ) -> tuple[bool, bool]:
     """Open two TLS connections back-to-back to `host:port`, sharing
     one `SSLContext`, and report whether the second handshake reused
@@ -356,15 +382,15 @@ def https_session_resume_check(
         # `session_reused` flag and the populated `session` object.
         sock = socket.create_connection((host, port), timeout=timeout)
         try:
-            ssock = ctx.wrap_socket(sock, server_hostname=sni,
-                                    session=prev_session)
+            ssock = ctx.wrap_socket(sock, server_hostname=sni, session=prev_session)
             try:
                 # Drive a request so the server emits NewSessionTicket
                 # (which it does after Client Finished verifies). Server
                 # closes after the response per Connection: close, so we
                 # read until EOF.
-                req = (f"GET /health HTTP/1.1\r\nHost: {sni}\r\n"
-                       f"Connection: close\r\n\r\n").encode()
+                req = (
+                    f"GET /health HTTP/1.1\r\nHost: {sni}\r\nConnection: close\r\n\r\n"
+                ).encode()
                 ssock.sendall(req)
                 while True:
                     buf = ssock.recv(4096)
@@ -388,14 +414,16 @@ def https_session_resume_check(
 
 
 def udp_echo(
-    payload: bytes = b"hello", *, host: str = "127.0.0.1",
-    port: int, timeout: float = 2.0,
+    payload: bytes = b"hello",
+    *,
+    host: str = "127.0.0.1",
+    port: int,
+    timeout: float = 2.0,
 ) -> Optional[bytes]:
     # `getaddrinfo` picks AF_INET or AF_INET6 based on the literal,
     # so callers can pass `"::1"` and we open the matching family
     # without a parallel `udp_echo_v6` helper.
-    info = socket.getaddrinfo(host, port,
-                              type=socket.SOCK_DGRAM)[0]
+    info = socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)[0]
     s = socket.socket(info[0], info[1])
     s.settimeout(timeout)
     try:
@@ -408,8 +436,9 @@ def udp_echo(
         s.close()
 
 
-def wait_http_ready(port: int, *, timeout: float, host: str = "127.0.0.1",
-                    path: str = "/health") -> bool:
+def wait_http_ready(
+    port: int, *, timeout: float, host: str = "127.0.0.1", path: str = "/health"
+) -> bool:
     """Poll `http://host:port{path}` until it answers 200 or `timeout` hits."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

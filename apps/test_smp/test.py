@@ -28,14 +28,19 @@ class SmpBootTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.serial = run_variant_and_capture(
-            "test_smp", marker="SMP test complete", timeout=15.0,
+            "test_smp",
+            marker="SMP test complete",
+            timeout=15.0,
         )
 
     def test_each_core_reported(self) -> None:
         # Core 0 is implicit; APs print "[SMP] core N online".
         for core in range(1, EXPECTED_CPUS):
-            self.assertIn(f"[SMP] core {core} online", self.serial,
-                          f"core {core} didn't print its online message")
+            self.assertIn(
+                f"[SMP] core {core} online",
+                self.serial,
+                f"core {core} didn't print its online message",
+            )
 
     def test_app_reached_main(self) -> None:
         self.assertIn("SMP test: cores booted.", self.serial)
@@ -54,8 +59,11 @@ class SmpBootTest(unittest.TestCase):
         """
         if "aarch64" not in os.environ["LAUNCHER_NAME"]:
             self.skipTest("IPI test is aarch64-specific; x86_64 path not wired up")
-        self.assertIn("IPI test: PASS", self.serial,
-                      "IPI was not received — sgi_handler / ICC_SGI1_EL1 path broken")
+        self.assertIn(
+            "IPI test: PASS",
+            self.serial,
+            "IPI was not received — sgi_handler / ICC_SGI1_EL1 path broken",
+        )
 
 
 if __name__ == "__main__":

@@ -10,17 +10,17 @@ extern crate uni_kernel;
 extern crate uni_runtime;
 
 use uni_iobuf::{Chain, OwnedIOBuf};
-pub extern crate net_types as types;
-pub extern crate net_ethernet as ethernet;
 pub extern crate net_arp as arp;
+pub extern crate net_dhcp as dhcp;
+pub extern crate net_ethernet as ethernet;
+pub extern crate net_icmpv6 as icmpv6;
 pub extern crate net_ipv4 as ipv4;
 pub extern crate net_ipv6 as ipv6;
 pub extern crate net_ipv6_send as ipv6_send;
-pub extern crate net_icmpv6 as icmpv6;
 pub extern crate net_ndp as ndp;
 pub extern crate net_tcp as tcp;
+pub extern crate net_types as types;
 pub extern crate net_udp as udp;
-pub extern crate net_dhcp as dhcp;
 
 /// Bare-metal TCP backend vtable. Listener hooks open one TCB per
 /// core; per-stream hooks use the generation-aware variants so a
@@ -125,19 +125,13 @@ pub async fn bringup_dhcp() -> bool {
 }
 
 /// `dns` is left at 0.0.0.0 — the stack doesn't resolve names.
-pub fn bringup_static(
-    ip: types::Ipv4Addr,
-    gateway: types::Ipv4Addr,
-    netmask: types::Ipv4Addr,
-) {
+pub fn bringup_static(ip: types::Ipv4Addr, gateway: types::Ipv4Addr, netmask: types::Ipv4Addr) {
     let ip_o = ip.octets();
     let mask_o = netmask.octets();
     let gw_o = gateway.octets();
     dhcp::set_fallback_config(
-        ip_o[0], ip_o[1], ip_o[2], ip_o[3],
-        mask_o[0], mask_o[1], mask_o[2], mask_o[3],
-        gw_o[0], gw_o[1], gw_o[2], gw_o[3],
-        0, 0, 0, 0, // DNS — unused
+        ip_o[0], ip_o[1], ip_o[2], ip_o[3], mask_o[0], mask_o[1], mask_o[2], mask_o[3], gw_o[0],
+        gw_o[1], gw_o[2], gw_o[3], 0, 0, 0, 0, // DNS — unused
     );
 }
 
@@ -171,7 +165,6 @@ static RX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 /// actually rotates under asymmetric load.
 static JUST_DISTRIBUTED: uni_kernel::percpu::PerWorker<core::sync::atomic::AtomicBool> =
     uni_kernel::percpu::PerWorker::new();
-
 
 /// Poll the network device and dispatch received frames through the
 /// full stack: Ethernet -> ARP/IPv4 -> TCP/UDP.
@@ -207,7 +200,8 @@ fn poll_tier1() -> bool {
         // One write_fmt holds SERIAL_TX_LOCK for the whole line so a
         // concurrent klog! on another core can't slip in mid-message.
         uni_kernel::serial::write_fmt(format_args!(
-            "[net] Tier 1: per-core RX queues ({} queue pairs)\n", nqp
+            "[net] Tier 1: per-core RX queues ({} queue pairs)\n",
+            nqp
         ));
     }
     let core = uni_kernel::cpu_id();
@@ -244,7 +238,8 @@ fn poll_tier2(num_cores: u32) -> bool {
     if !MULTICORE_INIT.load(core::sync::atomic::Ordering::Relaxed) {
         MULTICORE_INIT.store(true, core::sync::atomic::Ordering::Relaxed);
         uni_kernel::serial::write_fmt(format_args!(
-            "[net] Tier 2: software distribution ({} cores)\n", num_cores
+            "[net] Tier 2: software distribution ({} cores)\n",
+            num_cores
         ));
     }
 
@@ -256,7 +251,8 @@ fn poll_tier2(num_cores: u32) -> bool {
     // interrupt and will reclaim the role on the cycle after if no one
     // else takes over.
     if num_cores > 1
-        && JUST_DISTRIBUTED.at(my_core)
+        && JUST_DISTRIBUTED
+            .at(my_core)
             .swap(false, core::sync::atomic::Ordering::Relaxed)
     {
         return false;
@@ -265,7 +261,8 @@ fn poll_tier2(num_cores: u32) -> bool {
     // Try to become the distributor.
     let got_lock = RX_LOCK
         .compare_exchange(
-            0, 1,
+            0,
+            1,
             core::sync::atomic::Ordering::Acquire,
             core::sync::atomic::Ordering::Relaxed,
         )
@@ -279,7 +276,9 @@ fn poll_tier2(num_cores: u32) -> bool {
 
     // Poll VirtIO RX and distribute directly (no batch buffer copy).
     for i in 0..num_cores {
-        WAKEUP.at(i).store(false, core::sync::atomic::Ordering::Relaxed);
+        WAKEUP
+            .at(i)
+            .store(false, core::sync::atomic::Ordering::Relaxed);
     }
 
     let count = uni_drivers::net::poll(distribute_frame);
@@ -287,7 +286,8 @@ fn poll_tier2(num_cores: u32) -> bool {
     // Mark ourselves as "just distributed" — our next poll attempt will
     // yield, giving other cores first shot at the lock.
     if num_cores > 1 {
-        JUST_DISTRIBUTED.at(my_core)
+        JUST_DISTRIBUTED
+            .at(my_core)
             .store(true, core::sync::atomic::Ordering::Relaxed);
     }
 
@@ -315,7 +315,6 @@ fn poll_tier2(num_cores: u32) -> bool {
     had_frames
 }
 
-
 /// RX callback for the NIC poll path (`NicOps::poll_rx` / `poll_qp`)
 /// — dispatches one received frame through the full stack. This is
 /// the single-core and Tier-1 receive entry point, and the ARP / IPv6
@@ -342,7 +341,9 @@ fn poll_tier2(num_cores: u32) -> bool {
 /// reposts the buffer(s) via each part's drop callback.
 pub fn net_receive(chain: Chain<OwnedIOBuf>) {
     // Part 0 carries the L2/L3/L4 headers contiguously.
-    let Some(first) = chain.iter().next() else { return };
+    let Some(first) = chain.iter().next() else {
+        return;
+    };
     let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(first.data()) else {
         return;
     };
@@ -417,7 +418,11 @@ fn parse_ipv4(
         l4_len,
         // Snoop only on-subnet senders: off-subnet traffic's L2 src MAC
         // is the gateway's, not the IP's own (see `arp::arp_learn`).
-        arp: if ipv4::same_subnet(pkt.src) { Some(src_mac) } else { None },
+        arp: if ipv4::same_subnet(pkt.src) {
+            Some(src_mac)
+        } else {
+            None
+        },
     })
 }
 
@@ -435,9 +440,12 @@ fn dispatch_l4(parsed: &types::ParsedL3, chain: Chain<OwnedIOBuf>) {
             // The borrowed segment never outlives `udp_receive` (it
             // runs synchronously); `chain` then drops at the end of
             // this arm, reposting its device buffer.
-            let Some(first) = chain.iter().next() else { return };
-            let Some(segment) =
-                first.data().get(parsed.l4_off..parsed.l4_off + parsed.l4_len)
+            let Some(first) = chain.iter().next() else {
+                return;
+            };
+            let Some(segment) = first
+                .data()
+                .get(parsed.l4_off..parsed.l4_off + parsed.l4_len)
             else {
                 return;
             };
@@ -483,7 +491,9 @@ fn tcp_receive_segment(
         "multi-part RX chain in tcp_receive_segment: RSC (item I) must \
          refresh the chain's cached total_len after the part-0 narrow",
     );
-    let Some(part0) = chain.front_mut() else { return };
+    let Some(part0) = chain.front_mut() else {
+        return;
+    };
     if part0.narrow(l4_off, l4_len).is_err() {
         // Unreachable: `l4_off + l4_len` is the end of `pkt.payload`,
         // a sub-slice of part 0, in-bounds by construction.
@@ -508,11 +518,7 @@ fn tcp_receive_segment(
 /// learn here would be the redundant one the fuse removed.
 ///
 /// [`ParsedL3`]: types::ParsedL3
-fn classify_for_distribution(
-    frame: &[u8],
-    num_cores: u32,
-    my_core: u32,
-) -> ClassifyResult {
+fn classify_for_distribution(frame: &[u8], num_cores: u32, my_core: u32) -> ClassifyResult {
     let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) else {
         return ClassifyResult::Drop;
     };
@@ -546,8 +552,7 @@ fn classify_for_distribution(
             } else {
                 (0, 0)
             };
-            let target =
-                flow_hash(src_v4.addr, dst_v4.addr, src_port, dst_port, num_cores);
+            let target = flow_hash(src_v4.addr, dst_v4.addr, src_port, dst_port, num_cores);
             if target == my_core || num_cores <= 1 {
                 ClassifyResult::InlineParsed(parsed)
             } else {
@@ -598,7 +603,9 @@ enum ClassifyResult {
 fn distribute_frame(chain: Chain<OwnedIOBuf>) {
     let num_cores = percpu::num_cores();
     let my_core = uni_kernel::cpu_id();
-    let Some(first) = chain.iter().next() else { return };
+    let Some(first) = chain.iter().next() else {
+        return;
+    };
     match classify_for_distribution(first.data(), num_cores, my_core) {
         // ARP / IPv6 — `net_receive` re-parses; the chain drops there.
         ClassifyResult::InlineReparse => net_receive(chain),
@@ -611,7 +618,9 @@ fn distribute_frame(chain: Chain<OwnedIOBuf>) {
             let frame = percpu::RxChain { parsed, chain };
             match percpu::rx_node_pool().distribute(&core.rx_inbox, frame) {
                 Ok(()) => {
-                    WAKEUP.at(target).store(true, core::sync::atomic::Ordering::Relaxed);
+                    WAKEUP
+                        .at(target)
+                        .store(true, core::sync::atomic::Ordering::Relaxed);
                 }
                 Err(_frame) => {
                     // Unreachable: the node pool is sized ≥ the RX
@@ -637,10 +646,22 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 /// `AtomicU8`s so a multi-core read-during-init never races.
 /// Single writer (BSP at boot); many readers (per-core RX paths).
 static IPV6_LL_OCTETS: [AtomicU8; 16] = [
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
 ];
 static IPV6_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -657,10 +678,22 @@ fn ipv6_ll() -> types::Ipv6Addr {
 /// flag set) arrives. Same atomic-array shape as the link-local
 /// for race-free per-core reads.
 static IPV6_GLOBAL_OCTETS: [AtomicU8; 16] = [
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
 ];
 static IPV6_GLOBAL_SET: AtomicBool = AtomicBool::new(false);
 
@@ -715,13 +748,7 @@ fn send_router_solicitation() {
     };
     // Multicast destination → ipv6_send picks the
     // 33:33:00:00:00:02 mapping internally.
-    ipv6_send::ipv6_send(
-        &ll,
-        &dst,
-        ipv6::next_header::ICMPV6,
-        255,
-        &icmp[..n],
-    );
+    ipv6_send::ipv6_send(&ll, &dst, ipv6::next_header::ICMPV6, 255, &icmp[..n]);
 }
 
 /// Process an inbound Router Advertisement. If it carries a
@@ -759,7 +786,14 @@ fn handle_router_advertisement(payload: &[u8]) {
     }
     uni_kernel::serial::write_fmt(format_args!(
         "[net] ipv6 SLAAC: configured {:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}::{:x}:{:x}:{:x}:{:x}\n",
-        o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7],
+        o[0],
+        o[1],
+        o[2],
+        o[3],
+        o[4],
+        o[5],
+        o[6],
+        o[7],
         u16::from_be_bytes([o[8], o[9]]),
         u16::from_be_bytes([o[10], o[11]]),
         u16::from_be_bytes([o[12], o[13]]),
@@ -786,7 +820,9 @@ fn our_v6_addrs(out: &mut [types::Ipv6Addr; 5]) -> usize {
 }
 
 fn ipv6_receive_frame(chain: Chain<OwnedIOBuf>, src_mac: types::MacAddr) {
-    let Some(first) = chain.iter().next() else { return };
+    let Some(first) = chain.iter().next() else {
+        return;
+    };
     let Some((_, _, eth_payload)) = ethernet::ethernet_parse_full(first.data()) else {
         return;
     };
@@ -812,8 +848,7 @@ fn ipv6_receive_frame(chain: Chain<OwnedIOBuf>, src_mac: types::MacAddr) {
                 // pointer arithmetic over the backing buffer. Robust
                 // across IPv6 extension headers (which a fixed
                 // `eth + 40` constant would miss).
-                let l4_off = pkt.payload.as_ptr() as usize
-                    - first.data().as_ptr() as usize;
+                let l4_off = pkt.payload.as_ptr() as usize - first.data().as_ptr() as usize;
                 let l4_len = pkt.payload.len();
                 tcp_receive_segment(src, dst, chain, l4_off, l4_len);
             } else {
@@ -836,7 +871,8 @@ fn handle_icmpv6(pkt: &ipv6::Ipv6Packet<'_>, src_mac: types::MacAddr) {
             // Reply: src = our LL, dst = original src. RFC 4443 §4.2:
             // hop limit 64 (default).
             let mut icmp_out = [0u8; 1500 - ipv6::HEADER_LEN];
-            let n = match icmpv6::build_echo_reply(&ipv6_ll(), &pkt.src, pkt.payload, &mut icmp_out) {
+            let n = match icmpv6::build_echo_reply(&ipv6_ll(), &pkt.src, pkt.payload, &mut icmp_out)
+            {
                 Some(n) => n,
                 None => return,
             };
@@ -859,8 +895,7 @@ fn handle_icmpv6(pkt: &ipv6::Ipv6Packet<'_>, src_mac: types::MacAddr) {
             };
             // Respond if the target is one of our addresses
             // (link-local OR the SLAAC global).
-            let is_ours = ns.target == ipv6_ll()
-                || ipv6_global().map_or(false, |g| g == ns.target);
+            let is_ours = ns.target == ipv6_ll() || ipv6_global().map_or(false, |g| g == ns.target);
             if !is_ours {
                 return;
             }
@@ -895,7 +930,6 @@ fn handle_icmpv6(pkt: &ipv6::Ipv6Packet<'_>, src_mac: types::MacAddr) {
         _ => {}
     }
 }
-
 
 /// Flow hash: map a 4-tuple to a core index for Tier 2 distribution.
 ///
@@ -991,4 +1025,3 @@ fn net_flush_cb() {
         uni_drivers::net::flush_tx_kick_if_dirty();
     }
 }
-

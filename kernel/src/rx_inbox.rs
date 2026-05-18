@@ -385,8 +385,8 @@ mod tests {
     use super::*;
     extern crate std;
 
-    use std::sync::atomic::{AtomicBool, AtomicU64 as StdAtomicU64};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64 as StdAtomicU64};
     use std::thread;
     use std::vec::Vec;
 
@@ -630,7 +630,8 @@ mod tests {
         let mut total_seen = 0u64;
         for core in 0..CORES {
             assert_eq!(
-                seen[core].len() as u64, sent[core],
+                seen[core].len() as u64,
+                sent[core],
                 "core {core}: drained count matches sent count",
             );
             total_seen += seen[core].len() as u64;
@@ -641,7 +642,8 @@ mod tests {
                 assert!(
                     w[0] < w[1],
                     "core {core}: payloads out of order ({} then {})",
-                    w[0], w[1],
+                    w[0],
+                    w[1],
                 );
             }
         }

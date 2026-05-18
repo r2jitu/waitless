@@ -16,8 +16,8 @@ use core::ptr::{self, addr_of_mut};
 use p256::ecdsa::SigningKey;
 
 use crate::handshake::ParseError;
-use crate::record::{content_type, seal as record_seal, RecordError};
-use crate::schedule::{KeySchedule, TrafficKey, Transcript, X25519ServerKey, HASH_LEN};
+use crate::record::{RecordError, content_type, seal as record_seal};
+use crate::schedule::{HASH_LEN, KeySchedule, TrafficKey, Transcript, X25519ServerKey};
 
 // File-local aliases. Sibling modules of this crate referenced
 // throughout the file body keep their original short names
@@ -395,8 +395,7 @@ impl TlsServer {
             // safely.
             addr_of_mut!((*this).transcript).write(Transcript::new());
             addr_of_mut!((*this).schedule).write(KeySchedule::new_without_psk());
-            addr_of_mut!((*this).ephemeral)
-                .write(Some(X25519ServerKey::from_seed(x25519_seed)));
+            addr_of_mut!((*this).ephemeral).write(Some(X25519ServerKey::from_seed(x25519_seed)));
             addr_of_mut!((*this).client_hs_tk).write(None);
             addr_of_mut!((*this).server_hs_tk).write(None);
             addr_of_mut!((*this).client_ap_tk).write(None);
@@ -557,10 +556,7 @@ impl TlsServer {
             self.state = State::Closed;
             return Ok(());
         }
-        let tk = self
-            .server_ap_tk
-            .as_mut()
-            .ok_or(HandshakeError::Internal)?;
+        let tk = self.server_ap_tk.as_mut().ok_or(HandshakeError::Internal)?;
         let alert_body: [u8; 2] = [1, 0]; // warning(1), close_notify(0)
         let needed = record::HEADER_LEN + alert_body.len() + 1 + record::TAG_LEN;
         if TX_BUF_LEN - self.tx_len < needed {
@@ -599,17 +595,8 @@ impl TlsServer {
         if self.state != State::Established {
             return Err(HandshakeError::UnexpectedRecord);
         }
-        let tk = self
-            .server_ap_tk
-            .as_mut()
-            .ok_or(HandshakeError::Internal)?;
-        record::seal_chain(
-            tk,
-            content_type::APPLICATION_DATA,
-            src_chain,
-            dst,
-        )
-        .map_err(|e| e.into())
+        let tk = self.server_ap_tk.as_mut().ok_or(HandshakeError::Internal)?;
+        record::seal_chain(tk, content_type::APPLICATION_DATA, src_chain, dst).map_err(|e| e.into())
     }
 
     /// Advance the state machine as far as possible with what's in
@@ -649,7 +636,6 @@ impl TlsServer {
             }
         }
     }
-
 }
 
 // ============================================================================
@@ -673,9 +659,7 @@ mod tests {
         let mut blob = [0u8; 64];
         // id-ecPublicKey + prime256v1 OIDs (just the prime256v1 OID is
         // required by our extractor; id-ecPublicKey is a real-blob detail).
-        blob[0..10].copy_from_slice(&[
-            0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
-        ]);
+        blob[0..10].copy_from_slice(&[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]);
         // ECPrivateKey version=1 + OCTET STRING length=32 header.
         blob[10..15].copy_from_slice(&[0x02, 0x01, 0x01, 0x04, 0x20]);
         // Scalar: 32 bytes of 0, 1, 2, ... 31.

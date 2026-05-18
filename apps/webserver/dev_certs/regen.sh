@@ -41,7 +41,7 @@ openssl req -new -x509 -key dev_key.pem -out dev_cert.pem -days "$DAYS" \
     -sha256
 
 echo "==> Exporting DER forms..."
-openssl pkey -in dev_key.pem  -outform DER -out dev_key.der
+openssl pkey -in dev_key.pem -outform DER -out dev_key.der
 openssl x509 -in dev_cert.pem -outform DER -out dev_cert.der
 
 echo ""

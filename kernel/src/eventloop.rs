@@ -64,8 +64,7 @@ impl CoreStats {
 /// target in production today.
 pub const MAX_CORE_STATS: usize = 8;
 
-static CORE_STATS: [CoreStats; MAX_CORE_STATS] =
-    [const { CoreStats::new() }; MAX_CORE_STATS];
+static CORE_STATS: [CoreStats; MAX_CORE_STATS] = [const { CoreStats::new() }; MAX_CORE_STATS];
 
 /// Snapshot the stats for `core_id`. Returns zeros for ids ≥ the
 /// fixed cap. Live readers should sample two snapshots a known
@@ -200,7 +199,6 @@ pub fn run(core_id: u32) -> ! {
         }
     }
 
-
     // Per-core counters for diagnostics. These shadow the
     // `CORE_STATS[core_id]` atomics — local registers stay hot in
     // the inner loop; we publish to the atomics in bulk via
@@ -257,24 +255,35 @@ pub fn run(core_id: u32) -> ! {
     const IDLE_SPIN_BEFORE_HLT: u32 = 10_000;
 
     loop {
-        if loops & 63 == 0 && is_shutdown() { break; }
+        if loops & 63 == 0 && is_shutdown() {
+            break;
+        }
         loops += 1;
 
         let mut did_work = false;
 
         // 1. Network poll: try to distribute RX + flush TX (rotating distributor)
         if let Some(f) = NET_POLL.load() {
-            if f(core_id) { did_work = true; poll_work += 1; }
+            if f(core_id) {
+                did_work = true;
+                poll_work += 1;
+            }
         }
 
         // 2. Drain this core's inbox
         if let Some(f) = NET_DRAIN.load() {
-            if f(core_id) { did_work = true; drain_work += 1; }
+            if f(core_id) {
+                did_work = true;
+                drain_work += 1;
+            }
         }
 
         // 3. App service (connections, handlers)
         if let Some(f) = SERVICE.load() {
-            if f(core_id) { did_work = true; service_work += 1; }
+            if f(core_id) {
+                did_work = true;
+                service_work += 1;
+            }
         }
 
         // 3a. Async runtime: advance timers (drain pending MPSC + fire
@@ -288,7 +297,9 @@ pub fn run(core_id: u32) -> ! {
         // 3b. Flush TX after service — responses must be sent immediately
         // so keep-alive follow-up requests arrive promptly.
         if did_work {
-            if let Some(f) = NET_FLUSH.load() { f(); }
+            if let Some(f) = NET_FLUSH.load() {
+                f();
+            }
         }
 
         // 4. Check for shutdown (every 64 iterations to avoid MMIO overhead).
@@ -327,7 +338,9 @@ pub fn run(core_id: u32) -> ! {
                 {
                     let yield_addr = crate::aarch64::fdt::info().yield_mmio_base;
                     if yield_addr != 0 {
-                        unsafe { core::ptr::write_volatile(yield_addr as *mut u32, 0); }
+                        unsafe {
+                            core::ptr::write_volatile(yield_addr as *mut u32, 0);
+                        }
                     }
                 }
             }
@@ -376,10 +389,9 @@ pub fn run(core_id: u32) -> ! {
             // path apart from the per-iter start sample at the end;
             // bracket cost is ~10 ns on x86, ~5 ns on aarch64.
             let pre_sleep = crate::time::now_cycles();
-            stats.busy_cycles.fetch_add(
-                pre_sleep.wrapping_sub(iter_start_cycles),
-                Ordering::Relaxed,
-            );
+            stats
+                .busy_cycles
+                .fetch_add(pre_sleep.wrapping_sub(iter_start_cycles), Ordering::Relaxed);
             stats.idle_enters.fetch_add(1, Ordering::Relaxed);
             if uni_runtime::has_pending(core_id) {
                 // The executor has a pending timer or a task ready to
@@ -395,10 +407,9 @@ pub fn run(core_id: u32) -> ! {
                 crate::cpu::idle_bounded();
             }
             let post_sleep = crate::time::now_cycles();
-            stats.idle_cycles.fetch_add(
-                post_sleep.wrapping_sub(pre_sleep),
-                Ordering::Relaxed,
-            );
+            stats
+                .idle_cycles
+                .fetch_add(post_sleep.wrapping_sub(pre_sleep), Ordering::Relaxed);
             iter_start_cycles = post_sleep;
         }
 
@@ -464,7 +475,9 @@ pub fn run(core_id: u32) -> ! {
     }
 
     // Shutdown — allow APs to print before exiting
-    for _ in 0..100_000u32 { core::hint::spin_loop(); }
+    for _ in 0..100_000u32 {
+        core::hint::spin_loop();
+    }
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -490,7 +503,9 @@ pub fn run(core_id: u32) -> ! {
                 options(nomem, nostack),
             );
         }
-        loop { core::arch::asm!("wfi"); }
+        loop {
+            core::arch::asm!("wfi");
+        }
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -507,12 +522,17 @@ pub fn run(core_id: u32) -> ! {
             core::arch::asm!("out dx, ax", in("dx") 0x0604u16, in("ax") 0x3400u16, options(nomem, nostack));
             core::arch::asm!("out dx, ax", in("dx") 0xb004u16, in("ax") 0x2000u16, options(nomem, nostack));
         }
-        loop { core::arch::asm!("cli", "hlt", options(nomem, nostack)); }
+        loop {
+            core::arch::asm!("cli", "hlt", options(nomem, nostack));
+        }
     }
 }
 
 fn print_u64(mut val: u64) {
-    if val == 0 { crate::serial::puts(b"0"); return; }
+    if val == 0 {
+        crate::serial::puts(b"0");
+        return;
+    }
     let mut buf = [0u8; 20];
     let mut len = 0;
     while val > 0 {
@@ -521,6 +541,8 @@ fn print_u64(mut val: u64) {
         len += 1;
     }
     let mut out = [0u8; 20];
-    for i in 0..len { out[i] = buf[len - 1 - i]; }
+    for i in 0..len {
+        out[i] = buf[len - 1 - i];
+    }
     crate::serial::puts(&out[..len]);
 }

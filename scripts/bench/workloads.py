@@ -32,7 +32,9 @@ def wait_http(port, timeout=20, host="localhost"):
         try:
             r = subprocess.run(
                 ["curl", "-sf", "--max-time", "2", f"http://{host}:{port}/health"],
-                capture_output=True, timeout=5)
+                capture_output=True,
+                timeout=5,
+            )
             if r.returncode == 0:
                 return True
         except Exception:
@@ -55,6 +57,7 @@ def fetch_total_allocs(port, host="localhost", https=False):
     available on this env" and skip the per-handshake derivation.
     """
     import json
+
     scheme = "https" if https else "http"
     url = f"{scheme}://{host}:{port}/heap"
     try:
@@ -65,9 +68,7 @@ def fetch_total_allocs(port, host="localhost", https=False):
         flags = ["-sf", "--max-time", "3"]
         if https:
             flags.append("-k")
-        r = subprocess.run(
-            ["curl", *flags, url],
-            capture_output=True, timeout=5)
+        r = subprocess.run(["curl", *flags, url], capture_output=True, timeout=5)
         if r.returncode != 0:
             return None
         data = json.loads(r.stdout)
@@ -89,15 +90,14 @@ def fetch_tls_encrypt_stats(port, host="localhost", https=False):
     it's a clean signal of where the per-record AEAD cost sits.
     """
     import json
+
     scheme = "https" if https else "http"
     url = f"{scheme}://{host}:{port}/stats"
     try:
         flags = ["-sf", "--max-time", "3"]
         if https:
             flags.append("-k")
-        r = subprocess.run(
-            ["curl", *flags, url],
-            capture_output=True, timeout=5)
+        r = subprocess.run(["curl", *flags, url], capture_output=True, timeout=5)
         if r.returncode != 0:
             return None
         data = json.loads(r.stdout)
@@ -117,10 +117,20 @@ def run_wrk(port, endpoint, threads, conns, duration, host="localhost"):
     # so even a wedged wrk only blocks the bench by 10 s past its run.
     try:
         r = subprocess.run(
-            ["wrk", f"-t{threads}", f"-c{conns}", f"-d{duration}s",
-             "--timeout", "5s", "--latency",
-             f"http://{host}:{port}{endpoint}"],
-            capture_output=True, text=True, timeout=duration + 10)
+            [
+                "wrk",
+                f"-t{threads}",
+                f"-c{conns}",
+                f"-d{duration}s",
+                "--timeout",
+                "5s",
+                "--latency",
+                f"http://{host}:{port}{endpoint}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=duration + 10,
+        )
         rps, p50, p99 = 0.0, "", ""
         for line in r.stdout.split("\n"):
             if "Requests/sec" in line:
@@ -150,10 +160,20 @@ def run_wrk_https(port, endpoint, threads, conns, duration, host="localhost"):
     """
     try:
         r = subprocess.run(
-            ["wrk", f"-t{threads}", f"-c{conns}", f"-d{duration}s",
-             "--timeout", "5s", "--latency",
-             f"https://{host}:{port}{endpoint}"],
-            capture_output=True, text=True, timeout=duration + 10)
+            [
+                "wrk",
+                f"-t{threads}",
+                f"-c{conns}",
+                f"-d{duration}s",
+                "--timeout",
+                "5s",
+                "--latency",
+                f"https://{host}:{port}{endpoint}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=duration + 10,
+        )
         rps, p50, p99 = 0.0, "", ""
         for line in r.stdout.split("\n"):
             if "Requests/sec" in line:
@@ -203,9 +223,7 @@ def _tls_handshake_worker(args):
 
     connect_host = "127.0.0.1" if host in ("localhost", "127.0.0.1") else host
     request = (
-        f"GET {endpoint} HTTP/1.1\r\n"
-        f"Host: {host}\r\n"
-        f"Connection: close\r\n\r\n"
+        f"GET {endpoint} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
     ).encode()
 
     # SO_LINGER={on=1,linger=0} → RST on close (no TIME_WAIT on the
@@ -217,8 +235,8 @@ def _tls_handshake_worker(args):
     local_err = 0
     MAX_SAMPLES = 100_000
     total_start = time_mod.monotonic()
-    warmup_end  = total_start + warmup
-    total_end   = warmup_end  + total_duration
+    warmup_end = total_start + warmup
+    total_end = warmup_end + total_duration
 
     while time_mod.monotonic() < total_end:
         in_measure = time_mod.monotonic() >= warmup_end
@@ -261,8 +279,9 @@ def _tls_handshake_worker(args):
     return (local_lat, local_err)
 
 
-def run_tls_handshake_rate(port, endpoint, duration, host="localhost",
-                           parallelism=4, warmup=1.0):
+def run_tls_handshake_rate(
+    port, endpoint, duration, host="localhost", parallelism=4, warmup=1.0
+):
     """Measure full TLS 1.3 handshake throughput.
 
     Spawns `parallelism` *processes* (not threads — see
@@ -324,13 +343,14 @@ def run_tls_handshake_rate(port, endpoint, duration, host="localhost",
     against our server.
     """
     import multiprocessing
+
     args = (port, endpoint, host, duration, warmup)
     with multiprocessing.Pool(processes=parallelism) as pool:
         results = pool.map(_tls_handshake_worker, [args] * parallelism)
 
     all_lat = []
     total_err = 0
-    for (lat, err) in results:
+    for lat, err in results:
         all_lat.extend(lat)
         total_err += err
 
@@ -394,20 +414,24 @@ def _loadgen_bin():
             cargo = candidate
     if cargo is None:
         if not getattr(_loadgen_bin, "_warned_no_cargo", False):
-            print("warning: cargo not found; falling back to Python "
-                  "loadgen for tls_handshake / tcp_echo (slower).",
-                  file=sys.stderr)
+            print(
+                "warning: cargo not found; falling back to Python "
+                "loadgen for tls_handshake / tcp_echo (slower).",
+                file=sys.stderr,
+            )
             _loadgen_bin._warned_no_cargo = True
         return None
-    print("==> Building scripts/bench/loadgen (first-run, ~30s)...",
-          file=sys.stderr)
+    print("==> Building scripts/bench/loadgen (first-run, ~30s)...", file=sys.stderr)
     try:
         subprocess.run(
-            [cargo, "build", "--release"],
-            cwd=crate_dir, check=True, timeout=300)
+            [cargo, "build", "--release"], cwd=crate_dir, check=True, timeout=300
+        )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        print(f"warning: loadgen cargo build failed ({e}); falling "
-              "back to Python loadgen.", file=sys.stderr)
+        print(
+            f"warning: loadgen cargo build failed ({e}); falling "
+            "back to Python loadgen.",
+            file=sys.stderr,
+        )
         return None
     return os.path.join(crate_dir, "target", "release", "loadgen")
 
@@ -436,17 +460,31 @@ def run_loadgen_tls_handshake(port, endpoint, duration, host, parallelism, warmu
     dispatcher can swap implementations transparently."""
     bin_path = _loadgen_bin()
     if bin_path is None:
-        return run_tls_handshake_rate(port, endpoint, duration, host=host,
-                                      parallelism=parallelism, warmup=warmup)
+        return run_tls_handshake_rate(
+            port, endpoint, duration, host=host, parallelism=parallelism, warmup=warmup
+        )
     try:
         r = subprocess.run(
-            [bin_path, "tls-handshake",
-             "--host", host, "--port", str(port),
-             "--endpoint", endpoint,
-             "--duration-secs", str(duration),
-             "--warmup-secs", str(warmup),
-             "--parallelism", str(parallelism)],
-            capture_output=True, text=True, timeout=duration + warmup + 30)
+            [
+                bin_path,
+                "tls-handshake",
+                "--host",
+                host,
+                "--port",
+                str(port),
+                "--endpoint",
+                endpoint,
+                "--duration-secs",
+                str(duration),
+                "--warmup-secs",
+                str(warmup),
+                "--parallelism",
+                str(parallelism),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=duration + warmup + 30,
+        )
         if r.returncode != 0:
             return 0.0, "ERROR", "ERROR"
         return _parse_loadgen_output(r.stdout)
@@ -466,13 +504,26 @@ def run_loadgen_http_close(port, endpoint, duration, host, parallelism, warmup=1
         return 0.0, "NO_LOADGEN", "NO_LOADGEN"
     try:
         r = subprocess.run(
-            [bin_path, "http-close",
-             "--host", host, "--port", str(port),
-             "--endpoint", endpoint,
-             "--duration-secs", str(duration),
-             "--warmup-secs", str(warmup),
-             "--parallelism", str(parallelism)],
-            capture_output=True, text=True, timeout=duration + warmup + 30)
+            [
+                bin_path,
+                "http-close",
+                "--host",
+                host,
+                "--port",
+                str(port),
+                "--endpoint",
+                endpoint,
+                "--duration-secs",
+                str(duration),
+                "--warmup-secs",
+                str(warmup),
+                "--parallelism",
+                str(parallelism),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=duration + warmup + 30,
+        )
         if r.returncode != 0:
             return 0.0, "ERROR", "ERROR"
         return _parse_loadgen_output(r.stdout)
@@ -495,13 +546,26 @@ def run_loadgen_tls_resume(port, endpoint, duration, host, parallelism, warmup=1
         return 0.0, "NO_LOADGEN", "NO_LOADGEN"
     try:
         r = subprocess.run(
-            [bin_path, "tls-resume",
-             "--host", host, "--port", str(port),
-             "--endpoint", endpoint,
-             "--duration-secs", str(duration),
-             "--warmup-secs", str(warmup),
-             "--parallelism", str(parallelism)],
-            capture_output=True, text=True, timeout=duration + warmup + 30)
+            [
+                bin_path,
+                "tls-resume",
+                "--host",
+                host,
+                "--port",
+                str(port),
+                "--endpoint",
+                endpoint,
+                "--duration-secs",
+                str(duration),
+                "--warmup-secs",
+                str(warmup),
+                "--parallelism",
+                str(parallelism),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=duration + warmup + 30,
+        )
         if r.returncode != 0:
             return 0.0, "ERROR", "ERROR"
         return _parse_loadgen_output(r.stdout)
@@ -524,13 +588,26 @@ def run_loadgen_h3_health(port, endpoint, duration, host, parallelism, warmup=1)
         return 0.0, "NO_LOADGEN", "NO_LOADGEN"
     try:
         r = subprocess.run(
-            [bin_path, "h3-health",
-             "--host", host, "--port", str(port),
-             "--endpoint", endpoint,
-             "--duration-secs", str(duration),
-             "--warmup-secs", str(warmup),
-             "--parallelism", str(parallelism)],
-            capture_output=True, text=True, timeout=duration + warmup + 30)
+            [
+                bin_path,
+                "h3-health",
+                "--host",
+                host,
+                "--port",
+                str(port),
+                "--endpoint",
+                endpoint,
+                "--duration-secs",
+                str(duration),
+                "--warmup-secs",
+                str(warmup),
+                "--parallelism",
+                str(parallelism),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=duration + warmup + 30,
+        )
         if r.returncode != 0:
             return 0.0, "ERROR", "ERROR"
         return _parse_loadgen_output(r.stdout)
@@ -546,12 +623,24 @@ def run_loadgen_tcp_echo(port, conns, duration, host="127.0.0.1", msg_size=64):
         return run_tcp_echo(port, conns, duration, host=host, msg_size=msg_size)
     try:
         r = subprocess.run(
-            [bin_path, "tcp-echo",
-             "--host", host, "--port", str(port),
-             "--duration-secs", str(duration),
-             "--connections", str(conns),
-             "--msg-size", str(msg_size)],
-            capture_output=True, text=True, timeout=duration + 30)
+            [
+                bin_path,
+                "tcp-echo",
+                "--host",
+                host,
+                "--port",
+                str(port),
+                "--duration-secs",
+                str(duration),
+                "--connections",
+                str(conns),
+                "--msg-size",
+                str(msg_size),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=duration + 30,
+        )
         if r.returncode != 0:
             return 0.0, "ERROR", "ERROR"
         return _parse_loadgen_output(r.stdout)
@@ -559,20 +648,29 @@ def run_loadgen_tcp_echo(port, conns, duration, host="127.0.0.1", msg_size=64):
         return 0.0, "TIMEOUT", "TIMEOUT"
 
 
-def run_loadgen_http_upload(port, endpoint, conns, duration, host,
-                            msg_size, tls=False):
+def run_loadgen_http_upload(port, endpoint, conns, duration, host, msg_size, tls=False):
     """Run the Rust loadgen `http-upload` workload — keep-alive
     POSTs of a sized body to `endpoint`, optionally over TLS.
     Returns `(rps, p50_us, p99_us)`."""
     bin_path = _loadgen_bin()
     if bin_path is None:
         return 0.0, "NO_LOADGEN", "NO_LOADGEN"
-    argv = [bin_path, "http-upload",
-            "--host", host, "--port", str(port),
-            "--endpoint", endpoint,
-            "--duration-secs", str(duration),
-            "--connections", str(conns),
-            "--msg-size", str(msg_size)]
+    argv = [
+        bin_path,
+        "http-upload",
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--endpoint",
+        endpoint,
+        "--duration-secs",
+        str(duration),
+        "--connections",
+        str(conns),
+        "--msg-size",
+        str(msg_size),
+    ]
     if tls:
         argv.append("--tls")
     try:
@@ -583,8 +681,7 @@ def run_loadgen_http_upload(port, endpoint, conns, duration, host,
         # as a 4c coin-flip between 60k req/s and TIMEOUT on
         # identical builds). +60 keeps real hangs bounded while
         # absorbing stall variance.
-        r = subprocess.run(argv, capture_output=True, text=True,
-                           timeout=duration + 60)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=duration + 60)
         if r.returncode != 0:
             return 0.0, "ERROR", "ERROR"
         return _parse_loadgen_output(r.stdout)
@@ -592,8 +689,9 @@ def run_loadgen_http_upload(port, endpoint, conns, duration, host,
         return 0.0, "TIMEOUT", "TIMEOUT"
 
 
-def run_loadgen_gateway(port, backend_port, conns, duration, host="127.0.0.1",
-                        msg_size=32):
+def run_loadgen_gateway(
+    port, backend_port, conns, duration, host="127.0.0.1", msg_size=32
+):
     """Run the Rust loadgen `gateway` workload. Hosts a UDP echo
     backend on `backend_port` (loadgen's own tokio task), then drives
     the unikernel's gateway listener at `host:port` with `conns`
@@ -604,13 +702,26 @@ def run_loadgen_gateway(port, backend_port, conns, duration, host="127.0.0.1",
         return 0.0, "NO_LOADGEN", "NO_LOADGEN"
     try:
         r = subprocess.run(
-            [bin_path, "gateway",
-             "--host", host, "--port", str(port),
-             "--backend-port", str(backend_port),
-             "--duration-secs", str(duration),
-             "--connections", str(conns),
-             "--msg-size", str(msg_size)],
-            capture_output=True, text=True, timeout=duration + 30)
+            [
+                bin_path,
+                "gateway",
+                "--host",
+                host,
+                "--port",
+                str(port),
+                "--backend-port",
+                str(backend_port),
+                "--duration-secs",
+                str(duration),
+                "--connections",
+                str(conns),
+                "--msg-size",
+                str(msg_size),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=duration + 30,
+        )
         if r.returncode != 0:
             return 0.0, "ERROR", "ERROR"
         return _parse_loadgen_output(r.stdout)
@@ -633,11 +744,12 @@ def _udp_bench_bin():
     os.makedirs(cache, exist_ok=True)
     udp_bin = os.path.join(cache, "udp_bench")
 
-    if (not os.path.isfile(udp_bin)
-            or os.path.getmtime(udp_bin) < os.path.getmtime(src)):
+    if not os.path.isfile(udp_bin) or os.path.getmtime(udp_bin) < os.path.getmtime(src):
         cc = subprocess.run(
             ["cc", "-O2", "-o", udp_bin, src, "-lpthread"],
-            capture_output=True, timeout=30)
+            capture_output=True,
+            timeout=30,
+        )
         if cc.returncode != 0:
             return None
     return udp_bin if os.path.isfile(udp_bin) else None
@@ -681,8 +793,7 @@ def run_udp(port, senders, duration, host="127.0.0.1"):
     if host != "127.0.0.1":
         cmd.append(f"--host={host}")
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=duration + 10)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=duration + 10)
     except Exception:
         return 0.0, "", ""
     recv_pps, _, p50, p99, _ = _parse_udp_bench_output(r.stdout)
@@ -712,8 +823,9 @@ def _udp_with_retry(port, senders, duration, host):
 _UDP_PEAK_LEVELS = [8, 16, 32, 64, 128, 256, 512]
 
 
-def _udp_concurrent_probe(port, slots_per_thread, duration, host,
-                          client_cpus, timeout_ms):
+def _udp_concurrent_probe(
+    port, slots_per_thread, duration, host, client_cpus, timeout_ms
+):
     """Run one windowed udp_bench probe and return the parsed result.
 
     Returns `(recv_pps, loss_pct, p50, p99)`. All zeros on failure.
@@ -721,15 +833,20 @@ def _udp_concurrent_probe(port, slots_per_thread, duration, host,
     udp_bin = _udp_bench_bin()
     if udp_bin is None:
         return 0.0, 0.0, "", ""
-    cmd = [udp_bin, str(port), str(slots_per_thread), str(duration),
-           "--concurrent", f"--timeout={timeout_ms}"]
+    cmd = [
+        udp_bin,
+        str(port),
+        str(slots_per_thread),
+        str(duration),
+        "--concurrent",
+        f"--timeout={timeout_ms}",
+    ]
     if client_cpus > 1:
         cmd.append(f"--client-cpus={client_cpus}")
     if host != "127.0.0.1":
         cmd.append(f"--host={host}")
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=duration + 30)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=duration + 30)
     except Exception:
         return 0.0, 0.0, "", ""
     recv, _, p50, p99, loss = _parse_udp_bench_output(r.stdout)
@@ -894,7 +1011,8 @@ def echo_udp_concurrent(port, duration, host, client_cpus=1, timeout_ms=100):
 
     for n in _UDP_PEAK_LEVELS:
         pps, loss, p50, p99 = _udp_concurrent_probe(
-            port, n, probe_duration, host, client_cpus, timeout_ms)
+            port, n, probe_duration, host, client_cpus, timeout_ms
+        )
         if pps <= 0:
             continue
         if pps > best_pps:

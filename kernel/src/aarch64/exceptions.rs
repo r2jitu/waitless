@@ -49,11 +49,11 @@ mod aarch64 {
     /// interface accessed via the banked alias).
     #[repr(C)]
     struct GiccRegs {
-        ctlr: ReadWrite<u32>,              // 0x000
-        pmr: ReadWrite<u32>,               // 0x004
-        _bpr: u32,                         // 0x008
-        iar: ReadOnly<u32>,                // 0x00C
-        eoir: ReadWrite<u32>,              // 0x010
+        ctlr: ReadWrite<u32>, // 0x000
+        pmr: ReadWrite<u32>,  // 0x004
+        _bpr: u32,            // 0x008
+        iar: ReadOnly<u32>,   // 0x00C
+        eoir: ReadWrite<u32>, // 0x010
     }
 
     /// GICv3 redistributor frame: top 64KB for the RD region (we only
@@ -61,14 +61,14 @@ mod aarch64 {
     /// frame lives at +0x10000 from the same base.
     #[repr(C)]
     struct GicrRdFrame {
-        _pad_000: [u32; 5],                // 0x000..0x013
-        waker: ReadWrite<u32>,             // 0x014
+        _pad_000: [u32; 5],    // 0x000..0x013
+        waker: ReadWrite<u32>, // 0x014
     }
 
     #[repr(C)]
     struct GicrSgiFrame {
-        _pad_000: [u32; 64],               // 0x000..0x0FF
-        isenabler0: ReadWrite<u32>,        // 0x100 (corresponds to GICD_ISENABLER0 in the SGI frame)
+        _pad_000: [u32; 64],        // 0x000..0x0FF
+        isenabler0: ReadWrite<u32>, // 0x100 (corresponds to GICD_ISENABLER0 in the SGI frame)
     }
 
     // Compile-time layout assertions.
@@ -87,10 +87,22 @@ mod aarch64 {
     }
     static GIC: InitOnce<GicConfig> = InitOnce::new();
 
-    #[inline] fn gicd_base() -> u64 { GIC.get().gicd_base }
-    #[inline] fn gicc_base() -> u64 { GIC.get().gicc_base }
-    #[inline] fn gicr_base() -> u64 { GIC.get().gicr_base }
-    #[inline] fn gic_version() -> u8 { GIC.get().version }
+    #[inline]
+    fn gicd_base() -> u64 {
+        GIC.get().gicd_base
+    }
+    #[inline]
+    fn gicc_base() -> u64 {
+        GIC.get().gicc_base
+    }
+    #[inline]
+    fn gicr_base() -> u64 {
+        GIC.get().gicr_base
+    }
+    #[inline]
+    fn gic_version() -> u8 {
+        GIC.get().version
+    }
 
     #[inline]
     fn gicd() -> &'static GicdRegs {
@@ -144,57 +156,61 @@ mod aarch64 {
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn exception_handler(kind: u32, frame: *const Frame) {
         unsafe {
-        let frame = &*frame;
+            let frame = &*frame;
 
-        if kind == 1 {
-            // IRQ
-            let ver = if GIC.is_initialized() { gic_version() } else { 0 };
-            if ver == 3 {
-                let iar: u64;
-                asm!("mrs {}, ICC_IAR1_EL1", out(reg) iar);
-                let intid = (iar & 0xFF_FFFF) as u32;
-                if intid < 1020 {
-                    if (intid as usize) < MAX_IRQS {
-                        if let Some(handler) = (*IRQ_HANDLERS.0.get())[intid as usize] {
-                            handler(intid);
+            if kind == 1 {
+                // IRQ
+                let ver = if GIC.is_initialized() {
+                    gic_version()
+                } else {
+                    0
+                };
+                if ver == 3 {
+                    let iar: u64;
+                    asm!("mrs {}, ICC_IAR1_EL1", out(reg) iar);
+                    let intid = (iar & 0xFF_FFFF) as u32;
+                    if intid < 1020 {
+                        if (intid as usize) < MAX_IRQS {
+                            if let Some(handler) = (*IRQ_HANDLERS.0.get())[intid as usize] {
+                                handler(intid);
+                            }
                         }
+                        asm!("msr ICC_EOIR1_EL1, {}", in(reg) iar);
                     }
-                    asm!("msr ICC_EOIR1_EL1, {}", in(reg) iar);
+                } else if ver == 2 {
+                    let iar = gicc().iar.read();
+                    let irq = iar & 0x3FF;
+                    if irq < 1020 {
+                        if (irq as usize) < MAX_IRQS {
+                            if let Some(handler) = (*IRQ_HANDLERS.0.get())[irq as usize] {
+                                handler(irq);
+                            }
+                        }
+                        gicc().eoir.write(iar);
+                    }
                 }
-            } else if ver == 2 {
-                let iar = gicc().iar.read();
-                let irq = iar & 0x3FF;
-                if irq < 1020 {
-                    if (irq as usize) < MAX_IRQS {
-                        if let Some(handler) = (*IRQ_HANDLERS.0.get())[irq as usize] {
-                            handler(irq);
-                        }
-                    }
-                    gicc().eoir.write(iar);
+                // GIC_VERSION == 0: no GIC, WFI woke us, nothing to ack
+            } else {
+                let kind_str = match kind {
+                    0 => "synchronous",
+                    1 => "IRQ",
+                    2 => "FIQ",
+                    3 => "SError",
+                    _ => "unknown",
+                };
+                klog!("\n*** ARM64 EXCEPTION: kind={}\n", kind_str);
+                klog!("    ESR_EL1  = 0x{:x}\n", frame.esr);
+                klog!("    FAR_EL1  = 0x{:x}\n", frame.far);
+                klog!("    ELR_EL1  = 0x{:x}  (PC at fault)\n", frame.pc);
+                klog!("    SPSR_EL1 = 0x{:x}\n", frame.pstate);
+                klog!("    x0  = 0x{:x}  x1  = 0x{:x}\n", frame.x[0], frame.x[1]);
+
+                // Halt — unrecoverable
+                serial::puts(b"\nSystem halted.\n");
+                loop {
+                    asm!("wfe", options(nomem, nostack));
                 }
             }
-            // GIC_VERSION == 0: no GIC, WFI woke us, nothing to ack
-        } else {
-            let kind_str = match kind {
-                0 => "synchronous",
-                1 => "IRQ",
-                2 => "FIQ",
-                3 => "SError",
-                _ => "unknown",
-            };
-            klog!("\n*** ARM64 EXCEPTION: kind={}\n", kind_str);
-            klog!("    ESR_EL1  = 0x{:x}\n", frame.esr);
-            klog!("    FAR_EL1  = 0x{:x}\n", frame.far);
-            klog!("    ELR_EL1  = 0x{:x}  (PC at fault)\n", frame.pc);
-            klog!("    SPSR_EL1 = 0x{:x}\n", frame.pstate);
-            klog!("    x0  = 0x{:x}  x1  = 0x{:x}\n", frame.x[0], frame.x[1]);
-
-            // Halt — unrecoverable
-            serial::puts(b"\nSystem halted.\n");
-            loop {
-                asm!("wfe", options(nomem, nostack));
-            }
-        }
         }
     }
 
@@ -215,7 +231,9 @@ mod aarch64 {
 
         // Disable distributor while configuring
         d.ctlr.write(0);
-        unsafe { asm!("dsb sy", options(nostack)); }
+        unsafe {
+            asm!("dsb sy", options(nostack));
+        }
 
         let typer = d.typer.read();
         let it_lines = (typer & 0x1F) + 1;
@@ -240,7 +258,9 @@ mod aarch64 {
         d.ctlr.write(1);
         c.pmr.write(0xFF);
         c.ctlr.write(1);
-        unsafe { asm!("dsb sy", "isb", options(nostack)); }
+        unsafe {
+            asm!("dsb sy", "isb", options(nostack));
+        }
 
         // Silent on success: the boot banner already prints
         // `platform:` which encodes the GIC version, and the line
@@ -272,13 +292,17 @@ mod aarch64 {
                     if (rd.waker.read() & (1 << 2)) == 0 {
                         break;
                     }
-                    unsafe { asm!("nop", options(nomem, nostack)); }
+                    unsafe {
+                        asm!("nop", options(nomem, nostack));
+                    }
                 }
             }
 
             // Full distributor init (QEMU, bare metal)
             d.ctlr.write(0);
-            unsafe { asm!("dsb sy", options(nostack)); }
+            unsafe {
+                asm!("dsb sy", options(nostack));
+            }
 
             // Only write fields that differ from reset state and that
             // we actually depend on. We must set IGROUPR=Group 1 NS
@@ -291,11 +315,13 @@ mod aarch64 {
             // HVF for no behavioral change. Same logic for ICENABLER /
             // ICPENDR / IROUTER (reset already matches what we want).
             for i in 1..(num_irqs / 32) as usize {
-                d._igroupr[i].write(0xFFFF_FFFF);   // Group 1 NS
+                d._igroupr[i].write(0xFFFF_FFFF); // Group 1 NS
             }
 
             d.ctlr.write(GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_GRP1_NS);
-            unsafe { asm!("dsb sy", options(nostack)); }
+            unsafe {
+                asm!("dsb sy", options(nostack));
+            }
         }
         let _ = num_irqs;
 
@@ -350,8 +376,8 @@ mod aarch64 {
             if gic_version() == 2 {
                 // GICv2: CPU interface is at GICD_BASE + 0x10000 (banked per-CPU)
                 let c = gicc();
-                c.ctlr.write(1);     // Enable CPU interface
-                c.pmr.write(0xFF);   // All priorities
+                c.ctlr.write(1); // Enable CPU interface
+                c.pmr.write(0xFF); // All priorities
                 return;
             }
 
@@ -389,7 +415,9 @@ mod aarch64 {
 
     /// Timer PPI handler — disables the virtual timer so it doesn't re-fire.
     fn timer_wakeup_handler(_irq: u32) {
-        unsafe { asm!("msr cntv_ctl_el0, {}", in(reg) 0_u64, options(nostack)); }
+        unsafe {
+            asm!("msr cntv_ctl_el0, {}", in(reg) 0_u64, options(nostack));
+        }
     }
 
     pub unsafe fn enable_timer_wakeup() {
@@ -436,26 +464,36 @@ mod aarch64 {
 /// Initialise the GIC (or no-op on x86_64).
 pub fn init() {
     #[cfg(target_arch = "aarch64")]
-    unsafe { aarch64::init(); }
+    unsafe {
+        aarch64::init();
+    }
 }
 
 /// Register an IRQ handler (aarch64 GIC).
 /// On x86_64 this is a no-op — IDT registration goes through `uni_kernel::x86_64::idt`.
 pub fn register_irq(irq: u32, handler: fn(u32)) {
     #[cfg(target_arch = "aarch64")]
-    unsafe { aarch64::register_irq(irq, handler); }
+    unsafe {
+        aarch64::register_irq(irq, handler);
+    }
     #[cfg(not(target_arch = "aarch64"))]
-    { let _ = (irq, handler); }
+    {
+        let _ = (irq, handler);
+    }
 }
 
 /// Enable the timer wakeup PPI (INTID 27) for idle().
 pub fn enable_timer_wakeup() {
     #[cfg(target_arch = "aarch64")]
-    unsafe { aarch64::enable_timer_wakeup(); }
+    unsafe {
+        aarch64::enable_timer_wakeup();
+    }
 }
 
 /// Initialize GIC for a secondary core (AP).
 pub fn init_ap() {
     #[cfg(target_arch = "aarch64")]
-    unsafe { aarch64::init_ap(); }
+    unsafe {
+        aarch64::init_ap();
+    }
 }

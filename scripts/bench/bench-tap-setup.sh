@@ -35,7 +35,7 @@ fi
 # Create dnsmasq config if missing.
 DNSMASQ_CONF=/etc/dnsmasq.d/unikernel-bench.conf
 if [ ! -f "$DNSMASQ_CONF" ]; then
-    cat > "$DNSMASQ_CONF" <<'EOF'
+    cat >"$DNSMASQ_CONF" <<'EOF'
 # Unikernel benchmark: minimal DHCP for tap0
 interface=tap0
 bind-interfaces

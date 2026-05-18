@@ -35,9 +35,7 @@ pub async fn run(
     warmup: Duration,
     parallelism: usize,
 ) -> WorkloadResult {
-    let request = format!(
-        "GET {endpoint} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
-    );
+    let request = format!("GET {endpoint} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",);
     let request: Arc<[u8]> = Arc::from(request.into_bytes().into_boxed_slice());
     let host: Arc<str> = Arc::from(host.to_string().into_boxed_str());
 
@@ -90,12 +88,7 @@ pub async fn run(
     }
 }
 
-async fn do_one_request(
-    host: &str,
-    port: u16,
-    request: &[u8],
-    buf: &mut [u8],
-) -> bool {
+async fn do_one_request(host: &str, port: u16, request: &[u8], buf: &mut [u8]) -> bool {
     let mut tcp = match timeout(PER_OP_TIMEOUT, TcpStream::connect((host, port))).await {
         Ok(Ok(s)) => s,
         _ => return false,
@@ -106,8 +99,11 @@ async fn do_one_request(
     // exhausts in <1s at high rates without this.
     let _ = tcp.set_zero_linger();
 
-    if timeout(PER_OP_TIMEOUT, tcp.write_all(request)).await
-        .ok().and_then(|r| r.ok()).is_none()
+    if timeout(PER_OP_TIMEOUT, tcp.write_all(request))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .is_none()
     {
         return false;
     }

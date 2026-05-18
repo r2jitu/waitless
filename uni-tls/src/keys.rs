@@ -8,9 +8,9 @@
 // don't bloat tls_server.rs and so the set of places that touch raw
 // traffic-secret bytes stays small and auditable.
 
+use crate::schedule::{self as tls, HASH_LEN};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use crate::schedule::{self as tls, HASH_LEN};
 
 /// Derive a TLS 1.3 `finished_key` from a traffic secret via
 /// HKDF-Expand-Label(label="finished", context=""). See RFC 8446

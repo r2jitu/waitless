@@ -8,31 +8,26 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use uni_kernel::sync::Spinlock;
 
-use crate::{
-    MAX_QUEUE_PAIRS, RX_QUEUES, TX_BIG_POOL_SLOTS, TX_QUEUES, TX_SMALL_POOL_SLOTS,
-};
+use crate::{MAX_QUEUE_PAIRS, RX_QUEUES, TX_BIG_POOL_SLOTS, TX_QUEUES, TX_SMALL_POOL_SLOTS};
 
 // ---- Per-qp byte / packet counters -----------------------------------------
 
 /// Per-qp count of packets successfully handed to the device by
 /// `submit_tx*`. Diagnostic only — the device's own completion
 /// counter is the source of truth for "done", this counts "issued".
-pub(crate) static TX_PACKETS_PER_QP: [AtomicU64; 8] =
-    [const { AtomicU64::new(0) }; 8];
+pub(crate) static TX_PACKETS_PER_QP: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// Per-qp cumulative TX wire bytes — sum of all `frame_len` values
 /// passed to `submit_tx` / `submit_tx_tso`. For TSO the count is the
 /// super-segment frame length (NOT the post-segmentation wire bytes
 /// the device actually emits), so a TSO/STD comparison is not
 /// byte-for-byte equal on the wire — interpret carefully.
-pub(crate) static TX_BYTES_PER_QP: [AtomicU64; 8] =
-    [const { AtomicU64::new(0) }; 8];
+pub(crate) static TX_BYTES_PER_QP: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// Per-qp cumulative RX wire bytes — driver-side count of the
 /// frame length the callback receives. Includes Eth + IP + L4
 /// headers + payload.
-pub(crate) static RX_BYTES_PER_QP: [AtomicU64; 8] =
-    [const { AtomicU64::new(0) }; 8];
+pub(crate) static RX_BYTES_PER_QP: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// Per-qp count of RX device buffers reposted to the receive ring
 /// (item B). DQO bumps it from the `dqo_repost` drop callback —
@@ -41,16 +36,14 @@ pub(crate) static RX_BYTES_PER_QP: [AtomicU64; 8] =
 /// drop-callback sanity check: this should track the per-qp RX
 /// frame count — a persistent shortfall means a drop callback
 /// isn't firing (a leaked device buffer). Surfaced via /stats.
-pub static RX_BUF_REPOST_COUNT: [AtomicU64; 8] =
-    [const { AtomicU64::new(0) }; 8];
+pub static RX_BUF_REPOST_COUNT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// Per-qp count of GQI frames dropped because the recycle pool was
 /// exhausted — no slab free to copy the frame into (item B).
 /// Always 0 on a healthy GQI queue; a non-zero value means the
 /// consumer isn't draining pooled slabs fast enough (see
 /// `gqi::GQI_RX_POOL_SLABS`). Surfaced via /stats.
-pub static GQI_RECYCLE_POOL_EXHAUSTED: [AtomicU64; 8] =
-    [const { AtomicU64::new(0) }; 8];
+pub static GQI_RECYCLE_POOL_EXHAUSTED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 // ---- TX direct-fill pool saturation counters -------------------------------
 
@@ -171,9 +164,7 @@ pub fn tx_desc_log_snapshot(out: &mut [TxDescLogEntry]) -> usize {
 /// reads. Same fields, same layout — we copy field-by-field rather
 /// than transmute to keep the boundary explicit. Registered as the
 /// `NicDiagOps::tx_desc_log_snapshot` function pointer.
-pub(crate) fn tx_desc_log_snapshot_export(
-    out: &mut [uni_net_driver::TxDescLogEntry],
-) -> usize {
+pub(crate) fn tx_desc_log_snapshot_export(out: &mut [uni_net_driver::TxDescLogEntry]) -> usize {
     let mut local = [TxDescLogEntry {
         seq: 0,
         qp: 0,

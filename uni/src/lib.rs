@@ -40,7 +40,7 @@ pub fn native_run() -> i32 {
 pub mod boot_info;
 pub mod rng;
 
-pub use boot_info::{boot_info, BootInfo, NicInfo};
+pub use boot_info::{BootInfo, NicInfo, boot_info};
 
 pub use net::{DhcpError, NetError, NicError};
 
@@ -75,8 +75,7 @@ struct Bag(core::cell::UnsafeCell<alloc::vec::Vec<alloc::boxed::Box<dyn core::an
 // reads happen only from `shutdown_and_drop`, also on the boot CPU.
 unsafe impl Sync for Bag {}
 
-static LISTENERS: Bag =
-    Bag(core::cell::UnsafeCell::new(alloc::vec::Vec::new()));
+static LISTENERS: Bag = Bag(core::cell::UnsafeCell::new(alloc::vec::Vec::new()));
 
 /// Internal: take ownership of a listener handle so it lives for
 /// the rest of the process. Called by `tcp_listen` / `udp_listen` /
@@ -84,7 +83,9 @@ static LISTENERS: Bag =
 #[doc(hidden)]
 pub fn _retain<T: 'static>(handle: T) {
     // SAFETY: boot-CPU-only writer; see `unsafe impl Sync for Bag`.
-    unsafe { (*LISTENERS.0.get()).push(alloc::boxed::Box::new(handle)); }
+    unsafe {
+        (*LISTENERS.0.get()).push(alloc::boxed::Box::new(handle));
+    }
 }
 
 /// Invoked from the event-loop exit path (unikernel BSP after the
@@ -103,8 +104,7 @@ pub fn shutdown_and_drop() {
     );
 
     // SAFETY: boot-CPU-only; see `unsafe impl Sync for Bag`.
-    let drained: alloc::vec::Vec<_> =
-        unsafe { core::mem::take(&mut *LISTENERS.0.get()) };
+    let drained: alloc::vec::Vec<_> = unsafe { core::mem::take(&mut *LISTENERS.0.get()) };
     drop(drained);
 
     // Force-drop every live task across all workers' arenas. Listener
@@ -135,14 +135,20 @@ pub fn shutdown_and_drop() {
     if s.allocated_bytes > bsl_b || s.allocation_count > bsl_a {
         crate::log!(
             "HEAP_LEAK_CHECK LEAK bytes={}->{} allocs={}->{} delta=+{}B,+{}allocs\n",
-            bsl_b, s.allocated_bytes, bsl_a, s.allocation_count,
+            bsl_b,
+            s.allocated_bytes,
+            bsl_a,
+            s.allocation_count,
             s.allocated_bytes.saturating_sub(bsl_b),
             s.allocation_count.saturating_sub(bsl_a),
         );
     } else {
         crate::log!(
             "HEAP_LEAK_CHECK ok bytes={}->{} allocs={}->{}\n",
-            bsl_b, s.allocated_bytes, bsl_a, s.allocation_count,
+            bsl_b,
+            s.allocated_bytes,
+            bsl_a,
+            s.allocation_count,
         );
     }
 }
@@ -183,8 +189,7 @@ pub fn _install_shutdown_hook() {}
 // ---- Re-exported platform functions ---------------------------------------
 
 pub use uni_backend::{
-    check_shutdown, log, num_workers, request_shutdown,
-    wait_for_events, HeapStats,
+    HeapStats, check_shutdown, log, num_workers, request_shutdown, wait_for_events,
 };
 
 /// Format-and-log helper for `uni::log!("…", args)`. Allocates a
@@ -225,24 +230,21 @@ macro_rules! println {
 /// Re-export of the shared async runtime. `use uni::runtime::spawn;`
 /// works on both unikernel and native.
 pub mod runtime {
-    pub use uni_backend::runtime::{sleep_us, spawn, Sleep};
+    pub use uni_backend::runtime::{Sleep, sleep_us, spawn};
     pub use uni_runtime::TaskHandle;
     pub use uni_runtime::event::{AsyncEvent, WaitEvent};
-    pub use uni_runtime::launcher::{LaunchTable, Launcher};
-    pub use uni_runtime::net::{
-        tcp_listen, udp_listen,
-        RecvChunk, RecvChunkGuard,
-        TcpBindError, TcpHandle, TcpListener, TcpRecv, TcpSendChain, TcpStream,
-        UdpBindError, UdpClient, UdpHandle, UdpRecv, UdpRecvInplace, UdpSocket,
-    };
-    pub use uni_runtime::select::{
-        join, join3, select, select3, timeout_us, Either, Three,
-    };
     /// Family-agnostic IP address used in `UdpSocket::recv_from` /
     /// `send_to` and elsewhere on the runtime API. Re-exported so
     /// callers don't need to add a `net_types` dep just to pattern-
     /// match the source of an inbound datagram.
     pub use uni_runtime::ip::{IpAddr, Ipv4Addr, Ipv6Addr};
+    pub use uni_runtime::launcher::{LaunchTable, Launcher};
+    pub use uni_runtime::net::{
+        RecvChunk, RecvChunkGuard, TcpBindError, TcpHandle, TcpListener, TcpRecv, TcpSendChain,
+        TcpStream, UdpBindError, UdpClient, UdpHandle, UdpRecv, UdpRecvInplace, UdpSocket,
+        tcp_listen, udp_listen,
+    };
+    pub use uni_runtime::select::{Either, Three, join, join3, select, select3, timeout_us};
 }
 
 // Top-level shortcuts for the most common runtime calls. The full
@@ -258,10 +260,7 @@ pub use uni_runtime::net::UdpClient;
 /// `body` is invoked once per accepted connection. Use
 /// [`runtime::tcp_listen`] directly if you need explicit
 /// ownership of the listener handle (e.g. teardown mid-run).
-pub fn tcp_listen<H, F>(
-    port: u16,
-    body: H,
-) -> Result<(), uni_runtime::net::TcpBindError>
+pub fn tcp_listen<H, F>(port: u16, body: H) -> Result<(), uni_runtime::net::TcpBindError>
 where
     H: Fn(uni_runtime::net::TcpStream) -> F + Send + Sync + 'static,
     F: core::future::Future<Output = ()> + 'static,
@@ -272,10 +271,7 @@ where
 }
 
 /// Listen for UDP on `port`; semantics match [`tcp_listen`].
-pub fn udp_listen<H, F>(
-    port: u16,
-    body: H,
-) -> Result<(), uni_runtime::net::UdpBindError>
+pub fn udp_listen<H, F>(port: u16, body: H) -> Result<(), uni_runtime::net::UdpBindError>
 where
     H: Fn(alloc::sync::Arc<uni_runtime::net::UdpSocket>) -> F + Send + Sync + 'static,
     F: core::future::Future<Output = ()> + 'static,
@@ -292,9 +288,13 @@ where
 #[inline]
 pub fn cpu_id() -> u32 {
     #[cfg(target_os = "none")]
-    { uni_kernel::cpu_id() }
+    {
+        uni_kernel::cpu_id()
+    }
     #[cfg(not(target_os = "none"))]
-    { 0 }
+    {
+        0
+    }
 }
 
 // ---- Diagnostics ----------------------------------------------------------
@@ -307,16 +307,22 @@ pub mod diagnostics {
     /// Per-queue RX frame counts (Tier 1 multi-queue NIC). Index
     /// is the queue-pair number; `[0..num_queue_pairs()]` are
     /// meaningful, the rest are zero.
-    pub fn net_rx_counts() -> [u64; 8] { uni_backend::net_rx_counts() }
+    pub fn net_rx_counts() -> [u64; 8] {
+        uni_backend::net_rx_counts()
+    }
 
     /// Negotiated RX/TX queue-pair count. Tier 2 (single-queue)
     /// reports 1; Tier 1 reports the per-vCPU count.
-    pub fn net_num_queue_pairs() -> u16 { uni_backend::net_num_queue_pairs() }
+    pub fn net_num_queue_pairs() -> u16 {
+        uni_backend::net_num_queue_pairs()
+    }
 
     /// Per-queue used-ring cursors `(device, driver)`. Useful for
     /// spotting "device produced but driver didn't consume" gaps
     /// (cursors apart) vs "host not delivering" (both stuck).
-    pub fn net_rx_used_cursors() -> [(u16, u16); 8] { uni_backend::net_rx_used_cursors() }
+    pub fn net_rx_used_cursors() -> [(u16, u16); 8] {
+        uni_backend::net_rx_used_cursors()
+    }
 
     /// gve NIC-driver diagnostic counters (RX-path items B/H —
     /// surfaced on the `/stats` endpoint). Real values on a
@@ -324,14 +330,18 @@ pub mod diagnostics {
     /// Routed through `uni_backend` so application crates need no
     /// direct — and native-build-breaking — dependency on the
     /// `os:none`-only gve driver crate.
-    pub fn gve_diag() -> uni_backend::GveDiag { uni_backend::gve_diag() }
+    pub fn gve_diag() -> uni_backend::GveDiag {
+        uni_backend::gve_diag()
+    }
 
     /// TCP/IP-stack diagnostic counters (`/stats`): SYN ingress vs
     /// SYN-ACK egress, and the RX item-H `recv_chunk` zero-copy
     /// stash-vs-ring-drain split. Real on bare-metal; all-zero on
     /// native. Routed through `uni_backend` for the same reason as
     /// [`gve_diag`] — app crates stay off a direct `net`-crate dep.
-    pub fn tcp_diag() -> uni_backend::TcpDiag { uni_backend::tcp_diag() }
+    pub fn tcp_diag() -> uni_backend::TcpDiag {
+        uni_backend::tcp_diag()
+    }
 
     /// TX-side hot-path counters: per-qp packet counts + small/big
     /// pool saturation + scan-depth aggregates. `None` when no
@@ -386,17 +396,23 @@ pub mod diagnostics {
 
     /// Snapshot the heap. Cheap on bare-metal (O(1) + spinlock);
     /// best-effort zero on native.
-    pub fn heap_stats() -> super::HeapStats { uni_backend::heap_stats() }
+    pub fn heap_stats() -> super::HeapStats {
+        uni_backend::heap_stats()
+    }
 
     /// Append a byte slice to the in-band diag buffer. For boot-time
     /// KATs and one-shot probes that want their results to land in
     /// `/diag-panic` alongside any later panic traces.
-    pub fn diag_append(bytes: &[u8]) { uni_backend::diag_append(bytes) }
+    pub fn diag_append(bytes: &[u8]) {
+        uni_backend::diag_append(bytes)
+    }
 
     /// Append a 16-char hex-encoded u64 (no `0x` prefix). Pairs with
     /// `diag_append` for format-free logging from boot-critical code
     /// paths.
-    pub fn diag_append_hex(value: u64) { uni_backend::diag_append_hex(value) }
+    pub fn diag_append_hex(value: u64) {
+        uni_backend::diag_append_hex(value)
+    }
 
     /// Append a 2-char hex-encoded u8. For dumps of byte windows
     /// where the u64 form would print 14 leading zeros per byte.
@@ -429,4 +445,3 @@ pub mod diagnostics {
         uni_backend::diag_reset()
     }
 }
-

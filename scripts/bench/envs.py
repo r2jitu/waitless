@@ -33,44 +33,66 @@ def _bench_tap_setup_script():
 class QemuEnv:
     name = "qemu"
     label = "QEMU x86_64 TCG"
-    tls_port_offset = 1000   # host TLS port = guest HTTP port + 1000
+    tls_port_offset = 1000  # host TLS port = guest HTTP port + 1000
     udp_port_offset = 1
     tcp_echo_offset = 2
-    gateway_offset = 3       # host gateway port (guest:9000)
+    gateway_offset = 3  # host gateway port (guest:9000)
 
     def build(self):
         subprocess.run(
             ["bazel", "build", "//apps/webserver:webserver_qemu_x86_64"],
-            capture_output=True, cwd=_project_root(), timeout=120)
+            capture_output=True,
+            cwd=_project_root(),
+            timeout=120,
+        )
 
     def start(self, cpus, port):
-        elf = os.path.join(_project_root(),
-                           "bazel-bin/apps/webserver/webserver_qemu_x86_64.elf")
+        elf = os.path.join(
+            _project_root(), "bazel-bin/apps/webserver/webserver_qemu_x86_64.elf"
+        )
         # `-cpu max` instead of `-cpu qemu64`: the compiled crypto
         # code (p256 / chacha20poly1305 / etc.) is annotated with
         # `+avx,+avx2` in MODULE.bazel and crashes with #UD the
         # first time it emits an AVX instruction on a pre-AVX CPU
         # model. `qemu64` is pre-AVX; `max` enables every feature
         # TCG can simulate.
-        cmd = ["qemu-system-x86_64", "-machine", "q35", "-cpu", "max",
-               "-m", "128", "-smp", str(cpus), "-nographic",
-               "-serial", f"file:/tmp/bench_{port}.log", "-no-reboot"]
+        cmd = [
+            "qemu-system-x86_64",
+            "-machine",
+            "q35",
+            "-cpu",
+            "max",
+            "-m",
+            "128",
+            "-smp",
+            str(cpus),
+            "-nographic",
+            "-serial",
+            f"file:/tmp/bench_{port}.log",
+            "-no-reboot",
+        ]
         if cpus > 1:
             cmd += ["-accel", "tcg,thread=multi"]
         dev = "virtio-net-pci"
         if cpus > 1:
-            dev += f",mq=on,vectors={2*cpus+2}"
+            dev += f",mq=on,vectors={2 * cpus + 2}"
         tls_port = port + self.tls_port_offset
         tcp_echo_port = port + self.tcp_echo_offset
         gateway_port = port + self.gateway_offset
-        cmd += ["-device", f"{dev},netdev=net0",
-                "-netdev",
-                (f"user,id=net0,hostfwd=tcp::{port}-:80,"
-                 f"hostfwd=tcp::{tls_port}-:443,"
-                 f"hostfwd=tcp::{tcp_echo_port}-:9,"
-                 f"hostfwd=tcp::{gateway_port}-:9000,"
-                 f"hostfwd=udp::{port+1}-:7"),
-                "-kernel", elf]
+        cmd += [
+            "-device",
+            f"{dev},netdev=net0",
+            "-netdev",
+            (
+                f"user,id=net0,hostfwd=tcp::{port}-:80,"
+                f"hostfwd=tcp::{tls_port}-:443,"
+                f"hostfwd=tcp::{tcp_echo_port}-:9,"
+                f"hostfwd=tcp::{gateway_port}-:9000,"
+                f"hostfwd=udp::{port + 1}-:7"
+            ),
+            "-kernel",
+            elf,
+        ]
         # Capture QEMU stderr (accel-init / bad-device errors) so a
         # failed launch surfaces instead of a bare `SKIP (not ready)`.
         qemu_log = open(f"/tmp/bench_{port}.qemu.log", "w")
@@ -99,8 +121,8 @@ class KvmEnv:
     GUEST_PORT = 80
     GUEST_TLS_PORT = 443
     GUEST_UDP_PORT = 7
-    GUEST_H3_PORT = 443     # H3/QUIC over UDP (same port number as
-                            # TLS-over-TCP; the unikernel binds both).
+    GUEST_H3_PORT = 443  # H3/QUIC over UDP (same port number as
+    # TLS-over-TCP; the unikernel binds both).
     GUEST_TCP_ECHO_PORT = 9
     GUEST_GATEWAY_PORT = 9000
 
@@ -111,7 +133,10 @@ class KvmEnv:
         if not self.elf_override:
             subprocess.run(
                 ["bazel", "build", "//apps/webserver:webserver_qemu_x86_64"],
-                capture_output=True, cwd=_project_root(), timeout=120)
+                capture_output=True,
+                cwd=_project_root(),
+                timeout=120,
+            )
         # Ensure tap0 + dnsmasq + NAT are up before the first qemu
         # launch. Idempotent (the script itself is), so re-running
         # on every bench invocation is cheap and replaces the old
@@ -123,19 +148,35 @@ class KvmEnv:
 
     def start(self, cpus, port):
         elf = self.elf_override or os.path.join(
-            _project_root(),
-            "bazel-bin/apps/webserver/webserver_qemu_x86_64.elf")
+            _project_root(), "bazel-bin/apps/webserver/webserver_qemu_x86_64.elf"
+        )
         # tap backend with vhost-net + multi-queue. Multi-queue is only
         # requested when cpus > 1 because QEMU rejects queues=1 on tap.
-        cmd = ["qemu-system-x86_64", "-machine", "q35", "-accel", "kvm", "-cpu", "host",
-               "-m", "128", "-smp", str(cpus), "-nographic",
-               "-serial", f"file:/tmp/bench_{port}.log", "-no-reboot"]
+        cmd = [
+            "qemu-system-x86_64",
+            "-machine",
+            "q35",
+            "-accel",
+            "kvm",
+            "-cpu",
+            "host",
+            "-m",
+            "128",
+            "-smp",
+            str(cpus),
+            "-nographic",
+            "-serial",
+            f"file:/tmp/bench_{port}.log",
+            "-no-reboot",
+        ]
         # The host tap0 is created with IFF_MULTI_QUEUE; QEMU rejects
         # opening it with queues=1 ("could not configure /dev/net/tun:
         # Invalid argument"), so use max(cpus, 2) on the netdev side.
         nqueues = max(cpus, 2)
-        netdev = (f"tap,id=net0,ifname={self.TAP_IF},script=no,downscript=no,"
-                  f"vhost=on,queues={nqueues}")
+        netdev = (
+            f"tap,id=net0,ifname={self.TAP_IF},script=no,downscript=no,"
+            f"vhost=on,queues={nqueues}"
+        )
         # Always pass `mq=on` and `vectors` on the device, even at 1c.
         # Without it, vhost-net silently drops UDP under high send rates
         # when the netdev has more queues than the device exposes (the
@@ -143,10 +184,8 @@ class KvmEnv:
         # driver gates activation on cpu count, but the device side
         # needs mq=on to wire up vhost properly with the multi-queue tap).
         #
-        dev = f"virtio-net-pci,mac={self.GUEST_MAC},mq=on,vectors={2*nqueues+2}"
-        cmd += ["-device", f"{dev},netdev=net0",
-                "-netdev", netdev,
-                "-kernel", elf]
+        dev = f"virtio-net-pci,mac={self.GUEST_MAC},mq=on,vectors={2 * nqueues + 2}"
+        cmd += ["-device", f"{dev},netdev=net0", "-netdev", netdev, "-kernel", elf]
         # Capture QEMU stderr (accel-init / bad-device errors) so a
         # failed launch surfaces instead of a bare `SKIP (not ready)`.
         qemu_log = open(f"/tmp/bench_{port}.qemu.log", "w")
@@ -169,10 +208,11 @@ class KvmEnv:
         try:
             subprocess.run(
                 ["sudo", "ip", "link", "del", self.TAP_IF],
-                capture_output=True, timeout=5)
+                capture_output=True,
+                timeout=5,
+            )
             if script:
-                subprocess.run(
-                    ["sudo", script], capture_output=True, timeout=5)
+                subprocess.run(["sudo", script], capture_output=True, timeout=5)
         except Exception:
             pass
 
@@ -183,7 +223,7 @@ class KvmEnv:
 class QemuAarch64Env:
     name = "qemu-arm"
     label = "QEMU aarch64 TCG"
-    tls_port_offset = 1000   # host TLS port = guest HTTP port + 1000
+    tls_port_offset = 1000  # host TLS port = guest HTTP port + 1000
     udp_port_offset = 1
     tcp_echo_offset = 2
     gateway_offset = 3
@@ -191,25 +231,45 @@ class QemuAarch64Env:
     def build(self):
         subprocess.run(
             ["bazel", "build", "//apps/webserver:webserver_qemu_aarch64"],
-            capture_output=True, cwd=_project_root(), timeout=120)
+            capture_output=True,
+            cwd=_project_root(),
+            timeout=120,
+        )
 
     def start(self, cpus, port):
-        img = os.path.join(_project_root(),
-                           "bazel-bin/apps/webserver/webserver_qemu_aarch64.img")
+        img = os.path.join(
+            _project_root(), "bazel-bin/apps/webserver/webserver_qemu_aarch64.img"
+        )
         tls_port = port + self.tls_port_offset
         tcp_echo_port = port + self.tcp_echo_offset
         gateway_port = port + self.gateway_offset
-        cmd = ["qemu-system-aarch64", "-machine", "virt", "-cpu", "max",
-               "-m", "128", "-smp", str(cpus), "-nographic",
-               "-serial", f"file:/tmp/bench_{port}.log", "-no-reboot",
-               "-device", "virtio-net-device,netdev=net0",
-               "-netdev",
-               (f"user,id=net0,hostfwd=tcp::{port}-:80,"
+        cmd = [
+            "qemu-system-aarch64",
+            "-machine",
+            "virt",
+            "-cpu",
+            "max",
+            "-m",
+            "128",
+            "-smp",
+            str(cpus),
+            "-nographic",
+            "-serial",
+            f"file:/tmp/bench_{port}.log",
+            "-no-reboot",
+            "-device",
+            "virtio-net-device,netdev=net0",
+            "-netdev",
+            (
+                f"user,id=net0,hostfwd=tcp::{port}-:80,"
                 f"hostfwd=tcp::{tls_port}-:443,"
                 f"hostfwd=tcp::{tcp_echo_port}-:9,"
                 f"hostfwd=tcp::{gateway_port}-:9000,"
-                f"hostfwd=udp::{port+1}-:7"),
-               "-kernel", img]
+                f"hostfwd=udp::{port + 1}-:7"
+            ),
+            "-kernel",
+            img,
+        ]
         # Capture QEMU stderr (accel-init / bad-device errors) so a
         # failed launch surfaces instead of a bare `SKIP (not ready)`.
         qemu_log = open(f"/tmp/bench_{port}.qemu.log", "w")
@@ -238,27 +298,43 @@ class DockerEnv:
         # Docker only needs the binary — env vars are set via
         # `docker run -e`, so the launcher's defaults are redundant.
         subprocess.run(
-            ["bazel", "build", "--config=x86_64-linux", "//apps/webserver:webserver_bin"],
-            capture_output=True, cwd=root, timeout=120)
+            [
+                "bazel",
+                "build",
+                "--config=x86_64-linux",
+                "//apps/webserver:webserver_bin",
+            ],
+            capture_output=True,
+            cwd=root,
+            timeout=120,
+        )
         bench_dir = os.path.join(root, "bench")
         src = os.path.join(root, "bazel-bin/apps/webserver/webserver_bin")
         if os.path.exists(src):
             os.makedirs(bench_dir, exist_ok=True)
             shutil.copy2(src, os.path.join(bench_dir, "webserver_native"))
-            subprocess.run(["docker", "build", "-q", "-t", "webserver_linux", bench_dir],
-                           capture_output=True, timeout=60)
+            subprocess.run(
+                ["docker", "build", "-q", "-t", "webserver_linux", bench_dir],
+                capture_output=True,
+                timeout=60,
+            )
 
     def start(self, cpus, port):
         r = subprocess.run(
             ["docker", "run", "--rm", "-d", "-p", f"{port}:80", "webserver_linux"],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
         if r.returncode == 0:
             self.cid = r.stdout.strip()
         return self  # return self as "proc" handle
 
     def stop(self, proc):
         if self.cid:
-            subprocess.run(["docker", "stop", self.cid], capture_output=True, timeout=10)
+            subprocess.run(
+                ["docker", "stop", self.cid], capture_output=True, timeout=10
+            )
             self.cid = None
 
     def poll(self):
@@ -277,14 +353,14 @@ class NativeEnv:
     # outbound sockets, and to be predictable for the bench
     # dispatch loop.
     tls_port_offset = 1000
-    udp_port_offset = 1      # host UDP port = guest HTTP port + 1
-    tcp_echo_offset = 2      # async TCP echo port (guest:9)
-    gateway_offset = 3       # async gateway port (guest:9000)
-    h3_port_offset = 1500    # host UDP port for the H3/QUIC listener
-                             # (guest UDP:443). Picked above
-                             # `tls_port_offset` so the human-readable
-                             # mapping (`bench_port + 1500` ↔ H3) is
-                             # easy to spot when reading log output.
+    udp_port_offset = 1  # host UDP port = guest HTTP port + 1
+    tcp_echo_offset = 2  # async TCP echo port (guest:9)
+    gateway_offset = 3  # async gateway port (guest:9000)
+    h3_port_offset = 1500  # host UDP port for the H3/QUIC listener
+    # (guest UDP:443). Picked above
+    # `tls_port_offset` so the human-readable
+    # mapping (`bench_port + 1500` ↔ H3) is
+    # easy to spot when reading log output.
 
     # Path to pre-staged native binary; set via --native-bin. If None, bazel build runs.
     bin_override = None
@@ -292,18 +368,26 @@ class NativeEnv:
     def build(self):
         if self.bin_override:
             return  # Pre-staged binary; nothing to build.
-        config = "aarch64-macos" if platform.machine() in ("arm64", "aarch64") else "x86_64-linux"
+        config = (
+            "aarch64-macos"
+            if platform.machine() in ("arm64", "aarch64")
+            else "x86_64-linux"
+        )
         # Bypass the `:webserver_native` launcher (which sets BUILD
         # port-fwd defaults) and build the underlying rust_binary
         # directly — `start()` sets every `UNIKERNEL_*` it needs, so
         # the launcher's defaults would be no-ops anyway.
         subprocess.run(
             ["bazel", "build", f"--config={config}", "//apps/webserver:webserver_bin"],
-            capture_output=True, cwd=_project_root(), timeout=120)
+            capture_output=True,
+            cwd=_project_root(),
+            timeout=120,
+        )
 
     def start(self, cpus, port):
         bin_path = self.bin_override or os.path.join(
-            _project_root(), "bazel-bin/apps/webserver/webserver_bin")
+            _project_root(), "bazel-bin/apps/webserver/webserver_bin"
+        )
         if not os.path.exists(bin_path):
             return None
         env = os.environ.copy()
@@ -318,7 +402,8 @@ class NativeEnv:
         env["UNIKERNEL_TCP_9000"] = str(port + NativeEnv.gateway_offset)
         env["UNIKERNEL_CPUS"] = str(cpus)
         return subprocess.Popen(
-            [bin_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+            [bin_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
+        )
 
     def stop(self, proc):
         if proc and proc.poll() is None:
@@ -333,13 +418,13 @@ class HvfEnv:
     name = "hvf"
     label = "HVF"
     udp_port_offset = 10000  # host UDP port = guest port + 10000
-    tls_port_offset = 1000   # host TLS port = guest HTTP port + 1000
-    tcp_echo_offset = 2000   # host TCP echo port (guest:9)
-    gateway_offset = 3000    # host gateway port (guest:9000)
-    h3_port_offset = 11000   # host UDP port for the H3/QUIC listener
-                             # (guest UDP:443). Disjoint from
-                             # `udp_port_offset` (which forwards the
-                             # echo listener at guest UDP:7).
+    tls_port_offset = 1000  # host TLS port = guest HTTP port + 1000
+    tcp_echo_offset = 2000  # host TCP echo port (guest:9)
+    gateway_offset = 3000  # host gateway port (guest:9000)
+    h3_port_offset = 11000  # host UDP port for the H3/QUIC listener
+    # (guest UDP:443). Disjoint from
+    # `udp_port_offset` (which forwards the
+    # echo listener at guest UDP:7).
 
     def build(self):
         # `:webserver_hvf` bundles both the transitioned aarch64
@@ -349,7 +434,10 @@ class HvfEnv:
         # single `bazel build` covers both.
         subprocess.run(
             ["bazel", "build", "//apps/webserver:webserver_hvf"],
-            capture_output=True, cwd=_project_root(), timeout=240)
+            capture_output=True,
+            cwd=_project_root(),
+            timeout=240,
+        )
 
     def start(self, cpus, port):
         root = _project_root()
@@ -375,15 +463,28 @@ class HvfEnv:
         # workloads cost the host nothing extra; the heap grows
         # dynamically and unused pages stay unfaulted.
         return subprocess.Popen(
-            [run_hvf, img,
-             "--ram=512", f"--cpus={cpus}",
-             "-p", f"tcp:{port}:80",
-             "-p", f"tcp:{tls_port}:443",
-             "-p", f"tcp:{tcp_echo_port}:9",
-             "-p", f"tcp:{gateway_port}:9000",
-             "-p", f"udp:{udp_port}:7",
-             "-p", f"udp:{h3_port}:443"],
-            stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            [
+                run_hvf,
+                img,
+                "--ram=512",
+                f"--cpus={cpus}",
+                "-p",
+                f"tcp:{port}:80",
+                "-p",
+                f"tcp:{tls_port}:443",
+                "-p",
+                f"tcp:{tcp_echo_port}:9",
+                "-p",
+                f"tcp:{gateway_port}:9000",
+                "-p",
+                f"udp:{udp_port}:7",
+                "-p",
+                f"udp:{h3_port}:443",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+        )
 
     def wait_proxy_ready(self, port, proc, timeout=30):
         """Wait for the HTTP server to be reachable on the proxy port."""

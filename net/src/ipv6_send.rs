@@ -34,13 +34,7 @@ use types::{Ipv6Addr, MacAddr};
 /// NDP cache for unicast. On unicast cache miss the packet is
 /// dropped (the packet's owner — typically a TCP/UDP retransmit
 /// timer — will retry; the cache fills as inbound frames arrive).
-pub fn ipv6_send(
-    src: &Ipv6Addr,
-    dst: &Ipv6Addr,
-    next_header: u8,
-    hop_limit: u8,
-    payload: &[u8],
-) {
+pub fn ipv6_send(src: &Ipv6Addr, dst: &Ipv6Addr, next_header: u8, hop_limit: u8, payload: &[u8]) {
     let dst_mac = if dst.is_multicast() {
         dst.multicast_mac()
     } else {
@@ -79,7 +73,14 @@ fn solicit(src: &Ipv6Addr, target: &Ipv6Addr) {
         None => return,
     };
     let mut buf = [0u8; 1500];
-    let total = match ipv6::ipv6_build(src, &snm, ipv6::next_header::ICMPV6, 255, &icmp[..n], &mut buf) {
+    let total = match ipv6::ipv6_build(
+        src,
+        &snm,
+        ipv6::next_header::ICMPV6,
+        255,
+        &icmp[..n],
+        &mut buf,
+    ) {
         Some(t) => t,
         None => return,
     };

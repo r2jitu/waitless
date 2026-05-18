@@ -68,7 +68,9 @@ const _: () = {
 impl AdminqCommand {
     /// New command with `opcode` at offset 0 and the rest zeroed.
     pub(crate) fn new(opcode: u32) -> Self {
-        let mut cmd = AdminqCommand { bytes: [0; CMD_SIZE] };
+        let mut cmd = AdminqCommand {
+            bytes: [0; CMD_SIZE],
+        };
         put_be32(&mut cmd.bytes, 0, opcode);
         cmd
     }
@@ -123,12 +125,17 @@ pub(crate) fn init(adminq_va: u64, adminq_phys: u64) -> bool {
     }
     {
         let mut st = STATE.lock();
-        *st = Some(AdminqState { va: adminq_va, prod_cnt: 0 });
+        *st = Some(AdminqState {
+            va: adminq_va,
+            prod_cnt: 0,
+        });
     }
     // Program the device's admin-queue PFN. Must be safe because
     // we've published STATE above; no readers exist before this
     // returns and the BAR0 write is the only side effect.
-    unsafe { reg_write32(REG_ADMINQ_PFN, (adminq_phys >> 12) as u32); }
+    unsafe {
+        reg_write32(REG_ADMINQ_PFN, (adminq_phys >> 12) as u32);
+    }
     true
 }
 
@@ -153,7 +160,9 @@ pub(crate) fn submit_no_wait(cmd: &AdminqCommand) -> Option<(usize, u32)> {
     let s = st.as_mut()?;
     let slot_idx = (s.prod_cnt as usize) & (ADMINQ_SLOTS - 1);
     let slot_ptr = (s.va as *mut AdminqCommand).wrapping_add(slot_idx);
-    unsafe { ptr::write_volatile(slot_ptr, *cmd); }
+    unsafe {
+        ptr::write_volatile(slot_ptr, *cmd);
+    }
     let new_prod = s.prod_cnt.wrapping_add(1);
     s.prod_cnt = new_prod;
     Some((slot_idx, new_prod))
@@ -170,7 +179,9 @@ pub(crate) fn kick_and_wait_to(expected_event_count: u32) -> bool {
     // Without this the device can read a stale command slot
     // (status=0) and either reject the command or execute garbage.
     host_dma_fence();
-    unsafe { reg_write32(REG_ADMINQ_DOORBELL, expected_event_count); }
+    unsafe {
+        reg_write32(REG_ADMINQ_DOORBELL, expected_event_count);
+    }
     for _ in 0..ADMINQ_WAIT_SPINS {
         let ev = unsafe { reg_read32(REG_ADMINQ_EVENT_COUNTER) };
         if ev == expected_event_count {
@@ -242,4 +253,3 @@ unsafe fn read_slot_status(slot_idx: usize) -> u32 {
     let slot = unsafe { &*slot_ptr };
     read_be32(&slot.bytes, 4)
 }
-

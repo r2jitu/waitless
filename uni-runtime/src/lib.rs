@@ -38,8 +38,8 @@ pub fn init(num_workers: u32) {
     task::init(num_workers);
 }
 
-pub use sleep::{sleep_us, Sleep};
+pub use sleep::{Sleep, sleep_us};
 pub use task::{
-    drain_all_arenas, has_pending, spawn, spawn_boxed, tick, BoxedFuture, TaskArena,
-    TaskHandle, TaskSlot, TASKS_PER_WORKER,
+    BoxedFuture, TASKS_PER_WORKER, TaskArena, TaskHandle, TaskSlot, drain_all_arenas, has_pending,
+    spawn, spawn_boxed, tick,
 };

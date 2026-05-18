@@ -33,12 +33,12 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use aes::Aes128;
 use aes::cipher::BlockEncrypt;
 use aes::cipher::KeyInit as _;
 use aes::cipher::generic_array::GenericArray;
-use aes::Aes128;
 
-use crate::ghash_batch::{GhashKey, BATCH_LEN, BLOCK_LEN as GHASH_BLOCK};
+use crate::ghash_batch::{BATCH_LEN, BLOCK_LEN as GHASH_BLOCK, GhashKey};
 
 pub const KEY_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
@@ -77,12 +77,7 @@ impl Aes128GcmFast {
 
     /// One-shot seal. `buffer` is plaintext on entry, ciphertext
     /// on exit (same length). Returns the 16-byte tag.
-    pub fn seal(
-        &self,
-        nonce: &[u8; NONCE_LEN],
-        aad: &[u8],
-        buffer: &mut [u8],
-    ) -> [u8; TAG_LEN] {
+    pub fn seal(&self, nonce: &[u8; NONCE_LEN], aad: &[u8], buffer: &mut [u8]) -> [u8; TAG_LEN] {
         // J0 + tag mask E_K(J0).
         let mut j0 = [0u8; BLOCK_LEN];
         j0[..NONCE_LEN].copy_from_slice(nonce);
@@ -126,9 +121,8 @@ impl Aes128GcmFast {
             for j in 0..BLOCK_LEN {
                 block[j] ^= ks[j];
             }
-            let blk: &[u8; BLOCK_LEN] = (&*block)
-                .try_into()
-                .expect("tail block slice is BLOCK_LEN");
+            let blk: &[u8; BLOCK_LEN] =
+                (&*block).try_into().expect("tail block slice is BLOCK_LEN");
             g.absorb_one(blk);
         }
         let partial = tail_blocks.into_remainder();
@@ -206,9 +200,8 @@ impl Aes128GcmFast {
         let tail = chunks.into_remainder();
         let mut tail_blocks = tail.chunks_exact_mut(BLOCK_LEN);
         for block in tail_blocks.by_ref() {
-            let snapshot: [u8; BLOCK_LEN] = (&*block)
-                .try_into()
-                .expect("tail block slice is BLOCK_LEN");
+            let snapshot: [u8; BLOCK_LEN] =
+                (&*block).try_into().expect("tail block slice is BLOCK_LEN");
             g.absorb_one(&snapshot);
             let mut ks: GenericArray<u8, _> = GenericArray::default();
             ks.copy_from_slice(&counter);
@@ -240,7 +233,11 @@ impl Aes128GcmFast {
         for i in 0..TAG_LEN {
             computed[i] = g_out[i] ^ mask[i];
         }
-        if ct_eq_tag(&computed, tag) { Ok(()) } else { Err(()) }
+        if ct_eq_tag(&computed, tag) {
+            Ok(())
+        } else {
+            Err(())
+        }
     }
 
     /// Fused scatter-gather seal. Source plaintext from a chain
@@ -258,7 +255,9 @@ impl Aes128GcmFast {
         let mut cursor = 0usize;
         for src in src_parts {
             let n = src.len();
-            if n == 0 { continue; }
+            if n == 0 {
+                continue;
+            }
             dst[cursor..cursor + n].copy_from_slice(src);
             cursor += n;
         }
@@ -340,8 +339,8 @@ unsafe fn stitched_chunk_x86(
     chunk: &mut [u8; CHUNK_LEN],
     ks_buf: &[GenericArray<u8, aes::cipher::consts::U16>; CHUNK_BLOCKS],
 ) {
-    use core::arch::x86_64::*;
     use crate::ghash_batch::xmm;
+    use core::arch::x86_64::*;
 
     let bswap = xmm::bswap_mask();
     let state_polyval = g.polyval_state();
@@ -359,7 +358,11 @@ unsafe fn stitched_chunk_x86(
         _mm_storeu_si128(chunk.as_mut_ptr().add(i * BLOCK_LEN) as *mut __m128i, ct);
         // GHASH-absorb the same register-resident CT (no reload).
         let ct_rev = _mm_shuffle_epi8(ct, bswap);
-        let yi = if i == 0 { _mm_xor_si128(state, ct_rev) } else { ct_rev };
+        let yi = if i == 0 {
+            _mm_xor_si128(state, ct_rev)
+        } else {
+            ct_rev
+        };
         xmm::karatsuba_accumulate(&mut acc, yi, h[i]);
     }
 
@@ -376,8 +379,8 @@ unsafe fn stitched_chunk_arm(
     chunk: &mut [u8; CHUNK_LEN],
     ks_buf: &[GenericArray<u8, aes::cipher::consts::U16>; CHUNK_BLOCKS],
 ) {
-    use core::arch::aarch64::*;
     use crate::ghash_batch::neon;
+    use core::arch::aarch64::*;
 
     let bswap = neon::bswap_indices();
     let state_polyval = g.polyval_state();
@@ -391,7 +394,11 @@ unsafe fn stitched_chunk_arm(
         let ct = veorq_u8(pt, ks);
         vst1q_u8(chunk.as_mut_ptr().add(i * BLOCK_LEN), ct);
         let ct_rev = vqtbl1q_u8(ct, bswap);
-        let yi = if i == 0 { veorq_u8(state, ct_rev) } else { ct_rev };
+        let yi = if i == 0 {
+            veorq_u8(state, ct_rev)
+        } else {
+            ct_rev
+        };
         neon::karatsuba_accumulate(&mut acc, yi, h[i]);
     }
 
@@ -408,41 +415,33 @@ mod tests {
     #[test]
     fn nist_kat_test_case_4() {
         let key: [u8; 16] = [
-            0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c,
-            0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30, 0x83, 0x08,
+            0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c, 0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30,
+            0x83, 0x08,
         ];
         let nonce: [u8; 12] = [
-            0xca, 0xfe, 0xba, 0xbe, 0xfa, 0xce, 0xdb, 0xad,
-            0xde, 0xca, 0xf8, 0x88,
+            0xca, 0xfe, 0xba, 0xbe, 0xfa, 0xce, 0xdb, 0xad, 0xde, 0xca, 0xf8, 0x88,
         ];
         let aad: [u8; 20] = [
-            0xfe, 0xed, 0xfa, 0xce, 0xde, 0xad, 0xbe, 0xef,
-            0xfe, 0xed, 0xfa, 0xce, 0xde, 0xad, 0xbe, 0xef,
-            0xab, 0xad, 0xda, 0xd2,
+            0xfe, 0xed, 0xfa, 0xce, 0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce, 0xde, 0xad,
+            0xbe, 0xef, 0xab, 0xad, 0xda, 0xd2,
         ];
         let plaintext: [u8; 60] = [
-            0xd9, 0x31, 0x32, 0x25, 0xf8, 0x84, 0x06, 0xe5,
-            0xa5, 0x59, 0x09, 0xc5, 0xaf, 0xf5, 0x26, 0x9a,
-            0x86, 0xa7, 0xa9, 0x53, 0x15, 0x34, 0xf7, 0xda,
-            0x2e, 0x4c, 0x30, 0x3d, 0x8a, 0x31, 0x8a, 0x72,
-            0x1c, 0x3c, 0x0c, 0x95, 0x95, 0x68, 0x09, 0x53,
-            0x2f, 0xcf, 0x0e, 0x24, 0x49, 0xa6, 0xb5, 0x25,
-            0xb1, 0x6a, 0xed, 0xf5, 0xaa, 0x0d, 0xe6, 0x57,
+            0xd9, 0x31, 0x32, 0x25, 0xf8, 0x84, 0x06, 0xe5, 0xa5, 0x59, 0x09, 0xc5, 0xaf, 0xf5,
+            0x26, 0x9a, 0x86, 0xa7, 0xa9, 0x53, 0x15, 0x34, 0xf7, 0xda, 0x2e, 0x4c, 0x30, 0x3d,
+            0x8a, 0x31, 0x8a, 0x72, 0x1c, 0x3c, 0x0c, 0x95, 0x95, 0x68, 0x09, 0x53, 0x2f, 0xcf,
+            0x0e, 0x24, 0x49, 0xa6, 0xb5, 0x25, 0xb1, 0x6a, 0xed, 0xf5, 0xaa, 0x0d, 0xe6, 0x57,
             0xba, 0x63, 0x7b, 0x39,
         ];
         let expected_ct: [u8; 60] = [
-            0x42, 0x83, 0x1e, 0xc2, 0x21, 0x77, 0x74, 0x24,
-            0x4b, 0x72, 0x21, 0xb7, 0x84, 0xd0, 0xd4, 0x9c,
-            0xe3, 0xaa, 0x21, 0x2f, 0x2c, 0x02, 0xa4, 0xe0,
-            0x35, 0xc1, 0x7e, 0x23, 0x29, 0xac, 0xa1, 0x2e,
-            0x21, 0xd5, 0x14, 0xb2, 0x54, 0x66, 0x93, 0x1c,
-            0x7d, 0x8f, 0x6a, 0x5a, 0xac, 0x84, 0xaa, 0x05,
-            0x1b, 0xa3, 0x0b, 0x39, 0x6a, 0x0a, 0xac, 0x97,
+            0x42, 0x83, 0x1e, 0xc2, 0x21, 0x77, 0x74, 0x24, 0x4b, 0x72, 0x21, 0xb7, 0x84, 0xd0,
+            0xd4, 0x9c, 0xe3, 0xaa, 0x21, 0x2f, 0x2c, 0x02, 0xa4, 0xe0, 0x35, 0xc1, 0x7e, 0x23,
+            0x29, 0xac, 0xa1, 0x2e, 0x21, 0xd5, 0x14, 0xb2, 0x54, 0x66, 0x93, 0x1c, 0x7d, 0x8f,
+            0x6a, 0x5a, 0xac, 0x84, 0xaa, 0x05, 0x1b, 0xa3, 0x0b, 0x39, 0x6a, 0x0a, 0xac, 0x97,
             0x3d, 0x58, 0xe0, 0x91,
         ];
         let expected_tag: [u8; 16] = [
-            0x5b, 0xc9, 0x4f, 0xbc, 0x32, 0x21, 0xa5, 0xdb,
-            0x94, 0xfa, 0xe9, 0x5a, 0xe7, 0x12, 0x1a, 0x47,
+            0x5b, 0xc9, 0x4f, 0xbc, 0x32, 0x21, 0xa5, 0xdb, 0x94, 0xfa, 0xe9, 0x5a, 0xe7, 0x12,
+            0x1a, 0x47,
         ];
 
         let ctx = Aes128GcmFast::new(&key);
@@ -457,9 +456,9 @@ mod tests {
 
     #[test]
     fn matches_aes_gcm_crate_roundtrip() {
+        use aes_gcm::Aes128Gcm;
         use aes_gcm::aead::AeadInPlace;
         use aes_gcm::aead::KeyInit as KI;
-        use aes_gcm::Aes128Gcm;
 
         let key = [0x42u8; 16];
         let nonce = [0x17u8; 12];
@@ -470,9 +469,8 @@ mod tests {
         // 8-block chunk (128 B), multi-chunk, multi-chunk +
         // partial tail. With and without AAD of various lengths.
         let sizes = [
-            0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 100, 127,
-            128, 129, 200, 256, 257, 511, 512, 1024, 4096, 9000,
-            16383,
+            0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 100, 127, 128, 129, 200, 256, 257, 511, 512,
+            1024, 4096, 9000, 16383,
         ];
         let aads: &[&[u8]] = &[
             b"",
@@ -491,23 +489,22 @@ mod tests {
 
                 let mut slow_buf = plaintext.clone();
                 let slow_tag = slow
-                    .encrypt_in_place_detached(
-                        GenericArray::from_slice(&nonce),
-                        aad,
-                        &mut slow_buf,
-                    )
+                    .encrypt_in_place_detached(GenericArray::from_slice(&nonce), aad, &mut slow_buf)
                     .unwrap();
 
                 assert_eq!(
-                    fast_buf, slow_buf,
+                    fast_buf,
+                    slow_buf,
                     "ciphertext mismatch size={} aad_len={}",
-                    size, aad.len()
+                    size,
+                    aad.len()
                 );
                 assert_eq!(
                     &fast_tag,
                     slow_tag.as_slice(),
                     "tag mismatch size={} aad_len={}",
-                    size, aad.len()
+                    size,
+                    aad.len()
                 );
 
                 // Round-trip.

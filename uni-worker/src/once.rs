@@ -37,7 +37,9 @@ impl<T> InitOnce<T> {
             panic!("InitOnce::init called twice");
         }
         // SAFETY: we just claimed the slot; no other writer can race.
-        unsafe { (*self.value.get()).write(v); }
+        unsafe {
+            (*self.value.get()).write(v);
+        }
         // Republish via release fence so the value write is visible
         // before any subsequent acquire-load on `initialized`. The
         // CAS above already had AcqRel ordering, but we need the
@@ -146,7 +148,9 @@ mod tests {
             // Initialize from the main thread.
             cell.init(0xDEAD_BEEF_CAFE_BABE);
 
-            for r in readers { r.join().unwrap(); }
+            for r in readers {
+                r.join().unwrap();
+            }
         }
     }
 

@@ -32,7 +32,10 @@ detect_qemu() {
         QEMU_MACHINE=(-machine virt -cpu max)
         VIRTIO_DEV="virtio-net-device"
         KERNEL_ARG="$img"
-        [[ -f "$KERNEL_ARG" ]] || { echo "error: .img not found: $KERNEL_ARG" >&2; return 1; }
+        [[ -f "$KERNEL_ARG" ]] || {
+            echo "error: .img not found: $KERNEL_ARG" >&2
+            return 1
+        }
     else
         QEMU_BIN="qemu-system-x86_64"
         VIRTIO_DEV="virtio-net-pci"
@@ -99,7 +102,7 @@ run_qemu() {
     # `port_forwards = []` (e.g. the headless SMP tests) get a
     # single-queue netdev even when booting multi-core.
     if [[ "$cpus" -gt 1 ]] && [[ "$VIRTIO_DEV" == *"-pci"* ]] && [[ -n "$hostfwd" ]]; then
-        local vectors=$(( 2 * cpus + 2 ))
+        local vectors=$((2 * cpus + 2))
         dev_extra=",mq=on,vectors=$vectors,queues=$cpus"
         netdev_extra=",queues=$cpus"
     fi

@@ -5,11 +5,11 @@
 // The AP trampoline (boot/x86_64/ap_boot.S) transitions from
 // 16-bit real mode to 64-bit long mode.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use crate::serial;
-use crate::mm;
-use crate::time;
 use super::apic;
+use crate::mm;
+use crate::serial;
+use crate::time;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Per-core stack size: 64KB.
 const AP_STACK_SIZE: usize = 64 * 1024;
@@ -141,9 +141,15 @@ pub unsafe extern "C" fn ap_entry_via_limine(apic_id: u32) -> ! {
     let id = cpu_id();
     let mut buf = [0u8; 24];
     let mut pos = 0;
-    for &b in b"[SMP] core " { buf[pos] = b; pos += 1; }
+    for &b in b"[SMP] core " {
+        buf[pos] = b;
+        pos += 1;
+    }
     pos += fmt_u32(&mut buf[pos..], id);
-    for &b in b" online\n" { buf[pos] = b; pos += 1; }
+    for &b in b" online\n" {
+        buf[pos] = b;
+        pos += 1;
+    }
     serial::puts(&buf[..pos]);
 
     core::arch::asm!("sti", options(nomem, nostack));
@@ -168,8 +174,7 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
         static ap_trampoline_end: u8;
     }
     let trampoline_src = &ap_trampoline_start as *const u8;
-    let trampoline_size = (&ap_trampoline_end as *const u8 as usize)
-        - (trampoline_src as usize);
+    let trampoline_size = (&ap_trampoline_end as *const u8 as usize) - (trampoline_src as usize);
     let trampoline_dst = AP_TRAMPOLINE_ADDR as *mut u8;
 
     core::ptr::copy_nonoverlapping(trampoline_src, trampoline_dst, trampoline_size);
@@ -220,11 +225,8 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
 
         // Wait up to 100 ms for the AP to come online before starting
         // the next one (the trampoline page at 0x8000 is reused).
-        let deadline = time::now_cycles()
-            .wrapping_add(100_000 * time::cycles_per_us());
-        while num_cores_online() < expected
-            && time::now_cycles() < deadline
-        {
+        let deadline = time::now_cycles().wrapping_add(100_000 * time::cycles_per_us());
+        while num_cores_online() < expected && time::now_cycles() < deadline {
             core::hint::spin_loop();
         }
     }
@@ -248,7 +250,9 @@ extern "C" fn ap_entry_x86(_ctx: u64) -> ! {
     super::gdt::load_on_ap();
 
     // Initialize this AP's APIC
-    unsafe { apic::init_ap(); }
+    unsafe {
+        apic::init_ap();
+    }
 
     // Set GS_BASE for fast cpu_id() — look up logical core index from APIC ID.
     let apic_id = apic::apic_id();
@@ -273,13 +277,21 @@ extern "C" fn ap_entry_x86(_ctx: u64) -> ! {
     let id = cpu_id();
     let mut buf = [0u8; 24];
     let mut pos = 0;
-    for &b in b"[SMP] core " { buf[pos] = b; pos += 1; }
+    for &b in b"[SMP] core " {
+        buf[pos] = b;
+        pos += 1;
+    }
     pos += fmt_u32(&mut buf[pos..], id);
-    for &b in b" online\n" { buf[pos] = b; pos += 1; }
+    for &b in b" online\n" {
+        buf[pos] = b;
+        pos += 1;
+    }
     serial::puts(&buf[..pos]);
 
     // Enable interrupts so IPI can be delivered.
-    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("sti", options(nomem, nostack));
+    }
 
     // Enter the unified kernel event loop.
     crate::eventloop::run(id);
@@ -326,10 +338,19 @@ unsafe fn setup_ap_gdt(addr: *mut u8) {
 }
 
 fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {
-    if val == 0 { buf[0] = b'0'; return 1; }
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
     let mut tmp = [0u8; 10];
     let mut len = 0;
-    while val > 0 { tmp[len] = b'0' + (val % 10) as u8; val /= 10; len += 1; }
-    for i in 0..len { buf[i] = tmp[len - 1 - i]; }
+    while val > 0 {
+        tmp[len] = b'0' + (val % 10) as u8;
+        val /= 10;
+        len += 1;
+    }
+    for i in 0..len {
+        buf[i] = tmp[len - 1 - i];
+    }
     len
 }

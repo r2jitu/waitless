@@ -25,11 +25,11 @@
 
 // `aes-gcm 0.10` re-exports the underlying `aes` crate (`pub use aes;`),
 // so we get `Aes128` for free without adding a top-level dep.
-use aes_gcm::aead::{AeadInPlace, KeyInit as AeadKeyInit};
-use aes_gcm::aes::cipher::generic_array::GenericArray;
-use aes_gcm::aes::cipher::BlockEncrypt;
-use aes_gcm::aes::Aes128;
 use aes_gcm::Aes128Gcm;
+use aes_gcm::aead::{AeadInPlace, KeyInit as AeadKeyInit};
+use aes_gcm::aes::Aes128;
+use aes_gcm::aes::cipher::BlockEncrypt;
+use aes_gcm::aes::cipher::generic_array::GenericArray;
 
 use uni_tls::schedule::hkdf_expand_label;
 
@@ -61,8 +61,8 @@ pub const HP_MASK_LEN: usize = 5;
 /// QUIC v1 Initial salt (RFC 9001 §5.2). Anything else is for v2 /
 /// experimental drafts and is out of scope.
 pub const INITIAL_SALT_V1: [u8; 20] = [
-    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
-    0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
+    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
+    0xcc, 0xbb, 0x7f, 0x0a,
 ];
 
 /// HKDF-Extract over the v1 salt + client_dst_connection_id, then
@@ -222,7 +222,10 @@ pub fn aes128_gcm_open(
 
 /// Compute the 5-byte header-protection mask for AES-128 per
 /// RFC 9001 §5.4.3: AES-128-ECB(hp_key, sample), truncated to 5 bytes.
-pub fn hp_mask_aes128(hp_key: &[u8; AES_KEY_LEN], sample: &[u8; HP_SAMPLE_LEN]) -> [u8; HP_MASK_LEN] {
+pub fn hp_mask_aes128(
+    hp_key: &[u8; AES_KEY_LEN],
+    sample: &[u8; HP_SAMPLE_LEN],
+) -> [u8; HP_MASK_LEN] {
     use aes_gcm::aes::cipher::KeyInit as _;
     let cipher = Aes128::new(GenericArray::from_slice(hp_key));
     // Single 16-byte block; encrypt in place into a copy of the sample.
@@ -268,8 +271,7 @@ mod tests {
     /// RFC 9001 Appendix A.1 known-answer values. Server-side perspective:
     /// the client picks DCID=0x8394c8f03e515708 for its first Initial,
     /// and both sides derive the same secrets from it.
-    const APPENDIX_A_DCID: [u8; 8] =
-        [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
+    const APPENDIX_A_DCID: [u8; 8] = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
 
     // RFC 9001 §A.1: HKDF-Extract(initial_salt_v1, dcid).
     // Implementation-derived; cross-checked indirectly by the
@@ -510,8 +512,7 @@ mod tests {
             let mut i = 0;
             let mut j = 0;
             while i < hex_bytes.len() {
-                out[j] = ((nyb_for(hex_bytes[i]) as u8) << 4)
-                    | nyb_for(hex_bytes[i + 1]) as u8;
+                out[j] = ((nyb_for(hex_bytes[i]) as u8) << 4) | nyb_for(hex_bytes[i + 1]) as u8;
                 i += 2;
                 j += 1;
             }
@@ -546,8 +547,7 @@ mod tests {
         k16.copy_from_slice(&client_keys.key);
         let payload_slice = &mut packet[payload_offset..payload_offset + 16];
         let tag = aes128_gcm_seal(&k16, &nonce, &aad, payload_slice);
-        packet[payload_offset + 16..payload_offset + 16 + TAG_LEN]
-            .copy_from_slice(&tag);
+        packet[payload_offset + 16..payload_offset + 16 + TAG_LEN].copy_from_slice(&tag);
 
         // HP protect.
         let sample_start = pn_offset + 4;
@@ -683,8 +683,7 @@ mod tests {
         // ── Apply header protection ─────────────────────────────────────
         // Sample = packet[pn_offset + 4 .. + HP_SAMPLE_LEN].
         let sample_start = pn_offset + 4;
-        let sample: [u8; HP_SAMPLE_LEN] = packet
-            [sample_start..sample_start + HP_SAMPLE_LEN]
+        let sample: [u8; HP_SAMPLE_LEN] = packet[sample_start..sample_start + HP_SAMPLE_LEN]
             .try_into()
             .unwrap();
         let mask = hp_mask_aes128(&keys.hp, &sample);
@@ -697,8 +696,7 @@ mod tests {
         // 1. HP unprotect using the same sample (sample is over
         //    *encrypted* bytes, which HP doesn't touch — so the
         //    sample on the wire matches what we computed).
-        let sample_recv: [u8; HP_SAMPLE_LEN] = packet
-            [sample_start..sample_start + HP_SAMPLE_LEN]
+        let sample_recv: [u8; HP_SAMPLE_LEN] = packet[sample_start..sample_start + HP_SAMPLE_LEN]
             .try_into()
             .unwrap();
         let mask_recv = hp_mask_aes128(&keys.hp, &sample_recv);

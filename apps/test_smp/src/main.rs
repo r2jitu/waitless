@@ -41,7 +41,9 @@ fn init() {
         while uni_kernel::aarch64::smp::ipi_count() == before
             && uni_kernel::time::now_cycles() < deadline
         {
-            unsafe { core::arch::asm!("yield"); }
+            unsafe {
+                core::arch::asm!("yield");
+            }
         }
 
         let after = uni_kernel::aarch64::smp::ipi_count();

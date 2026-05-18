@@ -28,7 +28,7 @@
 
 use alloc::vec::Vec;
 
-use crate::wire::{read_varint, write_varint, WireError};
+use crate::wire::{WireError, read_varint, write_varint};
 
 // ============================================================================
 // Parameter IDs (RFC 9000 §18.2)

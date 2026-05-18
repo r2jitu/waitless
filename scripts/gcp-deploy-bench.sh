@@ -65,7 +65,7 @@ DEFAULT_DURATION="5"
 
 do_redeploy=1
 do_stop=1
-mode="harness"            # `harness` (bench.py) or `raw` (one loadgen call)
+mode="harness" # `harness` (bench.py) or `raw` (one loadgen call)
 workloads=""
 cores=""
 duration=""
@@ -75,30 +75,55 @@ endpoint="/health"
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --no-redeploy)   do_redeploy=0 ;;
-        --keep-running)  do_stop=0 ;;
-        --workload)      shift; workloads="$1" ;;
-        --workload=*)    workloads="${1#--workload=}" ;;
-        --cores)         shift; cores="$1" ;;
-        --cores=*)       cores="${1#--cores=}" ;;
-        --duration)      shift; duration="$1" ;;
-        --duration=*)    duration="${1#--duration=}" ;;
-        --par)           shift; mode="raw"; par="$1" ;;
-        --par=*)         mode="raw"; par="${1#--par=}" ;;
-        --warmup)        shift; warmup="$1" ;;
-        --endpoint)      shift; endpoint="$1" ;;
-        --endpoint=*)    endpoint="${1#--endpoint=}" ;;
-        -h|--help)
-            sed -n '2,30p' "$0" | sed 's/^# *//'
-            exit 0
-            ;;
-        *) echo "unknown arg: $1" >&2; exit 1 ;;
+    --no-redeploy) do_redeploy=0 ;;
+    --keep-running) do_stop=0 ;;
+    --workload)
+        shift
+        workloads="$1"
+        ;;
+    --workload=*) workloads="${1#--workload=}" ;;
+    --cores)
+        shift
+        cores="$1"
+        ;;
+    --cores=*) cores="${1#--cores=}" ;;
+    --duration)
+        shift
+        duration="$1"
+        ;;
+    --duration=*) duration="${1#--duration=}" ;;
+    --par)
+        shift
+        mode="raw"
+        par="$1"
+        ;;
+    --par=*)
+        mode="raw"
+        par="${1#--par=}"
+        ;;
+    --warmup)
+        shift
+        warmup="$1"
+        ;;
+    --endpoint)
+        shift
+        endpoint="$1"
+        ;;
+    --endpoint=*) endpoint="${1#--endpoint=}" ;;
+    -h | --help)
+        sed -n '2,30p' "$0" | sed 's/^# *//'
+        exit 0
+        ;;
+    *)
+        echo "unknown arg: $1" >&2
+        exit 1
+        ;;
     esac
     shift
 done
 
-[ -n "$cores" ]     || cores="$DEFAULT_CORES"
-[ -n "$duration" ]  || duration="$DEFAULT_DURATION"
+[ -n "$cores" ] || cores="$DEFAULT_CORES"
+[ -n "$duration" ] || duration="$DEFAULT_DURATION"
 
 # Resolve project for gcloud calls (same shape as deploy-gcloud.sh).
 PROJECT="${UNIKERNEL_GCE_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
@@ -129,20 +154,26 @@ start_if_stopped() {
     local s
     s="$(instance_status "$name" "$zone")"
     case "$s" in
-        RUNNING) ;;
-        TERMINATED|STOPPED)
-            echo "==> Starting $name..."
-            gcloud compute instances start "$name" --zone="$zone" \
-                --project="$PROJECT" >/dev/null
-            ;;
-        STOPPING) wait_until_stopped "$name" "$zone"; start_if_stopped "$name" "$zone" ;;
-        MISSING) echo "Error: $name not found in zone $zone" >&2; exit 1 ;;
-        *)
-            echo "==> $name in transient state $s — waiting..."
-            until [ "$(instance_status "$name" "$zone")" = "RUNNING" ]; do
-                sleep 3
-            done
-            ;;
+    RUNNING) ;;
+    TERMINATED | STOPPED)
+        echo "==> Starting $name..."
+        gcloud compute instances start "$name" --zone="$zone" \
+            --project="$PROJECT" >/dev/null
+        ;;
+    STOPPING)
+        wait_until_stopped "$name" "$zone"
+        start_if_stopped "$name" "$zone"
+        ;;
+    MISSING)
+        echo "Error: $name not found in zone $zone" >&2
+        exit 1
+        ;;
+    *)
+        echo "==> $name in transient state $s — waiting..."
+        until [ "$(instance_status "$name" "$zone")" = "RUNNING" ]; do
+            sleep 3
+        done
+        ;;
     esac
 }
 
@@ -156,11 +187,11 @@ wait_for_ssh() {
     local i=0
     while [ $i -lt 30 ]; do
         if gcloud compute ssh "$name" --zone="$zone" --project="$PROJECT" \
-                --command='true' >/dev/null 2>&1; then
+            --command='true' >/dev/null 2>&1; then
             return 0
         fi
         sleep 2
-        i=$((i+1))
+        i=$((i + 1))
     done
     echo "Error: ssh to $name didn't come up within 60s" >&2
     return 1
@@ -170,9 +201,9 @@ wait_for_ssh() {
 wait_until_stopped() {
     local name="$1" zone="$2"
     until case "$(instance_status "$name" "$zone")" in
-              STOPPED|TERMINATED|MISSING) true ;;
-              *) false ;;
-          esac; do
+    STOPPED | TERMINATED | MISSING) true ;;
+    *) false ;;
+    esac do
         sleep 3
     done
 }
@@ -201,13 +232,16 @@ else
 fi
 
 UNI_IP="$(instance_internal_ip "$UNI_NAME" "$UNI_ZONE")"
-[ -n "$UNI_IP" ] || { echo "Error: couldn't read $UNI_NAME's internal IP" >&2; exit 1; }
+[ -n "$UNI_IP" ] || {
+    echo "Error: couldn't read $UNI_NAME's internal IP" >&2
+    exit 1
+}
 echo "    $UNI_NAME internal IP: $UNI_IP"
 
 # ── Step 2: ensure kvm-vm is running, sync the bench files ────────
 
 start_if_stopped "$KVM_NAME" "$KVM_ZONE"
-wait_for_ssh    "$KVM_NAME" "$KVM_ZONE"
+wait_for_ssh "$KVM_NAME" "$KVM_ZONE"
 
 # Sync only what changed: cli.py / workloads.py / envs.py + the
 # loadgen sources. The bench harness's `--no-build` skips the

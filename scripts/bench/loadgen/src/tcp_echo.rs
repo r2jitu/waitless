@@ -41,7 +41,10 @@ pub async fn run(
                 Ok(s) => s,
                 Err(_) => {
                     barrier.wait().await;
-                    return (0u64, Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap());
+                    return (
+                        0u64,
+                        Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap(),
+                    );
                 }
             };
             let _ = sock.set_nodelay(true);
@@ -58,7 +61,11 @@ pub async fn run(
 
             let mut count = 0u64;
             while Instant::now() < deadline {
-                let t0 = if sample_latency { Some(Instant::now()) } else { None };
+                let t0 = if sample_latency {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 if sock.write_all(&msg).await.is_err() {
                     break;
                 }
@@ -91,5 +98,10 @@ pub async fn run(
     let elapsed = start.elapsed();
     let p50 = combined.value_at_quantile(0.50);
     let p99 = combined.value_at_quantile(0.99);
-    WorkloadResult { ops: total, elapsed, p50_us: p50, p99_us: p99 }
+    WorkloadResult {
+        ops: total,
+        elapsed,
+        p50_us: p50,
+        p99_us: p99,
+    }
 }

@@ -87,7 +87,10 @@ impl GhashKey {
     /// Start a new GHASH state (Y_0 = 0).
     #[inline]
     pub fn start(&self) -> GhashState<'_> {
-        GhashState { key: self, y: [0u8; BLOCK_LEN] }
+        GhashState {
+            key: self,
+            y: [0u8; BLOCK_LEN],
+        }
     }
 }
 
@@ -281,7 +284,11 @@ pub(crate) mod xmm {
     #[target_feature(enable = "sse2")]
     pub(crate) unsafe fn acc_zero() -> Acc {
         let z = _mm_setzero_si128();
-        Acc { lo: z, hi: z, mid: z }
+        Acc {
+            lo: z,
+            hi: z,
+            mid: z,
+        }
     }
 
     /// Karatsuba per-block: 3 PCLMULs producing (lo×lo, hi×hi,
@@ -395,7 +402,11 @@ unsafe fn absorb_8_x86(
     for i in 0..BATCH_BLOCKS {
         let x_raw = _mm_loadu_si128(chunk.as_ptr().add(i * BLOCK_LEN) as *const __m128i);
         let x_rev = _mm_shuffle_epi8(x_raw, bswap);
-        let yi = if i == 0 { _mm_xor_si128(state, x_rev) } else { x_rev };
+        let yi = if i == 0 {
+            _mm_xor_si128(state, x_rev)
+        } else {
+            x_rev
+        };
         xmm::karatsuba_accumulate(&mut acc, yi, h[i]);
     }
     let result = xmm::acc_reduce(acc);
@@ -502,11 +513,7 @@ pub(crate) mod neon {
     /// `polyval::backend::pmull::karatsuba2`.
     #[inline]
     #[target_feature(enable = "neon")]
-    unsafe fn karatsuba2(
-        h: uint8x16_t,
-        m: uint8x16_t,
-        l: uint8x16_t,
-    ) -> (uint8x16_t, uint8x16_t) {
+    unsafe fn karatsuba2(h: uint8x16_t, m: uint8x16_t, l: uint8x16_t) -> (uint8x16_t, uint8x16_t) {
         let t = {
             let t0 = veorq_u8(m, vextq_u8(l, h, 8));
             let t1 = veorq_u8(h, l);
@@ -522,9 +529,8 @@ pub(crate) mod neon {
     #[inline]
     #[target_feature(enable = "aes,neon")]
     unsafe fn mont_reduce(x23: uint8x16_t, x01: uint8x16_t) -> uint8x16_t {
-        let poly = vreinterpretq_u8_p128(
-            1 << 127 | 1 << 126 | 1 << 121 | 1 << 63 | 1 << 62 | 1 << 57,
-        );
+        let poly =
+            vreinterpretq_u8_p128(1 << 127 | 1 << 126 | 1 << 121 | 1 << 63 | 1 << 62 | 1 << 57);
         let a = pmull_lo(x01, poly);
         let b = veorq_u8(x01, vextq_u8(a, a, 8));
         let c = pmull_hi(b, poly);
@@ -571,7 +577,11 @@ unsafe fn absorb_8_arm(
     for i in 0..BATCH_BLOCKS {
         let x_raw = vld1q_u8(chunk.as_ptr().add(i * BLOCK_LEN));
         let x_rev = vqtbl1q_u8(x_raw, bswap);
-        let yi = if i == 0 { veorq_u8(state, x_rev) } else { x_rev };
+        let yi = if i == 0 {
+            veorq_u8(state, x_rev)
+        } else {
+            x_rev
+        };
         neon::karatsuba_accumulate(&mut acc, yi, h[i]);
     }
     let result = neon::acc_reduce(acc);
@@ -644,12 +654,12 @@ mod tests {
     #[test]
     fn mulx_rfc8452() {
         let input: [u8; 16] = [
-            0x9c, 0x98, 0xc0, 0x4d, 0xf9, 0x38, 0x7d, 0xed,
-            0x82, 0x81, 0x75, 0xa9, 0x2b, 0xa6, 0x52, 0xd8,
+            0x9c, 0x98, 0xc0, 0x4d, 0xf9, 0x38, 0x7d, 0xed, 0x82, 0x81, 0x75, 0xa9, 0x2b, 0xa6,
+            0x52, 0xd8,
         ];
         let expected: [u8; 16] = [
-            0x39, 0x31, 0x81, 0x9b, 0xf2, 0x71, 0xfa, 0xda,
-            0x05, 0x03, 0xeb, 0x52, 0x57, 0x4c, 0xa5, 0x72,
+            0x39, 0x31, 0x81, 0x9b, 0xf2, 0x71, 0xfa, 0xda, 0x05, 0x03, 0xeb, 0x52, 0x57, 0x4c,
+            0xa5, 0x72,
         ];
         assert_eq!(mulx(&input), expected);
     }
@@ -660,10 +670,10 @@ mod tests {
     /// signal — any byte-order or reduction bug shows up here.
     #[test]
     fn matches_ghash_crate() {
-        use ghash::universal_hash::generic_array::GenericArray;
+        use ghash::GHash;
         use ghash::universal_hash::KeyInit as KI;
         use ghash::universal_hash::UniversalHash;
-        use ghash::GHash;
+        use ghash::universal_hash::generic_array::GenericArray;
 
         let h_keys: &[[u8; 16]] = &[
             [0x00; 16],
@@ -671,21 +681,22 @@ mod tests {
             [0x42; 16],
             *b"YELLOW SUBMARINE",
             [
-                0xee, 0xc0, 0xed, 0x67, 0x6b, 0xa5, 0xee, 0x91,
-                0xaf, 0xd3, 0xc4, 0x76, 0x57, 0x71, 0xc4, 0xd4,
+                0xee, 0xc0, 0xed, 0x67, 0x6b, 0xa5, 0xee, 0x91, 0xaf, 0xd3, 0xc4, 0x76, 0x57, 0x71,
+                0xc4, 0xd4,
             ],
         ];
 
         let sizes: &[usize] = &[
-            0, 16, 32, 48, 64, 80, 96, 112,
-            128, 144, 160, 176,
-            256, 257, 384, 511, 512, 1024, 4096, 16383,
+            0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 256, 257, 384, 511, 512, 1024,
+            4096, 16383,
         ];
 
         for h in h_keys {
             let key = GhashKey::new(h);
             for &n in sizes {
-                let input: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(7)).collect();
+                let input: Vec<u8> = (0..n)
+                    .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+                    .collect();
 
                 let mut ours = key.start();
                 let mut i = 0;
@@ -721,11 +732,7 @@ mod tests {
                 }
                 let reference: [u8; 16] = reference.finalize().into();
 
-                assert_eq!(
-                    ours, reference,
-                    "GHASH mismatch: h={:02x?} n={}",
-                    h, n
-                );
+                assert_eq!(ours, reference, "GHASH mismatch: h={:02x?} n={}", h, n);
             }
         }
     }

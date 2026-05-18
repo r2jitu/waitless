@@ -13,30 +13,31 @@
 // `rx_buf`, buffer plaintext into `pt_buf`, and emit sealed records
 // into `tx_buf`; they never perform I/O directly.
 
-use p256::ecdsa::{signature::Signer, Signature as EcdsaSignature};
+use p256::ecdsa::{Signature as EcdsaSignature, signature::Signer};
 
 use crate::handshake::{
-    build_certificate, build_certificate_verify, build_encrypted_extensions, build_finished,
-    build_new_session_ticket, build_server_hello, cipher_suite, encode_handshake, ext_type,
-    iter_alpn, msg_type, parse_finished, parse_handshake, psk_ke_mode,
-    sign_content_server_cert_verify, ClientHello, ParseError, PskOffer,
+    ClientHello, ParseError, PskOffer, build_certificate, build_certificate_verify,
+    build_encrypted_extensions, build_finished, build_new_session_ticket, build_server_hello,
+    cipher_suite, encode_handshake, ext_type, iter_alpn, msg_type, parse_finished, parse_handshake,
+    psk_ke_mode, sign_content_server_cert_verify,
 };
-use crate::record::{self, content_type, open as record_open, seal as record_seal, RecordError, HEADER_LEN};
+use crate::record::{
+    self, HEADER_LEN, RecordError, content_type, open as record_open, seal as record_seal,
+};
 use crate::schedule::{
-    derive_secret, empty_transcript_hash, hkdf_expand_label, secure_zero, KeySchedule,
-    TrafficKey, HASH_LEN,
+    HASH_LEN, KeySchedule, TrafficKey, derive_secret, empty_transcript_hash, hkdf_expand_label,
+    secure_zero,
 };
 
 use sha2::{Digest as _, Sha256};
 
 use crate::keys::{ct_eq_32, derive_finished_key, hmac_sha256};
 use crate::profile;
+use crate::server::{HandshakeError, State, TX_BUF_LEN, TlsServer, TlsServerConfig};
 use crate::ticket::{
-    open_ticket, seal_ticket, TicketPlaintext, SEALED_LEN, TICKET_LIFETIME_SECONDS,
-    TICKET_VERSION,
+    SEALED_LEN, TICKET_LIFETIME_SECONDS, TICKET_VERSION, TicketPlaintext, open_ticket, seal_ticket,
 };
 use crate::trace;
-use crate::server::{State, HandshakeError, TlsServer, TlsServerConfig, TX_BUF_LEN};
 
 /// Monotonic value the server stamps into freshly-issued tickets and
 /// against which `open_ticket` measures age.
@@ -158,8 +159,7 @@ pub fn try_resume(
         // binder_key = Derive-Secret(early_secret, "res binder", "")
         // finished_key = HKDF-Expand-Label(binder_key, "finished", "", 32)
         // expected = HMAC(finished_key, partial_transcript)
-        let binder_key =
-            derive_secret(candidate.secret(), b"res binder", &empty_transcript_hash());
+        let binder_key = derive_secret(candidate.secret(), b"res binder", &empty_transcript_hash());
         let finished_key = derive_finished_key(&binder_key);
         let expected = hmac_sha256(&finished_key, &partial_transcript);
 
@@ -199,7 +199,10 @@ impl TlsServer {
     /// of content_type::handshake containing ClientHello. If found,
     /// emits the full server flight into tx_buf and transitions to
     /// WaitClientFinished.
-    pub(super) fn do_client_hello(&mut self, config: &TlsServerConfig) -> Result<(), HandshakeError> {
+    pub(super) fn do_client_hello(
+        &mut self,
+        config: &TlsServerConfig,
+    ) -> Result<(), HandshakeError> {
         // Need at least a record header.
         if self.rx_len < record::HEADER_LEN {
             return Ok(());
@@ -256,7 +259,9 @@ impl TlsServer {
             let mut sid = [0u8; 32];
             let sid_len = ch.legacy_session_id.len();
             sid[..sid_len].copy_from_slice(ch.legacy_session_id);
-            let pub_key = ch.x25519_client_pub.ok_or(HandshakeError::UnsupportedClient)?;
+            let pub_key = ch
+                .x25519_client_pub
+                .ok_or(HandshakeError::UnsupportedClient)?;
 
             // RFC 7301 §3.2: if the client offered ALPN and we
             // support a name in their list, we MUST echo the
@@ -510,12 +515,8 @@ impl TlsServer {
         let sf_body_len =
             build_finished(&sf_verify, &mut sf_body).ok_or(HandshakeError::Internal)?;
         let mut sf_msg = [0u8; 48];
-        let sf_msg_len = encode_handshake(
-            msg_type::FINISHED,
-            &sf_body[..sf_body_len],
-            &mut sf_msg,
-        )
-        .ok_or(HandshakeError::Internal)?;
+        let sf_msg_len = encode_handshake(msg_type::FINISHED, &sf_body[..sf_body_len], &mut sf_msg)
+            .ok_or(HandshakeError::Internal)?;
         self.transcript.update(&sf_msg[..sf_msg_len]);
         self.seal_handshake_record(&mut server_hs_tk, &sf_msg[..sf_msg_len])?;
         trace::step(b"[tls] ServerFinished sealed, entering WaitClientFinished\n");
@@ -547,7 +548,12 @@ impl TlsServer {
         if TX_BUF_LEN - self.tx_len < needed {
             return Err(HandshakeError::TxBufTooSmall);
         }
-        let n = record_seal(tk, content_type::HANDSHAKE, body, &mut self.tx_buf[self.tx_len..])?;
+        let n = record_seal(
+            tk,
+            content_type::HANDSHAKE,
+            body,
+            &mut self.tx_buf[self.tx_len..],
+        )?;
         self.tx_len += n;
         Ok(())
     }
@@ -558,7 +564,11 @@ impl TlsServer {
     pub(super) fn do_client_finished(&mut self) -> Result<(), HandshakeError> {
         trace::do_client_finished_entry(
             self.rx_len,
-            if self.rx_len >= 1 { Some(self.rx_buf[0]) } else { None },
+            if self.rx_len >= 1 {
+                Some(self.rx_buf[0])
+            } else {
+                None
+            },
         );
         // Skip any middlebox-compat ChangeCipherSpec the client sends
         // (plaintext record with content_type 20, 1-byte body = 0x01).
@@ -571,12 +581,12 @@ impl TlsServer {
             }
             // Parse the plaintext CCS record and drop it. Treat
             // Truncated as wait-for-more-data.
-            let (_ct, _body, consumed) =
-                match record::parse_plaintext(&self.rx_buf[..self.rx_len]) {
-                    Ok(tuple) => tuple,
-                    Err(RecordError::Truncated) => return Ok(()),
-                    Err(e) => return Err(e.into()),
-                };
+            let (_ct, _body, consumed) = match record::parse_plaintext(&self.rx_buf[..self.rx_len])
+            {
+                Ok(tuple) => tuple,
+                Err(RecordError::Truncated) => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
             self.drain_rx(consumed);
             trace::step(b"[tls]   skipped ChangeCipherSpec\n");
         }
@@ -594,10 +604,7 @@ impl TlsServer {
         trace::record_header(self.rx_buf[0], total);
 
         // Decrypt in place under the client handshake traffic key.
-        let tk = self
-            .client_hs_tk
-            .as_mut()
-            .ok_or(HandshakeError::Internal)?;
+        let tk = self.client_hs_tk.as_mut().ok_or(HandshakeError::Internal)?;
         let (inner_type, pt, consumed) = record_open(tk, &mut self.rx_buf[..total])?;
         trace::decrypted_record(inner_type, pt.len());
         if inner_type == content_type::ALERT && pt.len() >= 2 {
@@ -721,10 +728,7 @@ impl TlsServer {
         )
         .ok_or(HandshakeError::Internal)?;
 
-        let tk = self
-            .server_ap_tk
-            .as_mut()
-            .ok_or(HandshakeError::Internal)?;
+        let tk = self.server_ap_tk.as_mut().ok_or(HandshakeError::Internal)?;
         let needed = HEADER_LEN + msg_len + 1 + record::TAG_LEN;
         if TX_BUF_LEN - self.tx_len < needed {
             return Err(HandshakeError::TxBufTooSmall);
@@ -752,10 +756,7 @@ impl TlsServer {
             if self.rx_len < total {
                 return Ok(());
             }
-            let tk = self
-                .client_ap_tk
-                .as_mut()
-                .ok_or(HandshakeError::Internal)?;
+            let tk = self.client_ap_tk.as_mut().ok_or(HandshakeError::Internal)?;
             let (inner_type, pt, consumed) = record_open(tk, &mut self.rx_buf[..total])?;
             match inner_type {
                 content_type::APPLICATION_DATA => {

@@ -90,8 +90,7 @@ class WebserverMultiCoreTest(unittest.TestCase):
                 pass
             cls.launcher.terminate()
             raise RuntimeError(
-                f"HTTP not ready on :{PORT} after 30s "
-                f"(UNIKERNEL_CPUS={CPU_COUNT})"
+                f"HTTP not ready on :{PORT} after 30s (UNIKERNEL_CPUS={CPU_COUNT})"
             )
 
     @classmethod
@@ -108,7 +107,8 @@ class WebserverMultiCoreTest(unittest.TestCase):
         log = self._log()
         marker = f"cpus={CPU_COUNT}".encode()
         self.assertIn(
-            marker, log,
+            marker,
+            log,
             f"expected {marker!r} in serial log; this test is meaningless "
             f"at fewer vCPUs (log length={len(log)})",
         )
@@ -123,7 +123,8 @@ class WebserverMultiCoreTest(unittest.TestCase):
         # activate_multi_queue() on success; its absence means we're
         # running the Tier-2 fallback path and this test is lying.
         self.assertIn(
-            b"multi-queue:", log,
+            b"multi-queue:",
+            log,
             "virtio-net multi-queue activation log line missing; "
             "guest booted single-queue, MQ path untested",
         )
@@ -180,7 +181,8 @@ class WebserverMultiCoreTest(unittest.TestCase):
             for i, s in enumerate(sockets):
                 got = s.recv(32)
                 self.assertEqual(
-                    got, payload,
+                    got,
+                    payload,
                     f"conn[{i}] echoed {got!r}, expected {payload!r}",
                 )
         finally:

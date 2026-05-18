@@ -35,9 +35,7 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use crate::aead::{
-    open, seal, KEY_LEN, NONCE_LEN, TAG_LEN,
-};
+use crate::aead::{KEY_LEN, NONCE_LEN, TAG_LEN, open, seal};
 use crate::schedule::secure_zero;
 
 /// Plaintext schema version. Bumped whenever the field layout below
@@ -236,11 +234,7 @@ pub fn seal_ticket(pt: &TicketPlaintext, out: &mut [u8]) -> Option<usize> {
 /// module doesn't depend on `kernel::time` (it lives in `uni-tls`,
 /// which compiles on native too). Caller derives `max_age_cycles`
 /// from a wall-clockish duration via `cycles_per_us`.
-pub fn open_ticket(
-    sealed: &[u8],
-    now_cycles: u64,
-    max_age_cycles: u64,
-) -> Option<TicketPlaintext> {
+pub fn open_ticket(sealed: &[u8], now_cycles: u64, max_age_cycles: u64) -> Option<TicketPlaintext> {
     open_under_key(GLOBAL_TICKET_KEY.get()?, sealed, now_cycles, max_age_cycles)
 }
 
@@ -287,8 +281,7 @@ pub(super) fn seal_under_key(
         &tk.name,
         &mut out[ct_start..ct_start + PLAINTEXT_LEN],
     );
-    out[ct_start + PLAINTEXT_LEN..ct_start + PLAINTEXT_LEN + TAG_LEN]
-        .copy_from_slice(&tag);
+    out[ct_start + PLAINTEXT_LEN..ct_start + PLAINTEXT_LEN + TAG_LEN].copy_from_slice(&tag);
 
     Some(SEALED_LEN)
 }
@@ -307,15 +300,15 @@ pub(super) fn open_under_key(
         return None;
     }
 
-    let nonce: [u8; NONCE_LEN] =
-        sealed[KEY_NAME_LEN..KEY_NAME_LEN + NONCE_LEN].try_into().ok()?;
+    let nonce: [u8; NONCE_LEN] = sealed[KEY_NAME_LEN..KEY_NAME_LEN + NONCE_LEN]
+        .try_into()
+        .ok()?;
     let ct_start = KEY_NAME_LEN + NONCE_LEN;
     let mut buf = [0u8; PLAINTEXT_LEN];
     buf.copy_from_slice(&sealed[ct_start..ct_start + PLAINTEXT_LEN]);
-    let tag: [u8; TAG_LEN] =
-        sealed[ct_start + PLAINTEXT_LEN..ct_start + PLAINTEXT_LEN + TAG_LEN]
-            .try_into()
-            .ok()?;
+    let tag: [u8; TAG_LEN] = sealed[ct_start + PLAINTEXT_LEN..ct_start + PLAINTEXT_LEN + TAG_LEN]
+        .try_into()
+        .ok()?;
 
     if open(&tk.key, &nonce, &tk.name, &mut buf, &tag).is_err() {
         return None;
@@ -477,7 +470,10 @@ mod tests {
     fn sealed_layout_constants_match() {
         // Tripwire if anyone changes the schema without updating SEALED_LEN.
         assert_eq!(PLAINTEXT_LEN, 1 + 32 + 4 + 8 + 2);
-        assert_eq!(SEALED_LEN, KEY_NAME_LEN + NONCE_LEN + PLAINTEXT_LEN + TAG_LEN);
+        assert_eq!(
+            SEALED_LEN,
+            KEY_NAME_LEN + NONCE_LEN + PLAINTEXT_LEN + TAG_LEN
+        );
         assert_eq!(SEALED_LEN, 91);
     }
 }

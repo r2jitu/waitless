@@ -107,18 +107,12 @@ pub enum RecordError {
 // Counters are u64 atomics with Relaxed ops — each fetch_add is
 // one extra cache-line touch per record. At 16 KiB / record that's
 // negligible (~ns) next to the encrypt itself.
-static TLS_ENCRYPT_BYTES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-static TLS_ENCRYPT_RECORDS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-static TLS_ENCRYPT_CYCLES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-static TLS_DECRYPT_BYTES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-static TLS_DECRYPT_RECORDS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-static TLS_DECRYPT_CYCLES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static TLS_ENCRYPT_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TLS_ENCRYPT_RECORDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TLS_ENCRYPT_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TLS_DECRYPT_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TLS_DECRYPT_RECORDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TLS_DECRYPT_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// RAII bracket: capture `now_cycles` on construction; on drop,
 /// commit the elapsed delta to the target counter. Used to
@@ -127,7 +121,10 @@ static TLS_DECRYPT_CYCLES: core::sync::atomic::AtomicU64 =
 /// one relaxed add).
 #[inline]
 fn bracket(target: &'static core::sync::atomic::AtomicU64) -> CycleBracket {
-    CycleBracket { start: now_cycles_inline(), target }
+    CycleBracket {
+        start: now_cycles_inline(),
+        target,
+    }
 }
 
 pub struct CycleBracket {
@@ -139,7 +136,8 @@ impl Drop for CycleBracket {
     #[inline]
     fn drop(&mut self) {
         let elapsed = now_cycles_inline().wrapping_sub(self.start);
-        self.target.fetch_add(elapsed, core::sync::atomic::Ordering::Relaxed);
+        self.target
+            .fetch_add(elapsed, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -204,7 +202,6 @@ pub fn encrypt_stats() -> (u64, u64, u64, u64, u64, u64) {
         TLS_DECRYPT_CYCLES.load(Relaxed),
     )
 }
-
 
 // ============================================================================
 // AAD helpers
@@ -347,15 +344,10 @@ pub fn seal_chain(
             Some(&p.data()[..n])
         })
         .chain(core::iter::once(&type_buf[..]));
-    let tag = traffic_key.seal_chain(
-        &aad,
-        src_iter,
-        &mut dst[HEADER_LEN..HEADER_LEN + inner_len],
-    );
+    let tag = traffic_key.seal_chain(&aad, src_iter, &mut dst[HEADER_LEN..HEADER_LEN + inner_len]);
 
     // Tag.
-    dst[HEADER_LEN + inner_len..HEADER_LEN + inner_len + TAG_LEN]
-        .copy_from_slice(&tag);
+    dst[HEADER_LEN + inner_len..HEADER_LEN + inner_len + TAG_LEN].copy_from_slice(&tag);
 
     // Record header.
     dst[0] = OPAQUE_TYPE;
@@ -461,11 +453,7 @@ pub fn open<'a>(
     let _ = decrypted_len; // consumed via decrypted_end
 
     bump_decrypt(trailer_idx - decrypted_start);
-    Ok((
-        inner_type,
-        &input[decrypted_start..trailer_idx],
-        total,
-    ))
+    Ok((inner_type, &input[decrypted_start..trailer_idx], total))
 }
 
 // ============================================================================
@@ -531,19 +519,16 @@ mod tests {
         let plaintext = b"EncryptedExtensions body bytes";
         let mut out = [0u8; 256];
 
-        let n = seal(
-            &mut sender,
-            content_type::HANDSHAKE,
-            plaintext,
-            &mut out,
-        )
-        .unwrap();
+        let n = seal(&mut sender, content_type::HANDSHAKE, plaintext, &mut out).unwrap();
         // Header(5) + plaintext + type(1) + tag(16)
         assert_eq!(n, 5 + plaintext.len() + 1 + TAG_LEN);
         // Header bytes are correct.
         assert_eq!(out[0], OPAQUE_TYPE);
         assert_eq!(&out[1..3], &[0x03, 0x03]);
-        assert_eq!(u16::from_be_bytes([out[3], out[4]]), (plaintext.len() + 1 + TAG_LEN) as u16);
+        assert_eq!(
+            u16::from_be_bytes([out[3], out[4]]),
+            (plaintext.len() + 1 + TAG_LEN) as u16
+        );
 
         let (inner_type, pt, consumed) = open(&mut receiver, &mut out[..n]).unwrap();
         assert_eq!(inner_type, content_type::HANDSHAKE);
@@ -583,7 +568,7 @@ mod tests {
         let mut sender = tls::TrafficKey::from_secret(&secret);
         let mut receiver = tls::TrafficKey::from_secret(&secret);
 
-        let plaintext = b"x" ;
+        let plaintext = b"x";
         let mut out = [0u8; 64];
         let n = seal(&mut sender, content_type::HANDSHAKE, plaintext, &mut out).unwrap();
 
@@ -674,8 +659,7 @@ mod tests {
 
         // Round-trip via `open`.
         let mut wire_buf = dst[..n].to_vec();
-        let (inner_type, decrypted, consumed) =
-            open(&mut receiver, &mut wire_buf).unwrap();
+        let (inner_type, decrypted, consumed) = open(&mut receiver, &mut wire_buf).unwrap();
         assert_eq!(inner_type, content_type::APPLICATION_DATA);
         assert_eq!(decrypted, &plaintext_total[..]);
         assert_eq!(consumed, HEADER_LEN + plaintext_len + 1 + TAG_LEN);
@@ -696,10 +680,8 @@ mod tests {
 
         // 25 KiB of plaintext across two parts → 16 KiB ships in
         // the first call, ~8.7 KiB remains for the second.
-        let part1: alloc::vec::Vec<u8> =
-            (0u32..15000).map(|i| i as u8).collect();
-        let part2: alloc::vec::Vec<u8> =
-            (0u32..10000).map(|i| (i ^ 0x55) as u8).collect();
+        let part1: alloc::vec::Vec<u8> = (0u32..15000).map(|i| i as u8).collect();
+        let part2: alloc::vec::Vec<u8> = (0u32..10000).map(|i| (i ^ 0x55) as u8).collect();
         let mut src_chain = uni_iobuf::IOBufChain::new();
         let mut b1 = uni_iobuf::IOBuf::new_with_reserved(0, part1.len(), 0);
         b1.append_slice(&part1).unwrap();

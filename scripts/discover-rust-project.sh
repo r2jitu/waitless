@@ -74,13 +74,16 @@ trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
 # normal consumers (proc_macro_deps with cfg=exec, `bazel test` on
 # the host platform) are unaffected.
 case "$(uname -sm)" in
-    "Darwin arm64") HOST_PLATFORM="//bazel/platforms:aarch64_macos" ;;
-    "Linux x86_64") HOST_PLATFORM="//bazel/platforms:x86_64_linux" ;;
-    *) echo "unsupported host $(uname -sm)" >&2; exit 1 ;;
+"Darwin arm64") HOST_PLATFORM="//bazel/platforms:aarch64_macos" ;;
+"Linux x86_64") HOST_PLATFORM="//bazel/platforms:x86_64_linux" ;;
+*)
+    echo "unsupported host $(uname -sm)" >&2
+    exit 1
+    ;;
 esac
 case "$(uname -m)" in
-    arm64|aarch64) TARGET_PLATFORM="//bazel/platforms:aarch64_unikernel" ;;
-    x86_64)        TARGET_PLATFORM="//bazel/platforms:x86_64_unikernel" ;;
+arm64 | aarch64) TARGET_PLATFORM="//bazel/platforms:aarch64_unikernel" ;;
+x86_64) TARGET_PLATFORM="//bazel/platforms:x86_64_unikernel" ;;
 esac
 
 bazel \

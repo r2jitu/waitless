@@ -2,17 +2,16 @@
 
 use core::ptr;
 
-use crate::{
-    log, dsb_st, dsb_ld, dsb_sy,
-    mmio_read32, mmio_write32, mmio_read16, mmio_write16, mmio_read8, mmio_write8,
-    virtio_read32, virtio_write32, virtio_read16, virtio_write16, virtio_read8, virtio_write8,
-};
-use crate::pci::{
-    pci_device, read_config, write_config, find_device,
-    enable_bus_mastering_inner, read_bar64,
-};
 #[cfg(target_arch = "aarch64")]
 use crate::map_device_range;
+use crate::pci::{
+    enable_bus_mastering_inner, find_device, pci_device, read_bar64, read_config, write_config,
+};
+use crate::{
+    dsb_ld, dsb_st, dsb_sy, log, mmio_read8, mmio_read16, mmio_read32, mmio_write8, mmio_write16,
+    mmio_write32, virtio_read8, virtio_read16, virtio_read32, virtio_write8, virtio_write16,
+    virtio_write32,
+};
 use uni_kernel::mm::{alloc_pages, phys_to_virt};
 
 // ============================================================================
@@ -52,11 +51,11 @@ pub const VIRTIO_PCI_MAX_DEVICES: usize = 8;
 
 #[derive(Clone, Copy)]
 pub struct VirtioPciDevice {
-    pub pci_idx: usize,         // index into PCI_DEVICES
-    pub common_cfg: u64,        // MMIO address of common_cfg
-    pub notify_base: u64,       // MMIO address of notify cap
-    pub device_cfg: u64,        // MMIO address of device-specific cfg
-    pub isr_cfg: u64,           // MMIO address of ISR cap
+    pub pci_idx: usize,   // index into PCI_DEVICES
+    pub common_cfg: u64,  // MMIO address of common_cfg
+    pub notify_base: u64, // MMIO address of notify cap
+    pub device_cfg: u64,  // MMIO address of device-specific cfg
+    pub isr_cfg: u64,     // MMIO address of ISR cap
     pub notify_off_multiplier: u32,
     /// Offset into PCI config space of the MSI-X capability structure,
     /// or 0 if the device doesn't expose one.
@@ -111,7 +110,9 @@ pub fn vpci_device(idx: usize) -> VirtioPciDevice {
 fn resolve_bar(pci_idx: usize, bar_idx: usize) -> u64 {
     let dev = pci_device(pci_idx);
     let addr = read_bar64(&dev, bar_idx);
-    if addr == 0 { return 0; }
+    if addr == 0 {
+        return 0;
+    }
 
     #[cfg(target_arch = "aarch64")]
     if addr >= 0x1_0000_0000 {
@@ -128,7 +129,9 @@ fn vpci_parse_caps(dev: &mut VirtioPciDevice) -> bool {
 
     // Check capabilities bit in Status register
     let status_cmd = read_config(bus, slot, func, 0x04);
-    if ((status_cmd >> 16) & (1 << 4)) == 0 { return false; }
+    if ((status_cmd >> 16) & (1 << 4)) == 0 {
+        return false;
+    }
 
     let mut cap_ptr = (read_config(bus, slot, func, 0x34) & 0xFF) as u8;
     let mut found_common = false;
@@ -173,8 +176,8 @@ fn vpci_parse_caps(dev: &mut VirtioPciDevice) -> bool {
                     }
                     VIRTIO_PCI_CAP_NOTIFY_CFG => {
                         dev.notify_base = bar_base + offset;
-                        dev.notify_off_multiplier = read_config(
-                            bus, slot, func, cap_ptr.wrapping_add(16));
+                        dev.notify_off_multiplier =
+                            read_config(bus, slot, func, cap_ptr.wrapping_add(16));
                         found_notify = true;
                     }
                     VIRTIO_PCI_CAP_DEVICE_CFG => {
@@ -230,7 +233,9 @@ pub fn vpci_find(virtio_device_type: u16) -> Option<usize> {
     }
 
     let mut table = VPCI_DEVICES.lock();
-    if table.count >= VIRTIO_PCI_MAX_DEVICES { return None; }
+    if table.count >= VIRTIO_PCI_MAX_DEVICES {
+        return None;
+    }
     let idx = table.count;
     table.devices[idx] = dev;
     table.count += 1;
@@ -249,7 +254,9 @@ pub fn vpci_reset(dev: &VirtioPciDevice) {
 }
 
 pub fn vpci_set_status(dev: &VirtioPciDevice, status: u8) {
-    unsafe { mmio_write8(dev.common_cfg + CC_DEVICE_STATUS, status); }
+    unsafe {
+        mmio_write8(dev.common_cfg + CC_DEVICE_STATUS, status);
+    }
 }
 
 pub fn vpci_get_status(dev: &VirtioPciDevice) -> u8 {
@@ -271,7 +278,9 @@ pub fn vpci_write_features(dev: &VirtioPciDevice, word: u32, features: u32) {
 }
 
 pub fn vpci_select_queue(dev: &VirtioPciDevice, idx: u16) {
-    unsafe { mmio_write16(dev.common_cfg + CC_QUEUE_SELECT, idx); }
+    unsafe {
+        mmio_write16(dev.common_cfg + CC_QUEUE_SELECT, idx);
+    }
 }
 
 pub fn vpci_get_queue_size(dev: &VirtioPciDevice) -> u16 {
@@ -290,7 +299,9 @@ pub fn vpci_set_queue_addrs(dev: &VirtioPciDevice, desc: u64, avail: u64, used: 
 }
 
 pub fn vpci_enable_queue(dev: &VirtioPciDevice) {
-    unsafe { mmio_write16(dev.common_cfg + CC_QUEUE_ENABLE, 1); }
+    unsafe {
+        mmio_write16(dev.common_cfg + CC_QUEUE_ENABLE, 1);
+    }
 }
 
 pub fn vpci_get_queue_notify_off(dev: &VirtioPciDevice) -> u16 {
@@ -302,33 +313,45 @@ pub fn vpci_queue_notify_addr(dev: &VirtioPciDevice, notify_off: u16) -> u64 {
 }
 
 pub fn vpci_read_dev_cfg8(dev: &VirtioPciDevice, offset: u32) -> u8 {
-    if dev.device_cfg == 0 { return 0; }
+    if dev.device_cfg == 0 {
+        return 0;
+    }
     unsafe { mmio_read8(dev.device_cfg + offset as u64) }
 }
 
 pub fn vpci_read_dev_cfg16(dev: &VirtioPciDevice, offset: u32) -> u16 {
-    if dev.device_cfg == 0 { return 0; }
+    if dev.device_cfg == 0 {
+        return 0;
+    }
     unsafe { mmio_read16(dev.device_cfg + offset as u64) }
 }
 
 pub fn vpci_read_isr(dev: &VirtioPciDevice) -> u8 {
-    if dev.isr_cfg == 0 { return 0; }
+    if dev.isr_cfg == 0 {
+        return 0;
+    }
     unsafe { mmio_read8(dev.isr_cfg) }
 }
 
 pub fn vpci_set_queue_msix_vector(dev: &VirtioPciDevice, vector: u16) {
-    unsafe { mmio_write16(dev.common_cfg + CC_QUEUE_MSIX_VECTOR, vector); }
+    unsafe {
+        mmio_write16(dev.common_cfg + CC_QUEUE_MSIX_VECTOR, vector);
+    }
 }
 
 pub fn vpci_set_config_msix_vector(dev: &VirtioPciDevice, vector: u16) {
-    unsafe { mmio_write16(dev.common_cfg + CC_CONFIG_MSIX_VECTOR, vector); }
+    unsafe {
+        mmio_write16(dev.common_cfg + CC_CONFIG_MSIX_VECTOR, vector);
+    }
 }
 
 /// Toggle the `MSI-X Enable` bit in the device's message-control word.
 /// The function-mask bit is cleared so individual entries control
 /// delivery via their own per-vector mask.
 pub fn vpci_msix_enable(dev: &VirtioPciDevice, enable: bool) {
-    if dev.msix_cap_off == 0 { return; }
+    if dev.msix_cap_off == 0 {
+        return;
+    }
     let pci = pci_device(dev.pci_idx);
     let cap = dev.msix_cap_off;
     let word = read_config(pci.bus, pci.slot, pci.func, cap);
@@ -356,10 +379,10 @@ pub fn vpci_msix_write_entry(
     }
     let slot = dev.msix_table + (entry as u64) * 16;
     unsafe {
-        mmio_write32(slot,        addr as u32);
-        mmio_write32(slot + 4,   (addr >> 32) as u32);
-        mmio_write32(slot + 8,    data);
-        mmio_write32(slot + 12,   if masked { 1 } else { 0 });
+        mmio_write32(slot, addr as u32);
+        mmio_write32(slot + 4, (addr >> 32) as u32);
+        mmio_write32(slot + 8, data);
+        mmio_write32(slot + 12, if masked { 1 } else { 0 });
     }
 }
 
@@ -540,13 +563,19 @@ impl Virtqueue {
 
     /// Allocate ring memory and set up descriptor free list.
     /// Returns (desc_phys, avail_phys, used_phys) for the caller to program the device.
-    pub fn alloc_rings(&mut self, queue_size: u16, notify_addr: u64,
-                   queue_index: u16) -> Option<(u64, u64, u64)> {
+    pub fn alloc_rings(
+        &mut self,
+        queue_size: u16,
+        notify_addr: u64,
+        queue_index: u16,
+    ) -> Option<(u64, u64, u64)> {
         self.queue_index = queue_index;
         self.notify_addr = notify_addr;
         self.queue_size = queue_size;
 
-        if queue_size == 0 { return None; }
+        if queue_size == 0 {
+            return None;
+        }
 
         let desc_size = (queue_size as u64) * 16; // sizeof(VirtqDesc)
         let avail_size = 6 + 2 * (queue_size as u64); // flags + idx + ring[] + used_event
@@ -565,10 +594,14 @@ impl Virtqueue {
         // so a non-contiguous second allocation would corrupt
         // unrelated heap memory on every device DMA.
         let phys_base = alloc_pages(num_frames as usize);
-        if phys_base == 0 { return None; }
+        if phys_base == 0 {
+            return None;
+        }
 
         let base_ptr = phys_to_virt(phys_base);
-        unsafe { ptr::write_bytes(base_ptr, 0, total_size as usize); }
+        unsafe {
+            ptr::write_bytes(base_ptr, 0, total_size as usize);
+        }
 
         self.descs = base_ptr as *mut VirtqDesc;
         self.avail = unsafe { base_ptr.add(desc_size as usize) } as *mut VirtqAvail;
@@ -595,15 +628,24 @@ impl Virtqueue {
     }
 
     /// Initialize for modern PCI transport.
-    pub fn init_pci_modern(&mut self, queue_size: u16, notify_addr: u64,
-                       queue_index: u16) -> Option<(u64, u64, u64)> {
+    pub fn init_pci_modern(
+        &mut self,
+        queue_size: u16,
+        notify_addr: u64,
+        queue_index: u16,
+    ) -> Option<(u64, u64, u64)> {
         self.is_mmio = false;
         self.alloc_rings(queue_size, notify_addr, queue_index)
     }
 
     /// Initialize for legacy PCI or MMIO transport.
-    pub fn init_legacy(&mut self, base: u64, queue_index: u16,
-                   is_mmio: bool, is_mmio_v2: bool) -> bool {
+    pub fn init_legacy(
+        &mut self,
+        base: u64,
+        queue_index: u16,
+        is_mmio: bool,
+        is_mmio_v2: bool,
+    ) -> bool {
         self.io_base = base;
         self.is_mmio = is_mmio;
 
@@ -612,7 +654,9 @@ impl Virtqueue {
             unsafe {
                 virtio_write32(base + MMIO_QUEUE_SEL, queue_index as u32);
                 let qmax = virtio_read32(base + MMIO_QUEUE_NUM_MAX);
-                if qmax == 0 { return false; }
+                if qmax == 0 {
+                    return false;
+                }
                 queue_size = if qmax > 256 { 256 } else { qmax as u16 };
                 virtio_write32(base + MMIO_QUEUE_NUM, queue_size as u32);
                 if !is_mmio_v2 {
@@ -623,7 +667,9 @@ impl Virtqueue {
             unsafe {
                 virtio_write16(base + VREG_QUEUE_SELECT, queue_index);
                 let dev_qs = virtio_read16(base + VREG_QUEUE_SIZE);
-                if dev_qs == 0 { return false; }
+                if dev_qs == 0 {
+                    return false;
+                }
                 queue_size = dev_qs;
             }
         }
@@ -669,7 +715,9 @@ impl Virtqueue {
     /// header + data even when the total byte count matches.
     pub fn add_chain(&mut self, segs: &[(u64, u32, bool)]) -> i32 {
         let total = segs.len() as u16;
-        if total == 0 || self.num_free < total { return -1; }
+        if total == 0 || self.num_free < total {
+            return -1;
+        }
 
         let head = self.free_head;
         let mut idx = head;
@@ -678,7 +726,9 @@ impl Virtqueue {
             d.addr = phys;
             d.len = len;
             d.flags = if writeable { VIRTQ_DESC_F_WRITE } else { 0 };
-            if (i as u16) < total - 1 { d.flags |= VIRTQ_DESC_F_NEXT; }
+            if (i as u16) < total - 1 {
+                d.flags |= VIRTQ_DESC_F_NEXT;
+            }
             idx = d.next;
         }
 
@@ -698,7 +748,9 @@ impl Virtqueue {
     /// Returns head descriptor index, or -1 on failure.
     pub fn add_buf(&mut self, buf_phys: u64, buf_len: u32, out_count: u16, in_count: u16) -> i32 {
         let total = out_count + in_count;
-        if total == 0 || self.num_free < total { return -1; }
+        if total == 0 || self.num_free < total {
+            return -1;
+        }
 
         let head = self.free_head;
         let mut idx = head;
@@ -718,7 +770,9 @@ impl Virtqueue {
             d.addr = buf_phys;
             d.len = buf_len;
             d.flags = VIRTQ_DESC_F_WRITE;
-            if i < in_count - 1 { d.flags |= VIRTQ_DESC_F_NEXT; }
+            if i < in_count - 1 {
+                d.flags |= VIRTQ_DESC_F_NEXT;
+            }
             idx = d.next;
         }
 
@@ -760,11 +814,17 @@ impl Virtqueue {
         }
         dsb_st();
         if self.notify_addr != 0 {
-            unsafe { ptr::write_volatile(self.notify_addr as *mut u16, self.queue_index); }
+            unsafe {
+                ptr::write_volatile(self.notify_addr as *mut u16, self.queue_index);
+            }
         } else if self.is_mmio {
-            unsafe { virtio_write32(self.io_base + MMIO_QUEUE_NOTIFY, self.queue_index as u32); }
+            unsafe {
+                virtio_write32(self.io_base + MMIO_QUEUE_NOTIFY, self.queue_index as u32);
+            }
         } else {
-            unsafe { virtio_write16(self.io_base + VREG_QUEUE_NOTIFY, self.queue_index); }
+            unsafe {
+                virtio_write16(self.io_base + VREG_QUEUE_NOTIFY, self.queue_index);
+            }
         }
     }
 
@@ -828,7 +888,9 @@ impl Virtqueue {
             dsb_ld();
             self.used_idx()
         };
-        if self.last_used_idx == cur_used_idx { return None; }
+        if self.last_used_idx == cur_used_idx {
+            return None;
+        }
 
         let used_slot = self.last_used_idx & (self.queue_size - 1);
         let id = self.used_ring_id(used_slot) as u16;
@@ -979,7 +1041,9 @@ impl Virtqueue {
     /// Write avail->idx (volatile, device may read concurrently).
     fn set_avail_idx(&mut self, val: u16) {
         // SAFETY: avail points to a valid VirtqAvail header.
-        unsafe { ptr::write_volatile(&mut (*self.avail).idx, val); }
+        unsafe {
+            ptr::write_volatile(&mut (*self.avail).idx, val);
+        }
     }
 
     /// Read used->idx (volatile, device writes this).
@@ -999,7 +1063,9 @@ impl Virtqueue {
     /// Write avail->flags (volatile).
     fn set_avail_flags(&mut self, val: u16) {
         // SAFETY: avail points to a valid VirtqAvail header.
-        unsafe { ptr::write_volatile(&mut (*self.avail).flags, val); }
+        unsafe {
+            ptr::write_volatile(&mut (*self.avail).flags, val);
+        }
     }
 
     /// Write the used_event field (located after avail->ring[queue_size]).
@@ -1007,8 +1073,8 @@ impl Virtqueue {
         // SAFETY: used_event is the u16 immediately after avail->ring[queue_size],
         // i.e. at offset 4 + 2*queue_size from avail base.
         unsafe {
-            let used_event_ptr = ((self.avail as *mut u8).add(4) as *mut u16)
-                .add(self.queue_size as usize);
+            let used_event_ptr =
+                ((self.avail as *mut u8).add(4) as *mut u16).add(self.queue_size as usize);
             ptr::write_volatile(used_event_ptr, val);
         }
     }

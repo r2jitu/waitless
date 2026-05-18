@@ -34,8 +34,7 @@ unsafe impl FromBytes for EthernetHeader {}
 /// `uni_kernel::once::InitOnce` (this leaf crate has no kernel dep).
 /// `init_mac` runs once on the BSP after virtio-net init; readers on
 /// every core load via Acquire and decode.
-static OUR_MAC_PACKED: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static OUR_MAC_PACKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Cache our MAC address. Called once at boot after virtio-net init.
 pub fn init_mac() {

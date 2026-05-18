@@ -47,13 +47,13 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::future::Future;
 
-use crate::wire::{long_packet_type, parse_long_header_preamble, FIXED_BIT, HEADER_FORM_LONG};
+use crate::wire::{FIXED_BIT, HEADER_FORM_LONG, long_packet_type, parse_long_header_preamble};
 
-use uni::runtime::{spawn, AsyncEvent, UdpSocket};
+use uni::runtime::{AsyncEvent, UdpSocket, spawn};
 
 use crate::conn::{ConnError, ConnState, Connection, ConnectionId, DatagramBuf};
 use crate::inbox::{
-    make_local_cid, parse_local_cid, ConnInbox, Datagram, SlotTable, SERVER_CID_LEN,
+    ConnInbox, Datagram, SERVER_CID_LEN, SlotTable, make_local_cid, parse_local_cid,
 };
 use uni_tls::TlsServerConfig;
 
@@ -218,10 +218,14 @@ impl QuicConn {
                 let elapsed = uni_tls::ticket::now_us().saturating_sub(entered_us);
                 if elapsed > STUCK_THRESHOLD_US {
                     let state = self.conn.borrow().recv_stream_state(sid);
-                    crate::quic_drop!(other_wire,
+                    crate::quic_drop!(
+                        other_wire,
                         "stuck recv await sid={} elapsed_ms={} state={:?} local_cid={}",
-                        sid, elapsed / 1_000, state,
-                        crate::endpoint::hex8(&self.local_cid));
+                        sid,
+                        elapsed / 1_000,
+                        state,
+                        crate::endpoint::hex8(&self.local_cid)
+                    );
                     warned = true;
                 }
             }
@@ -444,9 +448,12 @@ async fn listener_loop<H, F>(
         let dcid = match extract_dcid(&buf) {
             Some(d) => d,
             None => {
-                crate::quic_drop!(no_dcid, "datagram_size={} first={:#x}",
+                crate::quic_drop!(
+                    no_dcid,
+                    "datagram_size={} first={:#x}",
                     buf.len(),
-                    buf.first().copied().unwrap_or(0));
+                    buf.first().copied().unwrap_or(0)
+                );
                 recycle_buf(&recycle_pool, buf);
                 continue;
             }
@@ -466,9 +473,13 @@ async fn listener_loop<H, F>(
                     bytes: buf,
                 });
                 if !pushed {
-                    crate::quic_drop!(inbox_full_drops,
+                    crate::quic_drop!(
+                        inbox_full_drops,
                         "size={} slot={} gen={}",
-                        dgram_size, slot_idx, generation);
+                        dgram_size,
+                        slot_idx,
+                        generation
+                    );
                 }
                 continue;
             }
@@ -492,16 +503,14 @@ async fn listener_loop<H, F>(
         //      same conn — otherwise we drop the 0-RTT data.
         if let Some(inbox) = slots.lookup_initial_dcid(&dcid) {
             let dgram_size = buf.len();
-            crate::quic_event!(initial_dcid_hit,
-                "size={} dcid={}", dgram_size, hex8(&dcid));
+            crate::quic_event!(initial_dcid_hit, "size={} dcid={}", dgram_size, hex8(&dcid));
             let pushed = inbox.push(Datagram {
                 src_ip,
                 src_port,
                 bytes: buf,
             });
             if !pushed {
-                crate::quic_drop!(inbox_full_drops,
-                    "size={} initial-dcid", dgram_size);
+                crate::quic_drop!(inbox_full_drops, "size={} initial-dcid", dgram_size);
             }
             continue;
         }
@@ -514,12 +523,20 @@ async fn listener_loop<H, F>(
             // — drop. (Stateless reset is out of scope.)
             let first = buf.first().copied().unwrap_or(0);
             if first & 0x80 == 0 {
-                crate::quic_drop!(unknown_short_header,
-                    "size={} dcid={}", buf.len(), hex8(&dcid));
+                crate::quic_drop!(
+                    unknown_short_header,
+                    "size={} dcid={}",
+                    buf.len(),
+                    hex8(&dcid)
+                );
             } else {
-                crate::quic_drop!(unknown_long_header,
+                crate::quic_drop!(
+                    unknown_long_header,
                     "size={} dcid={} first={:#x}",
-                    buf.len(), hex8(&dcid), first);
+                    buf.len(),
+                    hex8(&dcid),
+                    first
+                );
             }
             recycle_buf(&recycle_pool, buf);
             continue;
@@ -532,8 +549,7 @@ async fn listener_loop<H, F>(
                 // is already at its per-IP cap. Both surface as
                 // `slot_table_full` for now; the inbox unit tests
                 // distinguish them.
-                crate::quic_drop!(slot_table_full,
-                    "dcid={} src_ip={:?}", hex8(&dcid), src_ip);
+                crate::quic_drop!(slot_table_full, "dcid={} src_ip={:?}", hex8(&dcid), src_ip);
                 recycle_buf(&recycle_pool, buf);
                 continue;
             }
@@ -547,9 +563,14 @@ async fn listener_loop<H, F>(
         }
         let local_cid_bytes = make_local_cid(slot_idx, generation, nonce);
         let local_cid = ConnectionId::new(&local_cid_bytes);
-        crate::quic_event!(conns_allocated,
+        crate::quic_event!(
+            conns_allocated,
             "slot={} gen={} dcid={} local_cid={}",
-            slot_idx, generation, hex8(&dcid), hex8(&local_cid_bytes));
+            slot_idx,
+            generation,
+            hex8(&dcid),
+            hex8(&local_cid_bytes)
+        );
 
         let inbox = ConnInbox::new();
         slots.install(slot_idx, generation, &inbox);
@@ -618,8 +639,7 @@ async fn conn_task<H, F>(
     // iteration and refresh last_recv there).
     conn.borrow_mut().set_last_recv_now();
     let progress = Rc::new(AsyncEvent::new());
-    let peer_ip: Rc<Cell<uni::runtime::IpAddr>> =
-        Rc::new(Cell::new(uni::runtime::IpAddr::V4_ANY));
+    let peer_ip: Rc<Cell<uni::runtime::IpAddr>> = Rc::new(Cell::new(uni::runtime::IpAddr::V4_ANY));
     let peer_port: Rc<Cell<u16>> = Rc::new(Cell::new(0));
     let mut handler_spawned = false;
 
@@ -638,9 +658,13 @@ async fn conn_task<H, F>(
         let now = uni_tls::ticket::now_us();
         let elapsed = now.saturating_sub(last_recv_us);
         if elapsed >= idle_us {
-            crate::quic_event!(idle_timeouts,
+            crate::quic_event!(
+                idle_timeouts,
                 "elapsed_us={} idle_us={} local_cid={}",
-                elapsed, idle_us, hex8(&local_cid_bytes));
+                elapsed,
+                idle_us,
+                hex8(&local_cid_bytes)
+            );
             break;
         }
         let idle_deadline = last_recv_us + idle_us;
@@ -650,10 +674,8 @@ async fn conn_task<H, F>(
         };
         let remaining = timer_deadline.saturating_sub(now).max(1);
 
-        let dgram = match uni::runtime::select(
-            inbox.pop(),
-            uni::runtime::sleep_us(remaining),
-        ).await {
+        let dgram = match uni::runtime::select(inbox.pop(), uni::runtime::sleep_us(remaining)).await
+        {
             uni::runtime::Either::Left(Some(d)) => d,
             uni::runtime::Either::Left(None) => break, // inbox closed
             uni::runtime::Either::Right(()) => {
@@ -678,21 +700,20 @@ async fn conn_task<H, F>(
                                     Some(p) => p,
                                     None => break,
                                 };
-                                ship_datagram(
-                                    &sock, &conn,
-                                    peer_ip.get(), peer_port.get(),
-                                    pkt,
-                                );
+                                ship_datagram(&sock, &conn, peer_ip.get(), peer_port.get(), pkt);
                             }
                         }
                         continue;
                     }
                 }
                 // Idle path.
-                crate::quic_event!(idle_timeouts,
+                crate::quic_event!(
+                    idle_timeouts,
                     "elapsed_us={} idle_us={} local_cid={}",
                     after.saturating_sub(last_recv_us),
-                    idle_us, hex8(&local_cid_bytes));
+                    idle_us,
+                    hex8(&local_cid_bytes)
+                );
                 break;
             }
         };
@@ -727,9 +748,13 @@ async fn conn_task<H, F>(
             // allocs per request.
             recycle_buf(&recycle_pool, bytes);
             if let Err(e) = result {
-                crate::quic_drop!(other_wire,
+                crate::quic_drop!(
+                    other_wire,
                     "process_datagram failed: {:?} dgram_size={} local_cid={}",
-                    e, dgram_size, hex8(&local_cid_bytes));
+                    e,
+                    dgram_size,
+                    hex8(&local_cid_bytes)
+                );
                 let (code, reason): (u64, &[u8]) = match e {
                     ConnError::Wire => (0x0a, b"protocol_violation"),
                     ConnError::Decrypt => (0x0a, b"crypto_error"),
@@ -766,11 +791,7 @@ async fn conn_task<H, F>(
                 Some(p) => p,
                 None => break,
             };
-            ship_datagram(
-                &sock, &conn,
-                peer_ip.get(), peer_port.get(),
-                pkt,
-            );
+            ship_datagram(&sock, &conn, peer_ip.get(), peer_port.get(), pkt);
         }
         if tearing_down {
             break;

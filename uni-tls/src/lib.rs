@@ -116,8 +116,8 @@ pub fn preinit() {
     // (it's < the group order).
     {
         use p256::ecdsa::{
-            signature::{Signer, Verifier},
             Signature, SigningKey, VerifyingKey,
+            signature::{Signer, Verifier},
         };
         let scalar = [0xFFu8; 32];
         if let Ok(sk) = SigningKey::from_slice(&scalar) {
@@ -186,8 +186,7 @@ where
         + Sync
         + 'static,
 {
-    let cfg = TlsServerConfig::from_dev_cert(cert_der, key_der)
-        .ok_or(ListenError::Cert)?;
+    let cfg = TlsServerConfig::from_dev_cert(cert_der, key_der).ok_or(ListenError::Cert)?;
     let cfg = Arc::new(cfg);
     let pool = TlsConnPool::new();
 
@@ -282,7 +281,9 @@ pub(crate) struct TlsConnPool {
 
 impl TlsConnPool {
     fn new() -> Arc<Self> {
-        let pool = TlsConnPool { slots: WorkerLocal::new() };
+        let pool = TlsConnPool {
+            slots: WorkerLocal::new(),
+        };
         pool.slots.ensure_init(uni::num_workers(), |_| {
             RefCell::new(Vec::with_capacity(POOL_CAP))
         });
@@ -570,8 +571,7 @@ impl TlsStream {
         // sub-MSS sends bypass the TSO descriptor path (which gve
         // silently drops at <= MSS).
         const TLS13_RECORD_OVERHEAD: usize = TLS_HEADROOM + TLS_TAILROOM;
-        let min_payload =
-            src.total_len().min(PLAINTEXT_CHUNK) + TLS13_RECORD_OVERHEAD;
+        let min_payload = src.total_len().min(PLAINTEXT_CHUNK) + TLS13_RECORD_OVERHEAD;
         match self
             .tcp
             .try_send_tso(min_payload, |slot| self.tls.seal_app_data(src, slot))
@@ -586,7 +586,12 @@ impl TlsStream {
         // hold &mut record_scratch (for the seal) and &mut tcp
         // (for the send) at the same time without the borrow
         // checker conflating them.
-        let Self { tcp, tls, record_scratch, .. } = self;
+        let Self {
+            tcp,
+            tls,
+            record_scratch,
+            ..
+        } = self;
         let scratch = record_scratch
             .get_or_insert_with(|| alloc::vec![0u8; TLS_RECORD_LEN].into_boxed_slice());
         let n = tls.seal_app_data(src, &mut scratch[..]).map_err(|_| ())?;
@@ -598,9 +603,7 @@ impl TlsStream {
         // exit, ending the raw-pointer borrow.
         let mut ship = IOBufChain::new();
         let ptr = unsafe { core::ptr::NonNull::new_unchecked(scratch.as_mut_ptr()) };
-        ship.push_back(unsafe {
-            IOBuf::borrow(ptr, TLS_RECORD_LEN as u32, 0, n as u32)
-        });
+        ship.push_back(unsafe { IOBuf::borrow(ptr, TLS_RECORD_LEN as u32, 0, n as u32) });
         tcp.send(&mut ship).await
     }
 }
@@ -699,9 +702,7 @@ impl uni_http::HttpStream for TlsStream {
         //    `&mut self` borrow — so no second view overlaps.
         //  * The `Borrowed` IOBuf drops with the guard, ending the
         //    borrow before the next `recv` / `recv_chunk` can run.
-        let iobuf = unsafe {
-            IOBuf::borrow(core::ptr::NonNull::new_unchecked(base), len, 0, len)
-        };
+        let iobuf = unsafe { IOBuf::borrow(core::ptr::NonNull::new_unchecked(base), len, 0, len) };
         Some(uni::runtime::RecvChunkGuard::new(iobuf))
     }
 
@@ -731,4 +732,3 @@ impl uni_http::HttpStream for TlsStream {
         self.drain_tx().await
     }
 }
-

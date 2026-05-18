@@ -8,13 +8,21 @@
 // ── Byte-order utilities ─────────────────────────────────────────────────────
 
 #[inline]
-pub fn htons(h: u16) -> u16 { h.to_be() }
+pub fn htons(h: u16) -> u16 {
+    h.to_be()
+}
 #[inline]
-pub fn ntohs(n: u16) -> u16 { u16::from_be(n) }
+pub fn ntohs(n: u16) -> u16 {
+    u16::from_be(n)
+}
 #[inline]
-pub fn htonl(h: u32) -> u32 { h.to_be() }
+pub fn htonl(h: u32) -> u32 {
+    h.to_be()
+}
 #[inline]
-pub fn ntohl(n: u32) -> u32 { u32::from_be(n) }
+pub fn ntohl(n: u32) -> u32 {
+    u32::from_be(n)
+}
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -27,7 +35,6 @@ pub struct MacAddr {
 impl MacAddr {
     pub const ZERO: Self = MacAddr { bytes: [0; 6] };
     pub const BROADCAST: Self = MacAddr { bytes: [0xff; 6] };
-
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,7 +144,14 @@ impl Ipv6Addr {
     /// (RFC 2464 §7).
     pub fn multicast_mac(&self) -> MacAddr {
         MacAddr {
-            bytes: [0x33, 0x33, self.octets[12], self.octets[13], self.octets[14], self.octets[15]],
+            bytes: [
+                0x33,
+                0x33,
+                self.octets[12],
+                self.octets[13],
+                self.octets[14],
+                self.octets[15],
+            ],
         }
     }
 }
@@ -261,7 +275,8 @@ impl ConfigStore {
     pub fn store(&self, c: NetConfig) {
         use core::sync::atomic::Ordering;
         self.ip.store(c.ip.addr, Ordering::Relaxed);
-        self.subnet_mask.store(c.subnet_mask.addr, Ordering::Relaxed);
+        self.subnet_mask
+            .store(c.subnet_mask.addr, Ordering::Relaxed);
         self.gateway.store(c.gateway.addr, Ordering::Relaxed);
         self.dns.store(c.dns.addr, Ordering::Relaxed);
     }
@@ -269,24 +284,40 @@ impl ConfigStore {
     pub fn load(&self) -> NetConfig {
         use core::sync::atomic::Ordering;
         NetConfig {
-            ip: Ipv4Addr { addr: self.ip.load(Ordering::Relaxed) },
-            subnet_mask: Ipv4Addr { addr: self.subnet_mask.load(Ordering::Relaxed) },
-            gateway: Ipv4Addr { addr: self.gateway.load(Ordering::Relaxed) },
-            dns: Ipv4Addr { addr: self.dns.load(Ordering::Relaxed) },
+            ip: Ipv4Addr {
+                addr: self.ip.load(Ordering::Relaxed),
+            },
+            subnet_mask: Ipv4Addr {
+                addr: self.subnet_mask.load(Ordering::Relaxed),
+            },
+            gateway: Ipv4Addr {
+                addr: self.gateway.load(Ordering::Relaxed),
+            },
+            dns: Ipv4Addr {
+                addr: self.dns.load(Ordering::Relaxed),
+            },
         }
     }
 
     pub fn ip(&self) -> Ipv4Addr {
-        Ipv4Addr { addr: self.ip.load(core::sync::atomic::Ordering::Relaxed) }
+        Ipv4Addr {
+            addr: self.ip.load(core::sync::atomic::Ordering::Relaxed),
+        }
     }
     pub fn subnet_mask(&self) -> Ipv4Addr {
-        Ipv4Addr { addr: self.subnet_mask.load(core::sync::atomic::Ordering::Relaxed) }
+        Ipv4Addr {
+            addr: self.subnet_mask.load(core::sync::atomic::Ordering::Relaxed),
+        }
     }
     pub fn gateway(&self) -> Ipv4Addr {
-        Ipv4Addr { addr: self.gateway.load(core::sync::atomic::Ordering::Relaxed) }
+        Ipv4Addr {
+            addr: self.gateway.load(core::sync::atomic::Ordering::Relaxed),
+        }
     }
     pub fn dns(&self) -> Ipv4Addr {
-        Ipv4Addr { addr: self.dns.load(core::sync::atomic::Ordering::Relaxed) }
+        Ipv4Addr {
+            addr: self.dns.load(core::sync::atomic::Ordering::Relaxed),
+        }
     }
 }
 
@@ -322,12 +353,7 @@ pub fn checksum(data: *const u8, len: usize) -> u16 {
 /// Cheaper than `tcp_checksum_any` because it skips the data
 /// pass — that's the whole point of CSUM-offload.
 #[inline]
-pub fn tcp_pseudo_partial(
-    src: IpAddr,
-    dst: IpAddr,
-    proto: u8,
-    l4_len: usize,
-) -> u16 {
+pub fn tcp_pseudo_partial(src: IpAddr, dst: IpAddr, proto: u8, l4_len: usize) -> u16 {
     let mut sum: u32 = match (src, dst) {
         (IpAddr::V4(s), IpAddr::V4(d)) => {
             let mut s32: u32 = 0;
@@ -361,13 +387,7 @@ pub fn tcp_pseudo_partial(
 /// TCP/UDP pseudo-header checksum, family-dispatched.
 /// `src`/`dst` must agree on family; mismatched families fall back
 /// to `tcp_checksum_v4` on the v4 component (caller bug).
-pub fn tcp_checksum_any(
-    src: IpAddr,
-    dst: IpAddr,
-    proto: u8,
-    data: *const u8,
-    len: usize,
-) -> u16 {
+pub fn tcp_checksum_any(src: IpAddr, dst: IpAddr, proto: u8, data: *const u8, len: usize) -> u16 {
     match (src, dst) {
         (IpAddr::V4(s), IpAddr::V4(d)) => tcp_checksum(s, d, proto, data, len),
         (IpAddr::V6(s), IpAddr::V6(d)) => tcp_checksum_v6(&s, &d, proto, data, len),
@@ -500,13 +520,16 @@ mod tests {
         // RFC 4291 Appendix A example: MAC 02:00:00:00:00:01 →
         // EUI-64 with universal/local bit flipped (0x02 → 0x00),
         // resulting interface ID = 0000:00ff:fe00:0001.
-        let mac = MacAddr { bytes: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01] };
+        let mac = MacAddr {
+            bytes: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        };
         let ll = Ipv6Addr::link_local_from_mac(&mac);
         assert!(ll.is_link_local());
         assert_eq!(
             ll.octets,
-            [0xfe, 0x80, 0, 0, 0, 0, 0, 0,
-             0x00, 0x00, 0x00, 0xff, 0xfe, 0x00, 0x00, 0x01]
+            [
+                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x00, 0x00, 0x00, 0xff, 0xfe, 0x00, 0x00, 0x01
+            ]
         );
     }
 
@@ -515,15 +538,17 @@ mod tests {
         // Target fe80::5054:ff:fe12:3456 → solicited-node
         // ff02::1:ff12:3456 (low 24 bits of target).
         let target = Ipv6Addr {
-            octets: [0xfe, 0x80, 0, 0, 0, 0, 0, 0,
-                     0x52, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x56],
+            octets: [
+                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x52, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x56,
+            ],
         };
         let sn = Ipv6Addr::solicited_node(&target);
         assert!(sn.is_multicast());
         assert_eq!(
             sn.octets,
-            [0xff, 0x02, 0, 0, 0, 0, 0, 0,
-             0, 0, 0, 0x01, 0xff, 0x12, 0x34, 0x56]
+            [
+                0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, 0x12, 0x34, 0x56
+            ]
         );
     }
 
@@ -546,7 +571,8 @@ mod tests {
     #[test]
     fn ip_addr_family_predicates() {
         let v4: IpAddr = Ipv4Addr::from(10, 0, 0, 1).into();
-        let v6: IpAddr = Ipv6Addr::from([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).into();
+        let v6: IpAddr =
+            Ipv6Addr::from([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).into();
         assert!(v4.is_v4());
         assert!(!v4.is_v6());
         assert!(v6.is_v6());
@@ -601,11 +627,9 @@ mod tests {
         // Compute checksum of an IPv4-like header, then verify it
         // produces 0 when re-checked with the checksum filled in.
         let hdr: [u8; 20] = [
-            0x45, 0x00, 0x00, 0x3C,
-            0x1C, 0x46, 0x40, 0x00,
-            0x40, 0x06, 0x00, 0x00,  // checksum field = 0
-            0xAC, 0x10, 0x0A, 0x63,
-            0xAC, 0x10, 0x0A, 0x0C,
+            0x45, 0x00, 0x00, 0x3C, 0x1C, 0x46, 0x40, 0x00, 0x40, 0x06, 0x00,
+            0x00, // checksum field = 0
+            0xAC, 0x10, 0x0A, 0x63, 0xAC, 0x10, 0x0A, 0x0C,
         ];
         let cksum = checksum(hdr.as_ptr(), hdr.len());
         // Fill in checksum (LE byte order) and re-verify
@@ -634,6 +658,9 @@ mod tests {
         let mut verified = udp_data;
         verified[6] = (cksum & 0xFF) as u8;
         verified[7] = (cksum >> 8) as u8;
-        assert_eq!(tcp_checksum(src, dst, 17, verified.as_ptr(), verified.len()), 0);
+        assert_eq!(
+            tcp_checksum(src, dst, 17, verified.as_ptr(), verified.len()),
+            0
+        );
     }
 }

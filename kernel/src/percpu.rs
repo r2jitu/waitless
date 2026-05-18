@@ -12,12 +12,12 @@
 //   different cores' state simultaneously — undefined behaviour even when
 //   the underlying memory accesses don't actually overlap.
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use uni_iobuf::{Chain, OwnedIOBuf};
 use crate::deque::{Deque, Task};
 use crate::rx_inbox::{RxInbox, RxNodePool};
 use crate::spsc;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use uni_iobuf::{Chain, OwnedIOBuf};
 
 // ── Tier 2 cross-core RX inbox ──────────────────────────────────────
 //
@@ -145,7 +145,12 @@ unsafe impl Sync for TxStaging {}
 impl TxStaging {
     pub const fn new() -> Self {
         TxStaging {
-            pool: [const { UnsafeCell::new(TxPacket { len: 0, data: [0; TX_BUF_SIZE] }) }; TX_POOL_SIZE],
+            pool: [const {
+                UnsafeCell::new(TxPacket {
+                    len: 0,
+                    data: [0; TX_BUF_SIZE],
+                })
+            }; TX_POOL_SIZE],
             ready: spsc::Ring::new(),
             next_slot: AtomicUsize::new(0),
         }
@@ -170,7 +175,11 @@ impl TxStaging {
         if !self.ready.push(slot as u32) {
             return false;
         }
-        let next = if slot + 1 >= TX_POOL_SIZE { 0 } else { slot + 1 };
+        let next = if slot + 1 >= TX_POOL_SIZE {
+            0
+        } else {
+            slot + 1
+        };
         self.next_slot.store(next, Ordering::Relaxed);
         true
     }
@@ -250,7 +259,6 @@ pub fn num_cores() -> u32 {
 pub fn percore(cc: &CurrentWorker) -> &'static PerCore {
     CORES.current(cc)
 }
-
 
 /// Register the AP poll function (called by net layer during init).
 /// Release-stores via `AtomicFn` so APs that observe it via acquire-load

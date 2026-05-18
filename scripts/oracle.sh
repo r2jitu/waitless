@@ -30,7 +30,7 @@ INSTANCE_OCID="${ORACLE_INSTANCE_OCID:-}"
 MEMORY="${UNIKERNEL_MEMORY:-128}"
 CPUS="${UNIKERNEL_CPUS:-1}"
 HOST_PORT="${UNIKERNEL_TCP_80:-8080}"
-TEST_PORT=19099  # internal port for automated tests (avoids conflicts)
+TEST_PORT=19099 # internal port for automated tests (avoids conflicts)
 
 cmd="${1:-help}"
 
@@ -64,49 +64,54 @@ _push() {
 
 case "$cmd" in
 
-    status)
-        _require_ocid; _require_oci
-        oci compute instance get \
-            --instance-id "$INSTANCE_OCID" \
-            --query 'data."lifecycle-state"' --raw-output
-        ;;
+status)
+    _require_ocid
+    _require_oci
+    oci compute instance get \
+        --instance-id "$INSTANCE_OCID" \
+        --query 'data."lifecycle-state"' --raw-output
+    ;;
 
-    start)
-        _require_ocid; _require_oci
-        echo "==> Starting instance..."
-        oci compute instance action \
-            --instance-id "$INSTANCE_OCID" --action START
-        echo "    Waiting for RUNNING state..."
-        oci compute instance get \
-            --instance-id "$INSTANCE_OCID" \
-            --wait-for-state RUNNING \
-            --max-wait-seconds 120 \
-            --query 'data."lifecycle-state"' --raw-output
-        echo ""; echo "    Connect: ssh $SSH_HOST"
-        ;;
+start)
+    _require_ocid
+    _require_oci
+    echo "==> Starting instance..."
+    oci compute instance action \
+        --instance-id "$INSTANCE_OCID" --action START
+    echo "    Waiting for RUNNING state..."
+    oci compute instance get \
+        --instance-id "$INSTANCE_OCID" \
+        --wait-for-state RUNNING \
+        --max-wait-seconds 120 \
+        --query 'data."lifecycle-state"' --raw-output
+    echo ""
+    echo "    Connect: ssh $SSH_HOST"
+    ;;
 
-    stop)
-        _require_ocid; _require_oci
-        echo "==> Stopping instance..."
-        oci compute instance action \
-            --instance-id "$INSTANCE_OCID" --action SOFTSTOP
-        ;;
+stop)
+    _require_ocid
+    _require_oci
+    echo "==> Stopping instance..."
+    oci compute instance action \
+        --instance-id "$INSTANCE_OCID" --action SOFTSTOP
+    ;;
 
-    ssh)
-        exec ssh "$SSH_HOST"
-        ;;
+ssh)
+    exec ssh "$SSH_HOST"
+    ;;
 
-    run)
-        _build; _push
+run)
+    _build
+    _push
 
-        echo "==> Running on Oracle with KVM..."
-        echo "    URL: http://localhost:${HOST_PORT}/"
-        echo "    Serial console below. Press Ctrl-C to stop."
-        echo ""
-        # -L: tunnel Oracle's QEMU port-forward back to localhost (no firewall rules needed)
-        # -t: PTY so Ctrl-C (0x03) is forwarded to the VM for graceful shutdown
-        ssh -t -L "${HOST_PORT}:localhost:${HOST_PORT}" "$SSH_HOST" \
-            "qemu-system-aarch64 \
+    echo "==> Running on Oracle with KVM..."
+    echo "    URL: http://localhost:${HOST_PORT}/"
+    echo "    Serial console below. Press Ctrl-C to stop."
+    echo ""
+    # -L: tunnel Oracle's QEMU port-forward back to localhost (no firewall rules needed)
+    # -t: PTY so Ctrl-C (0x03) is forwarded to the VM for graceful shutdown
+    ssh -t -L "${HOST_PORT}:localhost:${HOST_PORT}" "$SSH_HOST" \
+        "qemu-system-aarch64 \
                 -machine virt -accel kvm -cpu host \
                 -kernel ~/webserver.img \
                 -m ${MEMORY} -smp ${CPUS} \
@@ -114,14 +119,15 @@ case "$cmd" in
                 -netdev user,id=net0,hostfwd=tcp::${HOST_PORT}-:80 \
                 -chardev stdio,id=s0,signal=off -serial chardev:s0 \
                 -display none -no-reboot"
-        ;;
+    ;;
 
-    test)
-        _build; _push
+test)
+    _build
+    _push
 
-        echo "==> Running tests on Oracle with KVM..."
-        # Pass TEST_PORT as $1 via bash -s; use quoted heredoc so remote $vars are literal.
-        ssh "$SSH_HOST" bash -s "$TEST_PORT" <<'REMOTE'
+    echo "==> Running tests on Oracle with KVM..."
+    # Pass TEST_PORT as $1 via bash -s; use quoted heredoc so remote $vars are literal.
+    ssh "$SSH_HOST" bash -s "$TEST_PORT" <<'REMOTE'
 set -euo pipefail
 PORT="$1"
 UDP_PORT=$((PORT + 1))
@@ -193,10 +199,10 @@ echo ""
 [[ $FAILURES -eq 0 ]] && echo "ALL TESTS PASSED" && exit 0
 echo "$FAILURES TEST(S) FAILED"; tail -40 "$VM_LOG" >&2; exit 1
 REMOTE
-        ;;
+    ;;
 
-    help|*)
-        cat <<'USAGE'
+help | *)
+    cat <<'USAGE'
 Usage: ./scripts/oracle.sh <command>
 
 Commands:
@@ -214,5 +220,5 @@ Environment:
   UNIKERNEL_CPUS=1              vCPU count
   UNIKERNEL_TCP_80=8080         Local port forwarded to VM port 80 (run only)
 USAGE
-        ;;
+    ;;
 esac

@@ -87,13 +87,27 @@ mod arch {
         let (_, _, ecx1, _edx1) = cpuid(1);
         let (_, ebx7, _, _) = cpuid_subleaf(7, 0);
         let mut feats = FeatureList::new(w);
-        if ecx1 & (1 << 25) != 0 { feats.add("AES-NI")?; }
-        if ecx1 & (1 << 1)  != 0 { feats.add("PCLMUL")?; }
-        if ecx1 & (1 << 28) != 0 { feats.add("AVX")?; }
-        if ebx7 & (1 << 5)  != 0 { feats.add("AVX2")?; }
-        if ebx7 & (1 << 3)  != 0 { feats.add("BMI1")?; }
-        if ebx7 & (1 << 8)  != 0 { feats.add("BMI2")?; }
-        if ecx1 & (1 << 12) != 0 { feats.add("FMA")?; }
+        if ecx1 & (1 << 25) != 0 {
+            feats.add("AES-NI")?;
+        }
+        if ecx1 & (1 << 1) != 0 {
+            feats.add("PCLMUL")?;
+        }
+        if ecx1 & (1 << 28) != 0 {
+            feats.add("AVX")?;
+        }
+        if ebx7 & (1 << 5) != 0 {
+            feats.add("AVX2")?;
+        }
+        if ebx7 & (1 << 3) != 0 {
+            feats.add("BMI1")?;
+        }
+        if ebx7 & (1 << 8) != 0 {
+            feats.add("BMI2")?;
+        }
+        if ecx1 & (1 << 12) != 0 {
+            feats.add("FMA")?;
+        }
         feats.finish()
     }
 
@@ -111,11 +125,11 @@ mod arch {
         buf[8..12].copy_from_slice(&edx.to_le_bytes());
         match &buf {
             b"KVMKVMKVM\0\0\0" => "KVM",
-            b"TCGTCGTCGTCG"   => "QEMU TCG",
-            b"Microsoft Hv"   => "Hyper-V",
-            b"VMwareVMware"   => "VMware",
-            b"XenVMMXenVMM"   => "Xen",
-            b"bhyve bhyve "   => "bhyve",
+            b"TCGTCGTCGTCG" => "QEMU TCG",
+            b"Microsoft Hv" => "Hyper-V",
+            b"VMwareVMware" => "VMware",
+            b"XenVMMXenVMM" => "Xen",
+            b"bhyve bhyve " => "bhyve",
             _ => "Unknown",
         }
     }
@@ -194,18 +208,30 @@ mod arch {
                 options(nomem, nostack, preserves_flags),
             );
         }
-        let aes_field   = ((isar0 >> 4)  & 0xF) as u8;
-        let sha1_field  = ((isar0 >> 8)  & 0xF) as u8;
-        let sha2_field  = ((isar0 >> 12) & 0xF) as u8;
+        let aes_field = ((isar0 >> 4) & 0xF) as u8;
+        let sha1_field = ((isar0 >> 8) & 0xF) as u8;
+        let sha2_field = ((isar0 >> 12) & 0xF) as u8;
         let crc32_field = ((isar0 >> 16) & 0xF) as u8;
         let atomic_field = ((isar0 >> 20) & 0xF) as u8;
         let mut feats = FeatureList::new(w);
-        if aes_field   >= 1 { feats.add("AES")?; }
-        if aes_field   >= 2 { feats.add("PMULL")?; }
-        if sha1_field  >= 1 { feats.add("SHA1")?; }
-        if sha2_field  >= 1 { feats.add("SHA2")?; }
-        if crc32_field >= 1 { feats.add("CRC32")?; }
-        if atomic_field >= 1 { feats.add("LSE")?; }
+        if aes_field >= 1 {
+            feats.add("AES")?;
+        }
+        if aes_field >= 2 {
+            feats.add("PMULL")?;
+        }
+        if sha1_field >= 1 {
+            feats.add("SHA1")?;
+        }
+        if sha2_field >= 1 {
+            feats.add("SHA2")?;
+        }
+        if crc32_field >= 1 {
+            feats.add("CRC32")?;
+        }
+        if atomic_field >= 1 {
+            feats.add("LSE")?;
+        }
         feats.finish()
     }
 

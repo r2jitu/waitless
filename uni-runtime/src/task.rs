@@ -131,8 +131,7 @@ impl TaskHandle {
     pub fn is_finished(&self) -> bool {
         let arena = ARENAS.at(self.worker_id);
         let slot = &arena.slots[self.slot_idx as usize];
-        slot.epoch.load(Ordering::Acquire) != self.epoch
-            || !slot.used.load(Ordering::Acquire)
+        slot.epoch.load(Ordering::Acquire) != self.epoch || !slot.used.load(Ordering::Acquire)
     }
 }
 
@@ -204,12 +203,8 @@ pub fn spawn_boxed(fut: BoxedFuture) -> Result<TaskHandle, ()> {
 const WAKER_SLOT_MASK: usize = 0xFF;
 const WAKER_WORKER_SHIFT: u32 = 8;
 
-static WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    waker_clone,
-    waker_wake,
-    waker_wake_by_ref,
-    waker_drop,
-);
+static WAKER_VTABLE: RawWakerVTable =
+    RawWakerVTable::new(waker_clone, waker_wake, waker_wake_by_ref, waker_drop);
 
 fn waker_clone(data: *const ()) -> RawWaker {
     RawWaker::new(data, &WAKER_VTABLE)

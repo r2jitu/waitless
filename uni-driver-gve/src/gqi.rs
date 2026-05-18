@@ -15,18 +15,18 @@
 // Linux's `iowrite32be` doorbell convention; opposite of DQO).
 
 use core::ptr;
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
 use drivers_infra::mmio_write32;
 use uni_iobuf::{Chain, OwnedIOBuf};
 
 use crate::{
-    put_be16, put_be64, read_be16, record_tx_desc, tx_desc_kind, BAR2_VA,
-    COUNTER_ARRAY_VA, DEFERRED_KICK, GQI_RECYCLE_POOL_EXHAUSTED, MAX_QUEUE_PAIRS,
-    PAGE_SIZE, RX_BUF_REPOST_COUNT, RX_BYTES_PER_QP, RX_QUEUES, TX_BIG_ACQUIRES,
+    _GVE_RX_PAD, BAR2_VA, COUNTER_ARRAY_VA, DEFERRED_KICK, GQI_RECYCLE_POOL_EXHAUSTED,
+    MAX_QUEUE_PAIRS, PAGE_SIZE, RX_BUF_REPOST_COUNT, RX_BYTES_PER_QP, RX_QUEUES, TX_BIG_ACQUIRES,
     TX_BIG_FULL_RETURNS, TX_BIG_POOL_QPL_OFFSET, TX_BIG_POOL_SLOTS, TX_BIG_SLOT_SIZE,
-    TX_BYTES_PER_QP, TX_PACKETS_PER_QP, TX_QUEUES, TX_SMALL_ACQUIRES,
-    TX_SMALL_FULL_SPINS, TX_SMALL_POOL_SLOTS, TX_SMALL_SCAN_ITERS, TxQueue, _GVE_RX_PAD,
+    TX_BYTES_PER_QP, TX_PACKETS_PER_QP, TX_QUEUES, TX_SMALL_ACQUIRES, TX_SMALL_FULL_SPINS,
+    TX_SMALL_POOL_SLOTS, TX_SMALL_SCAN_ITERS, TxQueue, put_be16, put_be64, read_be16,
+    record_tx_desc, tx_desc_kind,
 };
 
 // ---- RX recycle pool sizing ------------------------------------------------
@@ -51,11 +51,11 @@ pub(crate) const GQI_RX_POOL_SLABS: usize = 256;
 // `type_flags` byte layout: low 4 bits = type, upper 4 bits = flags
 // for STD/TSO; for SEG the upper bit (GVE_TXSF_IPV6) is the only
 // flag we care about.
-const GVE_TXD_STD: u8 = 0x0 << 4;     // 0x00 — std packet (single-seg or first of multi-seg non-TSO)
-const GVE_TXD_TSO: u8 = 0x1 << 4;     // 0x10 — TSO header desc (first desc of a TSO super-segment)
-const GVE_TXD_SEG: u8 = 0x2 << 4;     // 0x20 — segment desc (TSO continuation)
-const GVE_TXF_L4CSUM: u8 = 1 << 0;    // device computes L4 csum
-const GVE_TXSF_IPV6: u8 = 1 << 1;     // TSO is over IPv6 (vs v4)
+const GVE_TXD_STD: u8 = 0x0 << 4; // 0x00 — std packet (single-seg or first of multi-seg non-TSO)
+const GVE_TXD_TSO: u8 = 0x1 << 4; // 0x10 — TSO header desc (first desc of a TSO super-segment)
+const GVE_TXD_SEG: u8 = 0x2 << 4; // 0x20 — segment desc (TSO continuation)
+const GVE_TXF_L4CSUM: u8 = 1 << 0; // device computes L4 csum
+const GVE_TXSF_IPV6: u8 = 1 << 1; // TSO is over IPv6 (vs v4)
 
 // ---- RX completion descriptor layout (gve_desc.h, big-endian) -------------
 
@@ -147,9 +147,13 @@ fn decode_token(token: u64) -> (usize, usize, u8) {
 /// mem-forget the handle on the success leg.
 fn release_tx_slot(token: u64) {
     let (qp, slot, pool) = decode_token(token);
-    if qp >= MAX_QUEUE_PAIRS { return; }
+    if qp >= MAX_QUEUE_PAIRS {
+        return;
+    }
     let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
-    if tx_ptr.is_null() { return; }
+    if tx_ptr.is_null() {
+        return;
+    }
     let tx = unsafe { &*tx_ptr };
     match pool {
         POOL_ID_BIG if slot < TX_BIG_POOL_SLOTS as usize => {
@@ -184,12 +188,16 @@ fn release_tx_slot(token: u64) {
 #[inline]
 pub(crate) fn tx_drain(tx: &TxQueue) {
     let counter_va = COUNTER_ARRAY_VA.load(Ordering::Acquire);
-    if counter_va == 0 { return; }
+    if counter_va == 0 {
+        return;
+    }
     let counter_ptr = counter_va as *const u32;
     let raw = unsafe { ptr::read_volatile(counter_ptr.add(tx.counter_index as usize)) };
     let nic_done = u32::from_be(raw);
     let prev = tx.done_cnt.load(Ordering::Relaxed);
-    if nic_done == prev { return; }
+    if nic_done == prev {
+        return;
+    }
 
     // Walk completed descriptors and free their slots.
     let mask = (tx.ring_entries - 1) as u32;
@@ -203,9 +211,7 @@ pub(crate) fn tx_drain(tx: &TxQueue) {
         let dtype = type_flags & 0xF0; // upper nibble = type
         // gve_tx_pkt_desc / gve_tx_seg_desc: seg_addr at offset 8,
         // big-endian u64.
-        let seg_addr_be = unsafe {
-            ptr::read_unaligned(desc_ptr.add(8) as *const u64)
-        };
+        let seg_addr_be = unsafe { ptr::read_unaligned(desc_ptr.add(8) as *const u64) };
         let seg_addr = u64::from_be(seg_addr_be);
         match dtype {
             GVE_TXD_TSO => {
@@ -262,9 +268,13 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8]) -> bool {
 /// owning worker (Tier 1) so this is cooperative scheduling, not
 /// deadlock-prone.
 pub(crate) fn acquire_tx_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxBufHandle> {
-    if qp >= MAX_QUEUE_PAIRS { return None; }
+    if qp >= MAX_QUEUE_PAIRS {
+        return None;
+    }
     let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
-    if tx_ptr.is_null() { return None; }
+    if tx_ptr.is_null() {
+        return None;
+    }
     let tx = unsafe { &*tx_ptr };
 
     let mut local_iters: u64 = 0;
@@ -320,9 +330,13 @@ pub(crate) fn acquire_tx_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxBufHa
 /// transient saturation should not block the worker; the per-MSS
 /// path is the safety net.
 pub(crate) fn acquire_tx_tso_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxTsoBufHandle> {
-    if qp >= MAX_QUEUE_PAIRS { return None; }
+    if qp >= MAX_QUEUE_PAIRS {
+        return None;
+    }
     let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
-    if tx_ptr.is_null() { return None; }
+    if tx_ptr.is_null() {
+        return None;
+    }
     let tx = unsafe { &*tx_ptr };
 
     // Drain so completions free big slots before we try to claim
@@ -341,12 +355,14 @@ pub(crate) fn acquire_tx_tso_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxT
             TX_BIG_ACQUIRES.fetch_add(1, Ordering::Relaxed);
             let qpl_offset = TX_BIG_POOL_QPL_OFFSET + (slot as u32) * TX_BIG_SLOT_SIZE;
             let data_ptr = (tx.qpl_base_va + qpl_offset as u64) as *mut u8;
-            return Some(uni_net_driver::TxTsoBufHandle(uni_net_driver::TxBufHandle {
-                data_ptr,
-                data_cap: TX_MAX_TSO_LEN as u32,
-                driver_token: encode_token(qp, slot, POOL_ID_BIG),
-                release_fn: release_tx_slot,
-            }));
+            return Some(uni_net_driver::TxTsoBufHandle(
+                uni_net_driver::TxBufHandle {
+                    data_ptr,
+                    data_cap: TX_MAX_TSO_LEN as u32,
+                    driver_token: encode_token(qp, slot, POOL_ID_BIG),
+                    release_fn: release_tx_slot,
+                },
+            ));
         }
     }
     TX_BIG_FULL_RETURNS.fetch_add(1, Ordering::Relaxed);
@@ -398,12 +414,16 @@ pub(crate) fn submit_tx_inner(
     if frame_len == 0 || frame_len > TX_MAX_PKT_LEN {
         let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
         if !tx_ptr.is_null() {
-            unsafe { (*tx_ptr).small_slot_used[slot].store(false, Ordering::Release); }
+            unsafe {
+                (*tx_ptr).small_slot_used[slot].store(false, Ordering::Release);
+            }
         }
         return;
     }
     let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
-    if tx_ptr.is_null() { return; }
+    if tx_ptr.is_null() {
+        return;
+    }
     let tx = unsafe { &*tx_ptr };
     let bar2_va = BAR2_VA.load(Ordering::Acquire);
 
@@ -439,8 +459,8 @@ pub(crate) fn submit_tx_inner(
     let new_fill = fill_cnt.wrapping_add(1);
     tx.fill_cnt.store(new_fill, Ordering::Release);
 
-    let near_full = new_fill.wrapping_sub(tx.done_cnt.load(Ordering::Relaxed))
-        >= (tx.ring_entries as u32) - 16;
+    let near_full =
+        new_fill.wrapping_sub(tx.done_cnt.load(Ordering::Relaxed)) >= (tx.ring_entries as u32) - 16;
     if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
         doorbell_write(bar2_va, tx.db_offset, new_fill);
         tx.last_kicked.store(new_fill, Ordering::Relaxed);
@@ -492,12 +512,16 @@ pub(crate) fn submit_tx_tso_inner(
     {
         let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
         if !tx_ptr.is_null() {
-            unsafe { (*tx_ptr).big_slot_used[slot].store(false, Ordering::Release); }
+            unsafe {
+                (*tx_ptr).big_slot_used[slot].store(false, Ordering::Release);
+            }
         }
         return;
     }
     let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
-    if tx_ptr.is_null() { return; }
+    if tx_ptr.is_null() {
+        return;
+    }
     let tx = unsafe { &*tx_ptr };
     let bar2_va = BAR2_VA.load(Ordering::Acquire);
 
@@ -541,7 +565,7 @@ pub(crate) fn submit_tx_tso_inner(
     desc1[0] = GVE_TXD_SEG | if is_v6 { GVE_TXSF_IPV6 } else { 0 };
     desc1[1] = L3_OFFSET_WORDS;
     // bytes 2..4 reserved
-    put_be16(&mut desc1, 4, gso_size);  // mss
+    put_be16(&mut desc1, 4, gso_size); // mss
     put_be16(&mut desc1, 6, payload_len);
     put_be64(&mut desc1, 8, qpl_off_payload as u64);
 
@@ -560,8 +584,8 @@ pub(crate) fn submit_tx_tso_inner(
     let new_fill = fill_cnt.wrapping_add(2);
     tx.fill_cnt.store(new_fill, Ordering::Release);
 
-    let near_full = new_fill.wrapping_sub(tx.done_cnt.load(Ordering::Relaxed))
-        >= (tx.ring_entries as u32) - 16;
+    let near_full =
+        new_fill.wrapping_sub(tx.done_cnt.load(Ordering::Relaxed)) >= (tx.ring_entries as u32) - 16;
     if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
         doorbell_write(bar2_va, tx.db_offset, new_fill);
         tx.last_kicked.store(new_fill, Ordering::Relaxed);
@@ -607,12 +631,16 @@ pub(crate) fn submit_tx_udp_gso_inner(
     {
         let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
         if !tx_ptr.is_null() {
-            unsafe { (*tx_ptr).big_slot_used[slot].store(false, Ordering::Release); }
+            unsafe {
+                (*tx_ptr).big_slot_used[slot].store(false, Ordering::Release);
+            }
         }
         return;
     }
     let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
-    if tx_ptr.is_null() { return; }
+    if tx_ptr.is_null() {
+        return;
+    }
     let tx = unsafe { &*tx_ptr };
     let bar2_va = BAR2_VA.load(Ordering::Acquire);
 
@@ -661,8 +689,8 @@ pub(crate) fn submit_tx_udp_gso_inner(
     let new_fill = fill_cnt.wrapping_add(2);
     tx.fill_cnt.store(new_fill, Ordering::Release);
 
-    let near_full = new_fill.wrapping_sub(tx.done_cnt.load(Ordering::Relaxed))
-        >= (tx.ring_entries as u32) - 16;
+    let near_full =
+        new_fill.wrapping_sub(tx.done_cnt.load(Ordering::Relaxed)) >= (tx.ring_entries as u32) - 16;
     if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
         doorbell_write(bar2_va, tx.db_offset, new_fill);
         tx.last_kicked.store(new_fill, Ordering::Relaxed);
@@ -753,10 +781,7 @@ pub(crate) fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, mut callback
             // under 4 KiB).
             let page_va = rx.qpl_base_va as usize + idx * (PAGE_SIZE as usize);
             let frame: &[u8] = unsafe {
-                core::slice::from_raw_parts(
-                    (page_va + RX_DATA_OFFSET_IN_PAGE) as *const u8,
-                    len,
-                )
+                core::slice::from_raw_parts((page_va + RX_DATA_OFFSET_IN_PAGE) as *const u8, len)
             };
             // `alloc` copies `frame` into a pooled slab and hands
             // back a filled, `Send`-able `OwnedIOBuf` — the copy

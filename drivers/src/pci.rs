@@ -1,14 +1,14 @@
 // drivers/pci.rs — PCI config space access, bus scan, BAR assignment
 
-use crate::{log, mmio_read32, mmio_write32, mmio_read16, mmio_write16};
 #[cfg(target_arch = "aarch64")]
 use crate::map_device_range;
+use crate::{log, mmio_read16, mmio_read32, mmio_write16, mmio_write32};
 #[cfg(target_arch = "aarch64")]
 use uni_kernel::aarch64::fdt;
 use uni_kernel::sync::Spinlock;
 
 #[cfg(target_arch = "x86_64")]
-use crate::{outl, inl};
+use crate::{inl, outl};
 
 // ============================================================================
 // PCI subsystem
@@ -33,9 +33,14 @@ pub struct PciDevice {
 
 impl PciDevice {
     pub const ZERO: Self = PciDevice {
-        bus: 0, slot: 0, func: 0,
-        vendor_id: 0, device_id: 0,
-        class_code: 0, subclass: 0, prog_if: 0,
+        bus: 0,
+        slot: 0,
+        func: 0,
+        vendor_id: 0,
+        device_id: 0,
+        class_code: 0,
+        subclass: 0,
+        prog_if: 0,
         header_type: 0,
         bar: [0; 6],
     };
@@ -59,15 +64,13 @@ impl PciDeviceTable {
     }
 }
 
-pub static PCI_DEVICES: Spinlock<PciDeviceTable> =
-    Spinlock::new(PciDeviceTable::new());
+pub static PCI_DEVICES: Spinlock<PciDeviceTable> = Spinlock::new(PciDeviceTable::new());
 
 /// Init guard. Replaces a `static mut bool` checked-then-set, which would
 /// let two cores both pass the guard and double-scan the bus.
 /// `compare_exchange` makes the "first caller wins, others bail" intent
 /// race-free.
-static PCI_INITIALIZED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static PCI_INITIALIZED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 // ---- Config space access (arch-specific unsafe core) ------------------------
 
@@ -99,11 +102,7 @@ const PCI_CONFIG_DATA: u16 = 0x0CFC;
 #[inline]
 fn ecam_addr(bus: u8, slot: u8, func: u8, offset: u8) -> u64 {
     let base = *G_ECAM_BASE.get();
-    base
-        + ((bus as u64) << 20)
-        + ((slot as u64) << 15)
-        + ((func as u64) << 12)
-        + (offset as u64)
+    base + ((bus as u64) << 20) + ((slot as u64) << 15) + ((func as u64) << 12) + (offset as u64)
 }
 
 /// Read 32-bit PCI config register (offset must be 4-byte aligned).
@@ -165,7 +164,9 @@ pub fn read_config16(bus: u8, slot: u8, func: u8, offset: u8) -> u16 {
 /// Critical for Command register (offset 0x04) to avoid clobbering Status.
 #[cfg(target_arch = "aarch64")]
 pub fn write_config16(bus: u8, slot: u8, func: u8, offset: u8, val: u16) {
-    unsafe { mmio_write16(ecam_addr(bus, slot, func, offset), val); }
+    unsafe {
+        mmio_write16(ecam_addr(bus, slot, func, offset), val);
+    }
 }
 
 // ---- BAR assignment (aarch64 only) ------------------------------------------
@@ -176,11 +177,15 @@ pub fn write_config16(bus: u8, slot: u8, func: u8, offset: u8, val: u16) {
 #[cfg(target_arch = "aarch64")]
 fn assign_bars(dev: &mut PciDevice) {
     // Only assign for endpoint devices (header type 0x00)
-    if (dev.header_type & 0x7F) != 0x00 { return; }
+    if (dev.header_type & 0x7F) != 0x00 {
+        return;
+    }
 
     // Check if Memory Space is already enabled (firmware assigned BARs)
     let cmd = read_config16(dev.bus, dev.slot, dev.func, 0x04);
-    if (cmd & 0x02) != 0 { return; } // Already enabled
+    if (cmd & 0x02) != 0 {
+        return;
+    } // Already enabled
 
     let mut mmio_next = G_PCI_MEM_NEXT.lock();
 
@@ -201,14 +206,32 @@ fn assign_bars(dev: &mut PciDevice) {
             // Skip I/O BARs on aarch64
         } else if is_64bit {
             let alloc = (*mmio_next + 0x3F_FFFF) & !0x3F_FFFF; // 4MB align
-            write_config(dev.bus, dev.slot, dev.func, (0x10 + i * 4) as u8, (alloc as u32) | (bar_val & 0x0F));
-            write_config(dev.bus, dev.slot, dev.func, (0x10 + (i + 1) * 4) as u8, (alloc >> 32) as u32);
+            write_config(
+                dev.bus,
+                dev.slot,
+                dev.func,
+                (0x10 + i * 4) as u8,
+                (alloc as u32) | (bar_val & 0x0F),
+            );
+            write_config(
+                dev.bus,
+                dev.slot,
+                dev.func,
+                (0x10 + (i + 1) * 4) as u8,
+                (alloc >> 32) as u32,
+            );
             dev.bar[i] = (alloc as u32) | (bar_val & 0x0F);
             dev.bar[i + 1] = (alloc >> 32) as u32;
             *mmio_next = alloc + 0x40_0000; // 4MB block
         } else {
             let alloc = (*mmio_next + 0x3F_FFFF) & !0x3F_FFFF; // 4MB align
-            write_config(dev.bus, dev.slot, dev.func, (0x10 + i * 4) as u8, (alloc as u32) | (bar_val & 0x0F));
+            write_config(
+                dev.bus,
+                dev.slot,
+                dev.func,
+                (0x10 + i * 4) as u8,
+                (alloc as u32) | (bar_val & 0x0F),
+            );
             dev.bar[i] = (alloc as u32) | (bar_val & 0x0F);
             *mmio_next = alloc + 0x40_0000;
         }
@@ -228,7 +251,9 @@ fn assign_bars(dev: &mut PciDevice) {
 fn probe_function(bus: u8, slot: u8, func: u8) -> bool {
     let reg0 = read_config(bus, slot, func, 0x00);
     let vendor_id = (reg0 & 0xFFFF) as u16;
-    if vendor_id == 0xFFFF { return false; }
+    if vendor_id == 0xFFFF {
+        return false;
+    }
 
     let device_id = (reg0 >> 16) as u16;
     let reg8 = read_config(bus, slot, func, 0x08);
@@ -239,9 +264,14 @@ fn probe_function(bus: u8, slot: u8, func: u8) -> bool {
     let header_type = (regc >> 16) as u8;
 
     let mut dev = PciDevice {
-        bus, slot, func,
-        vendor_id, device_id,
-        class_code, subclass, prog_if,
+        bus,
+        slot,
+        func,
+        vendor_id,
+        device_id,
+        class_code,
+        subclass,
+        prog_if,
         header_type,
         bar: [0; 6],
     };
@@ -318,7 +348,9 @@ fn init_inner() {
 
     // Scan bus 0, slots 0-31
     for slot in 0..32u8 {
-        if !probe_function(0, slot, 0) { continue; }
+        if !probe_function(0, slot, 0) {
+            continue;
+        }
 
         // Check multi-function bit
         let regc = read_config(0, slot, 0, 0x0C);

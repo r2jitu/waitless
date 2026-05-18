@@ -168,7 +168,9 @@ impl<T> PerWorker<T> {
         }
         for i in 0..count {
             // SAFETY: writing into freshly-allocated, owned memory.
-            unsafe { core::ptr::write(raw.add(i), UnsafeCell::new(f(i as u32))); }
+            unsafe {
+                core::ptr::write(raw.add(i), UnsafeCell::new(f(i as u32)));
+            }
         }
         // Publish via CAS so concurrent initialisers don't both
         // succeed and leak one allocation each. Set len BEFORE the
@@ -190,11 +192,15 @@ impl<T> PerWorker<T> {
             for i in 0..count {
                 // SAFETY: we wrote each slot above; nobody else has
                 // observed `raw` because the CAS failed.
-                unsafe { core::ptr::drop_in_place(raw.add(i)); }
+                unsafe {
+                    core::ptr::drop_in_place(raw.add(i));
+                }
             }
             // SAFETY: `raw` came from `alloc(layout)` and was never
             // published; we're the unique owner.
-            unsafe { alloc::alloc::dealloc(raw as *mut u8, layout); }
+            unsafe {
+                alloc::alloc::dealloc(raw as *mut u8, layout);
+            }
         }
     }
 
@@ -229,8 +235,10 @@ impl<T> PerWorker<T> {
     pub fn at(&self, id: u32) -> &T {
         let base = self.slots.load(Ordering::Relaxed);
         debug_assert!(!base.is_null(), "PerWorker::at before init");
-        debug_assert!(id < self.len.load(Ordering::Relaxed),
-                      "PerWorker::at out-of-bounds");
+        debug_assert!(
+            id < self.len.load(Ordering::Relaxed),
+            "PerWorker::at out-of-bounds"
+        );
         // SAFETY: after `init` completes, `base` points at a valid
         // `[UnsafeCell<T>; len]` for the lifetime of the program.
         // `id < len` is the caller's invariant (typically guaranteed
@@ -313,7 +321,9 @@ impl<T> WorkerLocal<T> {
     /// Empty cell. Allocation happens in `init()`.
     #[inline]
     pub const fn new() -> Self {
-        WorkerLocal { inner: PerWorker::new() }
+        WorkerLocal {
+            inner: PerWorker::new(),
+        }
     }
 
     /// Allocate `n` slots and populate each via `f(i)`. Same

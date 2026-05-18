@@ -90,7 +90,10 @@ pub struct CsumOffload {
 impl CsumOffload {
     /// No offload — caller computed the full checksum and stamped
     /// it before submit. Drivers ship the frame verbatim.
-    pub const NONE: Self = Self { start: 0, offset: 0 };
+    pub const NONE: Self = Self {
+        start: 0,
+        offset: 0,
+    };
 
     /// True when the caller wants offload (any non-zero `start`).
     #[inline]
@@ -126,9 +129,7 @@ impl TxBufHandle {
         // `data_cap` accurate for the handle's lifetime, with
         // exclusive write access (no other holder of the same
         // slot exists between acquire and submit/drop).
-        unsafe {
-            core::slice::from_raw_parts_mut(self.data_ptr, self.data_cap as usize)
-        }
+        unsafe { core::slice::from_raw_parts_mut(self.data_ptr, self.data_cap as usize) }
     }
 }
 
@@ -296,13 +297,9 @@ pub struct NicOps {
     /// from `acquire_tx_tso_buf`) — a small-pool `TxBufHandle`
     /// won't compile here, eliminating the previous runtime
     /// pool-ID check.
-    pub submit_tx_tso: Option<fn(
-        handle: TxTsoBufHandle,
-        frame_len: usize,
-        hdr_len: u16,
-        csum_start: u16,
-        gso_size: u16,
-    )>,
+    pub submit_tx_tso: Option<
+        fn(handle: TxTsoBufHandle, frame_len: usize, hdr_len: u16, csum_start: u16, gso_size: u16),
+    >,
     /// UDP-GSO (`UDP_SEGMENT` / `GSO_UDP_L4`) capability — the UDP
     /// analogue of `tso_available`. `true` when the device can
     /// segment a single big UDP super-packet into N same-size
@@ -337,13 +334,15 @@ pub struct NicOps {
     ///
     /// Takes a [`TxUdpGsoBufHandle`]; same handling rules as the
     /// TSO wrapper.
-    pub submit_tx_udp_gso: Option<fn(
-        handle: TxUdpGsoBufHandle,
-        frame_len: usize,
-        hdr_len: u16,
-        csum_start: u16,
-        gso_size: u16,
-    )>,
+    pub submit_tx_udp_gso: Option<
+        fn(
+            handle: TxUdpGsoBufHandle,
+            frame_len: usize,
+            hdr_len: u16,
+            csum_start: u16,
+            gso_size: u16,
+        ),
+    >,
     /// RX callback: the driver delivers each received L2 frame
     /// (Eth + IP + L4 + payload) as an owned `Chain<OwnedIOBuf>`.
     /// `OwnedIOBuf` is `Send` by derivation, so the chain — and the
@@ -513,7 +512,6 @@ pub struct TxDiag {
     pub big_pool_size: u32,
 }
 
-
 // ---- Link-time registry ---------------------------------------------------
 
 /// One entry per linked driver crate, placed in `.uni_drivers_ethernet`
@@ -576,13 +574,23 @@ pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
 // one Acquire load + one direct fn-pointer call.
 
 fn null_send(_: &[u8]) {}
-fn null_poll(_: fn(Chain<OwnedIOBuf>)) -> usize { 0 }
-fn null_poll_qp(_: usize, _: fn(Chain<OwnedIOBuf>)) -> usize { 0 }
-fn null_probe() -> bool { false }
+fn null_poll(_: fn(Chain<OwnedIOBuf>)) -> usize {
+    0
+}
+fn null_poll_qp(_: usize, _: fn(Chain<OwnedIOBuf>)) -> usize {
+    0
+}
+fn null_probe() -> bool {
+    false
+}
 fn null_get_mac(_: *mut u8) {}
-fn null_num_queue_pairs() -> u16 { 1 }
+fn null_num_queue_pairs() -> u16 {
+    1
+}
 fn null_void() {}
-fn null_false() -> bool { false }
+fn null_false() -> bool {
+    false
+}
 
 static NULL_OPS: NicOps = NicOps {
     name: "none",
@@ -611,8 +619,7 @@ static NULL_OPS: NicOps = NicOps {
     diag: None,
 };
 
-static ACTIVE_OPS: AtomicPtr<NicOps> =
-    AtomicPtr::new(&NULL_OPS as *const NicOps as *mut NicOps);
+static ACTIVE_OPS: AtomicPtr<NicOps> = AtomicPtr::new(&NULL_OPS as *const NicOps as *mut NicOps);
 
 /// Install `ops` as the active driver. Called once by `init()` when
 /// the first `probe` succeeds.

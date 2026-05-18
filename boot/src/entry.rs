@@ -14,10 +14,10 @@ extern crate alloc;
 
 use core::ptr;
 
-extern crate uni_kernel;
-extern crate uni_drivers;
-extern crate uni_net_stack as net;
 extern crate uni;
+extern crate uni_drivers;
+extern crate uni_kernel;
+extern crate uni_net_stack as net;
 
 // Boot assembly — compiled by LLVM's integrated assembler via global_asm!.
 //
@@ -37,11 +37,10 @@ core::arch::global_asm!(include_str!("x86_64/ap_boot.S"), options(att_syntax));
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(include_str!("aarch64/boot.S"));
 
-
-use uni_kernel::{types, serial, mm};
+use types::{BootInfo, MAX_MEMORY_REGIONS, MEM_AVAILABLE, MEM_RESERVED, MemoryRegion, Protocol};
 #[cfg(target_arch = "aarch64")]
-use uni_kernel::aarch64::{fdt, mmu, exceptions, smp};
-use types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
+use uni_kernel::aarch64::{exceptions, fdt, mmu, smp};
+use uni_kernel::{mm, serial, types};
 
 // ============================================================================
 // Panic handler (required for rust_static_library)
@@ -91,7 +90,6 @@ pub extern "C" fn rust_eh_personality() {}
 // Architecture-specific code
 // ============================================================================
 
-
 /// Power off the machine. Never returns.
 #[cfg(target_arch = "x86_64")]
 unsafe fn arch_shutdown() -> ! {
@@ -100,7 +98,9 @@ unsafe fn arch_shutdown() -> ! {
         core::arch::asm!("out dx, ax", in("dx") 0x0604u16, in("ax") 0x2000u16, options(nomem, nostack));
         core::arch::asm!("out dx, ax", in("dx") 0x0604u16, in("ax") 0x3400u16, options(nomem, nostack));
         core::arch::asm!("out dx, ax", in("dx") 0xb004u16, in("ax") 0x2000u16, options(nomem, nostack));
-        loop { core::arch::asm!("cli", "hlt", options(nomem, nostack)); }
+        loop {
+            core::arch::asm!("cli", "hlt", options(nomem, nostack));
+        }
     }
 }
 
@@ -115,7 +115,9 @@ unsafe fn arch_shutdown() -> ! {
             out("x0") _,
             options(nomem, nostack)
         );
-        loop { core::arch::asm!("wfi", options(nomem, nostack)); }
+        loop {
+            core::arch::asm!("wfi", options(nomem, nostack));
+        }
     }
 }
 
@@ -207,101 +209,42 @@ mod boot_shim_x86 {
 
     pub unsafe fn shim(info: &mut BootInfo, boot_info_addr: u64) {
         unsafe {
-        info.protocol = Protocol::Unknown;
-        info.memory_map_count = 0;
-        info.dtb_addr = 0;
-        info.kernel_phys_base = 0;
-        info.kernel_virt_base = 0;
-        info.hhdm_offset = 0;
-        info.rsdp_paddr = 0;
+            info.protocol = Protocol::Unknown;
+            info.memory_map_count = 0;
+            info.dtb_addr = 0;
+            info.kernel_phys_base = 0;
+            info.kernel_virt_base = 0;
+            info.hhdm_offset = 0;
+            info.rsdp_paddr = 0;
 
-        if boot_info_addr == 0 {
-            info.memory_map[0] = MemoryRegion {
-                base: 0,
-                length: 128 * 1024 * 1024,
-                region_type: MEM_AVAILABLE,
-                _pad: 0,
-            };
-            info.memory_map_count = 1;
-            return;
-        }
-
-        let magic = ptr::read_volatile(boot_info_addr as *const u32);
-
-        if magic == HVM_START_MAGIC {
-            // PVH boot
-            info.protocol = Protocol::Pvh;
-            let hvm = &*(boot_info_addr as *const HvmStartInfo);
-            let entries = hvm.memmap_paddr as *const HvmMemmapEntry;
-            let mut count = 0;
-            for i in 0..hvm.memmap_entries as usize {
-                if count >= MAX_MEMORY_REGIONS {
-                    break;
-                }
-                let e = &*entries.add(i);
-                info.memory_map[count] = MemoryRegion {
-                    base: e.addr,
-                    length: e.size,
-                    region_type: if e.mem_type == HVM_MEMMAP_TYPE_RAM {
-                        MEM_AVAILABLE
-                    } else {
-                        MEM_RESERVED
-                    },
+            if boot_info_addr == 0 {
+                info.memory_map[0] = MemoryRegion {
+                    base: 0,
+                    length: 128 * 1024 * 1024,
+                    region_type: MEM_AVAILABLE,
                     _pad: 0,
                 };
-                count += 1;
-            }
-            info.memory_map_count = count as i32;
-            info.rsdp_paddr = hvm.rsdp_paddr;
-            return;
-        }
-
-        // Try Multiboot2
-        let mb2_total_size = ptr::read_volatile(boot_info_addr as *const u32);
-        if mb2_total_size >= 8 && mb2_total_size < 65536 {
-            // Scan tags for memory map
-            let mut tag_addr = boot_info_addr + 8;
-            let mut mmap_addr: u64 = 0;
-            loop {
-                let tag_type = ptr::read_volatile(tag_addr as *const u32);
-                let tag_size = ptr::read_volatile((tag_addr + 4) as *const u32);
-                if tag_type == MULTIBOOT_TAG_END {
-                    break;
-                }
-                if tag_type == MULTIBOOT_TAG_MMAP {
-                    mmap_addr = tag_addr;
-                }
-                // Multiboot2 ACPI tags 14/15 embed a copy of the RSDP
-                // starting at byte 8 of the tag (right after type+size).
-                // We just need the address of that copy — the RSDP
-                // parser reads the signature/revision/RSDT/XSDT fields
-                // from there regardless of which tag carried it.
-                if (tag_type == MULTIBOOT_TAG_ACPI_OLD || tag_type == MULTIBOOT_TAG_ACPI_NEW)
-                    && info.rsdp_paddr == 0
-                {
-                    info.rsdp_paddr = tag_addr + 8;
-                }
-                tag_addr = (tag_addr + tag_size as u64 + 7) & !7;
+                info.memory_map_count = 1;
+                return;
             }
 
-            if mmap_addr != 0 {
-                info.protocol = Protocol::Multiboot2;
-                // Mmap tag: type(4) + size(4) + entry_size(4) + entry_version(4) + entries...
-                let tag_size = ptr::read_volatile((mmap_addr + 4) as *const u32);
-                let entry_size = ptr::read_volatile((mmap_addr + 8) as *const u32);
-                let entries_start = mmap_addr + 16;
-                let entries_end = mmap_addr + tag_size as u64;
+            let magic = ptr::read_volatile(boot_info_addr as *const u32);
 
+            if magic == HVM_START_MAGIC {
+                // PVH boot
+                info.protocol = Protocol::Pvh;
+                let hvm = &*(boot_info_addr as *const HvmStartInfo);
+                let entries = hvm.memmap_paddr as *const HvmMemmapEntry;
                 let mut count = 0;
-                let mut ea = entries_start;
-                while ea < entries_end && count < MAX_MEMORY_REGIONS {
-                    let addr = ptr::read_volatile(ea as *const u64);
-                    let len = ptr::read_volatile((ea + 8) as *const u64);
-                    let mem_type = ptr::read_volatile((ea + 16) as *const u32);
+                for i in 0..hvm.memmap_entries as usize {
+                    if count >= MAX_MEMORY_REGIONS {
+                        break;
+                    }
+                    let e = &*entries.add(i);
                     info.memory_map[count] = MemoryRegion {
-                        base: addr,
-                        length: len,
-                        region_type: if mem_type == MULTIBOOT_MEMORY_AVAILABLE {
+                        base: e.addr,
+                        length: e.size,
+                        region_type: if e.mem_type == HVM_MEMMAP_TYPE_RAM {
                             MEM_AVAILABLE
                         } else {
                             MEM_RESERVED
@@ -309,21 +252,80 @@ mod boot_shim_x86 {
                         _pad: 0,
                     };
                     count += 1;
-                    ea += entry_size as u64;
                 }
                 info.memory_map_count = count as i32;
+                info.rsdp_paddr = hvm.rsdp_paddr;
                 return;
             }
-        }
 
-        // Fallback
-        info.memory_map[0] = MemoryRegion {
-            base: 0,
-            length: 128 * 1024 * 1024,
-            region_type: MEM_AVAILABLE,
-            _pad: 0,
-        };
-        info.memory_map_count = 1;
+            // Try Multiboot2
+            let mb2_total_size = ptr::read_volatile(boot_info_addr as *const u32);
+            if mb2_total_size >= 8 && mb2_total_size < 65536 {
+                // Scan tags for memory map
+                let mut tag_addr = boot_info_addr + 8;
+                let mut mmap_addr: u64 = 0;
+                loop {
+                    let tag_type = ptr::read_volatile(tag_addr as *const u32);
+                    let tag_size = ptr::read_volatile((tag_addr + 4) as *const u32);
+                    if tag_type == MULTIBOOT_TAG_END {
+                        break;
+                    }
+                    if tag_type == MULTIBOOT_TAG_MMAP {
+                        mmap_addr = tag_addr;
+                    }
+                    // Multiboot2 ACPI tags 14/15 embed a copy of the RSDP
+                    // starting at byte 8 of the tag (right after type+size).
+                    // We just need the address of that copy — the RSDP
+                    // parser reads the signature/revision/RSDT/XSDT fields
+                    // from there regardless of which tag carried it.
+                    if (tag_type == MULTIBOOT_TAG_ACPI_OLD || tag_type == MULTIBOOT_TAG_ACPI_NEW)
+                        && info.rsdp_paddr == 0
+                    {
+                        info.rsdp_paddr = tag_addr + 8;
+                    }
+                    tag_addr = (tag_addr + tag_size as u64 + 7) & !7;
+                }
+
+                if mmap_addr != 0 {
+                    info.protocol = Protocol::Multiboot2;
+                    // Mmap tag: type(4) + size(4) + entry_size(4) + entry_version(4) + entries...
+                    let tag_size = ptr::read_volatile((mmap_addr + 4) as *const u32);
+                    let entry_size = ptr::read_volatile((mmap_addr + 8) as *const u32);
+                    let entries_start = mmap_addr + 16;
+                    let entries_end = mmap_addr + tag_size as u64;
+
+                    let mut count = 0;
+                    let mut ea = entries_start;
+                    while ea < entries_end && count < MAX_MEMORY_REGIONS {
+                        let addr = ptr::read_volatile(ea as *const u64);
+                        let len = ptr::read_volatile((ea + 8) as *const u64);
+                        let mem_type = ptr::read_volatile((ea + 16) as *const u32);
+                        info.memory_map[count] = MemoryRegion {
+                            base: addr,
+                            length: len,
+                            region_type: if mem_type == MULTIBOOT_MEMORY_AVAILABLE {
+                                MEM_AVAILABLE
+                            } else {
+                                MEM_RESERVED
+                            },
+                            _pad: 0,
+                        };
+                        count += 1;
+                        ea += entry_size as u64;
+                    }
+                    info.memory_map_count = count as i32;
+                    return;
+                }
+            }
+
+            // Fallback
+            info.memory_map[0] = MemoryRegion {
+                base: 0,
+                length: 128 * 1024 * 1024,
+                region_type: MEM_AVAILABLE,
+                _pad: 0,
+            };
+            info.memory_map_count = 1;
         }
     }
 }
@@ -334,32 +336,32 @@ mod boot_shim_fdt {
 
     pub unsafe fn shim(info: &mut BootInfo, dtb_addr: u64) {
         unsafe {
-        info.protocol = Protocol::Fdt;
-        info.dtb_addr = dtb_addr;
-        info.kernel_phys_base = 0;
-        info.kernel_virt_base = 0;
-        info.hhdm_offset = 0;
+            info.protocol = Protocol::Fdt;
+            info.dtb_addr = dtb_addr;
+            info.kernel_phys_base = 0;
+            info.kernel_virt_base = 0;
+            info.hhdm_offset = 0;
 
-        let fdt = &*fdt::info_ptr();
-        let ram_base = if fdt.ram_size != 0 {
-            fdt.ram_base
-        } else {
-            0x4000_0000
-        };
-        let ram_size = if fdt.ram_size != 0 {
-            fdt.ram_size
-        } else {
-            128 * 1024 * 1024
-        };
+            let fdt = &*fdt::info_ptr();
+            let ram_base = if fdt.ram_size != 0 {
+                fdt.ram_base
+            } else {
+                0x4000_0000
+            };
+            let ram_size = if fdt.ram_size != 0 {
+                fdt.ram_size
+            } else {
+                128 * 1024 * 1024
+            };
 
-        info.memory_map[0] = MemoryRegion {
-            base: ram_base,
-            length: ram_size,
-            region_type: MEM_AVAILABLE,
-            _pad: 0,
-        };
-        info.memory_map_count = 1;
-        let _ = (ram_base, ram_size);
+            info.memory_map[0] = MemoryRegion {
+                base: ram_base,
+                length: ram_size,
+                region_type: MEM_AVAILABLE,
+                _pad: 0,
+            };
+            info.memory_map_count = 1;
+            let _ = (ram_base, ram_size);
         }
     }
 }
@@ -379,238 +381,259 @@ static G_BOOT_INFO: BootInfoCell = BootInfoCell(core::cell::UnsafeCell::new(Boot
 
 unsafe fn kernel_boot(info: &BootInfo) {
     unsafe {
-    // Mark boot-start as early as possible — `serial::init` itself
-    // takes a few hundred microseconds (UART config + FIFO drain) and
-    // we want every subsequent log line's timestamp to include it.
-    uni_kernel::time::mark_boot_start();
-    serial::init();
+        // Mark boot-start as early as possible — `serial::init` itself
+        // takes a few hundred microseconds (UART config + FIFO drain) and
+        // we want every subsequent log line's timestamp to include it.
+        uni_kernel::time::mark_boot_start();
+        serial::init();
 
-    // Force TSC calibration BEFORE the first log line. On x86 without
-    // CPUID 0x15/0x16 (which `-cpu host` masks out under standard KVM —
-    // max basic leaf reads as 0xd) `cycles_per_us` falls back to a PIT
-    // calibration; if that runs lazily inside the first `klog!`, the
-    // elapsed cycles for that line's timestamp are captured before the
-    // calibration delay, so the line shows `[0.000]` and every subsequent
-    // line is offset by the calibration cost. Eager calibration here
-    // keeps every timestamp truthful and lets us shorten the PIT window.
-    let _ = uni_kernel::time::cycles_per_us();
-    #[cfg(target_arch = "aarch64")]
-    klog!("UniKernel v0.1.0 (aarch64)\n");
-    #[cfg(target_arch = "x86_64")]
-    klog!("UniKernel v0.1.0 (x86_64)\n");
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        uni_kernel::x86_64::gdt::init();
-        uni_kernel::x86_64::idt::init();
-    }
-    #[cfg(target_arch = "aarch64")]
-    exceptions::init();
-
-    mm::init(info as *const BootInfo);
-
-    #[cfg(target_arch = "x86_64")]
-    uni_kernel::x86_64::apic::init();
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Seed the RSDP hint before `detect_cpus()` — under UEFI
-        // (GCE's OVMF) the BIOS-area scan fallback fails, so without
-        // this we'd silently boot 1 CPU.
-        uni_kernel::x86_64::acpi::set_rsdp(info.rsdp_paddr);
-    }
-
-    // Detect actual core count, publish via `set_num_workers`, then
-    // size every `PerWorker<T>`. Strict ordering: `mm::init` first
-    // (heap up), then `acpi::set_rsdp` (x86 detect needs ACPI), then
-    // `percpu::init`, then `init_tls` (which reads `percpu::get(0)`
-    // for GS_BASE / TPIDR_EL1 — running it before `percpu::init`
-    // points the TLS register at a null cell and every later
-    // `cpu_id()` returns garbage).
-    #[cfg(target_arch = "aarch64")]
-    let cpu_count = uni_kernel::aarch64::fdt::info().cpu_count;
-    #[cfg(target_arch = "x86_64")]
-    let cpu_count = uni_kernel::x86_64::acpi::detect_cpus();
-    uni_kernel::percpu::init(cpu_count);
-
-    #[cfg(target_arch = "x86_64")]
-    uni_kernel::x86_64::smp::init_tls(0);
-    #[cfg(target_arch = "aarch64")]
-    uni_kernel::aarch64::smp::init_tls(0);
-
-    // ── Identity / platform / memory diagnostics ────────────────────
-    {
-        let mut buf = [0u8; 128];
-        let n = uni_kernel::cpu_info::summary(&mut buf);
-        // SAFETY: `summary` only writes ASCII chars produced via
-        // `core::fmt::Write` over a `&str`-backed source.
-        let cpu = core::str::from_utf8_unchecked(&buf[..n]);
-        klog!("cpu: {} × {}\n", cpu_count, cpu);
-    }
-    klog!("platform: {}\n", uni_kernel::cpu_info::hypervisor());
-    klog!("mem: {} / {} MB heap\n",
-          mm::free_memory() / (1024 * 1024),
-          mm::total_memory() / (1024 * 1024));
-    #[cfg(target_arch = "x86_64")]
-    klog!("irq: xAPIC online\n");
-    #[cfg(target_arch = "aarch64")]
-    klog!("irq: GICv{} configured\n",
-          uni_kernel::aarch64::fdt::info().gic_version);
-    klog!("smp: {} workers\n", cpu_count);
-    #[cfg(target_arch = "x86_64")]
-    klog!("console: 16550 UART @ COM1\n");
-
-    uni_drivers::pci::init();
-    klog!("pci: {} devices on bus 0\n", uni_drivers::pci::device_count());
-    uni_drivers::pci::log_devices();
-
-    // Two-stage console: 16550 (x86) gives us early-boot output
-    // before the PCI bus is scanned; once `pci::init` completes we
-    // try to attach virtio-console-pci so subsequent log lines —
-    // most of boot, and all of runtime — emit through the batched
-    // virtio path (1 vmexit per ≤256-byte chunk vs 1 per byte for
-    // 16550). No-op on aarch64; that path's `serial::aarch64::init`
-    // already picks the best FDT-advertised backend.
-    let upgraded = serial::upgrade_after_pci();
-    if upgraded {
-        klog!("console: upgraded to virtio-console-pci (batched, ≤256 B/vmexit)\n");
-    }
-    // Drain the early-boot buffer through the now-chosen backend.
-    // If we just upgraded, every pre-PCI line gets flushed via
-    // virtio-console (one batched ≤256 B emit). If we didn't, it
-    // fans out through the 16550 at ~1 ms / line — same cost we
-    // would have paid emitting inline, just deferred.
-    serial::flush_early_buf();
-
-    // NIC bring-up. `uni_drivers::net::init()` tries gVNIC first
-    // (preferred on GCE — native RSS multi-queue) then falls back
-    // to virtio-net (kvm-vm, HVF, default GCE instances).
-    let net_ok = uni_drivers::net::init();
-    if !net_ok {
-        klog!("nic: none (no gVNIC, no virtio-net)\n");
-    } else {
-        // Cache MAC address for multi-core safe access.
-        net::ethernet::init_mac();
-        let mut mac = [0u8; 6];
-        uni_drivers::net::get_mac(mac.as_mut_ptr());
-        klog!("nic: {} {} qps={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
-              uni_drivers::net::driver_name(),
-              if uni_drivers::net::num_queue_pairs() > 1 { "Tier-1" } else { "Tier-2" },
-              uni_drivers::net::num_queue_pairs(),
-              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
-        // IP bring-up (DHCP / static) happens inside the app's
-        // `#[uni::init]` task via `uni::net::Net::enable(...).await`.
-        // Driver-level config like multi-queue activation is
-        // self-contained in the driver's `init()`.
-
-        net::tcp::init();
-        // Initialise IPv4/IPv6 stack state (ARP cache, our local
-        // addrs, NDP, etc.). `net_receive` matches on the IP
-        // protocol byte directly.
-        net::init_stack();
-        uni_drivers::net::enable_irq();
-        klog!("net: stack ready (Ethernet/ARP/IPv4/TCP/UDP)\n");
+        // Force TSC calibration BEFORE the first log line. On x86 without
+        // CPUID 0x15/0x16 (which `-cpu host` masks out under standard KVM —
+        // max basic leaf reads as 0xd) `cycles_per_us` falls back to a PIT
+        // calibration; if that runs lazily inside the first `klog!`, the
+        // elapsed cycles for that line's timestamp are captured before the
+        // calibration delay, so the line shows `[0.000]` and every subsequent
+        // line is offset by the calibration cost. Eager calibration here
+        // keeps every timestamp truthful and lets us shorten the PIT window.
+        let _ = uni_kernel::time::cycles_per_us();
+        #[cfg(target_arch = "aarch64")]
+        klog!("UniKernel v0.1.0 (aarch64)\n");
+        #[cfg(target_arch = "x86_64")]
+        klog!("UniKernel v0.1.0 (x86_64)\n");
 
         #[cfg(target_arch = "x86_64")]
         {
-            // Serial RX interrupt (IRQ4 / vector 36) for Ctrl-C wakeup
-            uni_kernel::x86_64::idt::register_handler(36, serial_rx_isr_trampoline);
-            uni_kernel::x86_64::idt::enable_irq(4);
-            serial::enable_rx_irq();
+            uni_kernel::x86_64::gdt::init();
+            uni_kernel::x86_64::idt::init();
         }
-    }
+        #[cfg(target_arch = "aarch64")]
+        exceptions::init();
 
-    // Idle-path infrastructure (timer IRQ + SGI handler + IRQ unmask) is
-    // orthogonal to the NIC. Apps without networking still need
-    // `uni_kernel::cpu::idle_bounded` to wake from WFI when the 1 ms
-    // generic-timer fires — `uni_kernel::runtime`'s `Sleep` future depends
-    // on it.
-    #[cfg(target_arch = "aarch64")]
-    {
-        let fdt = &*fdt::info_ptr();
-        if fdt.gic_dist_base != 0 {
-            exceptions::enable_timer_wakeup();
-            // Enable SGI 0 on core 0 so APs can wake it from WFI via wake_core0().
-            // Without this, SGI 0 is pending in GICR but never forwarded to the
-            // CPU interface (bit 0 of GICR_ISENABLER0 is 0), so WFI never returns.
-            exceptions::register_irq(0, smp::sgi_handler);
-            // Unmask IRQ only; leave FIQ masked since Apple hypervisors
-            // reserve FIQ for themselves and unmasking it crashes the guest.
-            core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack));
-        }
-    }
+        mm::init(info as *const BootInfo);
 
-    // ── SMP: detect and bring up all available cores ──────────────────────
-    // Matches the native backend's behaviour of using every available
-    // thread. Apps that want single-core determinism get it by running
-    // on a single-CPU VM (or, on native, via `UNIKERNEL_CPUS=1`).
-    // `percpu::init` already ran near the top of boot — that publishes
-    // the worker count and sizes every `PerWorker<T>` to it; the
-    // SMP layer below is only responsible for waking the secondaries.
-    #[cfg(target_arch = "aarch64")]
-    {
-        if cpu_count > 1 {
-            uni_kernel::aarch64::smp::start_secondary_cores(cpu_count);
+        #[cfg(target_arch = "x86_64")]
+        uni_kernel::x86_64::apic::init();
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Seed the RSDP hint before `detect_cpus()` — under UEFI
+            // (GCE's OVMF) the BIOS-area scan fallback fails, so without
+            // this we'd silently boot 1 CPU.
+            uni_kernel::x86_64::acpi::set_rsdp(info.rsdp_paddr);
         }
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if cpu_count > 1 {
-            match info.protocol {
-                Protocol::Limine => {
-                    // Limine MP releases APs into `ap_entry_via_limine`;
-                    // they print their own `[SMP] core N online` lines
-                    // and join the event loop on `READY`. No wait
-                    // needed — see `aarch64::smp::start_secondary_cores`
-                    // for the same rationale.
-                    let _ = start_aps_via_limine_mp();
-                }
-                _ => {
-                    uni_kernel::x86_64::smp::start_secondary_cores(cpu_count);
+
+        // Detect actual core count, publish via `set_num_workers`, then
+        // size every `PerWorker<T>`. Strict ordering: `mm::init` first
+        // (heap up), then `acpi::set_rsdp` (x86 detect needs ACPI), then
+        // `percpu::init`, then `init_tls` (which reads `percpu::get(0)`
+        // for GS_BASE / TPIDR_EL1 — running it before `percpu::init`
+        // points the TLS register at a null cell and every later
+        // `cpu_id()` returns garbage).
+        #[cfg(target_arch = "aarch64")]
+        let cpu_count = uni_kernel::aarch64::fdt::info().cpu_count;
+        #[cfg(target_arch = "x86_64")]
+        let cpu_count = uni_kernel::x86_64::acpi::detect_cpus();
+        uni_kernel::percpu::init(cpu_count);
+
+        #[cfg(target_arch = "x86_64")]
+        uni_kernel::x86_64::smp::init_tls(0);
+        #[cfg(target_arch = "aarch64")]
+        uni_kernel::aarch64::smp::init_tls(0);
+
+        // ── Identity / platform / memory diagnostics ────────────────────
+        {
+            let mut buf = [0u8; 128];
+            let n = uni_kernel::cpu_info::summary(&mut buf);
+            // SAFETY: `summary` only writes ASCII chars produced via
+            // `core::fmt::Write` over a `&str`-backed source.
+            let cpu = core::str::from_utf8_unchecked(&buf[..n]);
+            klog!("cpu: {} × {}\n", cpu_count, cpu);
+        }
+        klog!("platform: {}\n", uni_kernel::cpu_info::hypervisor());
+        klog!(
+            "mem: {} / {} MB heap\n",
+            mm::free_memory() / (1024 * 1024),
+            mm::total_memory() / (1024 * 1024)
+        );
+        #[cfg(target_arch = "x86_64")]
+        klog!("irq: xAPIC online\n");
+        #[cfg(target_arch = "aarch64")]
+        klog!(
+            "irq: GICv{} configured\n",
+            uni_kernel::aarch64::fdt::info().gic_version
+        );
+        klog!("smp: {} workers\n", cpu_count);
+        #[cfg(target_arch = "x86_64")]
+        klog!("console: 16550 UART @ COM1\n");
+
+        uni_drivers::pci::init();
+        klog!(
+            "pci: {} devices on bus 0\n",
+            uni_drivers::pci::device_count()
+        );
+        uni_drivers::pci::log_devices();
+
+        // Two-stage console: 16550 (x86) gives us early-boot output
+        // before the PCI bus is scanned; once `pci::init` completes we
+        // try to attach virtio-console-pci so subsequent log lines —
+        // most of boot, and all of runtime — emit through the batched
+        // virtio path (1 vmexit per ≤256-byte chunk vs 1 per byte for
+        // 16550). No-op on aarch64; that path's `serial::aarch64::init`
+        // already picks the best FDT-advertised backend.
+        let upgraded = serial::upgrade_after_pci();
+        if upgraded {
+            klog!("console: upgraded to virtio-console-pci (batched, ≤256 B/vmexit)\n");
+        }
+        // Drain the early-boot buffer through the now-chosen backend.
+        // If we just upgraded, every pre-PCI line gets flushed via
+        // virtio-console (one batched ≤256 B emit). If we didn't, it
+        // fans out through the 16550 at ~1 ms / line — same cost we
+        // would have paid emitting inline, just deferred.
+        serial::flush_early_buf();
+
+        // NIC bring-up. `uni_drivers::net::init()` tries gVNIC first
+        // (preferred on GCE — native RSS multi-queue) then falls back
+        // to virtio-net (kvm-vm, HVF, default GCE instances).
+        let net_ok = uni_drivers::net::init();
+        if !net_ok {
+            klog!("nic: none (no gVNIC, no virtio-net)\n");
+        } else {
+            // Cache MAC address for multi-core safe access.
+            net::ethernet::init_mac();
+            let mut mac = [0u8; 6];
+            uni_drivers::net::get_mac(mac.as_mut_ptr());
+            klog!(
+                "nic: {} {} qps={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                uni_drivers::net::driver_name(),
+                if uni_drivers::net::num_queue_pairs() > 1 {
+                    "Tier-1"
+                } else {
+                    "Tier-2"
+                },
+                uni_drivers::net::num_queue_pairs(),
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
+            );
+
+            // IP bring-up (DHCP / static) happens inside the app's
+            // `#[uni::init]` task via `uni::net::Net::enable(...).await`.
+            // Driver-level config like multi-queue activation is
+            // self-contained in the driver's `init()`.
+
+            net::tcp::init();
+            // Initialise IPv4/IPv6 stack state (ARP cache, our local
+            // addrs, NDP, etc.). `net_receive` matches on the IP
+            // protocol byte directly.
+            net::init_stack();
+            uni_drivers::net::enable_irq();
+            klog!("net: stack ready (Ethernet/ARP/IPv4/TCP/UDP)\n");
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                // Serial RX interrupt (IRQ4 / vector 36) for Ctrl-C wakeup
+                uni_kernel::x86_64::idt::register_handler(36, serial_rx_isr_trampoline);
+                uni_kernel::x86_64::idt::enable_irq(4);
+                serial::enable_rx_irq();
+            }
+        }
+
+        // Idle-path infrastructure (timer IRQ + SGI handler + IRQ unmask) is
+        // orthogonal to the NIC. Apps without networking still need
+        // `uni_kernel::cpu::idle_bounded` to wake from WFI when the 1 ms
+        // generic-timer fires — `uni_kernel::runtime`'s `Sleep` future depends
+        // on it.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let fdt = &*fdt::info_ptr();
+            if fdt.gic_dist_base != 0 {
+                exceptions::enable_timer_wakeup();
+                // Enable SGI 0 on core 0 so APs can wake it from WFI via wake_core0().
+                // Without this, SGI 0 is pending in GICR but never forwarded to the
+                // CPU interface (bit 0 of GICR_ISENABLER0 is 0), so WFI never returns.
+                exceptions::register_irq(0, smp::sgi_handler);
+                // Unmask IRQ only; leave FIQ masked since Apple hypervisors
+                // reserve FIQ for themselves and unmasking it crashes the guest.
+                core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack));
+            }
+        }
+
+        // ── SMP: detect and bring up all available cores ──────────────────────
+        // Matches the native backend's behaviour of using every available
+        // thread. Apps that want single-core determinism get it by running
+        // on a single-CPU VM (or, on native, via `UNIKERNEL_CPUS=1`).
+        // `percpu::init` already ran near the top of boot — that publishes
+        // the worker count and sizes every `PerWorker<T>` to it; the
+        // SMP layer below is only responsible for waking the secondaries.
+        #[cfg(target_arch = "aarch64")]
+        {
+            if cpu_count > 1 {
+                uni_kernel::aarch64::smp::start_secondary_cores(cpu_count);
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if cpu_count > 1 {
+                match info.protocol {
+                    Protocol::Limine => {
+                        // Limine MP releases APs into `ap_entry_via_limine`;
+                        // they print their own `[SMP] core N online` lines
+                        // and join the event loop on `READY`. No wait
+                        // needed — see `aarch64::smp::start_secondary_cores`
+                        // for the same rationale.
+                        let _ = start_aps_via_limine_mp();
+                    }
+                    _ => {
+                        uni_kernel::x86_64::smp::start_secondary_cores(cpu_count);
+                    }
                 }
             }
         }
-    }
 
-    // Register event-loop callbacks. `check_shutdown` reads the
-    // serial port and is NIC-independent — always wire it. The
-    // NIC-specific hooks (poll/drain/flush/rearm/idle) only make
-    // sense when a NIC probed.
-    uni_kernel::eventloop::set_check_shutdown(|| serial::check_shutdown());
-    if net_ok {
-        net::init_eventloop();
-        uni_kernel::eventloop::set_idle(idle_cb);
-    }
+        // Register event-loop callbacks. `check_shutdown` reads the
+        // serial port and is NIC-independent — always wire it. The
+        // NIC-specific hooks (poll/drain/flush/rearm/idle) only make
+        // sense when a NIC probed.
+        uni_kernel::eventloop::set_check_shutdown(|| serial::check_shutdown());
+        if net_ok {
+            net::init_eventloop();
+            uni_kernel::eventloop::set_idle(idle_cb);
+        }
 
-    // Publish the read-only boot snapshot to apps. Must run after
-    // SMP and NIC init so `num_cpus` and `nics` are final.
-    publish_boot_info(net_ok);
+        // Publish the read-only boot snapshot to apps. Must run after
+        // SMP and NIC init so `num_cpus` and `nics` are final.
+        publish_boot_info(net_ok);
 
-    // Register the bare-metal async runtime with `//uni-runtime`.
-    // Must happen before `uni_init` so the app can `spawn` / `sleep_us`.
-    uni_kernel::runtime::init();
-    klog!("runtime: {} workers ready\n", uni_kernel::percpu::num_cores());
+        // Register the bare-metal async runtime with `//uni-runtime`.
+        // Must happen before `uni_init` so the app can `spawn` / `sleep_us`.
+        uni_kernel::runtime::init();
+        klog!(
+            "runtime: {} workers ready\n",
+            uni_kernel::percpu::num_cores()
+        );
 
-    // `uni_init()` (generated by `#[uni::init]`) spawns the app's
-    // init body on core 0's arena and returns immediately. The
-    // event loop below polls that task, so DHCP / async setup /
-    // `uni::run(app)` all run while `net_flush_cb`, `net_poll_cb`,
-    // etc. are ticking — no separate pre-eventloop phase, no
-    // deferred-TX-kick race.
-    uni_init();
+        // `uni_init()` (generated by `#[uni::init]`) spawns the app's
+        // init body on core 0's arena and returns immediately. The
+        // event loop below polls that task, so DHCP / async setup /
+        // `uni::run(app)` all run while `net_flush_cb`, `net_poll_cb`,
+        // etc. are ticking — no separate pre-eventloop phase, no
+        // deferred-TX-kick race.
+        uni_init();
 
-    if !uni_kernel::eventloop::is_shutdown() {
-        uni_kernel::eventloop::run(0);
-    }
+        if !uni_kernel::eventloop::is_shutdown() {
+            uni_kernel::eventloop::run(0);
+        }
 
-    klog!("\n[SHUTDOWN] Powering off.\n");
+        klog!("\n[SHUTDOWN] Powering off.\n");
 
-    // Stop secondary cores before system poweroff
-    #[cfg(target_arch = "aarch64")]
-    uni_kernel::aarch64::smp::request_shutdown();
+        // Stop secondary cores before system poweroff
+        #[cfg(target_arch = "aarch64")]
+        uni_kernel::aarch64::smp::request_shutdown();
 
-    arch_shutdown();
+        arch_shutdown();
     }
 }
 
@@ -619,8 +642,8 @@ unsafe fn kernel_boot(info: &BootInfo) {
 /// read the resulting snapshot via `uni::boot_info()` to size
 /// per-core buffers, log runtime identity, etc.
 fn publish_boot_info(net_ok: bool) {
-    use uni::boot_info::{BootInfoParams, NicInfo};
     use alloc::vec::Vec;
+    use uni::boot_info::{BootInfoParams, NicInfo};
 
     let mut nics: Vec<NicInfo> = Vec::new();
     if net_ok {
@@ -694,7 +717,9 @@ fn idle_cb(core_id: u32) {
         {
             let yield_addr = uni_kernel::aarch64::fdt::info().yield_mmio_base;
             if yield_addr != 0 {
-                unsafe { core::ptr::write_volatile(yield_addr as *mut u32, core_id); }
+                unsafe {
+                    core::ptr::write_volatile(yield_addr as *mut u32, core_id);
+                }
                 return;
             }
         }
@@ -704,7 +729,9 @@ fn idle_cb(core_id: u32) {
 
 // x86_64: ISR trampoline for serial RX (ignores InterruptFrame pointer)
 #[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn serial_rx_isr_trampoline(_frame: *mut uni_kernel::x86_64::idt::InterruptFrame) {
+unsafe extern "C" fn serial_rx_isr_trampoline(
+    _frame: *mut uni_kernel::x86_64::idt::InterruptFrame,
+) {
     serial::rx_isr();
 }
 
@@ -716,36 +743,36 @@ unsafe extern "C" fn serial_rx_isr_trampoline(_frame: *mut uni_kernel::x86_64::i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kernel_main(boot_info_addr: u64) {
     unsafe {
-    zero_bss();
+        zero_bss();
 
-    #[cfg(target_arch = "aarch64")]
-    {
-        // Parse DTB before serial::init() (PL011 address comes from FDT)
-        fdt::init(boot_info_addr);
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Parse DTB before serial::init() (PL011 address comes from FDT)
+            fdt::init(boot_info_addr);
 
-        // Map device MMIO regions before any access
-        let fdt = &*fdt::info_ptr();
-        if fdt.pcie_ecam_base != 0 && fdt.pcie_ecam_size != 0 {
-            mmu::map_device_range(fdt.pcie_ecam_base, fdt.pcie_ecam_size);
+            // Map device MMIO regions before any access
+            let fdt = &*fdt::info_ptr();
+            if fdt.pcie_ecam_base != 0 && fdt.pcie_ecam_size != 0 {
+                mmu::map_device_range(fdt.pcie_ecam_base, fdt.pcie_ecam_size);
+            }
+            if fdt.gic_dist_base != 0 {
+                mmu::map_device_range(fdt.gic_dist_base, 0x10000);
+            }
+            if fdt.gic_redist_base != 0 {
+                // Each CPU's redistributor frame is 0x20000 bytes; map all CPUs.
+                let n = (fdt.cpu_count as u64).max(1);
+                mmu::map_device_range(fdt.gic_redist_base, n * 0x20000);
+            }
+
+            // SAFETY: G_BOOT_INFO is touched only here during single-
+            // threaded boot before any AP starts.
+            boot_shim_fdt::shim(&mut *G_BOOT_INFO.0.get(), boot_info_addr);
         }
-        if fdt.gic_dist_base != 0 {
-            mmu::map_device_range(fdt.gic_dist_base, 0x10000);
-        }
-        if fdt.gic_redist_base != 0 {
-            // Each CPU's redistributor frame is 0x20000 bytes; map all CPUs.
-            let n = (fdt.cpu_count as u64).max(1);
-            mmu::map_device_range(fdt.gic_redist_base, n * 0x20000);
-        }
 
-        // SAFETY: G_BOOT_INFO is touched only here during single-
-        // threaded boot before any AP starts.
-        boot_shim_fdt::shim(&mut *G_BOOT_INFO.0.get(), boot_info_addr);
-    }
+        #[cfg(target_arch = "x86_64")]
+        boot_shim_x86::shim(&mut *G_BOOT_INFO.0.get(), boot_info_addr);
 
-    #[cfg(target_arch = "x86_64")]
-    boot_shim_x86::shim(&mut *G_BOOT_INFO.0.get(), boot_info_addr);
-
-    kernel_boot(&*G_BOOT_INFO.0.get());
+        kernel_boot(&*G_BOOT_INFO.0.get());
     }
 }
 

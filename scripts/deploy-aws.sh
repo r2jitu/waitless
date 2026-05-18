@@ -50,7 +50,7 @@ fi
 # --- Create a bootable raw disk image ---
 echo "==> Creating bootable disk image..."
 
-DISK_SIZE_MB=1024  # AWS prefers at least 1GB
+DISK_SIZE_MB=1024 # AWS prefers at least 1GB
 
 # Create the raw disk
 dd if=/dev/zero of="$DISK_FILE" bs=1M count=0 seek=$DISK_SIZE_MB 2>/dev/null
@@ -59,7 +59,7 @@ if command -v grub-mkrescue &>/dev/null; then
     ISODIR="$(mktemp -d)"
     mkdir -p "$ISODIR/boot/grub"
     cp "$ELF" "$ISODIR/boot/kernel.elf"
-    cat > "$ISODIR/boot/grub/grub.cfg" <<'GRUB_EOF'
+    cat >"$ISODIR/boot/grub/grub.cfg" <<'GRUB_EOF'
 set timeout=0
 set default=0
 menuentry "unikernel" {
@@ -103,7 +103,8 @@ aws iam create-role \
     --role-name vmimport \
     --assume-role-policy-document "$ROLE_POLICY" 2>/dev/null || true
 
-BUCKET_POLICY=$(cat <<EOF
+BUCKET_POLICY=$(
+    cat <<EOF
 {
     "Version": "2012-10-17",
     "Statement": [

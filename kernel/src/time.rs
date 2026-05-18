@@ -75,7 +75,9 @@ pub fn cycles_per_us() -> u64 {
         return rate.max(1);
     }
     udelay(0);
-    X86_TSC_PER_US.load(core::sync::atomic::Ordering::Relaxed).max(1)
+    X86_TSC_PER_US
+        .load(core::sync::atomic::Ordering::Relaxed)
+        .max(1)
 }
 
 /// Try to derive TSC frequency from KVM's pvclock paravirt interface.
@@ -89,14 +91,18 @@ fn kvmclock_tsc_per_us() -> Option<u64> {
     // "no KVM pvclock here" — Hyper-V / Xen / VMware advertise
     // different feature MSRs.
     let sig = cpuid_x86(0x40000000);
-    if sig.0 < 0x40000001 { return None; }
+    if sig.0 < 0x40000001 {
+        return None;
+    }
     let kvm_sig = (sig.1, sig.2, sig.3);
     if kvm_sig != (0x4b4d564b, 0x564b4d56, 0x0000004d) {
         return None;
     }
     // CPUID 0x40000001: KVM features. Bit 3 = CLOCKSOURCE2.
     let feat = cpuid_x86(0x40000001);
-    if feat.0 & (1 << 3) == 0 { return None; }
+    if feat.0 & (1 << 3) == 0 {
+        return None;
+    }
 
     // 32-byte aligned BSS-resident struct (matches Linux's pvclock-abi).
     #[repr(C, align(32))]
@@ -111,8 +117,14 @@ fn kvmclock_tsc_per_us() -> Option<u64> {
         pad: [u8; 2],
     }
     static mut PVCLOCK: PvClock = PvClock {
-        version: 0, pad0: 0, tsc_timestamp: 0, system_time: 0,
-        tsc_to_system_mul: 0, tsc_shift: 0, flags: 0, pad: [0; 2],
+        version: 0,
+        pad0: 0,
+        tsc_timestamp: 0,
+        system_time: 0,
+        tsc_to_system_mul: 0,
+        tsc_shift: 0,
+        flags: 0,
+        pad: [0; 2],
     };
 
     // SAFETY: BSS-resident static; called single-threaded at boot.
@@ -202,8 +214,7 @@ fn cpuid_x86(leaf: u32) -> (u32, u32, u32, u32) {
 }
 
 #[cfg(target_arch = "x86_64")]
-static X86_TSC_PER_US: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static X86_TSC_PER_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // ── Boot-phase timing ──────────────────────────────────────────────────────
 //
@@ -218,8 +229,7 @@ static X86_TSC_PER_US: core::sync::atomic::AtomicU64 =
 // timestamp is still valid because we capture raw cycles and only
 // convert to µs when reporting.
 
-static BOOT_START_CYCLES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static BOOT_START_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Capture the boot-start cycle count. Idempotent: only the first call
 /// wins (so an accidental second call from an AP can't reset the
@@ -324,14 +334,18 @@ pub fn udelay(us: u32) {
 #[inline]
 fn x86_inb(port: u16) -> u8 {
     let val: u8;
-    unsafe { core::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack));
+    }
     val
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn x86_outb(port: u16, val: u8) {
-    unsafe { core::arch::asm!("out dx, al", in("al") val, in("dx") port, options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("out dx, al", in("al") val, in("dx") port, options(nomem, nostack));
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -339,7 +353,9 @@ fn x86_outb(port: u16, val: u8) {
 fn x86_rdtsc() -> u64 {
     let lo: u32;
     let hi: u32;
-    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+    }
     ((hi as u64) << 32) | (lo as u64)
 }
 
@@ -355,7 +371,9 @@ pub fn udelay(us: u32) {
         loop {
             let now: u64;
             core::arch::asm!("mrs {}, cntpct_el0", out(reg) now);
-            if now >= end { break; }
+            if now >= end {
+                break;
+            }
             core::arch::asm!("nop");
         }
     }

@@ -7,17 +7,16 @@
 
 use alloc::vec::Vec;
 
+use crate::mm;
 use crate::once::InitOnce;
 use crate::serial;
-use crate::mm;
 
 /// RSDP physical address supplied by the boot loader (Limine, PVH),
 /// populated by `set_rsdp()` before `detect_cpus()` runs. 0 means
 /// "fall back to scanning 0xE0000–0xFFFFF". UEFI firmware (GCE's OVMF
 /// path) doesn't put the RSDP in that legacy range, so on those
 /// platforms the boot-loader hint is the only way to find it.
-static BOOT_RSDP_PADDR: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static BOOT_RSDP_PADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn set_rsdp(paddr: u64) {
     BOOT_RSDP_PADDR.store(paddr, core::sync::atomic::Ordering::Relaxed);
@@ -109,7 +108,9 @@ unsafe fn find_table(sdt_phys: u64, entry_size: u64, sig: [u8; 4]) -> u64 {
         } else {
             read_phys::<u32>(entry_phys_addr) as u64
         };
-        if entry_phys == 0 { continue; }
+        if entry_phys == 0 {
+            continue;
+        }
         let entry_sig: [u8; 4] = read_phys(entry_phys);
         if entry_sig == sig {
             return entry_phys;
@@ -180,7 +181,11 @@ unsafe fn locate_root_sdt() -> (u64, u64) {
     // OVMF path) doesn't put the RSDP in 0xE0000–0xFFFFF, so the scan
     // fails there.
     let rsdp_addr = BOOT_RSDP_PADDR.load(core::sync::atomic::Ordering::Relaxed);
-    let rsdp_addr = if rsdp_addr != 0 { rsdp_addr } else { find_rsdp_bios_scan() };
+    let rsdp_addr = if rsdp_addr != 0 {
+        rsdp_addr
+    } else {
+        find_rsdp_bios_scan()
+    };
     if rsdp_addr == 0 {
         return (0, 0);
     }
@@ -226,7 +231,9 @@ pub unsafe fn detect_cpus() -> u32 {
     }
 
     let mut count = parse_madt_entries(madt_addr, &mut topo);
-    if count == 0 { count = 1; }
+    if count == 0 {
+        count = 1;
+    }
     topo.cpu_count = count;
     TOPOLOGY.init(topo);
     // CPU count is already surfaced in the boot banner's `cpu:` line;
@@ -260,15 +267,21 @@ pub fn topology() -> &'static CpuTopology {
 /// and GCE there is exactly one.
 pub unsafe fn mcfg_ecam_base() -> Option<u64> {
     let (sdt_phys, entry_size) = locate_root_sdt();
-    if sdt_phys == 0 { return None; }
+    if sdt_phys == 0 {
+        return None;
+    }
 
     let mcfg = find_table(sdt_phys, entry_size, MCFG_SIG);
-    if mcfg == 0 { return None; }
+    if mcfg == 0 {
+        return None;
+    }
 
     let total_len: u32 = read_phys(mcfg + 4);
     let total_len = total_len as usize;
     // Header (36) + reserved (8) + at least one 16-byte allocation.
-    if total_len < 60 || total_len > MAX_TABLE_LEN { return None; }
+    if total_len < 60 || total_len > MAX_TABLE_LEN {
+        return None;
+    }
 
     let entries_off = (SDT_HEADER_LEN + 8) as u64;
     let entry_count = (total_len - SDT_HEADER_LEN - 8) / 16;
@@ -278,9 +291,10 @@ pub unsafe fn mcfg_ecam_base() -> Option<u64> {
         let start_bus: u8 = read_phys(base + 10);
         if segment == 0 && start_bus == 0 {
             let phys: u64 = read_phys(base);
-            if phys != 0 { return Some(phys); }
+            if phys != 0 {
+                return Some(phys);
+            }
         }
     }
     None
 }
-

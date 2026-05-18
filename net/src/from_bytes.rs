@@ -128,10 +128,8 @@ mod tests {
     #[test]
     fn try_ref_from_extra_bytes() {
         let bytes = [
-            0x12, 0x34,
-            0x78, 0x56, 0x34, 0x12,
-            0xAB,
-            0xFF, 0xFF, 0xFF, // extra trailing bytes — ignored
+            0x12, 0x34, 0x78, 0x56, 0x34, 0x12, 0xAB, 0xFF, 0xFF,
+            0xFF, // extra trailing bytes — ignored
         ];
         let hdr = Hdr::try_ref_from(&bytes).unwrap();
         let a = hdr.a;

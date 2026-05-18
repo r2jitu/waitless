@@ -49,30 +49,62 @@ pub fn decode(instr: u32) -> Option<MmioAccess> {
 
     match instr & 0xffc0_0000 {
         // LDR Wt, [Xn{, #imm12}]  — 32-bit unsigned-offset load
-        0xb940_0000 => Some(MmioAccess { size: 4, is_write: false, rt }),
+        0xb940_0000 => Some(MmioAccess {
+            size: 4,
+            is_write: false,
+            rt,
+        }),
 
         // STR Wt, [Xn{, #imm12}]  — 32-bit unsigned-offset store
-        0xb900_0000 => Some(MmioAccess { size: 4, is_write: true, rt }),
+        0xb900_0000 => Some(MmioAccess {
+            size: 4,
+            is_write: true,
+            rt,
+        }),
 
         // LDRB Wt, [Xn{, #imm12}] — 8-bit unsigned-offset load
-        0x3940_0000 => Some(MmioAccess { size: 1, is_write: false, rt }),
+        0x3940_0000 => Some(MmioAccess {
+            size: 1,
+            is_write: false,
+            rt,
+        }),
 
         // STRB Wt, [Xn{, #imm12}] — 8-bit unsigned-offset store
-        0x3900_0000 => Some(MmioAccess { size: 1, is_write: true, rt }),
+        0x3900_0000 => Some(MmioAccess {
+            size: 1,
+            is_write: true,
+            rt,
+        }),
 
         // LDR Xt, [Xn{, #imm12}]  — 64-bit unsigned-offset load
         // Needed if the kernel ever does a 64-bit MMIO read (rare but
         // possible for GIC IROUTER if native vGIC doesn't catch it).
-        0xf940_0000 => Some(MmioAccess { size: 8, is_write: false, rt }),
+        0xf940_0000 => Some(MmioAccess {
+            size: 8,
+            is_write: false,
+            rt,
+        }),
 
         // STR Xt, [Xn{, #imm12}]  — 64-bit unsigned-offset store
-        0xf900_0000 => Some(MmioAccess { size: 8, is_write: true, rt }),
+        0xf900_0000 => Some(MmioAccess {
+            size: 8,
+            is_write: true,
+            rt,
+        }),
 
         // LDRH Wt, [Xn{, #imm12}] — 16-bit unsigned-offset load
-        0x7940_0000 => Some(MmioAccess { size: 2, is_write: false, rt }),
+        0x7940_0000 => Some(MmioAccess {
+            size: 2,
+            is_write: false,
+            rt,
+        }),
 
         // STRH Wt, [Xn{, #imm12}] — 16-bit unsigned-offset store
-        0x7900_0000 => Some(MmioAccess { size: 2, is_write: true, rt }),
+        0x7900_0000 => Some(MmioAccess {
+            size: 2,
+            is_write: true,
+            rt,
+        }),
 
         _ => {
             // Check for post-indexed forms (bits 29:27 = 111, bits 26:24 = 000,
