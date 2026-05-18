@@ -266,13 +266,33 @@ async fn udp_echo(sock: alloc::sync::Arc<uni::runtime::UdpSocket>) {
     }
 }
 
-async fn tcp_echo(stream: TcpStream) {
-    let mut buf = [0u8; 1024];
+async fn tcp_echo(mut stream: TcpStream) {
     loop {
-        let Some(n) = uni::runtime::timeout_us(30_000_000, stream.recv(&mut buf)).await
-        else { return; };
-        if n == 0 { return; }
-        if stream.send_bytes(&buf[..n]).await.is_err() { return; }
+        // Zero-copy echo. `recv_chunk` surfaces the transport's own
+        // buffer behind a guard — a NIC RX buffer on bare-metal, a
+        // heap chunk on native. `into_owned()` consumes the guard
+        // (releasing the `&mut stream` borrow) and yields an owned
+        // IOBuf: zero-copy when it wraps the device RX buffer, which
+        // then flows straight back out through `send` — RX buffer →
+        // TX with no intermediate copy on bare-metal. Contrast the
+        // old `recv` + `send_bytes`: device buf → `buf` → TX,
+        // two copies.
+        let guard = match uni::runtime::timeout_us(
+            30_000_000,
+            stream.recv_chunk(),
+        )
+        .await
+        {
+            Some(Some(g)) => g,
+            // inner `None`: peer close / EOF. outer `None`: idle
+            // timeout. Either ends the connection.
+            _ => return,
+        };
+        let mut chain = IOBufChain::new();
+        chain.push_back(guard.into_owned());
+        if stream.send(&mut chain).await.is_err() {
+            return;
+        }
     }
 }
 
