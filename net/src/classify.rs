@@ -54,11 +54,12 @@ fn offset_within(outer: &[u8], inner: &[u8]) -> usize {
 /// arp/ndp snoop and the L4 dispatch are the caller's job, so the
 /// same `classify` serves Tier 1 and Tier 2 with no behavioural fork.
 ///
-/// `fill_v6` fills the IPv6 dst-address accept-list and returns its
-/// length; it is invoked **only for an IPv6 frame**, so an IPv4 or
-/// ARP frame pays nothing for it (the caller passes the os:none
-/// `ipv6_nd::our_v6_addrs`, which `net_rx` must not depend on).
-pub fn classify(frame: &[u8], fill_v6: impl FnOnce(&mut [Ipv6Addr; 5]) -> usize) -> Classified {
+/// `accept_v6` answers "is this IPv6 dst one of ours?" — the host's
+/// address policy. It is consulted **only for an IPv6 frame**, so an
+/// IPv4 or ARP frame pays nothing for it (the caller passes the
+/// os:none `ipv6_nd::v6_addr_is_ours`, which `net_rx` must not depend
+/// on).
+pub fn classify(frame: &[u8], accept_v6: impl Fn(&Ipv6Addr) -> bool) -> Classified {
     let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) else {
         return Classified::Drop;
     };
@@ -72,14 +73,10 @@ pub fn classify(frame: &[u8], fill_v6: impl FnOnce(&mut [Ipv6Addr; 5]) -> usize)
             Some(p) => Classified::Ip(p),
             None => Classified::Drop,
         },
-        ipv6::ETHERTYPE_IPV6 => {
-            let mut accept = [Ipv6Addr::ANY; 5];
-            let n = fill_v6(&mut accept);
-            match summarize_ipv6(frame, payload, src_mac, &accept[..n]) {
-                Some(p) => Classified::Ip(p),
-                None => Classified::Drop,
-            }
-        }
+        ipv6::ETHERTYPE_IPV6 => match summarize_ipv6(frame, payload, src_mac, accept_v6) {
+            Some(p) => Classified::Ip(p),
+            None => Classified::Drop,
+        },
         _ => Classified::Drop,
     }
 }
@@ -113,15 +110,21 @@ fn summarize_ipv4(frame: &[u8], eth_payload: &[u8], src_mac: MacAddr) -> Option<
 
 /// Summarise an IPv6 packet into a [`ParsedL3`] — the IPv6 twin of
 /// `summarize_ipv4`. The L4 offset is robust across IPv6 extension
-/// headers. `our_v6` is the dst-address accept-list `ipv6_parse`
-/// filters against.
+/// headers. `accept_v6` is the host's dst-address policy: a v6 frame
+/// whose dst it rejects summarises to `None` (→ `Classified::Drop`).
 fn summarize_ipv6(
     frame: &[u8],
     eth_payload: &[u8],
     src_mac: MacAddr,
-    our_v6: &[Ipv6Addr],
+    accept_v6: impl Fn(&Ipv6Addr) -> bool,
 ) -> Option<ParsedL3> {
-    let pkt = ipv6::ipv6_parse(eth_payload, our_v6)?;
+    let pkt = ipv6::ipv6_parse(eth_payload)?;
+    // `ipv6_parse` is a pure wire parse; applying the dst-address
+    // policy is ours. `net_rx` stays a leaf — the predicate is
+    // supplied by the os:none caller.
+    if !accept_v6(&pkt.dst) {
+        return None;
+    }
     let l4_off = offset_within(frame, pkt.payload);
     let l4_len = pkt.payload.len();
     Some(ParsedL3 {
@@ -239,10 +242,9 @@ mod tests {
         p
     }
 
-    // The IPv6 accept-list closure for tests: dst `::` is `ANY`.
-    fn accept_any(buf: &mut [Ipv6Addr; 5]) -> usize {
-        buf[0] = Ipv6Addr::ANY;
-        1
+    // The IPv6 dst-address accept predicate for tests: accept any.
+    fn accept_any(_dst: &Ipv6Addr) -> bool {
+        true
     }
 
     #[test]
@@ -286,6 +288,21 @@ mod tests {
             }
             _ => panic!("expected Ip(v6)"),
         }
+    }
+
+    #[test]
+    fn drops_ipv6_dst_not_ours() {
+        // A well-formed IPv6/TCP frame whose dst the accept predicate
+        // rejects classifies to `Drop`. `ipv6_parse` no longer applies
+        // the dst-address policy itself — `summarize_ipv6` does, via
+        // the predicate `classify` is handed.
+        let mut v6 = vec![0u8; 40];
+        v6[0] = 0x60; // version 6
+        v6[4..6].copy_from_slice(&4u16.to_be_bytes()); // payload_length = 4
+        v6[6] = 6; // next_header = TCP
+        v6.extend_from_slice(&[0x00, 0x50, 0x30, 0x39]);
+        let frame = eth_frame(0x86dd, &v6);
+        assert!(matches!(classify(&frame, |_| false), Classified::Drop));
     }
 
     #[test]

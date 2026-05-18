@@ -42,7 +42,7 @@ pub fn net_receive(chain: Chain<OwnedIOBuf>) {
         return;
     };
     let frame = first.data();
-    match classify(frame, ipv6_nd::our_v6_addrs) {
+    match classify(frame, ipv6_nd::v6_addr_is_ours) {
         Classified::Arp(off) => {
             if let Some(payload) = frame.get(off..) {
                 arp::arp_receive(payload);
@@ -68,7 +68,7 @@ pub(crate) fn distribute_frame(chain: Chain<OwnedIOBuf>) {
         return;
     };
     let frame = first.data();
-    match classify(frame, ipv6_nd::our_v6_addrs) {
+    match classify(frame, ipv6_nd::v6_addr_is_ours) {
         Classified::Arp(off) => {
             if let Some(payload) = frame.get(off..) {
                 arp::arp_receive(payload);

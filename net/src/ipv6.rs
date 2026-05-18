@@ -11,7 +11,8 @@
 //   * `ipv6_build` — fills a caller-supplied buffer with header +
 //     payload, returns total length.
 //   * `ipv6_parse` — peels the v6 header, returns src/dst/
-//     next_header/payload after dst-address filtering.
+//     next_header/payload. Pure parse: dst-address policy (is
+//     this packet for us?) is the caller's.
 //   * `pseudo_checksum` — IPv6 pseudo-header for ICMPv6 / UDP /
 //     TCP (RFC 8200 §8.1 + RFC 4443 §2.3).
 //
@@ -136,15 +137,15 @@ pub fn ipv6_build(
     Some(total)
 }
 
-/// Parse and validate an IPv6 packet. Returns `None` if malformed
-/// or addressed elsewhere.
-///
-/// `our_addrs` is the slice of unicast / solicited-node /
-/// all-nodes-link-local addresses we accept. The receive path
-/// drops packets whose dst isn't in this set. Caller-managed
-/// because the IPv6 module is plain L3 — the address policy lives
-/// in higher layers (NDP / SLAAC / app config).
-pub fn ipv6_parse<'a>(data: &'a [u8], our_addrs: &[Ipv6Addr]) -> Option<Ipv6Packet<'a>> {
+/// Parse and validate an IPv6 packet's fixed header. Returns `None`
+/// only when the bytes are malformed — too short for the 40-byte
+/// header, or not version 6. A pure wire parse: whether the packet
+/// is addressed to us (dst-address policy) is the caller's call.
+/// The IPv6 module is plain L3, so `net_rx`'s `summarize_ipv6`
+/// applies the host accept predicate against the returned `dst`;
+/// the address policy itself lives in higher layers (NDP / SLAAC /
+/// app config).
+pub fn ipv6_parse(data: &[u8]) -> Option<Ipv6Packet<'_>> {
     let hdr = Ipv6Header::try_ref_from(data)?;
     let v_c_f = ntohl_local(hdr.version_class_flow);
     if (v_c_f >> 28) != 6 {
@@ -165,9 +166,6 @@ pub fn ipv6_parse<'a>(data: &'a [u8], our_addrs: &[Ipv6Addr]) -> Option<Ipv6Pack
     // multi-buffer chain. `try_ref_from` already guaranteed
     // `data.len() >= HEADER_LEN`, so `payload_end >= HEADER_LEN`.
     let payload_end = (HEADER_LEN + payload_len).min(data.len());
-    if !our_addrs.iter().any(|a| *a == hdr.dst) {
-        return None;
-    }
     Some(Ipv6Packet {
         src: hdr.src,
         dst: hdr.dst,
@@ -237,7 +235,7 @@ mod tests {
         let n = ipv6_build(&src, &dst, next_header::ICMPV6, 255, payload, &mut buf).expect("build");
         assert_eq!(n, HEADER_LEN + 4);
 
-        let pkt = ipv6_parse(&buf, &[dst]).expect("parse");
+        let pkt = ipv6_parse(&buf).expect("parse");
         assert_eq!(pkt.src, src);
         assert_eq!(pkt.dst, dst);
         assert_eq!(pkt.next_header, next_header::ICMPV6);
@@ -249,8 +247,7 @@ mod tests {
     fn rejects_wrong_version() {
         let mut buf = [0u8; HEADER_LEN];
         buf[0] = 0x40; // version=4 (impossible in v6 header but caught)
-        let addrs: [Ipv6Addr; 0] = [];
-        assert!(ipv6_parse(&buf, &addrs).is_none());
+        assert!(ipv6_parse(&buf).is_none());
     }
 
     #[test]
@@ -270,8 +267,7 @@ mod tests {
         // tail lives in later chain parts the parser never sees.
         buf[4..6].copy_from_slice(&50000u16.to_be_bytes());
         buf[6] = next_header::TCP;
-        let our = [Ipv6Addr::ANY];
-        let pkt = ipv6_parse(&buf, &our).expect("super-segment accepted");
+        let pkt = ipv6_parse(&buf).expect("super-segment accepted");
         assert_eq!(pkt.next_header, next_header::TCP);
         // Payload view is clamped to what part 0 actually holds — the
         // 24 bytes after the header — not the 50000 declared.
@@ -285,18 +281,7 @@ mod tests {
         // fixed header is still rejected by `try_ref_from`, which
         // guards the header read the clamp relies on.
         let buf = [0x60u8; HEADER_LEN - 1];
-        let our = [Ipv6Addr::ANY];
-        assert!(ipv6_parse(&buf, &our).is_none());
-    }
-
-    #[test]
-    fn rejects_dst_not_ours() {
-        let mut buf = [0u8; HEADER_LEN];
-        buf[0] = 0x60;
-        buf[6] = next_header::ICMPV6;
-        buf[24 + 15] = 0x42; // dst = ::42
-        let our = [Ipv6Addr::ANY]; // ::
-        assert!(ipv6_parse(&buf, &our).is_none());
+        assert!(ipv6_parse(&buf).is_none());
     }
 
     #[test]

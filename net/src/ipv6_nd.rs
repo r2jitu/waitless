@@ -4,8 +4,8 @@
 //!
 //! Carved out of the crate root so the IPv6 bring-up logic no longer
 //! sits interleaved with the RX poll machinery. The receive pipeline
-//! (`crate::rx`) calls `our_v6_addrs` to build the dst-address
-//! accept-list and `handle_icmpv6` to service an inbound ICMPv6
+//! (`crate::rx`) calls `v6_addr_is_ours` as the dst-address accept
+//! predicate and `handle_icmpv6` to service an inbound ICMPv6
 //! packet; `init_ipv6` is invoked once from `crate::init_stack`.
 
 use crate::{ethernet, icmpv6, ipv6, ipv6_send, types};
@@ -171,22 +171,28 @@ fn handle_router_advertisement(payload: &[u8]) {
     ));
 }
 
-/// Fill `out` with the addresses we accept inbound IPv6 packets
-/// to: link-local, its solicited-node multicast, all-nodes
-/// link-local (ff02::1), and the SLAAC global (when configured)
-/// + its solicited-node group. Returns the number of slots used.
-pub(crate) fn our_v6_addrs(out: &mut [types::Ipv6Addr; 5]) -> usize {
+/// Is `addr` an IPv6 destination this host accepts inbound packets
+/// to — its link-local, that link-local's solicited-node multicast,
+/// all-nodes link-local (ff02::1), or (once SLAAC has completed) the
+/// global unicast + its solicited-node group? Passed to
+/// `net_rx::classify` as the v6 dst-address accept predicate;
+/// consulted once per inbound IPv6 frame.
+pub(crate) fn v6_addr_is_ours(addr: &types::Ipv6Addr) -> bool {
     let ll = ipv6_ll();
-    out[0] = ll;
-    out[1] = types::Ipv6Addr::solicited_node(&ll);
-    out[2] = types::Ipv6Addr::ALL_NODES_LL;
-    let mut n = 3;
-    if let Some(g) = ipv6_global() {
-        out[n] = g;
-        out[n + 1] = types::Ipv6Addr::solicited_node(&g);
-        n += 2;
+    // Cheapest, commonest cases first — most inbound v6 traffic is
+    // unicast to our link-local or global, or NDP to all-nodes. `||`
+    // short-circuits, so the solicited-node derivation and the
+    // `ipv6_global` read only run when those miss.
+    if *addr == ll || *addr == types::Ipv6Addr::ALL_NODES_LL {
+        return true;
     }
-    n
+    if *addr == types::Ipv6Addr::solicited_node(&ll) {
+        return true;
+    }
+    match ipv6_global() {
+        Some(g) => *addr == g || *addr == types::Ipv6Addr::solicited_node(&g),
+        None => false,
+    }
 }
 
 pub(crate) fn handle_icmpv6(
