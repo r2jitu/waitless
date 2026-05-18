@@ -87,8 +87,8 @@ rust_library(
         ":ethernet",
         ":from_bytes",
         ":types",
-        "//drivers",
-        "//kernel",
+        "//drivers:nic",
+        "//kernel/core",
         "//uni-iobuf",
     ],
 )
@@ -157,9 +157,9 @@ rust_test(
     crate = ":icmpv6",
 )
 
-# NDP MAC cache. Mirrors `:arp`. Kernel-only (Spinlock dep), so
-# no host test target — covered via the integration tests against
-# the running unikernel.
+# NDP MAC cache. Mirrors `:arp`. Host-testable — its only non-leaf
+# dep is `kernel_core` (the host-buildable `Spinlock`); `ndp_test`
+# covers the cache logic (lookup / FIFO eviction / learn guards).
 rust_library(
     name = "ndp",
     srcs = ["src/ndp.rs"],
@@ -167,8 +167,14 @@ rust_library(
     crate_root = "src/ndp.rs",
     deps = [
         ":types",
-        "//kernel",
+        "//kernel/core",
     ],
+)
+
+rust_test(
+    name = "ndp_test",
+    size = "small",
+    crate = ":ndp",
 )
 
 # Destination-MAC resolution dispatcher. Thin layer over `arp` +

@@ -2,20 +2,20 @@
 
 #![no_std]
 
+extern crate kernel_core;
 extern crate net_eth_tx as eth_tx;
 extern crate net_ethernet as ethernet;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
-extern crate uni_drivers;
+extern crate nic;
 extern crate uni_iobuf;
-extern crate uni_kernel;
 
 use eth_tx::ethernet_send;
 use ethernet::{ETHERTYPE_ARP, ethernet_our_mac, ethernet_parse};
 use from_bytes::FromBytes;
+use kernel_core::sync::Spinlock;
 use types::{CONFIG, Ipv4Addr, MacAddr, htons, ntohs};
 use uni_iobuf::{Chain, OwnedIOBuf};
-use uni_kernel::sync::Spinlock;
 
 const ARP_CACHE_SIZE: usize = 64;
 
@@ -154,13 +154,14 @@ struct ArpFastSlot {
 }
 
 /// Per-core fast cache slots, sized to actual core count at boot.
-static ARP_FAST: uni_kernel::percpu::PerWorker<ArpFastSlot> = uni_kernel::percpu::PerWorker::new();
+static ARP_FAST: kernel_core::percpu::PerWorker<ArpFastSlot> =
+    kernel_core::percpu::PerWorker::new();
 
 /// Allocate the per-core ARP fast cache. Called from the net stack's
-/// init path on the BSP after `uni_kernel::percpu::init` has set
+/// init path on the BSP after `kernel_core::percpu::init` has set
 /// `num_workers`. Idempotent.
 pub fn init() {
-    ARP_FAST.init(uni_kernel::percpu::num_cores(), |_| ArpFastSlot {
+    ARP_FAST.init(kernel_core::percpu::num_cores(), |_| ArpFastSlot {
         ip: AtomicU32::new(0),
         mac: AtomicU64::new(0),
     });
@@ -196,7 +197,7 @@ fn arp_fast_lookup(ip: Ipv4Addr) -> Option<MacAddr> {
     if ip.addr == 0 {
         return None;
     }
-    let core = uni_kernel::cpu_id();
+    let core = kernel_core::cpu_id();
     if core >= ARP_FAST.len() {
         return None;
     }
@@ -216,7 +217,7 @@ fn arp_fast_lookup(ip: Ipv4Addr) -> Option<MacAddr> {
 
 #[inline]
 fn arp_fast_store(ip: Ipv4Addr, mac: MacAddr) {
-    let core = uni_kernel::cpu_id();
+    let core = kernel_core::cpu_id();
     if core >= ARP_FAST.len() {
         return;
     }
@@ -251,7 +252,7 @@ fn arp_request(target_ip: Ipv4Addr) {
     // arrives — but that can't happen until the ARP request is sent. One
     // targeted flush_tx_staging call breaks the deadlock by waking core 0.
     // Fires at most 3 times per arp_resolve (once per retry), not thousands.
-    uni_drivers::net::flush_tx_staging();
+    nic::flush_tx_staging();
 }
 
 /// Snoop a peer's MAC from any received L2 frame with a usable
@@ -367,7 +368,7 @@ pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
             // around the queue access, so concurrent calls across cores
             // are serialised; an ARP reply observed here updates the
             // cache that arp_lookup reads on the next iteration.
-            uni_drivers::net::poll(arp_poll_callback);
+            nic::poll(arp_poll_callback);
             if let Some(mac) = ARP_CACHE.lock().lookup(target) {
                 arp_fast_store(ip, mac);
                 return Some(mac);

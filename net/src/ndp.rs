@@ -22,13 +22,13 @@
 //     inline using the inbound frame's MAC, learn-only suffices.
 //   * Per-entry timeout — an entry stays valid until evicted.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
+extern crate kernel_core;
 extern crate net_types as types;
-extern crate uni_kernel;
 
+use kernel_core::sync::Spinlock;
 use types::{Ipv6Addr, MacAddr};
-use uni_kernel::sync::Spinlock;
 
 const NDP_CACHE_SIZE: usize = 32;
 
@@ -137,9 +137,76 @@ pub fn ndp_resolve(ip: &Ipv6Addr) -> Option<MacAddr> {
 
 #[cfg(test)]
 mod tests {
-    // Note: these tests require `Spinlock` from `uni_kernel`,
-    // which is bare-metal-only. Skipped under host-native test
-    // runners — covered indirectly via the integration tests in
-    // `apps/webserver` (which exercises ndp_learn from the
-    // receive path on the running unikernel).
+    use super::*;
+
+    /// A global-unicast IPv6 address (`2000::/3`) keyed by its last
+    /// octet — distinct from `ANY` and from any multicast group.
+    fn ip(last: u8) -> Ipv6Addr {
+        let mut o = [0u8; 16];
+        o[0] = 0x20;
+        o[15] = last;
+        Ipv6Addr::from(o)
+    }
+
+    fn mac(tag: u8) -> MacAddr {
+        MacAddr { bytes: [tag; 6] }
+    }
+
+    #[test]
+    fn lookup_misses_on_empty_cache() {
+        let cache = NdpCache::new();
+        assert_eq!(cache.lookup(&ip(1)), None);
+    }
+
+    #[test]
+    fn update_then_lookup_hits() {
+        let mut cache = NdpCache::new();
+        cache.update(ip(1), mac(0xaa));
+        assert_eq!(cache.lookup(&ip(1)), Some(mac(0xaa)));
+        assert_eq!(cache.lookup(&ip(2)), None);
+    }
+
+    #[test]
+    fn update_refreshes_existing_entry() {
+        let mut cache = NdpCache::new();
+        cache.update(ip(1), mac(0xaa));
+        cache.update(ip(1), mac(0xbb));
+        assert_eq!(cache.lookup(&ip(1)), Some(mac(0xbb)));
+        // A refresh must reuse the slot, not consume a second one:
+        // fill the rest of the table and confirm ip(1) is not evicted.
+        for i in 0..(NDP_CACHE_SIZE - 1) as u8 {
+            cache.update(ip(100 + i), mac(i));
+        }
+        assert_eq!(cache.lookup(&ip(1)), Some(mac(0xbb)));
+    }
+
+    #[test]
+    fn fifo_eviction_when_full() {
+        let mut cache = NdpCache::new();
+        for i in 0..NDP_CACHE_SIZE as u8 {
+            cache.update(ip(i), mac(i));
+        }
+        assert_eq!(cache.lookup(&ip(0)), Some(mac(0)));
+        // One past full — FIFO evicts the oldest entry (slot 0 = ip(0)).
+        cache.update(ip(200), mac(0xff));
+        assert_eq!(cache.lookup(&ip(0)), None);
+        assert_eq!(cache.lookup(&ip(200)), Some(mac(0xff)));
+        // The second-oldest entry survives.
+        assert_eq!(cache.lookup(&ip(1)), Some(mac(1)));
+    }
+
+    #[test]
+    fn resolve_rejects_multicast() {
+        // Multicast destinations have a deterministic MAC mapping
+        // (RFC 2464 §7) and must never resolve through the cache.
+        assert_eq!(ndp_resolve(&Ipv6Addr::ALL_NODES_LL), None);
+    }
+
+    #[test]
+    fn learn_ignores_unspecified() {
+        // The unspecified address is never a valid unicast
+        // destination — `ndp_learn` must drop it silently.
+        ndp_learn(Ipv6Addr::ANY, mac(0x11));
+        assert_eq!(ndp_resolve(&Ipv6Addr::ANY), None);
+    }
 }
