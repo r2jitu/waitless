@@ -71,7 +71,12 @@ class QemuEnv:
                  f"hostfwd=tcp::{gateway_port}-:9000,"
                  f"hostfwd=udp::{port+1}-:7"),
                 "-kernel", elf]
-        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Capture QEMU stderr (accel-init / bad-device errors) so a
+        # failed launch surfaces instead of a bare `SKIP (not ready)`.
+        qemu_log = open(f"/tmp/bench_{port}.qemu.log", "w")
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=qemu_log)
+        qemu_log.close()  # child keeps the dup'd fd
+        return proc
 
     def stop(self, proc):
         if proc and proc.poll() is None:
@@ -142,7 +147,12 @@ class KvmEnv:
         cmd += ["-device", f"{dev},netdev=net0",
                 "-netdev", netdev,
                 "-kernel", elf]
-        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Capture QEMU stderr (accel-init / bad-device errors) so a
+        # failed launch surfaces instead of a bare `SKIP (not ready)`.
+        qemu_log = open(f"/tmp/bench_{port}.qemu.log", "w")
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=qemu_log)
+        qemu_log.close()  # child keeps the dup'd fd
+        return proc
 
     def stop(self, proc):
         if proc and proc.poll() is None:
@@ -200,7 +210,12 @@ class QemuAarch64Env:
                 f"hostfwd=tcp::{gateway_port}-:9000,"
                 f"hostfwd=udp::{port+1}-:7"),
                "-kernel", img]
-        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Capture QEMU stderr (accel-init / bad-device errors) so a
+        # failed launch surfaces instead of a bare `SKIP (not ready)`.
+        qemu_log = open(f"/tmp/bench_{port}.qemu.log", "w")
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=qemu_log)
+        qemu_log.close()  # child keeps the dup'd fd
+        return proc
 
     def stop(self, proc):
         if proc and proc.poll() is None:

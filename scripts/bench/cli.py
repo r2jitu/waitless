@@ -629,7 +629,10 @@ def main():
                             (f"/tmp/hvf_{port}.log", "stderr"),
                         ]
                     elif isinstance(env, (KvmEnv, QemuEnv, QemuAarch64Env)):
-                        serial_sources = [(f"/tmp/bench_{port}.log", "serial")]
+                        serial_sources = [
+                            (f"/tmp/bench_{port}.log", "serial"),
+                            (f"/tmp/bench_{port}.qemu.log", "qemu"),
+                        ]
                     else:
                         serial_sources = []
                     for path, label in serial_sources:
