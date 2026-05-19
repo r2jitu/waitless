@@ -14,7 +14,7 @@ pub fn check_shutdown() -> bool {
 
 // ---- Net stack re-exports (TCP/UDP + driver diagnostics) ------------------
 
-pub use uni_drivers::net::{
+pub use nic::{
     DIAG_QP_CAP as NET_DIAG_QP_CAP, TxDescLogEntry as NetTxDescLogEntry, TxDiag as NetTxDiag,
     num_queue_pairs as net_num_queue_pairs, rx_counts as net_rx_counts,
     rx_used_cursors as net_rx_used_cursors, tx_desc_log_snapshot as net_tx_desc_log_snapshot,
@@ -180,15 +180,15 @@ impl Drop for IrqGuard {
 }
 
 pub fn wait_for_events() {
-    uni_drivers::net::flush_tx_staging();
+    nic::flush_tx_staging();
 
-    if uni_drivers::net::irq_idle_supported() {
+    if nic::irq_idle_supported() {
         let _irq = IrqGuard::new();
-        uni_drivers::net::arm_rx_interrupts();
-        if !uni_drivers::net::has_pending_rx() && !uni_drivers::net::has_pending_tx() {
+        nic::arm_rx_interrupts();
+        if !nic::has_pending_rx() && !nic::has_pending_tx() {
             uni_kernel::cpu::idle_bounded();
         }
-        uni_drivers::net::flush_tx_staging();
+        nic::flush_tx_staging();
     } else {
         uni_kernel::cpu::relax();
     }

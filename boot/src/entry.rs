@@ -14,6 +14,7 @@ extern crate alloc;
 
 use core::ptr;
 
+extern crate nic;
 extern crate uni;
 extern crate uni_drivers;
 extern crate uni_kernel;
@@ -491,26 +492,26 @@ unsafe fn kernel_boot(info: &BootInfo) {
         // would have paid emitting inline, just deferred.
         serial::flush_early_buf();
 
-        // NIC bring-up. `uni_drivers::net::init()` tries gVNIC first
+        // NIC bring-up. `nic::init()` tries gVNIC first
         // (preferred on GCE — native RSS multi-queue) then falls back
         // to virtio-net (kvm-vm, HVF, default GCE instances).
-        let net_ok = uni_drivers::net::init();
+        let net_ok = nic::init();
         if !net_ok {
             klog!("nic: none (no gVNIC, no virtio-net)\n");
         } else {
             // Cache MAC address for multi-core safe access.
             net::eth_tx::init_mac();
             let mut mac = [0u8; 6];
-            uni_drivers::net::get_mac(mac.as_mut_ptr());
+            nic::get_mac(mac.as_mut_ptr());
             klog!(
                 "nic: {} {} qps={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
-                uni_drivers::net::driver_name(),
-                if uni_drivers::net::num_queue_pairs() > 1 {
+                nic::driver_name(),
+                if nic::num_queue_pairs() > 1 {
                     "Tier-1"
                 } else {
                     "Tier-2"
                 },
-                uni_drivers::net::num_queue_pairs(),
+                nic::num_queue_pairs(),
                 mac[0],
                 mac[1],
                 mac[2],
@@ -529,7 +530,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
             // addrs, NDP, etc.). `net_receive` matches on the IP
             // protocol byte directly.
             net::init_stack();
-            uni_drivers::net::enable_irq();
+            nic::enable_irq();
             klog!("net: stack ready (Ethernet/ARP/IPv4/TCP/UDP)\n");
 
             #[cfg(target_arch = "x86_64")]
@@ -648,11 +649,11 @@ fn publish_boot_info(net_ok: bool) {
     let mut nics: Vec<NicInfo> = Vec::new();
     if net_ok {
         let mut mac = [0u8; 6];
-        uni_drivers::net::get_mac(mac.as_mut_ptr());
+        nic::get_mac(mac.as_mut_ptr());
         nics.push(NicInfo {
-            name: uni_drivers::net::driver_name(),
+            name: nic::driver_name(),
             mac,
-            num_queue_pairs: uni_drivers::net::num_queue_pairs(),
+            num_queue_pairs: nic::num_queue_pairs(),
         });
     }
 
@@ -703,7 +704,7 @@ fn idle_cb(core_id: u32) {
     // No wake-up source → busy-poll. (Happens when the transport
     // doesn't expose any IRQ path: aarch64 without GIC configured,
     // legacy PCI without an IRQ line, etc.)
-    if !uni_drivers::net::irq_idle_supported() {
+    if !nic::irq_idle_supported() {
         return;
     }
     if core_id == 0 || uni_kernel::percpu::num_cores() <= 1 {

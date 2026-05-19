@@ -1240,9 +1240,9 @@ pub extern "C" fn native_worker_loop(thread_id: u32) {
 
 // ---- Driver diagnostics stubs (native has no NIC driver) -------------------
 //
-// Parallel the unikernel side's `uni_drivers::net::{rx_counts, num_queue_pairs,
-// rx_used_cursors}` so cross-platform callers see the same names and return
-// zeros here.
+// Parallel the unikernel side's `nic::{rx_counts, num_queue_pairs,
+// rx_used_cursors}` so cross-platform callers see the same names and
+// return zeros here.
 
 pub fn net_rx_counts() -> [u64; 8] {
     [0; 8]

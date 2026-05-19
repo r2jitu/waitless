@@ -34,7 +34,7 @@ rust_library(
     ] + select({
         "//bazel/platforms:native": ["//util/atomic_fn"],
         "//conditions:default": [
-            "//drivers",
+            "//drivers:nic",
             "//kernel",
             "//net",
             # `net_tcp` crate, for `tcp_diag()`'s TCP-stack counters.

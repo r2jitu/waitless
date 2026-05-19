@@ -11,7 +11,7 @@
 #![no_std]
 
 extern crate alloc;
-extern crate uni_drivers;
+extern crate nic;
 extern crate uni_iobuf;
 extern crate uni_kernel;
 extern crate uni_runtime;
@@ -73,15 +73,14 @@ static BARE_TCP_BACKEND: uni_runtime::net::TcpBackend = uni_runtime::net::TcpBac
     shutdown_all: Some(bare_shutdown_all),
 };
 
-/// Wrapper around `tcp::shutdown_all` that flushes the virtio-net
-/// TX staging + queue-notify after the RST sweep so the host
-/// observes the RSTs before `arch::shutdown()` returns. Lives here
-/// (not in `net_tcp`) because that crate deliberately doesn't depend
-/// on `uni_drivers`.
+/// Wrapper around `tcp::shutdown_all` that flushes the NIC TX
+/// staging + queue-notify after the RST sweep so the host observes
+/// the RSTs before `arch::shutdown()` returns. Bare-metal backend
+/// glue — lives here, where the `TcpBackend` vtable is assembled.
 fn bare_shutdown_all() {
     tcp::shutdown_all();
-    uni_drivers::net::flush_tx_staging();
-    uni_drivers::net::flush_tx_kick_if_dirty();
+    nic::flush_tx_staging();
+    nic::flush_tx_kick_if_dirty();
 }
 
 /// Bare-metal UDP backend vtable. No `bind` / `unbind` — routing
@@ -90,7 +89,7 @@ static BARE_UDP_BACKEND: uni_runtime::net::UdpBackend = uni_runtime::net::UdpBac
     bind: None,
     unbind: None,
     send: udp::send,
-    acquire_tx_buf: Some(uni_drivers::net::acquire_tx_buf),
+    acquire_tx_buf: Some(nic::acquire_tx_buf),
     send_via_tx_handle: Some(udp::send_via_tx_handle),
     send_with_l2_headroom: Some(udp::send_with_l2_headroom),
 };

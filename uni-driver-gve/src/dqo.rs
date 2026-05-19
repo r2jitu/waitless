@@ -12,7 +12,7 @@ use core::ptr;
 use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 
-use drivers_infra::mmio_write32;
+use uni_drivers::mmio_write32;
 use uni_iobuf::{Chain, IOBufDropFn, OwnedIOBuf};
 
 use crate::{

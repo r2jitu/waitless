@@ -2,18 +2,19 @@ load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
-# Shared hardware-access infra: MMIO helpers, PCI enumeration, VirtIO
-# transport, virtio-console. NIC driver crates depend here.
+# Shared hardware-access layer: MMIO helpers, PCI enumeration, VirtIO
+# transport, virtio-console. The NIC driver crates depend here; the
+# NIC-dispatch layer is the sibling `:nic` crate.
 rust_library(
-    name = "infra",
+    name = "drivers",
     srcs = [
-        "src/infra.rs",
+        "src/lib.rs",
         "src/pci.rs",
         "src/virtio.rs",
         "src/virtio_console.rs",
     ],
-    crate_name = "drivers_infra",
-    crate_root = "src/infra.rs",
+    crate_name = "uni_drivers",
+    crate_root = "src/lib.rs",
     deps = [
         "//kernel",
     ],
@@ -24,27 +25,11 @@ rust_library(
 # host-buildable crate — its only dependency is the host-buildable
 # `//uni-net:driver` interface crate — so the TX-side net crates
 # (`net_eth_tx`, `net_tcp`, …) can call the dispatchers without being
-# dragged onto the os:none `//drivers` umbrella.
+# dragged onto the os:none `:drivers` crate.
 rust_library(
     name = "nic",
     srcs = ["src/nic.rs"],
     crate_name = "nic",
     crate_root = "src/nic.rs",
     deps = ["//uni-net:driver"],
-)
-
-# Outer umbrella: re-exports `drivers_infra` + the `nic` dispatch crate
-# (as `uni_drivers::net`). Does NOT depend on specific NIC crates —
-# apps pick their drivers via `unikernel_binary(drivers = [...])`.
-rust_library(
-    name = "drivers",
-    srcs = [
-        "src/lib.rs",
-    ],
-    crate_name = "uni_drivers",
-    crate_root = "src/lib.rs",
-    deps = [
-        ":infra",
-        ":nic",
-    ],
 )

@@ -4,8 +4,8 @@
 #![allow(dead_code, unused_imports)]
 
 extern crate alloc;
-extern crate drivers_infra;
 extern crate net_checksum;
+extern crate uni_drivers;
 extern crate uni_iobuf;
 extern crate uni_kernel;
 extern crate uni_net_driver;
@@ -17,8 +17,8 @@ use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
 use uni_iobuf::{Chain, IOBufDropFn, OwnedIOBuf};
 
-use drivers_infra::pci::{enable_bus_mastering_inner, find_device, pci_device, read_config};
-use drivers_infra::virtio::{
+use uni_drivers::pci::{enable_bus_mastering_inner, find_device, pci_device, read_config};
+use uni_drivers::virtio::{
     MMIO_BASE, MMIO_DEVICE_CONFIG, MMIO_DEVICE_FEATURES_SEL, MMIO_DEVICE_ID,
     MMIO_DRIVER_FEATURES_SEL, MMIO_GUEST_FEATURES, MMIO_GUEST_PAGE_SIZE, MMIO_HOST_FEATURES,
     MMIO_INTERRUPT_ACK, MMIO_INTERRUPT_STATUS, MMIO_MAGIC, MMIO_MAGIC_VALUE, MMIO_STATUS,
@@ -33,7 +33,7 @@ use drivers_infra::virtio::{
     vpci_read_features, vpci_read_isr, vpci_reset, vpci_select_queue, vpci_set_config_msix_vector,
     vpci_set_queue_addrs, vpci_set_queue_msix_vector, vpci_set_status, vpci_write_features,
 };
-use drivers_infra::{
+use uni_drivers::{
     dsb_st, log, virtio_read8, virtio_read16, virtio_read32, virtio_write8, virtio_write32,
 };
 #[cfg(target_arch = "aarch64")]

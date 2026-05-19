@@ -39,7 +39,7 @@
 
 #![no_std]
 
-extern crate drivers_infra;
+extern crate uni_drivers;
 extern crate uni_iobuf;
 extern crate uni_kernel;
 extern crate uni_net_driver;
@@ -74,8 +74,8 @@ use core::ptr;
 use core::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
 };
-use drivers_infra::pci;
-use drivers_infra::{log, mmio_read32, mmio_write32};
+use uni_drivers::pci;
+use uni_drivers::{log, mmio_read32, mmio_write32};
 use uni_kernel::mm::{alloc_pages, phys_to_virt};
 use uni_kernel::sync::Spinlock;
 
@@ -1929,9 +1929,9 @@ fn flush_tx_kick_if_dirty_qp(qp: usize) -> bool {
     true
 }
 
-/// Flush the current core's TX queue if dirty. Mirrors
-/// `uni_drivers::virtio_net::flush_tx_kick_if_dirty` so the shim in
-/// `uni_drivers::net` can dispatch through the same signature.
+/// Flush the current core's TX queue if dirty. Matches the
+/// `NicOps::flush_tx_kick_if_dirty` signature so the `nic` dispatch
+/// crate can call it through the active-ops slot.
 fn flush_tx_kick_if_dirty() -> bool {
     match current_qp() {
         Some(qp) => flush_tx_kick_if_dirty_qp(qp),

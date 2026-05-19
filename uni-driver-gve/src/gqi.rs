@@ -17,7 +17,7 @@
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
-use drivers_infra::mmio_write32;
+use uni_drivers::mmio_write32;
 use uni_iobuf::{Chain, OwnedIOBuf};
 
 use crate::{

@@ -86,11 +86,11 @@ pub fn poll() -> bool {
     let num_cores = percpu::num_cores();
 
     if num_cores <= 1 {
-        return uni_drivers::net::poll(rx::net_receive) > 0;
+        return nic::poll(rx::net_receive) > 0;
     }
 
     // Tier 1: multi-queue — each core polls its own RX queue pair.
-    if uni_drivers::net::num_queue_pairs() > 1 {
+    if nic::num_queue_pairs() > 1 {
         return poll_tier1();
     }
 
@@ -103,7 +103,7 @@ pub fn poll() -> bool {
 fn poll_tier1() -> bool {
     if !MULTICORE_INIT.load(core::sync::atomic::Ordering::Relaxed) {
         MULTICORE_INIT.store(true, core::sync::atomic::Ordering::Relaxed);
-        let nqp = uni_drivers::net::num_queue_pairs();
+        let nqp = nic::num_queue_pairs();
         // One write_fmt holds SERIAL_TX_LOCK for the whole line so a
         // concurrent klog! on another core can't slip in mid-message.
         uni_kernel::serial::write_fmt(format_args!(
@@ -112,7 +112,7 @@ fn poll_tier1() -> bool {
         ));
     }
     let core = uni_kernel::cpu_id();
-    let nqp = uni_drivers::net::num_queue_pairs() as u32;
+    let nqp = nic::num_queue_pairs() as u32;
     // Pre-`set_ready` (boot-task window): only the BSP is polling;
     // APs are still idling at the top of `eventloop::run`. If a
     // multi-queue NIC hashes inbound traffic to a queue >0 (e.g.
@@ -125,7 +125,7 @@ fn poll_tier1() -> bool {
     if core == 0 && !uni_kernel::eventloop::is_ready() {
         let mut total = 0;
         for q in 0..nqp as usize {
-            total += uni_drivers::net::poll_qp(q, rx::net_receive);
+            total += nic::poll_qp(q, rx::net_receive);
         }
         return total > 0;
     }
@@ -137,7 +137,7 @@ fn poll_tier1() -> bool {
     if core >= nqp {
         return false;
     }
-    let count = uni_drivers::net::poll_qp(core as usize, rx::net_receive);
+    let count = nic::poll_qp(core as usize, rx::net_receive);
     count > 0
 }
 
@@ -179,7 +179,7 @@ fn poll_tier2(num_cores: u32) -> bool {
     }
 
     // Flush TX staging first — responses from previous cycle.
-    uni_drivers::net::flush_tx_staging();
+    nic::flush_tx_staging();
 
     // Poll VirtIO RX and distribute directly (no batch buffer copy).
     for i in 0..num_cores {
@@ -188,7 +188,7 @@ fn poll_tier2(num_cores: u32) -> bool {
             .store(false, core::sync::atomic::Ordering::Relaxed);
     }
 
-    let count = uni_drivers::net::poll(rx::distribute_frame);
+    let count = nic::poll(rx::distribute_frame);
 
     // Mark ourselves as "just distributed" — our next poll attempt will
     // yield, giving other cores first shot at the lock.
@@ -217,7 +217,7 @@ fn poll_tier2(num_cores: u32) -> bool {
     }
 
     // Flush TX (APs may have responded during distribution).
-    uni_drivers::net::flush_tx_staging();
+    nic::flush_tx_staging();
 
     had_frames
 }
@@ -234,7 +234,7 @@ pub fn init_eventloop() {
     uni_kernel::eventloop::set_net_flush(net_flush_cb);
     // NAPI re-arm: right before the event loop HLTs, re-enable RX
     // notifications on this core's queue pair and re-check the ring.
-    uni_kernel::eventloop::set_net_rearm_rx(uni_drivers::net::rearm_rx_napi);
+    uni_kernel::eventloop::set_net_rearm_rx(nic::rearm_rx_napi);
     // RFC 6298: a core with an armed retransmission timer must not
     // sleep past the deadline. The event loop bounds its idle when
     // this reports true (the connection awaiting a lost segment's
@@ -245,12 +245,12 @@ pub fn init_eventloop() {
     // because DHCP now runs as an async task polled by the event loop
     // — so the flush hook fires between DISCOVER/REQUEST sends and
     // the next `dhcp_await` poll.
-    uni_drivers::net::enable_deferred_tx_kick();
+    nic::enable_deferred_tx_kick();
 }
 
 fn net_poll_cb(_core_id: u32) -> bool {
     // Tier 1 (multi-queue): every core polls its own queue — no lock.
-    if uni_drivers::net::num_queue_pairs() > 1 {
+    if nic::num_queue_pairs() > 1 {
         return poll();
     }
     // Tier 2: any core can become the rotating distributor; the RX_LOCK CAS
@@ -279,14 +279,14 @@ fn net_drain_cb(core_id: u32) -> bool {
 }
 
 fn net_flush_cb() {
-    let nqp = uni_drivers::net::num_queue_pairs();
+    let nqp = nic::num_queue_pairs();
     if nqp > 1 {
         // Tier 1: each core flushes its own TX queue pair. No staging needed.
-        uni_drivers::net::flush_tx_kick_if_dirty();
+        nic::flush_tx_kick_if_dirty();
     } else {
-        uni_drivers::net::flush_tx_staging();
+        nic::flush_tx_staging();
         // Only kick if new TX buffers were actually added. Skipping
         // redundant kicks saves ~7 MMIO exits/request at high concurrency.
-        uni_drivers::net::flush_tx_kick_if_dirty();
+        nic::flush_tx_kick_if_dirty();
     }
 }

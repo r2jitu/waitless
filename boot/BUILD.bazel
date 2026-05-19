@@ -46,6 +46,7 @@ rust_library(
     target_compatible_with = _UNIKERNEL_ONLY,
     deps = [
         "//drivers",
+        "//drivers:nic",
         "//kernel",
         "//net",
         "//uni",

@@ -15,7 +15,7 @@ extern crate net_ipv4 as ipv4;
 extern crate net_ipv6 as ipv6;
 extern crate net_ipv6_send as ipv6_send;
 extern crate net_types as types;
-extern crate uni_drivers;
+extern crate nic;
 extern crate uni_net_driver;
 extern crate uni_runtime;
 
@@ -206,11 +206,11 @@ pub fn send_with_l2_headroom(dst: IpAddr, src_port: u16, dst_port: u16, frame: &
         // The UDP checksum field holds the pseudo-header partial
         // sum; `send` hands the driver these offsets to finish it.
         // 6 = the checksum field's offset within the UDP header.
-        let csum = uni_drivers::net::CsumOffload {
+        let csum = nic::CsumOffload {
             start: (ETH_HDR_LEN + ip_hdr_len) as u16,
             offset: 6,
         };
-        uni_drivers::net::send(frame_slice, csum);
+        nic::send(frame_slice, csum);
     }
 }
 
@@ -293,11 +293,11 @@ pub fn send_via_tx_handle(
     // `submit_tx` hands the driver these offsets to finish it.
     // 6 = the checksum field's offset within the UDP header.
     let _ = &mut handle;
-    let csum = uni_drivers::net::CsumOffload {
+    let csum = nic::CsumOffload {
         start: (ETH_HDR_LEN + ip_hdr_len) as u16,
         offset: 6,
     };
-    uni_drivers::net::submit_tx(handle, on_wire_actual, csum);
+    nic::submit_tx(handle, on_wire_actual, csum);
 }
 
 /// Slice-shaped UDP send. Copies `data` into a stack-local
