@@ -967,3 +967,34 @@ E and F are low-effort cleanups that can land any time.
     stall is debugged.
   * **HVF TSO bench** (G's prior +25% on diagnostics_tls_max 1c)
     still applies — virtio-net path unchanged.
+
+- **2026-05-19** — Uniform `send()`-side L4 checksum offload
+  (`12ad396`, `9eb0588`, `37eabf2`).
+
+  The 2026-05-09 design had the guest pick full-vs-partial checksum
+  from a global `csum_tx_offload()` query, but the driver `send()`
+  paths disagreed on what to do with the frame: virtio-net and
+  gve-GQI shipped it verbatim, gve-DQO self-classified and offloaded.
+  Two bugs fell out of that split:
+
+  * TCP `build_and_send_frame`'s slice-shaped fallback stamped the
+    pseudo-header partial, then shipped via `send()` — on virtio-net
+    / gve-GQI the partial went out uncorrected (corrupt segment;
+    reachable on gve-GQI under TX-pool exhaustion).
+  * UDP `send_with_l2_headroom` stamped the *full* checksum and
+    shipped via `send()` — on gve-DQO, `send()` offloads, so the
+    device double-counted the payload.
+
+  Fix: `send()` is now a uniform contract. The guest always stamps
+  the pseudo-header partial sum; `send()` gained a `CsumOffload`
+  parameter (symmetric with `submit_tx`), and every driver finishes
+  the checksum — device CSUM offload, or a software pass
+  (`net_checksum::internet_checksum`) when the device never
+  negotiated `VIRTIO_NET_F_CSUM`. virtio-net tracks `has_csum`
+  apart from `has_tso4` for that decision.
+
+  `NicOps::csum_tx_offload` and the `net_l4_tx` crate are gone — the
+  guest no longer chooses. The `UdpCsum` enum and the dead
+  `l4_checksum` / `l4_checksum_v4` helpers went with them. Supersedes
+  the `csum_tx_offload` + `csum_stamp_convention` mechanism in the
+  2026-05-09 "Multi-driver TX-path overhaul" entry above.
