@@ -1,6 +1,6 @@
 # TCP / QUIC conformance + RFC-compliance roadmap
 
-Status: planning. Last updated 2026-05-19.
+Status: in progress (steps 1-3 complete). Last updated 2026-05-19.
 
 ## Purpose
 
@@ -20,22 +20,34 @@ existing implementation.
 
 ## Status today (2026-05-19)
 
-Landed (`main`, commits `c36c24f..bc8d01a`):
+Steps 1-3 of the sequencing below are **complete** (`main`, through
+the RFC 6298 estimator commit). The in-process harness, a
+test-controllable clock, and TCP retransmission all now exist.
+
+Landed:
 
 - `net_tcp` is host-buildable. `//net:tcp_test` is a packetdrill-style
   harness: it drives scripted TCP segments into the real `tcp_receive`
   against a mock `NicOps` that captures every transmitted frame, then
-  asserts on the captured output. Three scenarios: SYN→SYN-ACK,
-  in-order data→ACK, FIN→ACK. Harness lives in `net/src/tcp.rs`'s
-  `#[cfg(test)] mod tests`.
+  asserts on the captured output. Eleven scenarios — the handshake
+  trio (SYN→SYN-ACK, in-order data→ACK, FIN→ACK), the receiver-side
+  set (retransmitted SYN, duplicate data, out-of-order, RST at/off
+  `rcv_nxt`), and the RFC 6298 set (RTO retransmit + backoff, ACK
+  stops the timer, the SRTT/RTTVAR estimator). Harness lives in
+  `net/src/tcp.rs`'s `#[cfg(test)] mod tests`.
+- A `now_ms()` compile-time clock seam (`kernel_core::clock`) with a
+  test-controllable host mock — the prerequisite for every
+  timer-driven test.
+- TCP RFC 6298 retransmission: a per-conn retransmit ring, the RTO
+  timer wired into the poll loop, exponential backoff, and the
+  SRTT/RTTVAR estimator. A lost outbound segment is now resent.
 - `uni-quic` already host-builds; `//uni-quic:uni_quic_test` includes
   `end_to_end_self_handshake`, which drives a synthetic Initial
   through the receive path.
 - `classify` (RX parse) is host-tested via `//net:net_rx_test`.
 
-So the *receive path and the in-process drive/capture loop both
-exist*. What is missing is breadth of scenarios, a controllable clock,
-and — for retransmission and congestion — the features themselves.
+What remains: RFC 5681 congestion control, QUIC loss recovery, and
+the feature-breadth items (window scaling, SACK) — steps 4 onward.
 
 ## Part 1 — Conformance-test strategy
 
@@ -100,13 +112,14 @@ stays a smoke-test axis, not the conformance vehicle.
 
 ### Test-infrastructure backlog
 
-- **`now_cycles()` compile-time seam** — mirror the `cpu_id` /
-  `rng::fill_bytes` seams in `kernel_core`. Prerequisite for *every*
-  timer-driven test (RTO, delayed-ACK, TIME-WAIT, QUIC PTO). Highest
-  priority — nothing in Part 2/3 below that involves a timer can be
-  tested deterministically without it.
-- **Wider TCP scenario matrix** — out-of-order, RST edge cases, the
-  item-M `tcp_receive` super-segment test
+- ✅ **Clock seam** — `kernel_core::clock::now_ms()` mirrors the
+  `cpu_id` / `rng::fill_bytes` seams, with a test-controllable host
+  mock (`mock::set` / `advance` / `reset`). Landed in step 2. (A
+  millisecond monotonic clock, not raw `now_cycles()`: every timer
+  consumer works in the ms/second domain and a cycles seam would need
+  a second seam for the arch-specific cycles-per-µs conversion.)
+- **Wider TCP scenario matrix** — the receiver-side set landed in
+  step 1; still open is the item-M `tcp_receive` super-segment test
   (`docs/rx-path-optimizations.md`).
 - **Deeper assertions** — today's scenarios check flags/ports/ack.
   Also validate the TCP checksum, the IP header, and that delivered
@@ -124,30 +137,35 @@ optional feature.
 - **Have**: full state set (`Closed`…`TimeWait`), three-way handshake,
   in-order data transfer, FIN/close, RST generation + RFC 5961 RST
   acceptance check, per-core connection pool.
-- **Missing**: retransmission (see RFC 6298 — **MUST violation**);
-  TIME-WAIT and FIN-WAIT timeouts (no timer — orphaned connections
-  leak); the MSS option is never *sent* (`send_segment` hard-codes a
-  20-byte header); zero-window persist relies on the peer's persist
-  timer; no delayed-ACK coalescing (we ACK immediately — correct, just
-  not optimal).
-- **Conformance test**: receiver-side scenarios are testable *now* —
-  retransmitted SYN (stale-twin cleanup), duplicate/old data →
-  immediate dup-ACK, out-of-order segment handling, RST at/off
-  `rcv_nxt`. Add these to the harness first; they need no new feature.
+- **Missing**: TIME-WAIT and FIN-WAIT timeouts (no timer — orphaned
+  connections leak, though the RFC 6298 retransmission timer is now a
+  model for wiring them); the MSS option is never *sent*
+  (`send_segment` hard-codes a 20-byte header); zero-window persist
+  relies on the peer's persist timer; no delayed-ACK coalescing (we
+  ACK immediately — correct, just not optimal).
+- **Conformance test**: done — the receiver-side scenarios
+  (retransmitted SYN / stale-twin cleanup, duplicate/old data →
+  immediate dup-ACK, out-of-order segment, RST at/off `rcv_nxt`)
+  landed in the harness as step 1.
 
 ### RFC 6298 — retransmission timeout
 
-- **Have**: nothing. The stack has no RTO timer; a lost *outbound*
-  segment is never retransmitted (the code admits this). It relies on
-  the peer retransmitting. **MUST violation** — and a real correctness
-  gap on lossy paths.
-- **Missing**: the RTT estimator (SRTT/RTTVAR), the RTO computation +
-  backoff, a per-connection retransmission timer, and the unacked-
-  segment queue an RTO needs to retransmit *from*.
-- **Conformance test**: build it test-first on the harness + the clock
-  seam — script a send, drop the ACK, advance the clock past the RTO,
-  assert the segment is retransmitted; assert exponential backoff;
-  assert SRTT/RTTVAR track per RFC 6298 §2.
+- **Have**: the full mechanism. A per-conn retransmit ring holds the
+  unacked window; an RTO timer (`on_rtx_tick`, driven by the net poll
+  loop, with an event-loop idle hook so an idle core does not strand
+  it) retransmits the oldest unacked segment and backs the RTO off
+  exponentially (§5.5); the SRTT/RTTVAR estimator (§2.2/§2.3) makes
+  the RTO adaptive, with Karn's algorithm on the RTT samples. The
+  former MUST violation is closed.
+- **Missing**: SYN-ACK and FIN retransmission (data segments only
+  today — a retransmitted client SYN already re-drives the SYN-ACK);
+  and an unacked window larger than the retransmit ring suspends
+  coverage until it drains (gone once RFC 5681 `cwnd` bounds the
+  in-flight window).
+- **Conformance test**: done — `tcp_test` scripts a send, drops the
+  ACK, advances the mock clock past the RTO, and asserts the
+  retransmit fires and the RTO doubles; a second case asserts an ACK
+  stops the timer; a third asserts SRTT/RTTVAR track RFC 6298 §2.
 
 ### RFC 5681 — congestion control
 
@@ -244,11 +262,14 @@ host-tested, and the RFC 9002 *data model* is present.
 
 Dependency-ordered. Each step is test-first on the harness.
 
-1. **Receiver-side TCP scenarios** — retransmitted SYN, duplicate/old
-   data, out-of-order, RST edge cases. No new feature; pure coverage.
-2. **`now_cycles()` clock seam** — unblocks every timer-driven test.
-3. **TCP RFC 6298 (RTO)** — RTT estimator, RTO + backoff, the unacked
-   queue, the retransmission timer.
+1. ✅ **Receiver-side TCP scenarios** — retransmitted SYN,
+   duplicate/old data, out-of-order, RST edge cases. No new feature;
+   pure coverage.
+2. ✅ **Clock seam** — `kernel_core::clock::now_ms()`, a
+   test-controllable monotonic-millisecond seam. Unblocks every
+   timer-driven test.
+3. ✅ **TCP RFC 6298 (RTO)** — RTT estimator, RTO + backoff, the
+   per-conn retransmit ring, the retransmission timer.
 4. **TCP RFC 5681 (congestion)** — `cwnd`/`ssthresh`, slow-start,
    congestion avoidance, fast retransmit / fast recovery.
 5. **QUIC RFC 9002 loss recovery + congestion** — wire the PTO timer
@@ -262,9 +283,9 @@ Dependency-ordered. Each step is test-first on the harness.
 10. **QUIC Interop Runner** — cross-implementation validation, after
     step 5.
 
-Steps 1–2 are infrastructure and land first. Steps 3–5 are the
-headline correctness work (retransmission + congestion, both stacks).
-6–8 are feature breadth. 9–10 are tooling.
+Steps 1–3 are complete. Steps 4–5 are the remaining headline
+correctness work (congestion control, both stacks); 6–8 are feature
+breadth; 9–10 are tooling.
 
 ## Non-goals
 
