@@ -460,17 +460,26 @@ def _make_iso_variant(variant_transition, qemu_bin, virtio_dev, qemu_machine):
         ),
     )
 
+# `-cpu max` is REQUIRED here, not cosmetic: the x86_64 crypto crates
+# are built with `+aes,+avx2,+bmi2,…` (see MODULE.bazel), and QEMU's
+# default `qemu64` CPU advertises none of them — the first such
+# instruction (the boot-time AEAD self-test) `#UD`s and the guest
+# hangs with no output. `run_qemu`/`detect_qemu` get this right for the
+# `_qemu_*` variants; the `_iso_*` variants must pass it themselves
+# since `run_iso.sh.tmpl` bakes the machine args in instead of sniffing
+# an ELF. `-machine q35` (x86_64) / `-machine virt` (aarch64) match
+# `detect_qemu`.
 _iso_x86_64_variant = _make_iso_variant(
     _iso_x86_64_transition,
     qemu_bin = "qemu-system-x86_64",
     virtio_dev = "virtio-net-pci",
-    qemu_machine = "",  # x86_64 QEMU defaults are fine without `-machine`.
+    qemu_machine = "-machine q35 -cpu max",
 )
 _iso_aarch64_variant = _make_iso_variant(
     _iso_aarch64_transition,
     qemu_bin = "qemu-system-aarch64",
     virtio_dev = "virtio-net-pci",
-    qemu_machine = "-machine virt",
+    qemu_machine = "-machine virt -cpu max",
 )
 
 def _make_qemu_variant(variant_transition):
