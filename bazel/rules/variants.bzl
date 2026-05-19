@@ -35,7 +35,7 @@ Variants produced (names & platform compat defined in _VARIANT_SPECS):
 
 # ── Transitions ────────────────────────────────────────────────────────────
 #
-# Each transition flips the same four keys:
+# Each transition flips the same five keys:
 #
 #   * `//command_line_option:platforms` — target platform.
 #   * `//bazel/rules:uni_runner`        — string_flag driving runner
@@ -46,6 +46,15 @@ Variants produced (names & platform compat defined in _VARIANT_SPECS):
 #                                         Propagates to every rlib in
 #                                         the sub-graph; leaf BUILDs
 #                                         don't set `rustc_flags`.
+#   * `@rules_rust//rust/settings:lto`  — the `//bazel/rules:lto` mode
+#                                         (off / thin / fat), applied
+#                                         to the unikernel sub-graph
+#                                         only. `off` by default;
+#                                         `fat` is whole-program LTO
+#                                         (~40% smaller image). Host
+#                                         `rust_test` builds don't take
+#                                         this transition, so they stay
+#                                         non-LTO whatever the flag is.
 #   * `//bazel/rules:tests_need_std`    — False: the unikernel
 #                                         sub-graph builds no
 #                                         rust_test targets.
@@ -54,6 +63,7 @@ def _make_variant_transition(platform, uni_runner, target_arch):
     outputs = [
         "//bazel/rules:uni_runner",
         "@rules_rust//:extra_rustc_flag",
+        "@rules_rust//rust/settings:lto",
         "//bazel/rules:tests_need_std",
     ]
     if platform != None:
@@ -63,17 +73,22 @@ def _make_variant_transition(platform, uni_runner, target_arch):
     if target_arch == "aarch64":
         rustc_flags = rustc_flags + ["-Crelocation-model=pic"]
 
-    def _impl(_settings, _attr):
+    def _impl(settings, _attr):
         out = {
             "//bazel/rules:uni_runner": uni_runner,
             "@rules_rust//:extra_rustc_flag": rustc_flags,
+            "@rules_rust//rust/settings:lto": settings["//bazel/rules:lto"],
             "//bazel/rules:tests_need_std": False,
         }
         if platform != None:
             out["//command_line_option:platforms"] = platform
         return out
 
-    return transition(implementation = _impl, inputs = [], outputs = outputs)
+    return transition(
+        implementation = _impl,
+        inputs = ["//bazel/rules:lto"],
+        outputs = outputs,
+    )
 
 _hvf_transition = _make_variant_transition(
     platform = "//bazel/platforms:aarch64_unikernel",

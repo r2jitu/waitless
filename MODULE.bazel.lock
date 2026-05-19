@@ -195,7 +195,7 @@
   "moduleExtensions": {
     "//bazel/buildstd:extensions.bzl%hardfloat": {
       "general": {
-        "bzlTransitiveDigest": "LR9p/spN9Dg498rZMv1+T5zjF9yXQZYKt9OeGwTLwHQ=",
+        "bzlTransitiveDigest": "R2T6Gq3xgiu5mxtBDiH1beFLCcfy+cQJN8BxLv5yNvY=",
         "usagesDigest": "BVrwPHniN0pUieFl560KpZa01IzGsXA7pM9LfL4HbOA=",
         "recordedInputs": [],
         "generatedRepoSpecs": {

@@ -104,9 +104,14 @@ def _label_crate_name(label):
     return target.replace("-", "_")
 
 # Threads `-Cpanic=abort` (+ aarch64 PIC, required by the PIE kernel's
-# runtime relocations) through every rlib in the dep graph for direct
-# `bazel build :<name>.elf` invocations. The variant rules in
-# `//bazel/rules:variants.bzl` do the same for `:<name>_{hvf,iso_*,qemu_*}`.
+# runtime relocations) and the `//bazel/rules:lto` mode through every
+# rlib in the dep graph for direct `bazel build :<name>.elf`
+# invocations. The variant rules in `//bazel/rules:variants.bzl` do the
+# same for `:<name>_{hvf,iso_*,qemu_*}`. Reading the flag in the
+# transition scopes LTO to the unikernel sub-graph, so host `rust_test`
+# builds and `:<name>_native` stay non-LTO regardless. LTO is `off` by
+# default — opt in with `--//bazel/rules:lto={fat,thin}` (or the
+# `--config=lto-fat` / `--config=lto-thin` shortcuts).
 def _unikernel_elf_transition_impl(settings, _attr):
     is_aarch64 = any([
         p.package == "bazel/platforms" and p.name.startswith("aarch64")
@@ -115,12 +120,18 @@ def _unikernel_elf_transition_impl(settings, _attr):
     flags = ["-Cpanic=abort"]
     if is_aarch64:
         flags = flags + ["-Crelocation-model=pic"]
-    return {"@rules_rust//:extra_rustc_flag": flags}
+    return {
+        "@rules_rust//:extra_rustc_flag": flags,
+        "@rules_rust//rust/settings:lto": settings["//bazel/rules:lto"],
+    }
 
 _unikernel_elf_transition = transition(
     implementation = _unikernel_elf_transition_impl,
-    inputs = ["//command_line_option:platforms"],
-    outputs = ["@rules_rust//:extra_rustc_flag"],
+    inputs = ["//command_line_option:platforms", "//bazel/rules:lto"],
+    outputs = [
+        "@rules_rust//:extra_rustc_flag",
+        "@rules_rust//rust/settings:lto",
+    ],
 )
 
 def _unikernel_elf_impl(ctx):

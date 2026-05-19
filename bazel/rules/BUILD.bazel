@@ -51,3 +51,36 @@ string_flag(
         "iso",
     ],
 )
+
+# Link-time-optimization mode for the unikernel image. The transitions
+# in `//bazel/rules:{unikernel,variants}.bzl` read this and set
+# `@rules_rust//rust/settings:lto` on the unikernel sub-graph to its
+# value — so LTO covers the kernel/app/driver crates only, and host
+# `rust_test` / `:<app>_native` builds (which don't take those
+# transitions) stay non-LTO and fast regardless of the setting.
+#
+#   off  (default) — no cross-crate LTO.
+#   thin           — per-module ThinLTO: cross-crate inlining.
+#   fat            — whole-program LTO: inlining + constant/rodata
+#                    merging; ~40% smaller image, slower to link.
+#
+# Opt in per-build with `--//bazel/rules:lto={fat,thin}`, or the
+# `--config=lto-fat` / `--config=lto-thin` shortcuts (see `.bazelrc`).
+#
+# Why `thin` rarely helps the image size: this build already links
+# with `--gc-sections`, so dead code is gone before LTO runs. ThinLTO
+# then mostly just inlines (growing `.text`), and — being per-module —
+# cannot merge the identical read-only constants that the crypto
+# crates' monomorphizations duplicate across the dep graph. `fat` LTO
+# sees the whole program at once and folds them, which is where the
+# ~40% image shrink comes from. Pick `thin` for build speed, `fat`
+# for a deployable image.
+string_flag(
+    name = "lto",
+    build_setting_default = "off",
+    values = [
+        "off",
+        "thin",
+        "fat",
+    ],
+)

@@ -40,6 +40,19 @@ test --//bazel/rules:tests_need_std=True
 build:aarch64-macos --platforms=//bazel/platforms:aarch64_macos
 build:x86_64-linux  --platforms=//bazel/platforms:x86_64_linux
 
+# ── Opt-in link-time optimization for the unikernel image ─────────────────────
+# LTO is off by default. These configs build the unikernel sub-graph
+# (kernel + app + driver crates) with LTO; host `rust_test` /
+# `:<app>_native` builds are unaffected — the flag is read only by the
+# unikernel transitions. Equivalent to `--//bazel/rules:lto={fat,thin}`.
+#   --config=lto-fat   whole-program fat LTO: ~40% smaller image +
+#                      cross-crate inlining; heaviest link.
+#   --config=lto-thin  per-module ThinLTO: cross-crate inlining, much
+#                      faster link, but no whole-program rodata merging
+#                      (so little size win — see //bazel/rules:lto docs).
+build:lto-fat  --//bazel/rules:lto=fat
+build:lto-thin --//bazel/rules:lto=thin
+
 # ── Fallback default (overridden by .bazelrc.local on dev machines) ───────────
 # setup-dev.sh generates .bazelrc.local; on Apple Silicon it sets:
 #   build --platforms=//bazel/platforms:aarch64_macos  (native, no VM)

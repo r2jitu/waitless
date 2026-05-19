@@ -55,6 +55,17 @@ _COMPILER_BUILTINS_CFGS = [
 
 # Flags shared by all three std crates. `--emit=link` -> `lib<name>.rlib`
 # (no hash suffix), which `rust_stdlib_filegroup` partitions by basename.
+#
+# Bitcode is left embedded (rustc's default — no `-Cembed-bitcode=no`).
+# The unikernel image can be built with LTO (`--//bazel/rules:lto`, off
+# by default — see //bazel/rules:unikernel.bzl and :variants.bzl); when
+# it is, the final binary's LTO reaches `core` / `compiler_builtins` /
+# `alloc` as crate deps, and without a `.llvmbc` section in these rlibs
+# rustc aborts the link with "failed to get bitcode from object file
+# for LTO (Can't find section .llvmbc)". This sysroot is built once by
+# a repo rule that can't see the build flag, so bitcode is embedded
+# unconditionally — harmless for non-LTO builds (a metadata section,
+# not part of any loaded segment).
 _COMMON_RUSTC_FLAGS = [
     "--crate-type",
     "lib",
@@ -62,7 +73,6 @@ _COMMON_RUSTC_FLAGS = [
     "--edition",
     "2024",
     "-Cpanic=abort",
-    "-Cembed-bitcode=no",
     "-Copt-level=3",
     "-Cdebug-assertions=off",
     "-Cstrip=debuginfo",
