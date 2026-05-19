@@ -84,23 +84,23 @@ pub fn l4_pseudo_partial(src: IpAddr, dst: IpAddr, proto: u8, l4_len: usize) -> 
 
 /// TCP/UDP pseudo-header checksum, family-dispatched.
 /// `src`/`dst` must agree on family; mismatched families fall back
-/// to `l4_checksum` on the v4 component (caller bug).
+/// to `l4_checksum_v4` on the v4 component (caller bug).
 pub fn l4_checksum_any(src: IpAddr, dst: IpAddr, proto: u8, data: *const u8, len: usize) -> u16 {
     match (src, dst) {
-        (IpAddr::V4(s), IpAddr::V4(d)) => l4_checksum(s, d, proto, data, len),
+        (IpAddr::V4(s), IpAddr::V4(d)) => l4_checksum_v4(s, d, proto, data, len),
         (IpAddr::V6(s), IpAddr::V6(d)) => l4_checksum_v6(&s, &d, proto, data, len),
         // Mismatched families — should never happen in correct code.
         // Use whichever is v4 to keep the response well-formed
         // rather than crashing.
-        (IpAddr::V4(s), _) => l4_checksum(s, Ipv4Addr::ANY, proto, data, len),
-        (_, IpAddr::V4(d)) => l4_checksum(Ipv4Addr::ANY, d, proto, data, len),
+        (IpAddr::V4(s), _) => l4_checksum_v4(s, Ipv4Addr::ANY, proto, data, len),
+        (_, IpAddr::V4(d)) => l4_checksum_v4(Ipv4Addr::ANY, d, proto, data, len),
     }
 }
 
 /// TCP/UDP pseudo-header checksum over IPv6 (RFC 8200 §8.1).
 /// Returns the one's-complement folded sum suitable for direct
 /// placement in the upper-layer checksum field — same convention
-/// as the IPv4 `l4_checksum`.
+/// as the IPv4 `l4_checksum_v4`.
 pub fn l4_checksum_v6(
     src: &Ipv6Addr,
     dst: &Ipv6Addr,
@@ -110,7 +110,7 @@ pub fn l4_checksum_v6(
 ) -> u16 {
     // IPv6 pseudo-header: src(16) || dst(16) || u32 upper-len ||
     // 3 zeros || u8 next-header. Sum as LE u16 words to match the
-    // existing `l4_checksum` byte-order convention (the result is
+    // existing `l4_checksum_v4` byte-order convention (the result is
     // stored directly in a `repr(C, packed)` u16 field).
     let mut sum: u32 = 0;
     for chunk in src.octets.chunks(2).chain(dst.octets.chunks(2)) {
@@ -131,7 +131,7 @@ pub fn l4_checksum_v6(
 
 /// TCP/UDP pseudo-header checksum.
 /// Pseudo-header + data summed in LE byte order.
-pub fn l4_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, data: *const u8, len: usize) -> u16 {
+pub fn l4_checksum_v4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, data: *const u8, len: usize) -> u16 {
     let mut sum: u32 = 0;
 
     // Pseudo-header — read addr fields as LE 16-bit words
@@ -224,13 +224,13 @@ mod tests {
             0x00, 0x00, // checksum = 0 (to be computed)
             b'h', b'e', b'l', b'l', b'o',
         ];
-        let cksum = l4_checksum(src, dst, 17, udp_data.as_ptr(), udp_data.len());
+        let cksum = l4_checksum_v4(src, dst, 17, udp_data.as_ptr(), udp_data.len());
         // Fill in and re-verify
         let mut verified = udp_data;
         verified[6] = (cksum & 0xFF) as u8;
         verified[7] = (cksum >> 8) as u8;
         assert_eq!(
-            l4_checksum(src, dst, 17, verified.as_ptr(), verified.len()),
+            l4_checksum_v4(src, dst, 17, verified.as_ptr(), verified.len()),
             0
         );
     }

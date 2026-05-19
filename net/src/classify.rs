@@ -165,7 +165,9 @@ pub fn owner(parsed: &ParsedL3, frame: &[u8], num_cores: u32) -> u32 {
         (0, 0)
     };
     match (parsed.src, parsed.dst) {
-        (IpAddr::V4(s), IpAddr::V4(d)) => flow_hash(s.addr, d.addr, src_port, dst_port, num_cores),
+        (IpAddr::V4(s), IpAddr::V4(d)) => {
+            flow_hash_v4(s.addr, d.addr, src_port, dst_port, num_cores)
+        }
         (IpAddr::V6(s), IpAddr::V6(d)) => {
             flow_hash_v6(&s.octets, &d.octets, src_port, dst_port, num_cores)
         }
@@ -199,7 +201,7 @@ fn fmix32(mut h: u32) -> u32 {
 
 /// IPv4 flow hash — FNV-1a over the 4-tuple, then the `fmix32`
 /// finalizer (see `fmix32` for why the finalizer earns its keep).
-fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: u32) -> u32 {
+fn flow_hash_v4(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: u32) -> u32 {
     let mut h = FNV_BASIS;
     h = fnv_step(h, src_ip);
     h = fnv_step(h, dst_ip);
@@ -208,7 +210,7 @@ fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: 
     fmix32(h) % num_cores
 }
 
-/// The IPv6 twin of `flow_hash` — folds the two 16-byte addresses
+/// The IPv6 twin of `flow_hash_v4` — folds the two 16-byte addresses
 /// byte-by-byte into the same FNV-1a stream, then the same `fmix32`.
 fn flow_hash_v6(
     src: &[u8; 16],
