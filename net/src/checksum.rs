@@ -12,25 +12,36 @@ extern crate net_types as types;
 
 use types::{IpAddr, Ipv4Addr, Ipv6Addr, htons};
 
-/// RFC 1071 internet checksum over a byte buffer. Sums 16-bit words
-/// in little-endian byte order, so the returned `u16` drops straight
-/// into a network-order `repr(C, packed)` field. Used for the IPv4
-/// header checksum.
-pub fn ipv4_header_checksum(data: *const u8, len: usize) -> u16 {
+/// Sum a `len`-byte buffer as little-endian 16-bit words into a
+/// one's-complement accumulator; a trailing odd byte is the low byte
+/// of a final word. Pair with [`fold`] to finish a checksum.
+fn sum_words(data: *const u8, len: usize) -> u32 {
     let mut sum: u32 = 0;
     let mut i = 0;
     while i + 1 < len {
-        let word = unsafe { (*data.add(i) as u16) | ((*data.add(i + 1) as u16) << 8) };
-        sum += word as u32;
+        sum += unsafe { (*data.add(i) as u16) | ((*data.add(i + 1) as u16) << 8) } as u32;
         i += 2;
     }
     if i < len {
         sum += unsafe { *data.add(i) as u32 };
     }
+    sum
+}
+
+/// Fold a one's-complement accumulator down to 16 bits.
+fn fold(mut sum: u32) -> u16 {
     while (sum >> 16) != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
-    !(sum as u16)
+    sum as u16
+}
+
+/// RFC 1071 internet checksum over a byte buffer. Sums 16-bit words
+/// in little-endian byte order, so the returned `u16` drops straight
+/// into a network-order `repr(C, packed)` field. Used for the IPv4
+/// header checksum.
+pub fn ipv4_header_checksum(data: *const u8, len: usize) -> u16 {
+    !fold(sum_words(data, len))
 }
 
 /// 16-bit one's-complement pseudo-header partial sum (no
@@ -44,7 +55,7 @@ pub fn ipv4_header_checksum(data: *const u8, len: usize) -> u16 {
 /// pass — that's the whole point of CSUM-offload.
 #[inline]
 pub fn l4_pseudo_partial(src: IpAddr, dst: IpAddr, proto: u8, l4_len: usize) -> u16 {
-    let mut sum: u32 = match (src, dst) {
+    let sum: u32 = match (src, dst) {
         (IpAddr::V4(s), IpAddr::V4(d)) => {
             let mut s32: u32 = 0;
             s32 += (s.addr & 0xFFFF) as u32;
@@ -68,10 +79,7 @@ pub fn l4_pseudo_partial(src: IpAddr, dst: IpAddr, proto: u8, l4_len: usize) -> 
         }
         _ => 0, // mismatched families — caller bug; safe fallback
     };
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    sum as u16
+    fold(sum)
 }
 
 /// TCP/UDP pseudo-header checksum, family-dispatched.
@@ -118,20 +126,7 @@ pub fn l4_checksum_v6(
     sum += (proto as u32) << 8;
     // (no extra word needed — the high two bytes of the next-
     // header field area sum to zero.)
-
-    let mut i = 0;
-    while i + 1 < len {
-        let word = unsafe { (*data.add(i) as u16) | ((*data.add(i + 1) as u16) << 8) };
-        sum += word as u32;
-        i += 2;
-    }
-    if i < len {
-        sum += unsafe { *data.add(i) as u32 };
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
+    !fold(sum + sum_words(data, len))
 }
 
 /// TCP/UDP pseudo-header checksum.
@@ -147,20 +142,8 @@ pub fn l4_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, data: *const u8, len
     sum += (proto as u32) << 8; // zero byte | proto byte, LE word
     sum += htons(len as u16) as u32; // length in network byte order, stored LE
 
-    // Data — read in LE byte order
-    let mut i = 0;
-    while i + 1 < len {
-        let word = unsafe { (*data.add(i) as u16) | ((*data.add(i + 1) as u16) << 8) };
-        sum += word as u32;
-        i += 2;
-    }
-    if i < len {
-        sum += unsafe { *data.add(i) as u32 };
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
+    // Data summed in the same LE word order.
+    !fold(sum + sum_words(data, len))
 }
 
 #[cfg(test)]
