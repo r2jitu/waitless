@@ -166,7 +166,7 @@ rust_library(
     crate_name = "net_icmpv6",
     crate_root = "src/icmpv6.rs",
     deps = [
-        ":ipv6",
+        ":checksum",
         ":types",
     ],
 )

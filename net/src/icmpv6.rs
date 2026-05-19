@@ -24,7 +24,7 @@
 
 #![no_std]
 
-extern crate net_ipv6 as ipv6;
+extern crate net_checksum as checksum;
 extern crate net_types as types;
 
 use types::{Ipv6Addr, MacAddr, ntohs};
@@ -84,7 +84,13 @@ pub fn build_echo_reply(
     out[2] = 0;
     out[3] = 0; // checksum placeholder
     out[4..request_body.len()].copy_from_slice(&request_body[4..]);
-    let cksum = ipv6::pseudo_checksum(src, dst, types::proto::ICMPV6, &out[..request_body.len()]);
+    let cksum = checksum::l4_checksum_v6(
+        src,
+        dst,
+        types::proto::ICMPV6,
+        out.as_ptr(),
+        request_body.len(),
+    );
     out[2..4].copy_from_slice(&cksum.to_ne_bytes());
     Some(request_body.len())
 }
@@ -140,7 +146,7 @@ pub fn build_neighbor_advertisement(
     out[24] = opt::TARGET_LINK_LAYER_ADDRESS;
     out[25] = 1;
     out[26..32].copy_from_slice(&our_mac.bytes);
-    let cksum = ipv6::pseudo_checksum(src, dst, types::proto::ICMPV6, &out[..total]);
+    let cksum = checksum::l4_checksum_v6(src, dst, types::proto::ICMPV6, out.as_ptr(), total);
     out[2..4].copy_from_slice(&cksum.to_ne_bytes());
     Some(total)
 }
@@ -168,7 +174,7 @@ pub fn build_neighbor_solicitation(
     out[24] = opt::SOURCE_LINK_LAYER_ADDRESS;
     out[25] = 1;
     out[26..32].copy_from_slice(&our_mac.bytes);
-    let cksum = ipv6::pseudo_checksum(src, dst, types::proto::ICMPV6, &out[..total]);
+    let cksum = checksum::l4_checksum_v6(src, dst, types::proto::ICMPV6, out.as_ptr(), total);
     out[2..4].copy_from_slice(&cksum.to_ne_bytes());
     Some(total)
 }
@@ -194,7 +200,7 @@ pub fn build_router_solicitation(
     out[8] = opt::SOURCE_LINK_LAYER_ADDRESS;
     out[9] = 1;
     out[10..16].copy_from_slice(&our_mac.bytes);
-    let cksum = ipv6::pseudo_checksum(src, dst, types::proto::ICMPV6, &out[..total]);
+    let cksum = checksum::l4_checksum_v6(src, dst, types::proto::ICMPV6, out.as_ptr(), total);
     out[2..4].copy_from_slice(&cksum.to_ne_bytes());
     Some(total)
 }
@@ -326,7 +332,7 @@ pub fn find_prefix_info(options: &[u8]) -> Option<PrefixInfo> {
 /// Verify an inbound ICMPv6 message's checksum against the IPv6
 /// pseudo-header. Returns Ok(()) when valid.
 pub fn verify_checksum(src: &Ipv6Addr, dst: &Ipv6Addr, body: &[u8]) -> Result<(), IcmpError> {
-    if ipv6::pseudo_checksum(src, dst, types::proto::ICMPV6, body) != 0 {
+    if checksum::l4_checksum_v6(src, dst, types::proto::ICMPV6, body.as_ptr(), body.len()) != 0 {
         return Err(IcmpError::BadChecksum);
     }
     Ok(())

@@ -13,8 +13,6 @@
 //   * `ipv6_parse` — peels the v6 header, returns src/dst/
 //     next_header/payload. Pure parse: dst-address policy (is
 //     this packet for us?) is the caller's.
-//   * `pseudo_checksum` — IPv6 pseudo-header for ICMPv6 / UDP /
-//     TCP (RFC 8200 §8.1 + RFC 4443 §2.3).
 //
 // Out of scope until needed:
 //   * Extension header chain walking (Hop-by-Hop, Routing,
@@ -170,44 +168,6 @@ pub fn ipv6_parse(data: &[u8]) -> Option<Ipv6Parsed<'_>> {
     })
 }
 
-/// IPv6 pseudo-header checksum for ICMPv6 / UDP / TCP. RFC 8200 §8.1
-/// defines the input as: src(16) || dst(16) || u32 upper-layer-len ||
-/// 3 zero bytes || u8 next-header || upper-layer payload. Returns
-/// the one's-complement sum suitable for placement in the
-/// upper-layer checksum field.
-pub fn pseudo_checksum(src: &Ipv6Addr, dst: &Ipv6Addr, next_header: u8, payload: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    // src + dst (each 16 bytes = 8 u16 words).
-    for chunk in src.octets.chunks(2).chain(dst.octets.chunks(2)) {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-    }
-    // upper-layer-length as u32 — we send small messages so the
-    // high 16 bits are always zero.
-    let len = payload.len() as u32;
-    sum += (len >> 16) & 0xffff;
-    sum += len & 0xffff;
-    // Next header byte (already in low byte of the u32 form).
-    sum += next_header as u32;
-    // Payload: pad with one zero byte if odd-length.
-    let mut i = 0;
-    while i + 2 <= payload.len() {
-        sum += u16::from_be_bytes([payload[i], payload[i + 1]]) as u32;
-        i += 2;
-    }
-    if i < payload.len() {
-        sum += (payload[i] as u32) << 8;
-    }
-    // Fold carries.
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    let folded = sum as u16;
-    // Network-byte-order one's complement, returned in host byte
-    // order so callers can `to_be_bytes()` for placement. Same
-    // convention as `types::checksum`.
-    (!folded).to_be()
-}
-
 #[inline]
 fn ntohl_local(n: u32) -> u32 {
     u32::from_be(n)
@@ -278,40 +238,5 @@ mod tests {
         // guards the header read the clamp relies on.
         let buf = [0x60u8; HEADER_LEN - 1];
         assert!(ipv6_parse(&buf).is_none());
-    }
-
-    #[test]
-    fn pseudo_checksum_known_answer() {
-        // From RFC 4443 §A.2 / by hand: sum a known src + dst +
-        // length + next_header + payload, fold, complement. We
-        // verify that an icmp_checksum field containing the
-        // returned value zeros out when included in a recompute.
-        let src = Ipv6Addr {
-            octets: [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01],
-        };
-        let dst = Ipv6Addr {
-            octets: [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02],
-        };
-        // ICMPv6 echo request body: type=128, code=0, checksum=0,
-        // identifier=0x1234, sequence=0x0001, data="abcdefg".
-        let mut payload = [0u8; 15];
-        payload[0] = 128; // type
-        payload[1] = 0; // code
-        // checksum (bytes 2-3) left zero
-        payload[4] = 0x12;
-        payload[5] = 0x34;
-        payload[6] = 0x00;
-        payload[7] = 0x01;
-        payload[8..15].copy_from_slice(b"abcdefg");
-
-        let cksum = pseudo_checksum(&src, &dst, types::proto::ICMPV6, &payload);
-
-        // Splice into the payload's checksum field, recompute,
-        // expect 0 (the verification convention).
-        let mut verified = payload;
-        verified[2] = (cksum & 0xff) as u8;
-        verified[3] = (cksum >> 8) as u8;
-        let recheck = pseudo_checksum(&src, &dst, types::proto::ICMPV6, &verified);
-        assert_eq!(recheck, 0);
     }
 }
