@@ -1,15 +1,34 @@
-load("@rules_rust//rust:defs.bzl", "rust_static_library")
+load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
 exports_files(["limine.conf"])
 
-# Boot/entry code: rust_static_library targets supplying the
-# `#[no_mangle]` symbols that assembly resolves at link time
-# (kernel_main, limine_entry, memcpy).
+# Boot/entry code: rust_library crates supplying the `#[no_mangle]`
+# symbols that assembly resolves at link time (kernel_main,
+# limine_entry, memcpy) plus the kernel's sole `#[panic_handler]`
+# (in `entry`).
+#
+# These were `rust_static_library` until the LTO work. A staticlib is
+# a self-contained `.a` — it bundles a full copy of every Rust
+# dependency (kernel/uni/net/…), so `kernel`'s statics, e.g.
+# `fdt::G_INFO`, were duplicated between the boot `.a` and the binary
+# (which also links those crates via `app`). A non-LTO link collapsed
+# the duplicate global symbols via `--allow-multiple-definition`; LTO
+# internalises them, so the copies diverge — `fdt::init` (called from
+# `kernel_main` in the boot `.a`) initialised one `G_INFO`, while
+# `fdt::info` (in the LTO'd binary) read the other, still-zeroed one,
+# and boot panicked. As plain rlibs each dependency crate appears
+# exactly once in the binary, so there is nothing to duplicate.
 _UNIKERNEL_ONLY = ["@platforms//os:none"]
 
-rust_static_library(
+# `libc` (naive `memcpy`/`memset` byte loops — LLVM's loop-idiom pass
+# can rewrite them into self-recursive `memcpy` calls) and `boot_asm`
+# (pure `global_asm!`, nothing to optimise) opt out of LTO. `entry`
+# and `limine` carry real logic and are LTO'd with the rest.
+_NO_LTO = ["-Clto=off"]
+
+rust_library(
     name = "entry",
     srcs = ["src/entry.rs"],
     compile_data = select({
@@ -36,15 +55,16 @@ rust_static_library(
 # x86_64 multiboot/PVH stub. Excluded from the Limine higher-half
 # target: boot.S has 32-bit absolute relocations that can't be linked
 # into higher-half, and Limine enters at limine_entry() directly.
-rust_static_library(
+rust_library(
     name = "boot_asm",
     srcs = ["src/boot_asm.rs"],
     compile_data = ["src/x86_64/boot.S"],
     crate_root = "src/boot_asm.rs",
+    rustc_flags = _NO_LTO,
     target_compatible_with = _UNIKERNEL_ONLY,
 )
 
-rust_static_library(
+rust_library(
     name = "limine",
     srcs = ["src/limine_entry.rs"],
     crate_root = "src/limine_entry.rs",
@@ -55,9 +75,10 @@ rust_static_library(
     ],
 )
 
-rust_static_library(
+rust_library(
     name = "libc",
     srcs = ["src/libc.rs"],
     crate_root = "src/libc.rs",
+    rustc_flags = _NO_LTO,
     target_compatible_with = _UNIKERNEL_ONLY,
 )

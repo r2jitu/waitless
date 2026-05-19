@@ -16,54 +16,10 @@
 
 extern crate uni_kernel;
 
-// Log the panic to serial (if it's been initialised) before halting,
-// AND capture the same bytes into the in-band diag buffer so the
-// `/diag-panic` HTTP endpoint can surface them on systems where
-// serial-port-output isn't externally readable (sandboxed GCE).
-//
-// The bare `loop {}` fallback used previously meant a Limine-path
-// panic hung the VM with no diagnostic — painful when a regression
-// shows up only on the ISO config.
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    uni_kernel::diag::append(b"\n!!! PANIC on cpu ");
-    uni_kernel::diag::append_u32(uni_kernel::cpu_id());
-    uni_kernel::diag::append(b" !!!\n");
-    if let Some(loc) = info.location() {
-        uni_kernel::diag::append(b"  at ");
-        uni_kernel::diag::append(loc.file().as_bytes());
-        uni_kernel::diag::append(b":");
-        uni_kernel::diag::append_u32(loc.line());
-        uni_kernel::diag::append(b"\n");
-    }
-    // `PanicInfo::message()` returns a `PanicMessage` (formatter)
-    // that needs `core::fmt::Write` to render. Use a small stack
-    // buffer + a trivial `Write` impl that funnels through
-    // `diag::append` so we don't drag in `String` / heap.
-    use core::fmt::Write;
-    struct DiagWriter;
-    impl Write for DiagWriter {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            uni_kernel::diag::append(s.as_bytes());
-            Ok(())
-        }
-    }
-    uni_kernel::diag::append(b"  message: ");
-    let _ = write!(DiagWriter, "{}", info.message());
-    uni_kernel::diag::append(b"\n");
-
-    uni_kernel::serial::puts(b"PANIC in limine_entry\n");
-    loop {
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            core::arch::asm!("wfe", options(nomem, nostack));
-        }
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!("cli", "hlt", options(nomem, nostack));
-        }
-    }
-}
+// The kernel's sole `#[panic_handler]` lives in `entry` (boot/entry.rs)
+// and serves every boot path — multiboot, Limine, HVF. Now that the
+// boot crates are rlibs sharing one crate graph, a second handler here
+// would collide on the `panic_impl` lang item.
 
 use uni_kernel::types::{
     BootInfo, MAX_MEMORY_REGIONS, MEM_AVAILABLE, MEM_RESERVED, MemoryRegion, Protocol,

@@ -2,10 +2,8 @@
 
 #![no_std]
 
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
+// No `#[panic_handler]` here: this crate is a plain rlib linked into
+// the unikernel binary, whose sole handler lives in `entry`.
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {

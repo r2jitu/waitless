@@ -11,12 +11,9 @@
 
 #![no_std]
 
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    // Unreachable in practice — this crate exports no Rust functions, just
-    // assembly. The panic_handler is required by `rust_static_library`.
-    loop {}
-}
+// No `#[panic_handler]`: this crate is a plain rlib (it exports only
+// assembly anyway), and the unikernel binary's sole handler lives in
+// `entry`.
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(include_str!("x86_64/boot.S"), options(att_syntax));
