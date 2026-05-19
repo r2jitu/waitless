@@ -179,7 +179,7 @@ struct WorkerShared {
     tx_replies: Mutex<VecDeque<TxFrame>>,
     /// UDP return-path lookup: `(guest_port, client_ephemeral_port)` →
     /// external sockaddr. Populated by the worker on incoming UDP, read
-    /// by the vCPU in `handle_udp` when the guest sends a reply.
+    /// by the vCPU in `handle_udp_v4` when the guest sends a reply.
     udp_clients: Mutex<HashMap<(u16, u16), libc::sockaddr_in>>,
     /// IPv6 counterpart to `udp_clients`. Same `(guest_port,
     /// client_ephemeral_port)` key, value is `sockaddr_in6` so the
@@ -304,7 +304,7 @@ fn worker_shared(id: usize) -> &'static WorkerShared {
 }
 
 /// Look up the current vCPU's worker-shared state. Called from vCPU
-/// threads (handle_tcp/handle_udp/handle_guest_tx) where the current
+/// threads (handle_tcp/handle_udp_v4/handle_guest_tx) where the current
 /// vCPU id is published by `process_tx_queue` into `CURRENT_VCPU`.
 fn my_worker_shared() -> &'static WorkerShared {
     let id = CURRENT_VCPU.with(|c| c.get());
@@ -339,7 +339,7 @@ const GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 /// Per-listen-socket state.
 ///
 /// One `TcpListen` per `(host_port, family)` pair: `start()` calls
-/// `bind_listen` for AF_INET and (best-effort) `bind_listen_v6` for
+/// `bind_listen_v4` for AF_INET and (best-effort) `bind_listen_v6` for
 /// AF_INET6, so a single `-p tcp:H:G` mapping yields up to two
 /// entries here. Inline-accept polls every entry; the family tag
 /// propagates into the `ProxyConn` we synthesise so downstream
@@ -354,7 +354,7 @@ struct TcpListen {
 /// One UDP-relay sibling, scoped to a single vCPU's IoState. The
 /// enclosing relay opens `cpu_count` SO_REUSEPORT-bound siblings at
 /// `start()` time; vCPU `N` owns sibling `N`, and `UDP_RELAYS` below
-/// keeps a flat `Vec<i32>` so the TX-side `handle_udp` can still look
+/// keeps a flat `Vec<i32>` so the TX-side `handle_udp_v4` can still look
 /// up "this vCPU's sibling" when the guest sends a reply.
 
 /// IP family tag shared by `TcpListen`, `ProxyConn`, and the UDP
@@ -500,7 +500,7 @@ struct OutboundUdp {
 /// siblings, so we rely on `accept(2)` itself being safe across
 /// concurrent callers on the same fd: whichever vCPU's `poll`
 /// wakes first grabs the connection, the rest see `EAGAIN`.
-fn bind_listen(host_port: u16) -> Result<i32, String> {
+fn bind_listen_v4(host_port: u16) -> Result<i32, String> {
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
         if fd < 0 {
@@ -540,7 +540,7 @@ fn bind_listen(host_port: u16) -> Result<i32, String> {
     }
 }
 
-/// IPv6 sibling of `bind_listen`. Same shape but AF_INET6 +
+/// IPv6 sibling of `bind_listen_v4`. Same shape but AF_INET6 +
 /// `IPV6_V6ONLY=1` bound to `[::1]:host_port`, so v4 and v6
 /// listeners on the same host port stay disjoint (no
 /// `::ffff:1.2.3.4` mapped weirdness on accept). Best-effort: a
@@ -598,7 +598,7 @@ fn bind_listen_v6(host_port: u16) -> Result<i32, String> {
 /// receive buffers. All siblings of a relay share one port; the
 /// kernel distributes incoming packets across them and reply sends
 /// go out whichever one the current vCPU picks.
-fn open_udp_sibling(host_port: u16) -> Result<i32, String> {
+fn open_udp_sibling_v4(host_port: u16) -> Result<i32, String> {
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
         if fd < 0 {
@@ -654,7 +654,7 @@ fn open_udp_sibling(host_port: u16) -> Result<i32, String> {
     }
 }
 
-/// IPv6 sibling of `open_udp_sibling`. Binds to `[::1]:host_port`
+/// IPv6 sibling of `open_udp_sibling_v4`. Binds to `[::1]:host_port`
 /// with `IPV6_V6ONLY=1` so v4 traffic still goes to the AF_INET
 /// sibling — keeps the receive-path code paths cleanly separated
 /// (v4 sees `sockaddr_in`, v6 sees `sockaddr_in6`, no
@@ -756,7 +756,7 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
     for m in mappings {
         match m.proto {
             Proto::Tcp => {
-                let fd = bind_listen(m.host)?;
+                let fd = bind_listen_v4(m.host)?;
                 listens.push(TcpListen {
                     fd,
                     guest_port: m.guest,
@@ -783,11 +783,11 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
                 //
                 // The `UdpRelayFds.fds` Vec still carries `cpu_count`
                 // copies of the same fd — that's a legacy shape the
-                // TX-side `handle_udp` reply path indexes by vCPU id
+                // TX-side `handle_udp_v4` reply path indexes by vCPU id
                 // to pick a sibling, which used to matter under
                 // SO_REUSEPORT. With one fd per relay it's the same
                 // value `cpu_count` times, but kept for API symmetry.
-                match open_udp_sibling(m.host) {
+                match open_udp_sibling_v4(m.host) {
                     Ok(fd) => {
                         let fds = vec![fd; cpu_count.max(1)];
                         relay_table.push(UdpRelayFds {
@@ -895,7 +895,7 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
 }
 
 // Per-vCPU thread-local: the id of the vCPU whose TX queue notify
-// we are currently handling. Read by `handle_udp` to pick the right
+// we are currently handling. Read by `handle_udp_v4` to pick the right
 // per-vCPU TX fd from `UDP_RELAYS`. Set at the top of `process_tx_queue`
 // from `queue_idx / 2` — in Tier 1 multi-queue, vCPU N owns TX queue
 // index 2N+1, so `queue_idx / 2` is the vCPU id.
@@ -922,7 +922,7 @@ pub fn process_tx_queue(queue_idx: u32) {
         return;
     }
 
-    // Remember which vCPU we're processing for — `handle_udp` uses it
+    // Remember which vCPU we're processing for — `handle_udp_v4` uses it
     // to pick its per-vCPU TX socket.
     CURRENT_VCPU.with(|c| c.set(slot));
 
@@ -1045,7 +1045,7 @@ fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) ->
 
     let mut any_injected = false;
 
-    // ── Drain reply frames staged by handle_tcp/handle_udp/handle_arp ──
+    // ── Drain reply frames staged by handle_tcp/handle_udp_v4/handle_arp ──
     {
         let mut replies = shared.tx_replies.lock().unwrap();
         let mut any = false;
@@ -1845,13 +1845,13 @@ fn listener_drain_v4(
 
         // Reply-path NAT map lives on the OWNING vCPU so when the
         // guest sends a UDP reply the matching vCPU's
-        // `handle_udp` finds the right sockaddr.
+        // `handle_udp_v4` finds the right sockaddr.
         {
             let mut m = worker_shared(target).udp_clients.lock().unwrap();
             m.insert((guest_port, client_port), client_addr);
         }
 
-        let frame_len = build_udp_frame(
+        let frame_len = build_udp_frame_v4(
             frame_buf,
             &GUEST_MAC,
             GW_IP,
@@ -2143,7 +2143,7 @@ fn handle_ipv6(ip: &[u8], guest_mac: [u8; 6]) {
 
 // ── IPv6 UDP relay ─────────────────────────────────────────────
 //
-// Mirrors the v4 UDP path (`handle_udp_rx` worker-side, `handle_udp`
+// Mirrors the v4 UDP path (`handle_udp_rx` worker-side, `handle_udp_v4`
 // vCPU-side) for inbound + reply traffic over IPv6. The runner
 // holds an AF_INET6 socket bound to `::1:host_port` per
 // `-p udp:H:G` mapping; datagrams arriving there get translated
@@ -2472,7 +2472,7 @@ fn handle_ipv4(ip: &[u8]) {
     let dst_ip: [u8; 4] = ip[16..20].try_into().unwrap_or([0; 4]);
     match ip[9] {
         6 => handle_tcp(IpFamily::V4, &ip[ihl..]),
-        17 => handle_udp(&ip[ihl..], src_ip, dst_ip),
+        17 => handle_udp_v4(&ip[ihl..], src_ip, dst_ip),
         _ => {}
     }
 }
@@ -2619,7 +2619,7 @@ fn handle_tcp(family: IpFamily, tcp: &[u8]) {
     }
 }
 
-fn handle_udp(udp: &[u8], _src_ip: [u8; 4], dst_ip: [u8; 4]) {
+fn handle_udp_v4(udp: &[u8], _src_ip: [u8; 4], dst_ip: [u8; 4]) {
     if udp.len() < 8 {
         return;
     }
@@ -3087,7 +3087,7 @@ fn build_udp_frame_in(
         data: [0u8; MAX_REPLY_FRAME],
         len: 0,
     };
-    f.len = build_udp_frame(
+    f.len = build_udp_frame_v4(
         &mut f.data,
         dst_mac,
         src_ip,
@@ -3101,7 +3101,7 @@ fn build_udp_frame_in(
 
 /// Build a UDP frame: [virtio_net_hdr 12B][Eth 14B][IP 20B][UDP 8B][payload].
 /// Returns total frame length written into `buf`.
-fn build_udp_frame(
+fn build_udp_frame_v4(
     buf: &mut [u8],
     dst_mac: &[u8; 6],
     src_ip: [u8; 4],
