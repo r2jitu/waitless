@@ -261,57 +261,45 @@ pub(crate) fn tx_drain(tx: &TxQueue) {
 
 // ---- Outbound frame classification -----------------------------------------
 
-/// Inspect an outbound frame and report:
-///   - whether CSUM offload should be enabled (TCP/UDP only — those
-///     have a pseudo-header partial in the L4 cksum field that the
-///     device adds the payload sum to).
-///   - a 15-bit path hash derived from the L4 4-tuple, used as the
-///     `path_hash` metadata in the general context descriptor. Linux
-///     sets this from `skb->hash` for any flow with `skb->l4_hash`;
-///     we compute the same shape from the 4-tuple here. Setting it
-///     to a real per-flow value (rather than a constant zero) is
-///     what Linux does — the device exposes this as an opaque tag
-///     in TX completions, where it's mostly informational for the
-///     OS's queue tracking. We follow the spec for symmetry with
-///     Linux even though it doesn't move our benchmarks much.
-struct TxClassify {
-    csum: bool,
-    path_hash: u16, // 15-bit, never zero (matches Linux's sentinel rule)
-}
-
-fn classify_outbound(frame: &[u8]) -> TxClassify {
-    let default = TxClassify {
-        csum: false,
-        path_hash: 0,
-    };
+/// Compute the 15-bit TX path-hash for an outbound frame — the
+/// 4-tuple hash carried as `path_hash` metadata in the general
+/// context descriptor. Linux sets it from `skb->hash` for any flow
+/// with `skb->l4_hash`; we fold the same shape from the L4 4-tuple.
+/// The device exposes it as an opaque tag in TX completions, mostly
+/// informational for the OS's queue tracking. Zero for a non-
+/// TCP/UDP frame (ARP, ICMPv6, runt) — there's no 4-tuple to hash.
+///
+/// CSUM-offload classification used to live here too; it is now the
+/// caller's `CsumOffload` hint, threaded in through `send`.
+fn tx_path_hash(frame: &[u8]) -> u16 {
     if frame.len() < 14 {
-        return default;
+        return 0;
     }
     let etype = u16::from_be_bytes([frame[12], frame[13]]);
     let (l4_proto, l4_off, ip_off, ip_hdr_len) = match etype {
         0x0800 => {
             if frame.len() < 14 + 20 {
-                return default;
+                return 0;
             }
             let ihl = (frame[14] & 0x0f) as usize;
             if ihl < 5 {
-                return default;
+                return 0;
             }
             (frame[14 + 9], 14 + ihl * 4, 14, ihl * 4)
         }
         0x86dd => {
             if frame.len() < 14 + 40 {
-                return default;
+                return 0;
             }
             (frame[14 + 6], 14 + 40, 14, 40)
         }
-        _ => return default,
+        _ => return 0,
     };
     if !matches!(l4_proto, 6 | 17) {
-        return default;
+        return 0;
     }
     if l4_off + 4 > frame.len() {
-        return default;
+        return 0;
     }
     // Cheap 4-tuple hash: XOR-fold the src/dst IP words with the
     // src/dst port words. Linux uses a Jenkins-style hash; we just
@@ -335,11 +323,7 @@ fn classify_outbound(frame: &[u8]) -> TxClassify {
     h ^= sp.wrapping_mul(0x9e37);
     h ^= dp.wrapping_mul(0xc2b2);
     let path_hash = (h ^ (h >> 16)) as u16 & 0x7fff;
-    let path_hash = if path_hash == 0 { 0x7fff } else { path_hash };
-    TxClassify {
-        csum: true,
-        path_hash,
-    }
+    if path_hash == 0 { 0x7fff } else { path_hash }
 }
 
 // ---- TX descriptor builders ------------------------------------------------
@@ -374,12 +358,10 @@ fn build_pkt_desc(buf_addr: u64, flags: u8, compl_tag: u16, buf_size: u16) -> u1
 
 /// Slice-shaped send: copy `data` into the next ring's bounce buffer,
 /// emit a (general-ctx, pkt) descriptor pair, advance fill_cnt,
-/// doorbell unless deferred.
-///
-/// The `_csum` offload hint goes unused here: DQO runs
-/// `classify_outbound` on every frame for the TX flow-hash anyway,
-/// and takes the CSUM-enable flag from that same parse.
-pub(crate) fn send_on_qp(qp: usize, data: &[u8], _csum: uni_net_driver::CsumOffload) -> bool {
+/// doorbell unless deferred. `csum` enables the device's L4 CSUM
+/// offload for the packet descriptor; `tx_path_hash` fills the
+/// general-context descriptor's flow-hash.
+pub(crate) fn send_on_qp(qp: usize, data: &[u8], csum: uni_net_driver::CsumOffload) -> bool {
     if qp >= MAX_QUEUE_PAIRS || data.is_empty() || data.len() > (RX_BUFFER_SIZE as usize) {
         return false;
     }
@@ -440,10 +422,10 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8], _csum: uni_net_driver::CsumOffl
         ptr::copy_nonoverlapping(data.as_ptr(), buf_va, data.len());
     }
 
-    // Classify the outbound frame: figure out whether the device
-    // should do CSUM offload (for TCP/UDP), and compute a path_hash
-    // for Andromeda's per-flow fast path.
-    let cls = classify_outbound(data);
+    // Flow-hash for Andromeda's per-flow fast path. The CSUM-offload
+    // decision is the caller's `csum` hint, applied to the packet
+    // descriptor below.
+    let path_hash = tx_path_hash(data);
 
     // Build the 16-byte general context descriptor as a single u128
     // so the store hits memory atomically. Layout per gve_desc_dqo.h:
@@ -455,7 +437,7 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8], _csum: uni_net_driver::CsumOffl
     // previous byte-array + ptr::copy_nonoverlapping path translated
     // to two movq stores, which the device could theoretically
     // prefetch between, seeing a half-written desc.
-    let ctx_val: u128 = build_ctx_desc(cls.path_hash);
+    let ctx_val: u128 = build_ctx_desc(path_hash);
     let ctx_ptr = (tx.ring_va as *mut u128).wrapping_add(ctx_idx);
     unsafe {
         ptr::write_volatile(ctx_ptr, ctx_val);
@@ -466,7 +448,7 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8], _csum: uni_net_driver::CsumOffl
     let last_re = tx.last_re_at_fill.load(Ordering::Relaxed);
     let want_re = fill_cnt.wrapping_sub(last_re) >= DQO_TX_RE_INTERVAL;
     let mut flags = DQO_TX_DTYPE_PKT | DQO_TX_FLAG_EOP;
-    if cls.csum {
+    if csum.is_some() {
         flags |= DQO_TX_FLAG_CSUM;
     }
     if want_re {
