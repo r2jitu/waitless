@@ -1,4 +1,5 @@
-// kernel/libc.rs — Compiler-required memory intrinsics
+// boot/mem_stubs.rs — Compiler-required memory intrinsics (memcpy/memset/memmove/memcmp).
+// Not a libc; just the three byte-loop helpers LLVM emits calls to on bare metal.
 
 #![no_std]
 

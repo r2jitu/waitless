@@ -22,10 +22,10 @@ exports_files(["limine.conf"])
 # exactly once in the binary, so there is nothing to duplicate.
 _UNIKERNEL_ONLY = ["@platforms//os:none"]
 
-# `libc` (naive `memcpy`/`memset` byte loops — LLVM's loop-idiom pass
-# can rewrite them into self-recursive `memcpy` calls) and `boot_asm`
-# (pure `global_asm!`, nothing to optimise) opt out of LTO. `entry`
-# and `limine` carry real logic and are LTO'd with the rest.
+# `mem_stubs` (naive `memcpy`/`memset` byte loops — LLVM's loop-idiom
+# pass can rewrite them into self-recursive `memcpy` calls) and
+# `multiboot` (pure `global_asm!`, nothing to optimise) opt out of LTO.
+# `entry` and `limine` carry real logic and are LTO'd with the rest.
 _NO_LTO = ["-Clto=off"]
 
 rust_library(
@@ -57,10 +57,10 @@ rust_library(
 # target: boot.S has 32-bit absolute relocations that can't be linked
 # into higher-half, and Limine enters at limine_entry() directly.
 rust_library(
-    name = "boot_asm",
-    srcs = ["src/boot_asm.rs"],
+    name = "multiboot",
+    srcs = ["src/multiboot.rs"],
     compile_data = ["src/x86_64/boot.S"],
-    crate_root = "src/boot_asm.rs",
+    crate_root = "src/multiboot.rs",
     rustc_flags = _NO_LTO,
     target_compatible_with = _UNIKERNEL_ONLY,
 )
@@ -77,9 +77,9 @@ rust_library(
 )
 
 rust_library(
-    name = "libc",
-    srcs = ["src/libc.rs"],
-    crate_root = "src/libc.rs",
+    name = "mem_stubs",
+    srcs = ["src/mem_stubs.rs"],
+    crate_root = "src/mem_stubs.rs",
     rustc_flags = _NO_LTO,
     target_compatible_with = _UNIKERNEL_ONLY,
 )

@@ -1,4 +1,4 @@
-// boot/boot_asm.rs — x86_64 multiboot/PVH boot assembly stub.
+// boot/multiboot.rs — x86_64 multiboot/PVH boot assembly stub.
 //
 // This crate exists solely to host `boot.S` via `global_asm!`. boot.S
 // contains 32-bit absolute relocations (R_X86_64_32) targeting the

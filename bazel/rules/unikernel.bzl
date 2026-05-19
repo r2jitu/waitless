@@ -233,10 +233,10 @@ def unikernel_binary(
     # (`:<name>_hvf` → `:<name>.img` → `:<name>.elf`) builds fine.
     _unikernel_only = ["@platforms//os:none"]
 
-    # Common deps for both .elf paths. boot_asm (x86_64 multiboot/PVH stub)
+    # Common deps for both .elf paths. multiboot (x86_64 multiboot/PVH stub)
     # is added per-target below since it's incompatible with higher-half
     # linking and only needed for the QEMU direct-boot ELF.
-    _common_deps = [app, "//boot:entry", "//boot:limine", "//boot:libc"] + drivers
+    _common_deps = [app, "//boot:entry", "//boot:limine", "//boot:mem_stubs"] + drivers
     _unikernel_flags = _LINK_FLAGS + _LINK_FLAGS_ARCH
 
     # Per-binary crate root. Every boot/driver crate is an rlib; rustc
@@ -254,18 +254,18 @@ def unikernel_binary(
         "// Boot crates pulled in as rlibs: `entry` carries the kernel entry",
         "// points and the unikernel's sole `#[panic_handler]` +",
         "// `rust_eh_personality`; `limine` carries the Limine entry and its",
-        "// `.limine_requests` statics; `libc` carries the `mem*` intrinsics.",
+        "// `.limine_requests` statics; `mem_stubs` carries the `mem*` intrinsics.",
         "extern crate app;",
         "extern crate entry;",
         "extern crate limine;",
-        "extern crate libc;",
+        "extern crate mem_stubs;",
     ]
     for d in drivers:
         main_base.append("extern crate " + _label_crate_name(d) + ";")
 
-    # Multiboot ELF crate root: also pulls `boot_asm`, the x86_64
+    # Multiboot ELF crate root: also pulls `multiboot`, the x86_64
     # multiboot/PVH stub that owns `_start` (the linker `ENTRY`).
-    # `boot_asm` is a dep on x86_64 only — aarch64 boots via the Image
+    # `multiboot` is a dep on x86_64 only — aarch64 boots via the Image
     # header inside `entry` — so the `extern crate` is cfg-gated to match.
     elf_main_rule = name + "_elf_main_src"
     elf_main_rs = name + "_elf_main.rs"
@@ -275,13 +275,13 @@ def unikernel_binary(
         content = main_base + [
             "",
             "#[cfg(target_arch = \"x86_64\")]",
-            "extern crate boot_asm;",
+            "extern crate multiboot;",
             "",
         ],
         target_compatible_with = _unikernel_only,
     )
 
-    # Limine ELF crate root: no `boot_asm` — Limine enters via
+    # Limine ELF crate root: no `multiboot` — Limine enters via
     # `limine_entry_stub`, and boot.S's 32-bit absolute relocations
     # can't be linked into the higher-half image.
     limine_main_rule = name + "_limine_main_src"
@@ -300,7 +300,7 @@ def unikernel_binary(
         srcs = [":" + elf_main_rule],
         crate_root = elf_main_rs,
         deps = _common_deps + select({
-            "//bazel/platforms:x86_64": ["//boot:boot_asm"],
+            "//bazel/platforms:x86_64": ["//boot:multiboot"],
             "//conditions:default": [],
         }),
         linker_script = select({
@@ -349,7 +349,7 @@ def unikernel_binary(
     # ── Limine higher-half ELF (x86_64 Limine boot) ─────────────────────
     #
     # Uses a standalone linker script (unikernel_limine.ld) that places
-    # the kernel at 0xFFFFFFFF80100000. Excludes //boot:boot_asm because
+    # the kernel at 0xFFFFFFFF80100000. Excludes //boot:multiboot because
     # boot.S has 32-bit absolute relocations that can't reach higher-half;
     # Limine enters at limine_entry() directly so the multiboot stub
     # isn't needed. The runner_iso config also adds `-Ccode-model=kernel`

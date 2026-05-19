@@ -24,7 +24,7 @@ extern crate uni_net_stack as net;
 //
 // x86_64 boot.S contains 32-bit absolute relocations (R_X86_64_32)
 // targeting .boot_bss that cannot be linked into a higher-half ELF
-// (Limine boot), so it lives in a separate `boot_asm` crate that the
+// (Limine boot), so it lives in a separate `multiboot` crate that the
 // .limine.elf target excludes. Limine enters at `limine_entry()`
 // directly and does not need the multiboot/PVH stub.
 //
