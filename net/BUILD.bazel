@@ -232,9 +232,19 @@ rust_library(
         "//drivers:nic",
         "//kernel/core",
         "//uni-iobuf",
+        "//uni-net:driver",
         "//uni-runtime",
+        "//uni-worker",
         "@crates//:bitflags",
     ],
+)
+
+# Host-native TCP conformance harness — drives scripted segments into
+# `tcp_receive` against a mock `NicOps` that captures TX frames.
+rust_test(
+    name = "tcp_test",
+    size = "small",
+    crate = ":tcp",
 )
 
 rust_library(

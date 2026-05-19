@@ -4,7 +4,7 @@
 // the global pool. The flow hash (in net/lib.rs) routes packets to the
 // owning core. All connection operations are core-local — no locks.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 extern crate bitflags;
@@ -2503,4 +2503,353 @@ pub fn register_send_waker(handle: *mut (), generation: u16, waker: &Waker) {
 
 pub fn clear_send_waker(_handle: *mut (), _generation: u16) {
     // No-op on bare-metal — no send-waker state to clear.
+}
+
+// ── Host-native TCP conformance harness ─────────────────────────────────────
+//
+// packetdrill-style: drive scripted TCP segments into `tcp_receive`
+// against a mock `NicOps` that captures every transmitted frame into a
+// `Vec`, then assert on the captured output. `tcp_receive` is the real
+// RX entry point and the send path is the real TX code — only the NIC
+// underneath is mocked.
+//
+// `tcp.rs`'s per-core pools (`POOLS`, `TCP_HASH`) and the NIC-ops slot
+// are process-global, so the scenarios cannot run concurrently:
+// `TEST_LOCK` serialises them, and each uses a distinct 4-tuple so
+// connection-pool state never bleeds between tests.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::ptr::NonNull;
+    use std::sync::{Mutex, Once};
+    use types::Ipv4Addr;
+    use uni_iobuf::IOBufDropFn;
+    use uni_net_driver::{CsumStampConvention, NicOps, set_active_ops};
+
+    const SERVER_IP: [u8; 4] = [10, 0, 0, 1];
+    const CLIENT_IP: [u8; 4] = [10, 0, 0, 2];
+    const SERVER_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x01];
+
+    // ---- mock NIC: capture every transmitted frame ------------------------
+
+    static TX: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+    fn mock_send(frame: &[u8]) {
+        TX.lock().unwrap().push(frame.to_vec());
+    }
+    fn mock_get_mac(out: *mut u8) {
+        // SAFETY: the NIC-dispatch contract guarantees `out` addresses
+        // six writable bytes.
+        unsafe { core::ptr::copy_nonoverlapping(SERVER_MAC.as_ptr(), out, 6) };
+    }
+    fn yes() -> bool {
+        true
+    }
+    fn no() -> bool {
+        false
+    }
+    fn unit() {}
+    fn no_poll(_: fn(Chain<OwnedIOBuf>)) -> usize {
+        0
+    }
+    fn no_poll_qp(_: usize, _: fn(Chain<OwnedIOBuf>)) -> usize {
+        0
+    }
+    fn one_qp() -> u16 {
+        1
+    }
+
+    // `acquire_tx_buf` / TSO left `None` and the capabilities `false`,
+    // so every transmit funnels through `send(&[u8])` — the one path
+    // the capture hook covers. `csum_tx_offload = false` makes `tcp.rs`
+    // compute and stamp the full TCP checksum, so captured frames are
+    // wire-complete.
+    static MOCK_OPS: NicOps = NicOps {
+        name: "mock",
+        probe: yes,
+        send: mock_send,
+        acquire_tx_buf: None,
+        submit_tx: None,
+        tso_available: no,
+        csum_tx_offload: no,
+        csum_stamp_convention: || CsumStampConvention::PseudoHeaderPartial,
+        acquire_tx_tso_buf: None,
+        submit_tx_tso: None,
+        udp_gso_available: no,
+        acquire_tx_udp_gso_buf: None,
+        submit_tx_udp_gso: None,
+        poll_rx: no_poll,
+        poll_qp: no_poll_qp,
+        get_mac: mock_get_mac,
+        num_queue_pairs: one_qp,
+        enable_irq: unit,
+        enable_deferred_tx_kick: unit,
+        flush_tx_staging: unit,
+        flush_tx_kick_if_dirty: no,
+        poke_interrupt_status: unit,
+        idle: None,
+        diag: None,
+    };
+
+    // ---- one-time bring-up + per-test serialisation -----------------------
+
+    static SETUP: Once = Once::new();
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Lock out the other scenarios, run global bring-up once, and
+    /// start with an empty TX capture. The returned guard serialises
+    /// the test for as long as it is held.
+    fn harness() -> std::sync::MutexGuard<'static, ()> {
+        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SETUP.call_once(|| {
+            uni_worker::set_num_workers(1);
+            super::init(); // TCP per-core pools
+            ipv4::init(); // per-core IP-ID counter (the TX path stamps it)
+            ethernet::set_our_mac(SERVER_MAC);
+            set_active_ops(&MOCK_OPS);
+        });
+        TX.lock().unwrap().clear();
+        guard
+    }
+
+    /// Snapshot the captured frames.
+    fn tx() -> Vec<Vec<u8>> {
+        TX.lock().unwrap().clone()
+    }
+
+    /// Drop the captured frames — used to open a fresh assertion
+    /// window mid-scenario (e.g. after the handshake).
+    fn clear_tx() {
+        TX.lock().unwrap().clear();
+    }
+
+    // ---- scripted segment construction / parsing --------------------------
+
+    /// A scripted inbound TCP segment. `tcp_receive` is handed the
+    /// chain already narrowed to the TCP header, so the harness builds
+    /// no Ethernet/IP for the inbound direction.
+    struct Seg {
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        window: u16,
+        payload: Vec<u8>,
+    }
+
+    impl Seg {
+        fn encode(&self) -> Vec<u8> {
+            let mut b = Vec::with_capacity(TCP_HDR_LEN + self.payload.len());
+            b.extend_from_slice(&self.src_port.to_be_bytes());
+            b.extend_from_slice(&self.dst_port.to_be_bytes());
+            b.extend_from_slice(&self.seq.to_be_bytes());
+            b.extend_from_slice(&self.ack.to_be_bytes());
+            b.push(5 << 4); // data offset = 5 32-bit words (a 20-byte header)
+            b.push(self.flags);
+            b.extend_from_slice(&self.window.to_be_bytes());
+            b.extend_from_slice(&[0, 0]); // checksum — tcp_receive does not verify it
+            b.extend_from_slice(&[0, 0]); // urgent pointer
+            b.extend_from_slice(&self.payload);
+            b
+        }
+    }
+
+    /// Drop callback for `make_chain` — reclaims the `Box<[u8]>` whose
+    /// region was handed to `wrap_owned`.
+    ///
+    /// SAFETY: `base`/`cap` are the `(ptr, len)` of a `Box::<[u8]>`,
+    /// reclaimed exactly once here.
+    unsafe fn free_box(base: NonNull<u8>, cap: u32, _ctx: *mut ()) {
+        let slice = core::ptr::slice_from_raw_parts_mut(base.as_ptr(), cap as usize);
+        drop(unsafe { alloc::boxed::Box::from_raw(slice) });
+    }
+
+    /// Wrap `bytes` in a single-part `Chain<OwnedIOBuf>` — the shape
+    /// `tcp_receive` consumes.
+    fn make_chain(bytes: &[u8]) -> Chain<OwnedIOBuf> {
+        let boxed: alloc::boxed::Box<[u8]> = bytes.to_vec().into_boxed_slice();
+        let cap = boxed.len() as u32;
+        let raw = alloc::boxed::Box::into_raw(boxed);
+        // SAFETY: `raw` is a non-null `cap`-byte region; `free_box`
+        // reclaims it exactly once; offset 0 + len cap fits capacity.
+        let buf = unsafe {
+            OwnedIOBuf::wrap_owned(
+                NonNull::new_unchecked(raw as *mut u8),
+                cap,
+                0,
+                cap,
+                free_box as IOBufDropFn,
+                core::ptr::null_mut(),
+            )
+        };
+        Chain::from(buf)
+    }
+
+    fn v4(o: [u8; 4]) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::from(o[0], o[1], o[2], o[3]))
+    }
+
+    /// Drive one scripted segment from `CLIENT_IP` to `SERVER_IP`.
+    fn deliver(seg: &Seg) {
+        tcp_receive(v4(CLIENT_IP), v4(SERVER_IP), make_chain(&seg.encode()));
+    }
+
+    /// Host-order view of a captured frame's TCP header. Returned by
+    /// value so callers never hold a reference into the `repr(packed)`
+    /// `TcpHeader`.
+    struct TcpView {
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+    }
+
+    /// Parse the TCP header out of a captured `[Eth | IPv4 | TCP]`
+    /// frame (Ethernet 14 + IPv4 20 = offset 34).
+    fn tcp_hdr(frame: &[u8]) -> TcpView {
+        assert!(
+            frame.len() >= 34 + TCP_HDR_LEN,
+            "captured frame is {} bytes — too short for Eth+IPv4+TCP",
+            frame.len()
+        );
+        let h = TcpHeader::try_ref_from(&frame[34..]).expect("captured frame has a TCP header");
+        TcpView {
+            src_port: ntohs(h.src_port),
+            dst_port: ntohs(h.dst_port),
+            seq: ntohl(h.seq),
+            ack: ntohl(h.ack),
+            flags: h.flags,
+        }
+    }
+
+    // ---- scenarios --------------------------------------------------------
+
+    /// A bare SYN to a listening port is answered with a SYN|ACK that
+    /// acknowledges the client's ISN + 1.
+    #[test]
+    fn syn_elicits_syn_ack() {
+        let _g = harness();
+        const SP: u16 = 9101;
+        const CP: u16 = 50101;
+        const CLIENT_ISN: u32 = 0x1000;
+        super::listen_on_core(0, SP);
+
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN,
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            payload: Vec::new(),
+        });
+
+        let frames = tx();
+        assert_eq!(frames.len(), 1, "a SYN must elicit exactly one frame");
+        let h = tcp_hdr(&frames[0]);
+        assert_eq!(h.flags, TCP_SYN | TCP_ACK, "the reply must be SYN|ACK");
+        assert_eq!(h.src_port, SP, "reply source port = the listening port");
+        assert_eq!(h.dst_port, CP, "reply dest port = the client's port");
+        assert_eq!(
+            h.ack,
+            CLIENT_ISN.wrapping_add(1),
+            "SYN|ACK must acknowledge the client ISN + 1",
+        );
+    }
+
+    /// Once the three-way handshake completes, an in-order data
+    /// segment is acknowledged with `ack` advanced past the bytes.
+    #[test]
+    fn established_data_is_acked() {
+        let _g = harness();
+        const SP: u16 = 9102;
+        const CP: u16 = 50102;
+        const CLIENT_ISN: u32 = 0x2000;
+        super::listen_on_core(0, SP);
+
+        let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+        clear_tx();
+        let body = b"hello!";
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN.wrapping_add(1),
+            ack: server_isn.wrapping_add(1),
+            flags: TCP_ACK | TCP_PSH,
+            window: 65535,
+            payload: body.to_vec(),
+        });
+
+        let frames = tx();
+        assert!(!frames.is_empty(), "in-order data must elicit an ACK");
+        let last = tcp_hdr(frames.last().unwrap());
+        assert_ne!(last.flags & TCP_ACK, 0, "the reply must carry ACK");
+        assert_eq!(
+            last.ack,
+            CLIENT_ISN.wrapping_add(1 + body.len() as u32),
+            "ACK must cover the delivered payload",
+        );
+    }
+
+    /// A FIN on an established connection is acknowledged, with `ack`
+    /// advanced one sequence number past the FIN.
+    #[test]
+    fn fin_is_acked() {
+        let _g = harness();
+        const SP: u16 = 9103;
+        const CP: u16 = 50103;
+        const CLIENT_ISN: u32 = 0x3000;
+        super::listen_on_core(0, SP);
+
+        let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+        clear_tx();
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN.wrapping_add(1),
+            ack: server_isn.wrapping_add(1),
+            flags: TCP_FIN | TCP_ACK,
+            window: 65535,
+            payload: Vec::new(),
+        });
+
+        let frames = tx();
+        assert!(!frames.is_empty(), "a FIN must elicit an ACK");
+        let last = tcp_hdr(frames.last().unwrap());
+        assert_ne!(last.flags & TCP_ACK, 0, "the reply must carry ACK");
+        assert_eq!(
+            last.ack,
+            CLIENT_ISN.wrapping_add(2),
+            "ACK must cover the FIN — one sequence number past the handshake",
+        );
+    }
+
+    /// Drive a full three-way handshake on `(server_port, client_port)`
+    /// and return the server's chosen ISN (read from the SYN|ACK).
+    fn handshake(server_port: u16, client_port: u16, client_isn: u32) -> u32 {
+        deliver(&Seg {
+            src_port: client_port,
+            dst_port: server_port,
+            seq: client_isn,
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            payload: Vec::new(),
+        });
+        let server_isn = tcp_hdr(&tx()[0]).seq;
+        deliver(&Seg {
+            src_port: client_port,
+            dst_port: server_port,
+            seq: client_isn.wrapping_add(1),
+            ack: server_isn.wrapping_add(1),
+            flags: TCP_ACK,
+            window: 65535,
+            payload: Vec::new(),
+        });
+        server_isn
+    }
 }
