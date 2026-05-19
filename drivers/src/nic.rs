@@ -1,4 +1,4 @@
-// drivers/net.rs — the `nic` crate: NIC dispatch through
+// drivers/nic.rs — the `nic` crate: NIC dispatch through
 // `uni_net_driver::active_ops()`.
 //
 // Standalone host-buildable crate whose only dependency is the

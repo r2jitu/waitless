@@ -24,13 +24,12 @@ rust_library(
 # host-buildable crate — its only dependency is the host-buildable
 # `//uni-net:driver` interface crate — so the TX-side net crates
 # (`net_eth_tx`, `net_tcp`, …) can call the dispatchers without being
-# dragged onto the os:none `//drivers` umbrella. The crate is named
-# `nic`; `crate_root` keeps the historical `src/net.rs` filename.
+# dragged onto the os:none `//drivers` umbrella.
 rust_library(
     name = "nic",
-    srcs = ["src/net.rs"],
+    srcs = ["src/nic.rs"],
     crate_name = "nic",
-    crate_root = "src/net.rs",
+    crate_root = "src/nic.rs",
     deps = ["//uni-net:driver"],
 )
 
