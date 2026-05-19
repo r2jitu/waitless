@@ -131,7 +131,7 @@ unsafe fn fill_udp_frame_headers(
     // SAFETY: `udp_off + udp_len` is within `frame`.
     let seg = unsafe { frame.as_ptr().add(udp_off) };
     udp_hdr.checksum = match csum {
-        UdpCsum::Full => checksum::l4_checksum_any(src, dst, types::proto::UDP, seg, udp_len),
+        UdpCsum::Full => checksum::l4_checksum(src, dst, types::proto::UDP, seg, udp_len),
         UdpCsum::OffloadAware => l4_tx::checksum(src, dst, types::proto::UDP, seg, udp_len),
     };
 

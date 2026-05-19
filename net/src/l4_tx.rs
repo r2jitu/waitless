@@ -31,6 +31,6 @@ pub fn checksum(src: IpAddr, dst: IpAddr, proto: u8, seg: *const u8, seg_len: us
     if uni_drivers::net::csum_tx_offload() {
         net_checksum::l4_pseudo_partial(src, dst, proto, seg_len)
     } else {
-        net_checksum::l4_checksum_any(src, dst, proto, seg, seg_len)
+        net_checksum::l4_checksum(src, dst, proto, seg, seg_len)
     }
 }

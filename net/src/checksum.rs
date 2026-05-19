@@ -51,7 +51,7 @@ pub fn ipv4_header_checksum(data: *const u8, len: usize) -> u16 {
 /// The device adds the data checksum to this value and writes
 /// the final 16-bit checksum at the same offset.
 ///
-/// Cheaper than `l4_checksum_any` because it skips the data
+/// Cheaper than `l4_checksum` because it skips the data
 /// pass — that's the whole point of CSUM-offload.
 #[inline]
 pub fn l4_pseudo_partial(src: IpAddr, dst: IpAddr, proto: u8, l4_len: usize) -> u16 {
@@ -85,7 +85,7 @@ pub fn l4_pseudo_partial(src: IpAddr, dst: IpAddr, proto: u8, l4_len: usize) -> 
 /// TCP/UDP pseudo-header checksum, family-dispatched.
 /// `src`/`dst` must agree on family; mismatched families fall back
 /// to `l4_checksum_v4` on the v4 component (caller bug).
-pub fn l4_checksum_any(src: IpAddr, dst: IpAddr, proto: u8, data: *const u8, len: usize) -> u16 {
+pub fn l4_checksum(src: IpAddr, dst: IpAddr, proto: u8, data: *const u8, len: usize) -> u16 {
     match (src, dst) {
         (IpAddr::V4(s), IpAddr::V4(d)) => l4_checksum_v4(s, d, proto, data, len),
         (IpAddr::V6(s), IpAddr::V6(d)) => l4_checksum_v6(&s, &d, proto, data, len),
