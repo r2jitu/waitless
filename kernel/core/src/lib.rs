@@ -13,6 +13,7 @@
 
 extern crate alloc;
 
+pub mod clock;
 pub mod deque;
 pub mod diag;
 pub mod mmio;

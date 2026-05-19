@@ -22,7 +22,7 @@ pub mod time;
 // target). Re-export every one so consumers' `uni_kernel::{percpu,
 // sync, rx_inbox, ...}` paths are unchanged.
 pub use kernel_core::{
-    cpu_id, deque, diag, mmio, once, percpu, rx_inbox, spsc, sync, timer, types,
+    clock, cpu_id, deque, diag, mmio, once, percpu, rx_inbox, spsc, sync, timer, types,
 };
 
 #[cfg(target_arch = "x86_64")]

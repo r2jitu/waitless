@@ -12,6 +12,7 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "core",
     srcs = [
+        "src/clock.rs",
         "src/deque.rs",
         "src/diag.rs",
         "src/lib.rs",

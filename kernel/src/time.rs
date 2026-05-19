@@ -257,6 +257,26 @@ pub fn since_boot_us() -> u64 {
     elapsed / cycles_per_us()
 }
 
+// ── kernel_core clock link seam ─────────────────────────────────────────────
+//
+// `kernel_core::clock::now_ms()` resolves, on the bare-metal target,
+// to this `#[no_mangle]` symbol — mirroring `__uni_kernel_cpu_id` and
+// `__uni_kernel_rng_fill`. `kernel_core` is the lower crate and cannot
+// call up into `//kernel`, so it declares the `extern "Rust"` symbol
+// and `//kernel` defines it here. This is what lets `net_tcp`'s
+// RFC 6298 retransmission timer read a monotonic millisecond clock on
+// `os:none` while resolving to a test-controllable mock under host
+// unit tests.
+
+/// Link-seam definition for `kernel_core::clock::now_ms()`. Monotonic
+/// milliseconds since `mark_boot_start` — `since_boot_us` returns 0
+/// until that runs, so the clock reads a clean 0 pre-boot-mark rather
+/// than faulting.
+#[unsafe(no_mangle)]
+pub extern "Rust" fn __uni_kernel_now_ms() -> u64 {
+    since_boot_us() / 1000
+}
+
 /// Print `[TIME] LABEL: N ms` (since boot) on the serial console.
 /// Cheap: one cycle counter read, one TSC-rate read (cached after the
 /// first x86 PIT calibration), and a few `serial::puts`. Not on a hot
