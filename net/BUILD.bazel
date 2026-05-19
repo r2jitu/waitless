@@ -62,7 +62,7 @@ rust_test(
 )
 
 # Ethernet wire format — parse + header build. Pure leaf (no driver
-# dep), host-testable. The os:none send path is `:eth_tx`.
+# dep), host-testable. The os:none send path is `:ethernet_send`.
 rust_library(
     name = "ethernet",
     srcs = ["src/ethernet.rs"],
@@ -85,10 +85,10 @@ rust_test(
 # buildable: its NIC dep is the host-buildable `//drivers:nic`
 # dispatch crate, not the os:none `//drivers` umbrella.
 rust_library(
-    name = "eth_tx",
-    srcs = ["src/eth_tx.rs"],
-    crate_name = "net_eth_tx",
-    crate_root = "src/eth_tx.rs",
+    name = "ethernet_send",
+    srcs = ["src/ethernet_send.rs"],
+    crate_name = "net_ethernet_send",
+    crate_root = "src/ethernet_send.rs",
     deps = [
         ":ethernet",
         ":types",
@@ -102,8 +102,8 @@ rust_library(
     crate_name = "net_arp",
     crate_root = "src/arp.rs",
     deps = [
-        ":eth_tx",
         ":ethernet",
+        ":ethernet_send",
         ":from_bytes",
         ":types",
         "//drivers:nic",
@@ -203,10 +203,10 @@ rust_test(
 # builders so they don't carry duplicate copies of the same
 # 10-line dispatch.
 rust_library(
-    name = "dst_mac",
-    srcs = ["src/dst_mac.rs"],
-    crate_name = "net_dst_mac",
-    crate_root = "src/dst_mac.rs",
+    name = "mac_resolve",
+    srcs = ["src/mac_resolve.rs"],
+    crate_name = "net_mac_resolve",
+    crate_root = "src/mac_resolve.rs",
     deps = [
         ":arp",
         ":ndp",
@@ -227,8 +227,8 @@ rust_library(
     crate_name = "net_ipv6_send",
     crate_root = "src/ipv6_send.rs",
     deps = [
-        ":eth_tx",
         ":ethernet",
+        ":ethernet_send",
         ":icmpv6",
         ":ipv6",
         ":ndp",
@@ -243,12 +243,12 @@ rust_library(
     crate_root = "src/tcp.rs",
     deps = [
         ":checksum",
-        ":dst_mac",
         ":ethernet",
         ":from_bytes",
         ":ipv4",
         ":ipv6",
         ":ipv6_send",
+        ":mac_resolve",
         ":types",
         "//drivers:nic",
         "//kernel/core",
@@ -275,12 +275,12 @@ rust_library(
     crate_root = "src/udp.rs",
     deps = [
         ":checksum",
-        ":dst_mac",
         ":ethernet",
         ":from_bytes",
         ":ipv4",
         ":ipv6",
         ":ipv6_send",
+        ":mac_resolve",
         ":types",
         "//drivers:nic",
         "//uni-iobuf",
@@ -334,9 +334,9 @@ rust_test(
 # the flow hash are host-unit-testable. `uni_net_stack`'s `rx` module
 # is the os:none shell that supplies the IPv6 accept-list + delivers.
 rust_library(
-    name = "net_rx",
+    name = "classify",
     srcs = ["src/classify.rs"],
-    crate_name = "net_rx",
+    crate_name = "net_classify",
     crate_root = "src/classify.rs",
     deps = [
         ":ethernet",
@@ -347,9 +347,9 @@ rust_library(
 )
 
 rust_test(
-    name = "net_rx_test",
+    name = "classify_test",
     size = "small",
-    crate = ":net_rx",
+    crate = ":classify",
 )
 
 # ── Umbrella crate: full-stack dispatch + poll ───────────────────────────────
@@ -366,15 +366,15 @@ rust_library(
     crate_root = "src/lib.rs",
     deps = [
         ":arp",
+        ":classify",
         ":dhcp",
-        ":eth_tx",
         ":ethernet",
+        ":ethernet_send",
         ":icmpv6",
         ":ipv4",
         ":ipv6",
         ":ipv6_send",
         ":ndp",
-        ":net_rx",
         ":tcp",
         ":types",
         ":udp",

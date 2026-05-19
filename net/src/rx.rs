@@ -26,7 +26,7 @@
 //! returns), reposting the buffer(s) via each part's drop callback.
 
 use crate::{arp, ipv6_nd, ndp, sched, tcp, types, udp};
-use net_rx::{Classified, classify, owner};
+use net_classify::{Classified, classify, owner};
 use uni_iobuf::{Chain, OwnedIOBuf};
 use uni_kernel::percpu;
 

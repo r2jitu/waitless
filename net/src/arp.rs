@@ -3,15 +3,15 @@
 #![no_std]
 
 extern crate kernel_core;
-extern crate net_eth_tx as eth_tx;
 extern crate net_ethernet as ethernet;
+extern crate net_ethernet_send as ethernet_send;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate nic;
 extern crate uni_iobuf;
 
-use eth_tx::ethernet_send;
 use ethernet::{ETHERTYPE_ARP, ethernet_our_mac, ethernet_parse};
+use ethernet_send::ethernet_send;
 use from_bytes::FromBytes;
 use kernel_core::sync::Spinlock;
 use types::{CONFIG, Ipv4Addr, MacAddr, htons, ntohs};

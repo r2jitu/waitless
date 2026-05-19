@@ -18,14 +18,14 @@
 
 #![no_std]
 
-extern crate net_eth_tx as eth_tx;
 extern crate net_ethernet as ethernet;
+extern crate net_ethernet_send as ethernet_send;
 extern crate net_icmpv6 as icmpv6;
 extern crate net_ipv6 as ipv6;
 extern crate net_ndp as ndp;
 extern crate net_types as types;
 
-use eth_tx::ethernet_send;
+use ethernet_send::ethernet_send;
 use ipv6::ETHERTYPE_IPV6;
 use types::{Ipv6Addr, MacAddr};
 

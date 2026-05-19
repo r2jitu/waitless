@@ -134,7 +134,7 @@ pub fn ipv6_build(
 /// only when the bytes are malformed — too short for the 40-byte
 /// header, or not version 6. A pure wire parse: whether the packet
 /// is addressed to us (dst-address policy) is the caller's call.
-/// The IPv6 module is plain L3, so `net_rx`'s `summarize_ipv6`
+/// The IPv6 module is plain L3, so `net_classify`'s `summarize_ipv6`
 /// applies the host accept predicate against the returned `dst`;
 /// the address policy itself lives in higher layers (NDP / SLAAC /
 /// app config).

@@ -1,6 +1,6 @@
 // net/classify.rs — the RX classify stage + Tier-2 flow distribution.
 //
-// Pure leaf crate (`net_rx`): turns a received frame's part-0 bytes
+// Pure leaf crate (`net_classify`): turns a received frame's part-0 bytes
 // into a `Classified` verdict — eth + L3 parse, once, IPv4 and IPv6
 // alike — and maps a TCP/UDP flow to an owning core. Depends only on
 // the pure wire-format leaves (net_ethernet / net_ipv4 / net_ipv6 /
@@ -71,7 +71,7 @@ struct EthFrame<'a> {
 /// `accept_v6` answers "is this IPv6 dst one of ours?" — the host's
 /// address policy. It is consulted **only for an IPv6 frame**, so an
 /// IPv4 or ARP frame pays nothing for it (the caller passes the
-/// os:none `ipv6_nd::v6_addr_is_ours`, which `net_rx` must not depend
+/// os:none `ipv6_nd::v6_addr_is_ours`, which `net_classify` must not depend
 /// on).
 pub fn classify(frame: &[u8], accept_v6: impl Fn(&Ipv6Addr) -> bool) -> Classified {
     let Some((src_mac, ethertype, l3)) = ethernet::ethernet_parse_full(frame) else {
@@ -127,7 +127,7 @@ fn summarize_ipv4(eth: EthFrame<'_>) -> Option<ParsedL3> {
 fn summarize_ipv6(eth: EthFrame<'_>, accept_v6: impl Fn(&Ipv6Addr) -> bool) -> Option<ParsedL3> {
     let pkt = ipv6::ipv6_parse(eth.l3)?;
     // `ipv6_parse` is a pure wire parse; applying the dst-address
-    // policy is ours. `net_rx` stays a leaf — the predicate is
+    // policy is ours. `net_classify` stays a leaf — the predicate is
     // supplied by the os:none caller.
     if !accept_v6(&pkt.dst) {
         return None;

@@ -10,12 +10,12 @@ extern crate alloc;
 extern crate bitflags;
 extern crate kernel_core;
 extern crate net_checksum as checksum;
-extern crate net_dst_mac as dst_mac;
 extern crate net_ethernet as ethernet;
 extern crate net_from_bytes as from_bytes;
 extern crate net_ipv4 as ipv4;
 extern crate net_ipv6 as ipv6;
 extern crate net_ipv6_send as ipv6_send;
+extern crate net_mac_resolve as mac_resolve;
 extern crate net_types as types;
 extern crate nic;
 extern crate uni_runtime;
@@ -1479,7 +1479,7 @@ fn send_segment(
     window: u16,
     payload: &[u8],
 ) {
-    let dst_mac = match dst_mac::resolve(dst_ip) {
+    let dst_mac = match mac_resolve::resolve(dst_ip) {
         Some(m) => m,
         None => return, // ARP/NDP miss; TCP retransmit will retry
     };
@@ -1539,7 +1539,7 @@ fn send_super_segment_from_cursor(
     cursor: &mut uni_iobuf::Cursor<'_>,
     payload_len: usize,
 ) {
-    let dst_mac = match dst_mac::resolve(dst_ip) {
+    let dst_mac = match mac_resolve::resolve(dst_ip) {
         Some(m) => m,
         None => return,
     };
@@ -1664,7 +1664,7 @@ pub fn try_send_tso(
     if min_payload <= mss {
         return None;
     }
-    let dst_mac = dst_mac::resolve(c.remote_ip)?;
+    let dst_mac = mac_resolve::resolve(c.remote_ip)?;
     let mut handle = nic::acquire_tx_tso_buf()?;
 
     let payload_off = payload_offset(c.local_ip);
@@ -1780,7 +1780,7 @@ fn send_segment_from_cursor(
     cursor: &mut uni_iobuf::Cursor<'_>,
     payload_len: usize,
 ) {
-    let dst_mac = match dst_mac::resolve(dst_ip) {
+    let dst_mac = match mac_resolve::resolve(dst_ip) {
         Some(m) => m,
         None => return, // ARP/NDP miss; TCP retransmit will retry
     };

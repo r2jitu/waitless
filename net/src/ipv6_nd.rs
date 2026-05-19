@@ -175,7 +175,7 @@ fn handle_router_advertisement(payload: &[u8]) {
 /// to — its link-local, that link-local's solicited-node multicast,
 /// all-nodes link-local (ff02::1), or (once SLAAC has completed) the
 /// global unicast + its solicited-node group? Passed to
-/// `net_rx::classify` as the v6 dst-address accept predicate;
+/// `net_classify::classify` as the v6 dst-address accept predicate;
 /// consulted once per inbound IPv6 frame.
 pub(crate) fn v6_addr_is_ours(addr: &types::Ipv6Addr) -> bool {
     let ll = ipv6_ll();

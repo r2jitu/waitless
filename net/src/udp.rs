@@ -8,12 +8,12 @@
 #![no_std]
 
 extern crate net_checksum as checksum;
-extern crate net_dst_mac as dst_mac;
 extern crate net_ethernet as ethernet;
 extern crate net_from_bytes as from_bytes;
 extern crate net_ipv4 as ipv4;
 extern crate net_ipv6 as ipv6;
 extern crate net_ipv6_send as ipv6_send;
+extern crate net_mac_resolve as mac_resolve;
 extern crate net_types as types;
 extern crate nic;
 extern crate uni_net_driver;
@@ -172,7 +172,7 @@ pub fn send_with_l2_headroom(dst: IpAddr, src_port: u16, dst_port: u16, frame: &
     }
     let udp_len = UDP_HDR_LEN + payload_len;
 
-    let dst_mac = match dst_mac::resolve(dst) {
+    let dst_mac = match mac_resolve::resolve(dst) {
         Some(m) => m,
         None => return,
     };
@@ -257,7 +257,7 @@ pub fn send_via_tx_handle(
     }
     let udp_len = UDP_HDR_LEN + payload_len;
 
-    let dst_mac = match dst_mac::resolve(dst) {
+    let dst_mac = match mac_resolve::resolve(dst) {
         Some(m) => m,
         None => return, // ARP/NDP miss; fire-and-forget UDP drop.
     };
