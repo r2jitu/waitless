@@ -1306,7 +1306,7 @@ fn free_connection(core: u32, slot: usize) {
 // fall back to the per-MSS loop rather than expanding this stack
 // buffer to ~16 KiB.
 
-const ETH_HDR_LEN: usize = 14;
+const ETH_HDR_LEN: usize = ethernet::HEADER_LEN; // 14
 const IPV4_HDR_LEN: usize = ipv4::HEADER_LEN; // 20
 const IPV6_HDR_LEN: usize = ipv6::HEADER_LEN; // 40
 const TCP_HDR_LEN: usize = 20;
