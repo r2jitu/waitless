@@ -38,6 +38,37 @@ static RX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 pub(crate) static JUST_DISTRIBUTED: uni_kernel::percpu::PerWorker<core::sync::atomic::AtomicBool> =
     uni_kernel::percpu::PerWorker::new();
 
+/// Per-core poll counter — gates the RFC 6298 retransmission tick.
+/// Walking the TCP pool (and reading the millisecond clock) on every
+/// event-loop iteration would be a measurable hot-path cost; gating
+/// on the low bits of this counter runs the tick roughly once per
+/// `RTX_TICK_INTERVAL` polls instead. A few hundred polls is a
+/// fraction of a millisecond and the RTO floor is 1 s, so the
+/// resolution is far finer than it needs to be, while the per-poll
+/// cost is a single owned-cache-line `fetch_add`.
+///
+/// Sized to the tree-wide 8-core ceiling (`MAX_CORE_STATS`,
+/// `MAX_QUEUE_PAIRS`); each core touches only its own slot, so the
+/// counters never share a contended line across cores.
+static RTX_POLL_COUNT: [core::sync::atomic::AtomicU32; 8] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 8];
+
+/// Mask selecting how often the retransmission tick runs — once per
+/// 1024 polls. A power-of-two mask keeps the gate a single `and`.
+const RTX_TICK_MASK: u32 = 0x3FF;
+
+/// Run the TCP retransmission tick for this core at a coarse cadence.
+fn rtx_tick_if_due() {
+    let core = uni_kernel::cpu_id() as usize;
+    if core >= RTX_POLL_COUNT.len() {
+        return;
+    }
+    let n = RTX_POLL_COUNT[core].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n & RTX_TICK_MASK == 0 {
+        crate::tcp::on_rtx_tick();
+    }
+}
+
 /// Poll the network device and dispatch received frames through the
 /// full stack: Ethernet -> ARP/IPv4 -> TCP/UDP.
 ///
@@ -48,6 +79,10 @@ pub(crate) static JUST_DISTRIBUTED: uni_kernel::percpu::PerWorker<core::sync::at
 /// by acquiring the RX lock.
 /// Returns true if any network work was done.
 pub fn poll() -> bool {
+    // Drive RFC 6298 retransmission timers before the RX work — a
+    // lost outbound segment is resent here, not on an RX event.
+    rtx_tick_if_due();
+
     let num_cores = percpu::num_cores();
 
     if num_cores <= 1 {
@@ -200,6 +235,11 @@ pub fn init_eventloop() {
     // NAPI re-arm: right before the event loop HLTs, re-enable RX
     // notifications on this core's queue pair and re-check the ring.
     uni_kernel::eventloop::set_net_rearm_rx(uni_drivers::net::rearm_rx_napi);
+    // RFC 6298: a core with an armed retransmission timer must not
+    // sleep past the deadline. The event loop bounds its idle when
+    // this reports true (the connection awaiting a lost segment's
+    // ACK gets no RX event to wake it otherwise).
+    uni_kernel::eventloop::set_net_has_timers(crate::tcp::has_armed_rtx_timers);
     // Batch TX kicks: defer MMIO writes until `net_flush_cb` fires at
     // the end of each event-loop tick. Correct for the whole boot
     // because DHCP now runs as an async task polled by the event loop

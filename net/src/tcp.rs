@@ -133,6 +133,37 @@ fn mss_for(local_ip: IpAddr) -> usize {
     }
 }
 
+// ─── RFC 6298 retransmission ─────────────────────────────────────────────────
+//
+// Every unacknowledged outbound byte is kept in a per-conn ring
+// (`rtx_buf`) alongside a millisecond RTO deadline. A periodic tick
+// (`on_rtx_tick`, driven by the net poll loop) retransmits the oldest
+// unacked data once the deadline passes and doubles the RTO each time
+// (§5.5 exponential backoff). Before this a lost *outbound* segment
+// was never resent — an RFC 9293 MUST violation, and a real
+// correctness gap on a lossy path.
+
+/// Per-conn retransmit-ring capacity. Sized to hold one maximum TLS
+/// 1.3 record's ciphertext (16384-byte plaintext chunk + AEAD
+/// envelope) with margin — the largest single `async_try_send_chain`
+/// the server issues. An unacked window that outgrows this suspends
+/// retransmit coverage (`rtx_overflow`) until the peer's ACKs drain
+/// it; that is strictly better than the pre-RFC-6298 "retransmit
+/// nothing" and disappears once RFC 5681 `cwnd` bounds the in-flight
+/// window. Boxed + lazy like `rx_ring`, so idle slots stay cheap.
+const RTX_BUF_BYTES: usize = 17408;
+/// Initial RTO before any RTT measurement (RFC 6298 §2.1); also the
+/// value the RTO is re-initialised to when new data is acknowledged.
+const RTO_INITIAL_MS: u32 = 1000;
+/// RTO ceiling — the §5.5 exponential backoff clamps here. RFC 6298
+/// §2.5 requires the bound to be at least 60 s.
+const RTO_MAX_MS: u32 = 60_000;
+/// Retransmissions of one segment before the connection is declared
+/// dead and torn down. With 1+2+4+…+60 s (capped) backoff this is
+/// ~100 s of total wait — in line with the RFC 9293 §3.8.3 "R2"
+/// lower bound for aborting a broken connection.
+const RTX_MAX_RETRIES: u8 = 8;
+
 /// Active `TcpRecv` future's destination buffer. The future
 /// registers this pointer + capacity when it parks, so a subsequent
 /// `tcp_receive` can copy payload bytes straight into the user buf
@@ -226,6 +257,33 @@ pub struct TcpConnection {
     /// owning core; woken when data lands in the ring or the
     /// peer closes. Per-core ownership — no lock needed.
     recv_waker: Option<Waker>,
+    /// RFC 6298 retransmit ring — the unacknowledged outbound bytes,
+    /// mirroring the wire range `[snd_una, snd_nxt)`. Heap-boxed and
+    /// lazily allocated on the first buffered send, then reused across
+    /// SYN/close cycles like `rx_ring`. `None` until the conn first
+    /// sends data.
+    rtx_buf: Option<Box<[u8; RTX_BUF_BYTES]>>,
+    /// Ring index of the byte at `snd_una`.
+    rtx_head: u16,
+    /// Bytes currently buffered. Equals `snd_nxt - snd_una` while
+    /// retransmit coverage holds; see `rtx_overflow`.
+    rtx_len: u16,
+    /// Set when the unacked window outgrew `rtx_buf` (or the buffer
+    /// failed to allocate): the ring no longer covers `[snd_una,
+    /// snd_nxt)`, so the RTO timer is held off until the peer's ACKs
+    /// drain the window back to empty, at which point coverage
+    /// resumes. Never *worse* than the pre-RFC-6298 behaviour.
+    rtx_overflow: bool,
+    /// Current retransmission timeout, milliseconds. Doubles on each
+    /// RTO expiry (§5.5); re-initialised when new data is ACK'd.
+    rto_ms: u32,
+    /// Absolute deadline (`kernel_core::clock::now_ms`) at which the
+    /// oldest unacked segment is retransmitted. 0 = timer disarmed.
+    rtx_deadline_ms: u64,
+    /// Consecutive RTO expiries for the oldest segment without an
+    /// intervening ACK — the §5.5 backoff exponent, and the
+    /// give-up counter (`RTX_MAX_RETRIES`).
+    rtx_backoff: u8,
     /// Free-list link. When this slot is on the free list (state ==
     /// Closed AND the slot has been returned to the pool), this
     /// holds the index of the next free slot, or `NULL_SLOT` for
@@ -258,6 +316,13 @@ impl TcpConnection {
             accepted: false,
             generation: 0,
             recv_waker: None,
+            rtx_buf: None,
+            rtx_head: 0,
+            rtx_len: 0,
+            rtx_overflow: false,
+            rto_ms: RTO_INITIAL_MS,
+            rtx_deadline_ms: 0,
+            rtx_backoff: 0,
             next_free: NULL_SLOT,
         }
     }
@@ -457,6 +522,148 @@ impl TcpConnection {
                 &[],
             );
         }
+    }
+
+    // ─── RFC 6298 retransmission ─────────────────────────────────────────
+
+    /// Lazy-allocate the per-conn retransmit ring on the first
+    /// buffered send. Reused across SYN/close cycles like `rx_ring`
+    /// (the pool free-list dance preserves it). Returns `false` on
+    /// OOM — the caller then suspends retransmit coverage.
+    fn ensure_rtx_buf(&mut self) -> bool {
+        if self.rtx_buf.is_some() {
+            return true;
+        }
+        let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        if v.try_reserve_exact(RTX_BUF_BYTES).is_err() {
+            return false;
+        }
+        v.resize(RTX_BUF_BYTES, 0);
+        let boxed: Box<[u8]> = v.into_boxed_slice();
+        // SAFETY: just resized to RTX_BUF_BYTES, so the slice length
+        // matches the array type we cast the Box to.
+        let ptr = Box::into_raw(boxed) as *mut [u8; RTX_BUF_BYTES];
+        self.rtx_buf = Some(unsafe { Box::from_raw(ptr) });
+        true
+    }
+
+    /// Arm the retransmission timer `rto_ms` ahead of now.
+    fn arm_rtx(&mut self) {
+        self.rtx_deadline_ms = kernel_core::clock::now_ms() + self.rto_ms as u64;
+    }
+
+    /// Retain the `total` just-sent bytes — read from a fresh cursor
+    /// over the chain `async_try_send_chain` already transmitted — so
+    /// the RTO timer can retransmit them, and start the timer if it
+    /// is not already running (RFC 6298 §5.1).
+    fn rtx_on_data_sent(&mut self, total: usize, cur: &mut uni_iobuf::Cursor<'_>) {
+        if total == 0 || self.rtx_overflow {
+            return; // nothing to retain, or coverage already suspended
+        }
+        if !self.ensure_rtx_buf() || self.rtx_len as usize + total > RTX_BUF_BYTES {
+            // OOM, or the unacked window outgrew the ring. Drop
+            // retransmit coverage until snd_una catches snd_nxt;
+            // `rtx_on_ack` clears the flag once the window drains.
+            self.rtx_overflow = true;
+            self.rtx_head = 0;
+            self.rtx_len = 0;
+            self.rtx_deadline_ms = 0;
+            return;
+        }
+        let tail = (self.rtx_head as usize + self.rtx_len as usize) % RTX_BUF_BYTES;
+        let buf = self.rtx_buf.as_mut().expect("ensure_rtx_buf succeeded");
+        if tail + total <= RTX_BUF_BYTES {
+            cur.read(&mut buf[tail..tail + total]);
+        } else {
+            let first = RTX_BUF_BYTES - tail;
+            cur.read(&mut buf[tail..]);
+            cur.read(&mut buf[..total - first]);
+        }
+        self.rtx_len += total as u16;
+        // §5.1: start the timer if it is not already running.
+        if self.rtx_deadline_ms == 0 {
+            self.arm_rtx();
+        }
+    }
+
+    /// Fold an ACK into the retransmission state: drop acknowledged
+    /// bytes from the ring and re-arm or stop the timer (RFC 6298
+    /// §5.2 / §5.3). `old_una` is `snd_una` from *before* the caller
+    /// advanced it for this ACK.
+    fn rtx_on_ack(&mut self, old_una: u32) {
+        // Resume coverage once an overflowed window has fully drained.
+        if self.rtx_overflow {
+            if self.snd_una == self.snd_nxt {
+                self.rtx_overflow = false;
+                self.rtx_backoff = 0;
+                self.rto_ms = RTO_INITIAL_MS;
+            }
+            return;
+        }
+        let acked = self.snd_una.wrapping_sub(old_una) as usize;
+        if acked == 0 {
+            return; // not new data — leave the timer untouched
+        }
+        let drop = acked.min(self.rtx_len as usize);
+        self.rtx_head = ((self.rtx_head as usize + drop) % RTX_BUF_BYTES) as u16;
+        self.rtx_len -= drop as u16;
+        // New data acknowledged: the peer is making progress, so clear
+        // the §5.5 backoff and re-initialise the RTO.
+        self.rtx_backoff = 0;
+        self.rto_ms = RTO_INITIAL_MS;
+        if self.rtx_len == 0 {
+            // §5.2: everything outstanding is ACK'd — stop the timer.
+            self.rtx_deadline_ms = 0;
+        } else {
+            // §5.3: some (not all) ACK'd — restart the timer.
+            self.arm_rtx();
+        }
+    }
+
+    /// Retransmit the oldest unacked segment (RFC 6298 §5.4-§5.6):
+    /// re-send up to one MSS from `snd_una`, double the RTO (§5.5),
+    /// and re-arm the timer. Called by `on_rtx_tick` when the
+    /// deadline has passed.
+    fn retransmit_oldest(&mut self, now: u64) {
+        let n = (self.rtx_len as usize).min(mss_for(self.local_ip));
+        if n == 0 {
+            self.rtx_deadline_ms = 0; // nothing to retransmit
+            return;
+        }
+        // Copy the (≤ MSS) bytes out of the ring into a contiguous
+        // scratch buffer — the ring segment may wrap, and `send_segment`
+        // takes a flat slice. Off the steady-state path (only fires on
+        // actual loss), so the stack copy is not a hot-path cost.
+        let mut scratch = [0u8; MSS_MAX];
+        {
+            let Some(buf) = self.rtx_buf.as_ref() else {
+                self.rtx_deadline_ms = 0;
+                return;
+            };
+            let head = self.rtx_head as usize;
+            if head + n <= RTX_BUF_BYTES {
+                scratch[..n].copy_from_slice(&buf[head..head + n]);
+            } else {
+                let first = RTX_BUF_BYTES - head;
+                scratch[..first].copy_from_slice(&buf[head..]);
+                scratch[first..n].copy_from_slice(&buf[..n - first]);
+            }
+        }
+        send_segment(
+            self.local_ip,
+            self.remote_ip,
+            self.local_port,
+            self.remote_port,
+            self.snd_una,
+            self.rcv_nxt,
+            TCP_ACK | TCP_PSH,
+            self.rx_free() as u16,
+            &scratch[..n],
+        );
+        // §5.5: back the RTO off exponentially, capped at the ceiling.
+        self.rtx_backoff = self.rtx_backoff.saturating_add(1);
+        self.rto_ms = self.rto_ms.saturating_mul(2).min(RTO_MAX_MS);
+        self.rtx_deadline_ms = now + self.rto_ms as u64;
     }
 }
 
@@ -907,9 +1114,11 @@ fn alloc_connection(core: u32) -> Option<usize> {
         // close-conn /health cycle on the bench hot path.
         let preserved_gen = c.generation;
         let preserved_ring = c.rx_ring.take();
+        let preserved_rtx = c.rtx_buf.take();
         *c = TcpConnection::new();
         c.generation = preserved_gen;
         c.rx_ring = preserved_ring;
+        c.rtx_buf = preserved_rtx;
         return Some(slot as usize);
     }
     // Pool grew to MAX_SEGMENTS without a free slot — try to reclaim
@@ -980,9 +1189,11 @@ fn free_connection(core: u32, slot: usize) {
     // per accept on the close-conn /health hot path. The next SYN's
     // `ensure_rx_ring` short-circuits when `rx_ring.is_some()`.
     let preserved_ring = c.rx_ring.take();
+    let preserved_rtx = c.rtx_buf.take();
     *c = TcpConnection::new();
     c.generation = next_gen;
     c.rx_ring = preserved_ring;
+    c.rtx_buf = preserved_rtx;
     // Return the slot to the pool's free list. O(1) push; the next
     // `alloc_connection` call picks it up in O(1) too.
     POOLS.at(core).free_slot(slot as u16);
@@ -1801,6 +2012,10 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
 
     // Process ACK
     if flags & TCP_ACK != 0 {
+        // `snd_una` before this ACK advances it — `rtx_on_ack` needs
+        // the delta to drop acknowledged bytes from the retransmit
+        // ring (RFC 6298 §5.2 / §5.3).
+        let old_una = c.snd_una;
         if c.state == TcpState::SynReceived {
             c.state = TcpState::Established;
             c.snd_una = ack;
@@ -1824,6 +2039,11 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
         } else {
             c.snd_una = ack;
         }
+        // RFC 6298 §5.2 / §5.3: drop acknowledged bytes from the
+        // retransmit ring and re-arm or stop the RTO timer. (The
+        // `LastAck` branch above already `return`ed — the connection
+        // is gone, so it is correctly skipped here.)
+        c.rtx_on_ack(old_una);
     }
 
     // Process data
@@ -2002,6 +2222,46 @@ fn seq_lt(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) < 0
 }
 
+/// Drive the RFC 6298 retransmission timers for the current core's
+/// connection pool. Called from the net poll loop (`sched::poll`) at
+/// a coarse cadence: every connection whose RTO deadline has passed
+/// gets its oldest unacked segment retransmitted, or is torn down
+/// once it has been retransmitted `RTX_MAX_RETRIES` times with no
+/// intervening progress (RFC 9293 §3.8.3 — give up on a dead peer).
+pub fn on_rtx_tick() {
+    let core = kernel_core::cpu_id();
+    let now = kernel_core::clock::now_ms();
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        // SAFETY: per-core ownership — only this core touches its pool.
+        let c = unsafe { &mut *conn_ptr(core, i) };
+        if c.rtx_deadline_ms == 0 || now < c.rtx_deadline_ms {
+            continue;
+        }
+        if c.rtx_backoff >= RTX_MAX_RETRIES {
+            free_connection(core, i);
+            continue;
+        }
+        c.retransmit_oldest(now);
+    }
+}
+
+/// True if any connection on the current core has an armed RTO timer.
+/// The event loop consults this before going fully idle so a core
+/// with a pending retransmission does not sleep past the deadline.
+pub fn has_armed_rtx_timers() -> bool {
+    let core = kernel_core::cpu_id();
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        // SAFETY: per-core ownership.
+        let c = unsafe { &*conn_ptr(core, i) };
+        if c.rtx_deadline_ms != 0 {
+            return true;
+        }
+    }
+    false
+}
+
 // ============================================================================
 // TCP public API — handles encode (core, slot) for transparent routing.
 // ============================================================================
@@ -2174,17 +2434,19 @@ pub fn shutdown_all() {
                 );
                 free_connection(core, slot);
             }
-            // Release the per-conn RX ring at shutdown — `free_connection`
-            // preserves it across normal close+reuse (the next SYN re-
-            // uses the allocation), but at process shutdown there are no
-            // more SYNs, and the preserved 8 KiB blocks would show up in
-            // `HEAP_LEAK_CHECK` as residual heap that the cooldown didn't
-            // reclaim. Drop here so the leak-check delta returns to zero.
+            // Release the per-conn RX ring and retransmit ring at
+            // shutdown — `free_connection` preserves both across normal
+            // close+reuse (the next SYN re-uses the allocations), but at
+            // process shutdown there are no more SYNs, and the preserved
+            // blocks would show up in `HEAP_LEAK_CHECK` as residual heap
+            // the cooldown didn't reclaim. Drop here so the leak-check
+            // delta returns to zero.
             // SAFETY: same per-fn invariant as above; the slot is in
             // Closed (post-`free_connection`) or Listen state, neither
-            // of which observes `rx_ring`.
+            // of which observes the rings.
             let c = unsafe { &mut *conn_ptr(core, slot) };
             c.rx_ring = None;
+            c.rtx_buf = None;
         }
     }
     // The caller (`net::bare_shutdown_all`) flushes the NIC TX
@@ -2465,9 +2727,19 @@ pub fn async_try_send_chain(
     }
 
     // Bytes are on the wire — release the cursor's borrow on the
-    // chain and drain it. Drops fire in chain order (External
-    // callbacks recycle NIC descriptors back to driver pools).
+    // chain.
     drop(cursor);
+    // RFC 6298: retain the just-sent bytes so the RTO timer can
+    // retransmit them if their ACK never arrives, and start the
+    // timer if it is not already running. A fresh cursor re-walks
+    // the still-intact chain (one extra copy into `rtx_buf`); the
+    // chain is dropped immediately after.
+    {
+        let mut rtx_cursor = chain.cursor();
+        c.rtx_on_data_sent(total, &mut rtx_cursor);
+    }
+    // Drops fire in chain order (External callbacks recycle NIC
+    // descriptors back to driver pools).
     chain.clear();
     // Both paths (TSO super-segment + per-MSS loop) consume the
     // entire chain — bare-metal NIC TX never blocks under our
@@ -2609,6 +2881,9 @@ mod tests {
             set_active_ops(&MOCK_OPS);
         });
         TX.lock().unwrap().clear();
+        // Start every scenario at t=0 so a timer-driven test never
+        // inherits clock advanced by an earlier one.
+        kernel_core::clock::mock::reset();
         guard
     }
 
@@ -3091,6 +3366,131 @@ mod tests {
             rcv_nxt.wrapping_add(body.len() as u32),
             "the connection survived the off-sequence RST and still delivers data",
         );
+    }
+
+    /// RFC 6298: an outbound data segment whose ACK never arrives is
+    /// retransmitted once the RTO elapses, and the RTO doubles on each
+    /// successive expiry (§5.5 exponential backoff). Drives the real
+    /// send path, withholds the ACK, and advances the mock clock.
+    #[test]
+    fn rto_retransmits_unacked_data_with_backoff() {
+        let _g = harness();
+        const SP: u16 = 9109;
+        const CP: u16 = 50109;
+        const CLIENT_ISN: u32 = 0x9000;
+        super::listen_on_core(0, SP);
+        let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+        // The server sends a response; its ACK will be withheld.
+        let (handle, generation) = conn_handle(CP, SP);
+        clear_tx();
+        let body = b"unacked-response-body";
+        let mut chain = uni_iobuf::IOBufChain::from(body.to_vec());
+        let sent = super::async_try_send_chain(handle, generation, &mut chain)
+            .expect("an established connection accepts the send");
+        assert_eq!(sent, body.len(), "the whole body is handed to the wire");
+        let first = tcp_hdr(&tx()[0]);
+        assert_eq!(
+            first.seq,
+            server_isn.wrapping_add(1),
+            "data is sent starting at snd_una",
+        );
+
+        // Before the RTO elapses the tick does nothing.
+        clear_tx();
+        kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 - 1);
+        super::on_rtx_tick();
+        assert!(tx().is_empty(), "no retransmit before the RTO elapses");
+
+        // Crossing the RTO retransmits the segment verbatim.
+        kernel_core::clock::mock::advance(2);
+        super::on_rtx_tick();
+        let rtx = tx();
+        assert_eq!(rtx.len(), 1, "exactly one retransmit fires at the RTO");
+        let r = tcp_hdr(&rtx[0]);
+        assert_eq!(r.seq, first.seq, "the retransmit re-sends from snd_una");
+        assert_eq!(
+            &rtx[0][34 + TCP_HDR_LEN..],
+            body,
+            "the retransmit carries the original payload bytes",
+        );
+
+        // §5.5: the RTO has doubled. One RTO of further wait — enough
+        // the first time — is now not enough for the second expiry.
+        clear_tx();
+        kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64);
+        super::on_rtx_tick();
+        assert!(
+            tx().is_empty(),
+            "the backed-off (2x) RTO has not elapsed after only one RTO of wait",
+        );
+        kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64);
+        super::on_rtx_tick();
+        assert_eq!(
+            tx().len(),
+            1,
+            "the second retransmit fires only after the doubled RTO",
+        );
+    }
+
+    /// RFC 6298 §5.3: an ACK that covers the outstanding data stops
+    /// the RTO timer — no spurious retransmit afterwards.
+    #[test]
+    fn ack_stops_the_retransmission_timer() {
+        let _g = harness();
+        const SP: u16 = 9110;
+        const CP: u16 = 50110;
+        const CLIENT_ISN: u32 = 0xA000;
+        super::listen_on_core(0, SP);
+        let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+        let (handle, generation) = conn_handle(CP, SP);
+        clear_tx();
+        let body = b"acked-response";
+        let mut chain = uni_iobuf::IOBufChain::from(body.to_vec());
+        super::async_try_send_chain(handle, generation, &mut chain)
+            .expect("an established connection accepts the send");
+
+        // The client acknowledges the whole response.
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN.wrapping_add(1),
+            ack: server_isn.wrapping_add(1 + body.len() as u32),
+            flags: TCP_ACK,
+            window: 65535,
+            payload: Vec::new(),
+        });
+
+        // The timer is disarmed: even far past the original RTO the
+        // tick produces nothing.
+        clear_tx();
+        kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 * 4);
+        super::on_rtx_tick();
+        assert!(
+            tx().is_empty(),
+            "fully-acknowledged data is never retransmitted",
+        );
+    }
+
+    /// Locate the live (non-listener) connection for a client/server
+    /// port pair and return its `(handle, generation)` so a scenario
+    /// can drive the real send path (`async_try_send_chain`).
+    fn conn_handle(client_port: u16, server_port: u16) -> (*mut (), u16) {
+        let core = 0u32;
+        let cap = pool_capacity(core);
+        for i in 0..cap {
+            // SAFETY: single worker, test-serialised by TEST_LOCK.
+            let c = unsafe { &*conn_ptr(core, i) };
+            if c.state != TcpState::Closed
+                && c.state != TcpState::Listen
+                && c.local_port == server_port
+                && c.remote_port == client_port
+            {
+                return (encode_handle(core, i), c.generation);
+            }
+        }
+        panic!("no live connection for ports {client_port} -> {server_port}");
     }
 
     /// Drive a full three-way handshake on `(server_port, client_port)`

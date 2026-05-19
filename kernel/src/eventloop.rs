@@ -102,6 +102,11 @@ static NET_DRAIN: AtomicFn<PollFn> = AtomicFn::null();
 static NET_FLUSH: AtomicFn<VoidFn> = AtomicFn::null();
 static SERVICE: AtomicFn<PollFn> = AtomicFn::null();
 static CHECK_SHUTDOWN: AtomicFn<BoolFn> = AtomicFn::null();
+/// Reports whether the net stack has a timer that needs servicing
+/// soon — chiefly a TCP RFC 6298 retransmission. Consulted before a
+/// fully-idle HLT/WFI so a core with a lost segment to resend does
+/// not sleep past the RTO deadline (no RX event would wake it).
+static NET_HAS_TIMERS: AtomicFn<BoolFn> = AtomicFn::null();
 static IDLE: AtomicFn<IdleFn> = AtomicFn::null();
 /// Invoked on the BSP exactly once, right after the loop breaks and
 /// before the machine powers off. Lets upper layers (e.g. `uni`'s
@@ -141,6 +146,10 @@ pub fn set_service(f: PollFn) {
 
 pub fn set_check_shutdown(f: BoolFn) {
     CHECK_SHUTDOWN.store(f);
+}
+
+pub fn set_net_has_timers(f: BoolFn) {
+    NET_HAS_TIMERS.store(f);
 }
 
 pub fn set_idle(f: IdleFn) {
@@ -393,12 +402,16 @@ pub fn run(core_id: u32) -> ! {
                 .busy_cycles
                 .fetch_add(pre_sleep.wrapping_sub(iter_start_cycles), Ordering::Relaxed);
             stats.idle_enters.fetch_add(1, Ordering::Relaxed);
-            if uni_runtime::has_pending(core_id) {
-                // The executor has a pending timer or a task ready to
-                // re-poll. Force a local-timer-bounded idle so we wake
-                // promptly — the normal IDLE hook on HVF uses the
-                // cooperative yield register, which only wakes on host
-                // IO and would strand a timer-driven task indefinitely.
+            // A pending async timer/task, OR a net-stack timer (a TCP
+            // RFC 6298 retransmission), forces a bounded idle. The
+            // normal IDLE hook on HVF uses the cooperative yield
+            // register, which only wakes on host IO — it would strand
+            // a timer-driven wakeup indefinitely. A lost outbound
+            // segment generates no RX event, so without this the core
+            // would sleep clean past the RTO deadline.
+            let net_timer_pending = NET_HAS_TIMERS.load().map(|f| f()).unwrap_or(false);
+            if uni_runtime::has_pending(core_id) || net_timer_pending {
+                // Force a local-timer-bounded idle so we wake promptly.
                 let cycles_per_ms = crate::time::cycles_per_us().saturating_mul(1000);
                 crate::cpu::idle_until_cycles(cycles_per_ms);
             } else if let Some(f) = IDLE.load() {
