@@ -357,10 +357,10 @@ async fn handle_request<S: uni_http::HttpStream>(
         // body rendering. `/diagnostics`-style dynamic pages
         // bundle real CPU work per request and don't surface the
         // wire ceiling.
-        b"/static-16k" => Response::ok(b"application/octet-stream", STATIC_16K_BYTES),
-        b"/static-64k" => Response::ok(b"application/octet-stream", STATIC_64K_BYTES),
-        b"/static-256k" => Response::ok(b"application/octet-stream", STATIC_256K_BYTES),
-        b"/static-1m" => Response::ok(b"application/octet-stream", STATIC_1M_BYTES),
+        b"/static-16k" => Response::ok(b"application/octet-stream", STATIC_16K_BYTES.get()),
+        b"/static-64k" => Response::ok(b"application/octet-stream", STATIC_64K_BYTES.get()),
+        b"/static-256k" => Response::ok(b"application/octet-stream", STATIC_256K_BYTES.get()),
+        b"/static-1m" => Response::ok(b"application/octet-stream", STATIC_1M_BYTES.get()),
 
         b"/stats" => stats_response(),
         b"/heap" => heap_response(),
@@ -951,15 +951,37 @@ auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
 
 const HEALTH_JSON: &[u8] = b"{\"status\":\"ok\",\"runtime\":\"unikernel\",\"version\":\"0.1.0\"}";
 
-/// Static bulk-throughput bodies. All-zero payloads sized for
-/// bench workloads that measure data-plane throughput
-/// (encrypt + TX descriptor + wire) without per-request dynamic
-/// rendering. Total ~1.34 MB of `.rodata`; trivial against a
-/// 128 MB+ VM.
-const STATIC_16K_BYTES: &[u8] = &[0u8; 16 * 1024];
-const STATIC_64K_BYTES: &[u8] = &[0u8; 64 * 1024];
-const STATIC_256K_BYTES: &[u8] = &[0u8; 256 * 1024];
-const STATIC_1M_BYTES: &[u8] = &[0u8; 1024 * 1024];
+/// All-zero bench-throughput body that lives in `.bss` — zero image
+/// bytes. A plain `static [u8; N]` is an LLVM `constant` and lands in
+/// `.rodata` (in the image) even all-zero; only *writable* zero data
+/// goes in `.bss`. `UnsafeCell` makes the global writable-typed — it
+/// is never actually written. Same shape as `BootInfoCell` in
+/// `boot/entry.rs`.
+struct ZeroBody<const N: usize>(core::cell::UnsafeCell<[u8; N]>);
+
+// SAFETY: the buffer is never written — `get()` hands out only shared
+// `&[u8]` views — so concurrent multi-core reads are sound.
+unsafe impl<const N: usize> Sync for ZeroBody<N> {}
+
+impl<const N: usize> ZeroBody<N> {
+    const fn new() -> Self {
+        Self(core::cell::UnsafeCell::new([0u8; N]))
+    }
+
+    fn get(&self) -> &[u8] {
+        // SAFETY: see the `Sync` impl — read-only, never mutated.
+        let arr: &[u8; N] = unsafe { &*self.0.get() };
+        arr
+    }
+}
+
+/// Static bulk-throughput bodies. All-zero payloads sized for bench
+/// workloads that measure data-plane throughput (encrypt + TX
+/// descriptor + wire) without per-request dynamic rendering.
+static STATIC_16K_BYTES: ZeroBody<{ 16 * 1024 }> = ZeroBody::new();
+static STATIC_64K_BYTES: ZeroBody<{ 64 * 1024 }> = ZeroBody::new();
+static STATIC_256K_BYTES: ZeroBody<{ 256 * 1024 }> = ZeroBody::new();
+static STATIC_1M_BYTES: ZeroBody<{ 1024 * 1024 }> = ZeroBody::new();
 
 /// Emit `"name":[v0,v1,...]` into `w` without a leading comma.
 /// Caller manages comma separators between fields. `T: Display`
