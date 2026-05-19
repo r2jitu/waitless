@@ -175,28 +175,37 @@ pub fn owner(parsed: &ParsedL3, frame: &[u8], num_cores: u32) -> u32 {
     }
 }
 
-/// IPv4 flow hash — FNV-1a over the 4-tuple, Murmur3 `fmix32`
-/// finalizer so `% num_cores` stays uniform even when inputs vary in
-/// only one field (e.g. wrk's N connections from one src IP to one
-/// dst port — without the finalizer all flows collapse to a single
-/// core on `num_cores = 2`).
-fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: u32) -> u32 {
-    let mut h: u32 = 2166136261; // FNV offset basis
-    h ^= src_ip;
-    h = h.wrapping_mul(16777619);
-    h ^= dst_ip;
-    h = h.wrapping_mul(16777619);
-    h ^= src_port as u32;
-    h = h.wrapping_mul(16777619);
-    h ^= dst_port as u32;
-    h = h.wrapping_mul(16777619);
-    // Murmur3 fmix32 — make low bits depend uniformly on the whole input.
+/// FNV-1a 32-bit offset basis.
+const FNV_BASIS: u32 = 2166136261;
+
+/// One FNV-1a step — fold `v` into the running hash `h`.
+fn fnv_step(h: u32, v: u32) -> u32 {
+    (h ^ v).wrapping_mul(16777619)
+}
+
+/// Murmur3 `fmix32` finalizer — makes every output bit depend
+/// uniformly on the whole input, so `% num_cores` spreads evenly
+/// even when the 4-tuple varies in only one field (e.g. wrk's N
+/// connections from one src IP to one dst port — without it all
+/// such flows collapse to a single core on `num_cores = 2`).
+fn fmix32(mut h: u32) -> u32 {
     h ^= h >> 16;
     h = h.wrapping_mul(0x85ebca6b);
     h ^= h >> 13;
     h = h.wrapping_mul(0xc2b2ae35);
     h ^= h >> 16;
-    h % num_cores
+    h
+}
+
+/// IPv4 flow hash — FNV-1a over the 4-tuple, then the `fmix32`
+/// finalizer (see `fmix32` for why the finalizer earns its keep).
+fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: u32) -> u32 {
+    let mut h = FNV_BASIS;
+    h = fnv_step(h, src_ip);
+    h = fnv_step(h, dst_ip);
+    h = fnv_step(h, src_port as u32);
+    h = fnv_step(h, dst_port as u32);
+    fmix32(h) % num_cores
 }
 
 /// The IPv6 twin of `flow_hash` — folds the two 16-byte addresses
@@ -208,21 +217,13 @@ fn flow_hash_v6(
     dst_port: u16,
     num_cores: u32,
 ) -> u32 {
-    let mut h: u32 = 2166136261; // FNV offset basis
+    let mut h = FNV_BASIS;
     for &b in src.iter().chain(dst.iter()) {
-        h ^= b as u32;
-        h = h.wrapping_mul(16777619);
+        h = fnv_step(h, b as u32);
     }
-    h ^= src_port as u32;
-    h = h.wrapping_mul(16777619);
-    h ^= dst_port as u32;
-    h = h.wrapping_mul(16777619);
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x85ebca6b);
-    h ^= h >> 13;
-    h = h.wrapping_mul(0xc2b2ae35);
-    h ^= h >> 16;
-    h % num_cores
+    h = fnv_step(h, src_port as u32);
+    h = fnv_step(h, dst_port as u32);
+    fmix32(h) % num_cores
 }
 
 #[cfg(test)]
