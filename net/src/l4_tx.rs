@@ -8,6 +8,7 @@
 
 #![no_std]
 
+extern crate net_checksum;
 extern crate net_types as types;
 extern crate uni_drivers;
 
@@ -28,8 +29,8 @@ use types::IpAddr;
 /// no-offload branch, and only for `seg_len` bytes.
 pub fn checksum(src: IpAddr, dst: IpAddr, proto: u8, seg: *const u8, seg_len: usize) -> u16 {
     if uni_drivers::net::csum_tx_offload() {
-        types::l4_pseudo_partial(src, dst, proto, seg_len)
+        net_checksum::l4_pseudo_partial(src, dst, proto, seg_len)
     } else {
-        types::l4_checksum_any(src, dst, proto, seg, seg_len)
+        net_checksum::l4_checksum_any(src, dst, proto, seg, seg_len)
     }
 }

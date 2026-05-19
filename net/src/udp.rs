@@ -7,6 +7,7 @@
 
 #![no_std]
 
+extern crate net_checksum as checksum;
 extern crate net_dst_mac as dst_mac;
 extern crate net_ethernet as ethernet;
 extern crate net_from_bytes as from_bytes;
@@ -130,7 +131,7 @@ unsafe fn fill_udp_frame_headers(
     // SAFETY: `udp_off + udp_len` is within `frame`.
     let seg = unsafe { frame.as_ptr().add(udp_off) };
     udp_hdr.checksum = match csum {
-        UdpCsum::Full => types::l4_checksum_any(src, dst, types::proto::UDP, seg, udp_len),
+        UdpCsum::Full => checksum::l4_checksum_any(src, dst, types::proto::UDP, seg, udp_len),
         UdpCsum::OffloadAware => l4_tx::checksum(src, dst, types::proto::UDP, seg, udp_len),
     };
 

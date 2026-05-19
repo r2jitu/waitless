@@ -3,11 +3,12 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate kernel_core;
+extern crate net_checksum as checksum;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 
 use from_bytes::FromBytes;
-use types::{CONFIG, Ipv4Addr, checksum, htons, ntohs};
+use types::{CONFIG, Ipv4Addr, htons, ntohs};
 
 #[repr(C, packed)]
 pub struct Ipv4Header {
@@ -108,7 +109,7 @@ pub fn fill_header(slot: &mut [u8], src: Ipv4Addr, dst: Ipv4Addr, proto: u8, tot
         hdr.checksum = 0;
         hdr.src = src;
         hdr.dst = dst;
-        hdr.checksum = checksum(slot.as_ptr(), HEADER_LEN);
+        hdr.checksum = checksum::ipv4_header_checksum(slot.as_ptr(), HEADER_LEN);
     }
 }
 

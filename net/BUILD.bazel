@@ -18,6 +18,25 @@ rust_test(
     crate = ":types",
 )
 
+# RFC 1071 internet checksum + the L4 (TCP/UDP/ICMPv6) pseudo-header
+# checksums. Pure arithmetic leaf — carved out of `:types` so the
+# checksum math is a crate with one job.
+rust_library(
+    name = "checksum",
+    srcs = ["src/checksum.rs"],
+    crate_name = "net_checksum",
+    crate_root = "src/checksum.rs",
+    deps = [
+        ":types",
+    ],
+)
+
+rust_test(
+    name = "checksum_test",
+    size = "small",
+    crate = ":checksum",
+)
+
 # Safe `try_ref_from(&[u8]) -> Option<&Self>` for packed packet headers.
 # Eliminates the dominant unsafe pattern in net/* (interpreting an inbound
 # byte slice as `&PacketHeader`).
@@ -102,6 +121,7 @@ rust_library(
     crate_name = "net_ipv4",
     crate_root = "src/ipv4.rs",
     deps = [
+        ":checksum",
         ":from_bytes",
         ":types",
         "//kernel/core",
@@ -205,6 +225,7 @@ rust_library(
     crate_name = "net_l4_tx",
     crate_root = "src/l4_tx.rs",
     deps = [
+        ":checksum",
         ":types",
         "//drivers",
     ],
@@ -270,6 +291,7 @@ rust_library(
     crate_name = "net_udp",
     crate_root = "src/udp.rs",
     deps = [
+        ":checksum",
         ":dst_mac",
         ":ethernet",
         ":from_bytes",
