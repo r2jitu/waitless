@@ -20,7 +20,7 @@ extern crate uni_net_driver;
 extern crate uni_runtime;
 
 use from_bytes::FromBytes;
-use types::{CONFIG, IpAddr, htons, ntohs, tcp_checksum, tcp_checksum_v6};
+use types::{CONFIG, IpAddr, MacAddr, htons, ntohs};
 
 #[repr(C, packed)]
 struct UdpHeader {
@@ -73,6 +73,95 @@ const FRAME_BUF_LEN: usize =
     uni_runtime::net::MAX_L2_HEADROOM + (1500 - IPV6_HDR_LEN - UDP_HDR_LEN);
 // = 62 + 1452 = 1514. Same total bound for both families.
 
+/// Which UDP checksum `fill_udp_frame_headers` stamps.
+enum UdpCsum {
+    /// The full checksum, computed guest-side — for frames shipped
+    /// via the legacy `uni_drivers::net::send()`, which carries no
+    /// CSUM-offload hint.
+    Full,
+    /// Offload-aware, per the active NIC's convention — for frames
+    /// shipped via `submit_tx` with a `CsumOffload` descriptor.
+    OffloadAware,
+}
+
+/// Fill the ETH + IP + UDP headers of `frame` in place — the UDP
+/// analogue of `net_tcp`'s `fill_tcp_frame_headers`. `eth_off` is
+/// where the Ethernet header starts; the IP and UDP headers follow
+/// contiguously, and the UDP payload must already sit past them.
+/// The two send paths lay the frame out at different `eth_off`s.
+/// Computes the UDP checksum (`csum` picks full vs offload-aware)
+/// and the IPv4 header checksum in place.
+unsafe fn fill_udp_frame_headers(
+    frame: &mut [u8],
+    eth_off: usize,
+    dst: IpAddr,
+    dst_mac: MacAddr,
+    src_port: u16,
+    dst_port: u16,
+    udp_len: usize,
+    csum: UdpCsum,
+) {
+    // For v6 the UDP source is the unspecified `::` — no SLAAC
+    // global yet; peers accept it for short-lived response traffic.
+    let (ip_hdr_len, ethertype, src) = match dst {
+        IpAddr::V4(_) => (
+            IPV4_HDR_LEN,
+            ethernet::ETHERTYPE_IPV4,
+            IpAddr::V4(CONFIG.ip()),
+        ),
+        IpAddr::V6(_) => (
+            IPV6_HDR_LEN,
+            ipv6::ETHERTYPE_IPV6,
+            IpAddr::V6(types::Ipv6Addr::ANY),
+        ),
+    };
+    let ip_off = eth_off + ETH_HDR_LEN;
+    let udp_off = ip_off + ip_hdr_len;
+
+    // ── UDP header ───────────────────────────────────────────────────
+    // SAFETY: `frame` holds the whole frame from `eth_off` (caller
+    // sized it); `UdpHeader` is `repr(C)` POD bytes.
+    let udp_hdr = unsafe { &mut *(frame.as_mut_ptr().add(udp_off) as *mut UdpHeader) };
+    udp_hdr.src_port = htons(src_port);
+    udp_hdr.dst_port = htons(dst_port);
+    udp_hdr.length = htons(udp_len as u16);
+    udp_hdr.checksum = 0;
+    // Checksum over the UDP segment — header (field now 0) + payload.
+    // SAFETY: `udp_off + udp_len` is within `frame`.
+    let seg = unsafe { frame.as_ptr().add(udp_off) };
+    udp_hdr.checksum = match csum {
+        UdpCsum::Full => types::tcp_checksum_any(src, dst, types::proto::UDP, seg, udp_len),
+        UdpCsum::OffloadAware => l4_tx::checksum(src, dst, types::proto::UDP, seg, udp_len),
+    };
+
+    // ── IP header (family-dispatched) ────────────────────────────────
+    let ip_total = (ip_hdr_len + udp_len) as u16;
+    let ip_slot = &mut frame[ip_off..ip_off + ip_hdr_len];
+    match dst {
+        IpAddr::V4(d) => {
+            ipv4::fill_header(ip_slot, CONFIG.ip(), d, types::proto::UDP, ip_total);
+        }
+        IpAddr::V6(d) => {
+            ipv6::fill_header(
+                ip_slot,
+                &types::Ipv6Addr::ANY,
+                &d,
+                types::proto::UDP,
+                ipv6::DEFAULT_HOP_LIMIT,
+                udp_len as u16,
+            );
+        }
+    }
+
+    // ── Ethernet header ──────────────────────────────────────────────
+    ethernet::fill_header(
+        &mut frame[eth_off..eth_off + ETH_HDR_LEN],
+        dst_mac,
+        ethernet::ethernet_our_mac(),
+        ethertype,
+    );
+}
+
 /// Zero-copy UDP send. Caller pre-supplies a frame buffer where
 /// the first [`uni_runtime::net::MAX_L2_HEADROOM`] (= 62) bytes
 /// are reserved for the L2/L3/L4 headers and the UDP payload
@@ -104,71 +193,34 @@ pub fn send_with_l2_headroom(dst: IpAddr, src_port: u16, dst_port: u16, frame: &
         None => return,
     };
 
-    // Family-specific header sizes. The Ethernet header always
-    // sits at MAX_L2_HEADROOM - actual_headroom, so for v4 the
-    // first 20 B of the buffer go unused (the IP header is 20 B
-    // shorter than v6).
-    let (ip_hdr_len, ethertype) = match dst {
-        IpAddr::V4(_) => (IPV4_HDR_LEN, ethernet::ETHERTYPE_IPV4),
-        IpAddr::V6(_) => (IPV6_HDR_LEN, ipv6::ETHERTYPE_IPV6),
+    // The buffer reserves MAX_L2_HEADROOM (= 62, the v6 header size)
+    // at the front. A v4 frame's headers are 20 B shorter, so they go
+    // in the trailing bytes of the reserve and the frame ships from
+    // `prefix_skip` — the leading 20 B go unused (no payload move,
+    // unlike `send_via_tx_handle`).
+    let ip_hdr_len = match dst {
+        IpAddr::V4(_) => IPV4_HDR_LEN,
+        IpAddr::V6(_) => IPV6_HDR_LEN,
     };
-    let actual_headroom = ETH_HDR_LEN + ip_hdr_len + UDP_HDR_LEN;
-    let prefix_skip = MAX_L2_HEADROOM - actual_headroom;
-    let eth_off = prefix_skip;
-    let ip_off = eth_off + ETH_HDR_LEN;
-    // UDP header is the last UDP_HDR_LEN bytes of headroom regardless
-    // of family — its position is anchored to MAX_L2_HEADROOM.
-    let udp_off = MAX_L2_HEADROOM - UDP_HDR_LEN;
+    let prefix_skip = MAX_L2_HEADROOM - (ETH_HDR_LEN + ip_hdr_len + UDP_HDR_LEN);
 
+    // SAFETY: `frame` holds the headroom reserve plus the payload
+    // (bounds-checked above), so the frame from `prefix_skip` on is
+    // in-bounds. `Full` checksum: this path ships via the legacy
+    // `send()`, which carries no offload hint.
     unsafe {
-        let p = frame.as_mut_ptr();
-
-        // UDP header.
-        let udp_hdr = &mut *(p.add(udp_off) as *mut UdpHeader);
-        udp_hdr.src_port = htons(src_port);
-        udp_hdr.dst_port = htons(dst_port);
-        udp_hdr.length = htons(udp_len as u16);
-        udp_hdr.checksum = 0;
-
-        // IP header + UDP checksum (family-specific pseudo-header).
-        let ip_total = (ip_hdr_len + udp_len) as u16;
-        let ip_slot = core::slice::from_raw_parts_mut(p.add(ip_off), ip_hdr_len);
-        match dst {
-            IpAddr::V4(d) => {
-                udp_hdr.checksum =
-                    tcp_checksum(CONFIG.ip(), d, types::proto::UDP, p.add(udp_off), udp_len);
-                ipv4::fill_header(ip_slot, CONFIG.ip(), d, types::proto::UDP, ip_total);
-            }
-            IpAddr::V6(d) => {
-                // Source is the unspecified `::` until the SLAAC
-                // global lands. Most peers accept this for short-
-                // lived response-path traffic.
-                let src = types::Ipv6Addr::ANY;
-                udp_hdr.checksum =
-                    tcp_checksum_v6(&src, &d, types::proto::UDP, p.add(udp_off), udp_len);
-                ipv6::fill_header(
-                    ip_slot,
-                    &src,
-                    &d,
-                    types::proto::UDP,
-                    ipv6::DEFAULT_HOP_LIMIT,
-                    udp_len as u16,
-                );
-            }
-        }
-
-        // Ethernet header at the family-correct offset (skipping
-        // any unused leading bytes for v4).
-        ethernet::fill_header(
-            core::slice::from_raw_parts_mut(p.add(eth_off), ETH_HDR_LEN),
+        fill_udp_frame_headers(
+            frame,
+            prefix_skip,
+            dst,
             dst_mac,
-            ethernet::ethernet_our_mac(),
-            ethertype,
+            src_port,
+            dst_port,
+            udp_len,
+            UdpCsum::Full,
         );
-
-        // Ship the contiguous frame from the family-correct offset.
         let frame_slice =
-            core::slice::from_raw_parts(p.add(prefix_skip), frame.len() - prefix_skip);
+            core::slice::from_raw_parts(frame.as_ptr().add(prefix_skip), frame.len() - prefix_skip);
         uni_drivers::net::send(frame_slice);
     }
 }
@@ -221,9 +273,9 @@ pub fn send_via_tx_handle(
         None => return, // ARP/NDP miss; fire-and-forget UDP drop.
     };
 
-    let (ip_hdr_len, ethertype) = match dst {
-        IpAddr::V4(_) => (IPV4_HDR_LEN, ethernet::ETHERTYPE_IPV4),
-        IpAddr::V6(_) => (IPV6_HDR_LEN, ipv6::ETHERTYPE_IPV6),
+    let ip_hdr_len = match dst {
+        IpAddr::V4(_) => IPV4_HDR_LEN,
+        IpAddr::V6(_) => IPV6_HDR_LEN,
     };
     // Total bytes on wire (after any in-place memmove for v4).
     let on_wire_actual = ETH_HDR_LEN + ip_hdr_len + UDP_HDR_LEN + payload_len;
@@ -231,67 +283,29 @@ pub fn send_via_tx_handle(
 
     {
         let frame = handle.data_mut();
-        // SAFETY: `frame` is `&mut [u8]` of `data_cap` bytes
-        // (>= MAX_L2_HEADROOM + payload_len per the bounds checks
-        // above). All offset arithmetic stays in-bounds.
+        // SAFETY: `frame` is `data_cap` bytes — >= the whole on-wire
+        // frame (bounds-checked above), so all offset arithmetic
+        // stays in-bounds.
         unsafe {
-            let p = frame.as_mut_ptr();
-
-            // For v4: shift payload back by 20 B so the L2 frame
-            // starts at slot.data[0] (where the driver's submit_tx
-            // expects it). Overlapping move — use ptr::copy.
+            // For v4: shift the payload back 20 B so the L2 frame
+            // starts at slot.data[0], where `submit_tx` expects it.
+            // Overlapping move — `ptr::copy`.
             if matches!(dst, IpAddr::V4(_)) {
+                let p = frame.as_mut_ptr();
                 core::ptr::copy(p.add(MAX_L2_HEADROOM), p.add(actual_headroom), payload_len);
             }
-
-            // UDP header at (eth + ip) offset.
-            let udp_off = ETH_HDR_LEN + ip_hdr_len;
-            let udp_hdr = &mut *(p.add(udp_off) as *mut UdpHeader);
-            udp_hdr.src_port = htons(src_port);
-            udp_hdr.dst_port = htons(dst_port);
-            udp_hdr.length = htons(udp_len as u16);
-            udp_hdr.checksum = 0;
-
-            let ip_total = (ip_hdr_len + udp_len) as u16;
-            let ip_slot = core::slice::from_raw_parts_mut(p.add(ETH_HDR_LEN), ip_hdr_len);
-            // Stamp the L4 checksum field per the active NIC's
-            // offload convention — see `l4_tx::checksum`.
-            match dst {
-                IpAddr::V4(d) => {
-                    udp_hdr.checksum = l4_tx::checksum(
-                        IpAddr::V4(CONFIG.ip()),
-                        IpAddr::V4(d),
-                        types::proto::UDP,
-                        p.add(udp_off),
-                        udp_len,
-                    );
-                    ipv4::fill_header(ip_slot, CONFIG.ip(), d, types::proto::UDP, ip_total);
-                }
-                IpAddr::V6(d) => {
-                    let src = types::Ipv6Addr::ANY;
-                    udp_hdr.checksum = l4_tx::checksum(
-                        IpAddr::V6(src),
-                        IpAddr::V6(d),
-                        types::proto::UDP,
-                        p.add(udp_off),
-                        udp_len,
-                    );
-                    ipv6::fill_header(
-                        ip_slot,
-                        &src,
-                        &d,
-                        types::proto::UDP,
-                        ipv6::DEFAULT_HOP_LIMIT,
-                        udp_len as u16,
-                    );
-                }
-            }
-
-            ethernet::fill_header(
-                core::slice::from_raw_parts_mut(p, ETH_HDR_LEN),
+            // Frame starts at offset 0 (after any v4 shift). Offload-
+            // aware checksum — this slot ships via `submit_tx` below
+            // with a `CsumOffload` descriptor.
+            fill_udp_frame_headers(
+                frame,
+                0,
+                dst,
                 dst_mac,
-                ethernet::ethernet_our_mac(),
-                ethertype,
+                src_port,
+                dst_port,
+                udp_len,
+                UdpCsum::OffloadAware,
             );
         }
     }
