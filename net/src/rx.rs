@@ -25,7 +25,7 @@
 //! when the callback returns (or, for TCP, when `tcp_receive`
 //! returns), reposting the buffer(s) via each part's drop callback.
 
-use crate::{arp, ipv4, ipv6, ipv6_nd, ndp, sched, tcp, types, udp};
+use crate::{arp, ipv6_nd, ndp, sched, tcp, types, udp};
 use net_rx::{Classified, classify, owner};
 use uni_iobuf::{Chain, OwnedIOBuf};
 use uni_kernel::percpu;
@@ -78,7 +78,7 @@ pub(crate) fn distribute_frame(chain: Chain<OwnedIOBuf>) {
             // Only TCP/UDP have a 4-tuple to flow-hash and a per-core
             // connection pool to honour. Anything else (ICMPv6, ...)
             // has no owning core — deliver it inline on this one.
-            let target = if parsed.proto == ipv4::PROTO_TCP || parsed.proto == ipv4::PROTO_UDP {
+            let target = if parsed.proto == types::proto::TCP || parsed.proto == types::proto::UDP {
                 owner(&parsed, frame, num_cores)
             } else {
                 my_core
@@ -139,10 +139,10 @@ pub(crate) fn deliver(parsed: types::ParsedL3, chain: Chain<OwnedIOBuf>) {
     // Protocol numbers are family-neutral (IANA): TCP 6 / UDP 17 for
     // both v4 and v6, ICMPv6 58 for v6 only.
     match parsed.proto {
-        ipv4::PROTO_TCP => {
+        types::proto::TCP => {
             tcp_receive_segment(parsed.src, parsed.dst, chain, parsed.l4_off, parsed.l4_len);
         }
-        ipv4::PROTO_UDP => {
+        types::proto::UDP => {
             // The borrowed segment never outlives `udp_receive` (it
             // runs synchronously); `chain` then drops, reposting.
             let Some(first) = chain.iter().next() else {
@@ -153,7 +153,7 @@ pub(crate) fn deliver(parsed: types::ParsedL3, chain: Chain<OwnedIOBuf>) {
             };
             udp::udp_receive(parsed.src, parsed.dst, segment);
         }
-        ipv6::next_header::ICMPV6 => {
+        types::proto::ICMPV6 => {
             // ICMPv6 — meaningful only for a v6 frame. Hand the IPv6
             // control plane the (src, dst, payload, L2 src); the
             // snoop above already warmed the NDP cache.

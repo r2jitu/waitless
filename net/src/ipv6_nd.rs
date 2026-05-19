@@ -118,7 +118,7 @@ fn send_router_solicitation() {
     };
     // Multicast destination → ipv6_send picks the
     // 33:33:00:00:00:02 mapping internally.
-    ipv6_send::ipv6_send(&ll, &dst, ipv6::next_header::ICMPV6, 255, &icmp[..n]);
+    ipv6_send::ipv6_send(&ll, &dst, types::proto::ICMPV6, 255, &icmp[..n]);
 }
 
 /// Process an inbound Router Advertisement. If it carries a
@@ -220,7 +220,7 @@ pub(crate) fn handle_icmpv6(
                 &ipv6_ll(),
                 src,
                 src_mac,
-                ipv6::next_header::ICMPV6,
+                types::proto::ICMPV6,
                 64,
                 &icmp_out[..n],
             );
@@ -262,7 +262,7 @@ pub(crate) fn handle_icmpv6(
                 &na_src,
                 src,
                 dst_mac,
-                ipv6::next_header::ICMPV6,
+                types::proto::ICMPV6,
                 255,
                 &icmp_out[..n],
             );

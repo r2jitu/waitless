@@ -9,9 +9,6 @@ extern crate net_types as types;
 use from_bytes::FromBytes;
 use types::{CONFIG, Ipv4Addr, checksum, htons, ntohs};
 
-pub const PROTO_TCP: u8 = 6;
-pub const PROTO_UDP: u8 = 17;
-
 #[repr(C, packed)]
 pub struct Ipv4Header {
     pub version_ihl: u8,
@@ -180,10 +177,10 @@ mod tests {
         let mut f = [0u8; 24];
         f[0] = 0x45;
         f[2..4].copy_from_slice(&24u16.to_be_bytes());
-        f[9] = PROTO_TCP;
+        f[9] = types::proto::TCP;
         f[20..24].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
         let pkt = ipv4_parse(&f).expect("parse");
-        assert_eq!(pkt.protocol, PROTO_TCP);
+        assert_eq!(pkt.protocol, types::proto::TCP);
         assert_eq!(pkt.payload, &[0xde, 0xad, 0xbe, 0xef]);
     }
 
@@ -198,7 +195,7 @@ mod tests {
         let mut f = [0u8; 24]; // 20-byte header + 4 payload bytes
         f[0] = 0x45;
         f[2..4].copy_from_slice(&50_000u16.to_be_bytes());
-        f[9] = PROTO_TCP;
+        f[9] = types::proto::TCP;
         let pkt = ipv4_parse(&f).expect("super-segment accepted");
         assert_eq!(pkt.payload.len(), 4); // clamped to 24 - 20
     }

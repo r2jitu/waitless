@@ -74,14 +74,7 @@ fn solicit(src: &Ipv6Addr, target: &Ipv6Addr) {
         None => return,
     };
     let mut buf = [0u8; 1500];
-    let total = match ipv6::ipv6_build(
-        src,
-        &snm,
-        ipv6::next_header::ICMPV6,
-        255,
-        &icmp[..n],
-        &mut buf,
-    ) {
+    let total = match ipv6::ipv6_build(src, &snm, types::proto::ICMPV6, 255, &icmp[..n], &mut buf) {
         Some(t) => t,
         None => return,
     };

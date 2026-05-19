@@ -35,14 +35,6 @@ use types::{Ipv6Addr, htons, ntohs};
 /// EtherType for IPv6 (RFC 2464).
 pub const ETHERTYPE_IPV6: u16 = 0x86dd;
 
-/// Next-header byte (= protocol) values we care about. Same
-/// numeric space as IPv4 protocol numbers, plus ICMPv6 (58).
-pub mod next_header {
-    pub const TCP: u8 = 6;
-    pub const UDP: u8 = 17;
-    pub const ICMPV6: u8 = 58;
-}
-
 /// Minimum hop limit for outbound traffic when the caller doesn't
 /// have a specific value. RFC 4861 §6.2.4 defaults to 64 for most
 /// host-to-host traffic; ICMPv6 NDP messages use 255 (handled at
@@ -235,13 +227,14 @@ mod tests {
         };
         let payload = &[0xde, 0xad, 0xbe, 0xef];
         let mut buf = [0u8; HEADER_LEN + 4];
-        let n = ipv6_build(&src, &dst, next_header::ICMPV6, 255, payload, &mut buf).expect("build");
+        let n =
+            ipv6_build(&src, &dst, types::proto::ICMPV6, 255, payload, &mut buf).expect("build");
         assert_eq!(n, HEADER_LEN + 4);
 
         let pkt = ipv6_parse(&buf).expect("parse");
         assert_eq!(pkt.src, src);
         assert_eq!(pkt.dst, dst);
-        assert_eq!(pkt.next_header, next_header::ICMPV6);
+        assert_eq!(pkt.next_header, types::proto::ICMPV6);
         assert_eq!(pkt.hop_limit, 255);
         assert_eq!(pkt.payload, payload);
     }
@@ -269,9 +262,9 @@ mod tests {
         // payload_length = 50000: a ~49 KiB coalesced segment whose
         // tail lives in later chain parts the parser never sees.
         buf[4..6].copy_from_slice(&50000u16.to_be_bytes());
-        buf[6] = next_header::TCP;
+        buf[6] = types::proto::TCP;
         let pkt = ipv6_parse(&buf).expect("super-segment accepted");
-        assert_eq!(pkt.next_header, next_header::TCP);
+        assert_eq!(pkt.next_header, types::proto::TCP);
         // Payload view is clamped to what part 0 actually holds — the
         // 24 bytes after the header — not the 50000 declared.
         assert_eq!(pkt.payload.len(), 24);
@@ -311,14 +304,14 @@ mod tests {
         payload[7] = 0x01;
         payload[8..15].copy_from_slice(b"abcdefg");
 
-        let cksum = pseudo_checksum(&src, &dst, next_header::ICMPV6, &payload);
+        let cksum = pseudo_checksum(&src, &dst, types::proto::ICMPV6, &payload);
 
         // Splice into the payload's checksum field, recompute,
         // expect 0 (the verification convention).
         let mut verified = payload;
         verified[2] = (cksum & 0xff) as u8;
         verified[3] = (cksum >> 8) as u8;
-        let recheck = pseudo_checksum(&src, &dst, next_header::ICMPV6, &verified);
+        let recheck = pseudo_checksum(&src, &dst, types::proto::ICMPV6, &verified);
         assert_eq!(recheck, 0);
     }
 }

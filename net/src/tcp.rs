@@ -23,7 +23,6 @@ use alloc::boxed::Box;
 use core::ptr;
 use core::task::Waker;
 use from_bytes::FromBytes;
-use ipv4::PROTO_TCP;
 use types::{IpAddr, MacAddr, htonl, htons, ntohl, ntohs, tcp_checksum_any, tcp_pseudo_partial};
 use uni_iobuf::{Chain, IOBuf, OwnedIOBuf};
 
@@ -1373,7 +1372,7 @@ unsafe fn fill_tcp_frame_headers(
     tcp_hdr.checksum = if nic::csum_tx_offload() {
         match nic::csum_stamp_convention() {
             nic::CsumStampConvention::PseudoHeaderPartial => {
-                tcp_pseudo_partial(local_ip, dst_ip, PROTO_TCP, tcp_seg_len)
+                tcp_pseudo_partial(local_ip, dst_ip, types::proto::TCP, tcp_seg_len)
             }
             nic::CsumStampConvention::Zero => 0,
         }
@@ -1382,7 +1381,7 @@ unsafe fn fill_tcp_frame_headers(
             tcp_checksum_any(
                 local_ip,
                 dst_ip,
-                PROTO_TCP,
+                types::proto::TCP,
                 frame.as_ptr().add(tcp_off),
                 tcp_seg_len,
             )
@@ -1397,7 +1396,7 @@ unsafe fn fill_tcp_frame_headers(
                 &mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN],
                 s,
                 d,
-                PROTO_TCP,
+                types::proto::TCP,
                 ip_total,
             );
         }
@@ -1406,7 +1405,7 @@ unsafe fn fill_tcp_frame_headers(
                 &mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV6_HDR_LEN],
                 &s,
                 &d,
-                ipv6::next_header::TCP,
+                types::proto::TCP,
                 64,
                 tcp_seg_len as u16,
             );

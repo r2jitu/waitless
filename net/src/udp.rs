@@ -19,7 +19,6 @@ extern crate uni_net_driver;
 extern crate uni_runtime;
 
 use from_bytes::FromBytes;
-use ipv4::PROTO_UDP;
 use types::{CONFIG, IpAddr, htons, ntohs, tcp_checksum, tcp_checksum_v6, tcp_pseudo_partial};
 
 #[repr(C, packed)]
@@ -135,8 +134,9 @@ pub fn send_with_l2_headroom(dst: IpAddr, src_port: u16, dst_port: u16, frame: &
         let ip_slot = core::slice::from_raw_parts_mut(p.add(ip_off), ip_hdr_len);
         match dst {
             IpAddr::V4(d) => {
-                udp_hdr.checksum = tcp_checksum(CONFIG.ip(), d, PROTO_UDP, p.add(udp_off), udp_len);
-                ipv4::fill_header(ip_slot, CONFIG.ip(), d, PROTO_UDP, ip_total);
+                udp_hdr.checksum =
+                    tcp_checksum(CONFIG.ip(), d, types::proto::UDP, p.add(udp_off), udp_len);
+                ipv4::fill_header(ip_slot, CONFIG.ip(), d, types::proto::UDP, ip_total);
             }
             IpAddr::V6(d) => {
                 // Source is the unspecified `::` until the SLAAC
@@ -144,12 +144,12 @@ pub fn send_with_l2_headroom(dst: IpAddr, src_port: u16, dst_port: u16, frame: &
                 // lived response-path traffic.
                 let src = types::Ipv6Addr::ANY;
                 udp_hdr.checksum =
-                    tcp_checksum_v6(&src, &d, ipv6::next_header::UDP, p.add(udp_off), udp_len);
+                    tcp_checksum_v6(&src, &d, types::proto::UDP, p.add(udp_off), udp_len);
                 ipv6::fill_header(
                     ip_slot,
                     &src,
                     &d,
-                    ipv6::next_header::UDP,
+                    types::proto::UDP,
                     ipv6::DEFAULT_HOP_LIMIT,
                     udp_len as u16,
                 );
@@ -268,16 +268,16 @@ pub fn send_via_tx_handle(
                                 tcp_pseudo_partial(
                                     IpAddr::V4(CONFIG.ip()),
                                     IpAddr::V4(d),
-                                    PROTO_UDP,
+                                    types::proto::UDP,
                                     udp_len,
                                 )
                             }
                             uni_drivers::net::CsumStampConvention::Zero => 0,
                         }
                     } else {
-                        tcp_checksum(CONFIG.ip(), d, PROTO_UDP, p.add(udp_off), udp_len)
+                        tcp_checksum(CONFIG.ip(), d, types::proto::UDP, p.add(udp_off), udp_len)
                     };
-                    ipv4::fill_header(ip_slot, CONFIG.ip(), d, PROTO_UDP, ip_total);
+                    ipv4::fill_header(ip_slot, CONFIG.ip(), d, types::proto::UDP, ip_total);
                 }
                 IpAddr::V6(d) => {
                     let src = types::Ipv6Addr::ANY;
@@ -287,20 +287,20 @@ pub fn send_via_tx_handle(
                                 tcp_pseudo_partial(
                                     IpAddr::V6(src),
                                     IpAddr::V6(d),
-                                    ipv6::next_header::UDP,
+                                    types::proto::UDP,
                                     udp_len,
                                 )
                             }
                             uni_drivers::net::CsumStampConvention::Zero => 0,
                         }
                     } else {
-                        tcp_checksum_v6(&src, &d, ipv6::next_header::UDP, p.add(udp_off), udp_len)
+                        tcp_checksum_v6(&src, &d, types::proto::UDP, p.add(udp_off), udp_len)
                     };
                     ipv6::fill_header(
                         ip_slot,
                         &src,
                         &d,
-                        ipv6::next_header::UDP,
+                        types::proto::UDP,
                         ipv6::DEFAULT_HOP_LIMIT,
                         udp_len as u16,
                     );
