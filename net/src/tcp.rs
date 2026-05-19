@@ -152,9 +152,12 @@ fn mss_for(local_ip: IpAddr) -> usize {
 /// nothing" and disappears once RFC 5681 `cwnd` bounds the in-flight
 /// window. Boxed + lazy like `rx_ring`, so idle slots stay cheap.
 const RTX_BUF_BYTES: usize = 17408;
-/// Initial RTO before any RTT measurement (RFC 6298 §2.1); also the
-/// value the RTO is re-initialised to when new data is acknowledged.
+/// Initial RTO before any RTT measurement (RFC 6298 §2.1), and the
+/// floor every computed RTO is clamped up to (§2.4 — round a sub-1 s
+/// estimate up to 1 s).
 const RTO_INITIAL_MS: u32 = 1000;
+/// RTT-estimator gain `K` — RTO = SRTT + K·RTTVAR (RFC 6298 §2.3).
+const RTO_K: u32 = 4;
 /// RTO ceiling — the §5.5 exponential backoff clamps here. RFC 6298
 /// §2.5 requires the bound to be at least 60 s.
 const RTO_MAX_MS: u32 = 60_000;
@@ -284,6 +287,24 @@ pub struct TcpConnection {
     /// intervening ACK — the §5.5 backoff exponent, and the
     /// give-up counter (`RTX_MAX_RETRIES`).
     rtx_backoff: u8,
+    /// RFC 6298 §2 smoothed round-trip time, milliseconds. 0 until
+    /// the first measurement (see `rtt_seeded`).
+    srtt_ms: u32,
+    /// RFC 6298 §2 round-trip-time variation, milliseconds.
+    rttvar_ms: u32,
+    /// False until `sample_rtt` has folded in a first measurement —
+    /// selects the §2.2 (seed) vs §2.3 (EWMA) update.
+    rtt_seeded: bool,
+    /// RTT-sample anchor: the send timestamp and the sequence number
+    /// just past the timed bytes. At most one sample is outstanding
+    /// per RTT (RFC 6298 §3); the ACK covering `rtt_anchor_seq`
+    /// yields the measurement `R`.
+    rtt_anchor_ms: u64,
+    rtt_anchor_seq: u32,
+    /// True while an RTT sample is outstanding. Cleared when the
+    /// sample is taken, and on any retransmission — Karn's algorithm
+    /// forbids deriving an RTT from a segment that was retransmitted.
+    rtt_anchor_active: bool,
     /// Free-list link. When this slot is on the free list (state ==
     /// Closed AND the slot has been returned to the pool), this
     /// holds the index of the next free slot, or `NULL_SLOT` for
@@ -323,6 +344,12 @@ impl TcpConnection {
             rto_ms: RTO_INITIAL_MS,
             rtx_deadline_ms: 0,
             rtx_backoff: 0,
+            srtt_ms: 0,
+            rttvar_ms: 0,
+            rtt_seeded: false,
+            rtt_anchor_ms: 0,
+            rtt_anchor_seq: 0,
+            rtt_anchor_active: false,
             next_free: NULL_SLOT,
         }
     }
@@ -552,6 +579,41 @@ impl TcpConnection {
         self.rtx_deadline_ms = kernel_core::clock::now_ms() + self.rto_ms as u64;
     }
 
+    /// Fold a round-trip-time measurement `r` (milliseconds) into the
+    /// RFC 6298 §2 estimator. §2.2 seeds SRTT/RTTVAR from the first
+    /// sample; §2.3 is the EWMA thereafter — RTTVAR is updated first,
+    /// against the *old* SRTT (alpha = 1/8, beta = 1/4).
+    fn sample_rtt(&mut self, r: u32) {
+        // §2.4: a measurement below the clock granularity (G = 1 ms)
+        // is floored at G.
+        let r = r.max(1);
+        if !self.rtt_seeded {
+            self.srtt_ms = r;
+            self.rttvar_ms = r / 2;
+            self.rtt_seeded = true;
+        } else {
+            let delta = self.srtt_ms.abs_diff(r);
+            // RTTVAR ← (1 - 1/4)·RTTVAR + 1/4·|SRTT - R|
+            self.rttvar_ms = self.rttvar_ms - (self.rttvar_ms >> 2) + (delta >> 2);
+            // SRTT ← (1 - 1/8)·SRTT + 1/8·R
+            self.srtt_ms = self.srtt_ms - (self.srtt_ms >> 3) + (r >> 3);
+        }
+    }
+
+    /// The RTO implied by the current estimator state (RFC 6298
+    /// §2.2 / §2.3): `SRTT + max(G, K·RTTVAR)`, clamped to the
+    /// [1 s, 60 s] bounds (§2.4 / §2.5). Before any measurement this
+    /// is the §2.1 initial 1 s.
+    fn estimated_rto(&self) -> u32 {
+        if !self.rtt_seeded {
+            return RTO_INITIAL_MS;
+        }
+        let spread = 1u32.max(self.rttvar_ms.saturating_mul(RTO_K));
+        self.srtt_ms
+            .saturating_add(spread)
+            .clamp(RTO_INITIAL_MS, RTO_MAX_MS)
+    }
+
     /// Retain the `total` just-sent bytes — read from a fresh cursor
     /// over the chain `async_try_send_chain` already transmitted — so
     /// the RTO timer can retransmit them, and start the timer if it
@@ -584,6 +646,14 @@ impl TcpConnection {
         if self.rtx_deadline_ms == 0 {
             self.arm_rtx();
         }
+        // RFC 6298 §3: take at most one RTT sample per RTT. Anchor on
+        // the sequence number just past this send (`snd_nxt` already
+        // advanced); the ACK covering it yields the measurement.
+        if !self.rtt_anchor_active {
+            self.rtt_anchor_active = true;
+            self.rtt_anchor_seq = self.snd_nxt;
+            self.rtt_anchor_ms = kernel_core::clock::now_ms();
+        }
     }
 
     /// Fold an ACK into the retransmission state: drop acknowledged
@@ -604,13 +674,23 @@ impl TcpConnection {
         if acked == 0 {
             return; // not new data — leave the timer untouched
         }
+        // RFC 6298 §3 (Karn): if this ACK covers the anchored byte and
+        // no retransmission has invalidated the sample, fold the
+        // round-trip time into the estimator.
+        if self.rtt_anchor_active && !seq_lt(self.snd_una, self.rtt_anchor_seq) {
+            let elapsed = kernel_core::clock::now_ms().saturating_sub(self.rtt_anchor_ms);
+            self.sample_rtt(elapsed.min(u32::MAX as u64) as u32);
+            self.rtt_anchor_active = false;
+        }
         let drop = acked.min(self.rtx_len as usize);
         self.rtx_head = ((self.rtx_head as usize + drop) % RTX_BUF_BYTES) as u16;
         self.rtx_len -= drop as u16;
         // New data acknowledged: the peer is making progress, so clear
-        // the §5.5 backoff and re-initialise the RTO.
+        // the §5.5 backoff and reset the RTO to the current estimate
+        // (RFC 6298 §5.7 — a backed-off RTO holds only until a
+        // successful round trip restores the estimator's value).
         self.rtx_backoff = 0;
-        self.rto_ms = RTO_INITIAL_MS;
+        self.rto_ms = self.estimated_rto();
         if self.rtx_len == 0 {
             // §5.2: everything outstanding is ACK'd — stop the timer.
             self.rtx_deadline_ms = 0;
@@ -660,6 +740,10 @@ impl TcpConnection {
             self.rx_free() as u16,
             &scratch[..n],
         );
+        // RFC 6298 §3 (Karn's algorithm): the outstanding RTT sample
+        // is now ambiguous — a later ACK could be for either the
+        // original transmission or this one — so discard it.
+        self.rtt_anchor_active = false;
         // §5.5: back the RTO off exponentially, capped at the ceiling.
         self.rtx_backoff = self.rtx_backoff.saturating_add(1);
         self.rto_ms = self.rto_ms.saturating_mul(2).min(RTO_MAX_MS);
@@ -3470,6 +3554,45 @@ mod tests {
         assert!(
             tx().is_empty(),
             "fully-acknowledged data is never retransmitted",
+        );
+    }
+
+    /// RFC 6298 §2: the RTT estimator seeds SRTT/RTTVAR from the first
+    /// measurement (§2.2) and tracks with the EWMA thereafter (§2.3);
+    /// the RTO follows `SRTT + 4·RTTVAR`, clamped to the 1 s floor.
+    #[test]
+    fn rtt_estimator_tracks_rfc6298() {
+        // The estimator math is pure — exercise it on a bare TCB.
+        let mut c = TcpConnection::new();
+
+        // §2.1: before any measurement the RTO is the 1 s initial value.
+        assert_eq!(c.estimated_rto(), RTO_INITIAL_MS);
+
+        // §2.2: first sample R → SRTT = R, RTTVAR = R/2.
+        c.sample_rtt(400);
+        assert_eq!(c.srtt_ms, 400, "SRTT seeds to the first sample");
+        assert_eq!(c.rttvar_ms, 200, "RTTVAR seeds to R/2");
+        // RTO = SRTT + 4·RTTVAR = 400 + 800 = 1200.
+        assert_eq!(c.estimated_rto(), 1200);
+
+        // §2.3: a second sample folds in (alpha = 1/8, beta = 1/4) —
+        // RTTVAR is updated first, against the *old* SRTT.
+        c.sample_rtt(440);
+        // RTTVAR = 200 - 200/4 + |400-440|/4 = 150 + 10 = 160.
+        assert_eq!(c.rttvar_ms, 160);
+        // SRTT  = 400 - 400/8 + 440/8 = 350 + 55 = 405.
+        assert_eq!(c.srtt_ms, 405);
+        assert_eq!(c.estimated_rto(), 405 + 4 * 160);
+
+        // §2.4: a steady low RTT drives the estimate below 1 s, where
+        // it is clamped up to the floor.
+        for _ in 0..60 {
+            c.sample_rtt(20);
+        }
+        assert_eq!(
+            c.estimated_rto(),
+            RTO_INITIAL_MS,
+            "a low, steady RTT clamps the RTO at the 1 s floor",
         );
     }
 
