@@ -9,13 +9,13 @@
 extern crate alloc;
 extern crate bitflags;
 extern crate kernel_core;
+extern crate net_checksum as checksum;
 extern crate net_dst_mac as dst_mac;
 extern crate net_ethernet as ethernet;
 extern crate net_from_bytes as from_bytes;
 extern crate net_ipv4 as ipv4;
 extern crate net_ipv6 as ipv6;
 extern crate net_ipv6_send as ipv6_send;
-extern crate net_l4_tx as l4_tx;
 extern crate net_types as types;
 extern crate nic;
 extern crate uni_runtime;
@@ -1365,12 +1365,11 @@ unsafe fn fill_tcp_frame_headers(
     tcp_hdr.window = htons(window);
     tcp_hdr.checksum = 0;
     tcp_hdr.urgent = 0;
-    // Stamp the L4 checksum field per the active NIC's offload
-    // convention — see `l4_tx::checksum`.
-    // SAFETY: `tcp_off + tcp_seg_len` is within `frame` — the caller
-    // sized the buffer to hold the whole segment.
-    let seg = unsafe { frame.as_ptr().add(tcp_off) };
-    tcp_hdr.checksum = l4_tx::checksum(local_ip, dst_ip, types::proto::TCP, seg, tcp_seg_len);
+    // Stamp the pseudo-header partial sum at the TCP checksum
+    // field; the driver finishes it — device CSUM offload, or a
+    // software pass when the device never negotiated it.
+    tcp_hdr.checksum =
+        checksum::l4_pseudo_partial(local_ip, dst_ip, types::proto::TCP, tcp_seg_len);
 
     // ── IP header (family-dispatched) ────────────────────────────────
     let ip_total = (tcp_off - ETH_HDR_LEN + tcp_seg_len) as u16;
@@ -1411,10 +1410,10 @@ unsafe fn fill_tcp_frame_headers(
 }
 
 /// Acquire a TX-pool slot from the driver and run `fill` over its
-/// frame region; submit it for transmission. `csum_tcp_off` is
-/// the byte offset of the TCP header within the frame (= `0` if
-/// the caller doesn't want CSUM offload) — `submit_tx` reads
-/// this to populate the offload-hint field.
+/// frame region; submit it for transmission. `tcp_hdr_off` is the
+/// byte offset of the TCP header within the frame — handed to the
+/// driver (via `submit_tx`, or the `send` fallback) as the L4
+/// checksum-offload descriptor.
 ///
 /// Falls back to a stack-staged frame + slice-shaped `send` when
 /// the driver doesn't expose direct-fill (`acquire_tx_buf == None`)
@@ -1424,20 +1423,17 @@ unsafe fn fill_tcp_frame_headers(
 /// passed `&mut [u8]` (≥ `FRAME_BUF_LEN` bytes). Caller is
 /// responsible for ensuring `frame_len <= FRAME_BUF_LEN`.
 #[inline]
-fn build_and_send_frame<F>(frame_len: usize, csum_tcp_off: u16, fill: F)
+fn build_and_send_frame<F>(frame_len: usize, tcp_hdr_off: u16, fill: F)
 where
     F: FnOnce(&mut [u8]),
 {
     debug_assert!(frame_len <= FRAME_BUF_LEN);
-    let csum = if csum_tcp_off != 0 && nic::csum_tx_offload() {
-        // 16 = byte offset of the TCP `checksum` field within
-        // the TCP header.
-        nic::CsumOffload {
-            start: csum_tcp_off,
-            offset: 16,
-        }
-    } else {
-        nic::CsumOffload::NONE
+    // `fill` (→ `fill_tcp_frame_headers`) stamps the pseudo-header
+    // partial sum at the TCP checksum field; the driver finishes
+    // it. 16 = the checksum field's offset within the TCP header.
+    let csum = nic::CsumOffload {
+        start: tcp_hdr_off,
+        offset: 16,
     };
     if let Some(mut handle) = nic::acquire_tx_buf() {
         let cap = handle.data_cap as usize;
@@ -1450,24 +1446,11 @@ where
         nic::submit_tx(handle, frame_len, csum);
         return;
     }
-    // Slice-shaped fallback: stage on the stack, hand to the
-    // driver's slice-shaped `send`. Driver-specific memcpy
-    // happens inside; csum-offload hint is lost here (the slice
-    // path doesn't carry it), so callers requesting offload
-    // would see a broken checksum on a fallback driver. The
-    // caller's `fill` already stamped the correct shape (full
-    // checksum if `csum_tx_offload()` returned false at
-    // header-fill time, partial otherwise) — but partial only
-    // works when paired with a NEEDS_CSUM submit. So when we
-    // fall back, the partial-stamped frame would be incorrect.
-    //
-    // In practice this can't bite today: the only fallback driver
-    // is gve-DQO, which reports `csum_tx_offload() == false`, so
-    // `fill` stamped the full checksum and the slice path ships
-    // a correct frame. If a future driver returns true for offload
-    // but None from acquire, we'll need to redo the checksum at
-    // fallback time. Marked here so we catch it.
-    let _ = csum;
+    // Slice-shaped fallback: stage the frame on the stack and hand
+    // it to the driver's `send` with the same `csum` descriptor as
+    // the `submit_tx` path above — the driver finishes the checksum
+    // either way (device offload, or a software pass). The gve
+    // DQO_RDA path takes this branch for every frame.
     let mut buf = core::mem::MaybeUninit::<[u8; FRAME_BUF_LEN]>::uninit();
     let p = buf.as_mut_ptr() as *mut u8;
     // SAFETY: `from_raw_parts_mut` over uninit memory is fine
@@ -1478,7 +1461,7 @@ where
         let frame = core::slice::from_raw_parts_mut(p, frame_len);
         fill(frame);
         let frame_const = core::slice::from_raw_parts(p, frame_len);
-        nic::send(frame_const);
+        nic::send(frame_const, csum);
     }
 }
 

@@ -12,6 +12,7 @@ rust_library(
     deps = [
         "//drivers:infra",
         "//kernel",
+        "//net:checksum",
         "//uni-iobuf",
         "//uni-net:driver",
     ],

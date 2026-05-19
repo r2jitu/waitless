@@ -214,23 +214,6 @@ rust_library(
     ],
 )
 
-# Outbound L4 checksum stamping. The value written into an outbound
-# TCP/UDP segment's checksum field turns on the active NIC's
-# CSUM-offload convention, not on the L4 protocol — so the `tcp` and
-# `udp` frame builders share this rather than each carrying a copy
-# of the offload-convention dispatch.
-rust_library(
-    name = "l4_tx",
-    srcs = ["src/l4_tx.rs"],
-    crate_name = "net_l4_tx",
-    crate_root = "src/l4_tx.rs",
-    deps = [
-        ":checksum",
-        ":types",
-        "//drivers",
-    ],
-)
-
 # Outbound IPv6 helper — combines the wire-format builder with
 # NDP MAC resolution and ethernet_send. Mirrors `ipv4_send`'s
 # place in the dependency graph: TCP / UDP / the umbrella
@@ -259,13 +242,13 @@ rust_library(
     crate_name = "net_tcp",
     crate_root = "src/tcp.rs",
     deps = [
+        ":checksum",
         ":dst_mac",
         ":ethernet",
         ":from_bytes",
         ":ipv4",
         ":ipv6",
         ":ipv6_send",
-        ":l4_tx",
         ":types",
         "//drivers:nic",
         "//kernel/core",
@@ -298,7 +281,6 @@ rust_library(
         ":ipv4",
         ":ipv6",
         ":ipv6_send",
-        ":l4_tx",
         ":types",
         "//drivers",
         "//uni-iobuf",

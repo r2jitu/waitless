@@ -67,8 +67,12 @@ pub fn poll_qp(qp: usize, callback: fn(Chain<OwnedIOBuf>)) -> usize {
     (active_ops().poll_qp)(qp, callback)
 }
 
-pub fn send(data: &[u8]) {
-    (active_ops().send)(data)
+/// Slice-shaped TX. The driver memcpys `data` into a TX-pool slot
+/// and submits it; `csum` is the L4 checksum-offload descriptor
+/// (see [`submit_tx`]). Pass [`CsumOffload::NONE`] for a frame that
+/// already carries a full checksum or needs none (ARP, ...).
+pub fn send(data: &[u8], csum: uni_net_driver::CsumOffload) {
+    (active_ops().send)(data, csum)
 }
 
 /// Acquire a writable TX buffer from the driver's pool. Caller fills
@@ -117,14 +121,6 @@ pub fn submit_tx(
 /// via [`submit_tx_tso`].
 pub fn tso_available() -> bool {
     (active_ops().tso_available)()
-}
-
-/// True iff the driver supports L4 checksum-offload-on-TX
-/// (`VIRTIO_NET_F_CSUM` or equivalent). When true, callers stamp
-/// the pseudo-header partial sum at the L4 checksum field; when
-/// false, the full checksum.
-pub fn csum_tx_offload() -> bool {
-    (active_ops().csum_tx_offload)()
 }
 
 /// Acquire a big-slot TX buffer (16 KiB capacity) for a TCP TSO

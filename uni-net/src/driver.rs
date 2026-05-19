@@ -183,7 +183,13 @@ pub struct NicOps {
     pub probe: fn() -> bool,
 
     // ── Data path ───────────────────────────────────────────────────
-    pub send: fn(&[u8]),
+    /// Slice-shaped TX: the driver memcpys the frame into a TX-pool
+    /// slot and submits it. `csum` is the L4 checksum-offload
+    /// descriptor — same one [`Self::submit_tx`] takes — finished
+    /// via device offload, or a software pass when the device never
+    /// negotiated it. Pass [`CsumOffload::NONE`] for a frame that
+    /// already carries a full checksum or needs none (ARP, ...).
+    pub send: fn(&[u8], CsumOffload),
     /// Optional zero-copy TX: caller acquires a slot from the
     /// driver's TX pool, fills frame bytes in place, submits.
     /// `None` means the driver doesn't support this surface (or
@@ -223,15 +229,6 @@ pub struct NicOps {
     /// into MSS-sized segments themselves and use the small-pool
     /// `acquire_tx_buf` + `submit_tx` path.
     pub tso_available: fn() -> bool,
-    /// L4 checksum-offload-on-TX capability: `true` when the
-    /// device negotiated `VIRTIO_NET_F_CSUM` (or the equivalent
-    /// on non-virtio drivers). When true, callers stamp the
-    /// pseudo-header partial sum at the L4 checksum field and pass
-    /// [`CsumOffload`] with non-zero `start`; the device finishes
-    /// the checksum host-side. When false, callers must compute
-    /// and stamp the full checksum themselves and pass
-    /// [`CsumOffload::NONE`].
-    pub csum_tx_offload: fn() -> bool,
     /// Acquire a big-slot TX buffer (16 KiB capacity) for a TCP
     /// TSO super-segment. Returns `None` when:
     ///   * TSO isn't negotiated (no big pool allocated), OR
@@ -545,7 +542,7 @@ pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
 // `&'static NicOps` without a null check. Hot-path cost per call:
 // one Acquire load + one direct fn-pointer call.
 
-fn null_send(_: &[u8]) {}
+fn null_send(_: &[u8], _: CsumOffload) {}
 fn null_poll(_: fn(Chain<OwnedIOBuf>)) -> usize {
     0
 }
@@ -571,7 +568,6 @@ static NULL_OPS: NicOps = NicOps {
     acquire_tx_buf: None,
     submit_tx: None,
     tso_available: null_false,
-    csum_tx_offload: null_false,
     acquire_tx_tso_buf: None,
     submit_tx_tso: None,
     udp_gso_available: null_false,

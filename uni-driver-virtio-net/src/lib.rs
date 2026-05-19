@@ -5,6 +5,7 @@
 
 extern crate alloc;
 extern crate drivers_infra;
+extern crate net_checksum;
 extern crate uni_iobuf;
 extern crate uni_kernel;
 extern crate uni_net_driver;
@@ -285,6 +286,12 @@ struct NetDevice {
     /// host-side. Saves the per-MSS frame-build loop in
     /// `async_try_send_chain`.
     has_tso4: bool,
+    /// `VIRTIO_NET_F_CSUM` negotiated — the device finishes an L4
+    /// checksum from a guest-stamped pseudo-header partial sum
+    /// (`VIRTIO_NET_HDR_F_NEEDS_CSUM`). Tracked apart from
+    /// `has_tso4`: a device can offer CSUM without TSO4. When this
+    /// is false, `submit_tx` finishes the L4 checksum in software.
+    has_csum: bool,
     irq_edge: bool, // SPI is edge-triggered (from FDT)
 }
 
@@ -304,6 +311,7 @@ impl NetDevice {
         guest_features: 0,
         has_mq: false,
         has_tso4: false,
+        has_csum: false,
         irq_edge: false,
     };
 }
@@ -494,6 +502,7 @@ fn init_pci_modern() -> bool {
     // submit_tx_tso call.
     let has_tso4 =
         (dev_features & VIRTIO_NET_F_CSUM) != 0 && (dev_features & VIRTIO_NET_F_HOST_TSO4) != 0;
+    let has_csum = (dev_features & VIRTIO_NET_F_CSUM) != 0;
 
     vpci_write_features(dev, 0, guest_features);
     vpci_write_features(dev, 1, 1); // VIRTIO_F_VERSION_1
@@ -665,6 +674,7 @@ fn init_pci_modern() -> bool {
         (*ndev()).negotiated_queue_pairs = num_pairs;
         (*ndev()).has_mq = has_mq && num_pairs > 1;
         (*ndev()).has_tso4 = has_tso4;
+        (*ndev()).has_csum = has_csum;
     }
     activate_multi_queue();
 
@@ -857,6 +867,7 @@ fn init_mmio() -> bool {
     let mut has_used_idx_mmio = false;
     let mut has_mq = false;
     let mut has_tso4 = false;
+    let mut has_csum = false;
     unsafe {
         if is_v2 {
             virtio_write32(io_base + MMIO_DEVICE_FEATURES_SEL, 0);
@@ -893,6 +904,7 @@ fn init_mmio() -> bool {
             // negotiated → TCP layer can collapse its per-MSS loop.
             has_tso4 = (guest_features & VIRTIO_NET_F_CSUM) != 0
                 && (guest_features & VIRTIO_NET_F_HOST_TSO4) != 0;
+            has_csum = (guest_features & VIRTIO_NET_F_CSUM) != 0;
             virtio_write32(io_base + MMIO_DRIVER_FEATURES_SEL, 0);
             virtio_write32(io_base + MMIO_GUEST_FEATURES, guest_features);
             virtio_write32(io_base + MMIO_DRIVER_FEATURES_SEL, 1);
@@ -1023,6 +1035,7 @@ fn init_mmio() -> bool {
         (*ndev()).negotiated_queue_pairs = num_pairs;
         (*ndev()).has_mq = has_mq && num_pairs > 1;
         (*ndev()).has_tso4 = has_tso4;
+        (*ndev()).has_csum = has_csum;
     }
     activate_multi_queue();
 
@@ -1189,7 +1202,7 @@ fn get_mac(mac_out: *mut u8) {
 /// from the caller's worker pool, copies `data` into it, and
 /// submits via the unified `submit_tx` path. Used by ARP/NDP/etc.
 /// callers that don't fill in place.
-fn send_slice(data: &[u8]) {
+fn send_slice(data: &[u8], csum: uni_net_driver::CsumOffload) {
     if data.is_empty() {
         return;
     }
@@ -1204,9 +1217,9 @@ fn send_slice(data: &[u8]) {
         None => return, // no driver
     };
     handle.data_mut()[..frame_len].copy_from_slice(&data[..frame_len]);
-    // Caller's frame already carries a fully-computed checksum
-    // (or doesn't need one — ARP, etc.); no offload.
-    submit_tx(handle, frame_len, uni_net_driver::CsumOffload::NONE);
+    // Same `csum` descriptor a `submit_tx` caller would pass — the
+    // slice path is just a memcpy in front of the same submit.
+    submit_tx(handle, frame_len, csum);
 }
 
 /// Flag: set by APs when they stage TX.
@@ -1222,8 +1235,8 @@ static TX_LOCK: uni_kernel::sync::Spinlock<()> = uni_kernel::sync::Spinlock::new
 /// acquire+submit path: pool is per-worker (lock-free slot
 /// allocation on both Tier 1 and Tier 2); virtq submission is
 /// per-core on Tier 1 and TX_LOCK-serialised on Tier 2.
-fn send(data: &[u8]) {
-    send_slice(data);
+fn send(data: &[u8], csum: uni_net_driver::CsumOffload) {
+    send_slice(data, csum);
 }
 
 // ─── Direct-fill (zero-copy) TX path ────────────────────────────────────────
@@ -1424,21 +1437,34 @@ fn submit_tx(
 
     let qp = worker_qp(worker);
 
-    // CsumOffload → virtio_net_hdr fields. NEEDS_CSUM tells the
-    // device to compute the L4 checksum at `csum_start +
-    // csum_offset`; the caller has already stamped the pseudo-
-    // header partial sum at the L4 checksum field.
-    let (flags, csum_start, csum_off) = if csum.is_some() {
-        (VIRTIO_NET_HDR_F_NEEDS_CSUM, csum.start, csum.offset)
-    } else {
-        (0, 0, 0)
-    };
+    // The caller stamped the pseudo-header partial sum at the L4
+    // checksum field; something has to finish it. A device that
+    // negotiated VIRTIO_NET_F_CSUM does — NEEDS_CSUM points it at
+    // `csum_start + csum_offset`. A device that didn't can't, so
+    // we finish the checksum here in software and ship a plain
+    // frame. Either way the frame leaves with a correct checksum.
+    let offload = csum.is_some() && unsafe { (*ndev()).has_csum };
 
     unsafe {
         let buf = &mut (*wpool(worker)).small[slot];
+        if csum.is_some() && !offload {
+            // Software-complete: the L4 segment's checksum field
+            // already holds the partial sum, so the RFC-1071 sum
+            // over the segment folds it straight into the answer.
+            let l4 = csum.start as usize;
+            let final_ck =
+                net_checksum::internet_checksum(buf.data.as_ptr().add(l4), frame_len - l4);
+            let field = l4 + csum.offset as usize;
+            buf.data[field] = (final_ck & 0xff) as u8;
+            buf.data[field + 1] = (final_ck >> 8) as u8;
+        }
+        let (flags, csum_start, csum_off) = if offload {
+            (VIRTIO_NET_HDR_F_NEEDS_CSUM, csum.start, csum.offset)
+        } else {
+            (0, 0, 0)
+        };
         // Fill virtio_net header. Single-buffer frame
-        // (num_buffers = 1); GSO disabled; checksum offload
-        // controlled by `csum` (caller's choice).
+        // (num_buffers = 1); GSO disabled.
         buf.hdr = VirtioNetHeader {
             flags,
             gso_type: 0,
@@ -1478,14 +1504,6 @@ fn submit_tx(
 }
 
 fn tso_available() -> bool {
-    unsafe { (*ndev()).has_tso4 }
-}
-
-/// L4 checksum offload — `VIRTIO_NET_F_CSUM`. Today it's
-/// negotiated together with TSO4 (the device init enables both
-/// or neither), so we report the same flag. If the negotiation
-/// gets split in the future, track CSUM separately on `ndev`.
-fn csum_tx_offload() -> bool {
     unsafe { (*ndev()).has_tso4 }
 }
 
@@ -2315,7 +2333,6 @@ static VIRTIO_NET_OPS: NicOps = NicOps {
     acquire_tx_buf: Some(acquire_tx_buf),
     submit_tx: Some(submit_tx),
     tso_available,
-    csum_tx_offload,
     acquire_tx_tso_buf: Some(acquire_tx_tso_buf),
     submit_tx_tso: Some(submit_tx_tso),
     // UDP-GSO would require negotiating `VIRTIO_NET_F_HOST_USO` and

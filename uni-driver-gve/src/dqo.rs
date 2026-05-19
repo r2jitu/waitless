@@ -375,7 +375,11 @@ fn build_pkt_desc(buf_addr: u64, flags: u8, compl_tag: u16, buf_size: u16) -> u1
 /// Slice-shaped send: copy `data` into the next ring's bounce buffer,
 /// emit a (general-ctx, pkt) descriptor pair, advance fill_cnt,
 /// doorbell unless deferred.
-pub(crate) fn send_on_qp(qp: usize, data: &[u8]) -> bool {
+///
+/// The `_csum` offload hint goes unused here: DQO runs
+/// `classify_outbound` on every frame for the TX flow-hash anyway,
+/// and takes the CSUM-enable flag from that same parse.
+pub(crate) fn send_on_qp(qp: usize, data: &[u8], _csum: uni_net_driver::CsumOffload) -> bool {
     if qp >= MAX_QUEUE_PAIRS || data.is_empty() || data.len() > (RX_BUFFER_SIZE as usize) {
         return false;
     }

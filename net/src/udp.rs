@@ -14,7 +14,6 @@ extern crate net_from_bytes as from_bytes;
 extern crate net_ipv4 as ipv4;
 extern crate net_ipv6 as ipv6;
 extern crate net_ipv6_send as ipv6_send;
-extern crate net_l4_tx as l4_tx;
 extern crate net_types as types;
 extern crate uni_drivers;
 extern crate uni_net_driver;
@@ -74,24 +73,13 @@ const FRAME_BUF_LEN: usize =
     uni_runtime::net::MAX_L2_HEADROOM + (1500 - IPV6_HDR_LEN - UDP_HDR_LEN);
 // = 62 + 1452 = 1514. Same total bound for both families.
 
-/// Which UDP checksum `fill_udp_frame_headers` stamps.
-enum UdpCsum {
-    /// The full checksum, computed guest-side — for frames shipped
-    /// via the legacy `uni_drivers::net::send()`, which carries no
-    /// CSUM-offload hint.
-    Full,
-    /// Offload-aware, per the active NIC's convention — for frames
-    /// shipped via `submit_tx` with a `CsumOffload` descriptor.
-    OffloadAware,
-}
-
 /// Fill the ETH + IP + UDP headers of `frame` in place — the UDP
 /// analogue of `net_tcp`'s `fill_tcp_frame_headers`. `eth_off` is
 /// where the Ethernet header starts; the IP and UDP headers follow
 /// contiguously, and the UDP payload must already sit past them.
 /// The two send paths lay the frame out at different `eth_off`s.
-/// Computes the UDP checksum (`csum` picks full vs offload-aware)
-/// and the IPv4 header checksum in place.
+/// Stamps the UDP pseudo-header partial sum and the IPv4 header
+/// checksum in place.
 unsafe fn fill_udp_frame_headers(
     frame: &mut [u8],
     eth_off: usize,
@@ -100,7 +88,6 @@ unsafe fn fill_udp_frame_headers(
     src_port: u16,
     dst_port: u16,
     udp_len: usize,
-    csum: UdpCsum,
 ) {
     // For v6 the UDP source is the unspecified `::` — no SLAAC
     // global yet; peers accept it for short-lived response traffic.
@@ -126,14 +113,10 @@ unsafe fn fill_udp_frame_headers(
     udp_hdr.src_port = htons(src_port);
     udp_hdr.dst_port = htons(dst_port);
     udp_hdr.length = htons(udp_len as u16);
-    udp_hdr.checksum = 0;
-    // Checksum over the UDP segment — header (field now 0) + payload.
-    // SAFETY: `udp_off + udp_len` is within `frame`.
-    let seg = unsafe { frame.as_ptr().add(udp_off) };
-    udp_hdr.checksum = match csum {
-        UdpCsum::Full => checksum::l4_checksum(src, dst, types::proto::UDP, seg, udp_len),
-        UdpCsum::OffloadAware => l4_tx::checksum(src, dst, types::proto::UDP, seg, udp_len),
-    };
+    // Stamp the pseudo-header partial sum at the UDP checksum
+    // field; the driver finishes it — device CSUM offload, or a
+    // software pass when the device never negotiated it.
+    udp_hdr.checksum = checksum::l4_pseudo_partial(src, dst, types::proto::UDP, udp_len);
 
     // ── IP header (family-dispatched) ────────────────────────────────
     let ip_total = (ip_hdr_len + udp_len) as u16;
@@ -207,8 +190,7 @@ pub fn send_with_l2_headroom(dst: IpAddr, src_port: u16, dst_port: u16, frame: &
 
     // SAFETY: `frame` holds the headroom reserve plus the payload
     // (bounds-checked above), so the frame from `prefix_skip` on is
-    // in-bounds. `Full` checksum: this path ships via the legacy
-    // `send()`, which carries no offload hint.
+    // in-bounds.
     unsafe {
         fill_udp_frame_headers(
             frame,
@@ -218,11 +200,17 @@ pub fn send_with_l2_headroom(dst: IpAddr, src_port: u16, dst_port: u16, frame: &
             src_port,
             dst_port,
             udp_len,
-            UdpCsum::Full,
         );
         let frame_slice =
             core::slice::from_raw_parts(frame.as_ptr().add(prefix_skip), frame.len() - prefix_skip);
-        uni_drivers::net::send(frame_slice);
+        // The UDP checksum field holds the pseudo-header partial
+        // sum; `send` hands the driver these offsets to finish it.
+        // 6 = the checksum field's offset within the UDP header.
+        let csum = uni_drivers::net::CsumOffload {
+            start: (ETH_HDR_LEN + ip_hdr_len) as u16,
+            offset: 6,
+        };
+        uni_drivers::net::send(frame_slice, csum);
     }
 }
 
@@ -295,34 +283,19 @@ pub fn send_via_tx_handle(
                 let p = frame.as_mut_ptr();
                 core::ptr::copy(p.add(MAX_L2_HEADROOM), p.add(actual_headroom), payload_len);
             }
-            // Frame starts at offset 0 (after any v4 shift). Offload-
-            // aware checksum — this slot ships via `submit_tx` below
-            // with a `CsumOffload` descriptor.
-            fill_udp_frame_headers(
-                frame,
-                0,
-                dst,
-                dst_mac,
-                src_port,
-                dst_port,
-                udp_len,
-                UdpCsum::OffloadAware,
-            );
+            // Frame starts at offset 0 (after any v4 shift).
+            fill_udp_frame_headers(frame, 0, dst, dst_mac, src_port, dst_port, udp_len);
         }
     }
 
-    // The L2 frame now starts at slot.data[0] for both families;
-    // submit_tx with the actual on-wire length. Pass CsumOffload
-    // when the driver supports it — UDP checksum field is at
-    // byte offset 6 within the UDP header.
+    // The L2 frame now starts at slot.data[0] for both families.
+    // The UDP checksum field holds the pseudo-header partial sum;
+    // `submit_tx` hands the driver these offsets to finish it.
+    // 6 = the checksum field's offset within the UDP header.
     let _ = &mut handle;
-    let csum = if uni_drivers::net::csum_tx_offload() {
-        uni_drivers::net::CsumOffload {
-            start: (ETH_HDR_LEN + ip_hdr_len) as u16,
-            offset: 6,
-        }
-    } else {
-        uni_drivers::net::CsumOffload::NONE
+    let csum = uni_drivers::net::CsumOffload {
+        start: (ETH_HDR_LEN + ip_hdr_len) as u16,
+        offset: 6,
     };
     uni_drivers::net::submit_tx(handle, on_wire_actual, csum);
 }

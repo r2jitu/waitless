@@ -1963,11 +1963,11 @@ fn enable_deferred_tx_kick() {
 /// (device hasn't caught up) or the frame exceeds the format's
 /// per-packet limit. Dispatches to GQI_QPL or DQO_RDA based on
 /// the queue format committed at init time.
-fn send_on_qp(qp: usize, data: &[u8]) -> bool {
+fn send_on_qp(qp: usize, data: &[u8], csum: uni_net_driver::CsumOffload) -> bool {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
-        dqo::send_on_qp(qp, data)
+        dqo::send_on_qp(qp, data, csum)
     } else {
-        gqi::send_on_qp(qp, data)
+        gqi::send_on_qp(qp, data, csum)
     }
 }
 
@@ -1975,9 +1975,9 @@ fn send_on_qp(qp: usize, data: &[u8]) -> bool {
 /// fits within `num_qp`, else falls back to qp 0. Matches the
 /// virtio-net "send on your own core's queue" semantics so Tier 1
 /// scaling keeps working.
-fn send(data: &[u8]) {
+fn send(data: &[u8], csum: uni_net_driver::CsumOffload) {
     if let Some(qp) = current_qp() {
-        let _ = send_on_qp(qp, data);
+        let _ = send_on_qp(qp, data, csum);
     }
 }
 
@@ -2146,12 +2146,6 @@ static GVE_OPS: NicOps = NicOps {
     // `GVE_TXF_L4CSUM`. Big-pool slots are 16 KiB so a typical
     // 10× MSS super-segment lands in one slot.
     tso_available: || true,
-    // CSUM offload via GQI's `GVE_TXF_L4CSUM` + `l4_csum_offset` /
-    // `l4_hdr_offset` (per Linux's `gve_tx_fill_pkt_desc`). The
-    // caller pre-stamps the pseudo-header partial sum at the L4
-    // checksum field; the device adds the data and folds (matching
-    // Linux's `CHECKSUM_PARTIAL` skb path).
-    csum_tx_offload: || true,
     acquire_tx_tso_buf: Some(acquire_tx_tso_buf),
     submit_tx_tso: Some(submit_tx_tso),
     // UDP-GSO via the same TSO descriptor shape with

@@ -44,6 +44,11 @@ pub fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
         let payload_len = payload.len().min(1500);
         ptr::copy_nonoverlapping(payload.as_ptr(), p.add(HEADER_LEN), payload_len);
 
-        nic::send(core::slice::from_raw_parts(p, HEADER_LEN + payload_len));
+        // ARP / ICMPv6 / NDP only — never an offloadable L4
+        // segment, so the frame ships with no checksum descriptor.
+        nic::send(
+            core::slice::from_raw_parts(p, HEADER_LEN + payload_len),
+            nic::CsumOffload::NONE,
+        );
     }
 }

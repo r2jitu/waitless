@@ -247,7 +247,7 @@ pub(crate) fn tx_drain(tx: &TxQueue) {
 /// Slice-shaped wrapper over the direct-fill path: acquire a slot
 /// from the QP's pool, memcpy data into it, submit. Used by `send`
 /// (the per-core dispatcher) when GQI is the negotiated format.
-pub(crate) fn send_on_qp(qp: usize, data: &[u8]) -> bool {
+pub(crate) fn send_on_qp(qp: usize, data: &[u8], csum: uni_net_driver::CsumOffload) -> bool {
     if data.is_empty() || data.len() > TX_MAX_PKT_LEN {
         return false;
     }
@@ -257,7 +257,7 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     };
     let n = data.len();
     handle.data_mut()[..n].copy_from_slice(data);
-    submit_tx_inner(handle, n, uni_net_driver::CsumOffload::NONE);
+    submit_tx_inner(handle, n, csum);
     true
 }
 
