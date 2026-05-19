@@ -33,11 +33,11 @@ pub fn checksum(src: IpAddr, dst: IpAddr, proto: u8, seg: *const u8, seg_len: us
     if uni_drivers::net::csum_tx_offload() {
         match uni_drivers::net::csum_stamp_convention() {
             uni_drivers::net::CsumStampConvention::PseudoHeaderPartial => {
-                types::tcp_pseudo_partial(src, dst, proto, seg_len)
+                types::l4_pseudo_partial(src, dst, proto, seg_len)
             }
             uni_drivers::net::CsumStampConvention::Zero => 0,
         }
     } else {
-        types::tcp_checksum_any(src, dst, proto, seg, seg_len)
+        types::l4_checksum_any(src, dst, proto, seg, seg_len)
     }
 }
