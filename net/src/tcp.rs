@@ -15,6 +15,7 @@ extern crate net_from_bytes as from_bytes;
 extern crate net_ipv4 as ipv4;
 extern crate net_ipv6 as ipv6;
 extern crate net_ipv6_send as ipv6_send;
+extern crate net_l4_tx as l4_tx;
 extern crate net_types as types;
 extern crate nic;
 extern crate uni_runtime;
@@ -23,7 +24,7 @@ use alloc::boxed::Box;
 use core::ptr;
 use core::task::Waker;
 use from_bytes::FromBytes;
-use types::{IpAddr, MacAddr, htonl, htons, ntohl, ntohs, tcp_checksum_any, tcp_pseudo_partial};
+use types::{IpAddr, MacAddr, htonl, htons, ntohl, ntohs};
 use uni_iobuf::{Chain, IOBuf, OwnedIOBuf};
 
 bitflags::bitflags! {
@@ -1364,29 +1365,12 @@ unsafe fn fill_tcp_frame_headers(
     tcp_hdr.window = htons(window);
     tcp_hdr.checksum = 0;
     tcp_hdr.urgent = 0;
-    // What we stamp depends on the active NIC's CSUM-offload
-    // convention. virtio expects pseudo-header partial sum;
-    // gve expects zero (device builds the pseudo-header from
-    // the IP header). Without offload, we compute the full
-    // checksum on the guest.
-    tcp_hdr.checksum = if nic::csum_tx_offload() {
-        match nic::csum_stamp_convention() {
-            nic::CsumStampConvention::PseudoHeaderPartial => {
-                tcp_pseudo_partial(local_ip, dst_ip, types::proto::TCP, tcp_seg_len)
-            }
-            nic::CsumStampConvention::Zero => 0,
-        }
-    } else {
-        unsafe {
-            tcp_checksum_any(
-                local_ip,
-                dst_ip,
-                types::proto::TCP,
-                frame.as_ptr().add(tcp_off),
-                tcp_seg_len,
-            )
-        }
-    };
+    // Stamp the L4 checksum field per the active NIC's offload
+    // convention — see `l4_tx::checksum`.
+    // SAFETY: `tcp_off + tcp_seg_len` is within `frame` — the caller
+    // sized the buffer to hold the whole segment.
+    let seg = unsafe { frame.as_ptr().add(tcp_off) };
+    tcp_hdr.checksum = l4_tx::checksum(local_ip, dst_ip, types::proto::TCP, seg, tcp_seg_len);
 
     // ── IP header (family-dispatched) ────────────────────────────────
     let ip_total = (tcp_off - ETH_HDR_LEN + tcp_seg_len) as u16;

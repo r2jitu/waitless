@@ -13,13 +13,14 @@ extern crate net_from_bytes as from_bytes;
 extern crate net_ipv4 as ipv4;
 extern crate net_ipv6 as ipv6;
 extern crate net_ipv6_send as ipv6_send;
+extern crate net_l4_tx as l4_tx;
 extern crate net_types as types;
 extern crate uni_drivers;
 extern crate uni_net_driver;
 extern crate uni_runtime;
 
 use from_bytes::FromBytes;
-use types::{CONFIG, IpAddr, htons, ntohs, tcp_checksum, tcp_checksum_v6, tcp_pseudo_partial};
+use types::{CONFIG, IpAddr, htons, ntohs, tcp_checksum, tcp_checksum_v6};
 
 #[repr(C, packed)]
 struct UdpHeader {
@@ -253,49 +254,28 @@ pub fn send_via_tx_handle(
 
             let ip_total = (ip_hdr_len + udp_len) as u16;
             let ip_slot = core::slice::from_raw_parts_mut(p.add(ETH_HDR_LEN), ip_hdr_len);
-            // Stamp value driven by the active NIC's CSUM-offload
-            // convention: virtio wants pseudo-header partial sum;
-            // gve wants zero (device builds the pseudo-header
-            // itself); no offload means we compute the full
-            // checksum guest-side.
-            let offload = uni_drivers::net::csum_tx_offload();
-            let convention = uni_drivers::net::csum_stamp_convention();
+            // Stamp the L4 checksum field per the active NIC's
+            // offload convention — see `l4_tx::checksum`.
             match dst {
                 IpAddr::V4(d) => {
-                    udp_hdr.checksum = if offload {
-                        match convention {
-                            uni_drivers::net::CsumStampConvention::PseudoHeaderPartial => {
-                                tcp_pseudo_partial(
-                                    IpAddr::V4(CONFIG.ip()),
-                                    IpAddr::V4(d),
-                                    types::proto::UDP,
-                                    udp_len,
-                                )
-                            }
-                            uni_drivers::net::CsumStampConvention::Zero => 0,
-                        }
-                    } else {
-                        tcp_checksum(CONFIG.ip(), d, types::proto::UDP, p.add(udp_off), udp_len)
-                    };
+                    udp_hdr.checksum = l4_tx::checksum(
+                        IpAddr::V4(CONFIG.ip()),
+                        IpAddr::V4(d),
+                        types::proto::UDP,
+                        p.add(udp_off),
+                        udp_len,
+                    );
                     ipv4::fill_header(ip_slot, CONFIG.ip(), d, types::proto::UDP, ip_total);
                 }
                 IpAddr::V6(d) => {
                     let src = types::Ipv6Addr::ANY;
-                    udp_hdr.checksum = if offload {
-                        match convention {
-                            uni_drivers::net::CsumStampConvention::PseudoHeaderPartial => {
-                                tcp_pseudo_partial(
-                                    IpAddr::V6(src),
-                                    IpAddr::V6(d),
-                                    types::proto::UDP,
-                                    udp_len,
-                                )
-                            }
-                            uni_drivers::net::CsumStampConvention::Zero => 0,
-                        }
-                    } else {
-                        tcp_checksum_v6(&src, &d, types::proto::UDP, p.add(udp_off), udp_len)
-                    };
+                    udp_hdr.checksum = l4_tx::checksum(
+                        IpAddr::V6(src),
+                        IpAddr::V6(d),
+                        types::proto::UDP,
+                        p.add(udp_off),
+                        udp_len,
+                    );
                     ipv6::fill_header(
                         ip_slot,
                         &src,
