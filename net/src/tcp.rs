@@ -2846,7 +2846,7 @@ mod tests {
     use std::sync::{Mutex, Once};
     use types::Ipv4Addr;
     use uni_iobuf::IOBufDropFn;
-    use uni_net_driver::{CsumStampConvention, NicOps, set_active_ops};
+    use uni_net_driver::{CsumOffload, NicOps, set_active_ops};
 
     const SERVER_IP: [u8; 4] = [10, 0, 0, 1];
     const CLIENT_IP: [u8; 4] = [10, 0, 0, 2];
@@ -2856,7 +2856,7 @@ mod tests {
 
     static TX: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
-    fn mock_send(frame: &[u8]) {
+    fn mock_send(frame: &[u8], _csum: CsumOffload) {
         TX.lock().unwrap().push(frame.to_vec());
     }
     fn mock_get_mac(out: *mut u8) {
@@ -2881,11 +2881,12 @@ mod tests {
         1
     }
 
-    // `acquire_tx_buf` / TSO left `None` and the capabilities `false`,
-    // so every transmit funnels through `send(&[u8])` — the one path
-    // the capture hook covers. `csum_tx_offload = false` makes `tcp.rs`
-    // compute and stamp the full TCP checksum, so captured frames are
-    // wire-complete.
+    // `acquire_tx_buf` / TSO left `None`, so every transmit funnels
+    // through `send` — the one path the capture hook covers. The
+    // stack stamps a pseudo-header partial sum; a real driver finishes
+    // the L4 checksum, but the conformance assertions check headers /
+    // seq / ack / payload, not the checksum, so the mock just records
+    // the frame bytes.
     static MOCK_OPS: NicOps = NicOps {
         name: "mock",
         probe: yes,
@@ -2893,8 +2894,6 @@ mod tests {
         acquire_tx_buf: None,
         submit_tx: None,
         tso_available: no,
-        csum_tx_offload: no,
-        csum_stamp_convention: || CsumStampConvention::PseudoHeaderPartial,
         acquire_tx_tso_buf: None,
         submit_tx_tso: None,
         udp_gso_available: no,
