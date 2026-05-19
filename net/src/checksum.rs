@@ -38,9 +38,16 @@ fn fold(mut sum: u32) -> u16 {
 
 /// RFC 1071 internet checksum over a byte buffer. Sums 16-bit words
 /// in little-endian byte order, so the returned `u16` drops straight
-/// into a network-order `repr(C, packed)` field. Used for the IPv4
-/// header checksum.
-pub fn ipv4_header_checksum(data: *const u8, len: usize) -> u16 {
+/// into a network-order `repr(C, packed)` field.
+///
+/// Two call sites, identical arithmetic. `ipv4::fill_header` runs it
+/// over the 20-byte IPv4 header (checksum field zeroed). A driver
+/// that has to finish an L4 checksum in software — the device never
+/// negotiated CSUM offload — runs it over the L4 segment, whose
+/// checksum field already holds the pseudo-header partial sum from
+/// [`l4_pseudo_partial`]: summing the segment folds that partial
+/// straight in, yielding the value a NEEDS_CSUM device would write.
+pub fn internet_checksum(data: *const u8, len: usize) -> u16 {
     !fold(sum_words(data, len))
 }
 
@@ -172,29 +179,29 @@ mod tests {
     }
 
     #[test]
-    fn ipv4_header_checksum_zeros() {
+    fn internet_checksum_zeros() {
         // All-zero data should checksum to 0xFFFF
         let data = [0u8; 20];
-        assert_eq!(ipv4_header_checksum(data.as_ptr(), data.len()), 0xFFFF);
+        assert_eq!(internet_checksum(data.as_ptr(), data.len()), 0xFFFF);
     }
 
     #[test]
-    fn ipv4_header_checksum_ones() {
+    fn internet_checksum_ones() {
         // All-0xFF data (20 bytes = 10 words of 0xFFFF)
         // Folded sum = 0xFFFF, complement = 0x0000
         let data = [0xFFu8; 20];
-        assert_eq!(ipv4_header_checksum(data.as_ptr(), data.len()), 0x0000);
+        assert_eq!(internet_checksum(data.as_ptr(), data.len()), 0x0000);
     }
 
     #[test]
-    fn ipv4_header_checksum_odd_length() {
+    fn internet_checksum_odd_length() {
         let data = [0x01, 0x02, 0x03];
         // sum = 0x0201 + 0x03 = 0x0204, complement = 0xFDFB
-        assert_eq!(ipv4_header_checksum(data.as_ptr(), data.len()), 0xFDFB);
+        assert_eq!(internet_checksum(data.as_ptr(), data.len()), 0xFDFB);
     }
 
     #[test]
-    fn ipv4_header_checksum_verification() {
+    fn internet_checksum_verification() {
         // Compute checksum of an IPv4-like header, then verify it
         // produces 0 when re-checked with the checksum filled in.
         let hdr: [u8; 20] = [
@@ -202,12 +209,12 @@ mod tests {
             0x00, // checksum field = 0
             0xAC, 0x10, 0x0A, 0x63, 0xAC, 0x10, 0x0A, 0x0C,
         ];
-        let cksum = ipv4_header_checksum(hdr.as_ptr(), hdr.len());
+        let cksum = internet_checksum(hdr.as_ptr(), hdr.len());
         // Fill in checksum (LE byte order) and re-verify
         let mut verified = hdr;
         verified[10] = (cksum & 0xFF) as u8;
         verified[11] = (cksum >> 8) as u8;
-        assert_eq!(ipv4_header_checksum(verified.as_ptr(), verified.len()), 0);
+        assert_eq!(internet_checksum(verified.as_ptr(), verified.len()), 0);
     }
 
     #[test]

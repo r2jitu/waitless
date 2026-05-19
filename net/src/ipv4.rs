@@ -109,7 +109,7 @@ pub fn fill_header(slot: &mut [u8], src: Ipv4Addr, dst: Ipv4Addr, proto: u8, tot
         hdr.checksum = 0;
         hdr.src = src;
         hdr.dst = dst;
-        hdr.checksum = checksum::ipv4_header_checksum(slot.as_ptr(), HEADER_LEN);
+        hdr.checksum = checksum::internet_checksum(slot.as_ptr(), HEADER_LEN);
     }
 }
 
