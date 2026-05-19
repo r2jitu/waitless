@@ -2135,3 +2135,70 @@ IPv6 Tier-2 correctness rests on `ipv6_receive` being host-tested
 (`//net:ipv6_test`) plus the shared distribute path being exercised
 by IPv4 on QEMU-multicore and GCE — unification makes the two halves
 compose.
+
+### 2026-05-19 — Investigation: Tier-2 `RX_LOCK` hold — "option (1)" measured and rejected
+
+**The question.** `sched::poll_tier2` holds `RX_LOCK` across the whole
+`poll()` batch, and for every frame the distributor *owns*
+(`rx::distribute_frame`) it runs `deliver` → `tcp_receive` **inline,
+under the lock**. Frames owned by *other* cores are pushed to their
+`rx_inbox` and delivered lock-free in `net_drain_cb`. Would moving the
+owned-frame delivery off the lock too help? "Option (1)": push *every*
+frame — own ones included — into its owning core's inbox; the
+distributor then drains its own inbox via `net_drain_cb` after
+releasing the lock. The distribution pass (classify + inbox push)
+stays locked, so per-inbox FIFO order is preserved; only L4 delivery
+moves out.
+
+**Measurement.** A temporary probe instrumented the distributor —
+`RX_LOCK` hold cycles, the inline-deliver share of the hold, frames
+per distribution, owned/distributed split. Two findings reshaped the
+approach:
+
+- **TCG cannot answer this.** Local QEMU-TCG showed **0.8 frames per
+  lock acquisition** — frames trickle in one at a time, so the
+  distributor never builds a batch. GCE KVM showed **~24 frames per
+  acquisition**: real hardware pipelines, the RX ring accumulates a
+  backlog, and one `poll()` drains it as a batch. The whole question
+  is about batched work under the lock; TCG's serialization erases the
+  batching, so its numbers (inline ≈ 20% of hold) are unrepresentative.
+- **`gcp-bench.sh --env kvm` runs Tier 1, not Tier 2.** QEMU's
+  virtio-net on the GCE host negotiates modern virtio + multi-queue,
+  the guest activates per-cpu queue pairs (`num_queue_pairs() == 3`),
+  and `distribute_frame` never executes. Entries above that call
+  `--env kvm` "GCE Tier-2" are mislabelled — that path is Tier 1.
+  Exercising Tier 2 on GCE needs a single-queue device (drop `mq=on`
+  from the `-device virtio-net-pci` line; the netdev tap keeps its
+  queues so QEMU can still open the `IFF_MULTI_QUEUE` tap0).
+
+GCE-KVM **Tier-2** baseline (`get_tcp`, 3 cores, single queue): inline
+`tcp_receive` is **~38% of the `RX_LOCK` hold**; mean hold ~58 µs, max
+~697 µs; the lock is held ~61% of wall-clock under load.
+
+**A/B.** Option (1) was implemented and benched against the baseline
+— 3 interleaved rounds, GCE KVM Tier-2, `get_tcp` 3c:
+
+| metric | baseline | option (1) |
+| --- | --- | --- |
+| throughput (mean of 3) | 252.6 k req/s | 238.8 k req/s — **−5.4%** |
+| p50 (mean of 3) | 363 µs | 385 µs — **+6%** |
+| mean `RX_LOCK` hold | ~58 µs | ~32 µs — −45% |
+| max `RX_LOCK` hold | 697 µs | 207 µs — −70% |
+
+Every one of the 3 baseline runs beat every option-(1) run on both
+throughput and p50 — the two distributions do not overlap.
+
+**Verdict — rejected; inline delivery stays.** Option (1) did exactly
+what it was designed to do — the lock hold dropped 45%, the worst-case
+hold 70% — and **still lost 5%**. The `RX_LOCK` hold was never the
+bottleneck: shortening it bought nothing, while the inbox round-trip
+it adds for the ~40% of frames the distributor owns cost ~5%
+throughput and ~6% p50. "Inline delivery is 38% of the hold" is true
+but irrelevant — relocating work no core is blocked waiting on cannot
+help; only the A/B could establish that, no counter or ratio could.
+
+If Tier-2 RX ever does warrant attention, the lever is **not** the
+lock hold. It is either the single-queue serialization itself (the
+"RX scheduler — unify the tier model" follow-up above) or the
+recognition that Tier 2 is a fallback regime — a multi-queue NIC runs
+Tier 1 and never takes `RX_LOCK` at all.
