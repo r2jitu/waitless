@@ -2828,6 +2828,271 @@ mod tests {
         );
     }
 
+    // ---- receiver-side scenarios — no new feature, pure coverage ----------
+
+    /// A retransmitted SYN on a 4-tuple already in `SynReceived` (the
+    /// peer never saw our SYN|ACK) must free the orphaned half-open
+    /// twin and answer with a fresh SYN|ACK — never leak a second
+    /// slot for one 4-tuple. Exercises the stale-twin cleanup in
+    /// `tcp_receive`'s SYN handler.
+    #[test]
+    fn retransmitted_syn_replaces_the_stale_twin() {
+        let _g = harness();
+        const SP: u16 = 9104;
+        const CP: u16 = 50104;
+        const CLIENT_ISN: u32 = 0x4000;
+        super::listen_on_core(0, SP);
+
+        let syn = Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN,
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            payload: Vec::new(),
+        };
+
+        // First SYN → SYN|ACK; the connection is now `SynReceived`.
+        deliver(&syn);
+        assert_eq!(tcp_hdr(&tx()[0]).flags, TCP_SYN | TCP_ACK);
+
+        // The peer never saw that SYN|ACK and retransmits its SYN.
+        clear_tx();
+        deliver(&syn);
+        let frames = tx();
+        assert_eq!(
+            frames.len(),
+            1,
+            "a retransmitted SYN must elicit exactly one fresh SYN|ACK",
+        );
+        let second = tcp_hdr(&frames[0]);
+        assert_eq!(
+            second.flags,
+            TCP_SYN | TCP_ACK,
+            "the retransmit reply must itself be SYN|ACK",
+        );
+        assert_eq!(
+            second.ack,
+            CLIENT_ISN.wrapping_add(1),
+            "the fresh SYN|ACK still acknowledges the client ISN + 1",
+        );
+
+        // The connection from the *second* SYN|ACK is the live one —
+        // complete its handshake and prove it delivers data.
+        let server_isn = second.seq;
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN.wrapping_add(1),
+            ack: server_isn.wrapping_add(1),
+            flags: TCP_ACK,
+            window: 65535,
+            payload: Vec::new(),
+        });
+        clear_tx();
+        let body = b"twin-ok";
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN.wrapping_add(1),
+            ack: server_isn.wrapping_add(1),
+            flags: TCP_ACK | TCP_PSH,
+            window: 65535,
+            payload: body.to_vec(),
+        });
+        assert_eq!(
+            tcp_hdr(tx().last().unwrap()).ack,
+            CLIENT_ISN.wrapping_add(1 + body.len() as u32),
+            "the post-retransmit connection delivers data correctly",
+        );
+    }
+
+    /// A duplicate segment wholly below `rcv_nxt` (the peer never saw
+    /// our ACK and retransmitted) elicits an immediate bare ACK still
+    /// pointing at `rcv_nxt` — the fast-retransmit signal, with no
+    /// data re-counted.
+    #[test]
+    fn duplicate_data_elicits_an_immediate_dup_ack() {
+        let _g = harness();
+        const SP: u16 = 9105;
+        const CP: u16 = 50105;
+        const CLIENT_ISN: u32 = 0x5000;
+        super::listen_on_core(0, SP);
+        let server_isn = handshake(SP, CP, CLIENT_ISN);
+        let rcv_nxt = CLIENT_ISN.wrapping_add(1);
+
+        let body = b"first-copy";
+        let seg = Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: rcv_nxt,
+            ack: server_isn.wrapping_add(1),
+            flags: TCP_ACK | TCP_PSH,
+            window: 65535,
+            payload: body.to_vec(),
+        };
+        // One in-order delivery advances rcv_nxt past the segment.
+        deliver(&seg);
+        let advanced = rcv_nxt.wrapping_add(body.len() as u32);
+
+        // The same bytes arrive again — a pure duplicate.
+        clear_tx();
+        deliver(&seg);
+        let frames = tx();
+        assert_eq!(
+            frames.len(),
+            1,
+            "a duplicate segment must elicit exactly one ACK",
+        );
+        let h = tcp_hdr(&frames[0]);
+        assert_ne!(h.flags & TCP_ACK, 0, "the reply must carry ACK");
+        assert_eq!(
+            h.flags & (TCP_SYN | TCP_FIN | TCP_RST),
+            0,
+            "a dup-ACK is a bare ACK — no other control flags",
+        );
+        assert_eq!(
+            h.ack, advanced,
+            "the dup-ACK still points at rcv_nxt — duplicate bytes are not re-counted",
+        );
+    }
+
+    /// An out-of-order segment (a gap before it) is silently dropped:
+    /// the stack has no reassembly queue (SACK is deferred), so the
+    /// bytes are neither buffered nor acknowledged. Pinned so a future
+    /// reassembly feature has to update this deliberately.
+    #[test]
+    fn out_of_order_segment_is_not_buffered() {
+        let _g = harness();
+        const SP: u16 = 9106;
+        const CP: u16 = 50106;
+        const CLIENT_ISN: u32 = 0x6000;
+        super::listen_on_core(0, SP);
+        let server_isn = handshake(SP, CP, CLIENT_ISN);
+        let rcv_nxt = CLIENT_ISN.wrapping_add(1);
+
+        // A segment 100 bytes past rcv_nxt — there is a gap before it.
+        clear_tx();
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: rcv_nxt.wrapping_add(100),
+            ack: server_isn.wrapping_add(1),
+            flags: TCP_ACK | TCP_PSH,
+            window: 65535,
+            payload: vec![0xAB; 10],
+        });
+        assert!(
+            tx().is_empty(),
+            "an out-of-order segment is silently dropped — no reassembly queue",
+        );
+
+        // The gap-filling in-order segment is accepted at the
+        // *original* rcv_nxt; the 10 out-of-order bytes were dropped.
+        clear_tx();
+        let body = b"in-order";
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: rcv_nxt,
+            ack: server_isn.wrapping_add(1),
+            flags: TCP_ACK | TCP_PSH,
+            window: 65535,
+            payload: body.to_vec(),
+        });
+        assert_eq!(
+            tcp_hdr(tx().last().unwrap()).ack,
+            rcv_nxt.wrapping_add(body.len() as u32),
+            "ACK covers only the in-order bytes — the out-of-order segment was not reassembled",
+        );
+    }
+
+    /// RFC 5961 §3.2: a RST exactly at `rcv_nxt` is accepted and tears
+    /// the connection down — a follow-up segment then finds no TCB.
+    #[test]
+    fn rst_at_rcv_nxt_tears_down_the_connection() {
+        let _g = harness();
+        const SP: u16 = 9107;
+        const CP: u16 = 50107;
+        const CLIENT_ISN: u32 = 0x7000;
+        super::listen_on_core(0, SP);
+        let server_isn = handshake(SP, CP, CLIENT_ISN);
+        let rcv_nxt = CLIENT_ISN.wrapping_add(1);
+
+        clear_tx();
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: rcv_nxt,
+            ack: 0,
+            flags: TCP_RST,
+            window: 0,
+            payload: Vec::new(),
+        });
+        assert!(tx().is_empty(), "an accepted RST elicits no reply");
+
+        // The TCB is gone: follow-up data finds nothing and is dropped
+        // without an ACK.
+        clear_tx();
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: rcv_nxt,
+            ack: server_isn.wrapping_add(1),
+            flags: TCP_ACK | TCP_PSH,
+            window: 65535,
+            payload: b"after-rst".to_vec(),
+        });
+        assert!(
+            tx().is_empty(),
+            "data on a reset connection finds no TCB — silently dropped",
+        );
+    }
+
+    /// RFC 5961 §3.2: a RST whose seq is *not* exactly `rcv_nxt` is a
+    /// blind-reset candidate — dropped, and the connection survives.
+    #[test]
+    fn rst_off_rcv_nxt_is_ignored() {
+        let _g = harness();
+        const SP: u16 = 9108;
+        const CP: u16 = 50108;
+        const CLIENT_ISN: u32 = 0x8000;
+        super::listen_on_core(0, SP);
+        let server_isn = handshake(SP, CP, CLIENT_ISN);
+        let rcv_nxt = CLIENT_ISN.wrapping_add(1);
+
+        clear_tx();
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: rcv_nxt.wrapping_add(9999),
+            ack: 0,
+            flags: TCP_RST,
+            window: 0,
+            payload: Vec::new(),
+        });
+        assert!(tx().is_empty(), "an off-sequence RST elicits no reply");
+
+        // The connection is still alive — in-order data is still ACK'd.
+        clear_tx();
+        let body = b"still-here";
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: rcv_nxt,
+            ack: server_isn.wrapping_add(1),
+            flags: TCP_ACK | TCP_PSH,
+            window: 65535,
+            payload: body.to_vec(),
+        });
+        assert_eq!(
+            tcp_hdr(tx().last().unwrap()).ack,
+            rcv_nxt.wrapping_add(body.len() as u32),
+            "the connection survived the off-sequence RST and still delivers data",
+        );
+    }
+
     /// Drive a full three-way handshake on `(server_port, client_port)`
     /// and return the server's chosen ISN (read from the SYN|ACK).
     fn handshake(server_port: u16, client_port: u16, client_isn: u32) -> u32 {
