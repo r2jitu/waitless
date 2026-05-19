@@ -2147,13 +2147,11 @@ static GVE_OPS: NicOps = NicOps {
     // 10× MSS super-segment lands in one slot.
     tso_available: || true,
     // CSUM offload via GQI's `GVE_TXF_L4CSUM` + `l4_csum_offset` /
-    // `l4_hdr_offset` (per Linux's `gve_tx_fill_pkt_desc`). Stamp
-    // convention is `PseudoHeaderPartial` to match Linux's
-    // `CHECKSUM_PARTIAL` skb path (caller pre-stamps the
-    // pseudo-header sum at the L4 checksum field; device adds
-    // data and folds).
+    // `l4_hdr_offset` (per Linux's `gve_tx_fill_pkt_desc`). The
+    // caller pre-stamps the pseudo-header partial sum at the L4
+    // checksum field; the device adds the data and folds (matching
+    // Linux's `CHECKSUM_PARTIAL` skb path).
     csum_tx_offload: || true,
-    csum_stamp_convention: || uni_net_driver::CsumStampConvention::PseudoHeaderPartial,
     acquire_tx_tso_buf: Some(acquire_tx_tso_buf),
     submit_tx_tso: Some(submit_tx_tso),
     // UDP-GSO via the same TSO descriptor shape with

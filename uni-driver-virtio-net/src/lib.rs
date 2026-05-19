@@ -2316,9 +2316,6 @@ static VIRTIO_NET_OPS: NicOps = NicOps {
     submit_tx: Some(submit_tx),
     tso_available,
     csum_tx_offload,
-    // virtio's NEEDS_CSUM expects the driver to pre-stamp the
-    // pseudo-header partial sum (per virtio spec 5.1.6.2).
-    csum_stamp_convention: || uni_net_driver::CsumStampConvention::PseudoHeaderPartial,
     acquire_tx_tso_buf: Some(acquire_tx_tso_buf),
     submit_tx_tso: Some(submit_tx_tso),
     // UDP-GSO would require negotiating `VIRTIO_NET_F_HOST_USO` and

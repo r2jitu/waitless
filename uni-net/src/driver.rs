@@ -63,15 +63,10 @@ unsafe impl Send for TxBufHandle {}
 /// per-segment L4 checksum host-side. Saves the guest CPU one
 /// full pass over the packet payload.
 ///
-/// What the caller must stamp at the L4 checksum field is
-/// driver-specific — see [`CsumStampConvention`] returned by
-/// `csum_stamp_convention()`. Two conventions in the wild:
-///   * `PseudoHeaderPartial` (virtio): caller pre-stamps the
-///     16-bit pseudo-header partial sum; device adds data,
-///     folds, inverts.
-///   * `Zero` (gve): caller stamps zero; device builds the
-///     pseudo-header itself from the IP header and produces the
-///     full checksum.
+/// The caller pre-stamps the 16-bit pseudo-header partial sum at
+/// the L4 checksum field; the device adds the payload data sum,
+/// folds, and inverts. Every NIC the stack drives expects this one
+/// convention — virtio (`VIRTIO_NET_HDR_F_NEEDS_CSUM`) and gve.
 ///
 /// Use [`Self::NONE`] when the caller already computed the full
 /// checksum and stamped it (control segments built at boot, etc.).
@@ -100,24 +95,6 @@ impl CsumOffload {
     pub fn is_some(&self) -> bool {
         self.start != 0
     }
-}
-
-/// What the caller must stamp at the L4 checksum field when
-/// requesting CSUM offload. Different NICs follow different
-/// conventions; the driver advertises which one it expects via
-/// [`NicOps::csum_stamp_convention`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CsumStampConvention {
-    /// Driver pre-stamps the 16-bit pseudo-header partial sum
-    /// (un-inverted folded sum of pseudo-header bytes). Device
-    /// adds the L4-payload data sum and folds/inverts. Used by
-    /// virtio-net (`VIRTIO_NET_HDR_F_NEEDS_CSUM`).
-    PseudoHeaderPartial,
-    /// Driver stamps zero at the checksum field. Device builds
-    /// the pseudo-header itself from the IP header in the frame,
-    /// computes the L4 data sum, and writes the final 16-bit
-    /// checksum. Used by gve.
-    Zero,
 }
 
 impl TxBufHandle {
@@ -248,18 +225,13 @@ pub struct NicOps {
     pub tso_available: fn() -> bool,
     /// L4 checksum-offload-on-TX capability: `true` when the
     /// device negotiated `VIRTIO_NET_F_CSUM` (or the equivalent
-    /// on non-virtio drivers). When true, callers should stamp
-    /// the value dictated by [`Self::csum_stamp_convention`] at
-    /// the L4 checksum field and pass [`CsumOffload`] with
-    /// non-zero `start`; the device finishes the checksum
-    /// host-side. When false, callers must compute and stamp the
-    /// full checksum themselves and pass [`CsumOffload::NONE`].
+    /// on non-virtio drivers). When true, callers stamp the
+    /// pseudo-header partial sum at the L4 checksum field and pass
+    /// [`CsumOffload`] with non-zero `start`; the device finishes
+    /// the checksum host-side. When false, callers must compute
+    /// and stamp the full checksum themselves and pass
+    /// [`CsumOffload::NONE`].
     pub csum_tx_offload: fn() -> bool,
-    /// What the caller must stamp at the L4 checksum field when
-    /// `csum_tx_offload` is true. virtio uses
-    /// `PseudoHeaderPartial`; gve uses `Zero` (its hardware
-    /// builds the pseudo-header itself from the IP header).
-    pub csum_stamp_convention: fn() -> CsumStampConvention,
     /// Acquire a big-slot TX buffer (16 KiB capacity) for a TCP
     /// TSO super-segment. Returns `None` when:
     ///   * TSO isn't negotiated (no big pool allocated), OR
@@ -600,7 +572,6 @@ static NULL_OPS: NicOps = NicOps {
     submit_tx: None,
     tso_available: null_false,
     csum_tx_offload: null_false,
-    csum_stamp_convention: || CsumStampConvention::PseudoHeaderPartial,
     acquire_tx_tso_buf: None,
     submit_tx_tso: None,
     udp_gso_available: null_false,
