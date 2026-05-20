@@ -3616,8 +3616,8 @@ mod tests {
     }
 
     fn dev_config() -> TlsServerConfig {
-        const CERT: &[u8] = include_bytes!("../../apps/webserver/dev_certs/dev_cert.der");
-        const KEY: &[u8] = include_bytes!("../../apps/webserver/dev_certs/dev_key.der");
+        const CERT: &[u8] = include_bytes!("../../../../apps/webserver/dev_certs/dev_cert.der");
+        const KEY: &[u8] = include_bytes!("../../../../apps/webserver/dev_certs/dev_key.der");
         TlsServerConfig::from_dev_cert(CERT, KEY).expect("dev cert load")
     }
 
