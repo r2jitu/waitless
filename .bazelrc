@@ -1,6 +1,19 @@
 # ── Global ────────────────────────────────────────────────────────────────────
 build --action_env=PATH
 
+# Always run clippy as part of `bazel build`. Each first-party rust
+# target gets a clippy action attached via aspect; `+clippy_checks`
+# adds clippy's outputs to the requested output groups without
+# dropping the default rlib / bin outputs. Cached on rlib-input
+# hash — steady-state incremental cost is near zero (the clippy
+# action only re-runs when the crate's own sources change).
+#
+# Third-party (crates.io) targets imported via rules_rust's
+# crate_universe inherit `--cap-lints=allow`, so their clippy
+# warnings stay silent and don't fail our `-Dwarnings` build.
+build --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+build --output_groups=+clippy_checks
+
 # Rust compiler flags applied to all crates.
 #
 # Global `panic=abort`: the production target is a unikernel with
