@@ -8,7 +8,7 @@ package(default_visibility = ["//visibility:public"])
 # / `NicError` etc. so apps see them under `uni::net`. On `os:none`
 # also pulls the full L2-L4 stack.
 rust_library(
-    name = "net",
+    name = "uni-net",
     srcs = [
         "src/error.rs",
         "src/lib.rs",

@@ -81,7 +81,7 @@ rust_library(
         "//crates/crypto/aes-gcm",
         "//crates/proto/http",
         "//crates/runtime/worker",
-        "//crates/uni/uni",
+        "//crates/uni",
         "//crates/util/iobuf",
         "@crates//:aes",
         "@crates//:aes-gcm",

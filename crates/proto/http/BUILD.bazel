@@ -19,7 +19,7 @@ rust_library(
     crate_name = "http",
     deps = [
         "//crates/runtime/worker",
-        "//crates/uni/uni",
+        "//crates/uni",
         "//crates/util/iobuf",
     ],
 )

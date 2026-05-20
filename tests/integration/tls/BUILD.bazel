@@ -15,7 +15,7 @@ rust_library(
     # the whole test runs natively too.
     deps = [
         "//crates/proto/tls",
-        "//crates/uni/uni",
+        "//crates/uni",
     ],
 )
 

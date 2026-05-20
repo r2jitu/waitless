@@ -11,8 +11,8 @@ rust_library(
         "src/rng.rs",
     ],
     crate_root = "src/lib.rs",
-    proc_macro_deps = ["//crates/uni/macros:uni_macros"],
-    # `//uni-net` re-exported as `uni::net`. `//crates/uni/backend` is the
+    proc_macro_deps = ["//crates/uni-macros:uni_macros"],
+    # `//uni-net` re-exported as `uni::net`. `//crates/uni-backend` is the
     # cfg-selected platform adapter (bare-metal or POSIX). `//kernel`
     # stays as a bare-metal-only direct dep because `uni/lib.rs`
     # itself calls into it for `cpu_id`, `eventloop::set_on_shutdown`,
@@ -20,8 +20,8 @@ rust_library(
     deps = [
         "//crates/runtime/executor",
         "//crates/runtime/worker",
-        "//crates/uni/backend",
-        "//crates/uni/net",
+        "//crates/uni-backend",
+        "//crates/uni-net",
     ] + select({
         "//bazel/platforms:native": [],
         "//conditions:default": ["//crates/kernel/bare"],

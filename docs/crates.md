@@ -32,7 +32,7 @@ crates/
                   ethernet_send, arp, ipv4, ipv6, icmpv6, ndp, mac_resolve,
                   ipv6_send, classify, udp, dhcp
   proto/       tls/  quic/  http/  http3/
-  uni/         uni/  macros/  net/  backend/
+  uni/  uni-macros/  uni-net/  uni-backend/   (flat — `uni` is a facade with 3 satellites, not a domain)
 ```
 
 (`tests/integration/` at repo root holds the boot-and-verify
@@ -41,8 +41,14 @@ to live alongside the real apps under `apps/`.)
 
 ## Naming rules
 
-1. **Directory tree.** `crates/<domain>/<name>/`, kebab-case throughout.
-   Domains: `util crypto runtime kernel boot drivers net proto uni`.
+1. **Directory tree.** Crates live at `crates/<domain>/<name>/` for
+   most crates. Domains: `util crypto runtime kernel boot drivers net
+   proto`. The `uni` facade plus its three satellites
+   (`uni-macros`, `uni-net`, `uni-backend`) live flat at the top of
+   `crates/` rather than under a `uni/` domain folder — they're not a
+   domain of peer crates, they're one facade crate plus three crates
+   that exist solely to support it (proc-macro pairing, cfg-gated net
+   re-export, cfg-gated platform impl). Kebab-case throughout.
 2. **Bazel target.** Default target = directory name. `//crates/net/tcp`
    is shorthand for `//crates/net/tcp:tcp`. No hyphenated explicit
    target names — the target's `name = "..."` always matches its
@@ -51,13 +57,13 @@ to live alongside the real apps under `apps/`.)
    `gve`). Qualify with one domain word only when the bare name would
    shadow `std`/`core` or collide with a common external crate. Current
    qualified names: `net_types`, `net_checksum`, `net_from_bytes`,
-   `net_classify`, `kernel_core`, `uni_net_stack`. Carve-outs under
-   `crates/uni/`: `uni`, `uni_macros`, `uni_net` (the facade family).
-   Two further carve-outs for external/internal collisions:
-   `uni_aes_gcm` (RustCrypto's `aes-gcm` crate is pulled in via
-   `@crates//:aes-gcm`). The kernel's os:none half is `kernel_bare`,
-   chosen for sibling symmetry with `kernel_core` (a bare `kernel`
-   name would be too overloaded).
+   `net_classify`, `kernel_core`, `uni_net_stack`. The uni facade
+   family keeps the `uni_` prefix as a meaningful "satellite of uni"
+   marker: `uni`, `uni_macros`, `uni_net`. Two further carve-outs
+   for external/internal collisions: `uni_aes_gcm` (RustCrypto's
+   `aes-gcm` crate is pulled in via `@crates//:aes-gcm`). The kernel's
+   os:none half is `kernel_bare`, chosen for sibling symmetry with
+   `kernel_core` (a bare `kernel` name would be too overloaded).
 4. **Cargo package name** (publishable leaves only, if/when published):
    chosen at publish time for crates.io availability. Internal name is
    unchanged. See [§Publishing](#publishing).

@@ -28,7 +28,7 @@ rust_library(
         "//crates/proto/http3",
         "//crates/proto/quic",
         "//crates/proto/tls",
-        "//crates/uni/uni",
+        "//crates/uni",
     ],
 )
 

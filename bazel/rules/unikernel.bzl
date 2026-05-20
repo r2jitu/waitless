@@ -430,7 +430,7 @@ def unikernel_binary(
         rust_binary(
             name = name + "_bin",
             srcs = ["//bazel/rules:native_main.rs"],
-            deps = [app, "//crates/uni/uni"],
+            deps = [app, "//crates/uni"],
             rustc_flags = select({
                 "@platforms//os:macos": ["-C", "link-arg=-lSystem"],
                 # Linux musl: static binary, no external sysroot needed.
