@@ -2,7 +2,7 @@
 //
 // Counterpart to `net/ipv4.rs`, but pure wire-format: no kernel
 // or driver dependency, no calls into Ethernet send. The umbrella
-// crate (`//net:net`) wires this to `ethernet_send` + the NDP
+// crate (`//crates/net/stack`) wires this to `ethernet_send` + the NDP
 // MAC resolver. Splitting that way keeps `ipv6.rs` host-testable
 // without dragging in `os:none`-only deps.
 //

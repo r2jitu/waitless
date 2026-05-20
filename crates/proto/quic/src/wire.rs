@@ -20,7 +20,7 @@
 //   negotiation packets, no Retry handling.
 
 // (no-std declaration is in lib.rs after the merger from
-// //net:quic_wire into //uni-quic.)
+// //crates/net:quic_wire into //crates/proto/quic.)
 
 // ============================================================================
 // Constants — RFC 9000 §17

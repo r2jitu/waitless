@@ -1,6 +1,6 @@
-// uni-http3/src/diag.rs — observability for the HTTP/3 server.
+// crates/proto/http3/src/diag.rs — observability for the HTTP/3 server.
 //
-// Mirrors the shape of `uni-quic::diag`: typed atomic counters
+// Mirrors the shape of `quic::diag`: typed atomic counters
 // for every drop reason and lifecycle event, plus `h3_drop!` /
 // `h3_event!` macros gated by a runtime log level. Default level
 // is `Drops`; override via the `h3.log=silent|drops|events` token

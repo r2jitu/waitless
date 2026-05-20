@@ -1,4 +1,4 @@
-// uni-tls/src/quic/inbox.rs — per-connection async queue.
+// crates/proto/tls/src/quic/inbox.rs — per-connection async queue.
 //
 // The QUIC server's listener task receives every UDP datagram
 // arriving at the bound port and, after a quick header parse to

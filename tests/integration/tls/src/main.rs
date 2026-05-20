@@ -1,13 +1,13 @@
 // tests/integration/tls — TLS 1.3 primitives smoke test.
 //
-// Boots the unikernel, runs the full //uni-tls key schedule and the
-// //uni-tls AEAD through a known-answer round-trip, and prints
+// Boots the unikernel, runs the full //crates/proto/tls key schedule and the
+// //crates/proto/tls AEAD through a known-answer round-trip, and prints
 // PASS/FAIL for each stage on the serial console. test_tls.sh parses
 // serial for "TLS TESTS: ALL PASSED" (or any FAIL) and reports test
 // status accordingly.
 //
-// This is the integration test for everything we ship under uni-tls.
-// The host unit tests on //uni-tls cover the AES-128-GCM AEAD
+// This is the integration test for everything we ship under tls.
+// The host unit tests on //crates/proto/tls cover the AES-128-GCM AEAD
 // against NIST SP 800-38D vectors; this test proves the TLS 1.3 key
 // schedule + X25519 round-trip + record AEAD actually run on bare
 // metal and produce self-consistent results.
@@ -133,7 +133,7 @@ fn init() {
     // against the NIST SP 800-38D Test Case 4 known-answer vector so we
     // catch that case. If this fails but the round-trip passes, the
     // AES-NI / PCLMULQDQ / GHASH paths are producing self-consistent
-    // but incorrect output. Same vector that uni-tls's boot-time KAT
+    // but incorrect output. Same vector that tls's boot-time KAT
     // pins against, just exercised here as a unikernel-side test too.
     {
         let key: [u8; 16] = [

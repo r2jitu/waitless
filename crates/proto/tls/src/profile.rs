@@ -7,7 +7,7 @@
 // human-readable dump that the webserver exposes at `/tls_profile`.
 //
 // The cycle-counter helpers are inlined directly here so this crate
-// doesn't need to depend on `//kernel` — that lets the same state
+// doesn't need to depend on `//crates/kernel/bare` — that lets the same state
 // machine compile for native host builds (used by the POSIX
 // `webserver_native` binary for bench comparisons against the
 // unikernel) without dragging in bare-metal kernel modules.

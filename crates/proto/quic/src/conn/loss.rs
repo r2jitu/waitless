@@ -1,4 +1,4 @@
-// uni-quic/src/conn/loss.rs — RFC 9002 loss detection + RTT
+// crates/proto/quic/src/conn/loss.rs — RFC 9002 loss detection + RTT
 // estimation + PTO timer.
 //
 // `process_ack` is the inbound side: for each ACK, drop the

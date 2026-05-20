@@ -2,7 +2,7 @@
 //
 // The send half of what used to be `ethernet` — split out so
 // `ethernet` itself is a pure, host-testable leaf. Depends on
-// `ethernet` (the header builder + MAC cache) and `//drivers:nic`
+// `ethernet` (the header builder + MAC cache) and `//crates/drivers/nic`
 // (the host-buildable NIC dispatch). `arp` / `ipv6_send` link against
 // this for `ethernet_send`; boot calls `init_mac`.
 

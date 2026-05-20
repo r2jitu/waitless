@@ -2,16 +2,16 @@
 //
 // `now_ms()` is the monotonic-millisecond time source for the
 // host-buildable crates that sit below `//uni` and so cannot reach a
-// `//kernel` clock directly — chiefly `tcp`, whose RFC 6298
+// `//crates/kernel/bare` clock directly — chiefly `tcp`, whose RFC 6298
 // retransmission timer needs a coarse wall-clock.
 //
 // It mirrors the `cpu_id` / `rng::fill_bytes` link seams:
 //
 //   * `target_os = "none"` → resolves, via the `extern "Rust"` symbol
-//     `__kernel_bare_now_ms`, to `//kernel`'s real cycle-counter clock
+//     `__kernel_bare_now_ms`, to `//crates/kernel/bare`'s real cycle-counter clock
 //     (`time::since_boot_us() / 1000`). `kernel_core` is the lower
-//     crate and cannot call up into `//kernel`, so it declares the
-//     symbol and `//kernel` defines it.
+//     crate and cannot call up into `//crates/kernel/bare`, so it declares the
+//     symbol and `//crates/kernel/bare` defines it.
 //
 //   * host build → a process-global, **test-controllable** counter.
 //     This is the deliberate difference from the other two seams: the
@@ -38,8 +38,8 @@ pub fn now_ms() -> u64 {
     unsafe extern "Rust" {
         fn __kernel_bare_now_ms() -> u64;
     }
-    // SAFETY: `//kernel` defines this `#[no_mangle]` symbol, and every
-    // `os:none` binary that links `kernel_core` also links `//kernel`
+    // SAFETY: `//crates/kernel/bare` defines this `#[no_mangle]` symbol, and every
+    // `os:none` binary that links `kernel_core` also links `//crates/kernel/bare`
     // (it is the foundational crate).
     unsafe { __kernel_bare_now_ms() }
 }

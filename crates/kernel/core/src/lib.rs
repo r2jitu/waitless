@@ -4,8 +4,8 @@
 // (percpu), synchronisation primitives (sync), the in-memory
 // diagnostic buffer (diag), and the plain boot-time data types —
 // none of which touch hardware or arch-specific code. Split out of
-// `//kernel` (which stays `os:none` for the MMU / APIC / boot code)
-// so this logic is unit-testable on the host. `//kernel` re-exports
+// `//crates/kernel/bare` (which stays `os:none` for the MMU / APIC / boot code)
+// so this logic is unit-testable on the host. `//crates/kernel/bare` re-exports
 // every module here, so consumers using `kernel_bare::{percpu, sync,
 // rx_inbox, ...}` are unaffected by the split.
 
@@ -29,9 +29,9 @@ pub mod types;
 /// Current CPU id.
 ///
 /// On the bare-metal target this resolves, via a link seam, to
-/// `//kernel`'s arch implementation (`__kernel_bare_cpu_id`);
+/// `//crates/kernel/bare`'s arch implementation (`__kernel_bare_cpu_id`);
 /// `kernel_core` is the lower crate and cannot call up into the
-/// arch modules, so it declares the symbol and `//kernel` defines
+/// arch modules, so it declares the symbol and `//crates/kernel/bare` defines
 /// it. On a host build there is one logical CPU, so it is `0` —
 /// which is what makes `tcp` (a `cpu_id` caller) host-testable.
 ///
@@ -46,9 +46,9 @@ pub fn cpu_id() -> u32 {
         unsafe extern "Rust" {
             fn __kernel_bare_cpu_id() -> u32;
         }
-        // SAFETY: `//kernel` defines this `#[no_mangle]` symbol, and
+        // SAFETY: `//crates/kernel/bare` defines this `#[no_mangle]` symbol, and
         // every `os:none` binary that links `kernel_core` also links
-        // `//kernel` (it is the foundational crate).
+        // `//crates/kernel/bare` (it is the foundational crate).
         unsafe { __kernel_bare_cpu_id() }
     }
     #[cfg(not(target_os = "none"))]

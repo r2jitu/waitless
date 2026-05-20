@@ -1,4 +1,4 @@
-// uni-worker/src/lib.rs — Cross-platform per-worker primitives.
+// crates/runtime/worker/src/lib.rs — Cross-platform per-worker primitives.
 //
 // Three types, picked deliberately so the names tell the whole story:
 //

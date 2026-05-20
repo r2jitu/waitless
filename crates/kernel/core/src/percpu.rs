@@ -64,7 +64,7 @@ pub fn rx_node_pool() -> &'static RxNodePool<RxChain, RX_NODE_POOL_CAP> {
     &RX_NODE_POOL
 }
 
-// `CurrentWorker` + `PerWorker<T>` (runtime-sized) live in `//uni-worker`
+// `CurrentWorker` + `PerWorker<T>` (runtime-sized) live in `//crates/runtime/worker`
 // so native can share them. Kept under the `kernel_bare::percpu` path via
 // re-export so existing callers don't shift.
 pub use worker::{CurrentWorker, PerWorker};
@@ -93,7 +93,7 @@ fn noop(_: usize) {}
 /// to this struct. Fields at known offsets can be read directly via
 /// the TLS register without indirection.
 ///
-/// "Core" here is the bare-metal name for what `uni-worker` calls a
+/// "Core" here is the bare-metal name for what `worker` calls a
 /// "worker"; this struct lives inside `PerWorker<PerCore>` and is the
 /// kernel's concrete per-worker state aggregate, not a separate
 /// abstraction.
@@ -225,7 +225,7 @@ static AP_POLL_FN: crate::sync::AtomicFn<fn(u32) -> bool> = crate::sync::AtomicF
 /// Initialise per-core state for `count` cores. BSP-only, single-
 /// threaded, before any AP starts and before any `get()`. Publishes
 /// `count` via `set_num_workers` so every `PerWorker<T>` (here, in
-/// `uni-runtime`, in `net::*`) sizes itself the same.
+/// `executor`, in `net::*`) sizes itself the same.
 pub unsafe fn init(count: u32) {
     worker::set_num_workers(count);
     CORES.init(count, |i| PerCore::new(i));
@@ -253,7 +253,7 @@ pub fn num_cores() -> u32 {
 
 // `CurrentWorker` used to expose a `.percore()` convenience that walked
 // the kernel-specific `CORES` array; now that the token is shared with
-// native (which has no `PerCore`) it lives in `uni-worker`. This free
+// native (which has no `PerCore`) it lives in `worker`. This free
 // function fills the same role for bare-metal callers.
 #[inline(always)]
 pub fn percore(cc: &CurrentWorker) -> &'static PerCore {

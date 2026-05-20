@@ -1,4 +1,4 @@
-// uni-tls/aes_gcm_fast.rs — 8-block batched, single-pass AES-128-GCM
+// crates/proto/tls/aes_gcm_fast.rs — 8-block batched, single-pass AES-128-GCM
 // with deferred-reduction GHASH.
 //
 // **Goal**: drop TLS encrypt cycles/byte from ~22 (upstream

@@ -1,4 +1,4 @@
-// uni-aes-gcm — hand-rolled AES-128-GCM with batched + stitched
+// crates/crypto/aes-gcm — hand-rolled AES-128-GCM with batched + stitched
 // AES-CTR + GHASH.
 //
 // **Self-contained**: depends only on `aes` (for the AES-128

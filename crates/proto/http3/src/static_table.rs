@@ -1,4 +1,4 @@
-// uni-http3/src/static_table.rs — QPACK static table (RFC 9204 Appendix A).
+// crates/proto/http3/src/static_table.rs — QPACK static table (RFC 9204 Appendix A).
 //
 // 99 fixed `(name, value)` entries. The QPACK encoder/decoder
 // references entries by index; the entries themselves are

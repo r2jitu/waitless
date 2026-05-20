@@ -231,7 +231,7 @@ pub fn seal_ticket(pt: &TicketPlaintext, out: &mut [u8]) -> Option<usize> {
 /// - the ticket is older than `max_age_cycles`.
 ///
 /// `now_cycles` and `max_age_cycles` are caller-supplied so this
-/// module doesn't depend on `kernel::time` (it lives in `uni-tls`,
+/// module doesn't depend on `kernel::time` (it lives in `tls`,
 /// which compiles on native too). Caller derives `max_age_cycles`
 /// from a wall-clockish duration via `cycles_per_us`.
 pub fn open_ticket(sealed: &[u8], now_cycles: u64, max_age_cycles: u64) -> Option<TicketPlaintext> {

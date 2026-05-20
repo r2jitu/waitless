@@ -1,4 +1,4 @@
-// uni-quic/src/frame.rs — RFC 9000 §19 frame codec (sans-io).
+// crates/proto/quic/src/frame.rs — RFC 9000 §19 frame codec (sans-io).
 //
 // Parses and encodes every frame the v1 server needs to interop
 // with curl/quinn/quiche over a 1-RTT HTTP/3 connection:

@@ -1,4 +1,4 @@
-// uni-iobuf — IOBuf primitive for the network stack.
+// crates/util/iobuf — IOBuf primitive for the network stack.
 //
 // Inspired by folly::IOBuf: a chain of byte segments with reserved
 // space at each end ("headroom" / "tailroom") so layers below can

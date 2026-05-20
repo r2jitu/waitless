@@ -262,8 +262,8 @@ pub fn since_boot_us() -> u64 {
 // `kernel_core::clock::now_ms()` resolves, on the bare-metal target,
 // to this `#[no_mangle]` symbol — mirroring `__kernel_bare_cpu_id` and
 // `__kernel_bare_rng_fill`. `kernel_core` is the lower crate and cannot
-// call up into `//kernel`, so it declares the `extern "Rust"` symbol
-// and `//kernel` defines it here. This is what lets `tcp`'s
+// call up into `//crates/kernel/bare`, so it declares the `extern "Rust"` symbol
+// and `//crates/kernel/bare` defines it here. This is what lets `tcp`'s
 // RFC 6298 retransmission timer read a monotonic millisecond clock on
 // `os:none` while resolving to a test-controllable mock under host
 // unit tests.

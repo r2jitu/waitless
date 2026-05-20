@@ -605,7 +605,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
         // SMP and NIC init so `num_cpus` and `nics` are final.
         publish_boot_info(net_ok);
 
-        // Register the bare-metal async runtime with `//uni-runtime`.
+        // Register the bare-metal async runtime with `//crates/runtime/executor`.
         // Must happen before `uni_init` so the app can `spawn` / `sleep_us`.
         kernel_bare::runtime::init();
         klog!(

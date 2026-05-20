@@ -1,4 +1,4 @@
-// uni-runtime/src/net.rs — UDP reactor with per-worker inboxes.
+// crates/runtime/executor/src/net.rs — UDP reactor with per-worker inboxes.
 //
 // ## Model
 //
@@ -162,7 +162,7 @@ pub(crate) fn install_worker_task(
 // `LaunchTable` uses chunked lazy allocation, so the upfront cost
 // is just the outer pointer array (8 KiB) regardless of how many
 // listeners the app eventually creates. See
-// `uni-runtime/src/launcher.rs` for the ownership / tombstone /
+// `executor/src/launcher.rs` for the ownership / tombstone /
 // monotonic-counter invariants that back the table.
 
 static NET_LAUNCHERS: crate::launcher::LaunchTable = crate::launcher::LaunchTable::new();

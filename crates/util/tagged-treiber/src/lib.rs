@@ -1,4 +1,4 @@
-// util/tagged_treiber/lib.rs — the shared tagged-pointer Treiber
+// crates/util/tagged-treiber/lib.rs — the shared tagged-pointer Treiber
 // free-list core.
 //
 // A `TaggedTreiberStack` is a lock-free LIFO of `u32` slot indices —
@@ -10,8 +10,8 @@
 // one audited copy they both delegate to.
 //
 // Kept zero-dep and `core`-only — like `util/atomic_fn` — so the
-// `rust_test`s that pull it in (`//uni-iobuf:iobuf_test`,
-// `//kernel:rx_inbox_test`) don't inherit `//kernel`'s RustCrypto /
+// `rust_test`s that pull it in (`//crates/util/iobuf:iobuf_test`,
+// `//crates/kernel/bare:rx_inbox_test`) don't inherit `//crates/kernel/bare`'s RustCrypto /
 // talc / `panic=abort` dependency chain.
 //
 // ── What the stack is ───────────────────────────────────────────

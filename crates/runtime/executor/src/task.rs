@@ -1,4 +1,4 @@
-// uni-runtime/src/task.rs — Per-worker task arena + spawn/tick/abort.
+// crates/runtime/executor/src/task.rs — Per-worker task arena + spawn/tick/abort.
 //
 // Each worker owns one `TaskArena` (in the `ARENAS` PerWorker), which
 // holds `TASKS_PER_WORKER` `TaskSlot`s plus a `ready_bits: AtomicU64`.

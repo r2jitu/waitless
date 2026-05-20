@@ -219,8 +219,8 @@ pub fn fill_bytes(dest: &mut [u8]) {
 //
 // `kernel_core::rng::fill_bytes()` resolves, on the bare-metal target,
 // to this `#[no_mangle]` symbol. `kernel_core` is the lower crate and
-// cannot call up into `//kernel`, so it declares the `extern "Rust"`
-// symbol and `//kernel` defines it here — mirroring `__kernel_bare_cpu_id`.
+// cannot call up into `//crates/kernel/bare`, so it declares the `extern "Rust"`
+// symbol and `//crates/kernel/bare` defines it here — mirroring `__kernel_bare_cpu_id`.
 // This is what lets RNG-dependent host-buildable crates (`tcp`'s
 // TCP initial-sequence-number selection) reach the real generator on
 // `os:none` while resolving to a deterministic stream under host
@@ -244,7 +244,7 @@ pub extern "Rust" fn __kernel_bare_rng_fill(dest: &mut [u8]) {
 // Because the macro emits a symbol with a fixed name, the kernel
 // crate is the only place that can register it (otherwise we'd get
 // duplicate-symbol link errors). Every unikernel binary depends on
-// `//kernel`, so this registration is always linked in.
+// `//crates/kernel/bare`, so this registration is always linked in.
 
 fn getrandom_callback(buf: &mut [u8]) -> Result<(), getrandom::Error> {
     fill_bytes(buf);

@@ -1,7 +1,7 @@
 // net/tls_record.rs — TLS 1.3 record layer.
 //
 // Wraps plaintext in `TLSCiphertext` records (RFC 8446 §5) using an
-// AEAD from `//net:tls_crypto`. Sans-io: the caller owns input/output
+// AEAD from `//crates/net:tls_crypto`. Sans-io: the caller owns input/output
 // byte buffers; this module is pure serialisation + cryptography.
 //
 // Wire format (§5.2):
@@ -29,8 +29,8 @@
 // || length) serves as AAD for the AEAD, per §5.2.
 
 // (no-std declaration lives in lib.rs after the merger. The former
-// //net:tls crate is now this crate's sibling `schedule` module;
-// //net:tls_crypto is now `aead`.)
+// //crates/net:tls crate is now this crate's sibling `schedule` module;
+// //crates/net:tls_crypto is now `aead`.)
 
 use crate::aead as tls_crypto;
 use crate::schedule as tls;

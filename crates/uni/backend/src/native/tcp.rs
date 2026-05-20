@@ -1,4 +1,4 @@
-// uni-backend/src/native/tcp.rs — POSIX TCP backend.
+// crates/uni/backend/src/native/tcp.rs — POSIX TCP backend.
 //
 // One nonblocking listen fd per port, registered in every worker's
 // kqueue/epoll. When a SYN arrives, whichever worker's event queue

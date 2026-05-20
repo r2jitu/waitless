@@ -1,4 +1,4 @@
-// uni-iobuf/src/pool.rs — fixed-size slab pool for IOBuf RX recycling.
+// crates/util/iobuf/src/pool.rs — fixed-size slab pool for IOBuf RX recycling.
 //
 // `IOBufPool` hands out `IOBuf`s backed by pre-allocated, fixed-size
 // heap slabs. Each slab is sized for one MTU frame plus whatever

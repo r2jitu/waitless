@@ -1,4 +1,4 @@
-// uni-runtime/src/sleep.rs — Per-worker timer wheel + `Sleep` future.
+// crates/runtime/executor/src/sleep.rs — Per-worker timer wheel + `Sleep` future.
 //
 // Owns the `WHEELS` static (one `TimerWheel` per worker) and the
 // `Sleep` future that schedules into it. Task-arena code in

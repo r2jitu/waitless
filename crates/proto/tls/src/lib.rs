@@ -1,10 +1,10 @@
-// uni-tls — TLS 1.3 protocol stack for HTTPS-over-TCP.
+// crates/proto/tls — TLS 1.3 protocol stack for HTTPS-over-TCP.
 //
 // Owns the full TLS 1.3 implementation: sans-io primitives that
 // were previously split across `//net/tls{,_crypto,_handshake,_record}`,
 // plus the TCP-specific record-layer driver and the per-connection
-// server state machine. After the //net→//uni-tls merger this is
-// one cohesive crate; `//uni-quic` reuses the sans-io modules
+// server state machine. After the //net→//crates/proto/tls merger this is
+// one cohesive crate; `//crates/proto/quic` reuses the sans-io modules
 // (`schedule`, `aead`, `handshake`) but skips `record` (which is
 // TCP-specific) and substitutes its own CRYPTO-frame I/O.
 //
@@ -15,7 +15,7 @@
 //                  per-worker record scratch
 //   schedule.rs  TLS 1.3 key schedule, transcript, X25519, HKDF math
 //   aead.rs      AES-128-GCM wrapper — the single AEAD shared by
-//                  TLS-over-TCP record protection here AND //uni-quic
+//                  TLS-over-TCP record protection here AND //crates/proto/quic
 //                  packet protection (see RFC 9001 §5.3)
 //   handshake.rs ClientHello parser, server-flight builders,
 //                  signature-content shaper, finished helpers
@@ -35,8 +35,8 @@
 //   * `TlsError`, `ListenError` — failure modes.
 //
 // Sans-io modules (`schedule`, `aead`, `handshake`) are also `pub`
-// so `//uni-quic` can reach into them without going through the
-// TCP-server wrappers. Apps consuming `uni-tls` for HTTPS only
+// so `//crates/proto/quic` can reach into them without going through the
+// TCP-server wrappers. Apps consuming `tls` for HTTPS only
 // don't import them directly — the public API hides them behind
 // `listen`.
 
@@ -57,8 +57,8 @@ use worker::{CurrentWorker, WorkerLocal};
 
 use http::{IOBuf, IOBufChain};
 
-// Sans-io TLS primitives (formerly //net:tls{,_crypto,_handshake,_record}).
-// Pub because //uni-quic reaches into `schedule`, `aead`, `handshake`
+// Sans-io TLS primitives (formerly //crates/net:tls{,_crypto,_handshake,_record}).
+// Pub because //crates/proto/quic reaches into `schedule`, `aead`, `handshake`
 // for the TLS-handshake-over-CRYPTO-frames driver. `record` stays
 // pub for symmetry; it's TCP-only but the wider audience doesn't
 // pay any cost — LTO drops it from QUIC binaries.
@@ -67,11 +67,11 @@ pub mod handshake;
 pub mod record;
 pub mod schedule;
 
-// TLS-over-TCP server state machine. (`//uni-quic` lives in its
+// TLS-over-TCP server state machine. (`//crates/proto/quic` lives in its
 // own crate now and depends on this one for the sans-io TLS bits.)
 pub mod server;
 
-// Submodules of the server stack. `pub` so `//uni-quic` can reuse
+// Submodules of the server stack. `pub` so `//crates/proto/quic` can reuse
 // `keys::{ct_eq_32, derive_finished_key, hmac_sha256}` (RFC 8446
 // §4.4.4 finished-key + helpers) and `profile` for the shared
 // per-stage timing accumulator.

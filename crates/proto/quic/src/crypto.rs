@@ -1,7 +1,7 @@
-// uni-quic/crypto.rs — RFC 9001 packet protection.
+// crates/proto/quic/crypto.rs — RFC 9001 packet protection.
 //
 // Initial-keys derivation (§5.2), AEAD packet protection (§5.3),
-// and header protection (§5.4). Reuses `//uni-tls`'s
+// and header protection (§5.4). Reuses `//crates/proto/tls`'s
 // HKDF-Expand-Label. After the AES-128-GCM TLS migration,
 // EVERY QUIC packet stage uses the same AEAD primitive
 // (AES-128-GCM + AES-128-ECB-based HP mask) — Initial,
@@ -19,7 +19,7 @@
 // QUIC's strictly-monotonic packet numbers within each space.
 
 // (no-std declaration is in lib.rs. The TLS sans-io modules
-// (`schedule`, `aead`) live in the //uni-tls crate; this module
+// (`schedule`, `aead`) live in the //crates/proto/tls crate; this module
 // pulls in `hkdf_expand_label` from there to share the audited
 // TLS 1.3 primitives.)
 

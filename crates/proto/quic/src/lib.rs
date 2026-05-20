@@ -1,11 +1,11 @@
-// uni-quic — QUIC v1 protocol stack (RFC 9000 + RFC 9001).
+// crates/proto/quic — QUIC v1 protocol stack (RFC 9000 + RFC 9001).
 //
 // Owns the FULL QUIC implementation: sans-io wire-format primitives
 // (`wire`, `frame`, `crypto`), the TLS 1.3 handshake driver wrapped
 // over CRYPTO frames (`tls`), the per-connection state machine
 // (`conn`), per-connection async inbox (`inbox`), and the UDP
 // endpoint that routes datagrams to conn tasks (`endpoint`).
-// Depends on `//uni-tls` for the sans-io TLS bits (`schedule`,
+// Depends on `//crates/proto/tls` for the sans-io TLS bits (`schedule`,
 // `aead`, `handshake`) plus the cert / signing-key types reused
 // across both protocols.
 //
@@ -20,7 +20,7 @@
 //                  seal/open (AES-128-GCM + ChaCha20-Poly1305),
 //                  header protection masks.
 //   tls.rs       TLS 1.3 handshake driver in CRYPTO-frame I/O mode
-//                  (`QuicTls`). Reuses every primitive in `//uni-tls`;
+//                  (`QuicTls`). Reuses every primitive in `//crates/proto/tls`;
 //                  only the wrapping changes from TLS records to
 //                  per-level byte queues.
 //   conn.rs      Per-connection state machine. Owns the keys for

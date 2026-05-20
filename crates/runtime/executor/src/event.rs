@@ -1,4 +1,4 @@
-// uni-runtime/src/event.rs — waker-driven async event flag.
+// crates/runtime/executor/src/event.rs — waker-driven async event flag.
 //
 // Shape: a manual-reset one-bit flag plus a single parked waker.
 // Producer calls `set()` to flip the bit and wake the waiter (on

@@ -1,4 +1,4 @@
-// uni-quic/src/transport_params.rs — RFC 9000 §18 transport parameters.
+// crates/proto/quic/src/transport_params.rs — RFC 9000 §18 transport parameters.
 //
 // Endpoints exchange their flow-control / connection-level limits
 // during the TLS handshake via the `quic_transport_parameters`

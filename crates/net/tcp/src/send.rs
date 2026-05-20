@@ -45,7 +45,7 @@ const FRAME_BUF_LEN: usize = ETH_HDR_LEN + IPV6_HDR_LEN + TCP_HDR_LEN + MSS_V4;
 /// hand to `submit_tx_tso` in one frame. Sized to cover one TLS
 /// 1.3 record (16384 plaintext + 22-byte envelope) plus the
 /// L2/L3/L4 headers. The driver's TX-pool slots are sized to
-/// match (`MAX_ETH_FRAME` in uni-driver-virtio-net).
+/// match (`MAX_ETH_FRAME` in virtio_net).
 const TSO_FRAME_BUF_LEN: usize = ETH_HDR_LEN + IPV6_HDR_LEN + TCP_HDR_LEN + 16384 + 24;
 
 /// Compute the TCP-payload offset within a frame buffer for `local_ip`'s family.

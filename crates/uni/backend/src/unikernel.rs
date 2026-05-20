@@ -1,4 +1,4 @@
-// uni-backend/src/unikernel.rs — Bare-metal dispatch.
+// crates/uni/backend/src/unikernel.rs — Bare-metal dispatch.
 
 use kernel_bare::serial;
 
@@ -66,7 +66,7 @@ pub use kernel_bare::percpu::num_cores as num_workers;
 
 /// Per-core event-loop stats snapshot. Tuple form so the cross-
 /// boundary type is opaque (the bare struct lives in the kernel
-/// crate, not exported across `uni-backend`). Fields, in order:
+/// crate, not exported across `backend`). Fields, in order:
 ///   * `loops`         — total event-loop iterations on this core
 ///   * `poll_work`     — iterations where the net-poll callback returned true
 ///   * `drain_work`    — iterations where the net-drain callback returned true

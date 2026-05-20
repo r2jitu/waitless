@@ -1,7 +1,7 @@
 // net/types.rs — Network types, byte order, and config.
 //
 // This module has no dependencies on other net/ modules or external crates.
-// It can be compiled as a standalone crate (//net:types).
+// It can be compiled as a standalone crate (//crates/net:types).
 
 #![cfg_attr(not(test), no_std)]
 

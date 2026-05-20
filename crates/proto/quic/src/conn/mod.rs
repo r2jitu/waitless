@@ -1,4 +1,4 @@
-// uni-quic/src/conn/mod.rs — QUIC server-side connection state
+// crates/proto/quic/src/conn/mod.rs — QUIC server-side connection state
 // machine (RFC 9000 + RFC 9001).
 //
 // One `Connection` per client. Holds: per-direction packet

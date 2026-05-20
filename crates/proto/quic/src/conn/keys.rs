@@ -1,4 +1,4 @@
-// uni-quic/src/conn/keys.rs — per-direction packet protection
+// crates/proto/quic/src/conn/keys.rs — per-direction packet protection
 // cipher cache + the `Connection` hooks that derive / rotate
 // those keys.
 //

@@ -271,7 +271,7 @@ impl TlsServer {
             // ERR_SSL_PROTOCOL_ERROR. We don't speak HTTP/2, so
             // `http/1.1` is the only protocol we select on the
             // TCP/TLS path. (HTTP/3 is selected separately by
-            // `uni-quic`'s own EncryptedExtensions builder.)
+            // `quic`'s own EncryptedExtensions builder.)
             if let Some(alpn_list) = ch.alpn_protocol_list {
                 for name in iter_alpn(alpn_list) {
                     if name == b"http/1.1" {

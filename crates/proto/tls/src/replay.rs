@@ -1,4 +1,4 @@
-// uni-tls/src/replay.rs — 0-RTT replay-protection cache.
+// crates/proto/tls/src/replay.rs — 0-RTT replay-protection cache.
 //
 // RFC 9001 §5.5 requires a server to provide protection against
 // replay of 0-RTT data. Without it an attacker can capture a

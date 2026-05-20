@@ -1,4 +1,4 @@
-// uni-worker/src/once.rs — `InitOnce<T>`: write-once cell, multi-reader.
+// crates/runtime/worker/src/once.rs — `InitOnce<T>`: write-once cell, multi-reader.
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;

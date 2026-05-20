@@ -1,4 +1,4 @@
-// uni-runtime/src/select.rs — `join`, `select`, and their macros.
+// crates/runtime/executor/src/select.rs — `join`, `select`, and their macros.
 //
 // Small `!Send`-friendly combinators over `Future`. Implemented as
 // plain futures (no executor hooks) so they work unchanged on both

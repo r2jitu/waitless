@@ -1,4 +1,4 @@
-// uni-driver-gve/src/lib.rs — Google Virtual Ethernet (gve) driver.
+// crates/drivers/gve/src/lib.rs — Google Virtual Ethernet (gve) driver.
 //
 // Naming: "gVNIC" is GCE's branding for the virtual NIC product;
 // the driver itself is `gve` (matches Linux / the upstream Google

@@ -1,4 +1,4 @@
-// uni-quic/src/diag.rs — observability for the QUIC stack.
+// crates/proto/quic/src/diag.rs — observability for the QUIC stack.
 //
 // Every place in the QUIC stack that historically said "this is bad,
 // drop the packet/conn and move on" now goes through `quic_drop!`.

@@ -2,7 +2,7 @@
 //
 // The platform entry point is a Rust-ABI symbol named `uni_init`
 // with `#[no_mangle]` so boot/entry.rs (bare-metal) and
-// uni-backend/src/native/mod.rs can resolve it at link time. Since
+// crates/uni/backend/src/native/mod.rs can resolve it at link time. Since
 // both sides are Rust and the function takes no args / returns
 // nothing, there's no point pretending this is an FFI boundary —
 // `extern "C"` is unnecessary ceremony.

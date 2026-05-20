@@ -34,8 +34,8 @@ pub mod aarch64;
 /// Arch CPU-id implementation, exported under a stable `#[no_mangle]`
 /// symbol so `kernel_core::cpu_id()`'s link seam resolves to it on
 /// the bare-metal target. `kernel_core` is the lower crate and can't
-/// reach `//kernel`'s arch modules directly, so it declares this
-/// symbol and `//kernel` defines it. Callers use `cpu_id()` (the
+/// reach `//crates/kernel/bare`'s arch modules directly, so it declares this
+/// symbol and `//crates/kernel/bare` defines it. Callers use `cpu_id()` (the
 /// re-exported `kernel_core::cpu_id`), never this directly.
 #[unsafe(no_mangle)]
 pub extern "Rust" fn __kernel_bare_cpu_id() -> u32 {

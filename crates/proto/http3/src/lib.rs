@@ -1,6 +1,6 @@
-// uni-http3 — HTTP/3 server over //uni-quic.
+// crates/proto/http3 — HTTP/3 server over //crates/proto/quic.
 //
-// Layered on top of `//uni-quic`'s QuicConn / accept_stream / recv
+// Layered on top of `//crates/proto/quic`'s QuicConn / accept_stream / recv
 // / send / close_stream API. Two concerns split by file:
 //
 //   frame.rs    RFC 9114 §7 frame types: DATA, HEADERS, SETTINGS.

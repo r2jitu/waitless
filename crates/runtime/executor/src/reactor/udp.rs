@@ -1,4 +1,4 @@
-// uni-runtime/src/net/udp.rs — UDP reactor, server (bound port)
+// crates/runtime/executor/src/net/udp.rs — UDP reactor, server (bound port)
 // + ephemeral pool + connected client.
 //
 // See `super` (`net/mod.rs`) for the shared primitives (`SpinLock`,

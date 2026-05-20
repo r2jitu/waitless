@@ -1,4 +1,4 @@
-// uni-http3/src/qpack.rs — QPACK (RFC 9204) encoder + decoder, static-only.
+// crates/proto/http3/src/qpack.rs — QPACK (RFC 9204) encoder + decoder, static-only.
 //
 // QPACK is a header compression scheme adapted from HPACK to play
 // nicely with QUIC's stream-loss model. It splits the dynamic

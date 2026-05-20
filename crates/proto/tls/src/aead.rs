@@ -1,10 +1,10 @@
-// uni-tls/aead.rs — Thin AEAD wrapper over the audited RustCrypto
+// crates/proto/tls/aead.rs — Thin AEAD wrapper over the audited RustCrypto
 // `aes-gcm` crate (TLS_AES_128_GCM_SHA256 — TLS 1.3's MTI cipher
 // suite per RFC 8446 §9.1, and the universal preference of every
 // modern client when AES-NI is available).
 //
-// Exposes a simple byte-slice `seal` / `open` API so `uni-tls`,
-// `uni-quic`, and tests don't have to deal with `generic-array`-typed
+// Exposes a simple byte-slice `seal` / `open` API so `tls`,
+// `quic`, and tests don't have to deal with `generic-array`-typed
 // `Nonce` / `Key` parameters directly.
 //
 // Why AES-128-GCM (not ChaCha20-Poly1305):

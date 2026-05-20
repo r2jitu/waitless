@@ -1,5 +1,5 @@
 // Platform abstraction: `TcpListener`, `TcpStream`, `log`, etc.
-// Dispatch goes through `//uni-backend` which cfg-selects the
+// Dispatch goes through `//crates/uni/backend` which cfg-selects the
 // unikernel or POSIX impl internally — `uni/lib.rs` stays uniform.
 
 #![no_std]

@@ -1,4 +1,4 @@
-// uni-backend/src/lib.rs — Platform adapter for `uni`.
+// crates/uni/backend/src/lib.rs — Platform adapter for `uni`.
 //
 // Single crate with two cfg-gated impls: `unikernel` (bare-metal)
 // and `native` (POSIX). Selected by `target_os`. The exported symbol
@@ -28,7 +28,7 @@ pub struct HeapStats {
 /// This type — and `gve_diag()`'s cfg-split — is what lets an
 /// application crate read the gve `/stats` counters *without*
 /// depending on the (`os:none`-only) gve driver directly. A direct
-/// app→`uni-driver-gve` dep makes the app unbuildable for native;
+/// app→`gve` dep makes the app unbuildable for native;
 /// undoing exactly that regression is why this struct exists.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GveDiag {

@@ -1,4 +1,4 @@
-// uni-http3/src/server.rs — HTTP/3 server over //uni-quic.
+// crates/proto/http3/src/server.rs — HTTP/3 server over //crates/proto/quic.
 //
 // Per QUIC connection:
 //   1. Open server-side unidirectional CONTROL stream
@@ -164,7 +164,7 @@ where
             // Drive request handling inline. We'd ideally spawn a
             // task per request, but the conn task already
             // multiplexes; doing it inline keeps lifetimes simple
-            // and matches the shape of //uni-http's handle_conn.
+            // and matches the shape of //crates/proto/http's handle_conn.
             handle_request(&conn, sid, h.as_ref(), &mut scratch).await;
         } else if sid & 0x3 == 0x2 {
             // Peer unidirectional streams — control, QPACK

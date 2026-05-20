@@ -145,7 +145,7 @@ pub fn sign_content_server_cert_verify(transcript_hash: &[u8; HASH_LEN], out: &m
 /// ```
 ///
 /// Caller is responsible for actually computing the signature (we don't
-/// want this module to depend on `p256`; that's `//uni-tls`'s job).
+/// want this module to depend on `p256`; that's `//crates/proto/tls`'s job).
 pub fn build_certificate_verify(signature: &[u8], out: &mut [u8]) -> Option<usize> {
     let total = 2 + 2 + signature.len();
     if out.len() < total || signature.len() > 0xffff {

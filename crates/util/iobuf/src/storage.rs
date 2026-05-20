@@ -1,4 +1,4 @@
-// uni-iobuf/src/storage.rs — the four per-variant storage structs.
+// crates/util/iobuf/src/storage.rs — the four per-variant storage structs.
 //
 // `IOBuf` is one type with two ownership models. Rather than inline
 // every variant's offset/len arithmetic into a match arm of every

@@ -1,7 +1,7 @@
 // net/protocol_tests.rs — Host-native unit tests for protocol parsing.
 //
 // Tests frame parsing using raw byte arrays. No driver or kernel deps needed.
-// Run: bazel test //net:protocol_tests
+// Run: bazel test //crates/net:protocol_tests
 
 // Inline byte-order helpers (avoid dep on net_types which has panic=abort)
 fn htons(h: u16) -> u16 {
@@ -182,7 +182,7 @@ fn ipv4_accepts_coalesced_super_segment_length() {
     // data.len()` (that dropped every super-segment pre-item-M); it
     // clamps the part-0 payload view to the bytes present instead.
     // This mirrors `ipv4_parse`'s post-item-M bound check —
-    // `ipv4`'s `os:none` dep chain (`//kernel`) keeps the real
+    // `ipv4`'s `os:none` dep chain (`//crates/kernel/bare`) keeps the real
     // function out of this host-native test crate.
     let frame: [u8; 24] = [
         0x45, 0x00, // version=4, IHL=5

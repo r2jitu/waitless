@@ -60,7 +60,7 @@ impl CoreStats {
 
 /// Fixed per-core stats array. Sized to match the rest of the tree's
 /// 8-core ceiling (`MAX_QUEUE_PAIRS` in the drivers, the 8-deep diag
-/// arrays in `uni-net`). Sufficient for every machine type we
+/// arrays in `uni_net`). Sufficient for every machine type we
 /// target in production today.
 pub const MAX_CORE_STATS: usize = 8;
 

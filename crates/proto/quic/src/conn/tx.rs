@@ -1,4 +1,4 @@
-// uni-quic/src/conn/tx.rs — outbound packet assembly + seal.
+// crates/proto/quic/src/conn/tx.rs — outbound packet assembly + seal.
 //
 // `flush_outbound` is the orchestrator: it coalesces an Initial,
 // Handshake, and first 1-RTT packet into a single datagram and

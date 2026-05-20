@@ -1,4 +1,4 @@
-// uni-http3/src/frame.rs — RFC 9114 §7 frame codec.
+// crates/proto/http3/src/frame.rs — RFC 9114 §7 frame codec.
 //
 // HTTP/3 frames live INSIDE QUIC streams (not packets). Each
 // frame is a `(varint type, varint length, payload)` triple,
@@ -23,7 +23,7 @@
 
 use alloc::vec::Vec;
 
-// Re-use the QUIC varint codec from //uni-quic — H3 frames use the
+// Re-use the QUIC varint codec from //crates/proto/quic — H3 frames use the
 // exact same encoding (RFC 9114 §7).
 use quic::wire::{WireError, read_varint, write_varint};
 
@@ -129,7 +129,7 @@ pub fn write_frame(ty: u64, payload: &[u8], out: &mut [u8]) -> Result<usize, Fra
 /// Append an H3 frame HEADER ([type-varint][length-varint]) to
 /// `out` without copying the body. Caller appends the body
 /// separately (typically `extend_from_slice`). This pairs with
-/// the `append_stream_header` pattern in uni-quic and lets the
+/// the `append_stream_header` pattern in quic and lets the
 /// HTTP/3 server write its response directly into one buffer
 /// rather than through tmp Vecs.
 pub fn append_frame_header(

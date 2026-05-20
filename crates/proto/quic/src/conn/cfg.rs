@@ -1,4 +1,4 @@
-// uni-quic/src/conn/cfg.rs — host-side test fixtures + the
+// crates/proto/quic/src/conn/cfg.rs — host-side test fixtures + the
 // `Connection`-level integration tests.
 //
 // Lives behind `#[cfg(test)]` so the dev-cert byte slices are

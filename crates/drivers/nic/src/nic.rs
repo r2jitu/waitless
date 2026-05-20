@@ -3,10 +3,10 @@
 //
 // Standalone host-buildable crate whose only dependency is the
 // host-buildable `nic_api` interface crate. Sibling of the
-// os:none `//drivers` (`bus`) hardware-access crate, kept
+// os:none `//crates/drivers/bus` (`bus`) hardware-access crate, kept
 // separate so the TX-side net crates that call these dispatchers
 // (`net_eth_tx`, `tcp`, …) stay host-buildable — they depend on
-// `//drivers:nic` directly, never on the os:none `//drivers`.
+// `//crates/drivers/nic` directly, never on the os:none `//crates/drivers/bus`.
 //
 // `init()` walks `linked_ethernet_drivers()`, calls the `probe` fn
 // pointer on each registration, and installs the first success into

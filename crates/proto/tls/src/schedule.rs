@@ -25,13 +25,13 @@
 //   module stops at "we have traffic keys and can seal/open records".
 
 // (no-std + `extern crate` declarations live in lib.rs after the
-// merger from //net:tls into //uni-tls. `tls_crypto` was a separate
+// merger from //crates/net:tls into //crates/proto/tls. `tls_crypto` was a separate
 // crate; it's now this crate's sibling `aead` module.)
 
 // Note: TrafficKey caches a `uni_aes_gcm::Aes128GcmFast` — our
 // hand-rolled stitched AES-128-GCM with batched + deferred-
 // reduction GHASH — bypassing the upstream `aes-gcm` crate's
-// two-pass / per-block-reduction structure. See `//uni-aes-gcm`
+// two-pass / per-block-reduction structure. See `//crates/crypto/aes-gcm`
 // for the crypto core. The `aead` shim still uses upstream
 // `Aes128Gcm` for one-shot boot KAT / ticket envelope callers;
 // those run rarely.

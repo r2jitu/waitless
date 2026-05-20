@@ -1,4 +1,4 @@
-// uni-quic/src/streams.rs — per-stream state for 1-RTT data.
+// crates/proto/quic/src/streams.rs — per-stream state for 1-RTT data.
 //
 // Receive side: per-stream byte queue + offset reassembly + FIN
 // flag. Send side: per-stream outbound byte queue + sent-offset

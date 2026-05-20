@@ -1,4 +1,4 @@
-// uni-platform/src/lib.rs — Leaf crate for platform-primitive reads.
+// crates/runtime/platform/src/lib.rs — Leaf crate for platform-primitive reads.
 //
 // Owns the two platform-dependent reads that every upper crate needs:
 //
@@ -8,8 +8,8 @@
 // Both are cfg-gated between bare-metal (inline asm, populated by the
 // kernel's boot code) and native (std thread-local + Instant). The
 // implementation lives here rather than going through a
-// `register(&Runtime)` hook at a higher crate so `uni-worker` and
-// `uni-runtime` can just call and inline, without the cross-crate
+// `register(&Runtime)` hook at a higher crate so `worker` and
+// `executor` can just call and inline, without the cross-crate
 // plug-in dance.
 //
 // Boot-time contract: bare-metal callers must not invoke these

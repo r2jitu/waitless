@@ -3,11 +3,11 @@
 // `platform::{current_worker, now_ticks}` are direct cfg-gated
 // calls, not register-style hooks, so this module has almost nothing
 // to do. The one piece of state that needs publishing is the
-// PIT-calibrated TSC rate (x86_64 only) — uni-platform caches it
+// PIT-calibrated TSC rate (x86_64 only) — platform caches it
 // separately so `now_ticks()` doesn't have to reach back into
-// `//kernel`.
+// `//crates/kernel/bare`.
 
-/// Publish any backend-side state `uni-platform` depends on. Called
+/// Publish any backend-side state `platform` depends on. Called
 /// once from `boot/src/entry.rs` before any `spawn` / `sleep_us`.
 pub fn init() {
     #[cfg(target_arch = "x86_64")]

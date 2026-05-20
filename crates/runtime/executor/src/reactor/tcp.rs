@@ -1,4 +1,4 @@
-// uni-runtime/src/net/tcp.rs — TCP listener / accept reactor +
+// crates/runtime/executor/src/net/tcp.rs — TCP listener / accept reactor +
 // per-stream send/recv futures.
 //
 // See `super` (`net/mod.rs`) for the shared primitives (`SpinLock`,
@@ -909,9 +909,9 @@ impl<'a> RecvChunkGuard<'a> {
     /// `pub` because the guard is the *one* type shared across
     /// every `recv_chunk` surface, and the constructions live in
     /// different crates: the `TcpStream` backend builds it from the
-    /// `do_recv_chunk` hook here in `uni-runtime` (an owned
+    /// `do_recv_chunk` hook here in `executor` (an owned
     /// `External`/`Heap` IOBuf), and `TlsStream::recv_chunk` in
-    /// `uni-tls` builds it from a `Borrowed` view of decrypted
+    /// `tls` builds it from a `Borrowed` view of decrypted
     /// plaintext (RX item G). A single guard type — not a parallel
     /// `TlsRecvChunkGuard` — is what lets item H's `BodyReader`
     /// stay generic over the stream.

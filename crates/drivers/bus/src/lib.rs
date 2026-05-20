@@ -4,8 +4,8 @@
 // PCI bus enumeration, VirtIO transport (legacy + modern PCI + MMIO),
 // virtio-console driver, and the MMIO / barrier / port-I/O helpers
 // each driver crate needs. The NIC driver crates
-// (`//uni-driver-virtio-net`, `//uni-driver-gve`) depend on this
-// crate; the NIC-dispatch layer is the sibling `//drivers:nic`.
+// (`//crates/drivers/virtio-net`, `//crates/drivers/gve`) depend on this
+// crate; the NIC-dispatch layer is the sibling `//crates/drivers/nic`.
 //
 // All unsafe hardware access is confined to small helper functions;
 // public APIs are safe where possible.

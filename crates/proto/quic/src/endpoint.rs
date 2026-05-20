@@ -1,4 +1,4 @@
-// uni-quic/src/endpoint.rs — QUIC v1 UDP endpoint + dispatcher.
+// crates/proto/quic/src/endpoint.rs — QUIC v1 UDP endpoint + dispatcher.
 //
 // Binds a UDP port, drives the per-worker endpoint loop, and
 // maintains the per-worker slot table. The endpoint:

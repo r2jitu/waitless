@@ -868,7 +868,7 @@ fn init_native() {
             .unwrap_or_else(|| num_cpus().min(MAX_THREADS));
         NUM_THREADS.store(num_threads, Ordering::Release);
 
-        // Publish to `uni-worker` so all `PerWorker<T>` users size
+        // Publish to `worker` so all `PerWorker<T>` users size
         // themselves correctly, then init the shared runtime's
         // per-worker tables (timer wheels + task arenas).
         worker::set_num_workers(num_threads as u32);
@@ -1109,7 +1109,7 @@ pub fn run_worker(worker_id: u32) {
 
         // 2a. Async runtime: every worker advances its own timer
         // list and polls its own arena — same per-core pattern as
-        // the unikernel, driven by `//uni-runtime` under the hood.
+        // the unikernel, driven by `//crates/runtime/executor` under the hood.
         if executor::tick(worker_id) {
             did_work = true;
         }

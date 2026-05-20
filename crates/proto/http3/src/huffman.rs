@@ -1,4 +1,4 @@
-// uni-http3/src/huffman.rs — RFC 7541 Appendix B static Huffman code.
+// crates/proto/http3/src/huffman.rs — RFC 7541 Appendix B static Huffman code.
 //
 // QPACK reuses the HPACK static Huffman code (RFC 9204 §4.1.4) for
 // `H=1` field-line values. This module implements the decode side

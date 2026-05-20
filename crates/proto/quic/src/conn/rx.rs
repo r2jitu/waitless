@@ -1,4 +1,4 @@
-// uni-quic/src/conn/rx.rs — inbound packet processing.
+// crates/proto/quic/src/conn/rx.rs — inbound packet processing.
 //
 // `process_datagram` is the entry point the UDP reactor calls
 // per inbound datagram. It walks coalesced packets left-to-right,

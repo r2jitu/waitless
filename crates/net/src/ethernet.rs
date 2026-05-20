@@ -5,7 +5,7 @@
 // is a host-testable leaf crate (the `ipv6` model). The
 // os:none send path (`ethernet_send`, `init_mac`) lives in the
 // sibling `ethernet_send` crate, which depends on this one plus
-// `//drivers`.
+// `//crates/drivers/bus`.
 
 #![cfg_attr(not(test), no_std)]
 

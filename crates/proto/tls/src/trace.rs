@@ -1,6 +1,6 @@
 // net/tls_server_trace.rs — Compile-time-gated handshake tracing.
 //
-// Enable with `--cfg=tls_debug` in rustc_flags on //uni-tls when
+// Enable with `--cfg=tls_debug` in rustc_flags on //crates/proto/tls when
 // you need to diagnose a broken handshake. When disabled (the default),
 // every function here is a no-op stub with no arguments read — the
 // compiler optimizes them to nothing, so there's zero runtime cost and
@@ -18,7 +18,7 @@ use crate::handshake;
 use crate::server::{HandshakeError, State};
 
 // `serial::puts` sink. Only compiled when `--cfg=tls_debug`
-// is set in `//uni-tls`'s rustc_flags. On the
+// is set in `//crates/proto/tls`'s rustc_flags. On the
 // bare-metal unikernel target we forward to the kernel's
 // debug UART via `kernel_bare::serial::puts`; on hosted native
 // builds we use libc `write(2, ...)` to stderr so the same

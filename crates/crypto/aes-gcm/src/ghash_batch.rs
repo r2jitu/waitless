@@ -1,4 +1,4 @@
-// uni-tls/ghash_batch.rs — 8-way batched GHASH with deferred reduction.
+// crates/proto/tls/ghash_batch.rs — 8-way batched GHASH with deferred reduction.
 //
 // **Why**: per-block GHASH (one PCLMUL multiply + one polynomial
 // reduction per 16 bytes) is the dominant cost in `aes_gcm_fast`

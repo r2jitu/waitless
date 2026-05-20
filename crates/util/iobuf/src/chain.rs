@@ -1,4 +1,4 @@
-// uni-iobuf/src/chain.rs — `Chain<B>`, a chain of byte segments.
+// crates/util/iobuf/src/chain.rs — `Chain<B>`, a chain of byte segments.
 //
 // A chain of buffer segments with a `Cursor` that walks node
 // boundaries transparently for readers. Each layer of the network

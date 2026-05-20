@@ -1,4 +1,4 @@
-// uni-quic/src/tls.rs — TLS 1.3 handshake driver for QUIC.
+// crates/proto/quic/src/tls.rs — TLS 1.3 handshake driver for QUIC.
 //
 // QUIC carries TLS handshake messages in CRYPTO frames at three
 // distinct packet number spaces (Initial / Handshake / 1-RTT)
@@ -6,8 +6,8 @@
 // the integration: same handshake state machine, same key
 // schedule, same cipher suite — only the I/O wrapping differs.
 //
-// `QuicTls` reuses every primitive in `//net:tls` (Transcript,
-// KeySchedule, X25519ServerKey) and `//net:tls_handshake`
+// `QuicTls` reuses every primitive in `//crates/net:tls` (Transcript,
+// KeySchedule, X25519ServerKey) and `//crates/net:tls_handshake`
 // (ClientHello parser, ServerHello / Certificate / etc. builders,
 // signed-content shaping for CertificateVerify) — the only thing
 // that changes vs the existing record-layer driver is:
@@ -690,7 +690,7 @@ impl QuicTls {
     }
 
     /// Build, seal, and queue a NewSessionTicket for emission via
-    /// `tx_one_rtt`. Mirrors `uni-tls::handlers::emit_session_ticket`
+    /// `tx_one_rtt`. Mirrors `tls::handlers::emit_session_ticket`
     /// but writes raw handshake-message bytes (the QUIC connection
     /// layer wraps them in CRYPTO frames; there's no TLS record
     /// envelope at QUIC's 1-RTT level).
@@ -760,7 +760,7 @@ impl QuicTls {
 // Each TLS level has its own monotonically-increasing CRYPTO byte
 // stream. Frames may arrive in any order (RFC 9000 §19.6): the
 // receiver MUST reassemble. This is a small specialisation of the
-// stream-recv pattern in //uni-quic/streams.rs — no FIN tracking,
+// stream-recv pattern in //crates/proto/quic/streams.rs — no FIN tracking,
 // no flow control, just contiguous-prefix accumulation + an
 // offset-keyed gap buffer for late chunks.
 //
