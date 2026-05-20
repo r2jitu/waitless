@@ -381,7 +381,7 @@ fn find_header_end_from(data: &[u8], start: usize) -> Option<usize> {
 fn parse_usize(data: &[u8]) -> usize {
     let mut n: usize = 0;
     for &b in data {
-        if (b'0'..=b'9').contains(&b) {
+        if b.is_ascii_digit() {
             n = n * 10 + (b - b'0') as usize;
         } else {
             break;

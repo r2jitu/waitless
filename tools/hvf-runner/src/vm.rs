@@ -344,7 +344,7 @@ impl Vm {
             // unikernels but stays correct for hand-rolled test images).
             kernel.len() as u64
         };
-        let dtb_offset = ((image_size + DTB_GAP + DTB_ALIGN - 1) / DTB_ALIGN) * DTB_ALIGN;
+        let dtb_offset = (image_size + DTB_GAP).div_ceil(DTB_ALIGN) * DTB_ALIGN;
         if (kernel.len() as u64) > dtb_offset {
             return Err(format!(
                 "kernel file ({} bytes) extends past computed DTB offset ({}); \

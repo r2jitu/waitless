@@ -362,7 +362,7 @@ unsafe fn framing_pool_drop(base: core::ptr::NonNull<u8>, capacity: u32, ctx: *m
     // `Box::into_raw` in `FramingPool::take`; reconstruct the
     // Box so it owns the storage again.
     let storage: alloc::boxed::Box<[u8]> = unsafe {
-        alloc::boxed::Box::from_raw(core::slice::from_raw_parts_mut(
+        alloc::boxed::Box::from_raw(core::ptr::slice_from_raw_parts_mut(
             base.as_ptr(),
             capacity as usize,
         ))

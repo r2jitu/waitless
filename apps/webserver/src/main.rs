@@ -1037,11 +1037,7 @@ fn rss_chi_squared_x100(observed: &[u64]) -> u64 {
     }
     let mut acc: u64 = 0;
     for &o in observed {
-        let diff = if o > expected {
-            o - expected
-        } else {
-            expected - o
-        };
+        let diff = o.abs_diff(expected);
         // (diff² / expected) — at bench scale (≤ 10⁷ packets/q),
         // diff² fits in u64 with margin (10¹⁴ vs u64 max 1.8×10¹⁹).
         let term = diff.saturating_mul(diff) / expected;

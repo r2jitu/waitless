@@ -240,7 +240,7 @@ static AP_POLL_FN: crate::sync::AtomicFn<fn(u32) -> bool> = crate::sync::AtomicF
 /// synchronisation, relying on no other core being live.
 pub unsafe fn init(count: u32) {
     worker::set_num_workers(count);
-    CORES.init(count, |i| PerCore::new(i));
+    CORES.init(count, PerCore::new);
     // Link the shared Tier-2 cross-core RX node pool's free-list.
     // BSP-only, single-threaded — no AP has started, so this races
     // nothing.

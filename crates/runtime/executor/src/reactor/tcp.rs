@@ -332,6 +332,18 @@ static TCP_REGISTRY: [TcpState; MAX_TCP_LISTENERS] = [const { TcpState::new() };
 
 // ---- Backend vtable (TCP) ---------------------------------------------------
 
+/// Optional TSO fast-path send. The `fill` closure writes TCP-
+/// payload bytes directly into the driver's big-slot TX-pool
+/// buffer; the backend stamps L2/L3/L4 headers around them and
+/// hands the slot to the NIC. See [`TcpBackend::try_send_tso`]
+/// for the full contract.
+pub type TrySendTsoFn = fn(
+    handle: *mut (),
+    generation: u16,
+    min_payload: usize,
+    fill: &mut dyn FnMut(&mut [u8]) -> Result<usize, ()>,
+) -> Option<Result<usize, ()>>;
+
 /// All TCP backend hooks. Installed once at boot by the platform
 /// backend — native (kqueue/epoll over POSIX sockets) or bare-
 /// metal (integrated NIC driver + handshake stack). Every TCP
@@ -479,14 +491,7 @@ pub struct TcpBackend {
     /// some hardware TSO — gve in particular — silently drops
     /// payloads at or below MSS, so the gate is correctness-load-
     /// bearing in those backends.)
-    pub try_send_tso: Option<
-        fn(
-            handle: *mut (),
-            generation: u16,
-            min_payload: usize,
-            fill: &mut dyn FnMut(&mut [u8]) -> Result<usize, ()>,
-        ) -> Option<Result<usize, ()>>,
-    >,
+    pub try_send_tso: Option<TrySendTsoFn>,
 
     /// Optional. RST every connection currently in the backend's
     /// pool — called once at shutdown so peers see an immediate

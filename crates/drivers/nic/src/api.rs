@@ -171,6 +171,23 @@ impl TxUdpGsoBufHandle {
     }
 }
 
+/// Submit a previously-acquired TSO super-segment slot. Wider than
+/// `submit_tx` because the device needs the per-segment GSO
+/// parameters (header len, checksum start, MSS) up-front.
+pub type SubmitTxTsoFn =
+    fn(handle: TxTsoBufHandle, frame_len: usize, hdr_len: u16, csum_start: u16, gso_size: u16);
+
+/// Submit a previously-acquired UDP-GSO super-packet slot. Same
+/// shape as `SubmitTxTsoFn` modulo the handle type — the L4 layer
+/// just differs.
+pub type SubmitTxUdpGsoFn =
+    fn(handle: TxUdpGsoBufHandle, frame_len: usize, hdr_len: u16, csum_start: u16, gso_size: u16);
+
+/// Per-queue-pair RX delivery callback. Takes the qp index and the
+/// per-frame `IOBuf`-chain callback the dispatcher uses to forward
+/// frames into the net stack.
+pub type PollQpFn = fn(usize, fn(Chain<OwnedIOBuf>)) -> usize;
+
 /// All fn pointers a NIC driver exposes. A single `&'static NicOps`
 /// is published via `AtomicPtr` at boot; every dispatcher call does
 /// one Acquire load + one direct call.
@@ -267,9 +284,7 @@ pub struct NicOps {
     /// from `acquire_tx_tso_buf`) — a small-pool `TxBufHandle`
     /// won't compile here, eliminating the previous runtime
     /// pool-ID check.
-    pub submit_tx_tso: Option<
-        fn(handle: TxTsoBufHandle, frame_len: usize, hdr_len: u16, csum_start: u16, gso_size: u16),
-    >,
+    pub submit_tx_tso: Option<SubmitTxTsoFn>,
     /// UDP-GSO (`UDP_SEGMENT` / `GSO_UDP_L4`) capability — the UDP
     /// analogue of `tso_available`. `true` when the device can
     /// segment a single big UDP super-packet into N same-size
@@ -304,15 +319,7 @@ pub struct NicOps {
     ///
     /// Takes a [`TxUdpGsoBufHandle`]; same handling rules as the
     /// TSO wrapper.
-    pub submit_tx_udp_gso: Option<
-        fn(
-            handle: TxUdpGsoBufHandle,
-            frame_len: usize,
-            hdr_len: u16,
-            csum_start: u16,
-            gso_size: u16,
-        ),
-    >,
+    pub submit_tx_udp_gso: Option<SubmitTxUdpGsoFn>,
     /// RX callback: the driver delivers each received L2 frame
     /// (Eth + IP + L4 + payload) as an owned `Chain<OwnedIOBuf>`.
     /// `OwnedIOBuf` is `Send` by derivation, so the chain — and the
@@ -346,7 +353,7 @@ pub struct NicOps {
     /// driver's drop callback MUST be panic-safe — it can run from
     /// `IOBuf::drop` on any core.
     pub poll_rx: fn(fn(Chain<OwnedIOBuf>)) -> usize,
-    pub poll_qp: fn(usize, fn(Chain<OwnedIOBuf>)) -> usize,
+    pub poll_qp: PollQpFn,
 
     // ── Config / bring-up ───────────────────────────────────────────
     pub get_mac: fn(*mut u8),

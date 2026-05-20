@@ -69,7 +69,7 @@ mod borrow_tracker {
     }
 
     std::thread_local! {
-        static ACTIVE: RefCell<Vec<Region>> = RefCell::new(Vec::new());
+        static ACTIVE: RefCell<Vec<Region>> = const { RefCell::new(Vec::new()) };
     }
 
     /// Register a new borrowed region. Panics on overlap with any

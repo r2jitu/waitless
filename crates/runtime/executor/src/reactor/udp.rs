@@ -476,6 +476,28 @@ fn lookup_eph(port: u16) -> Option<&'static EphSlot> {
 
 // ---- Backend vtable (UDP) ---------------------------------------------------
 
+/// Optional per-bind hook the platform backend runs after
+/// `UdpSocket::bind` claims a registry slot. See
+/// [`UdpBackend::bind`] for fanout vs single-owner semantics.
+pub type UdpBindFn = fn(port: u16, owner_worker: Option<u32>) -> Result<(), ()>;
+
+/// Optional submit-via-TX-handle entry: caller has filled the
+/// payload region of `handle` and the backend stamps L2/L3/L4
+/// headers in place. See [`UdpBackend::send_via_tx_handle`].
+pub type UdpSendViaTxHandleFn = fn(
+    dst_ip: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    handle: nic_api::TxBufHandle,
+    frame_len: usize,
+);
+
+/// Optional zero-copy send: caller hands a frame buffer with
+/// [`MAX_L2_HEADROOM`] bytes reserved for the L2/L3/L4 headers,
+/// payload starting after. See [`UdpBackend::send_with_l2_headroom`].
+pub type UdpSendWithL2HeadroomFn =
+    fn(dst_ip: IpAddr, src_port: u16, dst_port: u16, frame: &mut [u8]);
+
 /// All UDP backend hooks. Installed once at boot by the platform
 /// backend — native (POSIX sockets) or bare-metal (integrated NIC
 /// driver + protocol stack). `UdpSocket::bind` / `send_to` /
@@ -496,7 +518,7 @@ pub struct UdpBackend {
     /// just one socket on worker `w`, no SO_REUSEPORT — every reply
     /// lands on `w`'s kqueue, and the runtime's owner-aware
     /// `deliver_udp` keeps the one-bound-socket invariant.
-    pub bind: Option<fn(port: u16, owner_worker: Option<u32>) -> Result<(), ()>>,
+    pub bind: Option<UdpBindFn>,
     /// Mirror of `bind` — called on port release to let the
     /// backend tear down per-bind state. Same optional-on-bare-
     /// metal rationale.
@@ -522,15 +544,7 @@ pub struct UdpBackend {
     /// headers in the headroom in place and submits the slot to
     /// the driver via `submit_tx`. `frame_len` is `MAX_L2_HEADROOM
     /// + payload_len`.
-    pub send_via_tx_handle: Option<
-        fn(
-            dst_ip: IpAddr,
-            src_port: u16,
-            dst_port: u16,
-            handle: nic_api::TxBufHandle,
-            frame_len: usize,
-        ),
-    >,
+    pub send_via_tx_handle: Option<UdpSendViaTxHandleFn>,
     /// Optional zero-copy send: caller hands a frame buffer where
     /// the first [`MAX_L2_HEADROOM`] bytes are reserved for the
     /// L2/L3/L4 headers and the UDP payload starts at
@@ -551,8 +565,7 @@ pub struct UdpBackend {
     /// `udp::send_to_addr → ipv4_send → ethernet_send → driver`
     /// memcpy chain. Bare-metal sets this; native leaves it `None`
     /// (the OS does the wrap on `sendto`).
-    pub send_with_l2_headroom:
-        Option<fn(dst_ip: IpAddr, src_port: u16, dst_port: u16, frame: &mut [u8])>,
+    pub send_with_l2_headroom: Option<UdpSendWithL2HeadroomFn>,
 }
 
 /// Max bytes a caller of `UdpSocket::send_to_with_l2_headroom`
