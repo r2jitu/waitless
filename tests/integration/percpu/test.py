@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""apps/test_percpu/test.py — Per-core state independence integration test.
+"""tests/integration/percpu/test.py — Per-core state independence integration test.
 
 Boots the test_percpu launcher (4 vCPUs by default from the
 unikernel_binary attr) via `run_variant_and_capture` and asserts

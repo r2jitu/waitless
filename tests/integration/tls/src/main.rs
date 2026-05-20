@@ -1,4 +1,4 @@
-// apps/test_tls — TLS 1.3 primitives smoke test.
+// tests/integration/tls — TLS 1.3 primitives smoke test.
 //
 // Boots the unikernel, runs the full //uni-tls key schedule and the
 // //uni-tls AEAD through a known-answer round-trip, and prints

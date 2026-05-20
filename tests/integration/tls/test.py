@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""apps/test_tls/test.py — TLS primitives smoke test.
+"""tests/integration/tls/test.py — TLS primitives smoke test.
 
 Drives //net:tls_crypto + //net:tls through a full-stack boot
 (AEAD roundtrip + tamper, X25519, HKDF-Expand-Label, key schedule

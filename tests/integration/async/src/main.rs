@@ -1,4 +1,4 @@
-// apps/test_async — Async-runtime smoke test.
+// tests/integration/async — Async-runtime smoke test.
 //
 // Exercises the task arena, Waker wiring, and `Sleep` future.
 // Also verifies socket-lifecycle cleanup end-to-end: bind+drop

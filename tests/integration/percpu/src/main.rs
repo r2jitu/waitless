@@ -1,4 +1,4 @@
-// apps/test_percpu — Per-core state integration test.
+// tests/integration/percpu — Per-core state integration test.
 //
 // Verifies each core participates in the event loop and has
 // independent per-core state. Uses the event loop service callback.

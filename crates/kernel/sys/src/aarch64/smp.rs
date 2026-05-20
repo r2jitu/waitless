@@ -233,7 +233,7 @@ pub fn send_sgi_to(target_core: u32) {
 /// SGI 0 handler — called on the receiving core by the GIC exception dispatcher.
 /// This is just a wakeup signal — all real work happens in the event loop.
 /// The fetch-add serves a second purpose: `ipi_count()` reads it from
-/// tests (apps/test_smp) to verify the SGI actually landed. On the hot
+/// tests (tests/integration/smp) to verify the SGI actually landed. On the hot
 /// path the cost is a single Relaxed add per interrupt.
 pub fn sgi_handler(_irq: u32) {
     IPI_COUNT.fetch_add(1, Ordering::Relaxed);

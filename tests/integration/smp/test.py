@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""apps/test_smp/test.py — SMP boot + IPI delivery integration test.
+"""tests/integration/smp/test.py — SMP boot + IPI delivery integration test.
 
 Boots the test_smp launcher (which handles the per-variant QEMU /
 HVF invocation, including the 4-vCPU default from the

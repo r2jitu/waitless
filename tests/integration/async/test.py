@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""apps/test_async/test.py — Async-runtime + socket-lifecycle smoke test.
+"""tests/integration/async/test.py — Async-runtime + socket-lifecycle smoke test.
 
 Boots the test_async launcher via `run_variant_and_capture` and asserts:
 

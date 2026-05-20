@@ -557,8 +557,8 @@ INIT-SIPI-SIPI after init is done.
 
 **Try it:**
 ```bash
-bazel test //apps/test_smp:test_qemu_aarch64   # serial: "core 0 online" .. "core 3 online"
-bazel test //apps/test_smp:test_qemu_x86_64    # same on x86_64 QEMU
+bazel test //tests/integration/smp:test_qemu_aarch64   # serial: "core 0 online" .. "core 3 online"
+bazel test //tests/integration/smp:test_qemu_x86_64    # same on x86_64 QEMU
 # Webserver still runs single-core here — cores boot but networking is next
 ```
 
@@ -714,7 +714,7 @@ because using `Future` directly (instead of inventing a separate
 - [ ] `yield_now()` — defer until a concrete user needs it.
 
 **Tests:**
-- [x] Integration: [apps/test_async](apps/test_async) green on HVF,
+- [x] Integration: [tests/integration/async](tests/integration/async) green on HVF,
       QEMU aarch64, QEMU x86_64. Spawns an async task that sleeps
       50ms, nested-spawns, sleeps 10ms, shuts down.
 - [ ] Unit: arena spawn/free/reclaim semantics (host).
@@ -742,7 +742,7 @@ primitives QUIC needs; more reactor primitives land as QUIC demands.
       to async handlers (`AsyncFn(&Request) -> Response`).
 - [x] Event loop shim: tick drains the wheel, scans ready slots, calls
       `future.as_mut().poll(&mut cx)`. No change to poll/drain/idle.
-- [x] Smoke test: `apps/test_async` — spawn + timer + nested-spawn +
+- [x] Smoke test: `tests/integration/async` — spawn + timer + nested-spawn +
       graceful shutdown. Exercises the full stack.
 - [x] Perf: timer wheel fast-paths empty state in
       [kernel/timer.rs](kernel/timer.rs) — first `advance()` after
@@ -759,7 +759,7 @@ primitives QUIC needs; more reactor primitives land as QUIC demands.
   `idle_bounded` timer tick; bounded-latency, not zero-latency.
 
 **Tests:**
-- [x] Integration: `apps/test_async` end-to-end on HVF + QEMU.
+- [x] Integration: `tests/integration/async` end-to-end on HVF + QEMU.
       Native deferred (kernel::executor is bare-metal-only today).
 - [ ] Unit (host): Waker clone/wake correctness under miri.
 - [ ] Integration: spawn 1000 `Timer::sleep_until` tasks, verify all
@@ -767,8 +767,8 @@ primitives QUIC needs; more reactor primitives land as QUIC demands.
 
 **Try it:**
 ```bash
-bazel test //apps/test_async:test_hvf
-bazel test //apps/test_async:test_qemu_aarch64 //apps/test_async:test_qemu_x86_64
+bazel test //tests/integration/async:test_hvf
+bazel test //tests/integration/async:test_qemu_aarch64 //tests/integration/async:test_qemu_x86_64
 # Serial: "test_async: task woke up" → "test_async: nested task done"
 ```
 
@@ -845,7 +845,7 @@ refuse it for server auth — see commit `6cc283a`).
 - [x] **`chacha20_force_soft` / `poly1305_force_soft`** annotations
       for those two crates only. Their x86 SIMD backends produce
       incorrect output on `x86_64-unknown-none` (caught by a
-      `aead_rfc8439_known_answer` test in `apps/test_tls`). The
+      `aead_rfc8439_known_answer` test in `tests/integration/tls`). The
       software backends are audited constant-time Rust and ~3-5x
       slower; well worth the cost for correctness. aarch64
       unaffected. Filed under "investigate when we next bump
@@ -950,7 +950,7 @@ refuse it for server auth — see commit `6cc283a`).
       `10.0.2.15`). DER for `include_bytes!()`, PEM for host-side
       `curl --cacert` / `openssl s_client`. Regen via
       `dev_certs/regen.sh`.
-- [x] **`//apps/test_tls`** — in-kernel integration test. Boots
+- [x] **`//tests/integration/tls`** — in-kernel integration test. Boots
       via HVF / QEMU TCG / KVM, runs **12 stages** end-to-end:
       `aead_roundtrip`, `aead_tamper_detect`,
       `aead_roundtrip_large` (600-byte multi-block AEAD path),
@@ -979,7 +979,7 @@ refuse it for server auth — see commit `6cc283a`).
 **Try it:**
 ```bash
 # In-kernel integration test (12 primitives + RFC vectors)
-bazel test //apps/test_tls:test_hvf
+bazel test //tests/integration/tls:test_hvf
 # Serial: "TLS TESTS: ALL PASSED"
 
 # Live TLS server on the unikernel
@@ -1514,7 +1514,7 @@ compiled with `-Cpanic=abort` (kernel global policy via
 `-Cpanic=unwind`. Currently, `//net:tls`, `//net:tls_crypto`,
 `//net:tls_record`, `//net:tls_server`, and `//net:tcp` cannot
 have host-native unit tests. Coverage lives in bare-metal
-integration tests like `//apps/test_tls` (12 stages including
+integration tests like `//tests/integration/tls` (12 stages including
 RFC 8439 AEAD known-answer and RFC 8448 §3 key-schedule
 known-answer vectors).
 
@@ -1526,7 +1526,7 @@ known-answer vectors).
 
 **Trigger**: when an integration test caught something that a
 host unit test would have caught faster — currently no incidents
-(the RFC 8448 / RFC 8439 known-answer vectors in `//apps/test_tls`
+(the RFC 8448 / RFC 8439 known-answer vectors in `//tests/integration/tls`
 catch correctness bugs at boot, including the recent
 `x86_64-unknown-none` ChaCha20/Poly1305 SIMD codegen bug).
 
@@ -1820,7 +1820,7 @@ sh_test(name = "test", srcs = ["test.sh"], data = [":test_smp.elf"])
 ### Naming convention
 
 - Unit tests: `bazel test //net:ethernet_test`, `//kernel:mm_test`
-- Integration tests: `bazel test //apps/test_smp:test_qemu_aarch64`
+- Integration tests: `bazel test //tests/integration/smp:test_qemu_aarch64`
   (per-variant; see `bazel/rules/variants.bzl`). Filter the full
   matrix via `--test_tag_filters=hvf` / `=qemu` / `=qemu_x86_64`.
 

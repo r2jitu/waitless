@@ -1,4 +1,4 @@
-// apps/test_smp — SMP boot + IPI test application.
+// tests/integration/smp — SMP boot + IPI test application.
 //
 // Tests: multi-core boot, inter-processor interrupt delivery.
 
