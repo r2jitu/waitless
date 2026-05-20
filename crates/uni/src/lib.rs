@@ -35,11 +35,12 @@ pub fn native_run() -> i32 {
 pub mod boot_info;
 pub mod rng;
 
-pub use boot_info::{BootInfo, NicInfo, boot_info};
-
-// The facade-level net errors. The types live in `uni_net` so
-// driver crates can reach them without depending on `uni`.
-pub use net::{DhcpError, NetError, NicError};
+// `uni::boot_info()` returns the populated `&'static BootInfo`. The
+// `BootInfo` / `NicInfo` types live in `uni::boot_info::*` — boot
+// shims reach them there (along with `BootInfoParams`, the init
+// type), and apps that just read the snapshot don't need to name
+// the types thanks to method-chain inference.
+pub use boot_info::boot_info;
 
 // ----------------------------------------------------------------------------
 // Lifetime model — listeners run forever, no user-side bag
@@ -178,7 +179,14 @@ pub fn _install_shutdown_hook() {}
 
 // ---- Re-exported platform functions ---------------------------------------
 
-pub use backend::{HeapStats, check_shutdown, log, num_workers, request_shutdown, wait_for_events};
+// Hot platform calls every app uses. `check_shutdown` and
+// `HeapStats` are NOT re-exported here — neither has any qualified
+// `uni::*` consumer; `check_shutdown` is wired into the event loop
+// directly from `crates/boot/src/entry.rs` via the kernel callback
+// (no app-facing surface), and `HeapStats` is only the return type
+// of `uni::diagnostics::heap_stats()` and named there as
+// `backend::HeapStats`.
+pub use backend::{log, num_workers, request_shutdown, wait_for_events};
 
 /// Format-and-log helper for `uni::log!("…", args)`. Allocates a
 /// scratch `String` because `core::fmt::write` doesn't have a
@@ -378,7 +386,7 @@ pub mod diagnostics {
 
     /// Snapshot the heap. Cheap on bare-metal (O(1) + spinlock);
     /// best-effort zero on native.
-    pub fn heap_stats() -> super::HeapStats {
+    pub fn heap_stats() -> backend::HeapStats {
         backend::heap_stats()
     }
 
