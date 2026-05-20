@@ -22,7 +22,9 @@ rust_library(
     name = "iobuf",
     srcs = [
         "src/chain.rs",
+        "src/iobuf.rs",
         "src/lib.rs",
+        "src/owned.rs",
         "src/pool.rs",
         "src/storage.rs",
     ],
