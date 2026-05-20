@@ -3,7 +3,6 @@
 // trampoline + per-vector config. The poll path uses `IRQ_PENDING`
 // to short-circuit the per-iteration ISR-read MMIO exit.
 
-
 use core::sync::atomic::AtomicBool;
 
 #[cfg(target_arch = "aarch64")]

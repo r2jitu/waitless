@@ -6,7 +6,6 @@
 
 extern crate alloc;
 
-extern crate nic_api;
 pub use nic_api::{
     EthernetDriverReg, NicDiagOps, NicError, NicIdleOps, NicOps, linked_ethernet_drivers,
     register_ethernet_driver,

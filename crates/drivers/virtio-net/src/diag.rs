@@ -4,7 +4,6 @@
 // dispatches to. Read-mostly: every per-packet site touches just a
 // single relaxed atomic increment.
 
-
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{DIAG_QP_CAP, TX_POOL_BIG_SIZE, TX_POOL_SMALL_SIZE, ndev, tx_q};

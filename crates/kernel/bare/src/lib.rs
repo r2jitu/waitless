@@ -5,7 +5,6 @@
 #![no_std]
 
 extern crate alloc;
-extern crate kernel_core;
 
 pub mod cpu;
 pub mod cpu_info;

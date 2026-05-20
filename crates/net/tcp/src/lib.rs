@@ -33,18 +33,9 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
-extern crate bitflags;
-extern crate ethernet;
-extern crate executor;
-extern crate ipv4;
-extern crate ipv6;
-extern crate ipv6_send;
-extern crate kernel_core;
-extern crate mac_resolve;
 extern crate net_checksum as checksum;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
-extern crate nic;
 
 mod listener;
 mod pool;

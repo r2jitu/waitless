@@ -2,7 +2,6 @@
 // VirtIO-MMIO bring-up, per-queue-pair storage allocation, and the
 // MQ control-VQ command we send to activate multi-queue after DHCP.
 
-
 use core::ptr;
 
 use bus::virtio::{

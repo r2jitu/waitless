@@ -2,7 +2,6 @@
 
 #![cfg_attr(not(test), no_std)]
 
-extern crate kernel_core;
 extern crate net_checksum as checksum;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;

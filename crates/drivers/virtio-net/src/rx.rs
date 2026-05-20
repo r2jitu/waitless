@@ -3,7 +3,6 @@
 // and the legacy "batch into a flat buffer" poll variant kept
 // for callers that want a copying drain (`poll_batch`).
 
-
 use core::ptr;
 use core::ptr::NonNull;
 use core::sync::atomic::Ordering;

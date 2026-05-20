@@ -2,7 +2,6 @@
 // completion drain, slice-shaped convenience send, deferred-kick
 // flush helpers, and the small/big TSO pool acquire path.
 
-
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use kernel_bare::mm::virt_to_phys;

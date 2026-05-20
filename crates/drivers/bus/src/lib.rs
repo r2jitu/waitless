@@ -20,7 +20,6 @@ use core::sync::atomic::{Ordering, compiler_fence};
 // ============================================================================
 // Kernel crate dependencies — direct Rust calls
 // ============================================================================
-extern crate kernel_bare;
 #[cfg(target_arch = "aarch64")]
 use kernel_bare::aarch64::mmu::map_device_range;
 use kernel_bare::serial;

@@ -14,8 +14,6 @@
 
 #![no_std]
 
-extern crate uni;
-
 use ::tls::aead as tls_crypto;
 use ::tls::schedule as tls;
 

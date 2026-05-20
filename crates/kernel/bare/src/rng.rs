@@ -44,9 +44,6 @@
 
 #![allow(unsafe_op_in_unsafe_fn)] // SAFETY documented per call site
 
-extern crate getrandom;
-extern crate sha2;
-
 use core::cell::UnsafeCell;
 use sha2::{Digest, Sha256};
 

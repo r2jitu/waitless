@@ -51,11 +51,6 @@
 
 #![no_std]
 
-extern crate bus;
-extern crate iobuf;
-extern crate kernel_bare;
-extern crate nic_api;
-
 mod adminq;
 mod diag;
 pub mod dqo;

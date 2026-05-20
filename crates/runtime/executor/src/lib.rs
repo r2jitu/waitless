@@ -20,8 +20,7 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
-pub extern crate net_types as ip;
-extern crate nic_api;
+pub use net_types as ip;
 
 pub mod event;
 pub mod launcher;

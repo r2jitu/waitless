@@ -10,11 +10,6 @@
 #![allow(dead_code, unused_imports)]
 
 extern crate alloc;
-extern crate bus;
-extern crate iobuf;
-extern crate kernel_bare;
-extern crate net_checksum;
-extern crate nic_api;
 
 use core::ptr;
 

@@ -5,9 +5,6 @@
 
 #![no_std]
 
-extern crate kernel_bare;
-extern crate uni;
-
 use core::sync::atomic::{AtomicU8, Ordering};
 
 const MAX_CORES: usize = 8;

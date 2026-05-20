@@ -8,9 +8,7 @@
 
 #![no_std]
 
-extern crate ethernet;
 extern crate net_types as types;
-extern crate nic;
 
 use core::ptr;
 use ethernet::{EthernetHeader, HEADER_LEN, ethernet_our_mac};

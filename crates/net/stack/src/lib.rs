@@ -11,25 +11,19 @@
 #![no_std]
 
 extern crate alloc;
-extern crate executor;
-extern crate iobuf;
-extern crate kernel_bare;
-extern crate nic;
 
-extern crate net_classify;
-
-pub extern crate arp;
-pub extern crate dhcp;
-pub extern crate ethernet;
-pub extern crate ethernet_send;
-pub extern crate icmpv6;
-pub extern crate ipv4;
-pub extern crate ipv6;
-pub extern crate ipv6_send;
-pub extern crate ndp;
-pub extern crate net_types as types;
-pub extern crate tcp;
-pub extern crate udp;
+pub use arp;
+pub use dhcp;
+pub use ethernet;
+pub use ethernet_send;
+pub use icmpv6;
+pub use ipv4;
+pub use ipv6;
+pub use ipv6_send;
+pub use ndp;
+pub use net_types as types;
+pub use tcp;
+pub use udp;
 
 use kernel_bare::percpu;
 

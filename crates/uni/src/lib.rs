@@ -8,12 +8,7 @@ extern crate alloc;
 
 pub use uni_macros::init;
 
-extern crate backend;
-
-#[cfg(target_os = "none")]
-extern crate kernel_bare;
-
-pub extern crate uni_net as net;
+pub use uni_net as net;
 
 /// Native entry from `native_main.rs`. Plugs boot_info and shutdown
 /// callbacks into `backend::run` so the backend doesn't need a

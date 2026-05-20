@@ -14,8 +14,6 @@
 
 #![no_std]
 
-extern crate kernel_bare;
-
 // The kernel's sole `#[panic_handler]` lives in `entry` (boot/entry.rs)
 // and serves every boot path — multiboot, Limine, HVF. Now that the
 // boot crates are rlibs sharing one crate graph, a second handler here

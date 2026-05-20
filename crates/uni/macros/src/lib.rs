@@ -33,7 +33,6 @@
 // event loop. Same role as `/etc/init.d/` scripts or systemd unit
 // `ExecStart=` directives in Linux.
 
-extern crate proc_macro;
 use proc_macro::TokenStream;
 
 #[proc_macro_attribute]

@@ -24,7 +24,6 @@
 
 #![cfg_attr(not(test), no_std)]
 
-extern crate kernel_core;
 extern crate net_types as types;
 
 use kernel_core::sync::Spinlock;

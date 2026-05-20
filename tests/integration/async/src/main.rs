@@ -9,8 +9,6 @@
 
 #![no_std]
 
-extern crate uni;
-
 #[uni::init]
 fn init() {
     uni::log(b"test_async: boot\n");

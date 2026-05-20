@@ -4,9 +4,6 @@
 
 #![no_std]
 
-extern crate kernel_bare;
-extern crate uni;
-
 #[uni::init]
 fn init() {
     // Wait until every configured core has come up. The kernel's

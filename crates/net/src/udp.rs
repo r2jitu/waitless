@@ -7,17 +7,9 @@
 
 #![no_std]
 
-extern crate ethernet;
-extern crate executor;
-extern crate ipv4;
-extern crate ipv6;
-extern crate ipv6_send;
-extern crate mac_resolve;
 extern crate net_checksum as checksum;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
-extern crate nic;
-extern crate nic_api;
 
 use from_bytes::FromBytes;
 use types::{CONFIG, IpAddr, MacAddr, htons, ntohs};

@@ -2,13 +2,8 @@
 
 #![no_std]
 
-extern crate ethernet;
-extern crate ethernet_send;
-extern crate iobuf;
-extern crate kernel_core;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
-extern crate nic;
 
 use ethernet::{ETHERTYPE_ARP, ethernet_our_mac, ethernet_parse};
 use ethernet_send::ethernet_send;

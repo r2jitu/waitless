@@ -14,10 +14,6 @@ extern crate alloc;
 
 use core::ptr;
 
-extern crate bus;
-extern crate kernel_bare;
-extern crate nic;
-extern crate uni;
 extern crate uni_net_stack as net;
 
 // Boot assembly — compiled by LLVM's integrated assembler via global_asm!.

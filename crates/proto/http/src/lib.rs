@@ -9,8 +9,6 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
-extern crate iobuf;
-extern crate uni;
 
 // Re-export the shared IOBuf primitive so `http::IOBuf` /
 // `http::IOBufChain` keep working at every existing call
