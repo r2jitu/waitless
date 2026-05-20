@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# pre-push -- belt-and-suspenders check before pushing.
+#
+# The pre-commit hook only auto-formats. Build/lint regressions are
+# caught locally during your normal `bazel build` / `bazel test`
+# cycles (the `.bazelrc` `rust_clippy_aspect` line makes clippy run
+# on every first-party rust target by default — see the comment
+# block at the top of `.bazelrc`). This hook is the catch-net for
+# the case where you committed a small change without rebuilding:
+# we run a full first-party host build of crates + apps + tests
+# before letting the push leave the machine.
+#
+# The unikernel cross-compile is not run here — that build takes
+# 20+ s cold even when cached, and a host build with the clippy
+# aspect catches almost every regression in practice (cfg-gated
+# `target_os = "none"` code is a small fraction of the tree).
+# Run `bazel build //apps/webserver:webserver_hvf` manually for
+# unikernel coverage when you're touching kernel/boot/driver code.
+#
+# Active once git is pointed at this directory:
+#     git config core.hooksPath scripts/git-hooks
+# scripts/setup-dev.sh runs that automatically for fresh clones.
+#
+# Bypass entirely with:  git push --no-verify
+
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+echo "==> pre-push: bazel build //crates/... //apps/... //tests/... (includes clippy)"
+bazel build //crates/... //apps/... //tests/...
