@@ -115,14 +115,17 @@ impl Default for LaunchTable {
 #[inline]
 fn tombstone() -> *mut Launcher {
     // Any non-null pointer that can't collide with a real
-    // `Box::into_raw` result. All heap pointers are aligned to at
-    // least the pointer size, so `1` is safe as a sentinel.
-    1 as *mut Launcher
+    // `Box::into_raw` result. `ptr::dangling_mut` returns a pointer
+    // whose address is `align_of::<Launcher>()`, which is bogus for
+    // a heap allocation (no real heap object lives at the alignment
+    // value alone) — and gives clippy a happy `manual_dangling_ptr`-
+    // free idiom.
+    core::ptr::dangling_mut::<Launcher>()
 }
 
 #[inline]
 fn is_tombstone(p: *mut Launcher) -> bool {
-    p as usize == 1
+    p == core::ptr::dangling_mut::<Launcher>()
 }
 
 impl LaunchTable {

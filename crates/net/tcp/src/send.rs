@@ -592,8 +592,10 @@ pub fn async_try_send_chain(
     }
 
     // Bytes are on the wire — release the cursor's borrow on the
-    // chain.
-    drop(cursor);
+    // chain. `Cursor` doesn't impl Drop (so clippy gripes about
+    // `drop(cursor)`), but binding into `_` moves it and ends the
+    // borrow at the same point.
+    let _ = cursor;
     // RFC 6298: retain the just-sent bytes so the RTO timer can
     // retransmit them if their ACK never arrives, and start the
     // timer if it is not already running. A fresh cursor re-walks

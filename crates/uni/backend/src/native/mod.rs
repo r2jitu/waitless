@@ -65,7 +65,7 @@ pub fn host_ram_bytes() -> usize {
     unsafe {
         let mut val: u64 = 0;
         let mut len = std::mem::size_of::<u64>();
-        let name = b"hw.memsize\0".as_ptr();
+        let name = c"hw.memsize".as_ptr().cast::<u8>();
         if sysctlbyname(
             name,
             &mut val as *mut u64 as *mut u8,

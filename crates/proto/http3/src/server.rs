@@ -296,6 +296,17 @@ const FRAMING_BUF_SIZE: usize = 288;
 const FRAMING_POOL_MAX: usize = 16;
 
 impl FramingPool {
+    // clippy::arc_with_non_send_sync — `Arc<FramingPool>` is
+    // deliberately not `Send + Sync`: the `RefCell<Vec<...>>` inside
+    // makes `FramingPool` non-`Sync`. We use `Arc` (not `Rc`) anyway
+    // because `IOBuf::ExternalOwned` is `Send` in principle, and an
+    // IOBuf this pool issues could be moved between workers before
+    // drop. In current per-worker usage that never happens, so the
+    // atomic refcount is paid for nothing — but switching to `Rc`
+    // would land an unsoundness landmine for any future cross-worker
+    // IOBuf hand-off. See the type-level doc above for the
+    // longer-form trade-off discussion.
+    #[allow(clippy::arc_with_non_send_sync)]
     fn new() -> alloc::sync::Arc<Self> {
         alloc::sync::Arc::new(Self {
             bufs: core::cell::RefCell::new(Vec::with_capacity(FRAMING_POOL_MAX)),
