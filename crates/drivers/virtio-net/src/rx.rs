@@ -3,7 +3,6 @@
 // and the legacy "batch into a flat buffer" poll variant kept
 // for callers that want a copying drain (`poll_batch`).
 
-#![allow(dead_code, unused_imports)]
 
 use core::ptr;
 use core::ptr::NonNull;

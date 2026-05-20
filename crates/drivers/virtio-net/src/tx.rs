@@ -2,7 +2,6 @@
 // completion drain, slice-shaped convenience send, deferred-kick
 // flush helpers, and the small/big TSO pool acquire path.
 
-#![allow(dead_code, unused_imports)]
 
 use core::sync::atomic::{Ordering, compiler_fence};
 

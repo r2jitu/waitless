@@ -4,7 +4,6 @@
 // dispatches to. Read-mostly: every per-packet site touches just a
 // single relaxed atomic increment.
 
-#![allow(dead_code, unused_imports)]
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
