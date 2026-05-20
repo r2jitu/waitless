@@ -104,7 +104,7 @@ loss-recovery and congestion test cases. It is *interop* testing —
 real network, real time, a deployable server endpoint with
 qlog/keylog — not in-process. It cannot inspect internal state or
 control the clock, but it validates against other implementations.
-Reasonable as a later cross-check once `uni-quic` loss recovery is
+Reasonable as a later cross-check once `quic` loss recovery is
 wired; not a substitute for the in-process tests.
 
 Booting the unikernel under QEMU with a tap and firing crafted packets
