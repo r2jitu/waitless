@@ -35,29 +35,31 @@ No `--cfg` flags or feature matrices. Each protocol is a separate Bazel
 Transitive deps pull in exactly what's needed; `--gc-sections` strips the rest.
 
 ```
-//net:ethernet     <- always (virtio-net frames)
-//net:arp          <- ipv4 needs this
-//net:ipv4         <- tcp, udp-over-ipv4
-//net:ipv6         <- quic, udp-over-ipv6
-//net:ndp          <- ipv6 needs this (replaces ARP)
-//net:tcp          <- uni:http needs this
-//net:udp          <- quic needs this
-//net:quic         <- uni:http3 needs this (+ tls)
-//uni:http         <- HTTP/1.1 server (deps: tcp)
-//uni:http3        <- HTTP/3 server (deps: quic)
-//kernel:smp       <- multi-core support (optional)
+//crates/net:ethernet         <- always (virtio-net frames)
+//crates/net:arp              <- ipv4 needs this
+//crates/net:ipv4             <- tcp, udp-over-ipv4
+//crates/net:ipv6             <- quic, udp-over-ipv6
+//crates/net:ndp              <- ipv6 needs this (replaces ARP)
+//crates/net/tcp              <- transport/http needs this
+//crates/net:udp              <- quic needs this
+//crates/transport/quic       <- transport/http3 needs this (+ tls)
+//crates/transport/http       <- HTTP/1.1 server (deps: tcp)
+//crates/transport/http3      <- HTTP/3 server (deps: quic)
 ```
 
 Example apps:
 ```python
 # Modern: HTTP/3 + QUIC + IPv6 (no TCP, no ARP, no IPv4)
-rust_library(name = "app", deps = ["//uni:http3"])
+rust_library(name = "app", deps = ["//crates/transport/http3"])
 
 # Legacy: HTTP/1.1 + TCP + IPv4
-rust_library(name = "app", deps = ["//uni:http"])
+rust_library(name = "app", deps = ["//crates/transport/http"])
 
 # Both: serve HTTP/1.1 and HTTP/3 side by side
-rust_library(name = "app", deps = ["//uni:http", "//uni:http3"])
+rust_library(name = "app", deps = [
+    "//crates/transport/http",
+    "//crates/transport/http3",
+])
 ```
 
 ---
@@ -93,8 +95,8 @@ circular dependencies, then new protocols get their own targets.
 
 **Try it:**
 ```bash
-bazel test //net:types_test //net:protocol_tests  # 21 unit tests (host-native)
-bazel test //apps/webserver:test                  # HTTP + UDP echo (QEMU)
+bazel test //crates/net:types_test //crates/net:protocol_tests  # 21 unit tests (host-native)
+bazel test //apps/webserver:test                                # HTTP + UDP echo (QEMU)
 ```
 
 ### 1b. Add crate_universe for crates.io dependencies
@@ -802,9 +804,9 @@ Maybe 100 lines. Sits between IPv4 and QUIC.
 
 **Try it:**
 ```bash
-bazel test //net:types_test                          # unit tests (includes UDP checksum)
-bazel test //apps/webserver:test_qemu_x86_64   # HTTP + UDP echo (x86_64)
-bazel test //apps/webserver:test_qemu_aarch64  # HTTP + UDP echo (aarch64)
+bazel test //crates/net:types_test               # unit tests (includes UDP checksum)
+bazel test //apps/webserver:test_qemu_x86_64     # HTTP + UDP echo (x86_64)
+bazel test //apps/webserver:test_qemu_aarch64    # HTTP + UDP echo (aarch64)
 ```
 
 ### 3b. TLS 1.3 — hand-rolled, sans-io, audited primitives

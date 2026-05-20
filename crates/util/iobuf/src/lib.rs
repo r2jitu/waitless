@@ -25,7 +25,7 @@
 //
 // An IOBuf has two ownership models, and they have different
 // thread-safety. Rather than one `!Send` type guarded by discipline,
-// the crate splits them — see docs/uni-iobuf-type-model.md:
+// the crate splits them — see docs/iobuf-type-model.md:
 //
 //   * Each ownership variant is its own struct in `storage.rs`
 //     (`HeapStorage`, `StaticView`, `ExternalOwned`, `BorrowedView`),

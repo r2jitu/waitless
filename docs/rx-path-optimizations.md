@@ -1,5 +1,12 @@
 # RX path optimizations — tracker
 
+> **Note on Bazel labels.** Items below reference labels by their path
+> at the time the work landed (e.g. `//uni-iobuf:iobuf_test`,
+> `//net:tcp`). After the May 2026 crate reorganization those moved
+> under `//crates/`; see [crates.md](crates.md) for the current map.
+> Updates here are deliberately not retro-rewritten so the historical
+> narrative still matches what each commit's diff actually said.
+
 A living plan for trimming the RX path between NIC RX and the
 application handler. Covers TCP, HTTPS-over-TCP (TLS 1.3), and
 HTTP/3 (QUIC) where applicable. Each item below is sized to land
@@ -939,7 +946,7 @@ chain generic-ized as `Chain<B>`. Item C's `RxInbox<T: Send>`
 inherits the `Send` guarantee by derivation, with no `unsafe impl
 Send`. `into_owned` stayed item A's `IOBuf → IOBuf` (a cross-*time*
 tool, not the cross-core gate). Full write-up:
-[`uni-iobuf-type-model.md`](uni-iobuf-type-model.md).
+[`iobuf-type-model.md`](iobuf-type-model.md).
 
 ### Operational
 

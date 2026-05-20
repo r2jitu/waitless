@@ -26,25 +26,27 @@ test-controllable clock, and TCP retransmission all now exist.
 
 Landed:
 
-- `net_tcp` is host-buildable. `//net:tcp_test` is a packetdrill-style
-  harness: it drives scripted TCP segments into the real `tcp_receive`
-  against a mock `NicOps` that captures every transmitted frame, then
-  asserts on the captured output. Eleven scenarios — the handshake
-  trio (SYN→SYN-ACK, in-order data→ACK, FIN→ACK), the receiver-side
-  set (retransmitted SYN, duplicate data, out-of-order, RST at/off
-  `rcv_nxt`), and the RFC 6298 set (RTO retransmit + backoff, ACK
-  stops the timer, the SRTT/RTTVAR estimator). Harness lives in
-  `net/src/tcp.rs`'s `#[cfg(test)] mod tests`.
+- `tcp` is host-buildable. `//crates/net/tcp:tcp_test` is a
+  packetdrill-style harness: it drives scripted TCP segments into the
+  real `tcp_receive` against a mock `NicOps` that captures every
+  transmitted frame, then asserts on the captured output. Eleven
+  scenarios — the handshake trio (SYN→SYN-ACK, in-order data→ACK,
+  FIN→ACK), the receiver-side set (retransmitted SYN, duplicate data,
+  out-of-order, RST at/off `rcv_nxt`), and the RFC 6298 set (RTO
+  retransmit + backoff, ACK stops the timer, the SRTT/RTTVAR
+  estimator). Harness lives in `crates/net/tcp/src/lib.rs`'s
+  `#[cfg(test)] mod tests`.
 - A `now_ms()` compile-time clock seam (`kernel_core::clock`) with a
   test-controllable host mock — the prerequisite for every
   timer-driven test.
 - TCP RFC 6298 retransmission: a per-conn retransmit ring, the RTO
   timer wired into the poll loop, exponential backoff, and the
   SRTT/RTTVAR estimator. A lost outbound segment is now resent.
-- `uni-quic` already host-builds; `//uni-quic:uni_quic_test` includes
-  `end_to_end_self_handshake`, which drives a synthetic Initial
-  through the receive path.
-- `classify` (RX parse) is host-tested via `//net:net_rx_test`.
+- `quic` already host-builds; `//crates/transport/quic:uni_quic_test`
+  includes `end_to_end_self_handshake`, which drives a synthetic
+  Initial through the receive path.
+- `net_classify` (RX parse) is host-tested via
+  `//crates/net:classify_test`.
 
 What remains: RFC 5681 congestion control, QUIC loss recovery, and
 the feature-breadth items (window scaling, SACK) — steps 4 onward.
