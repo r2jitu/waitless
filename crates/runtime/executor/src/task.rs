@@ -135,13 +135,22 @@ impl TaskHandle {
     }
 }
 
-/// Spawn a future onto the current worker's arena. `Err(())` when
-/// the arena is full — the future is dropped in that case.
+/// Failure returned by [`spawn`] / [`spawn_boxed`] when the
+/// current worker's arena is full. The submitted future has been
+/// dropped — callers typically log and back off, or abort an
+/// existing task to free a slot. A unit struct (vs an enum)
+/// because "arena full" is the only failure mode the spawner has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnError;
+
+/// Spawn a future onto the current worker's arena. Returns
+/// `Err(SpawnError)` when the arena is full — the future is
+/// dropped in that case.
 ///
 /// One heap alloc per spawn (the `Box::pin`). Callers that
 /// already have a `Pin<Box<dyn Future>>` should use
 /// [`spawn_boxed`] instead to skip the redundant re-box.
-pub fn spawn<F>(f: F) -> Result<TaskHandle, ()>
+pub fn spawn<F>(f: F) -> Result<TaskHandle, SpawnError>
 where
     F: Future<Output = ()> + 'static,
 {
@@ -154,9 +163,9 @@ where
 /// listener accept-loops that route through a type-erased
 /// factory closure returning `BoxFuture`).
 ///
-/// `Err(())` when the arena is full — the future is dropped
-/// in that case.
-pub fn spawn_boxed(fut: BoxedFuture) -> Result<TaskHandle, ()> {
+/// `Err(SpawnError)` when the arena is full — the future is
+/// dropped in that case.
+pub fn spawn_boxed(fut: BoxedFuture) -> Result<TaskHandle, SpawnError> {
     let cc = CurrentWorker::enter();
     let worker_id = cc.id();
     let arena = ARENAS.current(&cc);
@@ -184,7 +193,7 @@ pub fn spawn_boxed(fut: BoxedFuture) -> Result<TaskHandle, ()> {
             });
         }
     }
-    Err(())
+    Err(SpawnError)
 }
 
 // ---- Waker vtable ----------------------------------------------------------

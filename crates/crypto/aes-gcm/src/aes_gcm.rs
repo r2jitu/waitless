@@ -43,6 +43,17 @@ use crate::ghash_batch::{BATCH_LEN, BLOCK_LEN as GHASH_BLOCK, GhashKey};
 pub const KEY_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
+
+/// AEAD `open` failure. The only failure mode is "the
+/// authentication tag did not match the recomputed tag" — a
+/// unit struct (vs an enum or `()`) because constant-time tag
+/// compare is the single source of failure for an AES-128-GCM
+/// decrypt, and so callers never branch on a variant. Callers
+/// either re-key + tear the conn down, or surface it via their
+/// own outer error enum (e.g. `RecordError::AeadOpenFailed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AeadError;
+
 const BLOCK_LEN: usize = 16;
 const CHUNK_BLOCKS: usize = 8;
 const CHUNK_LEN: usize = BLOCK_LEN * CHUNK_BLOCKS; // 128
@@ -152,14 +163,14 @@ impl Aes128GcmFast {
     }
 
     /// Verify-and-decrypt. On success: `buffer` decrypted in
-    /// place, returns `Ok(())`. On tag mismatch: `Err(())`.
+    /// place, returns `Ok(())`. On tag mismatch: `Err(AeadError)`.
     pub fn open(
         &self,
         nonce: &[u8; NONCE_LEN],
         aad: &[u8],
         buffer: &mut [u8],
         tag: &[u8; TAG_LEN],
-    ) -> Result<(), ()> {
+    ) -> Result<(), AeadError> {
         let mut j0 = [0u8; BLOCK_LEN];
         j0[..NONCE_LEN].copy_from_slice(nonce);
         j0[BLOCK_LEN - 1] = 1;
@@ -236,7 +247,7 @@ impl Aes128GcmFast {
         if ct_eq_tag(&computed, tag) {
             Ok(())
         } else {
-            Err(())
+            Err(AeadError)
         }
     }
 

@@ -897,15 +897,16 @@ impl UdpSocket {
     }
 
     /// Send a datagram from this socket to `(dst_ip, dst_port)`.
-    /// Returns `Err(())` if the backend isn't wired (should only
+    /// Returns `None` if the backend isn't wired (should only
     /// happen pre-init) — backend failures themselves (full TX
     /// ring on bare-metal, `sendto` EAGAIN on native) are swallowed
-    /// today since they're harmless for UDP; add a proper error
-    /// enum when QUIC needs to observe them.
-    pub fn send_to(&self, dst_ip: IpAddr, dst_port: u16, data: &[u8]) -> Result<(), ()> {
-        let b = udp_backend().ok_or(())?;
+    /// today since they're harmless for UDP; switch to a proper
+    /// error enum when QUIC needs to observe them.
+    #[must_use = "discarding the `None` swallows a missing-backend bug"]
+    pub fn send_to(&self, dst_ip: IpAddr, dst_port: u16, data: &[u8]) -> Option<()> {
+        let b = udp_backend()?;
         (b.send)(dst_ip, self.port, dst_port, data);
-        Ok(())
+        Some(())
     }
 
     /// Submit a previously-[acquired](acquire_tx_buf) TX
@@ -914,26 +915,27 @@ impl UdpSocket {
     /// the L2/L3/L4 headers in the headroom). Consumes the
     /// handle.
     ///
-    /// `Err(())` if the backend doesn't support handle-based send;
+    /// `None` if the backend doesn't support handle-based send;
     /// the handle is dropped (slot returns to the pool unused).
+    #[must_use = "discarding the `None` swallows a missing-backend bug"]
     pub fn send_via_tx_handle(
         &self,
         dst_ip: IpAddr,
         dst_port: u16,
         handle: nic_api::TxBufHandle,
         frame_len: usize,
-    ) -> Result<(), ()> {
-        let b = udp_backend().ok_or(())?;
+    ) -> Option<()> {
+        let b = udp_backend()?;
         if let Some(f) = b.send_via_tx_handle {
             f(dst_ip, self.port, dst_port, handle, frame_len);
-            Ok(())
+            Some(())
         } else {
             // No bare-metal-style hook (e.g. native): drop the
             // handle (returns slot to pool) and let the caller
             // retry via the slice-shaped path. Should not happen
             // when paired with `acquire_tx_buf`'s `None` gating.
             drop(handle);
-            Err(())
+            None
         }
     }
 
@@ -948,19 +950,22 @@ impl UdpSocket {
     ///
     /// Used by the QUIC reactor to skip the per-packet UDP-wrap
     /// memcpy that `send_to` would otherwise pay.
+    ///
+    /// Returns `None` if the backend isn't wired (pre-init only).
+    #[must_use = "discarding the `None` swallows a missing-backend bug"]
     pub fn send_to_with_l2_headroom(
         &self,
         dst_ip: IpAddr,
         dst_port: u16,
         frame: &mut [u8],
-    ) -> Result<(), ()> {
-        let b = udp_backend().ok_or(())?;
+    ) -> Option<()> {
+        let b = udp_backend()?;
         if let Some(fast) = b.send_with_l2_headroom {
             fast(dst_ip, self.port, dst_port, frame);
         } else {
             (b.send)(dst_ip, self.port, dst_port, &frame[MAX_L2_HEADROOM..]);
         }
-        Ok(())
+        Some(())
     }
 
     /// Await one datagram on the **calling worker's** inbox. The
@@ -1141,9 +1146,11 @@ impl UdpClient {
         })
     }
 
-    /// Send a datagram to the connected peer.
+    /// Send a datagram to the connected peer. Returns `None` if
+    /// the UDP backend isn't wired (pre-init).
     #[inline]
-    pub fn send(&self, data: &[u8]) -> Result<(), ()> {
+    #[must_use = "discarding the `None` swallows a missing-backend bug"]
+    pub fn send(&self, data: &[u8]) -> Option<()> {
         self.inner.send_to(self.peer_ip, self.peer_port, data)
     }
 

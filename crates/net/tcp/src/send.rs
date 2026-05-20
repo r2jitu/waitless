@@ -582,21 +582,23 @@ pub(crate) fn send_rst(
 ///
 /// Bare-metal's NIC TX never blocks under this stack's load
 /// model, so this always sends every byte in the chain (or
-/// returns `Err(())` on a dead conn / stale `gen`).
+/// returns `Err(TcpSendError::Closed)` on a dead conn / stale
+/// `gen`).
 pub fn async_try_send_chain(
     handle: *mut (),
     generation: u16,
     chain: &mut iobuf::IOBufChain,
-) -> Result<usize, ()> {
-    let (core, slot) = decode_handle(handle).ok_or(())?;
+) -> Result<usize, executor::reactor::TcpSendError> {
+    use executor::reactor::TcpSendError;
+    let (core, slot) = decode_handle(handle).ok_or(TcpSendError::Closed)?;
     // SAFETY: per-core ownership; the worker that registered this
     // backend is the one polling its `TcpSendChain`.
     let c = unsafe { &mut *conn_ptr(core, slot) };
     if c.generation != generation {
-        return Err(());
+        return Err(TcpSendError::Closed);
     }
     if c.state != TcpState::Established {
-        return Err(());
+        return Err(TcpSendError::Closed);
     }
 
     let total = chain.total_len();

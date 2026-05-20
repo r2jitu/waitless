@@ -344,21 +344,22 @@ fn native_tcp_clear_recv_waker(handle: *mut (), generation: u16) {
 /// committed bytes, so the next call sees only the remainder.
 ///
 /// Returns `Ok(n)` for bytes-pushed-this-call, `Ok(0)` on
-/// EAGAIN (caller parks waker), `Err(())` on fatal error / stale
-/// `gen` (caller drops the conn).
+/// EAGAIN (caller parks waker), `Err(TcpSendError::Closed)` on
+/// fatal error / stale `gen` (caller drops the conn).
 fn native_tcp_try_send_chain(
     handle: *mut (),
     generation: u16,
     chain: &mut iobuf::IOBufChain,
-) -> Result<usize, ()> {
+) -> Result<usize, executor::reactor::TcpSendError> {
+    use executor::reactor::TcpSendError;
     unsafe {
         let (c, live) = check_gen(handle, generation);
         if !live {
-            return Err(());
+            return Err(TcpSendError::Closed);
         }
         let fd = (*c).fd;
         if fd < 0 {
-            return Err(());
+            return Err(TcpSendError::Closed);
         }
         let total = chain.total_len();
         if total == 0 {
@@ -388,7 +389,7 @@ fn native_tcp_try_send_chain(
                 if errno() == EAGAIN {
                     return Ok(0);
                 }
-                return Err(());
+                return Err(TcpSendError::Closed);
             }
             drain_chain_prefix(chain, n as usize);
             return Ok(n as usize);
@@ -414,7 +415,7 @@ fn native_tcp_try_send_chain(
                     // to park; with partial progress → report it.
                     return Ok(sent_total);
                 }
-                return Err(());
+                return Err(TcpSendError::Closed);
             }
             let n = n as usize;
             if n == data.len() {

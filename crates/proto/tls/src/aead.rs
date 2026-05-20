@@ -106,17 +106,28 @@ where
     seal(key, nonce, aad, &mut dst[..cursor])
 }
 
+/// AEAD `open` failure. Tag-mismatch is the only AEAD failure
+/// mode (the upstream `aes-gcm` crate's `Error` is itself a unit
+/// type for the same reason). The TLS record layer maps it to
+/// [`crate::record::RecordError::AeadOpenFailed`]; QUIC's
+/// equivalent layer maps it to a packet-drop. A separate type
+/// per crate (`tls::aead::AeadError`, `quic::crypto::AeadError`)
+/// keeps the layering clean — TLS doesn't need a QUIC dep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AeadError;
+
 /// One-shot AEAD decrypt + verify. Returns `Ok(())` on tag match
-/// and decrypts `data` in place; returns `Err(())` on tag mismatch
-/// (in which case `data` is left in an undefined state — the
-/// upstream crate zeroises or leaves it, we don't rely on either).
+/// and decrypts `data` in place; returns `Err(AeadError)` on tag
+/// mismatch (in which case `data` is left in an undefined state —
+/// the upstream crate zeroises or leaves it, we don't rely on
+/// either).
 pub fn open(
     key: &[u8; KEY_LEN],
     nonce: &[u8; NONCE_LEN],
     aad: &[u8],
     data: &mut [u8],
     tag: &[u8; TAG_LEN],
-) -> Result<(), ()> {
+) -> Result<(), AeadError> {
     let cipher = Aes128Gcm::new(GenericArray::from_slice(key));
     cipher
         .decrypt_in_place_detached(
@@ -125,7 +136,7 @@ pub fn open(
             data,
             GenericArray::from_slice(tag),
         )
-        .map_err(|_| ())
+        .map_err(|_| AeadError)
 }
 
 // ============================================================================

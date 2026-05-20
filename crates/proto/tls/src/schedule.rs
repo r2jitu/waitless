@@ -302,9 +302,15 @@ impl TrafficKey {
         self.cipher.seal_chain(&nonce, aad, src_parts, dst)
     }
 
-    /// Open `data` in place; returns Err on tag mismatch. Auto-increments
-    /// `seq` on success.
-    pub fn open(&mut self, aad: &[u8], data: &mut [u8], tag: &[u8; 16]) -> Result<(), ()> {
+    /// Open `data` in place; returns `Err(AeadError)` on tag
+    /// mismatch (forwarded from the underlying `Aes128GcmFast`).
+    /// Auto-increments `seq` on success.
+    pub fn open(
+        &mut self,
+        aad: &[u8],
+        data: &mut [u8],
+        tag: &[u8; 16],
+    ) -> Result<(), uni_aes_gcm::AeadError> {
         let nonce = self.nonce_for_seq(self.seq);
         self.cipher.open(&nonce, aad, data, tag)?;
         self.seq = self.seq.wrapping_add(1);

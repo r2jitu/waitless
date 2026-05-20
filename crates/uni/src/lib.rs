@@ -224,7 +224,7 @@ macro_rules! println {
 /// works on both unikernel and native.
 pub mod runtime {
     pub use backend::runtime::{Sleep, sleep_us, spawn};
-    pub use executor::TaskHandle;
+    pub use executor::{SpawnError, TaskHandle};
     pub use executor::event::{AsyncEvent, WaitEvent};
     /// Family-agnostic IP address used in `UdpSocket::recv_from` /
     /// `send_to` and elsewhere on the runtime API. Re-exported so

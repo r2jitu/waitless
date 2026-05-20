@@ -57,4 +57,4 @@ extern crate alloc;
 pub mod aes_gcm;
 pub mod ghash_batch;
 
-pub use aes_gcm::{Aes128GcmFast, KEY_LEN, NONCE_LEN, TAG_LEN};
+pub use aes_gcm::{AeadError, Aes128GcmFast, KEY_LEN, NONCE_LEN, TAG_LEN};

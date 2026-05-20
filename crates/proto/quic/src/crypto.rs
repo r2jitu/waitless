@@ -194,20 +194,28 @@ pub fn aes128_gcm_seal(
     out
 }
 
-/// AES-128-GCM in-place open + verify. `Err(())` on tag mismatch.
+/// AES-128-GCM `open` failure. Tag-mismatch is the only failure
+/// mode — a unit struct keeps callers from branching on a
+/// non-existent variant, and the QUIC packet handler maps it
+/// straight to a frame-level "drop packet" decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AeadError;
+
+/// AES-128-GCM in-place open + verify. `Err(AeadError)` on tag
+/// mismatch.
 pub fn aes128_gcm_open(
     key: &[u8; AES_KEY_LEN],
     nonce: &[u8; NONCE_LEN],
     aad: &[u8],
     data: &mut [u8],
     tag: &[u8; TAG_LEN],
-) -> Result<(), ()> {
+) -> Result<(), AeadError> {
     let cipher = Aes128Gcm::new(GenericArray::from_slice(key));
     let nonce_arr = GenericArray::from_slice(nonce);
     let tag_arr = GenericArray::from_slice(tag);
     cipher
         .decrypt_in_place_detached(nonce_arr, aad, data, tag_arr)
-        .map_err(|_| ())
+        .map_err(|_| AeadError)
 }
 
 // `chacha20_poly1305_seal/open` removed in the AES-128-GCM TLS

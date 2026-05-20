@@ -332,6 +332,18 @@ static TCP_REGISTRY: [TcpState; MAX_TCP_LISTENERS] = [const { TcpState::new() };
 
 // ---- Backend vtable (TCP) ---------------------------------------------------
 
+/// Failure returned by [`TcpBackend::try_send`] (and the matching
+/// TSO fast path) when the connection cannot accept further bytes.
+/// One variant today — "the underlying conn is gone" — but kept as
+/// an enum so a future TX-backpressure signal can be added without
+/// touching every call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpSendError {
+    /// Conn closed by peer/reset, or the slot has been reused under
+    /// us (stale `generation`). The caller drops the conn.
+    Closed,
+}
+
 /// Optional TSO fast-path send. The `fill` closure writes TCP-
 /// payload bytes directly into the driver's big-slot TX-pool
 /// buffer; the backend stamps L2/L3/L4 headers around them and
@@ -455,10 +467,13 @@ pub struct TcpBackend {
     ///   * `Ok(n)` where `n > 0`: drained `n` bytes (chain shrunk).
     ///   * `Ok(0)`: backend queue is full — caller parks a waker
     ///     and re-polls.
-    ///   * `Err(())`: fatal conn error / stale `gen` — caller
-    ///     drops the conn.
-    pub try_send:
-        fn(handle: *mut (), generation: u16, chain: &mut iobuf::IOBufChain) -> Result<usize, ()>,
+    ///   * `Err(TcpSendError::Closed)`: fatal conn error / stale
+    ///     `gen` — caller drops the conn.
+    pub try_send: fn(
+        handle: *mut (),
+        generation: u16,
+        chain: &mut iobuf::IOBufChain,
+    ) -> Result<usize, TcpSendError>,
     /// Park `waker` on the conn's send slot; a subsequent writable
     /// event fires it. Stale `gen` fires immediately.
     pub register_send_waker: fn(handle: *mut (), generation: u16, waker: &Waker),
@@ -1093,7 +1108,7 @@ impl<'a> Future for TcpSendChain<'a> {
                 return Poll::Ready(Ok(()));
             }
             match (b.try_send)(h, g, this.chain) {
-                Err(()) => {
+                Err(_) => {
                     // Drop the unsent remainder — caller can't reuse
                     // a chain whose underlying conn just died.
                     this.chain.clear();
@@ -1105,7 +1120,7 @@ impl<'a> Future for TcpSendChain<'a> {
                     // the writable event site.
                     (b.register_send_waker)(h, g, cx.waker());
                     match (b.try_send)(h, g, this.chain) {
-                        Err(()) => {
+                        Err(_) => {
                             this.chain.clear();
                             return Poll::Ready(Err(()));
                         }
