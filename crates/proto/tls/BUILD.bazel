@@ -25,7 +25,11 @@ rust_library(
         "src/lib.rs",
         # Sans-io TLS primitives (formerly //crates/net:tls{,_crypto,_handshake,_record})
         "src/aead.rs",
-        "src/handshake.rs",
+        "src/handshake/mod.rs",
+        "src/handshake/client_hello.rs",
+        "src/handshake/messages.rs",
+        "src/handshake/reader.rs",
+        "src/handshake/server_hello.rs",
         "src/record.rs",
         "src/schedule.rs",
         # TLS-over-TCP server state machine + helpers.
