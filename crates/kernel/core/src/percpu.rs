@@ -222,10 +222,16 @@ static CORES: PerWorker<PerCore> = PerWorker::new();
 /// pair without per-call-site fn-pointer transmutes.
 static AP_POLL_FN: crate::sync::AtomicFn<fn(u32) -> bool> = crate::sync::AtomicFn::null();
 
-/// Initialise per-core state for `count` cores. BSP-only, single-
-/// threaded, before any AP starts and before any `get()`. Publishes
-/// `count` via `set_num_workers` so every `PerWorker<T>` (here, in
+/// Initialise per-core state for `count` cores. Publishes `count`
+/// via `set_num_workers` so every `PerWorker<T>` (here, in
 /// `executor`, in `net::*`) sizes itself the same.
+///
+/// # Safety
+///
+/// BSP-only, single-threaded: must run before any AP starts and
+/// before any `get()` call. The implementation initialises shared
+/// globals (`CORES`, `RX_NODE_POOL`, `executor`) without
+/// synchronisation, relying on no other core being live.
 pub unsafe fn init(count: u32) {
     worker::set_num_workers(count);
     CORES.init(count, |i| PerCore::new(i));
@@ -238,7 +244,9 @@ pub unsafe fn init(count: u32) {
 
 /// Get a shared reference to a core's state.
 ///
-/// SAFETY: caller must ensure `init()` has completed and `id < num_cores()`.
+/// # Safety
+///
+/// Caller must ensure `init()` has completed and `id < num_cores()`.
 /// Multiple cores may safely call this concurrently — interior mutability
 /// (`Atomic*`, `UnsafeCell` behind SPSC discipline) makes shared access sound.
 pub unsafe fn get(id: u32) -> &'static PerCore {

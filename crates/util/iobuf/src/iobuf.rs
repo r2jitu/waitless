@@ -80,11 +80,13 @@ impl IOBuf {
     /// the memset at the price of an unsafe contract: the caller must
     /// write to every byte before reading it.
     ///
-    /// SAFETY: the caller must ensure no byte is read via `data()`
-    /// before it's been written through one of `append_slice`,
-    /// `writer`, `extend_uninit`, or a `prepend` that moves the
-    /// visible window over it. The IOBuf API enforces this for
-    /// callers that only use the public mutation entry points.
+    /// # Safety
+    ///
+    /// The caller must ensure no byte is read via `data()` before
+    /// it's been written through one of `append_slice`, `writer`,
+    /// `extend_uninit`, or a `prepend` that moves the visible
+    /// window over it. The IOBuf API enforces this for callers
+    /// that only use the public mutation entry points.
     pub unsafe fn new_with_reserved_uninit(
         headroom: usize,
         payload_capacity: usize,
@@ -128,7 +130,9 @@ impl IOBuf {
     /// cross-core path is typed `OwnedIOBuf`, which has no borrowed
     /// variant, so a borrow can't reach it at all.
     ///
-    /// SAFETY: the caller MUST guarantee:
+    /// # Safety
+    ///
+    /// The caller MUST guarantee:
     ///   * `base..base+capacity` is a valid byte region for the
     ///     entire lifetime of this IOBuf.
     ///   * `offset + len <= capacity`.

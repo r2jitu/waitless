@@ -360,16 +360,18 @@ impl TlsServer {
     /// Write a fully-initialised `TlsServer` into the given
     /// uninitialised pointer.
     ///
-    /// SAFETY: `this` must point at writable, properly-aligned,
-    /// uninitialised memory of exactly `size_of::<TlsServer>()`.
-    /// On return, every field is initialised — the pointer is
-    /// safe to convert via `assume_init` / dereference.
-    ///
     /// Each field is written via `addr_of_mut!` so the compiler
     /// never materialises a struct-shaped stack temporary; in
     /// particular the three 4 KB buffers are zero-filled directly
     /// via `write_bytes` on the heap pointer rather than
     /// `[0u8; N]` literals.
+    ///
+    /// # Safety
+    ///
+    /// `this` must point at writable, properly-aligned,
+    /// uninitialised memory of exactly `size_of::<TlsServer>()`.
+    /// On return, every field is initialised — the pointer is
+    /// safe to convert via `assume_init` / dereference.
     pub unsafe fn init_in_place(this: *mut Self, x25519_seed: [u8; 32]) {
         // Plain Copy / small fields first.
         unsafe {

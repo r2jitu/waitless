@@ -113,7 +113,9 @@ unsafe impl<T: Copy + Send> Sync for ReadWrite<T> {}
 /// all subsequent register access through the returned reference is
 /// safe Rust.
 ///
-/// SAFETY: caller must ensure that
+/// # Safety
+///
+/// Caller must ensure that
 ///   1. `base` is a valid MMIO address for a device whose register
 ///      layout matches `D`,
 ///   2. the device exists for the lifetime of the program (`'static`),

@@ -82,7 +82,9 @@ impl OwnedIOBuf {
     /// land the result in a (borrow-mixing) `IOBuf` chain, widen it
     /// with `From<OwnedIOBuf>`.
     ///
-    /// SAFETY: the caller MUST guarantee:
+    /// # Safety
+    ///
+    /// The caller MUST guarantee:
     ///   * `base..base+capacity` is a valid, exclusively-owned byte
     ///     region for the IOBuf's lifetime.
     ///   * `offset + len <= capacity`.

@@ -92,10 +92,12 @@ impl CurrentWorker {
     /// matches the current worker (e.g. threaded through from an
     /// event-loop callback dispatch). Saves the `platform` read.
     ///
-    /// SAFETY: caller must guarantee that `id == platform::
-    /// current_worker()` at the time of the call AND that the token
-    /// does not outlive the iteration (which can never cross threads
-    /// because `CurrentWorker` is `!Send`).
+    /// # Safety
+    ///
+    /// Caller must guarantee that `id == platform::current_worker()`
+    /// at the time of the call AND that the token does not outlive
+    /// the iteration (which can never cross threads because
+    /// `CurrentWorker` is `!Send`).
     #[inline(always)]
     pub unsafe fn from_id_unchecked(id: u32) -> Self {
         CurrentWorker {
