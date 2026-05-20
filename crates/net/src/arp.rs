@@ -2,8 +2,8 @@
 
 #![no_std]
 
-extern crate ethernet as ethernet;
-extern crate ethernet_send as ethernet_send;
+extern crate ethernet;
+extern crate ethernet_send;
 extern crate iobuf;
 extern crate kernel_core;
 extern crate net_from_bytes as from_bytes;

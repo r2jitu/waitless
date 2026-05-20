@@ -18,11 +18,11 @@
 
 #![no_std]
 
-extern crate ethernet as ethernet;
-extern crate ethernet_send as ethernet_send;
-extern crate icmpv6 as icmpv6;
-extern crate ipv6 as ipv6;
-extern crate ndp as ndp;
+extern crate ethernet;
+extern crate ethernet_send;
+extern crate icmpv6;
+extern crate ipv6;
+extern crate ndp;
 extern crate net_types as types;
 
 use ethernet_send::ethernet_send;

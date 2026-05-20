@@ -15,10 +15,10 @@
 
 #![no_std]
 
-extern crate arp as arp;
-extern crate ethernet as ethernet;
+extern crate arp;
+extern crate ethernet;
 extern crate executor;
-extern crate ipv4 as ipv4;
+extern crate ipv4;
 extern crate kernel_bare;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;

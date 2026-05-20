@@ -7,12 +7,12 @@
 
 #![no_std]
 
-extern crate ethernet as ethernet;
+extern crate ethernet;
 extern crate executor;
-extern crate ipv4 as ipv4;
-extern crate ipv6 as ipv6;
-extern crate ipv6_send as ipv6_send;
-extern crate mac_resolve as mac_resolve;
+extern crate ipv4;
+extern crate ipv6;
+extern crate ipv6_send;
+extern crate mac_resolve;
 extern crate net_checksum as checksum;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;

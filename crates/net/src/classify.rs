@@ -14,9 +14,9 @@
 
 #![cfg_attr(not(test), no_std)]
 
-extern crate ethernet as ethernet;
-extern crate ipv4 as ipv4;
-extern crate ipv6 as ipv6;
+extern crate ethernet;
+extern crate ipv4;
+extern crate ipv6;
 extern crate net_types as types;
 
 use types::{IpAddr, Ipv6Addr, MacAddr, ParsedL3};

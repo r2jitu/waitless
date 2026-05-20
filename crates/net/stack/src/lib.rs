@@ -18,18 +18,18 @@ extern crate nic;
 
 extern crate net_classify;
 
-pub extern crate arp as arp;
-pub extern crate dhcp as dhcp;
-pub extern crate ethernet as ethernet;
-pub extern crate ethernet_send as ethernet_send;
-pub extern crate icmpv6 as icmpv6;
-pub extern crate ipv4 as ipv4;
-pub extern crate ipv6 as ipv6;
-pub extern crate ipv6_send as ipv6_send;
-pub extern crate ndp as ndp;
+pub extern crate arp;
+pub extern crate dhcp;
+pub extern crate ethernet;
+pub extern crate ethernet_send;
+pub extern crate icmpv6;
+pub extern crate ipv4;
+pub extern crate ipv6;
+pub extern crate ipv6_send;
+pub extern crate ndp;
 pub extern crate net_types as types;
-pub extern crate tcp as tcp;
-pub extern crate udp as udp;
+pub extern crate tcp;
+pub extern crate udp;
 
 use kernel_bare::percpu;
 

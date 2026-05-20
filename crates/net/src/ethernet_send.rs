@@ -8,7 +8,7 @@
 
 #![no_std]
 
-extern crate ethernet as ethernet;
+extern crate ethernet;
 extern crate net_types as types;
 extern crate nic;
 

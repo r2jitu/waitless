@@ -14,8 +14,8 @@
 
 #![no_std]
 
-extern crate arp as arp;
-extern crate ndp as ndp;
+extern crate arp;
+extern crate ndp;
 extern crate net_types as types;
 
 use types::{CONFIG, IpAddr, Ipv4Addr, MacAddr};
