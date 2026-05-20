@@ -11,27 +11,34 @@ Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework 
 ## Architecture
 
 ```
-┌─────────────────────────────────────┐
-│           Application               │  apps/webserver/
-│         #[uni::init]                │
-├─────────────────────────────────────┤
-│    Platform Abstraction (uni)       │  uni/ (HTTP, TCP, TLS 1.3, logging)
-├─────────────────────────────────────┤
-│       Network Stack (net)           │  net/ (TCP, IPv4, ARP, DHCP, Ethernet,
-│                                     │        TLS 1.3 server, 4-tuple hash)
-├─────────────────────────────────────┤
-│     Drivers (virtio-net, gVNIC,     │  drivers/ (PCI, VirtIO, virtio-net,
-│              PCI)                   │            gVNIC, net dispatch shim)
-├─────────────────────────────────────┤
-│       Kernel (serial, mm, SMP...)   │  kernel/ (serial, mm, fdt, mmu,
-│                                     │          percpu, eventloop,
-│                                     │          exceptions, x86_64 gdt/idt)
-├─────────────────────────────────────┤
-│        Boot / Entry                 │  boot/ (entry.rs, limine, boot.S)
-└─────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│           Application                │  apps/webserver/
+│         #[uni::init]                 │
+├──────────────────────────────────────┤
+│      Transports (above facade)       │  crates/transport/{tls, http,
+│                                      │                    quic, http3}
+├──────────────────────────────────────┤
+│    Facade (uni — kernel↔userspace)   │  crates/api/{uni, macros, net}
+├──────────────────────────────────────┤
+│       Network Stack (below facade)   │  crates/net/ (TCP, UDP, IPv4/6,
+│                                      │              ARP, NDP, DHCP, ...)
+├──────────────────────────────────────┤
+│     Drivers (NIC + bus)              │  crates/drivers/ (bus, nic-api,
+│                                      │                   nic, virtio-net, gve)
+├──────────────────────────────────────┤
+│     Runtime substrate                │  crates/runtime/{platform, worker,
+│                                      │                  executor, backend}
+├──────────────────────────────────────┤
+│       Kernel (serial, mm, SMP...)    │  crates/kernel/{core, sys}
+├──────────────────────────────────────┤
+│        Boot / Entry                  │  crates/boot/
+└──────────────────────────────────────┘
          x86_64          aarch64
      (Multiboot2/PVH)  (Linux Image/DTB)
 ```
+
+See [docs/crates.md](docs/crates.md) for the full crate taxonomy,
+naming rules, and the kernel↔userspace facade boundary.
 
 SMP via Limine's MP request on x86_64; one TX + RX queue pair per
 vCPU under Tier 1 polling, with Toeplitz-hashed RSS on gVNIC so
