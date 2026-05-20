@@ -167,6 +167,11 @@ impl ConnInbox {
     pub fn len(&self) -> usize {
         self.queue.borrow().len()
     }
+
+    /// True iff no datagrams are pending.
+    pub fn is_empty(&self) -> bool {
+        self.queue.borrow().is_empty()
+    }
 }
 
 // ============================================================================

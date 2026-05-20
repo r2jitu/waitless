@@ -261,6 +261,15 @@ impl<T> PerWorker<T> {
         self.len.load(Ordering::Relaxed)
     }
 
+    /// True iff `len() == 0`. Paired with [`Self::len`] to satisfy
+    /// the `len_without_is_empty` clippy lint; equivalent to
+    /// "no slots allocated yet" (i.e., `init` hasn't been called or
+    /// was called with `num_workers = 0`).
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// True if `init` has been called.
     #[inline(always)]
     pub fn is_initialized(&self) -> bool {

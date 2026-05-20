@@ -143,6 +143,10 @@ impl ConnectionId {
     pub fn len(&self) -> usize {
         self.len as usize
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 // ============================================================================
@@ -321,6 +325,12 @@ impl DatagramBuf {
     /// [`Connection::take_datagram_buf`].
     pub fn len(&self) -> usize {
         self.vec().len()
+    }
+
+    /// True iff no bytes have been written (headroom not yet
+    /// reserved either).
+    pub fn is_empty(&self) -> bool {
+        self.vec().is_empty()
     }
 
     /// Whether this buf is backed by a driver TX-pool slot.
