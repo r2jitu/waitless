@@ -7,7 +7,7 @@ use crate::pool::{
     TCP_SYN_RX, TCP_SYNACK_TX, alloc_connection, conn_ptr, free_connection, next_seq,
     pool_capacity, tcp_hash_find, tcp_hash_insert, tcp_hash_key, tcp_linear_find,
 };
-use crate::send::{send_rst, send_segment};
+use crate::send::{SegmentMeta, send_rst, send_segment};
 use crate::state::{
     RX_RING_BYTES, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN, TcpHeader, TcpState, seq_lt,
 };
@@ -190,14 +190,16 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
         {
             let c = unsafe { &*conn_ptr(core, slot) };
             send_segment(
-                dst_ip,
-                src_ip,
-                dst_port,
-                src_port,
-                c.snd_nxt,
-                c.rcv_nxt,
-                TCP_SYN | TCP_ACK,
-                RX_RING_BYTES as u16,
+                &SegmentMeta {
+                    local_ip: dst_ip,
+                    dst_ip: src_ip,
+                    src_port: dst_port,
+                    dst_port: src_port,
+                    seq: c.snd_nxt,
+                    ack: c.rcv_nxt,
+                    flags: TCP_SYN | TCP_ACK,
+                    window: RX_RING_BYTES as u16,
+                },
                 &[],
             );
             TCP_SYNACK_TX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -372,28 +374,32 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             // want a real timer-based ACK coalescer rather than
             // pinning this to "next data segment".
             send_segment(
-                dst_ip,
-                src_ip,
-                dst_port,
-                src_port,
-                c.snd_nxt,
-                c.rcv_nxt,
-                TCP_ACK,
-                c.rx_free() as u16,
+                &SegmentMeta {
+                    local_ip: dst_ip,
+                    dst_ip: src_ip,
+                    src_port: dst_port,
+                    dst_port: src_port,
+                    seq: c.snd_nxt,
+                    ack: c.rcv_nxt,
+                    flags: TCP_ACK,
+                    window: c.rx_free() as u16,
+                },
                 &[],
             );
         } else if seq_lt(seq, c.rcv_nxt) {
             // Duplicate/retransmitted segment — send ACK immediately so the
             // sender knows we already have this data (fast retransmit signal).
             send_segment(
-                dst_ip,
-                src_ip,
-                dst_port,
-                src_port,
-                c.snd_nxt,
-                c.rcv_nxt,
-                TCP_ACK,
-                c.rx_free() as u16,
+                &SegmentMeta {
+                    local_ip: dst_ip,
+                    dst_ip: src_ip,
+                    src_port: dst_port,
+                    dst_port: src_port,
+                    seq: c.snd_nxt,
+                    ack: c.rcv_nxt,
+                    flags: TCP_ACK,
+                    window: c.rx_free() as u16,
+                },
                 &[],
             );
         }
@@ -410,14 +416,16 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
     if flags & TCP_FIN != 0 && seq.wrapping_add(payload_len as u32) == c.rcv_nxt {
         c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
         send_segment(
-            dst_ip,
-            src_ip,
-            dst_port,
-            src_port,
-            c.snd_nxt,
-            c.rcv_nxt,
-            TCP_ACK,
-            c.rx_free() as u16,
+            &SegmentMeta {
+                local_ip: dst_ip,
+                dst_ip: src_ip,
+                src_port: dst_port,
+                dst_port: src_port,
+                seq: c.snd_nxt,
+                ack: c.rcv_nxt,
+                flags: TCP_ACK,
+                window: c.rx_free() as u16,
+            },
             &[],
         );
 

@@ -8,7 +8,7 @@ use crate::pool::{
     POOLS, RX_CHUNK_RING_DRAIN, RX_CHUNK_STASH_HITS, TCP_HASH, TcpHashCore, TcpPool,
     alloc_connection, conn_ptr, decode_handle, encode_handle, free_connection, pool_capacity,
 };
-use crate::send::send_rst;
+use crate::send::{SegmentMeta, send_rst};
 use crate::state::{TCP_ACK, TCP_FIN, TcpState};
 use core::ptr;
 use core::task::Waker;
@@ -128,14 +128,16 @@ pub fn close(handle: *mut (), generation: u16) {
     match c.state {
         TcpState::Established => {
             send_segment(
-                c.local_ip,
-                c.remote_ip,
-                c.local_port,
-                c.remote_port,
-                c.snd_nxt,
-                c.rcv_nxt,
-                TCP_FIN | TCP_ACK,
-                win,
+                &SegmentMeta {
+                    local_ip: c.local_ip,
+                    dst_ip: c.remote_ip,
+                    src_port: c.local_port,
+                    dst_port: c.remote_port,
+                    seq: c.snd_nxt,
+                    ack: c.rcv_nxt,
+                    flags: TCP_FIN | TCP_ACK,
+                    window: win,
+                },
                 &[],
             );
             c.snd_nxt = c.snd_nxt.wrapping_add(1);
@@ -143,14 +145,16 @@ pub fn close(handle: *mut (), generation: u16) {
         }
         TcpState::CloseWait => {
             send_segment(
-                c.local_ip,
-                c.remote_ip,
-                c.local_port,
-                c.remote_port,
-                c.snd_nxt,
-                c.rcv_nxt,
-                TCP_FIN | TCP_ACK,
-                win,
+                &SegmentMeta {
+                    local_ip: c.local_ip,
+                    dst_ip: c.remote_ip,
+                    src_port: c.local_port,
+                    dst_port: c.remote_port,
+                    seq: c.snd_nxt,
+                    ack: c.rcv_nxt,
+                    flags: TCP_FIN | TCP_ACK,
+                    window: win,
+                },
                 &[],
             );
             free_connection(core, slot);

@@ -40,6 +40,25 @@ pub(crate) const ETH_HDR_LEN: usize = ethernet::HEADER_LEN; // 14
 pub(crate) const IPV4_HDR_LEN: usize = ipv4::HEADER_LEN; // 20
 pub(crate) const IPV6_HDR_LEN: usize = ipv6::HEADER_LEN; // 40
 pub(crate) const TCP_HDR_LEN: usize = 20;
+
+/// The 4-tuple + sequence/ack/flags/window metadata that uniquely
+/// identifies a TCP segment we're about to emit. Bundled to keep
+/// the frame-builder + send-helper signatures readable — every site
+/// in this module previously passed the same eight scalars by hand.
+/// `dst_mac` is *not* here because it's resolved later (after a
+/// successful `mac_resolve::resolve`), and the payload (slice or
+/// cursor) varies by caller.
+#[derive(Clone, Copy)]
+pub(crate) struct SegmentMeta {
+    pub local_ip: IpAddr,
+    pub dst_ip: IpAddr,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub seq: u32,
+    pub ack: u32,
+    pub flags: u8,
+    pub window: u16,
+}
 const FRAME_BUF_LEN: usize = ETH_HDR_LEN + IPV6_HDR_LEN + TCP_HDR_LEN + MSS_V4;
 /// Per-conn-state cap on TSO super-segments: the maximum bytes we
 /// hand to `submit_tx_tso` in one frame. Sized to cover one TLS
@@ -64,18 +83,11 @@ pub(crate) fn payload_offset(local_ip: IpAddr) -> usize {
 /// checksums in place.
 unsafe fn fill_tcp_frame_headers(
     frame: &mut [u8],
-    local_ip: IpAddr,
-    dst_ip: IpAddr,
+    meta: &SegmentMeta,
     dst_mac: MacAddr,
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    window: u16,
     payload_len: usize,
 ) {
-    let tcp_off = match local_ip {
+    let tcp_off = match meta.local_ip {
         IpAddr::V4(_) => ETH_HDR_LEN + IPV4_HDR_LEN,
         IpAddr::V6(_) => ETH_HDR_LEN + IPV6_HDR_LEN,
     };
@@ -85,24 +97,24 @@ unsafe fn fill_tcp_frame_headers(
     // SAFETY: frame[tcp_off..tcp_off+TCP_HDR_LEN] is in-bounds (caller
     // sized the buffer). `TcpHeader` is `repr(C)` POD bytes.
     let tcp_hdr = unsafe { &mut *(frame.as_mut_ptr().add(tcp_off) as *mut TcpHeader) };
-    tcp_hdr.src_port = htons(src_port);
-    tcp_hdr.dst_port = htons(dst_port);
-    tcp_hdr.seq = htonl(seq);
-    tcp_hdr.ack = htonl(ack);
+    tcp_hdr.src_port = htons(meta.src_port);
+    tcp_hdr.dst_port = htons(meta.dst_port);
+    tcp_hdr.seq = htonl(meta.seq);
+    tcp_hdr.ack = htonl(meta.ack);
     tcp_hdr.data_offset = 0x50;
-    tcp_hdr.flags = flags;
-    tcp_hdr.window = htons(window);
+    tcp_hdr.flags = meta.flags;
+    tcp_hdr.window = htons(meta.window);
     tcp_hdr.checksum = 0;
     tcp_hdr.urgent = 0;
     // Stamp the pseudo-header partial sum at the TCP checksum
     // field; the driver finishes it — device CSUM offload, or a
     // software pass when the device never negotiated it.
     tcp_hdr.checksum =
-        checksum::l4_pseudo_partial(local_ip, dst_ip, types::proto::TCP, tcp_seg_len);
+        checksum::l4_pseudo_partial(meta.local_ip, meta.dst_ip, types::proto::TCP, tcp_seg_len);
 
     // ── IP header (family-dispatched) ────────────────────────────────
     let ip_total = (tcp_off - ETH_HDR_LEN + tcp_seg_len) as u16;
-    match (local_ip, dst_ip) {
+    match (meta.local_ip, meta.dst_ip) {
         (IpAddr::V4(s), IpAddr::V4(d)) => {
             ipv4::fill_header(
                 &mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN],
@@ -126,7 +138,7 @@ unsafe fn fill_tcp_frame_headers(
     }
 
     // ── Ethernet header ──────────────────────────────────────────────
-    let ethertype = match dst_ip {
+    let ethertype = match meta.dst_ip {
         IpAddr::V4(_) => ethernet::ETHERTYPE_IPV4,
         IpAddr::V6(_) => ipv6::ETHERTYPE_IPV6,
     };
@@ -197,28 +209,18 @@ where
 /// Build and ship a TCP segment whose payload comes from `payload`
 /// (a contiguous byte slice). Used by control-path callers (SYN,
 /// SYN-ACK, ACK-only, FIN, RST) and by tests.
-pub(crate) fn send_segment(
-    local_ip: IpAddr,
-    dst_ip: IpAddr,
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    window: u16,
-    payload: &[u8],
-) {
-    let dst_mac = match mac_resolve::resolve(dst_ip) {
+pub(crate) fn send_segment(meta: &SegmentMeta, payload: &[u8]) {
+    let dst_mac = match mac_resolve::resolve(meta.dst_ip) {
         Some(m) => m,
         None => return, // ARP/NDP miss; TCP retransmit will retry
     };
 
-    let payload_off = payload_offset(local_ip);
+    let payload_off = payload_offset(meta.local_ip);
     let payload_len = payload.len().min(MSS_MAX);
     let frame_len = payload_off + payload_len;
     // TCP header offset within the frame = ETH + IP. Used by the
     // CSUM-offload hint passed to `submit_tx`.
-    let tcp_off = match local_ip {
+    let tcp_off = match meta.local_ip {
         IpAddr::V4(_) => ETH_HDR_LEN + IPV4_HDR_LEN,
         IpAddr::V6(_) => ETH_HDR_LEN + IPV6_HDR_LEN,
     } as u16;
@@ -232,19 +234,7 @@ pub(crate) fn send_segment(
                 payload_len,
             );
         }
-        fill_tcp_frame_headers(
-            frame,
-            local_ip,
-            dst_ip,
-            dst_mac,
-            src_port,
-            dst_port,
-            seq,
-            ack,
-            flags,
-            window,
-            payload_len,
-        );
+        fill_tcp_frame_headers(frame, meta, dst_mac, payload_len);
     });
 }
 
@@ -257,23 +247,16 @@ pub(crate) fn send_segment(
 /// before reaching this. Falls back to the per-MSS loop in
 /// `async_try_send_chain` when not available.
 fn send_super_segment_from_cursor(
-    local_ip: IpAddr,
-    dst_ip: IpAddr,
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    window: u16,
+    meta: &SegmentMeta,
     cursor: &mut iobuf::Cursor<'_>,
     payload_len: usize,
 ) {
-    let dst_mac = match mac_resolve::resolve(dst_ip) {
+    let dst_mac = match mac_resolve::resolve(meta.dst_ip) {
         Some(m) => m,
         None => return,
     };
 
-    let payload_off = payload_offset(local_ip);
+    let payload_off = payload_offset(meta.local_ip);
     let frame_len = payload_off + payload_len;
     debug_assert!(frame_len <= TSO_FRAME_BUF_LEN);
 
@@ -281,18 +264,7 @@ fn send_super_segment_from_cursor(
     // Falls back to per-MSS when the big pool is full or TSO
     // isn't supported on this driver.
     let Some(mut handle) = nic::acquire_tx_tso_buf() else {
-        send_per_mss_fallback(
-            local_ip,
-            dst_ip,
-            src_port,
-            dst_port,
-            seq,
-            ack,
-            flags,
-            window,
-            cursor,
-            payload_len,
-        );
+        send_per_mss_fallback(meta, cursor, payload_len);
         return;
     };
     let cap = handle.data_cap() as usize;
@@ -311,19 +283,7 @@ fn send_super_segment_from_cursor(
     // payload_off + payload_len]` above; the header-fill below
     // writes the rest.
     unsafe {
-        fill_tcp_frame_headers(
-            frame,
-            local_ip,
-            dst_ip,
-            dst_mac,
-            src_port,
-            dst_port,
-            seq,
-            ack,
-            flags,
-            window,
-            payload_len,
-        );
+        fill_tcp_frame_headers(frame, meta, dst_mac, payload_len);
     }
     // Zero the TCP checksum: with VIRTIO_NET_F_NEEDS_CSUM set,
     // the device computes the per-segment TCP checksum (the
@@ -331,14 +291,14 @@ fn send_super_segment_from_cursor(
     // HVF's userspace TCP proxy ignores the field and forwards
     // bytes; vhost-net + real NICs honour the gso fields and
     // synthesise full checksums per segment).
-    let tcp_off = match local_ip {
+    let tcp_off = match meta.local_ip {
         IpAddr::V4(_) => ETH_HDR_LEN + IPV4_HDR_LEN,
         IpAddr::V6(_) => ETH_HDR_LEN + IPV6_HDR_LEN,
     };
     frame[tcp_off + 16] = 0; // TCP checksum field, big-endian high byte
     frame[tcp_off + 17] = 0; //                              low byte
 
-    let mss = mss_for(local_ip);
+    let mss = mss_for(meta.local_ip);
     let hdr_len = (payload_off) as u16;
     let csum_start = (tcp_off) as u16;
     nic::submit_tx_tso(handle, frame_len, hdr_len, csum_start, mss as u16);
@@ -434,20 +394,18 @@ pub fn try_send_tso(
     // worker; the frame slice is a fresh mutable reborrow that
     // doesn't alias with anything else (the closure's earlier
     // payload-region borrow ended above).
+    let meta = SegmentMeta {
+        local_ip: c.local_ip,
+        dst_ip: c.remote_ip,
+        src_port: c.local_port,
+        dst_port: c.remote_port,
+        seq: c.snd_nxt,
+        ack: c.rcv_nxt,
+        flags: TCP_ACK | TCP_PSH,
+        window: c.rx_free() as u16,
+    };
     unsafe {
-        fill_tcp_frame_headers(
-            frame,
-            c.local_ip,
-            c.remote_ip,
-            dst_mac,
-            c.local_port,
-            c.remote_port,
-            c.snd_nxt,
-            c.rcv_nxt,
-            TCP_ACK | TCP_PSH,
-            c.rx_free() as u16,
-            payload_len,
-        );
+        fill_tcp_frame_headers(frame, &meta, dst_mac, payload_len);
     }
     // Zero the TCP checksum: NEEDS_CSUM tells the device to
     // compute it per emitted segment. Same convention as
@@ -471,26 +429,17 @@ pub fn try_send_tso(
 /// can't acquire a TX-pool slot. Loops `send_segment_from_cursor`
 /// over the cursor as the original (pre-TSO) path did.
 fn send_per_mss_fallback(
-    local_ip: IpAddr,
-    dst_ip: IpAddr,
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    window: u16,
+    meta: &SegmentMeta,
     cursor: &mut iobuf::Cursor<'_>,
     payload_len: usize,
 ) {
-    let mss = mss_for(local_ip);
+    let mss = mss_for(meta.local_ip);
     let mut sent = 0usize;
-    let mut cur_seq = seq;
+    let mut chunk_meta = *meta;
     while sent < payload_len {
         let chunk = (payload_len - sent).min(mss);
-        send_segment_from_cursor(
-            local_ip, dst_ip, src_port, dst_port, cur_seq, ack, flags, window, cursor, chunk,
-        );
-        cur_seq = cur_seq.wrapping_add(chunk as u32);
+        send_segment_from_cursor(&chunk_meta, cursor, chunk);
+        chunk_meta.seq = chunk_meta.seq.wrapping_add(chunk as u32);
         sent += chunk;
     }
 }
@@ -498,26 +447,19 @@ fn send_per_mss_fallback(
 /// Build and ship a TCP segment whose payload is read from a chain
 /// cursor. Used by the data-send hot path (`async_try_send_chain`).
 fn send_segment_from_cursor(
-    local_ip: IpAddr,
-    dst_ip: IpAddr,
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    window: u16,
+    meta: &SegmentMeta,
     cursor: &mut iobuf::Cursor<'_>,
     payload_len: usize,
 ) {
-    let dst_mac = match mac_resolve::resolve(dst_ip) {
+    let dst_mac = match mac_resolve::resolve(meta.dst_ip) {
         Some(m) => m,
         None => return, // ARP/NDP miss; TCP retransmit will retry
     };
 
-    let payload_off = payload_offset(local_ip);
+    let payload_off = payload_offset(meta.local_ip);
     let payload_len = payload_len.min(MSS_MAX);
     let frame_len = payload_off + payload_len;
-    let tcp_off = match local_ip {
+    let tcp_off = match meta.local_ip {
         IpAddr::V4(_) => ETH_HDR_LEN + IPV4_HDR_LEN,
         IpAddr::V6(_) => ETH_HDR_LEN + IPV6_HDR_LEN,
     } as u16;
@@ -535,19 +477,7 @@ fn send_segment_from_cursor(
             debug_assert_eq!(n, payload_len);
             let _ = n;
         }
-        fill_tcp_frame_headers(
-            frame,
-            local_ip,
-            dst_ip,
-            dst_mac,
-            src_port,
-            dst_port,
-            seq,
-            ack,
-            flags,
-            window,
-            payload_len,
-        );
+        fill_tcp_frame_headers(frame, meta, dst_mac, payload_len);
     });
 }
 
@@ -560,14 +490,16 @@ pub(crate) fn send_rst(
     ack: u32,
 ) {
     send_segment(
-        local_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-        seq,
-        ack,
-        TCP_RST | TCP_ACK,
-        0,
+        &SegmentMeta {
+            local_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            seq,
+            ack,
+            flags: TCP_RST | TCP_ACK,
+            window: 0,
+        },
         &[],
     );
 }
@@ -631,39 +563,29 @@ pub fn async_try_send_chain(
     //      where serial-port output is gated on GCE) this is
     //      what makes a `/diag-gve` HTTP endpoint reachable on
     //      the same VM that's failing TSO sends for /diagnostics.
+    let meta = SegmentMeta {
+        local_ip: c.local_ip,
+        dst_ip: c.remote_ip,
+        src_port: c.local_port,
+        dst_port: c.remote_port,
+        seq: c.snd_nxt,
+        ack: c.rcv_nxt,
+        flags: TCP_ACK | TCP_PSH,
+        window: c.rx_free() as u16,
+    };
     if nic::tso_available()
         && total > mss
         && payload_offset(c.local_ip) + total <= TSO_FRAME_BUF_LEN
     {
-        send_super_segment_from_cursor(
-            c.local_ip,
-            c.remote_ip,
-            c.local_port,
-            c.remote_port,
-            c.snd_nxt,
-            c.rcv_nxt,
-            TCP_ACK | TCP_PSH,
-            c.rx_free() as u16,
-            &mut cursor,
-            total,
-        );
+        send_super_segment_from_cursor(&meta, &mut cursor, total);
         c.snd_nxt = c.snd_nxt.wrapping_add(total as u32);
     } else {
         let mut sent = 0usize;
+        let mut chunk_meta = meta;
         while sent < total {
             let chunk = (total - sent).min(mss);
-            send_segment_from_cursor(
-                c.local_ip,
-                c.remote_ip,
-                c.local_port,
-                c.remote_port,
-                c.snd_nxt,
-                c.rcv_nxt,
-                TCP_ACK | TCP_PSH,
-                c.rx_free() as u16,
-                &mut cursor,
-                chunk,
-            );
+            send_segment_from_cursor(&chunk_meta, &mut cursor, chunk);
+            chunk_meta.seq = chunk_meta.seq.wrapping_add(chunk as u32);
             c.snd_nxt = c.snd_nxt.wrapping_add(chunk as u32);
             sent += chunk;
         }

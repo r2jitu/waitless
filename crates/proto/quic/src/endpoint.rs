@@ -589,25 +589,19 @@ async fn listener_loop<H, F>(
             crate::quic_drop!(rng_failed, "minting per-conn TLS seed");
             continue;
         }
-        let task_inbox = inbox.clone();
-        let task_sock = sock.clone();
-        let task_cfg = cfg.clone();
-        let task_handler = handler.clone();
-        let task_recycle = recycle_pool.clone();
-        let task_slots = slots.clone();
-        let _ = spawn(conn_task::<H, F>(
-            task_inbox,
-            task_sock,
-            task_cfg,
-            task_handler,
+        let _ = spawn(conn_task::<H, F>(ConnTaskArgs {
+            inbox: inbox.clone(),
+            sock: sock.clone(),
+            cfg: cfg.clone(),
+            handler: handler.clone(),
             local_cid,
             local_cid_bytes,
             seed,
-            task_recycle,
-            task_slots,
+            recycle_pool: recycle_pool.clone(),
+            slots: slots.clone(),
             slot_idx,
             generation,
-        ));
+        }));
     }
 }
 
@@ -615,7 +609,10 @@ async fn listener_loop<H, F>(
 // Per-connection task
 // ============================================================================
 
-async fn conn_task<H, F>(
+/// Spawn-time arguments for [`conn_task`]. All eleven fields move
+/// into the task as a single bundle — grouped here to keep the
+/// `spawn` call site (and the `async fn` signature) tractable.
+struct ConnTaskArgs<H> {
     inbox: Rc<ConnInbox>,
     sock: Arc<UdpSocket>,
     cfg: Arc<TlsServerConfig>,
@@ -627,10 +624,26 @@ async fn conn_task<H, F>(
     slots: Rc<SlotTable>,
     slot_idx: u16,
     generation: u16,
-) where
+}
+
+async fn conn_task<H, F>(args: ConnTaskArgs<H>)
+where
     H: Fn(QuicConn) -> F + Send + Sync + 'static,
     F: Future<Output = ()> + 'static,
 {
+    let ConnTaskArgs {
+        inbox,
+        sock,
+        cfg,
+        handler,
+        local_cid,
+        local_cid_bytes,
+        seed,
+        recycle_pool,
+        slots,
+        slot_idx,
+        generation,
+    } = args;
     let conn = Rc::new(RefCell::new(Connection::new_server(local_cid, seed)));
     // Seed last_recv at conn creation so a peer that allocates a
     // slot via Initial and then disappears gets reaped after the

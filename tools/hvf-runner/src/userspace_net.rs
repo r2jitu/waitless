@@ -1477,11 +1477,13 @@ fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) ->
                 guest_buf,
                 &GUEST_MAC,
                 &addrs,
-                cs.port,
-                cs.guest_port,
-                cs.seq,
-                cs.ack,
-                0x18,
+                &TcpFrameSpec {
+                    src_port: cs.port,
+                    dst_port: cs.guest_port,
+                    seq: cs.seq,
+                    ack: cs.ack,
+                    flags: 0x18,
+                },
                 payload_len,
             );
 
@@ -2074,11 +2076,13 @@ fn inject_data_frames(
             frame_buf,
             mac,
             &addrs,
-            c.src_port,
-            c.guest_port,
-            c.my_seq,
-            c.peer_ack,
-            0x18,
+            &TcpFrameSpec {
+                src_port: c.src_port,
+                dst_port: c.guest_port,
+                seq: c.my_seq,
+                ack: c.peer_ack,
+                flags: 0x18,
+            },
             &data[off..off + chunk],
         );
         c.my_seq = c.my_seq.wrapping_add(chunk as u32);
@@ -2886,6 +2890,19 @@ fn build_grat_arp_frame(mac: &[u8; 6]) -> TxFrame {
 // one function each for: write-full-frame, write-headers-around-
 // pre-populated-payload, and the TxFrame wrapper.
 
+/// The five TCP-header scalars (4-tuple ports + seq/ack/flags)
+/// shared by every reply-frame builder in this module. Grouped to
+/// keep `write_tcp_frame*` / `build_tcp_*` signatures tractable —
+/// each used to pass these as five separate parameters.
+#[derive(Clone, Copy)]
+struct TcpFrameSpec {
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+}
+
 /// Write a complete TCP reply frame:
 ///   `[virtio_net_hdr 12 B][Eth 14 B][IP 20|40 B][TCP 20 B][payload]`
 /// into `buf` starting at offset 0 and return the byte count
@@ -2895,11 +2912,7 @@ fn write_tcp_frame(
     buf: &mut [u8],
     dst_mac: &[u8; 6],
     addrs: &IpAddrPair,
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
+    spec: &TcpFrameSpec,
     payload: &[u8],
 ) -> usize {
     let tcp_len = 20 + payload.len();
@@ -2923,7 +2936,7 @@ fn write_tcp_frame(
 
     // TCP header + payload (identical layout across families).
     let ts = o;
-    write_tcp_header(&mut buf[o..o + 20], src_port, dst_port, seq, ack, flags);
+    write_tcp_header(&mut buf[o..o + 20], spec);
     o += 20;
     buf[o..o + payload.len()].copy_from_slice(payload);
 
@@ -2942,11 +2955,7 @@ fn write_tcp_frame_around_payload(
     buf: *mut u8,
     dst_mac: &[u8; 6],
     addrs: &IpAddrPair,
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
+    spec: &TcpFrameSpec,
     payload_len: usize,
 ) -> usize {
     let tcp_len = 20 + payload_len;
@@ -2957,9 +2966,7 @@ fn write_tcp_frame_around_payload(
     // caller's read(2). SAFETY: caller guarantees `buf[..hdr_total
     // + payload_len]` is a valid mutable region in guest RAM.
     let prefix = unsafe { std::slice::from_raw_parts_mut(buf, hdr_total) };
-    write_tcp_headers_only(
-        prefix, dst_mac, addrs, src_port, dst_port, seq, ack, flags, tcp_len,
-    );
+    write_tcp_headers_only(prefix, dst_mac, addrs, spec, tcp_len);
     // Patch the TCP checksum over [TCP-hdr || payload].
     let tcp_start = VIRTIO_NET_HDR_SIZE + 14 + addrs.ip_hdr_len();
     let tcp_seg = unsafe { std::slice::from_raw_parts(buf.add(tcp_start), tcp_len) };
@@ -2975,13 +2982,13 @@ fn write_tcp_frame_around_payload(
 /// checksum field zeroed for the caller to patch once payload is
 /// in place.
 #[inline]
-fn write_tcp_header(buf: &mut [u8], src_port: u16, dst_port: u16, seq: u32, ack: u32, flags: u8) {
-    buf[0..2].copy_from_slice(&src_port.to_be_bytes());
-    buf[2..4].copy_from_slice(&dst_port.to_be_bytes());
-    buf[4..8].copy_from_slice(&seq.to_be_bytes());
-    buf[8..12].copy_from_slice(&ack.to_be_bytes());
+fn write_tcp_header(buf: &mut [u8], spec: &TcpFrameSpec) {
+    buf[0..2].copy_from_slice(&spec.src_port.to_be_bytes());
+    buf[2..4].copy_from_slice(&spec.dst_port.to_be_bytes());
+    buf[4..8].copy_from_slice(&spec.seq.to_be_bytes());
+    buf[8..12].copy_from_slice(&spec.ack.to_be_bytes());
     buf[12] = 0x50;
-    buf[13] = flags;
+    buf[13] = spec.flags;
     buf[14..16].copy_from_slice(&0xffffu16.to_be_bytes());
     buf[16..20].fill(0); // checksum + urgent ptr (csum patched by caller)
 }
@@ -2993,11 +3000,7 @@ fn write_tcp_headers_only(
     buf: &mut [u8],
     dst_mac: &[u8; 6],
     addrs: &IpAddrPair,
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
+    spec: &TcpFrameSpec,
     tcp_len: usize,
 ) {
     buf[..VIRTIO_NET_HDR_SIZE].fill(0);
@@ -3011,7 +3014,7 @@ fn write_tcp_headers_only(
     let ip_len = addrs.ip_hdr_len();
     addrs.write_ip_header(&mut buf[o..o + ip_len], tcp_len);
     o += ip_len;
-    write_tcp_header(&mut buf[o..o + 20], src_port, dst_port, seq, ack, flags);
+    write_tcp_header(&mut buf[o..o + 20], spec);
 }
 
 /// `TxFrame` wrapper: stack-only allocation, fills with
@@ -3020,28 +3023,14 @@ fn write_tcp_headers_only(
 fn build_tcp_frame_fixed(
     dst_mac: &[u8; 6],
     addrs: &IpAddrPair,
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
+    spec: &TcpFrameSpec,
     payload: &[u8],
 ) -> TxFrame {
     let mut f = TxFrame {
         data: [0u8; MAX_REPLY_FRAME],
         len: 0,
     };
-    f.len = write_tcp_frame(
-        &mut f.data,
-        dst_mac,
-        addrs,
-        src_port,
-        dst_port,
-        seq,
-        ack,
-        flags,
-        payload,
-    ) as u16;
+    f.len = write_tcp_frame(&mut f.data, dst_mac, addrs, spec, payload) as u16;
     f
 }
 
@@ -3067,9 +3056,14 @@ fn build_tcp_reply(
             dst: VM_IPV6,
         },
     };
-    build_tcp_frame_fixed(
-        &GUEST_MAC, &addrs, src_port, dst_port, seq, ack, flags, payload,
-    )
+    let spec = TcpFrameSpec {
+        src_port,
+        dst_port,
+        seq,
+        ack,
+        flags,
+    };
+    build_tcp_frame_fixed(&GUEST_MAC, &addrs, &spec, payload)
 }
 
 /// Build a guest-bound UDP frame using the saved outbound-NAT

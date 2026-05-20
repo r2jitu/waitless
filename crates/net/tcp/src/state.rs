@@ -5,7 +5,7 @@
 // `pool.rs`; the segment-assembly path (and the `send_segment` helper
 // these methods call) lives in `send.rs`.
 
-use crate::send::send_segment;
+use crate::send::{SegmentMeta, send_segment};
 use alloc::boxed::Box;
 use core::ptr;
 use core::task::Waker;
@@ -524,14 +524,16 @@ impl TcpConnection {
         if self.rcv_wnd < mss && free >= mss {
             self.rcv_wnd = free;
             send_segment(
-                self.local_ip,
-                self.remote_ip,
-                self.local_port,
-                self.remote_port,
-                self.snd_nxt,
-                self.rcv_nxt,
-                TCP_ACK,
-                free,
+                &SegmentMeta {
+                    local_ip: self.local_ip,
+                    dst_ip: self.remote_ip,
+                    src_port: self.local_port,
+                    dst_port: self.remote_port,
+                    seq: self.snd_nxt,
+                    ack: self.rcv_nxt,
+                    flags: TCP_ACK,
+                    window: free,
+                },
                 &[],
             );
         }
@@ -716,14 +718,16 @@ impl TcpConnection {
             }
         }
         send_segment(
-            self.local_ip,
-            self.remote_ip,
-            self.local_port,
-            self.remote_port,
-            self.snd_una,
-            self.rcv_nxt,
-            TCP_ACK | TCP_PSH,
-            self.rx_free() as u16,
+            &SegmentMeta {
+                local_ip: self.local_ip,
+                dst_ip: self.remote_ip,
+                src_port: self.local_port,
+                dst_port: self.remote_port,
+                seq: self.snd_una,
+                ack: self.rcv_nxt,
+                flags: TCP_ACK | TCP_PSH,
+                window: self.rx_free() as u16,
+            },
             &scratch[..n],
         );
         // RFC 6298 §3 (Karn's algorithm): the outstanding RTT sample
