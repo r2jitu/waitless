@@ -13,4 +13,5 @@ inbox and process packets. TX from APs goes through staging buffers
 that core 0 flushes.
 
 See the `WAKEUP` / `RX_LOCK` / `JUST_DISTRIBUTED` statics in
-[`net/src/lib.rs`](../net/src/lib.rs) for the Tier 2 coordination primitives.
+[`crates/net/stack/src/lib.rs`](../crates/net/stack/src/lib.rs)
+for the Tier 2 coordination primitives.
