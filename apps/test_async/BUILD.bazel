@@ -9,7 +9,7 @@ rust_library(
     name = "app",
     srcs = ["src/main.rs"],
     crate_root = "src/main.rs",
-    deps = ["//crates/api/uni"],
+    deps = ["//crates/uni/uni"],
 )
 
 # Single-core is enough — the executor is per-core and the test only

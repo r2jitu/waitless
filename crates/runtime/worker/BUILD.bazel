@@ -11,7 +11,7 @@ package(default_visibility = ["//visibility:public"])
 # array; `T` provides its own interior mutability (`Atomic*`,
 # `UnsafeCell` behind SPSC / owning-worker discipline). Both are
 # used by `//kernel` for its per-core state, by `//crates/runtime/executor`
-# for task arenas, and by `//crates/runtime/backend` for per-worker timer
+# for task arenas, and by `//crates/uni/backend` for per-worker timer
 # storage.
 #
 # `CurrentWorker::enter` calls `platform::current_worker()`

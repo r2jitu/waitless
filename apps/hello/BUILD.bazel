@@ -12,8 +12,8 @@ rust_library(
     srcs = ["src/main.rs"],
     crate_root = "src/main.rs",
     deps = [
-        "//crates/api/uni",
         "//crates/transport/http",
+        "//crates/uni/uni",
     ],
 )
 

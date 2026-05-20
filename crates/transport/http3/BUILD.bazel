@@ -22,9 +22,9 @@ rust_library(
     ],
     crate_name = "http3",
     deps = [
-        "//crates/api/uni",
         "//crates/transport/http",
         "//crates/transport/quic",
+        "//crates/uni/uni",
     ],
 )
 

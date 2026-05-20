@@ -49,7 +49,7 @@ rust_library(
         "//crates/drivers/nic",
         "//crates/kernel/sys",
         "//crates/net/stack",
-        "//crates/api/uni",
+        "//crates/uni/uni",
     ],
 )
 

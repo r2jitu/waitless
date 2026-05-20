@@ -11,8 +11,8 @@ rust_library(
     srcs = ["src/lib.rs"],
     crate_name = "http",
     deps = [
-        "//crates/api/uni",
         "//crates/runtime/worker",
+        "//crates/uni/uni",
         "//crates/util/iobuf",
     ],
 )
