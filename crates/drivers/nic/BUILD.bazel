@@ -1,17 +1,55 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# NIC dispatch shim: thin wrappers over the `nic_api`
-# active-ops slot (`send`, `poll`, `acquire_tx_buf`, …). Standalone
-# host-buildable crate — its only dependency is the host-buildable
-# `//crates/drivers/nic-api` interface crate — so the TX-side net
-# crates (`ethernet_send`, `tcp`, …) can call the dispatchers
-# without being dragged onto the os:none `//crates/drivers/bus`.
+# Shared package: the NIC trait crate + the dispatch shim. They're
+# two halves of the same thing (`api` defines `EthernetDriver` and
+# the `ACTIVE_OPS` slot; `nic` is the wrapper that consumers call)
+# and share the authoritative file layout. Per the shared-package
+# rule in docs/crates.md (small cohesive crates may share a Bazel
+# package), both rust_library targets live in one BUILD.
+
+# ──────────────────────────────────────────────────────────────────
+# `nic_api` — the trait + link-time registry.
+#
+# Pure leaf — drivers depend on this without forming a `drivers →
+# uni_net → net → drivers` cycle. Used to live in //uni-net:driver,
+# extracted into the driver domain during the reorg; merged into
+# this shared package as `:api` so the trait + dispatch don't need
+# two separate Bazel packages.
+rust_library(
+    name = "api",
+    srcs = [
+        "src/api.rs",
+        "src/error.rs",
+    ],
+    crate_name = "nic_api",
+    crate_root = "src/api.rs",
+    deps = ["//crates/util/iobuf"],
+)
+
+# Host-native unit tests for `NicError` and its size invariants.
+# Compiles `error.rs` standalone — no nic_api dep needed.
+rust_test(
+    name = "error_test",
+    size = "small",
+    srcs = ["src/error.rs"],
+    crate_root = "src/error.rs",
+)
+
+# ──────────────────────────────────────────────────────────────────
+# `nic` — the dispatch shim.
+#
+# Thin wrappers over the `nic_api` active-ops slot (`send`, `poll`,
+# `acquire_tx_buf`, …). Standalone host-buildable — its only dep is
+# the sibling `:api` trait crate — so the TX-side net crates
+# (`ethernet_send`, `tcp`, …) can call the dispatchers without
+# being dragged onto the os:none `//crates/drivers/bus`.
 rust_library(
     name = "nic",
     srcs = ["src/nic.rs"],
     crate_name = "nic",
     crate_root = "src/nic.rs",
-    deps = ["//crates/drivers/nic-api"],
+    deps = [":api"],
 )

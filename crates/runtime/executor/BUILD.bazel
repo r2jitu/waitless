@@ -22,7 +22,7 @@ rust_library(
     ],
     crate_name = "executor",
     deps = [
-        "//crates/drivers/nic-api",
+        "//crates/drivers/nic:api",
         "//crates/net:types",
         "//crates/runtime/platform",
         "//crates/runtime/worker",

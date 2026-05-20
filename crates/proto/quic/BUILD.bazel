@@ -53,9 +53,9 @@ rust_library(
         "//conditions:default": [],
     }),
     deps = [
-        "//crates/drivers/nic-api",
-        "//crates/runtime/executor",
+        "//crates/drivers/nic:api",
         "//crates/proto/tls",
+        "//crates/runtime/executor",
         "//crates/uni/uni",
         "//crates/util/iobuf",
         "@crates//:aes-gcm",

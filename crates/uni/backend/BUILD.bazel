@@ -30,7 +30,7 @@ rust_library(
         # native (stub) and bare-metal (driver-filled). The driver
         # leaf crate is dependency-light (just `//crates/util/iobuf`), so it
         # adds no real native footprint.
-        "//crates/drivers/nic-api",
+        "//crates/drivers/nic:api",
     ] + select({
         "//bazel/platforms:native": ["//crates/util/atomic-fn"],
         "//conditions:default": [

@@ -254,7 +254,7 @@ rust_library(
         ":mac_resolve",
         ":types",
         "//crates/drivers/nic",
-        "//crates/drivers/nic-api",
+        "//crates/drivers/nic:api",
         "//crates/runtime/executor",
         "//crates/util/iobuf",
     ],

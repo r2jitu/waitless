@@ -15,7 +15,7 @@ rust_library(
     ],
     crate_name = "uni_net",
     crate_root = "src/lib.rs",
-    deps = ["//crates/drivers/nic-api"] + select({
+    deps = ["//crates/drivers/nic:api"] + select({
         "//bazel/platforms:native": [],
         "//conditions:default": ["//crates/net/stack"],
     }),
@@ -30,5 +30,5 @@ rust_test(
     size = "small",
     srcs = ["src/error.rs"],
     crate_root = "src/error.rs",
-    deps = ["//crates/drivers/nic-api"],
+    deps = ["//crates/drivers/nic:api"],
 )

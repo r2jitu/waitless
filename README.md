@@ -24,8 +24,8 @@ Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework 
 │       Network Stack (below facade)   │  crates/net/ (TCP, UDP, IPv4/6,
 │                                      │              ARP, NDP, DHCP, ...)
 ├──────────────────────────────────────┤
-│     Drivers (NIC + bus)              │  crates/drivers/ (bus, nic-api,
-│                                      │                   nic, virtio-net, gve)
+│     Drivers (NIC + bus)              │  crates/drivers/ (bus, nic/{api,
+│                                      │                   nic}, virtio-net, gve)
 ├──────────────────────────────────────┤
 │     Runtime substrate                │  crates/runtime/{platform, worker,
 │                                      │                  executor}

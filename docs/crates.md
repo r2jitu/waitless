@@ -25,7 +25,8 @@ crates/
   runtime/     platform/  worker/  executor/
   kernel/      core/  bare/
   boot/        entry, limine, mem_stubs, multiboot   (shared Bazel package)
-  drivers/     bus/  nic-api/  nic/  virtio-net/  gve/
+  drivers/     bus/  nic/  virtio-net/  gve/
+               nic/ is a shared package: targets :api (the trait) + :nic (dispatch)
   net/         tcp/  stack/                           (own dirs)
                +  shared package: types, checksum, from_bytes, ethernet,
                   ethernet_send, arp, ipv4, ipv6, icmpv6, ndp, mac_resolve,
@@ -74,6 +75,9 @@ Applied:
 - `crates/boot/` — 4 link-time-symbol providers (`entry`, `limine`,
   `mem_stubs`, `multiboot`) share one package; none has meaningful
   logic of its own.
+- `crates/drivers/nic/` — `:api` (the `EthernetDriver` trait + the
+  `ACTIVE_OPS` registry) and `:nic` (the dispatch shim) live as two
+  targets in one package. They're two halves of the same thing.
 
 Everywhere else is one crate per directory.
 
@@ -224,7 +228,7 @@ consumers write `kernel_bare::percpu::...` and don't see the split.
 ```
                      ┌──────────────────────┐
                      │       nic_api        │  EthernetDriver trait
-                     │   (drivers/nic-api)  │  + ACTIVE_OPS slot
+                     │  (drivers/nic:api)   │  + ACTIVE_OPS slot
                      └──────────┬───────────┘
                 ┌───────────────┼────────────────┐
                 ▼               ▼                ▼
