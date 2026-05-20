@@ -1,7 +1,7 @@
 // net/udp.rs — UDP send/receive.
 //
 // Simple datagram protocol — no state machine, no connection
-// tracking. The async reactor (`executor::net::UdpSocket`) is
+// tracking. The async reactor (`executor::reactor::UdpSocket`) is
 // the only binder these days; the pre-async `bind(port, handler)`
 // sync-callback registry is gone.
 
@@ -69,7 +69,8 @@ const UDP_HDR_LEN: usize = 8;
 /// Total stack-buffer size used by `send_to_addr`. Sized so a v6
 /// frame ([14 + 40 + 8 + 1452]) fits; v4 uses fewer header bytes
 /// so its payload slot is larger.
-const FRAME_BUF_LEN: usize = executor::net::MAX_L2_HEADROOM + (1500 - IPV6_HDR_LEN - UDP_HDR_LEN);
+const FRAME_BUF_LEN: usize =
+    executor::reactor::MAX_L2_HEADROOM + (1500 - IPV6_HDR_LEN - UDP_HDR_LEN);
 // = 62 + 1452 = 1514. Same total bound for both families.
 
 /// Fill the ETH + IP + UDP headers of `frame` in place — the UDP
@@ -146,7 +147,7 @@ unsafe fn fill_udp_frame_headers(
 }
 
 /// Zero-copy UDP send. Caller pre-supplies a frame buffer where
-/// the first [`executor::net::MAX_L2_HEADROOM`] (= 62) bytes
+/// the first [`executor::reactor::MAX_L2_HEADROOM`] (= 62) bytes
 /// are reserved for the L2/L3/L4 headers and the UDP payload
 /// starts at `frame[MAX_L2_HEADROOM..]`. Fills the headers in
 /// place and ships the contiguous frame to the driver — no
@@ -162,7 +163,7 @@ unsafe fn fill_udp_frame_headers(
 /// miss drops the packet — UDP is fire-and-forget; the application
 /// layer (QUIC retransmits, DNS retries) handles loss.
 pub fn send_with_l2_headroom(dst: IpAddr, src_port: u16, dst_port: u16, frame: &mut [u8]) {
-    use executor::net::MAX_L2_HEADROOM;
+    use executor::reactor::MAX_L2_HEADROOM;
     debug_assert!(frame.len() >= MAX_L2_HEADROOM);
 
     let payload_len = frame.len() - MAX_L2_HEADROOM;
@@ -214,7 +215,7 @@ pub fn send_with_l2_headroom(dst: IpAddr, src_port: u16, dst_port: u16, frame: &
 }
 
 /// Submit a `TxBufHandle` (acquired via
-/// [`executor::net::acquire_tx_buf`]) for transmission. Caller
+/// [`executor::reactor::acquire_tx_buf`]) for transmission. Caller
 /// has written the UDP payload at
 /// `handle.data_mut()[MAX_L2_HEADROOM..frame_len]`; we fill the
 /// L2/L3/L4 headers in the headroom in place and submit the slot
@@ -244,7 +245,7 @@ pub fn send_via_tx_handle(
     mut handle: nic_api::TxBufHandle,
     frame_len: usize,
 ) {
-    use executor::net::MAX_L2_HEADROOM;
+    use executor::reactor::MAX_L2_HEADROOM;
     debug_assert!(frame_len >= MAX_L2_HEADROOM);
     debug_assert!(frame_len <= handle.data_cap as usize);
 
@@ -311,7 +312,7 @@ pub fn send_via_tx_handle(
 /// and as the native-backend fallback for callers that opted
 /// into `send_to_with_l2_headroom`.
 pub fn send_to_addr(dst: IpAddr, src_port: u16, dst_port: u16, data: &[u8]) {
-    use executor::net::MAX_L2_HEADROOM;
+    use executor::reactor::MAX_L2_HEADROOM;
     if data.len() > 1500 - IPV4_HDR_LEN - UDP_HDR_LEN {
         return;
     }
@@ -330,7 +331,7 @@ pub fn send_to_addr(dst: IpAddr, src_port: u16, dst_port: u16, data: &[u8]) {
 
 /// Called by the network dispatch layer when protocol == UDP.
 /// Delivers the datagram to the async reactor if a
-/// `executor::net::UdpSocket` is bound to the destination port;
+/// `executor::reactor::UdpSocket` is bound to the destination port;
 /// otherwise drops it.
 ///
 /// `segment` is a borrow over driver-pool storage covering the full
@@ -349,5 +350,5 @@ pub fn udp_receive(src_ip: IpAddr, _dst_ip: IpAddr, segment: &[u8]) {
         return;
     }
     let body = &segment[8..udp_len];
-    let _ = executor::net::deliver_udp(dst_port, src_ip, src_port, body);
+    let _ = executor::reactor::deliver_udp(dst_port, src_ip, src_port, body);
 }

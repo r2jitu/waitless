@@ -2074,7 +2074,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             // which is the same core that owns this conn slot, so
             // the reactor's per-worker waker fires the right task.
             let port = c.listener_port;
-            executor::net::deliver_tcp_ready(port);
+            executor::reactor::deliver_tcp_ready(port);
         } else if c.state == TcpState::LastAck {
             free_connection(core, slot);
             return;
@@ -2344,15 +2344,15 @@ pub fn listen_on_core(core: u32, port: u16) -> *mut () {
 }
 
 /// Accept a connection on the **current core** by port — the
-/// entry point used by `executor::net::TcpListener`'s backend
+/// entry point used by `executor::reactor::TcpListener`'s backend
 /// hook. Returns `TcpStream::NULL` if no connection is ready
 /// on this core.
-pub fn accept_on_port(port: u16) -> executor::net::TcpStream {
+pub fn accept_on_port(port: u16) -> executor::reactor::TcpStream {
     accept_on_port_core(kernel_core::cpu_id(), port)
 }
 
-fn accept_on_port_core(core: u32, port: u16) -> executor::net::TcpStream {
-    use executor::net::TcpStream;
+fn accept_on_port_core(core: u32, port: u16) -> executor::reactor::TcpStream {
+    use executor::reactor::TcpStream;
     let cap = pool_capacity(core);
     for i in 0..cap {
         // SAFETY: per-core ownership.
@@ -2520,7 +2520,7 @@ pub fn async_recv(handle: *mut (), generation: u16, buf: &mut [u8]) -> usize {
 
 /// Park the current task's waker on this conn, to be woken when
 /// data arrives or the peer FINs. Called from
-/// `executor::net::TcpRecv::poll` on the owning core. A
+/// `executor::reactor::TcpRecv::poll` on the owning core. A
 /// `generation` mismatch fires the waker immediately so the task
 /// observes closure on its next poll.
 pub fn register_recv_waker(handle: *mut (), generation: u16, waker: &Waker) {

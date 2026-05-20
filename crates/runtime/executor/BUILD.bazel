@@ -3,19 +3,21 @@ load("//bazel/rules:rust.bzl", "rust_doc_test", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# Shared async runtime — task arena + Waker + Sleep. Calls
-# `platform::now_ticks()` directly for time reads; no register/
-# plug-in indirection. Future reactor hooks (P4 UDP, P5 TCP) that
-# carry waker state will land here with their own mechanism.
+# Shared async runtime — task arena + Waker + Sleep + the socket-
+# I/O reactor (TcpStream, UdpSocket). Calls `platform::now_ticks()`
+# directly for time reads; no register/plug-in indirection. The
+# reactor submodule is the async wrapper around the bare-metal and
+# native socket backends — distinct from the //crates/net protocol
+# stack, hence `reactor` rather than `net` here.
 rust_library(
     name = "executor",
     srcs = [
         "src/event.rs",
         "src/launcher.rs",
         "src/lib.rs",
-        "src/net/mod.rs",
-        "src/net/tcp.rs",
-        "src/net/udp.rs",
+        "src/reactor/mod.rs",
+        "src/reactor/tcp.rs",
+        "src/reactor/udp.rs",
         "src/select.rs",
         "src/sleep.rs",
         "src/task.rs",

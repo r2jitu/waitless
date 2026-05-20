@@ -28,7 +28,7 @@ mod dhcp_parse;
 use arp::arp_announce;
 use ethernet::ethernet_our_mac;
 use executor::event::AsyncEvent;
-use executor::net::UdpSocket;
+use executor::reactor::UdpSocket;
 use executor::select::timeout_us;
 use from_bytes::FromBytes;
 use kernel_bare::sync::Spinlock;

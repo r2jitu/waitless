@@ -135,8 +135,8 @@ fn async_tcp_unlisten_hook(app_port: u16) {
     }
 }
 
-fn async_tcp_accept_hook(app_port: u16) -> executor::net::TcpStream {
-    use executor::net::TcpStream;
+fn async_tcp_accept_hook(app_port: u16) -> executor::reactor::TcpStream {
+    use executor::reactor::TcpStream;
     unsafe {
         let tid = platform::current_worker();
         let count = ASYNC_TCP_COUNT.load(Ordering::Acquire);
@@ -192,7 +192,7 @@ pub(super) fn async_tcp_dispatch(fd: i32) -> bool {
                 None => continue,
             };
             if l.fd == fd {
-                executor::net::deliver_tcp_ready(l.app_port);
+                executor::reactor::deliver_tcp_ready(l.app_port);
                 return true;
             }
         }
@@ -204,7 +204,7 @@ pub(super) fn async_tcp_dispatch(fd: i32) -> bool {
 // Async TCP recv / send hooks
 // ============================================================================
 //
-// Called from `executor::net::TcpRecv::poll` / `TcpSend::poll` via
+// Called from `executor::reactor::TcpRecv::poll` / `TcpSend::poll` via
 // the function pointers in `NATIVE_TCP_BACKEND`. Each operates on a
 // `NativeConn *` obtained from `async_tcp_accept_hook` and lives in
 // the owning worker's `ThreadState.conns`. No locking — the conn's
@@ -515,43 +515,44 @@ fn tcp_close(handle: *mut (), generation: u16) {
 
 /// Native TCP backend vtable. Wired into the runtime by
 /// `init_native`.
-pub(super) static NATIVE_TCP_BACKEND: executor::net::TcpBackend = executor::net::TcpBackend {
-    listen: async_tcp_listen_hook,
-    accept: async_tcp_accept_hook,
-    unlisten: Some(async_tcp_unlisten_hook),
-    has_data: native_tcp_has_data,
-    do_recv: native_tcp_do_recv,
-    register_recv_waker: native_tcp_register_recv_waker,
-    clear_recv_waker: native_tcp_clear_recv_waker,
-    // Native (POSIX `recv`) already copies into the user buf in
-    // one shot at the syscall boundary — no benefit to wiring a
-    // bare-metal-style direct-copy slot. Leave both `None` and
-    // `TcpRecv::poll` falls through to `do_recv` after the
-    // wake.
-    set_recv_buf_slot: None,
-    clear_recv_buf_slot: None,
-    // Zero-copy chunk recv (RX items F/H). `do_recv_chunk` is
-    // wired (not `None`) so `TcpStream::recv_chunk` resolves to
-    // a real chunk on native — handlers get one uniform API
-    // across bare-metal and native; see `native_tcp_do_recv_chunk`
-    // for why native still pays the syscall copy. The
-    // `set/clear_chunk_buf_slot` hooks stay `None`: they are the
-    // bare-metal "stash the device RX buffer" request, and
-    // native has no per-conn ring to bypass — `do_recv_chunk`
-    // just does the `recv` when called.
-    do_recv_chunk: Some(native_tcp_do_recv_chunk),
-    set_chunk_buf_slot: None,
-    clear_chunk_buf_slot: None,
-    close: tcp_close,
-    try_send: native_tcp_try_send_chain,
-    register_send_waker: native_tcp_register_send_waker,
-    clear_send_waker: native_tcp_clear_send_waker,
-    // Native (POSIX SOCK_STREAM) doesn't expose a TX-pool
-    // slot to write into — the kernel owns that region.
-    // Callers fall back to the regular `try_send` chain path.
-    try_send_tso: None,
-    shutdown_all: None,
-};
+pub(super) static NATIVE_TCP_BACKEND: executor::reactor::TcpBackend =
+    executor::reactor::TcpBackend {
+        listen: async_tcp_listen_hook,
+        accept: async_tcp_accept_hook,
+        unlisten: Some(async_tcp_unlisten_hook),
+        has_data: native_tcp_has_data,
+        do_recv: native_tcp_do_recv,
+        register_recv_waker: native_tcp_register_recv_waker,
+        clear_recv_waker: native_tcp_clear_recv_waker,
+        // Native (POSIX `recv`) already copies into the user buf in
+        // one shot at the syscall boundary — no benefit to wiring a
+        // bare-metal-style direct-copy slot. Leave both `None` and
+        // `TcpRecv::poll` falls through to `do_recv` after the
+        // wake.
+        set_recv_buf_slot: None,
+        clear_recv_buf_slot: None,
+        // Zero-copy chunk recv (RX items F/H). `do_recv_chunk` is
+        // wired (not `None`) so `TcpStream::recv_chunk` resolves to
+        // a real chunk on native — handlers get one uniform API
+        // across bare-metal and native; see `native_tcp_do_recv_chunk`
+        // for why native still pays the syscall copy. The
+        // `set/clear_chunk_buf_slot` hooks stay `None`: they are the
+        // bare-metal "stash the device RX buffer" request, and
+        // native has no per-conn ring to bypass — `do_recv_chunk`
+        // just does the `recv` when called.
+        do_recv_chunk: Some(native_tcp_do_recv_chunk),
+        set_chunk_buf_slot: None,
+        clear_chunk_buf_slot: None,
+        close: tcp_close,
+        try_send: native_tcp_try_send_chain,
+        register_send_waker: native_tcp_register_send_waker,
+        clear_send_waker: native_tcp_clear_send_waker,
+        // Native (POSIX SOCK_STREAM) doesn't expose a TX-pool
+        // slot to write into — the kernel owns that region.
+        // Callers fall back to the regular `try_send` chain path.
+        try_send_tso: None,
+        shutdown_all: None,
+    };
 
 /// Pump the worker's event queue non-blockingly. Flips
 /// `has_pending_data` on any TCP conn that became readable and

@@ -91,10 +91,10 @@ fn open_udp_sibling(bind_port: u16, reuseport: bool) -> i32 {
     }
 }
 
-/// Hook registered with `executor::net::register_backend_bind`.
+/// Hook registered with `executor::reactor::register_backend_bind`.
 /// Invoked when a `UdpSocket` is created; opens the SO_REUSEPORT
 /// siblings and routes inbound datagrams through the async
-/// reactor via `executor::net::deliver_udp`.
+/// reactor via `executor::reactor::deliver_udp`.
 ///
 /// `owner_worker == None`: open NUM_THREADS SO_REUSEPORT siblings
 /// (the fanout / `UdpSocket::run` model — kernel distributes by

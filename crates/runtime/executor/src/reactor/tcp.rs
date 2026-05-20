@@ -135,7 +135,7 @@ impl TcpStream {
     /// already used, now applied uniformly across the API.
     ///
     /// ```compile_fail
-    /// # async fn two_reads(s: &mut executor::net::TcpStream) {
+    /// # async fn two_reads(s: &mut executor::reactor::TcpStream) {
     /// let mut a = [0u8; 16];
     /// let mut b = [0u8; 16];
     /// let r1 = s.recv(&mut a);
@@ -167,7 +167,7 @@ impl TcpStream {
     /// borrow-check error:
     ///
     /// ```compile_fail
-    /// # async fn two_guards(s: &mut executor::net::TcpStream) {
+    /// # async fn two_guards(s: &mut executor::reactor::TcpStream) {
     /// let g1 = s.recv_chunk().await;
     /// let g2 = s.recv_chunk().await; // ERROR: `*s` already borrowed
     /// let _ = (g1, g2);
@@ -177,7 +177,7 @@ impl TcpStream {
     /// The same calls with one guard live at a time compile fine:
     ///
     /// ```no_run
-    /// # async fn sequential(s: &mut executor::net::TcpStream) {
+    /// # async fn sequential(s: &mut executor::reactor::TcpStream) {
     /// { let _g = s.recv_chunk().await; }
     /// { let _g = s.recv_chunk().await; }
     /// # }

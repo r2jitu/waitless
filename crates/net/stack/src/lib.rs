@@ -52,7 +52,7 @@ pub use crate::sched::{init_eventloop, poll};
 /// plumbing is wired through anyway for forward-compatibility
 /// with a future TX-backpressure implementation. `unlisten` is
 /// `None` — there's no per-listener teardown on bare-metal today.
-static BARE_TCP_BACKEND: executor::net::TcpBackend = executor::net::TcpBackend {
+static BARE_TCP_BACKEND: executor::reactor::TcpBackend = executor::reactor::TcpBackend {
     listen: tcp_backend_listen,
     accept: tcp_backend_accept,
     unlisten: None,
@@ -85,7 +85,7 @@ fn bare_shutdown_all() {
 
 /// Bare-metal UDP backend vtable. No `bind` / `unbind` — routing
 /// is purely `UDP_REGISTRY` lookups on the NIC RX path.
-static BARE_UDP_BACKEND: executor::net::UdpBackend = executor::net::UdpBackend {
+static BARE_UDP_BACKEND: executor::reactor::UdpBackend = executor::reactor::UdpBackend {
     bind: None,
     unbind: None,
     send: udp::send,
@@ -110,10 +110,10 @@ pub fn init_stack() {
     // owns its own per-port accept pool); accept reads the
     // current core's pool and returns the first Established+
     // !accepted conn.
-    executor::net::register_tcp_backend(&BARE_TCP_BACKEND);
+    executor::reactor::register_tcp_backend(&BARE_TCP_BACKEND);
     // UDP backend — `UdpSocket::send_to` hands datagrams to the
     // protocol stack via `udp::send`.
-    executor::net::register_udp_backend(&BARE_UDP_BACKEND);
+    executor::reactor::register_udp_backend(&BARE_UDP_BACKEND);
 }
 
 fn tcp_backend_listen(port: u16) -> Result<(), ()> {
@@ -131,7 +131,7 @@ fn tcp_backend_listen(port: u16) -> Result<(), ()> {
     Ok(())
 }
 
-fn tcp_backend_accept(port: u16) -> executor::net::TcpStream {
+fn tcp_backend_accept(port: u16) -> executor::reactor::TcpStream {
     tcp::accept_on_port(port)
 }
 

@@ -25,7 +25,7 @@ extern crate nic_api;
 
 pub mod event;
 pub mod launcher;
-pub mod net;
+pub mod reactor;
 pub mod select;
 mod sleep;
 mod task;

@@ -797,7 +797,7 @@ fn drain_udp_sibling(fd: i32, app_port: u16) {
             addr: u32::from_ne_bytes(src_octets),
         });
         let src_port = u16::from_be(src_addr.sin_port);
-        let _ = executor::net::deliver_udp(app_port, src_ip, src_port, &buf[..n]);
+        let _ = executor::reactor::deliver_udp(app_port, src_ip, src_port, &buf[..n]);
     }
 }
 
@@ -840,7 +840,7 @@ unsafe extern "C" fn sigint_handler(_sig: i32) {
 
 /// Native UDP backend vtable. `bind`/`unbind` open and close the
 /// per-port SO_REUSEPORT sibling fds; `send` is the `sendto` path.
-static NATIVE_UDP_BACKEND: executor::net::UdpBackend = executor::net::UdpBackend {
+static NATIVE_UDP_BACKEND: executor::reactor::UdpBackend = executor::reactor::UdpBackend {
     bind: Some(udp::udp_backend_bind),
     unbind: Some(udp::udp_backend_unbind),
     send: udp::udp_send,
@@ -890,8 +890,8 @@ fn init_native() {
     }
 
     // Wire the UDP + TCP reactors. Each module owns its vtable.
-    executor::net::register_udp_backend(&NATIVE_UDP_BACKEND);
-    executor::net::register_tcp_backend(&tcp::NATIVE_TCP_BACKEND);
+    executor::reactor::register_udp_backend(&NATIVE_UDP_BACKEND);
+    executor::reactor::register_tcp_backend(&tcp::NATIVE_TCP_BACKEND);
 
     // Register TCP/UDP polling as the first IO poll callback.
     // Runs on every worker's event-loop tick and drains the worker's

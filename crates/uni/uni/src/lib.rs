@@ -120,7 +120,7 @@ pub fn shutdown_and_drop() {
     // this matters: `arch::shutdown()` would otherwise just power
     // the VM off mid-handshake. On native this is a no-op (the
     // kernel FINs every fd at process exit).
-    executor::net::shutdown_all_tcp();
+    executor::reactor::shutdown_all_tcp();
 
     // Tear down the NET slot symmetrically.
     net::clear_on_shutdown();
@@ -237,7 +237,7 @@ pub mod runtime {
     /// match the source of an inbound datagram.
     pub use executor::ip::{IpAddr, Ipv4Addr, Ipv6Addr};
     pub use executor::launcher::{LaunchTable, Launcher};
-    pub use executor::net::{
+    pub use executor::reactor::{
         RecvChunk, RecvChunkGuard, TcpBindError, TcpHandle, TcpListener, TcpRecv, TcpSendChain,
         TcpStream, UdpBindError, UdpClient, UdpHandle, UdpRecv, UdpRecvInplace, UdpSocket,
         tcp_listen, udp_listen,
@@ -248,7 +248,7 @@ pub mod runtime {
 // Top-level shortcuts for the most common runtime calls. The full
 // `uni::runtime::*` namespace stays available for power users who
 // need raw handle ownership (tests, manual teardown).
-pub use executor::net::UdpClient;
+pub use executor::reactor::UdpClient;
 
 /// Listen for TCP on `port`; the listener runs for the rest of
 /// the process. The returned `Result` reports bind success or
@@ -258,23 +258,23 @@ pub use executor::net::UdpClient;
 /// `body` is invoked once per accepted connection. Use
 /// [`runtime::tcp_listen`] directly if you need explicit
 /// ownership of the listener handle (e.g. teardown mid-run).
-pub fn tcp_listen<H, F>(port: u16, body: H) -> Result<(), executor::net::TcpBindError>
+pub fn tcp_listen<H, F>(port: u16, body: H) -> Result<(), executor::reactor::TcpBindError>
 where
-    H: Fn(executor::net::TcpStream) -> F + Send + Sync + 'static,
+    H: Fn(executor::reactor::TcpStream) -> F + Send + Sync + 'static,
     F: core::future::Future<Output = ()> + 'static,
 {
-    let handle = executor::net::tcp_listen(port, body)?;
+    let handle = executor::reactor::tcp_listen(port, body)?;
     _retain(handle);
     Ok(())
 }
 
 /// Listen for UDP on `port`; semantics match [`tcp_listen`].
-pub fn udp_listen<H, F>(port: u16, body: H) -> Result<(), executor::net::UdpBindError>
+pub fn udp_listen<H, F>(port: u16, body: H) -> Result<(), executor::reactor::UdpBindError>
 where
-    H: Fn(alloc::sync::Arc<executor::net::UdpSocket>) -> F + Send + Sync + 'static,
+    H: Fn(alloc::sync::Arc<executor::reactor::UdpSocket>) -> F + Send + Sync + 'static,
     F: core::future::Future<Output = ()> + 'static,
 {
-    let handle = executor::net::udp_listen(port, body)?;
+    let handle = executor::reactor::udp_listen(port, body)?;
     _retain(handle);
     Ok(())
 }

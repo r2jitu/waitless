@@ -386,7 +386,7 @@ pub enum ConnState {
 ///     `out.split_at_mut`, slice indexing — never `reserve`).
 pub enum DatagramBuf {
     /// Heap-allocated Vec. Used as fallback when
-    /// [`executor::net::acquire_tx_buf`] returns `None`.
+    /// [`executor::reactor::acquire_tx_buf`] returns `None`.
     Heap(Vec<u8>),
     /// Vec wrapping a driver TX-pool slot. The handle's `Drop`
     /// returns the slot to the pool if the buf is dropped
@@ -929,7 +929,7 @@ impl Connection {
     /// No-op when no close is pending.
     pub fn flush_close(&mut self) {
         if let Some((error_code, reason)) = self.close_pending.take() {
-            use executor::net::MAX_L2_HEADROOM;
+            use executor::reactor::MAX_L2_HEADROOM;
             let mut datagram = self.take_datagram_buf(256);
             if self
                 .encode_close_packet(datagram.vec_mut(), error_code, &reason)
@@ -1044,7 +1044,7 @@ impl Connection {
             1 => CryptoLevel::Handshake,
             _ => CryptoLevel::OneRtt,
         };
-        use executor::net::MAX_L2_HEADROOM;
+        use executor::reactor::MAX_L2_HEADROOM;
         let mut datagram = self.take_datagram_buf(64);
         if self.encode_ping_probe(datagram.vec_mut(), level).is_ok()
             && datagram.len() > MAX_L2_HEADROOM
@@ -1239,10 +1239,10 @@ impl Connection {
     /// the encoder captures `header_start = out.len()` after the
     /// resize.
     fn take_datagram_buf(&mut self, fallback_capacity: usize) -> DatagramBuf {
-        use executor::net::MAX_L2_HEADROOM;
+        use executor::reactor::MAX_L2_HEADROOM;
 
         // Hot path: acquire a slot from the driver's TX pool.
-        if let Some(handle) = executor::net::acquire_tx_buf() {
+        if let Some(handle) = executor::reactor::acquire_tx_buf() {
             // Wrap the slot's data region as a Vec via raw
             // construction. Capacity == handle.data_cap (1514 B);
             // the encoder won't push beyond that for any single
@@ -2317,7 +2317,7 @@ impl Connection {
     }
 
     fn flush_outbound(&mut self, _config: &TlsServerConfig) -> Result<(), ConnError> {
-        use executor::net::MAX_L2_HEADROOM;
+        use executor::reactor::MAX_L2_HEADROOM;
 
         // CONNECTION_CLOSE short-circuits the normal flush flow.
         // RFC 9000 §10.2.1: once we decide to close, we send one
@@ -3579,7 +3579,7 @@ mod tests {
         let pkt = conn
             .pop_packet_owned()
             .expect("server reply datagram queued");
-        let reply = &pkt.vec()[executor::net::MAX_L2_HEADROOM..];
+        let reply = &pkt.vec()[executor::reactor::MAX_L2_HEADROOM..];
         assert!(!reply.is_empty(), "non-empty reply datagram");
 
         // First packet should be Initial. Re-derive server-side

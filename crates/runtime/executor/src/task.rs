@@ -264,7 +264,7 @@ pub fn tick(worker_id: u32) -> bool {
 
     // Spawn per-worker launchers registered by `UdpSocket::run` /
     // `TcpListener::run` since this worker last ticked.
-    crate::net::fire_pending_net_launchers(worker_id);
+    crate::reactor::fire_pending_net_launchers(worker_id);
 
     crate::sleep::advance_timers(&cc);
 
