@@ -17,6 +17,6 @@ rust_library(
     crate_name = "bus",
     crate_root = "src/lib.rs",
     deps = [
-        "//crates/kernel/sys",
+        "//crates/kernel/bare",
     ],
 )

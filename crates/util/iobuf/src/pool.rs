@@ -34,7 +34,7 @@
 // The free list is a lock-free `tagged_treiber::TaggedTreiberStack`
 // — a single `AtomicU64` head packing `(slot_index, version_tag)`,
 // the version as the ABA defence. The mechanism lives, audited once,
-// in that crate's docs; `uni_kernel::rx_inbox::RxNodePool` is its
+// in that crate's docs; `kernel_bare::rx_inbox::RxNodePool` is its
 // other consumer.
 //
 // The one pool-specific point is link storage. Free slabs are linked

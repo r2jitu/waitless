@@ -297,7 +297,7 @@ pub fn run(core_id: u32) -> ! {
 
         // 3a. Async runtime: advance timers (drain pending MPSC + fire
         // expired), then poll every ready task slot in the per-core
-        // arena. Spawned futures live here. See uni_kernel::runtime.
+        // arena. Spawned futures live here. See kernel_bare::runtime.
         if executor::tick(core_id) {
             did_work = true;
             runtime_work += 1;

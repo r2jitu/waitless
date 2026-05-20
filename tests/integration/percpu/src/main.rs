@@ -5,8 +5,8 @@
 
 #![no_std]
 
+extern crate kernel_bare;
 extern crate uni;
-extern crate uni_kernel;
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -30,7 +30,7 @@ fn test_service(core_id: u32) -> bool {
     }
 
     unsafe {
-        let core = uni_kernel::percpu::get(core_id);
+        let core = kernel_bare::percpu::get(core_id);
 
         // Verify core ID matches
         if core.id != core_id {
@@ -57,7 +57,7 @@ fn test_service(core_id: u32) -> bool {
 fn init() {
     uni::println!("Per-core state test starting.");
 
-    let num_cores = uni_kernel::percpu::num_cores();
+    let num_cores = kernel_bare::percpu::num_cores();
     uni::println!("Cores: {}", num_cores);
 
     if num_cores <= 1 {
@@ -74,11 +74,11 @@ fn init() {
     }
 
     // Register service callback
-    uni_kernel::eventloop::set_service(test_service);
+    kernel_bare::eventloop::set_service(test_service);
 
     // Signal APs to start
-    uni_kernel::eventloop::set_ready();
-    uni_kernel::wake_cores();
+    kernel_bare::eventloop::set_ready();
+    kernel_bare::wake_cores();
 
     // Run core 0's test inline
     test_service(0);
@@ -117,7 +117,7 @@ fn init() {
     let mut buf = [0u8; 1514];
     for i in 1..num_cores {
         unsafe {
-            let core = uni_kernel::percpu::get(i);
+            let core = kernel_bare::percpu::get(i);
             if let Some(n) = core.tx_staging.pop_into(&mut buf) {
                 let data = &buf[..n];
                 if data.len() >= 2 && data[0] == i as u8 && data[1] == 0xAA {
@@ -134,5 +134,5 @@ fn init() {
     }
 
     uni::println!("Per-core state test complete.");
-    uni_kernel::eventloop::request_shutdown();
+    kernel_bare::eventloop::request_shutdown();
 }

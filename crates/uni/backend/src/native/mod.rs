@@ -1012,7 +1012,7 @@ pub fn cycles_per_us() -> u64 {
 }
 
 // ============================================================================
-// Callback-driven event loop (mirrors uni_kernel::eventloop)
+// Callback-driven event loop (mirrors kernel_bare::eventloop)
 // ============================================================================
 //
 // Same pattern as the unikernel: register callbacks, all workers run

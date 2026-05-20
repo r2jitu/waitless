@@ -148,7 +148,7 @@ impl<'a, T> Drop for SpinlockGuard<'a, T> {
 // deps that break `rust_test`'s panic=unwind. A no-dep leaf
 // crate gives every consumer the same type.
 //
-// Re-exported here so existing `uni_kernel::sync::AtomicFn` imports
+// Re-exported here so existing `kernel_bare::sync::AtomicFn` imports
 // keep resolving unchanged. (Was `#[cfg(not(test))]`-gated for the
 // old standalone `//kernel:sync_test`; `kernel_core`'s crate-level
 // `core_test` declares the `atomic_fn` dep, and `percpu` references

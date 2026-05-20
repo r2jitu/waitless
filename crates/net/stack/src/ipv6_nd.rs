@@ -92,7 +92,7 @@ pub fn init_ipv6() {
     for (i, slot) in IPV6_LL_OCTETS.iter().enumerate() {
         slot.store(ll.octets[i], Ordering::Release);
     }
-    uni_kernel::serial::write_fmt(format_args!(
+    kernel_bare::serial::write_fmt(format_args!(
         "[net] ipv6 link-local fe80::{:x}:{:x}:{:x}:{:x}\n",
         u16::from_be_bytes([ll.octets[8], ll.octets[9]]),
         u16::from_be_bytes([ll.octets[10], ll.octets[11]]),
@@ -154,7 +154,7 @@ fn handle_router_advertisement(payload: &[u8]) {
     for (i, slot) in IPV6_GLOBAL_OCTETS.iter().enumerate() {
         slot.store(o[i], Ordering::Release);
     }
-    uni_kernel::serial::write_fmt(format_args!(
+    kernel_bare::serial::write_fmt(format_args!(
         "[net] ipv6 SLAAC: configured {:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}::{:x}:{:x}:{:x}:{:x}\n",
         o[0],
         o[1],

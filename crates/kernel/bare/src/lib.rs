@@ -19,7 +19,7 @@ pub mod time;
 // The pure-logic kernel modules — lock-free data structures, per-core
 // state, sync primitives — live in the host-buildable `kernel_core`
 // crate (split out so they are unit-testable off the bare-metal
-// target). Re-export every one so consumers' `uni_kernel::{percpu,
+// target). Re-export every one so consumers' `kernel_bare::{percpu,
 // sync, rx_inbox, ...}` paths are unchanged.
 pub use kernel_core::{
     clock, cpu_id, deque, diag, mmio, once, percpu, rx_inbox, spsc, sync, timer, types,
@@ -38,7 +38,7 @@ pub mod aarch64;
 /// symbol and `//kernel` defines it. Callers use `cpu_id()` (the
 /// re-exported `kernel_core::cpu_id`), never this directly.
 #[unsafe(no_mangle)]
-pub extern "Rust" fn __uni_kernel_cpu_id() -> u32 {
+pub extern "Rust" fn __kernel_bare_cpu_id() -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
         x86_64::smp::cpu_id()

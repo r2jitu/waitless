@@ -18,13 +18,13 @@ rust_library(
     # itself calls into it for `cpu_id`, `eventloop::set_on_shutdown`,
     # and `rng::fill_bytes`.
     deps = [
-        "//crates/uni/backend",
-        "//crates/uni/net",
         "//crates/runtime/executor",
         "//crates/runtime/worker",
+        "//crates/uni/backend",
+        "//crates/uni/net",
     ] + select({
         "//bazel/platforms:native": [],
-        "//conditions:default": ["//crates/kernel/sys"],
+        "//conditions:default": ["//crates/kernel/bare"],
     }),
 )
 

@@ -30,7 +30,7 @@ Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework 
 │     Runtime substrate                │  crates/runtime/{platform, worker,
 │                                      │                  executor}
 ├──────────────────────────────────────┤
-│       Kernel (serial, mm, SMP...)    │  crates/kernel/{core, sys}
+│       Kernel (serial, mm, SMP...)    │  crates/kernel/{core, bare}
 ├──────────────────────────────────────┤
 │        Boot / Entry                  │  crates/boot/
 └──────────────────────────────────────┘

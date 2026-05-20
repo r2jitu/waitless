@@ -7,7 +7,7 @@
 //! itself — what happens to a frame — is `crate::rx`.
 
 use crate::rx;
-use uni_kernel::percpu;
+use kernel_bare::percpu;
 
 /// Whether multi-core distribution has been initialized.
 static MULTICORE_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -16,8 +16,8 @@ static MULTICORE_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// distributor is single-threaded (only the lock holder writes), but
 /// every core wakes up afterwards and reads the flags, so atomic load/
 /// store removes the language-level data race.
-pub(crate) static WAKEUP: uni_kernel::percpu::PerWorker<core::sync::atomic::AtomicBool> =
-    uni_kernel::percpu::PerWorker::new();
+pub(crate) static WAKEUP: kernel_bare::percpu::PerWorker<core::sync::atomic::AtomicBool> =
+    kernel_bare::percpu::PerWorker::new();
 
 /// RX poll lock: 0 = free, 1 = held. CAS-based; only one core wins
 /// the right to drain the RX queue at a time.
@@ -35,8 +35,8 @@ static RX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 /// wins the `try_lock` CAS race consistently (because it's first to
 /// try after each release), so the "rotating distributor" never
 /// actually rotates under asymmetric load.
-pub(crate) static JUST_DISTRIBUTED: uni_kernel::percpu::PerWorker<core::sync::atomic::AtomicBool> =
-    uni_kernel::percpu::PerWorker::new();
+pub(crate) static JUST_DISTRIBUTED: kernel_bare::percpu::PerWorker<core::sync::atomic::AtomicBool> =
+    kernel_bare::percpu::PerWorker::new();
 
 /// Per-core poll counter — gates the RFC 6298 retransmission tick.
 /// Walking the TCP pool (and reading the millisecond clock) on every
@@ -59,7 +59,7 @@ const RTX_TICK_MASK: u32 = 0x3FF;
 
 /// Run the TCP retransmission tick for this core at a coarse cadence.
 fn rtx_tick_if_due() {
-    let core = uni_kernel::cpu_id() as usize;
+    let core = kernel_bare::cpu_id() as usize;
     if core >= RTX_POLL_COUNT.len() {
         return;
     }
@@ -106,12 +106,12 @@ fn poll_tier1() -> bool {
         let nqp = nic::num_queue_pairs();
         // One write_fmt holds SERIAL_TX_LOCK for the whole line so a
         // concurrent klog! on another core can't slip in mid-message.
-        uni_kernel::serial::write_fmt(format_args!(
+        kernel_bare::serial::write_fmt(format_args!(
             "[net] Tier 1: per-core RX queues ({} queue pairs)\n",
             nqp
         ));
     }
-    let core = uni_kernel::cpu_id();
+    let core = kernel_bare::cpu_id();
     let nqp = nic::num_queue_pairs() as u32;
     // Pre-`set_ready` (boot-task window): only the BSP is polling;
     // APs are still idling at the top of `eventloop::run`. If a
@@ -122,7 +122,7 @@ fn poll_tier1() -> bool {
     // fired we fall back to the per-core scheme — APs are then
     // polling their own queues, and double-polling would race on
     // the per-queue cursor atomics.
-    if core == 0 && !uni_kernel::eventloop::is_ready() {
+    if core == 0 && !kernel_bare::eventloop::is_ready() {
         let mut total = 0;
         for q in 0..nqp as usize {
             total += nic::poll_qp(q, rx::net_receive);
@@ -144,13 +144,13 @@ fn poll_tier1() -> bool {
 fn poll_tier2(num_cores: u32) -> bool {
     if !MULTICORE_INIT.load(core::sync::atomic::Ordering::Relaxed) {
         MULTICORE_INIT.store(true, core::sync::atomic::Ordering::Relaxed);
-        uni_kernel::serial::write_fmt(format_args!(
+        kernel_bare::serial::write_fmt(format_args!(
             "[net] Tier 2: software distribution ({} cores)\n",
             num_cores
         ));
     }
 
-    let my_core = uni_kernel::cpu_id();
+    let my_core = kernel_bare::cpu_id();
 
     // Cooperative yield for fair rotation: if we just distributed on the
     // previous cycle, skip this attempt so another (presumably busier)
@@ -209,9 +209,9 @@ fn poll_tier2(num_cores: u32) -> bool {
         for i in 1..num_cores {
             if WAKEUP.at(i).load(core::sync::atomic::Ordering::Relaxed) {
                 #[cfg(target_arch = "aarch64")]
-                uni_kernel::aarch64::smp::send_sgi_to(i);
+                kernel_bare::aarch64::smp::send_sgi_to(i);
                 #[cfg(target_arch = "x86_64")]
-                uni_kernel::send_ipi(i);
+                kernel_bare::send_ipi(i);
             }
         }
     }
@@ -229,17 +229,17 @@ fn poll_tier2(num_cores: u32) -> bool {
 /// Register network callbacks with the kernel event loop.
 /// Called during boot after virtio-net is initialized.
 pub fn init_eventloop() {
-    uni_kernel::eventloop::set_net_poll(net_poll_cb);
-    uni_kernel::eventloop::set_net_drain(net_drain_cb);
-    uni_kernel::eventloop::set_net_flush(net_flush_cb);
+    kernel_bare::eventloop::set_net_poll(net_poll_cb);
+    kernel_bare::eventloop::set_net_drain(net_drain_cb);
+    kernel_bare::eventloop::set_net_flush(net_flush_cb);
     // NAPI re-arm: right before the event loop HLTs, re-enable RX
     // notifications on this core's queue pair and re-check the ring.
-    uni_kernel::eventloop::set_net_rearm_rx(nic::rearm_rx_napi);
+    kernel_bare::eventloop::set_net_rearm_rx(nic::rearm_rx_napi);
     // RFC 6298: a core with an armed retransmission timer must not
     // sleep past the deadline. The event loop bounds its idle when
     // this reports true (the connection awaiting a lost segment's
     // ACK gets no RX event to wake it otherwise).
-    uni_kernel::eventloop::set_net_has_timers(crate::tcp::has_armed_rtx_timers);
+    kernel_bare::eventloop::set_net_has_timers(crate::tcp::has_armed_rtx_timers);
     // Batch TX kicks: defer MMIO writes until `net_flush_cb` fires at
     // the end of each event-loop tick. Correct for the whole boot
     // because DHCP now runs as an async task polled by the event loop

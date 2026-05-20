@@ -41,8 +41,8 @@
 
 extern crate bus;
 extern crate iobuf;
+extern crate kernel_bare;
 extern crate nic_api;
-extern crate uni_kernel;
 
 mod adminq;
 mod diag;
@@ -76,8 +76,8 @@ use core::ptr;
 use core::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
 };
-use uni_kernel::mm::{alloc_pages, phys_to_virt};
-use uni_kernel::sync::Spinlock;
+use kernel_bare::mm::{alloc_pages, phys_to_virt};
+use kernel_bare::sync::Spinlock;
 
 // ---- PCI identity ----------------------------------------------------------
 
@@ -1814,7 +1814,7 @@ fn current_qp() -> Option<usize> {
     if num_qp == 0 {
         return None;
     }
-    let core = uni_kernel::cpu_id();
+    let core = kernel_bare::cpu_id();
     Some(if core < num_qp { core as usize } else { 0 })
 }
 

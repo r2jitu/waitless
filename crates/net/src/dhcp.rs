@@ -19,9 +19,9 @@ extern crate arp as arp;
 extern crate ethernet as ethernet;
 extern crate executor;
 extern crate ipv4 as ipv4;
+extern crate kernel_bare;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
-extern crate uni_kernel;
 
 mod dhcp_parse;
 
@@ -31,8 +31,8 @@ use executor::event::AsyncEvent;
 use executor::net::UdpSocket;
 use executor::select::timeout_us;
 use from_bytes::FromBytes;
+use kernel_bare::sync::Spinlock;
 use types::{CONFIG, Ipv4Addr, htonl, htons};
-use uni_kernel::sync::Spinlock;
 
 /// Fixed DHCP/BOOTP header. 236 bytes + 4-byte magic cookie = 240
 /// bytes. Options follow.
@@ -338,7 +338,7 @@ pub async fn discover() -> bool {
         }
         msg[pos] = b'\n';
         pos += 1;
-        uni_kernel::serial::puts(&msg[..pos]);
+        kernel_bare::serial::puts(&msg[..pos]);
     }
 
     arp_announce();

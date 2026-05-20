@@ -6,7 +6,7 @@
 // none of which touch hardware or arch-specific code. Split out of
 // `//kernel` (which stays `os:none` for the MMU / APIC / boot code)
 // so this logic is unit-testable on the host. `//kernel` re-exports
-// every module here, so consumers using `uni_kernel::{percpu, sync,
+// every module here, so consumers using `kernel_bare::{percpu, sync,
 // rx_inbox, ...}` are unaffected by the split.
 
 #![cfg_attr(not(test), no_std)]
@@ -29,7 +29,7 @@ pub mod types;
 /// Current CPU id.
 ///
 /// On the bare-metal target this resolves, via a link seam, to
-/// `//kernel`'s arch implementation (`__uni_kernel_cpu_id`);
+/// `//kernel`'s arch implementation (`__kernel_bare_cpu_id`);
 /// `kernel_core` is the lower crate and cannot call up into the
 /// arch modules, so it declares the symbol and `//kernel` defines
 /// it. On a host build there is one logical CPU, so it is `0` —
@@ -44,12 +44,12 @@ pub fn cpu_id() -> u32 {
     #[cfg(target_os = "none")]
     {
         unsafe extern "Rust" {
-            fn __uni_kernel_cpu_id() -> u32;
+            fn __kernel_bare_cpu_id() -> u32;
         }
         // SAFETY: `//kernel` defines this `#[no_mangle]` symbol, and
         // every `os:none` binary that links `kernel_core` also links
         // `//kernel` (it is the foundational crate).
-        unsafe { __uni_kernel_cpu_id() }
+        unsafe { __kernel_bare_cpu_id() }
     }
     #[cfg(not(target_os = "none"))]
     {

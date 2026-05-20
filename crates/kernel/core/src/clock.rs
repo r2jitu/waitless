@@ -8,7 +8,7 @@
 // It mirrors the `cpu_id` / `rng::fill_bytes` link seams:
 //
 //   * `target_os = "none"` → resolves, via the `extern "Rust"` symbol
-//     `__uni_kernel_now_ms`, to `//kernel`'s real cycle-counter clock
+//     `__kernel_bare_now_ms`, to `//kernel`'s real cycle-counter clock
 //     (`time::since_boot_us() / 1000`). `kernel_core` is the lower
 //     crate and cannot call up into `//kernel`, so it declares the
 //     symbol and `//kernel` defines it.
@@ -36,12 +36,12 @@
 #[inline]
 pub fn now_ms() -> u64 {
     unsafe extern "Rust" {
-        fn __uni_kernel_now_ms() -> u64;
+        fn __kernel_bare_now_ms() -> u64;
     }
     // SAFETY: `//kernel` defines this `#[no_mangle]` symbol, and every
     // `os:none` binary that links `kernel_core` also links `//kernel`
     // (it is the foundational crate).
-    unsafe { __uni_kernel_now_ms() }
+    unsafe { __kernel_bare_now_ms() }
 }
 
 /// Host build: the test-controllable mock clock.

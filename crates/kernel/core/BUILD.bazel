@@ -7,7 +7,7 @@ package(default_visibility = ["//visibility:public"])
 # structures, per-core state, sync primitives, plain data types. No
 # hardware or arch access; that stays in `//kernel` (os:none). Split
 # out so this logic is unit-testable on the host. `//kernel`
-# re-exports every module here, so `uni_kernel::{percpu, sync, ...}`
+# re-exports every module here, so `kernel_bare::{percpu, sync, ...}`
 # paths are unchanged for consumers.
 rust_library(
     name = "core",
@@ -30,10 +30,10 @@ rust_library(
     crate_root = "src/lib.rs",
     deps = [
         "//crates/net:types",
-        "//crates/util/iobuf",
         "//crates/runtime/executor",
         "//crates/runtime/worker",
         "//crates/util/atomic-fn",
+        "//crates/util/iobuf",
         "//crates/util/tagged-treiber",
     ],
 )

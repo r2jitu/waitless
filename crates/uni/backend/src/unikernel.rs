@@ -1,6 +1,6 @@
 // uni-backend/src/unikernel.rs — Bare-metal dispatch.
 
-use uni_kernel::serial;
+use kernel_bare::serial;
 
 // ---- Lifecycle / config ---------------------------------------------------
 
@@ -61,8 +61,8 @@ pub fn tcp_diag() -> crate::TcpDiag {
 
 // ---- Event loop re-exports ------------------------------------------------
 
-pub use uni_kernel::eventloop::{request_shutdown, set_ready};
-pub use uni_kernel::percpu::num_cores as num_workers;
+pub use kernel_bare::eventloop::{request_shutdown, set_ready};
+pub use kernel_bare::percpu::num_cores as num_workers;
 
 /// Per-core event-loop stats snapshot. Tuple form so the cross-
 /// boundary type is opaque (the bare struct lives in the kernel
@@ -81,7 +81,7 @@ pub use uni_kernel::percpu::num_cores as num_workers;
 /// `idle_cycles / (busy_cycles + idle_cycles)`. Caller computes
 /// rates from two snapshots a known interval apart.
 pub fn core_stats(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
-    uni_kernel::eventloop::core_stats_snapshot(core_id)
+    kernel_bare::eventloop::core_stats_snapshot(core_id)
 }
 
 /// TSC / virtual-counter rate. Companion to `core_stats` —
@@ -89,7 +89,7 @@ pub fn core_stats(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
 /// multiplier. Cheap on aarch64 (CNTFRQ_EL0 read) and cached on
 /// x86_64 (PIT-calibrated TSC).
 pub fn cycles_per_us() -> u64 {
-    uni_kernel::time::cycles_per_us()
+    kernel_bare::time::cycles_per_us()
 }
 
 // ---- Async runtime re-exports ---------------------------------------------
@@ -101,7 +101,7 @@ pub mod runtime {
 // ---- Heap stats -----------------------------------------------------------
 
 pub fn heap_stats() -> super::HeapStats {
-    let s = uni_kernel::mm::heap_stats();
+    let s = kernel_bare::mm::heap_stats();
     super::HeapStats {
         allocated_bytes: s.allocated_bytes,
         available_bytes: s.available_bytes,
@@ -119,37 +119,37 @@ pub fn heap_stats() -> super::HeapStats {
 /// survive in `/diag-panic` even if the rest of the kernel later
 /// halts.
 pub fn diag_append(bytes: &[u8]) {
-    uni_kernel::diag::append(bytes)
+    kernel_bare::diag::append(bytes)
 }
 
 /// Append a hex-encoded u64 (no `0x` prefix) — pairs with
 /// `diag_append` for boot-time format-free logging.
 pub fn diag_append_hex(value: u64) {
-    uni_kernel::diag::append_hex(value)
+    kernel_bare::diag::append_hex(value)
 }
 
 /// Append a 2-char hex-encoded u8 — for byte-window dumps where
 /// `diag_append_hex` would render 14 leading zeros.
 pub fn diag_append_hex_u8(value: u8) {
-    uni_kernel::diag::append_hex_u8(value)
+    kernel_bare::diag::append_hex_u8(value)
 }
 
 /// Snapshot the in-band diag-capture buffer (panics + unhandled
 /// exceptions, cf. `kernel::diag`). Returns the byte count written.
 pub fn diag_snapshot(out: &mut [u8]) -> usize {
-    uni_kernel::diag::snapshot(out)
+    kernel_bare::diag::snapshot(out)
 }
 
 /// Bytes captured so far in the diag buffer. Cheap test for "is there
 /// anything to read?".
 pub fn diag_captured_len() -> usize {
-    uni_kernel::diag::captured_len()
+    kernel_bare::diag::captured_len()
 }
 
 /// Reset the diag buffer to empty. Useful for repro loops that want
 /// to capture a fresh trace per iteration.
 pub fn diag_reset() {
-    uni_kernel::diag::reset()
+    kernel_bare::diag::reset()
 }
 
 // ---- Wait for events ------------------------------------------------------
@@ -165,7 +165,7 @@ struct IrqGuard {
 impl IrqGuard {
     #[inline]
     fn new() -> Self {
-        uni_kernel::cpu::mask_irq();
+        kernel_bare::cpu::mask_irq();
         IrqGuard {
             _no_send: core::marker::PhantomData,
         }
@@ -175,7 +175,7 @@ impl IrqGuard {
 impl Drop for IrqGuard {
     #[inline]
     fn drop(&mut self) {
-        uni_kernel::cpu::unmask_irq();
+        kernel_bare::cpu::unmask_irq();
     }
 }
 
@@ -186,10 +186,10 @@ pub fn wait_for_events() {
         let _irq = IrqGuard::new();
         nic::arm_rx_interrupts();
         if !nic::has_pending_rx() && !nic::has_pending_tx() {
-            uni_kernel::cpu::idle_bounded();
+            kernel_bare::cpu::idle_bounded();
         }
         nic::flush_tx_staging();
     } else {
-        uni_kernel::cpu::relax();
+        kernel_bare::cpu::relax();
     }
 }

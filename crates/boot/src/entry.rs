@@ -15,9 +15,9 @@ extern crate alloc;
 use core::ptr;
 
 extern crate bus;
+extern crate kernel_bare;
 extern crate nic;
 extern crate uni;
-extern crate uni_kernel;
 extern crate uni_net_stack as net;
 
 // Boot assembly — compiled by LLVM's integrated assembler via global_asm!.
@@ -38,10 +38,10 @@ core::arch::global_asm!(include_str!("x86_64/ap_boot.S"), options(att_syntax));
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(include_str!("aarch64/boot.S"));
 
-use types::{BootInfo, MAX_MEMORY_REGIONS, MEM_AVAILABLE, MEM_RESERVED, MemoryRegion, Protocol};
 #[cfg(target_arch = "aarch64")]
-use uni_kernel::aarch64::{exceptions, fdt, mmu, smp};
-use uni_kernel::{mm, serial, types};
+use kernel_bare::aarch64::{exceptions, fdt, mmu, smp};
+use kernel_bare::{mm, serial, types};
+use types::{BootInfo, MAX_MEMORY_REGIONS, MEM_AVAILABLE, MEM_RESERVED, MemoryRegion, Protocol};
 
 // ============================================================================
 // Panic handler (required for rust_static_library)
@@ -53,27 +53,27 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // `/diag-panic` HTTP endpoint can surface the message on
     // systems where serial-port-output isn't externally readable
     // (sandboxed GCE deploys).
-    uni_kernel::diag::append(b"\n!!! PANIC on cpu ");
-    uni_kernel::diag::append_u32(uni_kernel::cpu_id());
-    uni_kernel::diag::append(b" !!!\n");
+    kernel_bare::diag::append(b"\n!!! PANIC on cpu ");
+    kernel_bare::diag::append_u32(kernel_bare::cpu_id());
+    kernel_bare::diag::append(b" !!!\n");
     if let Some(loc) = info.location() {
-        uni_kernel::diag::append(b"  at ");
-        uni_kernel::diag::append(loc.file().as_bytes());
-        uni_kernel::diag::append(b":");
-        uni_kernel::diag::append_u32(loc.line());
-        uni_kernel::diag::append(b"\n");
+        kernel_bare::diag::append(b"  at ");
+        kernel_bare::diag::append(loc.file().as_bytes());
+        kernel_bare::diag::append(b":");
+        kernel_bare::diag::append_u32(loc.line());
+        kernel_bare::diag::append(b"\n");
     }
     use core::fmt::Write;
     struct DiagWriter;
     impl Write for DiagWriter {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            uni_kernel::diag::append(s.as_bytes());
+            kernel_bare::diag::append(s.as_bytes());
             Ok(())
         }
     }
-    uni_kernel::diag::append(b"  message: ");
+    kernel_bare::diag::append(b"  message: ");
     let _ = write!(DiagWriter, "{}", info.message());
-    uni_kernel::diag::append(b"\n");
+    kernel_bare::diag::append(b"\n");
 
     // Flush whatever early-boot lines are buffered through the
     // current (16550 / PL011) backend before printing PANIC, so
@@ -385,7 +385,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
         // Mark boot-start as early as possible — `serial::init` itself
         // takes a few hundred microseconds (UART config + FIFO drain) and
         // we want every subsequent log line's timestamp to include it.
-        uni_kernel::time::mark_boot_start();
+        kernel_bare::time::mark_boot_start();
         serial::init();
 
         // Force TSC calibration BEFORE the first log line. On x86 without
@@ -396,7 +396,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
         // calibration delay, so the line shows `[0.000]` and every subsequent
         // line is offset by the calibration cost. Eager calibration here
         // keeps every timestamp truthful and lets us shorten the PIT window.
-        let _ = uni_kernel::time::cycles_per_us();
+        let _ = kernel_bare::time::cycles_per_us();
         #[cfg(target_arch = "aarch64")]
         klog!("UniKernel v0.1.0 (aarch64)\n");
         #[cfg(target_arch = "x86_64")]
@@ -404,8 +404,8 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
         #[cfg(target_arch = "x86_64")]
         {
-            uni_kernel::x86_64::gdt::init();
-            uni_kernel::x86_64::idt::init();
+            kernel_bare::x86_64::gdt::init();
+            kernel_bare::x86_64::idt::init();
         }
         #[cfg(target_arch = "aarch64")]
         exceptions::init();
@@ -413,14 +413,14 @@ unsafe fn kernel_boot(info: &BootInfo) {
         mm::init(info as *const BootInfo);
 
         #[cfg(target_arch = "x86_64")]
-        uni_kernel::x86_64::apic::init();
+        kernel_bare::x86_64::apic::init();
 
         #[cfg(target_arch = "x86_64")]
         {
             // Seed the RSDP hint before `detect_cpus()` — under UEFI
             // (GCE's OVMF) the BIOS-area scan fallback fails, so without
             // this we'd silently boot 1 CPU.
-            uni_kernel::x86_64::acpi::set_rsdp(info.rsdp_paddr);
+            kernel_bare::x86_64::acpi::set_rsdp(info.rsdp_paddr);
         }
 
         // Detect actual core count, publish via `set_num_workers`, then
@@ -431,26 +431,26 @@ unsafe fn kernel_boot(info: &BootInfo) {
         // points the TLS register at a null cell and every later
         // `cpu_id()` returns garbage).
         #[cfg(target_arch = "aarch64")]
-        let cpu_count = uni_kernel::aarch64::fdt::info().cpu_count;
+        let cpu_count = kernel_bare::aarch64::fdt::info().cpu_count;
         #[cfg(target_arch = "x86_64")]
-        let cpu_count = uni_kernel::x86_64::acpi::detect_cpus();
-        uni_kernel::percpu::init(cpu_count);
+        let cpu_count = kernel_bare::x86_64::acpi::detect_cpus();
+        kernel_bare::percpu::init(cpu_count);
 
         #[cfg(target_arch = "x86_64")]
-        uni_kernel::x86_64::smp::init_tls(0);
+        kernel_bare::x86_64::smp::init_tls(0);
         #[cfg(target_arch = "aarch64")]
-        uni_kernel::aarch64::smp::init_tls(0);
+        kernel_bare::aarch64::smp::init_tls(0);
 
         // ── Identity / platform / memory diagnostics ────────────────────
         {
             let mut buf = [0u8; 128];
-            let n = uni_kernel::cpu_info::summary(&mut buf);
+            let n = kernel_bare::cpu_info::summary(&mut buf);
             // SAFETY: `summary` only writes ASCII chars produced via
             // `core::fmt::Write` over a `&str`-backed source.
             let cpu = core::str::from_utf8_unchecked(&buf[..n]);
             klog!("cpu: {} × {}\n", cpu_count, cpu);
         }
-        klog!("platform: {}\n", uni_kernel::cpu_info::hypervisor());
+        klog!("platform: {}\n", kernel_bare::cpu_info::hypervisor());
         klog!(
             "mem: {} / {} MB heap\n",
             mm::free_memory() / (1024 * 1024),
@@ -461,7 +461,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
         #[cfg(target_arch = "aarch64")]
         klog!(
             "irq: GICv{} configured\n",
-            uni_kernel::aarch64::fdt::info().gic_version
+            kernel_bare::aarch64::fdt::info().gic_version
         );
         klog!("smp: {} workers\n", cpu_count);
         #[cfg(target_arch = "x86_64")]
@@ -533,16 +533,16 @@ unsafe fn kernel_boot(info: &BootInfo) {
             #[cfg(target_arch = "x86_64")]
             {
                 // Serial RX interrupt (IRQ4 / vector 36) for Ctrl-C wakeup
-                uni_kernel::x86_64::idt::register_handler(36, serial_rx_isr_trampoline);
-                uni_kernel::x86_64::idt::enable_irq(4);
+                kernel_bare::x86_64::idt::register_handler(36, serial_rx_isr_trampoline);
+                kernel_bare::x86_64::idt::enable_irq(4);
                 serial::enable_rx_irq();
             }
         }
 
         // Idle-path infrastructure (timer IRQ + SGI handler + IRQ unmask) is
         // orthogonal to the NIC. Apps without networking still need
-        // `uni_kernel::cpu::idle_bounded` to wake from WFI when the 1 ms
-        // generic-timer fires — `uni_kernel::runtime`'s `Sleep` future depends
+        // `kernel_bare::cpu::idle_bounded` to wake from WFI when the 1 ms
+        // generic-timer fires — `kernel_bare::runtime`'s `Sleep` future depends
         // on it.
         #[cfg(target_arch = "aarch64")]
         {
@@ -569,7 +569,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
         #[cfg(target_arch = "aarch64")]
         {
             if cpu_count > 1 {
-                uni_kernel::aarch64::smp::start_secondary_cores(cpu_count);
+                kernel_bare::aarch64::smp::start_secondary_cores(cpu_count);
             }
         }
         #[cfg(target_arch = "x86_64")]
@@ -585,7 +585,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
                         let _ = start_aps_via_limine_mp();
                     }
                     _ => {
-                        uni_kernel::x86_64::smp::start_secondary_cores(cpu_count);
+                        kernel_bare::x86_64::smp::start_secondary_cores(cpu_count);
                     }
                 }
             }
@@ -595,10 +595,10 @@ unsafe fn kernel_boot(info: &BootInfo) {
         // serial port and is NIC-independent — always wire it. The
         // NIC-specific hooks (poll/drain/flush/rearm/idle) only make
         // sense when a NIC probed.
-        uni_kernel::eventloop::set_check_shutdown(|| serial::check_shutdown());
+        kernel_bare::eventloop::set_check_shutdown(|| serial::check_shutdown());
         if net_ok {
             net::init_eventloop();
-            uni_kernel::eventloop::set_idle(idle_cb);
+            kernel_bare::eventloop::set_idle(idle_cb);
         }
 
         // Publish the read-only boot snapshot to apps. Must run after
@@ -607,10 +607,10 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
         // Register the bare-metal async runtime with `//uni-runtime`.
         // Must happen before `uni_init` so the app can `spawn` / `sleep_us`.
-        uni_kernel::runtime::init();
+        kernel_bare::runtime::init();
         klog!(
             "runtime: {} workers ready\n",
-            uni_kernel::percpu::num_cores()
+            kernel_bare::percpu::num_cores()
         );
 
         // `uni_init()` (generated by `#[uni::init]`) spawns the app's
@@ -621,15 +621,15 @@ unsafe fn kernel_boot(info: &BootInfo) {
         // deferred-TX-kick race.
         uni_init();
 
-        if !uni_kernel::eventloop::is_shutdown() {
-            uni_kernel::eventloop::run(0);
+        if !kernel_bare::eventloop::is_shutdown() {
+            kernel_bare::eventloop::run(0);
         }
 
         klog!("\n[SHUTDOWN] Powering off.\n");
 
         // Stop secondary cores before system poweroff
         #[cfg(target_arch = "aarch64")]
-        uni_kernel::aarch64::smp::request_shutdown();
+        kernel_bare::aarch64::smp::request_shutdown();
 
         arch_shutdown();
     }
@@ -655,8 +655,8 @@ fn publish_boot_info(net_ok: bool) {
     }
 
     uni::boot_info::init_boot_info(BootInfoParams {
-        ram_bytes: uni_kernel::mm::total_memory(),
-        num_cpus: uni_kernel::percpu::num_cores(),
+        ram_bytes: kernel_bare::mm::total_memory(),
+        num_cpus: kernel_bare::percpu::num_cores(),
         // Surface the kernel command line. On aarch64 this is
         // `chosen.bootargs` from the FDT (HVF runner's
         // `--bootargs=` flag, QEMU `-append`, …); on x86_64
@@ -682,12 +682,12 @@ fn publish_boot_info(net_ok: bool) {
 /// defaults).
 #[cfg(target_arch = "aarch64")]
 fn boot_args() -> &'static str {
-    uni_kernel::aarch64::fdt::info().boot_args()
+    kernel_bare::aarch64::fdt::info().boot_args()
 }
 
 #[cfg(target_arch = "x86_64")]
 fn boot_args() -> &'static str {
-    uni_kernel::x86_64::boot_args::boot_args()
+    kernel_bare::x86_64::boot_args::boot_args()
 }
 
 /// Event loop idle callback. Core-aware:
@@ -704,7 +704,7 @@ fn idle_cb(core_id: u32) {
     if !nic::irq_idle_supported() {
         return;
     }
-    if core_id == 0 || uni_kernel::percpu::num_cores() <= 1 {
+    if core_id == 0 || kernel_bare::percpu::num_cores() <= 1 {
         uni::wait_for_events();
     } else {
         // AP idle. On aarch64 + HVF we write the core_id to the
@@ -713,7 +713,7 @@ fn idle_cb(core_id: u32) {
         // WFI/HLT when the yield register isn't present.
         #[cfg(target_arch = "aarch64")]
         {
-            let yield_addr = uni_kernel::aarch64::fdt::info().yield_mmio_base;
+            let yield_addr = kernel_bare::aarch64::fdt::info().yield_mmio_base;
             if yield_addr != 0 {
                 unsafe {
                     core::ptr::write_volatile(yield_addr as *mut u32, core_id);
@@ -721,14 +721,14 @@ fn idle_cb(core_id: u32) {
                 return;
             }
         }
-        uni_kernel::cpu::idle_unbounded();
+        kernel_bare::cpu::idle_unbounded();
     }
 }
 
 // x86_64: ISR trampoline for serial RX (ignores InterruptFrame pointer)
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn serial_rx_isr_trampoline(
-    _frame: *mut uni_kernel::x86_64::idt::InterruptFrame,
+    _frame: *mut kernel_bare::x86_64::idt::InterruptFrame,
 ) {
     serial::rx_isr();
 }

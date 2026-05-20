@@ -14,14 +14,14 @@
 
 #![no_std]
 
-extern crate uni_kernel;
+extern crate kernel_bare;
 
 // The kernel's sole `#[panic_handler]` lives in `entry` (boot/entry.rs)
 // and serves every boot path — multiboot, Limine, HVF. Now that the
 // boot crates are rlibs sharing one crate graph, a second handler here
 // would collide on the `panic_impl` lang item.
 
-use uni_kernel::types::{
+use kernel_bare::types::{
     BootInfo, MAX_MEMORY_REGIONS, MEM_AVAILABLE, MEM_RESERVED, MemoryRegion, Protocol,
 };
 
@@ -101,7 +101,7 @@ core::arch::global_asm!(
 );
 
 #[cfg(target_arch = "aarch64")]
-use uni_kernel::aarch64::{fdt, mmu};
+use kernel_bare::aarch64::{fdt, mmu};
 
 // ============================================================================
 // Limine request statics — placed in .limine_requests* by the crate.
@@ -292,7 +292,7 @@ pub unsafe extern "C" fn limine_entry() {
     if let Some(resp) = CMDLINE_REQUEST.get_response() {
         let bytes = resp.cmdline().to_bytes();
         if !bytes.is_empty() {
-            uni_kernel::x86_64::boot_args::install(bytes);
+            kernel_bare::x86_64::boot_args::install(bytes);
         }
     }
 
@@ -333,7 +333,7 @@ pub unsafe extern "C" fn limine_entry() {
 
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn limine_ap_stub(cpu: &limine::mp::Cpu) -> ! {
-    unsafe { uni_kernel::x86_64::smp::ap_entry_via_limine(cpu.lapic_id) }
+    unsafe { kernel_bare::x86_64::smp::ap_entry_via_limine(cpu.lapic_id) }
 }
 
 /// Release every non-BSP CPU parked by Limine's MP request into

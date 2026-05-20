@@ -66,7 +66,7 @@ struct Tss {
 // The GDT state (entries, TSS, GDTR) lives in one `UnsafeCell<GdtState>`
 // behind a `GdtCell(unsafe impl Sync)` wrapper. Single-owner discipline:
 // `init()` writes on the BSP during boot, *before* any AP has been
-// started via `uni_kernel::x86_64::smp::boot_aps` and *before* any
+// started via `kernel_bare::x86_64::smp::boot_aps` and *before* any
 // interrupt handler runs (the IDT isn't loaded yet either). After that
 // point the state is read-only — `load_on_ap()` only reads the
 // BSP-initialised GDTR, never writes. `set_kernel_stack` rewrites

@@ -75,8 +75,8 @@ rust_library(
     }),
     deps = [
         "//crates/crypto/aes-gcm",
-        "//crates/runtime/worker",
         "//crates/proto/http",
+        "//crates/runtime/worker",
         "//crates/uni/uni",
         "//crates/util/iobuf",
         "@crates//:aes",
@@ -89,7 +89,7 @@ rust_library(
         "@crates//:x25519-dalek",
     ] + select({
         "//bazel/platforms:native": [],
-        "//conditions:default": ["//crates/kernel/sys"],
+        "//conditions:default": ["//crates/kernel/bare"],
     }),
 )
 

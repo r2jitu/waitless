@@ -35,7 +35,7 @@ rust_library(
         "//bazel/platforms:native": ["//crates/util/atomic-fn"],
         "//conditions:default": [
             "//crates/drivers/nic",
-            "//crates/kernel/sys",
+            "//crates/kernel/bare",
             "//crates/net/stack",
             # `tcp` crate, for `tcp_diag()`'s TCP-stack counters.
             # `gve` driver crate, for `gve_diag()`'s NIC counters.

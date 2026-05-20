@@ -8,7 +8,7 @@
 // It mirrors the `cpu_id` link seam:
 //
 //   * `target_os = "none"` → resolves, via the `extern "Rust"`
-//     symbol `__uni_kernel_rng_fill`, to `//kernel`'s real generator
+//     symbol `__kernel_bare_rng_fill`, to `//kernel`'s real generator
 //     (jitter entropy + RDRAND seed, expanded through a SHA-256 hash
 //     chain). `kernel_core` is the lower crate and cannot call up
 //     into `//kernel`, so it declares the symbol and `//kernel`
@@ -28,12 +28,12 @@
 #[cfg(target_os = "none")]
 pub fn fill_bytes(dest: &mut [u8]) {
     unsafe extern "Rust" {
-        fn __uni_kernel_rng_fill(dest: &mut [u8]);
+        fn __kernel_bare_rng_fill(dest: &mut [u8]);
     }
     // SAFETY: `//kernel` defines this `#[no_mangle]` symbol, and
     // every `os:none` binary that links `kernel_core` also links
     // `//kernel` (it is the foundational crate).
-    unsafe { __uni_kernel_rng_fill(dest) }
+    unsafe { __kernel_bare_rng_fill(dest) }
 }
 
 /// Host build: a deterministic SplitMix64 stream — reproducible

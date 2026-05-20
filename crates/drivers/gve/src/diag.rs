@@ -6,7 +6,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use uni_kernel::sync::Spinlock;
+use kernel_bare::sync::Spinlock;
 
 use crate::{MAX_QUEUE_PAIRS, RX_QUEUES, TX_BIG_POOL_SLOTS, TX_QUEUES, TX_SMALL_POOL_SLOTS};
 

@@ -27,8 +27,8 @@
 
 use crate::{arp, ipv6_nd, ndp, sched, tcp, types, udp};
 use iobuf::{Chain, OwnedIOBuf};
+use kernel_bare::percpu;
 use net_classify::{Classified, classify, owner};
-use uni_kernel::percpu;
 
 // ── Entry points — the tier adapters ────────────────────────────────
 
@@ -63,7 +63,7 @@ pub fn net_receive(chain: Chain<OwnedIOBuf>) {
 /// `crate::sched::net_drain_cb`.
 pub(crate) fn distribute_frame(chain: Chain<OwnedIOBuf>) {
     let num_cores = percpu::num_cores();
-    let my_core = uni_kernel::cpu_id();
+    let my_core = kernel_bare::cpu_id();
     let Some(first) = chain.iter().next() else {
         return;
     };

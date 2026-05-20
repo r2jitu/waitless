@@ -4,8 +4,8 @@
 use crate::map_device_range;
 use crate::{log, mmio_read16, mmio_read32, mmio_write16, mmio_write32};
 #[cfg(target_arch = "aarch64")]
-use uni_kernel::aarch64::fdt;
-use uni_kernel::sync::Spinlock;
+use kernel_bare::aarch64::fdt;
+use kernel_bare::sync::Spinlock;
 
 #[cfg(target_arch = "x86_64")]
 use crate::{inl, outl};
@@ -87,7 +87,7 @@ static PCI_INITIALIZED: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 ///
 /// `InitOnce` gives release/acquire publication; the volatile MMIO
 /// ops on the resulting address provide the actual hardware ordering.
-pub static G_ECAM_BASE: uni_kernel::once::InitOnce<u64> = uni_kernel::once::InitOnce::new();
+pub static G_ECAM_BASE: kernel_bare::once::InitOnce<u64> = kernel_bare::once::InitOnce::new();
 /// MMIO allocation pool cursor. Mutated by `assign_bars` during the
 /// init bus scan; the spinlock around it serialises future cross-core
 /// scans (currently only the BSP scans, but the lock makes it safe).
@@ -341,7 +341,7 @@ fn init_inner() {
         // 2-vmexit port-I/O (outl 0xCF8 + inl 0xCFC). On nested KVM
         // this halves config-space cost; on legacy `pc`/`i440fx`
         // machines (no MCFG) we silently fall back to port-I/O.
-        if let Some(base) = unsafe { uni_kernel::x86_64::acpi::mcfg_ecam_base() } {
+        if let Some(base) = unsafe { kernel_bare::x86_64::acpi::mcfg_ecam_base() } {
             G_ECAM_BASE.init(base);
         }
     }
@@ -388,7 +388,7 @@ pub fn log_devices() {
     let table = PCI_DEVICES.lock();
     for i in 0..table.count {
         let d = &table.devices[i];
-        uni_kernel::serial::write_fmt(format_args!(
+        kernel_bare::serial::write_fmt(format_args!(
             "[pci] {:02x}:{:02x}.{} vendor={:04x} device={:04x} class={:02x}.{:02x}\n",
             d.bus, d.slot, d.func, d.vendor_id, d.device_id, d.class_code, d.subclass,
         ));

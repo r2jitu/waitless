@@ -18,7 +18,7 @@ rust_library(
     crate_root = "src/lib.rs",
     deps = [
         "//crates/drivers/nic",
-        "//crates/kernel/sys",
+        "//crates/kernel/bare",
         "//crates/net:arp",
         "//crates/net:classify",
         "//crates/net:dhcp",

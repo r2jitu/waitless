@@ -3,7 +3,7 @@ load("@rules_rust//rust:defs.bzl", "rust_library")
 package(default_visibility = ["//visibility:public"])
 
 rust_library(
-    name = "sys",
+    name = "bare",
     srcs = [
         "src/cpu.rs",
         "src/cpu_info.rs",
@@ -33,7 +33,7 @@ rust_library(
         ],
         "//conditions:default": [],
     }),
-    crate_name = "uni_kernel",
+    crate_name = "kernel_bare",
     crate_root = "src/lib.rs",
     # Unikernel-only: links against MMU / APIC / IDT / boot-section
     # code that only makes sense under a bare-metal target. Host

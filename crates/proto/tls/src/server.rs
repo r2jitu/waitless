@@ -335,7 +335,7 @@ impl TlsServer {
     /// place — single 12 KB heap allocation, no per-buffer
     /// secondary allocs. `seed` is 32 bytes of entropy for the
     /// ephemeral X25519 keypair (caller supplies from
-    /// `uni_kernel::rng::fill_bytes()`).
+    /// `kernel_bare::rng::fill_bytes()`).
     ///
     /// The struct is too large to round-trip through a stack
     /// temporary (3 × 4 KB inline buffers), so we go through

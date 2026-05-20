@@ -26,7 +26,7 @@ use crate::{dsb_st, dsb_sy, mmio_read32, mmio_write32};
 //
 // State lives in one `UnsafeCell<VirtioConsole>` — `static mut` replaced
 // with interior mutability and an `unsafe impl Sync`. Single-threaded by
-// contract: `uni_kernel::serial` holds a spinlock around every `puts` /
+// contract: `kernel_bare::serial` holds a spinlock around every `puts` /
 // `putc` / `try_getc` call, so no concurrent mutation ever reaches us.
 // ============================================================================
 
@@ -77,7 +77,7 @@ impl VirtioConsole {
 }
 
 struct ConsoleCell(UnsafeCell<VirtioConsole>);
-// SAFETY: all mutation is serialised by `uni_kernel::serial`'s spinlock
+// SAFETY: all mutation is serialised by `kernel_bare::serial`'s spinlock
 // (see module-level comment).
 unsafe impl Sync for ConsoleCell {}
 
@@ -85,7 +85,7 @@ static CONSOLE: ConsoleCell = ConsoleCell(UnsafeCell::new(VirtioConsole::new()))
 
 // TX/RX ring index state. Atomic so cross-core access is data-race-free at
 // the language level. The actual TX serialisation is done by the caller
-// (uni_kernel::serial holds a spinlock around the whole `puts`/`putc` call).
+// (kernel_bare::serial holds a spinlock around the whole `puts`/`putc` call).
 // Atomic ops here defend against future callers that bypass that lock and
 // let Miri verify the soundness of any concurrent test.
 static CON_TX_AVAIL_IDX: AtomicU16 = AtomicU16::new(0);
@@ -208,7 +208,7 @@ fn con_init_mmio(base_addr: u64) -> bool {
             mmio_write32(base_addr + MMIO_GUEST_PAGE_SIZE, 4096);
         }
 
-        // SAFETY: console access is serialised by uni_kernel::serial — no
+        // SAFETY: console access is serialised by kernel_bare::serial — no
         // concurrent readers or writers are live during init.
         let con = &mut *CONSOLE.0.get();
 
@@ -283,7 +283,7 @@ fn con_init_pci() -> bool {
         return false;
     }
 
-    // SAFETY: console access is serialised by uni_kernel::serial — no
+    // SAFETY: console access is serialised by kernel_bare::serial — no
     // concurrent readers or writers are live during init.
     let con = unsafe { &mut *CONSOLE.0.get() };
 
@@ -374,7 +374,7 @@ fn con_init_pci() -> bool {
 /// the device signals completion. Caller is responsible for chunking
 /// longer payloads.
 ///
-/// SAFETY: console access is serialised by uni_kernel::serial.
+/// SAFETY: console access is serialised by kernel_bare::serial.
 unsafe fn con_tx_one_chunk(con: &mut VirtioConsole, bytes: &[u8]) {
     debug_assert!(bytes.len() <= CON_TX_BUF_LEN);
     unsafe {
@@ -428,7 +428,7 @@ unsafe fn con_tx_one_chunk(con: &mut VirtioConsole, bytes: &[u8]) {
 }
 
 fn con_puts(bytes: &[u8]) {
-    // SAFETY: console access is serialised by uni_kernel::serial.
+    // SAFETY: console access is serialised by kernel_bare::serial.
     let con = unsafe { &mut *CONSOLE.0.get() };
     if con.base == 0 {
         return;
@@ -445,7 +445,7 @@ fn con_putc(c: u8) {
 }
 
 fn con_try_getc() -> i32 {
-    // SAFETY: console access is serialised by uni_kernel::serial.
+    // SAFETY: console access is serialised by kernel_bare::serial.
     let con = unsafe { &mut *CONSOLE.0.get() };
     unsafe {
         if con.base == 0 {

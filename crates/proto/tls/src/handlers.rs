@@ -58,7 +58,7 @@ use crate::ticket::now_cycles as ticket_now_cycles;
 /// `ticket_now_cycles`).
 #[cfg(target_os = "none")]
 fn ticket_max_age_cycles() -> u64 {
-    let cyc_per_us = uni_kernel::time::cycles_per_us();
+    let cyc_per_us = kernel_bare::time::cycles_per_us();
     // 7 days * 24h * 3600s * 1e6 us/s, then × cyc_per_us. Saturating
     // multiplication so a wildly fast cycle counter can't wrap.
     (7u64 * 24 * 3600 * 1_000_000).saturating_mul(cyc_per_us)
@@ -316,7 +316,7 @@ impl TlsServer {
         // Server random: 32 bytes of entropy.
         //
         // `getrandom` bridges both worlds: on the unikernel build
-        // it's routed to `uni_kernel::rng` via
+        // it's routed to `kernel_bare::rng` via
         // `register_custom_getrandom!` (see kernel/rng.rs); on native
         // builds it falls through to the host OS entropy source
         // (`/dev/urandom`, `getentropy(2)`, etc.). Either way the

@@ -6,9 +6,9 @@
 extern crate alloc;
 extern crate bus;
 extern crate iobuf;
+extern crate kernel_bare;
 extern crate net_checksum;
 extern crate nic_api;
-extern crate uni_kernel;
 
 use core::arch::asm;
 use core::ptr;
@@ -35,8 +35,8 @@ use bus::virtio::{
 };
 use bus::{dsb_st, log, virtio_read8, virtio_read16, virtio_read32, virtio_write8, virtio_write32};
 #[cfg(target_arch = "aarch64")]
-use uni_kernel::aarch64::{exceptions, fdt};
-use uni_kernel::mm::{kmalloc, phys_to_virt, virt_to_phys};
+use kernel_bare::aarch64::{exceptions, fdt};
+use kernel_bare::mm::{kmalloc, phys_to_virt, virt_to_phys};
 
 // ============================================================================
 // VirtIO-net constants and types
@@ -181,7 +181,7 @@ struct QueuePairState {
     /// drain. The lock is kept for forward-compat (e.g. an IRQ
     /// handler that also re-arms) and as a single-writer
     /// invariant inside `add_buf`.
-    rx_lock: uni_kernel::sync::Spinlock<()>,
+    rx_lock: kernel_bare::sync::Spinlock<()>,
     /// Set by inline re-arm after a successful `add_buf`.
     /// Read + cleared by the end-of-batch kick in `poll_qp`,
     /// which kicks the device if set so it sees the freshly-
@@ -193,7 +193,7 @@ struct QueuePairState {
 impl QueuePairState {
     const ZEROED: Self = QueuePairState {
         rx_buffers: [ptr::null_mut(); RX_BUFFERS],
-        rx_lock: uni_kernel::sync::Spinlock::new(()),
+        rx_lock: kernel_bare::sync::Spinlock::new(()),
         rx_dirty: core::sync::atomic::AtomicBool::new(false),
     };
 }
@@ -262,7 +262,7 @@ struct NetDevice {
     worker_pools: *mut WorkerTxPool,
     /// Number of workers — the size of the `worker_pools` array.
     /// Captured at `init_qp_storage` time from
-    /// `uni_kernel::percpu::num_cores()`.
+    /// `kernel_bare::percpu::num_cores()`.
     num_workers: usize,
     ctrl_queue: Virtqueue, // Control VQ for multi-queue commands
     mac: [u8; 6],
@@ -324,7 +324,7 @@ unsafe fn init_qp_storage(num_pairs: usize, has_tso: bool) -> bool {
     if num_pairs == 0 {
         return false;
     }
-    let num_workers = uni_kernel::percpu::num_cores().max(1) as usize;
+    let num_workers = kernel_bare::percpu::num_cores().max(1) as usize;
     unsafe {
         if !(*ndev()).rx_queues.is_null() {
             return true;
@@ -516,9 +516,9 @@ fn init_pci_modern() -> bool {
     // Use UNIKERNEL_CPUS env var (set in QEMU args) since percpu::init()
     // hasn't run yet. Fall back to 1 if not available.
     #[cfg(target_arch = "x86_64")]
-    let desired_pairs = unsafe { uni_kernel::x86_64::acpi::detect_cpus() as u16 };
+    let desired_pairs = unsafe { kernel_bare::x86_64::acpi::detect_cpus() as u16 };
     #[cfg(target_arch = "aarch64")]
-    let desired_pairs = uni_kernel::aarch64::fdt::info().cpu_count as u16;
+    let desired_pairs = kernel_bare::aarch64::fdt::info().cpu_count as u16;
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let desired_pairs = 1u16;
     let max_pairs = if has_mq {
@@ -1122,7 +1122,7 @@ fn tx_drain() {
 
 // x86_64: extern "C" fn() wrapper for the IDT stub trampoline
 #[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn irq_handler_x86(_frame: *mut uni_kernel::x86_64::idt::InterruptFrame) {
+unsafe extern "C" fn irq_handler_x86(_frame: *mut kernel_bare::x86_64::idt::InterruptFrame) {
     irq_handler(0);
 }
 
@@ -1227,7 +1227,7 @@ static TX_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// flush or send. Wraps `()` because the underlying state lives in
 /// `(*tx_q(0))` and is mutable through the existing
 /// raw-pointer accessors; this lock just provides mutual exclusion.
-static TX_LOCK: uni_kernel::sync::Spinlock<()> = uni_kernel::sync::Spinlock::new(());
+static TX_LOCK: kernel_bare::sync::Spinlock<()> = kernel_bare::sync::Spinlock::new(());
 
 /// Send a slice-shaped frame. Goes through the unified
 /// acquire+submit path: pool is per-worker (lock-free slot
@@ -1306,7 +1306,7 @@ fn current_worker_and_qp() -> Option<(usize, usize)> {
     if unsafe { matches!((*ndev()).transport, Transport::None) } {
         return None;
     }
-    let cc = uni_kernel::percpu::CurrentWorker::enter();
+    let cc = kernel_bare::percpu::CurrentWorker::enter();
     let worker = cc.id() as usize;
     let qp = worker_qp(worker);
     tx_drain_qp_locked(qp);
@@ -1827,7 +1827,7 @@ fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
     // Drain TX completions. Tier 1 owns qp per core (no lock needed),
     // Tier 2 has the single shared queue and must serialise.
     let nqp = unsafe { (*ndev()).num_queue_pairs };
-    if uni_kernel::percpu::num_cores() <= 1 || (nqp as usize) > 1 {
+    if kernel_bare::percpu::num_cores() <= 1 || (nqp as usize) > 1 {
         tx_drain_qp(qp);
     } else if let Some(_g) = TX_LOCK.try_lock() {
         tx_drain_qp(qp);
@@ -1954,7 +1954,7 @@ fn init_msix_x86(dev: &VirtioPciDevice, num_pairs: usize) {
     // Config-change interrupt: unused.
     vpci_set_config_msix_vector(dev, NO_VEC);
 
-    let topo = uni_kernel::x86_64::acpi::topology();
+    let topo = kernel_bare::x86_64::acpi::topology();
     let cpu_count = topo.cpu_count as usize;
 
     for qp in 0..num_pairs {
@@ -1971,7 +1971,7 @@ fn init_msix_x86(dev: &VirtioPciDevice, num_pairs: usize) {
         // Install the IDT handler for this vector. All per-queue
         // handlers share one implementation that reads the current
         // core's id and sets the RX_PENDING flag for that core.
-        uni_kernel::x86_64::idt::register_handler(idt_vector, msix_rx_isr_trampoline);
+        kernel_bare::x86_64::idt::register_handler(idt_vector, msix_rx_isr_trampoline);
 
         // Point the RX queue at the vector; TX stays unvectored.
         let rx_qi = (qp * 2) as u16;
@@ -1993,7 +1993,7 @@ fn init_msix_x86(dev: &VirtioPciDevice, num_pairs: usize) {
 /// next iteration. Fires on the target vCPU because the MSI address
 /// was programmed with that vCPU's LAPIC id.
 #[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn msix_rx_isr_trampoline(_frame: *mut uni_kernel::x86_64::idt::InterruptFrame) {
+unsafe extern "C" fn msix_rx_isr_trampoline(_frame: *mut kernel_bare::x86_64::idt::InterruptFrame) {
     IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
 }
 
@@ -2059,7 +2059,7 @@ fn flush_tx_kick() {
 fn flush_tx_kick_if_dirty() -> bool {
     let nqp = unsafe { (*ndev()).num_queue_pairs };
     if nqp > 1 {
-        let core = uni_kernel::cpu_id() as usize;
+        let core = kernel_bare::cpu_id() as usize;
         let qp = if core < nqp as usize { core } else { 0 };
         unsafe { (*tx_q(qp)).flush_kick_if_dirty() }
     } else {
@@ -2192,7 +2192,7 @@ fn poll_qp(qp: usize, callback: fn(Chain<OwnedIOBuf>)) -> usize {
     }
 
     let nqp = unsafe { (*ndev()).num_queue_pairs };
-    if uni_kernel::percpu::num_cores() <= 1 || (nqp as usize) > 1 {
+    if kernel_bare::percpu::num_cores() <= 1 || (nqp as usize) > 1 {
         tx_drain_qp(qp);
     } else if let Some(_g) = TX_LOCK.try_lock() {
         tx_drain_qp(qp);

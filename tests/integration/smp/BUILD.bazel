@@ -10,7 +10,7 @@ rust_library(
     srcs = ["src/main.rs"],
     crate_root = "src/main.rs",
     deps = [
-        "//crates/kernel/sys",
+        "//crates/kernel/bare",
         "//crates/uni/uni",
     ],
 )

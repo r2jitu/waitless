@@ -220,7 +220,7 @@ pub fn fill_bytes(dest: &mut [u8]) {
 // `kernel_core::rng::fill_bytes()` resolves, on the bare-metal target,
 // to this `#[no_mangle]` symbol. `kernel_core` is the lower crate and
 // cannot call up into `//kernel`, so it declares the `extern "Rust"`
-// symbol and `//kernel` defines it here — mirroring `__uni_kernel_cpu_id`.
+// symbol and `//kernel` defines it here — mirroring `__kernel_bare_cpu_id`.
 // This is what lets RNG-dependent host-buildable crates (`tcp`'s
 // TCP initial-sequence-number selection) reach the real generator on
 // `os:none` while resolving to a deterministic stream under host
@@ -228,7 +228,7 @@ pub fn fill_bytes(dest: &mut [u8]) {
 
 /// Link-seam definition for `kernel_core::rng::fill_bytes()`.
 #[unsafe(no_mangle)]
-pub extern "Rust" fn __uni_kernel_rng_fill(dest: &mut [u8]) {
+pub extern "Rust" fn __kernel_bare_rng_fill(dest: &mut [u8]) {
     fill_bytes(dest);
 }
 

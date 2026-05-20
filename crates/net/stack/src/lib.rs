@@ -13,8 +13,8 @@
 extern crate alloc;
 extern crate executor;
 extern crate iobuf;
+extern crate kernel_bare;
 extern crate nic;
-extern crate uni_kernel;
 
 extern crate net_classify;
 
@@ -31,7 +31,7 @@ pub extern crate net_types as types;
 pub extern crate tcp as tcp;
 pub extern crate udp as udp;
 
-use uni_kernel::percpu;
+use kernel_bare::percpu;
 
 mod ipv6_nd;
 mod rx;
@@ -97,7 +97,7 @@ static BARE_UDP_BACKEND: executor::net::UdpBackend = executor::net::UdpBackend {
 pub fn init_stack() {
     // Per-core flag tables sized to actual core count. Must run
     // before any `poll_tier2` call dereferences them.
-    let n = uni_kernel::percpu::num_cores();
+    let n = kernel_bare::percpu::num_cores();
     sched::WAKEUP.init(n, |_| core::sync::atomic::AtomicBool::new(false));
     sched::JUST_DISTRIBUTED.init(n, |_| core::sync::atomic::AtomicBool::new(false));
     arp::init();

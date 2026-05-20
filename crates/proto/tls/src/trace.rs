@@ -20,13 +20,13 @@ use crate::server::{HandshakeError, State};
 // `serial::puts` sink. Only compiled when `--cfg=tls_debug`
 // is set in `//uni-tls`'s rustc_flags. On the
 // bare-metal unikernel target we forward to the kernel's
-// debug UART via `uni_kernel::serial::puts`; on hosted native
+// debug UART via `kernel_bare::serial::puts`; on hosted native
 // builds we use libc `write(2, ...)` to stderr so the same
 // debug flow works against the POSIX webserver. When
 // `tls_debug` is off (the default), this whole module
 // compiles to nothing.
 #[cfg(all(tls_debug, target_os = "none"))]
-use uni_kernel::serial;
+use kernel_bare::serial;
 #[cfg(all(tls_debug, not(target_os = "none")))]
 mod serial {
     extern "C" {

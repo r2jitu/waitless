@@ -1666,7 +1666,7 @@ load-bearing only for *who controls the implementation*.
 
 - [ ] Promote `net_tcp` → `uni-tcp` and `net_udp` → `uni-udp`
       above `uni_runtime`. Both crates are already `#![no_std]`
-      with no `uni_drivers` dep; the `uni_kernel::cpu_id` /
+      with no `uni_drivers` dep; the `kernel_bare::cpu_id` /
       `rng::fill_bytes` / `percpu::PerCpu` calls have
       `uni_worker` equivalents in use across `uni_runtime::net`.
 - [ ] Move the bare-metal `BARE_TCP_BACKEND` /

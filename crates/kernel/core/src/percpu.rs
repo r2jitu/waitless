@@ -65,7 +65,7 @@ pub fn rx_node_pool() -> &'static RxNodePool<RxChain, RX_NODE_POOL_CAP> {
 }
 
 // `CurrentWorker` + `PerWorker<T>` (runtime-sized) live in `//uni-worker`
-// so native can share them. Kept under the `uni_kernel::percpu` path via
+// so native can share them. Kept under the `kernel_bare::percpu` path via
 // re-export so existing callers don't shift.
 pub use worker::{CurrentWorker, PerWorker};
 

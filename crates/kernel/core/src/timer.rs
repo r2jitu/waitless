@@ -3,6 +3,6 @@
 // `TimerWheel` + `PendingTimers` live in `//uni-worker` so native
 // can share the same O(1) insert / slot-hashed fire + lock-free
 // cross-worker MPSC. Callers inside the kernel keep using
-// `uni_kernel::timer::…` unchanged.
+// `kernel_bare::timer::…` unchanged.
 
 pub use worker::timer::{Timer, TimerWheel};

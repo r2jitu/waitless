@@ -17,8 +17,8 @@ rust_library(
     target_compatible_with = ["@platforms//os:none"],
     deps = [
         "//crates/drivers/bus",
-        "//crates/kernel/sys",
-        "//crates/util/iobuf",
         "//crates/drivers/nic-api",
+        "//crates/kernel/bare",
+        "//crates/util/iobuf",
     ],
 )

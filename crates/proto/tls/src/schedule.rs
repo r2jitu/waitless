@@ -485,7 +485,7 @@ pub struct X25519ServerKey {
 impl X25519ServerKey {
     /// Generate a fresh keypair from 32 bytes of entropy.
     /// Callers pass kernel-sourced randomness (jitter + cycle counter
-    /// + PRNG); see `uni_kernel::rng` once it exists.
+    /// + PRNG); see `kernel_bare::rng` once it exists.
     pub fn from_seed(seed: [u8; 32]) -> Self {
         let secret = x25519_dalek::StaticSecret::from(seed);
         let public = x25519_dalek::PublicKey::from(&secret);

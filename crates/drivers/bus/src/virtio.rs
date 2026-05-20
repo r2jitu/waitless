@@ -12,7 +12,7 @@ use crate::{
     mmio_write32, virtio_read8, virtio_read16, virtio_read32, virtio_write8, virtio_write16,
     virtio_write32,
 };
-use uni_kernel::mm::{alloc_pages, phys_to_virt};
+use kernel_bare::mm::{alloc_pages, phys_to_virt};
 
 // ============================================================================
 // VirtIO PCI transport (modern, VirtIO 1.0+)
@@ -98,8 +98,8 @@ impl VpciTable {
     }
 }
 
-pub static VPCI_DEVICES: uni_kernel::sync::Spinlock<VpciTable> =
-    uni_kernel::sync::Spinlock::new(VpciTable::new());
+pub static VPCI_DEVICES: kernel_bare::sync::Spinlock<VpciTable> =
+    kernel_bare::sync::Spinlock::new(VpciTable::new());
 
 /// Snapshot of `VPCI_DEVICES[idx]` returned by value.
 pub fn vpci_device(idx: usize) -> VirtioPciDevice {

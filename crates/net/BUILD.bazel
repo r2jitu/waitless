@@ -281,7 +281,7 @@ rust_library(
         ":from_bytes",
         ":ipv4",
         ":types",
-        "//crates/kernel/sys",
+        "//crates/kernel/bare",
         "//crates/runtime/executor",
     ],
 )

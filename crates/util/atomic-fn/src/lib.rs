@@ -7,7 +7,7 @@
 //
 // Used for the "publish a fn pointer once at boot, read it from any
 // core later" pattern that recurs across the kernel / net / runtime.
-// Extracted from `uni_kernel::sync` into its own crate so downstream
+// Extracted from `kernel_bare::sync` into its own crate so downstream
 // consumers (`//net:protocol`, `//uni-net:driver`, `//uni:uni`
 // native backend, future `//util:*` hosts) can depend on it
 // without inheriting kernel's transitive deps (RustCrypto, talc,

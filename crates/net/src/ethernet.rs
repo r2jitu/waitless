@@ -33,7 +33,7 @@ unsafe impl FromBytes for EthernetHeader {}
 
 /// Cached MAC address. Packed into the low 48 bits of an `AtomicU64` so
 /// the cross-core publish is data-race-free without depending on
-/// `uni_kernel::once::InitOnce` (this leaf crate has no kernel dep).
+/// `kernel_bare::once::InitOnce` (this leaf crate has no kernel dep).
 /// `ethernet_send::init_mac` writes it once on the BSP after virtio-net
 /// init via `set_our_mac`; readers on every core load via Acquire.
 static OUR_MAC_PACKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

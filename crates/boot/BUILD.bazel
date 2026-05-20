@@ -47,7 +47,7 @@ rust_library(
     deps = [
         "//crates/drivers/bus",
         "//crates/drivers/nic",
-        "//crates/kernel/sys",
+        "//crates/kernel/bare",
         "//crates/net/stack",
         "//crates/uni/uni",
     ],
@@ -71,7 +71,7 @@ rust_library(
     crate_root = "src/limine_entry.rs",
     target_compatible_with = _UNIKERNEL_ONLY,
     deps = [
-        "//crates/kernel/sys",
+        "//crates/kernel/bare",
         "@crates//:limine",
     ],
 )

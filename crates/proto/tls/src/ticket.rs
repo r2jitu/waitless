@@ -75,7 +75,7 @@ pub const TICKET_LIFETIME_SECONDS: u32 = 7 * 24 * 3600;
 /// duplicating the cfg dance.
 #[cfg(target_os = "none")]
 pub fn now_cycles() -> u64 {
-    uni_kernel::time::now_cycles()
+    kernel_bare::time::now_cycles()
 }
 #[cfg(not(target_os = "none"))]
 pub fn now_cycles() -> u64 {
@@ -92,7 +92,7 @@ pub fn now_cycles() -> u64 {
 /// fine for the integration tests we run there today.
 #[cfg(target_os = "none")]
 pub fn now_us() -> u64 {
-    uni_kernel::time::since_boot_us()
+    kernel_bare::time::since_boot_us()
 }
 #[cfg(not(target_os = "none"))]
 pub fn now_us() -> u64 {

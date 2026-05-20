@@ -260,8 +260,8 @@ pub fn since_boot_us() -> u64 {
 // ── kernel_core clock link seam ─────────────────────────────────────────────
 //
 // `kernel_core::clock::now_ms()` resolves, on the bare-metal target,
-// to this `#[no_mangle]` symbol — mirroring `__uni_kernel_cpu_id` and
-// `__uni_kernel_rng_fill`. `kernel_core` is the lower crate and cannot
+// to this `#[no_mangle]` symbol — mirroring `__kernel_bare_cpu_id` and
+// `__kernel_bare_rng_fill`. `kernel_core` is the lower crate and cannot
 // call up into `//kernel`, so it declares the `extern "Rust"` symbol
 // and `//kernel` defines it here. This is what lets `tcp`'s
 // RFC 6298 retransmission timer read a monotonic millisecond clock on
@@ -273,7 +273,7 @@ pub fn since_boot_us() -> u64 {
 /// until that runs, so the clock reads a clean 0 pre-boot-mark rather
 /// than faulting.
 #[unsafe(no_mangle)]
-pub extern "Rust" fn __uni_kernel_now_ms() -> u64 {
+pub extern "Rust" fn __kernel_bare_now_ms() -> u64 {
     since_boot_us() / 1000
 }
 

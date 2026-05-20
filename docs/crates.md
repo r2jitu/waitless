@@ -23,7 +23,7 @@ crates/
   util/        atomic-fn/  tagged-treiber/  iobuf/
   crypto/      aes-gcm/
   runtime/     platform/  worker/  executor/
-  kernel/      core/  sys/
+  kernel/      core/  bare/
   boot/        entry, limine, mem_stubs, multiboot   (shared Bazel package)
   drivers/     bus/  nic-api/  nic/  virtio-net/  gve/
   net/         tcp/  stack/                           (own dirs)
@@ -54,8 +54,9 @@ to live alongside the real apps under `apps/`.)
    `crates/uni/`: `uni`, `uni_macros`, `uni_net` (the facade family).
    Two further carve-outs for external/internal collisions:
    `uni_aes_gcm` (RustCrypto's `aes-gcm` crate is pulled in via
-   `@crates//:aes-gcm`) and `uni_kernel` (the bare `kernel` name is
-   too overloaded).
+   `@crates//:aes-gcm`). The kernel's os:none half is `kernel_bare`,
+   chosen for sibling symmetry with `kernel_core` (a bare `kernel`
+   name would be too overloaded).
 4. **Cargo package name** (publishable leaves only, if/when published):
    chosen at publish time for crates.io availability. Internal name is
    unchanged. See [§Publishing](#publishing).
@@ -132,7 +133,7 @@ external `@crates//:...` deps are omitted for readability.
 
 | Crate | Deps |
 | --- | --- |
-| `uni_kernel` | `net_types`, `kernel_core`, `iobuf`, `executor`, `worker`, `platform`, `atomic_fn`, `tagged_treiber` |
+| `kernel_bare` | `net_types`, `kernel_core`, `iobuf`, `executor`, `worker`, `platform`, `atomic_fn`, `tagged_treiber` |
 | `arp` | `ethernet`, `ethernet_send`, `net_from_bytes`, `net_types`, `nic`, `kernel_core`, `iobuf` |
 | `mac_resolve` | `arp`, `ndp`, `net_types` |
 | `ipv6_send` | `ethernet`, `ethernet_send`, `icmpv6`, `ipv6`, `ndp`, `net_types` |
@@ -143,16 +144,16 @@ external `@crates//:...` deps are omitted for readability.
 | --- | --- |
 | `tcp` | `net_checksum`, `ethernet`, `net_from_bytes`, `ipv4`, `ipv6`, `ipv6_send`, `mac_resolve`, `net_types`, `nic`, `nic_api`, `kernel_core`, `iobuf`, `executor`, `worker` |
 | `udp` | same as `tcp` minus `kernel_core` and `worker` |
-| `dhcp` | `arp`, `ethernet`, `net_from_bytes`, `ipv4`, `net_types`, `uni_kernel`, `executor` |
-| `bus` | `uni_kernel` |
+| `dhcp` | `arp`, `ethernet`, `net_from_bytes`, `ipv4`, `net_types`, `kernel_bare`, `executor` |
+| `bus` | `kernel_bare` |
 
 ### Tier 6 — net stack umbrella + NIC drivers
 
 | Crate | Deps |
 | --- | --- |
-| `uni_net_stack` | `arp`, `net_classify`, `dhcp`, `ethernet`, `ethernet_send`, `icmpv6`, `ipv4`, `ipv6`, `ipv6_send`, `ndp`, `tcp`, `net_types`, `udp`, `nic`, `uni_kernel`, `iobuf`, `executor` |
-| `gve` | `bus`, `uni_kernel`, `iobuf`, `nic_api` |
-| `virtio_net` | `bus`, `uni_kernel`, `net_checksum`, `iobuf`, `nic_api` |
+| `uni_net_stack` | `arp`, `net_classify`, `dhcp`, `ethernet`, `ethernet_send`, `icmpv6`, `ipv4`, `ipv6`, `ipv6_send`, `ndp`, `tcp`, `net_types`, `udp`, `nic`, `kernel_bare`, `iobuf`, `executor` |
+| `gve` | `bus`, `kernel_bare`, `iobuf`, `nic_api` |
+| `virtio_net` | `bus`, `kernel_bare`, `net_checksum`, `iobuf`, `nic_api` |
 
 ### Tier 7 — facade plumbing
 
@@ -165,20 +166,20 @@ external `@crates//:...` deps are omitted for readability.
 
 | Crate | Deps |
 | --- | --- |
-| `backend` (`uni/backend`) | `iobuf`, `worker`, `platform`, `executor`, `nic_api`; on `os:none` also `nic`, `uni_kernel`, `uni_net_stack`, `tcp`, `gve` |
+| `backend` (`uni/backend`) | `iobuf`, `worker`, `platform`, `executor`, `nic_api`; on `os:none` also `nic`, `kernel_bare`, `uni_net_stack`, `tcp`, `gve` |
 
 ### Tier 9 — facade
 
 | Crate | Deps |
 | --- | --- |
-| `uni` | `backend`, `uni_net`, `executor`, `worker`; on `os:none` also `uni_kernel`; proc-macro `uni_macros` |
+| `uni` | `backend`, `uni_net`, `executor`, `worker`; on `os:none` also `kernel_bare`; proc-macro `uni_macros` |
 
 ### Tiers 10–13 — userspace network protocols
 
 | Crate | Tier | Deps |
 | --- | --- | --- |
 | `http` | 10 | `uni`, `iobuf`, `worker` |
-| `tls` | 11 | `uni`, `uni_aes_gcm`, `http`, `iobuf`, `worker`; on `os:none` also `uni_kernel` |
+| `tls` | 11 | `uni`, `uni_aes_gcm`, `http`, `iobuf`, `worker`; on `os:none` also `kernel_bare` |
 | `quic` | 12 | `uni`, `iobuf`, `nic_api`, `executor`, `tls` |
 | `http3` | 13 | `uni`, `http`, `quic` |
 
@@ -192,11 +193,11 @@ to assemble the bare-metal entrypoint. Apps under `apps/` depend on
 
 ### Why `net_types` is a separate crate (the cycle break)
 
-`uni_kernel`'s `percpu::RxChain` carries a `ParsedL3` value, so the
+`kernel_bare`'s `percpu::RxChain` carries a `ParsedL3` value, so the
 kernel must depend on something in the net domain. The rest of `net`
 depends on `kernel_core` (for `Spinlock`, the per-core IP-ID counter,
-etc.). If `net` were a single crate, `uni_kernel → net → kernel_core`
-would close into a cycle with `uni_kernel`'s `kernel_core` dependency.
+etc.). If `net` were a single crate, `kernel_bare → net → kernel_core`
+would close into a cycle with `kernel_bare`'s `kernel_core` dependency.
 
 `net_types` is the cut: a zero-dep leaf containing just the wire-format
 type definitions the kernel needs. Everything else in `net` is above
@@ -204,19 +205,19 @@ type definitions the kernel needs. Everything else in `net` is above
 
 **Structural, not aesthetic. Don't merge `net_types` into anything.**
 
-### Why `kernel_core` is split from `uni_kernel`
+### Why `kernel_core` is split from `kernel_bare`
 
 `kernel_core` is the host-testable pure-logic half: lock-free data
 structures, sync primitives, per-core types, the timer wheel, the RNG
 trait. Builds on the host; runs `rust_test` targets there.
 
-`uni_kernel` (`crates/kernel/sys`) is the `os:none` half: MMU,
+`kernel_bare` (`crates/kernel/bare`) is the `os:none` half: MMU,
 interrupts, APIC/GIC, SMP bring-up, serial — anything that touches
 hardware or arch-specific code. Unbuildable on the host
 (`target_compatible_with = ["@platforms//os:none"]`).
 
-`uni_kernel` re-exports the public modules of `kernel_core`, so
-consumers write `uni_kernel::percpu::...` and don't see the split.
+`kernel_bare` re-exports the public modules of `kernel_core`, so
+consumers write `kernel_bare::percpu::...` and don't see the split.
 
 ### The NIC driver dispatch chain
 

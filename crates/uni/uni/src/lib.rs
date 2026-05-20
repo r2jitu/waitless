@@ -11,7 +11,7 @@ pub use uni_macros::init;
 extern crate backend;
 
 #[cfg(target_os = "none")]
-extern crate uni_kernel;
+extern crate kernel_bare;
 
 pub extern crate uni_net as net;
 
@@ -98,7 +98,7 @@ pub fn _retain<T: 'static>(handle: T) {
 pub fn shutdown_and_drop() {
     #[cfg(target_os = "none")]
     debug_assert_eq!(
-        uni_kernel::cpu_id(),
+        kernel_bare::cpu_id(),
         0,
         "uni::shutdown_and_drop must run on BSP",
     );
@@ -179,7 +179,7 @@ pub fn set_ready() {
 #[doc(hidden)]
 #[cfg(target_os = "none")]
 pub fn _install_shutdown_hook() {
-    uni_kernel::eventloop::set_on_shutdown(shutdown_and_drop);
+    kernel_bare::eventloop::set_on_shutdown(shutdown_and_drop);
 }
 
 #[doc(hidden)]
@@ -287,7 +287,7 @@ where
 pub fn cpu_id() -> u32 {
     #[cfg(target_os = "none")]
     {
-        uni_kernel::cpu_id()
+        kernel_bare::cpu_id()
     }
     #[cfg(not(target_os = "none"))]
     {

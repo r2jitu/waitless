@@ -20,10 +20,10 @@ use core::sync::atomic::{Ordering, compiler_fence};
 // ============================================================================
 // Kernel crate dependencies — direct Rust calls
 // ============================================================================
-extern crate uni_kernel;
+extern crate kernel_bare;
 #[cfg(target_arch = "aarch64")]
-use uni_kernel::aarch64::mmu::map_device_range;
-use uni_kernel::serial;
+use kernel_bare::aarch64::mmu::map_device_range;
+use kernel_bare::serial;
 
 pub fn log(msg: &[u8]) {
     serial::puts(msg)

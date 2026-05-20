@@ -2,7 +2,7 @@
 //
 // Thin cfg-switch over the two backends:
 //
-//   * `target_os = "none"` → `uni_kernel::rng::fill_bytes` (the kernel-
+//   * `target_os = "none"` → `kernel_bare::rng::fill_bytes` (the kernel-
 //     side PRNG: jitter-entropy + RDRAND seed, expanded via SHA-256
 //     hash chain).
 //   * else (unix host)     → `getentropy(2)` (POSIX; available on
@@ -11,13 +11,13 @@
 // Callers (TLS handshake seed, test harness, …) get one name
 // regardless of runner. Previously `uni::http::fill_tls_seed` held
 // the cfg-switch inline; extracting it lets `//tests/integration/tls` drop
-// its direct `uni_kernel::rng` dep, which in turn lets test_tls run
+// its direct `kernel_bare::rng` dep, which in turn lets test_tls run
 // natively without pulling the kernel crate into the native
 // dep-chain.
 
 #[cfg(target_os = "none")]
 pub fn fill_bytes(buf: &mut [u8]) {
-    uni_kernel::rng::fill_bytes(buf);
+    kernel_bare::rng::fill_bytes(buf);
 }
 
 #[cfg(not(target_os = "none"))]
