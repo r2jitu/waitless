@@ -10,7 +10,16 @@ package(default_visibility = ["//visibility:public"])
 # the longest of any net protocol — easier to read on its own.
 rust_library(
     name = "tcp",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/lib.rs",
+        "src/listener.rs",
+        "src/pool.rs",
+        "src/receive.rs",
+        "src/retransmit.rs",
+        "src/send.rs",
+        "src/state.rs",
+        "src/tests.rs",
+    ],
     crate_name = "tcp",
     crate_root = "src/lib.rs",
     deps = [
