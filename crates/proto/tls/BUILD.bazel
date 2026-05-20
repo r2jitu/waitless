@@ -8,7 +8,7 @@ package(default_visibility = ["//visibility:public"])
 # After the //crates/net:tls{,_crypto,_handshake,_record} merger, this
 # crate owns the FULL TLS implementation: sans-io primitives
 # (`schedule`, `aead`, `handshake`, `record`) plus the per-conn
-# server state machine. //crates/transport/quic depends on `schedule` / `aead`
+# server state machine. //crates/proto/quic depends on `schedule` / `aead`
 # / `handshake` for its TLS-over-CRYPTO-frames driver; HTTPS apps
 # use the higher-level `acceptor` / `listen` API.
 #
@@ -76,7 +76,7 @@ rust_library(
     deps = [
         "//crates/crypto/aes-gcm",
         "//crates/runtime/worker",
-        "//crates/transport/http",
+        "//crates/proto/http",
         "//crates/uni/uni",
         "//crates/util/iobuf",
         "@crates//:aes",

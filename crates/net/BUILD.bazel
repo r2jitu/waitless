@@ -262,8 +262,8 @@ rust_library(
 
 # TLS and QUIC moved out of //net to break the kitchen-sink
 # pattern that was forming. Sans-io TLS primitives now live in
-# //crates/transport/tls (alongside the TLS-over-TCP server); sans-io QUIC
-# primitives now live in //crates/transport/quic (alongside the QUIC server).
+# //crates/proto/tls (alongside the TLS-over-TCP server); sans-io QUIC
+# primitives now live in //crates/proto/quic (alongside the QUIC server).
 # `//net` keeps its narrowed scope: L2-L4 network protocols and
 # cross-cutting helpers.
 

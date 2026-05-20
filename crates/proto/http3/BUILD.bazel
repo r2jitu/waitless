@@ -3,7 +3,7 @@ load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# HTTP/3 server over //crates/transport/quic.
+# HTTP/3 server over //crates/proto/quic.
 #
 # Layered: H3 frames + QPACK (static-only) + H3Server. Re-uses the
 # `http::Request` / `http::Response` shape so a single
@@ -22,8 +22,8 @@ rust_library(
     ],
     crate_name = "http3",
     deps = [
-        "//crates/transport/http",
-        "//crates/transport/quic",
+        "//crates/proto/http",
+        "//crates/proto/quic",
         "//crates/uni/uni",
     ],
 )

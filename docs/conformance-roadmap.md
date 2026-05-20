@@ -42,7 +42,7 @@ Landed:
 - TCP RFC 6298 retransmission: a per-conn retransmit ring, the RTO
   timer wired into the poll loop, exponential backoff, and the
   SRTT/RTTVAR estimator. A lost outbound segment is now resent.
-- `quic` already host-builds; `//crates/transport/quic:uni_quic_test`
+- `quic` already host-builds; `//crates/proto/quic:uni_quic_test`
   includes `end_to_end_self_handshake`, which drives a synthetic
   Initial through the receive path.
 - `net_classify` (RX parse) is host-tested via

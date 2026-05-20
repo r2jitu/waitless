@@ -30,14 +30,14 @@ crates/
                +  shared package: types, checksum, from_bytes, ethernet,
                   ethernet_send, arp, ipv4, ipv6, icmpv6, ndp, mac_resolve,
                   ipv6_send, classify, udp, dhcp
-  transport/   tls/  quic/  http/  http3/
+  proto/       tls/  quic/  http/  http3/
   api/         uni/  macros/  net/
 ```
 
 ## Naming rules
 
 1. **Directory tree.** `crates/<domain>/<name>/`, kebab-case throughout.
-   Domains: `util crypto runtime kernel boot drivers net transport api`.
+   Domains: `util crypto runtime kernel boot drivers net proto uni`.
 2. **Bazel target.** Default target = directory name. `//crates/net/tcp`
    is shorthand for `//crates/net/tcp:tcp`. No hyphenated explicit
    target names — the target's `name = "..."` always matches its
@@ -168,7 +168,7 @@ external `@crates//:...` deps are omitted for readability.
 | --- | --- |
 | `uni` | `backend`, `uni_net`, `executor`, `worker`; on `os:none` also `uni_kernel`; proc-macro `uni_macros` |
 
-### Tiers 10–13 — application transports
+### Tiers 10–13 — userspace network protocols
 
 | Crate | Tier | Deps |
 | --- | --- | --- |
@@ -181,7 +181,7 @@ external `@crates//:...` deps are omitted for readability.
 
 `crates/boot/entry` consumes the kernel, drivers, net stack, and `uni`
 to assemble the bare-metal entrypoint. Apps under `apps/` depend on
-`uni` plus the transports they choose (`http`, `tls`, `quic`, `http3`).
+`uni` plus the protocols they choose (`http`, `tls`, `quic`, `http3`).
 
 ## Three architectural cuts worth understanding
 
@@ -246,7 +246,7 @@ equivalent to the syscall surface in a conventional OS. The rule:
   *implement* an I/O primitive exposed by the facade, plus everything
   they need to do their job. Lives in the RX/TX pipeline, runs in the
   poll loop, can't sensibly be a library over a socket.
-- **Above the facade** (`transport/`): crates that *consume* an I/O
+- **Above the facade** (`proto/`): crates that *consume* an I/O
   primitive — sans-io state machines fed by the facade's `TcpListener`
   / `UdpSocket`. Built on the facade like an app would be.
 

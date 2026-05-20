@@ -15,7 +15,7 @@ Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework 
 │           Application                │  apps/webserver/
 │         #[uni::init]                 │
 ├──────────────────────────────────────┤
-│      Transports (above facade)       │  crates/transport/{tls, http,
+│   Userspace protos (above facade)    │  crates/proto/{tls, http,
 │                                      │                    quic, http3}
 ├──────────────────────────────────────┤
 │    Facade (uni — kernel↔userspace)   │  crates/api/{uni, macros, net}

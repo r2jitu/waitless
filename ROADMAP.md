@@ -42,23 +42,23 @@ Transitive deps pull in exactly what's needed; `--gc-sections` strips the rest.
 //crates/net:ndp              <- ipv6 needs this (replaces ARP)
 //crates/net/tcp              <- transport/http needs this
 //crates/net:udp              <- quic needs this
-//crates/transport/quic       <- transport/http3 needs this (+ tls)
-//crates/transport/http       <- HTTP/1.1 server (deps: tcp)
-//crates/transport/http3      <- HTTP/3 server (deps: quic)
+//crates/proto/quic       <- transport/http3 needs this (+ tls)
+//crates/proto/http       <- HTTP/1.1 server (deps: tcp)
+//crates/proto/http3      <- HTTP/3 server (deps: quic)
 ```
 
 Example apps:
 ```python
 # Modern: HTTP/3 + QUIC + IPv6 (no TCP, no ARP, no IPv4)
-rust_library(name = "app", deps = ["//crates/transport/http3"])
+rust_library(name = "app", deps = ["//crates/proto/http3"])
 
 # Legacy: HTTP/1.1 + TCP + IPv4
-rust_library(name = "app", deps = ["//crates/transport/http"])
+rust_library(name = "app", deps = ["//crates/proto/http"])
 
 # Both: serve HTTP/1.1 and HTTP/3 side by side
 rust_library(name = "app", deps = [
-    "//crates/transport/http",
-    "//crates/transport/http3",
+    "//crates/proto/http",
+    "//crates/proto/http3",
 ])
 ```
 

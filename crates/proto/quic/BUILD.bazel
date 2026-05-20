@@ -4,7 +4,7 @@ load("//bazel/rules:rust.bzl", "rust_test")
 package(default_visibility = ["//visibility:public"])
 
 # AES-GCM inlines 128-bit vector ops (`__m128i`, pclmulqdq) into call
-# sites, so //crates/transport/quic (and downstream crates that monomorphise its
+# sites, so //crates/proto/quic (and downstream crates that monomorphise its
 # types) pulls them in too. SSE2 -- the register class those need --
 # is baked into the hard-float `@hardfloat_x86_64_none` target spec,
 # so no ABI toggle is required. This flag is just the non-ABI
@@ -19,7 +19,7 @@ _X86_CRYPTO_FLAG = "-Ctarget-feature=+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+ae
 # over CRYPTO frames (`tls`), the per-connection state machine
 # (`conn`), per-connection async inbox (`inbox`), and the UDP
 # endpoint that routes datagrams to conn tasks (`endpoint`). Depends
-# on `//crates/transport/tls` for the sans-io TLS bits (`schedule`, `aead`,
+# on `//crates/proto/tls` for the sans-io TLS bits (`schedule`, `aead`,
 # `handshake`) plus the cert / signing-key types reused across
 # both protocols.
 rust_library(
@@ -55,7 +55,7 @@ rust_library(
     deps = [
         "//crates/drivers/nic-api",
         "//crates/runtime/executor",
-        "//crates/transport/tls",
+        "//crates/proto/tls",
         "//crates/uni/uni",
         "//crates/util/iobuf",
         "@crates//:aes-gcm",

@@ -14,7 +14,7 @@ rust_library(
     # through `uni::rng::fill_bytes` (platform-agnostic wrapper), so
     # the whole test runs natively too.
     deps = [
-        "//crates/transport/tls",
+        "//crates/proto/tls",
         "//crates/uni/uni",
     ],
 )
