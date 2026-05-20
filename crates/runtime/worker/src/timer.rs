@@ -124,14 +124,14 @@ impl TimerWheel {
 
     fn cancel_in_slot(slot: &mut Slot, arg: usize) -> bool {
         for i in 0..slot.count {
-            if let Some(t) = &slot.timers[i] {
-                if t.arg == arg {
-                    // Swap-remove
-                    slot.count -= 1;
-                    slot.timers[i] = slot.timers[slot.count];
-                    slot.timers[slot.count] = None;
-                    return true;
-                }
+            if let Some(t) = &slot.timers[i]
+                && t.arg == arg
+            {
+                // Swap-remove
+                slot.count -= 1;
+                slot.timers[i] = slot.timers[slot.count];
+                slot.timers[slot.count] = None;
+                return true;
             }
         }
         false

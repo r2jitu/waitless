@@ -158,12 +158,12 @@ impl Connection {
 
         // RTT sample (RFC 9002 §5.1). Only when the largest_acked
         // PN is newly acked AND its packet was ack-eliciting.
-        if let Some(pkt) = largest_pkt {
-            if pkt.ack_eliciting {
-                let now = tls::ticket::now_us();
-                let latest = now.saturating_sub(pkt.time_sent_us);
-                self.update_rtt(latest, ack_delay);
-            }
+        if let Some(pkt) = largest_pkt
+            && pkt.ack_eliciting
+        {
+            let now = tls::ticket::now_us();
+            let latest = now.saturating_sub(pkt.time_sent_us);
+            self.update_rtt(latest, ack_delay);
         }
         // Loss detection — runs after each ACK in the same space.
         // RFC 9002 §6.1: declare lost any sent packet that's both
@@ -234,11 +234,12 @@ impl Connection {
                 }
                 continue;
             }
-            if max_rtt > 0 && now.saturating_sub(pkt.time_sent_us) > time_threshold_us {
-                if lost_threshold_n + lost_time_n < SCRATCH_CAP {
-                    lost_buf[lost_threshold_n + lost_time_n] = pn;
-                    lost_time_n += 1;
-                }
+            if max_rtt > 0
+                && now.saturating_sub(pkt.time_sent_us) > time_threshold_us
+                && lost_threshold_n + lost_time_n < SCRATCH_CAP
+            {
+                lost_buf[lost_threshold_n + lost_time_n] = pn;
+                lost_time_n += 1;
             }
         }
         let total_lost = lost_threshold_n + lost_time_n;

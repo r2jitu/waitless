@@ -344,10 +344,10 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             c.rcv_wnd = c.rx_free() as u16;
             // Wake any `TcpRecvReady` parked on this conn. Same core
             // owns the waker and the rx ring, so no cross-core hop.
-            if pushed > 0 {
-                if let Some(w) = c.recv_waker.take() {
-                    w.wake();
-                }
+            if pushed > 0
+                && let Some(w) = c.recv_waker.take()
+            {
+                w.wake();
             }
             // Send an immediate ACK. The previous version of this code
             // deferred ACKs to piggyback on the next outbound data
@@ -439,10 +439,10 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
         // above already resets the whole conn (including `recv_waker`)
         // via `TcpConnection::new()`; in the CloseWait branch we still
         // hold the waker, so fire it here.
-        if c.state == TcpState::CloseWait {
-            if let Some(w) = c.recv_waker.take() {
-                w.wake();
-            }
+        if c.state == TcpState::CloseWait
+            && let Some(w) = c.recv_waker.take()
+        {
+            w.wake();
         }
     }
 }

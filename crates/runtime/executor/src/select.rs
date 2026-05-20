@@ -47,15 +47,15 @@ where
     let mut ra: Option<A::Output> = None;
     let mut rb: Option<B::Output> = None;
     core::future::poll_fn(move |cx| {
-        if ra.is_none() {
-            if let Poll::Ready(v) = a.as_mut().poll(cx) {
-                ra = Some(v);
-            }
+        if ra.is_none()
+            && let Poll::Ready(v) = a.as_mut().poll(cx)
+        {
+            ra = Some(v);
         }
-        if rb.is_none() {
-            if let Poll::Ready(v) = b.as_mut().poll(cx) {
-                rb = Some(v);
-            }
+        if rb.is_none()
+            && let Poll::Ready(v) = b.as_mut().poll(cx)
+        {
+            rb = Some(v);
         }
         match (ra.take(), rb.take()) {
             (Some(av), Some(bv)) => Poll::Ready((av, bv)),
@@ -84,20 +84,20 @@ where
     let mut rb: Option<B::Output> = None;
     let mut rc: Option<C::Output> = None;
     core::future::poll_fn(move |cx| {
-        if ra.is_none() {
-            if let Poll::Ready(v) = a.as_mut().poll(cx) {
-                ra = Some(v);
-            }
+        if ra.is_none()
+            && let Poll::Ready(v) = a.as_mut().poll(cx)
+        {
+            ra = Some(v);
         }
-        if rb.is_none() {
-            if let Poll::Ready(v) = b.as_mut().poll(cx) {
-                rb = Some(v);
-            }
+        if rb.is_none()
+            && let Poll::Ready(v) = b.as_mut().poll(cx)
+        {
+            rb = Some(v);
         }
-        if rc.is_none() {
-            if let Poll::Ready(v) = c.as_mut().poll(cx) {
-                rc = Some(v);
-            }
+        if rc.is_none()
+            && let Poll::Ready(v) = c.as_mut().poll(cx)
+        {
+            rc = Some(v);
         }
         match (ra.take(), rb.take(), rc.take()) {
             (Some(av), Some(bv), Some(cv)) => Poll::Ready((av, bv, cv)),

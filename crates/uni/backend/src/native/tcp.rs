@@ -124,12 +124,12 @@ fn async_tcp_unlisten_hook(app_port: u16) {
         let count = ASYNC_TCP_COUNT.load(Ordering::Acquire);
         let listeners = &mut *ASYNC_TCP_LISTENERS.0.get();
         for entry in listeners.iter_mut().take(count) {
-            if let Some(l) = entry {
-                if l.app_port == app_port {
-                    close(l.fd);
-                    *entry = None;
-                    return;
-                }
+            if let Some(l) = entry
+                && l.app_port == app_port
+            {
+                close(l.fd);
+                *entry = None;
+                return;
             }
         }
     }

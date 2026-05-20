@@ -219,10 +219,10 @@ pub(super) fn ack_remove_range(
     // explicit loop is still O((high-low) * log n) which is fine.
     let mut pn = high;
     loop {
-        if let Some(pkt) = space.sent_packets.remove(&pn) {
-            if pn == target_pn {
-                *largest_out = Some(pkt);
-            }
+        if let Some(pkt) = space.sent_packets.remove(&pn)
+            && pn == target_pn
+        {
+            *largest_out = Some(pkt);
         }
         if pn == low {
             break;
@@ -865,17 +865,17 @@ impl Connection {
             // `buffer` allocations instead of growing fresh
             // ones. `reset_for_reuse` clears state but
             // preserves capacity.
-            if let Some(mut s) = self.send_streams.remove(&sid) {
-                if self.send_pool.len() < STREAM_POOL_CAP {
-                    s.reset_for_reuse();
-                    self.send_pool.push(s);
-                }
+            if let Some(mut s) = self.send_streams.remove(&sid)
+                && self.send_pool.len() < STREAM_POOL_CAP
+            {
+                s.reset_for_reuse();
+                self.send_pool.push(s);
             }
-            if let Some(mut r) = self.recv_streams.remove(&sid) {
-                if self.recv_pool.len() < STREAM_POOL_CAP {
-                    r.reset_for_reuse();
-                    self.recv_pool.push(r);
-                }
+            if let Some(mut r) = self.recv_streams.remove(&sid)
+                && self.recv_pool.len() < STREAM_POOL_CAP
+            {
+                r.reset_for_reuse();
+                self.recv_pool.push(r);
             }
             // Tombstone the sid so a late retransmit's STREAM
             // frame can't resurrect the stream and strand the H3

@@ -199,11 +199,11 @@ where
                     }
                 }
             }
-            if !found {
-                if let Some(idx) = empty {
-                    uni_seen[idx] = Some(sid);
-                    crate::h3_event!(peer_uni_streams_seen, "sid={}", sid);
-                }
+            if !found
+                && let Some(idx) = empty
+            {
+                uni_seen[idx] = Some(sid);
+                crate::h3_event!(peer_uni_streams_seen, "sid={}", sid);
             }
             conn.discard_recv(sid);
         } else {

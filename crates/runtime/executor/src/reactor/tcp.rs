@@ -507,10 +507,10 @@ pub fn register_tcp_backend(b: &'static TcpBackend) {
 /// on native (the kernel handles fd cleanup at process exit) and
 /// before any backend has registered.
 pub fn shutdown_all_tcp() {
-    if let Some(b) = tcp_backend() {
-        if let Some(f) = b.shutdown_all {
-            f();
-        }
+    if let Some(b) = tcp_backend()
+        && let Some(f) = b.shutdown_all
+    {
+        f();
     }
 }
 
@@ -859,10 +859,10 @@ impl<'a> Drop for TcpRecv<'a> {
         // clear the recv_buf_slot pointer we registered above so a
         // subsequent `tcp_receive` doesn't write into freed user
         // memory.
-        if let Some(b) = tcp_backend() {
-            if let Some(clear) = b.clear_recv_buf_slot {
-                clear(self.handle, self.generation);
-            }
+        if let Some(b) = tcp_backend()
+            && let Some(clear) = b.clear_recv_buf_slot
+        {
+            clear(self.handle, self.generation);
         }
     }
 }
@@ -1023,10 +1023,10 @@ impl<'a> Drop for RecvChunk<'a> {
         // longer exists. An already-stashed chunk is left intact;
         // it's still owed to the conn slot and is released on slot
         // reset.
-        if let Some(b) = tcp_backend() {
-            if let Some(clear) = b.clear_chunk_buf_slot {
-                clear(self.handle, self.generation);
-            }
+        if let Some(b) = tcp_backend()
+            && let Some(clear) = b.clear_chunk_buf_slot
+        {
+            clear(self.handle, self.generation);
         }
     }
 }

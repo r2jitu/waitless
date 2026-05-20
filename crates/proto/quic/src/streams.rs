@@ -193,10 +193,10 @@ impl RecvStream {
     /// (contiguous append + gap fold-in). No-op when not in
     /// `FinSeen`.
     fn maybe_close(&mut self) {
-        if let RecvState::FinSeen { fin_offset } = self.state {
-            if self.offset >= fin_offset {
-                self.state = RecvState::Closed { fin_offset };
-            }
+        if let RecvState::FinSeen { fin_offset } = self.state
+            && self.offset >= fin_offset
+        {
+            self.state = RecvState::Closed { fin_offset };
         }
     }
 
@@ -410,11 +410,11 @@ impl SendStream {
     /// resets the cursor when fully drained.
     fn advance_head(&mut self, n: usize) {
         self.head_consumed += n;
-        if let Some(head) = self.outbound.front() {
-            if self.head_consumed == head.len() {
-                self.outbound.pop_front();
-                self.head_consumed = 0;
-            }
+        if let Some(head) = self.outbound.front()
+            && self.head_consumed == head.len()
+        {
+            self.outbound.pop_front();
+            self.head_consumed = 0;
         }
     }
 

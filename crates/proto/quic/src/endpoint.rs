@@ -464,25 +464,25 @@ async fn listener_loop<H, F>(
         // that conn. This is the steady-state path — every
         // post-first-reply packet from the client echoes our
         // server-chosen SCID as its DCID.
-        if let Some((slot_idx, generation)) = parse_local_cid(&dcid) {
-            if let Some(inbox) = slots.lookup(slot_idx, generation) {
-                let dgram_size = buf.len();
-                let pushed = inbox.push(Datagram {
-                    src_ip,
-                    src_port,
-                    bytes: buf,
-                });
-                if !pushed {
-                    crate::quic_drop!(
-                        inbox_full_drops,
-                        "size={} slot={} gen={}",
-                        dgram_size,
-                        slot_idx,
-                        generation
-                    );
-                }
-                continue;
+        if let Some((slot_idx, generation)) = parse_local_cid(&dcid)
+            && let Some(inbox) = slots.lookup(slot_idx, generation)
+        {
+            let dgram_size = buf.len();
+            let pushed = inbox.push(Datagram {
+                src_ip,
+                src_port,
+                bytes: buf,
+            });
+            if !pushed {
+                crate::quic_drop!(
+                    inbox_full_drops,
+                    "size={} slot={} gen={}",
+                    dgram_size,
+                    slot_idx,
+                    generation
+                );
             }
+            continue;
         }
 
         // Try the client-chosen-DCID map BEFORE the Initial-only
@@ -682,29 +682,30 @@ async fn conn_task<H, F>(
                 // Timer fired. Distinguish PTO vs idle by which
                 // deadline was earlier and is now in the past.
                 let after = tls::ticket::now_us();
-                if let Some(p) = pto_deadline {
-                    if after >= p && p < idle_deadline {
-                        // PTO fired first — emit a probe and loop
-                        // back. Don't break; PTO is recovery, not
-                        // teardown.
-                        let probed = conn.borrow_mut().send_pto_probe();
-                        if probed {
-                            crate::diag::COUNTERS
-                                .pto_probes_sent
-                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                            // Drain the probe to the wire
-                            // immediately via the ownership-
-                            // transfer pop + recycle pattern.
-                            loop {
-                                let pkt = match conn.borrow_mut().pop_packet_owned() {
-                                    Some(p) => p,
-                                    None => break,
-                                };
-                                ship_datagram(&sock, &conn, peer_ip.get(), peer_port.get(), pkt);
-                            }
+                if let Some(p) = pto_deadline
+                    && after >= p
+                    && p < idle_deadline
+                {
+                    // PTO fired first — emit a probe and loop
+                    // back. Don't break; PTO is recovery, not
+                    // teardown.
+                    let probed = conn.borrow_mut().send_pto_probe();
+                    if probed {
+                        crate::diag::COUNTERS
+                            .pto_probes_sent
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        // Drain the probe to the wire
+                        // immediately via the ownership-
+                        // transfer pop + recycle pattern.
+                        loop {
+                            let pkt = match conn.borrow_mut().pop_packet_owned() {
+                                Some(p) => p,
+                                None => break,
+                            };
+                            ship_datagram(&sock, &conn, peer_ip.get(), peer_port.get(), pkt);
                         }
-                        continue;
                     }
+                    continue;
                 }
                 // Idle path.
                 crate::quic_event!(

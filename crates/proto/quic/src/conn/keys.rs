@@ -190,61 +190,61 @@ impl Connection {
         // unprotect 0-RTT packets that arrive in the same datagram
         // as the Initial / right after; without these the packets
         // get silently dropped by `aead_decrypt_failed`.
-        if let Some(et) = self.tls.client_early_traffic_secret() {
-            if self.early_recv.is_none() {
-                let recv = derive_aes128_keys(et);
-                self.early_recv = Some(DirKeys::from_aes128(&recv));
-                crate::quic_event!(
-                    early_keys_derived,
-                    "local_cid={}",
-                    crate::endpoint::hex8(self.local_cid.as_slice())
-                );
-                // Replay any 0-RTT packets that arrived before
-                // the keys were ready. process_zero_rtt is the
-                // canonical handler — call it on each buffered
-                // packet so we share decryption + frame-dispatch
-                // logic with the steady-state path.
-                let pending: Vec<Vec<u8>> = core::mem::take(&mut self.pending_zero_rtt);
-                for mut pkt in pending {
-                    if let Err(e) = self.process_zero_rtt(&mut pkt) {
-                        // Don't propagate — replay failures are
-                        // best-effort and shouldn't kill the conn.
-                        crate::quic_drop!(other_wire, "0-RTT replay error: {:?}", e);
-                    }
+        if let Some(et) = self.tls.client_early_traffic_secret()
+            && self.early_recv.is_none()
+        {
+            let recv = derive_aes128_keys(et);
+            self.early_recv = Some(DirKeys::from_aes128(&recv));
+            crate::quic_event!(
+                early_keys_derived,
+                "local_cid={}",
+                crate::endpoint::hex8(self.local_cid.as_slice())
+            );
+            // Replay any 0-RTT packets that arrived before
+            // the keys were ready. process_zero_rtt is the
+            // canonical handler — call it on each buffered
+            // packet so we share decryption + frame-dispatch
+            // logic with the steady-state path.
+            let pending: Vec<Vec<u8>> = core::mem::take(&mut self.pending_zero_rtt);
+            for mut pkt in pending {
+                if let Err(e) = self.process_zero_rtt(&mut pkt) {
+                    // Don't propagate — replay failures are
+                    // best-effort and shouldn't kill the conn.
+                    crate::quic_drop!(other_wire, "0-RTT replay error: {:?}", e);
                 }
             }
         }
         // Once handshake-stage secrets exist on the TLS side and
         // we haven't yet derived our packet-protection keys for
         // the Handshake space, derive them now.
-        if let Some(hs) = self.tls.handshake_secrets() {
-            if self.handshake_send.is_none() {
-                let send = derive_aes128_keys(&hs.server_hs);
-                let recv = derive_aes128_keys(&hs.client_hs);
-                self.handshake_send = Some(DirKeys::from_aes128(&send));
-                self.handshake_recv = Some(DirKeys::from_aes128(&recv));
-            }
+        if let Some(hs) = self.tls.handshake_secrets()
+            && self.handshake_send.is_none()
+        {
+            let send = derive_aes128_keys(&hs.server_hs);
+            let recv = derive_aes128_keys(&hs.client_hs);
+            self.handshake_send = Some(DirKeys::from_aes128(&send));
+            self.handshake_recv = Some(DirKeys::from_aes128(&recv));
         }
-        if let Some(ap) = self.tls.application_secrets() {
-            if self.application_send.is_none() {
-                let send = derive_aes128_keys(&ap.server_ap);
-                let recv = derive_aes128_keys(&ap.client_ap);
-                self.application_send = Some(DirKeys::from_aes128(&send));
-                self.application_recv = Some(DirKeys::from_aes128(&recv));
-                // Pre-derive next-phase recv keys so a peer-initiated
-                // key update (RFC 9001 §6) doesn't require HKDF on
-                // the hot decrypt path — we just trial-decrypt with
-                // `application_recv_next` whenever the KEY_PHASE bit
-                // disagrees with `recv_key_phase`. HP key persists
-                // across phases (§6.1: "the same header protection
-                // key is used") so we copy it from the current keys.
-                self.client_app_secret = Some(ap.client_ap);
-                let next_secret = next_traffic_secret(&ap.client_ap);
-                let next_aes128 = derive_aes128_keys(&next_secret);
-                let cur_recv = self.application_recv.as_ref().unwrap();
-                self.application_recv_next =
-                    Some(DirKeys::from_aes128_reuse_hp(&next_aes128, cur_recv));
-            }
+        if let Some(ap) = self.tls.application_secrets()
+            && self.application_send.is_none()
+        {
+            let send = derive_aes128_keys(&ap.server_ap);
+            let recv = derive_aes128_keys(&ap.client_ap);
+            self.application_send = Some(DirKeys::from_aes128(&send));
+            self.application_recv = Some(DirKeys::from_aes128(&recv));
+            // Pre-derive next-phase recv keys so a peer-initiated
+            // key update (RFC 9001 §6) doesn't require HKDF on
+            // the hot decrypt path — we just trial-decrypt with
+            // `application_recv_next` whenever the KEY_PHASE bit
+            // disagrees with `recv_key_phase`. HP key persists
+            // across phases (§6.1: "the same header protection
+            // key is used") so we copy it from the current keys.
+            self.client_app_secret = Some(ap.client_ap);
+            let next_secret = next_traffic_secret(&ap.client_ap);
+            let next_aes128 = derive_aes128_keys(&next_secret);
+            let cur_recv = self.application_recv.as_ref().unwrap();
+            self.application_recv_next =
+                Some(DirKeys::from_aes128_reuse_hp(&next_aes128, cur_recv));
         }
         // `Failed` is terminal — never resurrect it. Without this
         // guard, a peer-initiated CONNECTION_CLOSE (handled in

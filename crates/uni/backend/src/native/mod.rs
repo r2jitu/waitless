@@ -874,18 +874,18 @@ pub fn run_worker(worker_id: u32) {
         // 1. IO poll callbacks (network, future storage, etc)
         let n = IO_POLL_COUNT.load(Ordering::Acquire).min(IO_POLL_MAX);
         for i in 0..n {
-            if let Some(f) = IO_POLL[i].load() {
-                if f(worker_id) {
-                    did_work = true;
-                }
+            if let Some(f) = IO_POLL[i].load()
+                && f(worker_id)
+            {
+                did_work = true;
             }
         }
 
         // 2. App service callback
-        if let Some(f) = get_service() {
-            if f(worker_id) {
-                did_work = true;
-            }
+        if let Some(f) = get_service()
+            && f(worker_id)
+        {
+            did_work = true;
         }
 
         // 2a. Async runtime: every worker advances its own timer

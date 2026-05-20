@@ -738,11 +738,11 @@ impl UdpSocket {
                     }
                     inbox.reset();
                 }
-                if let Some(bind) = udp_backend().and_then(|b| b.bind) {
-                    if bind(port, None).is_err() {
-                        state.port.store(0, Ordering::Release);
-                        return Err(UdpBindError::BackendFailed);
-                    }
+                if let Some(bind) = udp_backend().and_then(|b| b.bind)
+                    && bind(port, None).is_err()
+                {
+                    state.port.store(0, Ordering::Release);
+                    return Err(UdpBindError::BackendFailed);
                 }
                 return Ok(UdpSocket {
                     port,
@@ -855,17 +855,17 @@ impl UdpSocket {
 
         // Notify the backend (native opens an actual fd; bare-metal
         // is a no-op since routing is registry-only).
-        if let Some(bind) = udp_backend().and_then(|b| b.bind) {
-            if bind(port, Some(me)).is_err() {
-                // Roll back: clear port, mark slot free.
-                slot.port.store(0, Ordering::Release);
-                // SAFETY: owner-only access.
-                unsafe {
-                    let bk = &mut *pool.bookkeeping.get();
-                    bk.free_list.push(slot_idx);
-                }
-                return Err(UdpBindError::BackendFailed);
+        if let Some(bind) = udp_backend().and_then(|b| b.bind)
+            && bind(port, Some(me)).is_err()
+        {
+            // Roll back: clear port, mark slot free.
+            slot.port.store(0, Ordering::Release);
+            // SAFETY: owner-only access.
+            unsafe {
+                let bk = &mut *pool.bookkeeping.get();
+                bk.free_list.push(slot_idx);
             }
+            return Err(UdpBindError::BackendFailed);
         }
 
         Ok(UdpSocket {
