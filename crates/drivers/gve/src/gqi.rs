@@ -124,7 +124,7 @@ pub(crate) fn doorbell_write(bar2_va: u64, offset: u32, value: u32) {
 // ---- Token encoding for direct-fill TX slots ------------------------------
 
 /// Encode `(qp, slot, pool_id)` into the opaque `driver_token` of
-/// a [`uni_net_driver::TxBufHandle`]. Layout:
+/// a [`nic_api::TxBufHandle`]. Layout:
 ///   * bit  63    : pool_id (0 = small, 1 = big)
 ///   * bits 32..62: qp index
 ///   * bits  0..32: slot index (within the pool)
@@ -247,7 +247,7 @@ pub(crate) fn tx_drain(tx: &TxQueue) {
 /// Slice-shaped wrapper over the direct-fill path: acquire a slot
 /// from the QP's pool, memcpy data into it, submit. Used by `send`
 /// (the per-core dispatcher) when GQI is the negotiated format.
-pub(crate) fn send_on_qp(qp: usize, data: &[u8], csum: uni_net_driver::CsumOffload) -> bool {
+pub(crate) fn send_on_qp(qp: usize, data: &[u8], csum: nic_api::CsumOffload) -> bool {
     if data.is_empty() || data.len() > TX_MAX_PKT_LEN {
         return false;
     }
@@ -267,7 +267,7 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8], csum: uni_net_driver::CsumOfflo
 /// worker's qp). Spin-drains on full pool — the caller is the qp's
 /// owning worker (Tier 1) so this is cooperative scheduling, not
 /// deadlock-prone.
-pub(crate) fn acquire_tx_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxBufHandle> {
+pub(crate) fn acquire_tx_buf_for_qp(qp: usize) -> Option<nic_api::TxBufHandle> {
     if qp >= MAX_QUEUE_PAIRS {
         return None;
     }
@@ -298,7 +298,7 @@ pub(crate) fn acquire_tx_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxBufHa
                     TX_SMALL_ACQUIRES.fetch_add(1, Ordering::Relaxed);
                     let qpl_offset = (slot as u32) * PAGE_SIZE;
                     let data_ptr = (tx.qpl_base_va + qpl_offset as u64) as *mut u8;
-                    return Some(uni_net_driver::TxBufHandle {
+                    return Some(nic_api::TxBufHandle {
                         data_ptr,
                         data_cap: TX_MAX_PKT_LEN as u32,
                         driver_token: encode_token(qp, slot, POOL_ID_SMALL),
@@ -329,7 +329,7 @@ pub(crate) fn acquire_tx_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxBufHa
 /// pool: TSO super-segments are best-effort batching, and a
 /// transient saturation should not block the worker; the per-MSS
 /// path is the safety net.
-pub(crate) fn acquire_tx_tso_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxTsoBufHandle> {
+pub(crate) fn acquire_tx_tso_buf_for_qp(qp: usize) -> Option<nic_api::TxTsoBufHandle> {
     if qp >= MAX_QUEUE_PAIRS {
         return None;
     }
@@ -355,14 +355,12 @@ pub(crate) fn acquire_tx_tso_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxT
             TX_BIG_ACQUIRES.fetch_add(1, Ordering::Relaxed);
             let qpl_offset = TX_BIG_POOL_QPL_OFFSET + (slot as u32) * TX_BIG_SLOT_SIZE;
             let data_ptr = (tx.qpl_base_va + qpl_offset as u64) as *mut u8;
-            return Some(uni_net_driver::TxTsoBufHandle(
-                uni_net_driver::TxBufHandle {
-                    data_ptr,
-                    data_cap: TX_MAX_TSO_LEN as u32,
-                    driver_token: encode_token(qp, slot, POOL_ID_BIG),
-                    release_fn: release_tx_slot,
-                },
-            ));
+            return Some(nic_api::TxTsoBufHandle(nic_api::TxBufHandle {
+                data_ptr,
+                data_cap: TX_MAX_TSO_LEN as u32,
+                driver_token: encode_token(qp, slot, POOL_ID_BIG),
+                release_fn: release_tx_slot,
+            }));
         }
     }
     TX_BIG_FULL_RETURNS.fetch_add(1, Ordering::Relaxed);
@@ -394,9 +392,9 @@ pub(crate) fn acquire_tx_tso_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxT
 /// computes the L4 checksum at byte
 /// `l4_hdr_offset*2 + l4_csum_offset*2` of the frame.
 pub(crate) fn submit_tx_inner(
-    handle: uni_net_driver::TxBufHandle,
+    handle: nic_api::TxBufHandle,
     frame_len: usize,
-    csum: uni_net_driver::CsumOffload,
+    csum: nic_api::CsumOffload,
 ) {
     let (qp, slot, _pool) = decode_token(handle.driver_token);
     // mem::forget skips Drop's `release_fn` — the slot is about
@@ -489,7 +487,7 @@ pub(crate) fn submit_tx_inner(
 ///     passes `skb->len`); the device uses `desc_cnt` to know how
 ///     many descs to fetch, then segments the payload using `mss`.
 pub(crate) fn submit_tx_tso_inner(
-    handle: uni_net_driver::TxTsoBufHandle,
+    handle: nic_api::TxTsoBufHandle,
     frame_len: usize,
     hdr_len: u16,
     csum_start: u16,
@@ -611,7 +609,7 @@ pub(crate) fn submit_tx_tso_inner(
 /// so a single descriptor format covers both modes — we only
 /// need to point the device at the correct csum field.
 pub(crate) fn submit_tx_udp_gso_inner(
-    handle: uni_net_driver::TxUdpGsoBufHandle,
+    handle: nic_api::TxUdpGsoBufHandle,
     frame_len: usize,
     hdr_len: u16,
     csum_start: u16,

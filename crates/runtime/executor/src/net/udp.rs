@@ -515,7 +515,7 @@ pub struct UdpBackend {
     /// Used by the QUIC encoder's `take_datagram_buf` to write
     /// packet bytes straight into a TX-pool slot — saves the
     /// driver-side memcpy that the slice-based `send` path pays.
-    pub acquire_tx_buf: Option<fn() -> Option<uni_net_driver::TxBufHandle>>,
+    pub acquire_tx_buf: Option<fn() -> Option<nic_api::TxBufHandle>>,
     /// Optional submit-via-TX-handle entry. Caller has filled
     /// `handle.data_mut()[MAX_L2_HEADROOM..MAX_L2_HEADROOM+payload_len]`
     /// with the UDP payload; the backend fills the L2/L3/L4
@@ -527,7 +527,7 @@ pub struct UdpBackend {
             dst_ip: IpAddr,
             src_port: u16,
             dst_port: u16,
-            handle: uni_net_driver::TxBufHandle,
+            handle: nic_api::TxBufHandle,
             frame_len: usize,
         ),
     >,
@@ -580,7 +580,7 @@ pub const MAX_L2_HEADROOM: usize = 14 + 40 + 8;
 /// (native), the driver doesn't either (GVE today), or the
 /// pool is full. Caller falls back to a heap-allocated
 /// `Vec<u8>` + slice-shaped send.
-pub fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
+pub fn acquire_tx_buf() -> Option<nic_api::TxBufHandle> {
     let b = udp_backend()?;
     let f = b.acquire_tx_buf?;
     f()
@@ -907,7 +907,7 @@ impl UdpSocket {
         &self,
         dst_ip: IpAddr,
         dst_port: u16,
-        handle: uni_net_driver::TxBufHandle,
+        handle: nic_api::TxBufHandle,
         frame_len: usize,
     ) -> Result<(), ()> {
         let b = udp_backend().ok_or(())?;

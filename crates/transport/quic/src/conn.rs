@@ -395,7 +395,7 @@ pub enum DatagramBuf {
     /// slot stays in-flight until the device signals descriptor
     /// completion via the driver's `tx_drain`.
     TxSlot {
-        handle: uni_net_driver::TxBufHandle,
+        handle: nic_api::TxBufHandle,
         vec: ManuallyDrop<Vec<u8>>,
     },
 }
@@ -437,7 +437,7 @@ impl DatagramBuf {
     /// for submission. Only succeeds for the `TxSlot` variant;
     /// `Heap`-variant returns the buf back via `Err(self)` so
     /// the caller can fall back to a slice-shaped send.
-    pub fn into_tx_handle(self) -> Result<(uni_net_driver::TxBufHandle, usize), Self> {
+    pub fn into_tx_handle(self) -> Result<(nic_api::TxBufHandle, usize), Self> {
         match self {
             DatagramBuf::TxSlot { handle, vec } => {
                 let len = vec.len();

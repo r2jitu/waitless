@@ -1,13 +1,13 @@
 // `Net::enable` API + re-exports. The `NicOps` POD + link-time
-// registry live in the sibling `uni_net_driver` leaf crate so NIC
+// registry live in the sibling `nic_api` leaf crate so NIC
 // drivers can depend there without forming a `drivers → uni` cycle.
 
 #![no_std]
 
 extern crate alloc;
 
-extern crate uni_net_driver;
-pub use uni_net_driver::{
+extern crate nic_api;
+pub use nic_api::{
     DhcpError, EthernetDriverReg, NetError, NicDiagOps, NicError, NicIdleOps, NicOps,
     linked_ethernet_drivers, register_ethernet_driver,
 };
@@ -115,10 +115,10 @@ impl Net {
             // (`drivers::net::init()`); re-probing here just re-fires
             // the per-driver "device not found" diagnostics for nothing.
             // Trust the boot-time outcome.
-            if uni_net_driver::linked_ethernet_drivers().is_empty() {
+            if nic_api::linked_ethernet_drivers().is_empty() {
                 return Err(NetError::NoDriver);
             }
-            if !uni_net_driver::is_installed() {
+            if !nic_api::is_installed() {
                 return Err(NetError::NoNic);
             }
         }

@@ -160,11 +160,11 @@ pub fn tx_desc_log_snapshot(out: &mut [TxDescLogEntry]) -> usize {
 }
 
 /// Trampoline that bridges this module's local `TxDescLogEntry`
-/// to the cross-crate `uni_net_driver::TxDescLogEntry` the consumer
+/// to the cross-crate `nic_api::TxDescLogEntry` the consumer
 /// reads. Same fields, same layout — we copy field-by-field rather
 /// than transmute to keep the boundary explicit. Registered as the
 /// `NicDiagOps::tx_desc_log_snapshot` function pointer.
-pub(crate) fn tx_desc_log_snapshot_export(out: &mut [uni_net_driver::TxDescLogEntry]) -> usize {
+pub(crate) fn tx_desc_log_snapshot_export(out: &mut [nic_api::TxDescLogEntry]) -> usize {
     let mut local = [TxDescLogEntry {
         seq: 0,
         qp: 0,
@@ -174,7 +174,7 @@ pub(crate) fn tx_desc_log_snapshot_export(out: &mut [uni_net_driver::TxDescLogEn
     let limit = out.len().min(TX_DESC_LOG_DEPTH);
     let n = tx_desc_log_snapshot(&mut local[..limit]);
     for i in 0..n {
-        out[i] = uni_net_driver::TxDescLogEntry {
+        out[i] = nic_api::TxDescLogEntry {
             seq: local[i].seq,
             qp: local[i].qp,
             kind: local[i].kind,
@@ -186,12 +186,12 @@ pub(crate) fn tx_desc_log_snapshot_export(out: &mut [uni_net_driver::TxDescLogEn
 
 // ---- NicDiagOps adapters ---------------------------------------------------
 
-pub(crate) fn tx_diag() -> uni_net_driver::TxDiag {
-    let mut packets = [0u64; uni_net_driver::DIAG_QP_CAP];
-    let mut inflight = [0u32; uni_net_driver::DIAG_QP_CAP];
-    let mut tx_bytes = [0u64; uni_net_driver::DIAG_QP_CAP];
-    let mut rx_bytes = [0u64; uni_net_driver::DIAG_QP_CAP];
-    for i in 0..uni_net_driver::DIAG_QP_CAP {
+pub(crate) fn tx_diag() -> nic_api::TxDiag {
+    let mut packets = [0u64; nic_api::DIAG_QP_CAP];
+    let mut inflight = [0u32; nic_api::DIAG_QP_CAP];
+    let mut tx_bytes = [0u64; nic_api::DIAG_QP_CAP];
+    let mut rx_bytes = [0u64; nic_api::DIAG_QP_CAP];
+    for i in 0..nic_api::DIAG_QP_CAP {
         packets[i] = TX_PACKETS_PER_QP[i].load(Ordering::Relaxed);
         if i < TX_BYTES_PER_QP.len() {
             tx_bytes[i] = TX_BYTES_PER_QP[i].load(Ordering::Relaxed);
@@ -209,7 +209,7 @@ pub(crate) fn tx_diag() -> uni_net_driver::TxDiag {
             inflight[i] = fill.wrapping_sub(done);
         }
     }
-    uni_net_driver::TxDiag {
+    nic_api::TxDiag {
         packets_per_qp: packets,
         inflight_per_qp: inflight,
         tx_bytes_per_qp: tx_bytes,

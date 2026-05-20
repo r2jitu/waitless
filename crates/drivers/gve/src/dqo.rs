@@ -361,7 +361,7 @@ fn build_pkt_desc(buf_addr: u64, flags: u8, compl_tag: u16, buf_size: u16) -> u1
 /// doorbell unless deferred. `csum` enables the device's L4 CSUM
 /// offload for the packet descriptor; `tx_path_hash` fills the
 /// general-context descriptor's flow-hash.
-pub(crate) fn send_on_qp(qp: usize, data: &[u8], csum: uni_net_driver::CsumOffload) -> bool {
+pub(crate) fn send_on_qp(qp: usize, data: &[u8], csum: nic_api::CsumOffload) -> bool {
     if qp >= MAX_QUEUE_PAIRS || data.is_empty() || data.len() > (RX_BUFFER_SIZE as usize) {
         return false;
     }

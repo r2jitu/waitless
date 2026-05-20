@@ -17,7 +17,7 @@ extern crate net_checksum as checksum;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate nic;
-extern crate uni_net_driver;
+extern crate nic_api;
 
 use from_bytes::FromBytes;
 use types::{CONFIG, IpAddr, MacAddr, htons, ntohs};
@@ -241,7 +241,7 @@ pub fn send_via_tx_handle(
     dst: IpAddr,
     src_port: u16,
     dst_port: u16,
-    mut handle: uni_net_driver::TxBufHandle,
+    mut handle: nic_api::TxBufHandle,
     frame_len: usize,
 ) {
     use executor::net::MAX_L2_HEADROOM;

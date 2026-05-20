@@ -495,8 +495,8 @@ pub struct EthernetDriverReg {
 /// `init()` discovers it via section-boundary symbols.
 ///
 /// ```ignore
-/// static MY_OPS: uni_net_driver::NicOps = uni_net_driver::NicOps { /* … */ };
-/// uni_net_driver::register_ethernet_driver!(MY_OPS);
+/// static MY_OPS: nic_api::NicOps = nic_api::NicOps { /* … */ };
+/// nic_api::register_ethernet_driver!(MY_OPS);
 /// ```
 #[macro_export]
 macro_rules! register_ethernet_driver {

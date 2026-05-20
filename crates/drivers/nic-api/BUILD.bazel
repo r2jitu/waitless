@@ -13,7 +13,7 @@ rust_library(
         "src/error.rs",
         "src/lib.rs",
     ],
-    crate_name = "uni_net_driver",
+    crate_name = "nic_api",
     crate_root = "src/lib.rs",
     deps = ["//crates/util/iobuf"],
 )

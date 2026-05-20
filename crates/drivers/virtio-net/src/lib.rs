@@ -7,8 +7,8 @@ extern crate alloc;
 extern crate bus;
 extern crate iobuf;
 extern crate net_checksum;
+extern crate nic_api;
 extern crate uni_kernel;
-extern crate uni_net_driver;
 
 use core::arch::asm;
 use core::ptr;
@@ -1200,7 +1200,7 @@ fn get_mac(mac_out: *mut u8) {
 /// from the caller's worker pool, copies `data` into it, and
 /// submits via the unified `submit_tx` path. Used by ARP/NDP/etc.
 /// callers that don't fill in place.
-fn send_slice(data: &[u8], csum: uni_net_driver::CsumOffload) {
+fn send_slice(data: &[u8], csum: nic_api::CsumOffload) {
     if data.is_empty() {
         return;
     }
@@ -1233,7 +1233,7 @@ static TX_LOCK: uni_kernel::sync::Spinlock<()> = uni_kernel::sync::Spinlock::new
 /// acquire+submit path: pool is per-worker (lock-free slot
 /// allocation on both Tier 1 and Tier 2); virtq submission is
 /// per-core on Tier 1 and TX_LOCK-serialised on Tier 2.
-fn send(data: &[u8], csum: uni_net_driver::CsumOffload) {
+fn send(data: &[u8], csum: nic_api::CsumOffload) {
     send_slice(data, csum);
 }
 
@@ -1325,7 +1325,7 @@ fn tx_drain_qp_locked(qp: usize) {
     }
 }
 
-fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
+fn acquire_tx_buf() -> Option<nic_api::TxBufHandle> {
     use core::sync::atomic::Ordering;
     let (worker, qp) = current_worker_and_qp()?;
 
@@ -1347,7 +1347,7 @@ fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
                     TX_SMALL_SCAN_ITERS.fetch_add(local_iters, Ordering::Relaxed);
                     TX_SMALL_ACQUIRES.fetch_add(1, Ordering::Relaxed);
                     let buf = &mut (*wpool(worker)).small[slot];
-                    return Some(uni_net_driver::TxBufHandle {
+                    return Some(nic_api::TxBufHandle {
                         data_ptr: buf.data.as_mut_ptr(),
                         data_cap: MAX_ETH_FRAME_SMALL as u32,
                         driver_token: encode_token(worker, slot, POOL_ID_SMALL),
@@ -1375,7 +1375,7 @@ fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
 /// `acquire_tx_buf` + per-MSS segmentation when None — TSO pool
 /// is small (16 slots) so we don't spin-drain it; per-MSS keeps
 /// throughput up under transient TSO-pool saturation.
-fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
+fn acquire_tx_tso_buf() -> Option<nic_api::TxTsoBufHandle> {
     use core::sync::atomic::Ordering;
     let (worker, _qp) = current_worker_and_qp()?;
     let big_ptr = unsafe { (*wpool(worker)).big };
@@ -1388,14 +1388,12 @@ fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
                 (*wpool(worker)).big_used[slot].store(true, Ordering::Relaxed);
                 TX_BIG_ACQUIRES.fetch_add(1, Ordering::Relaxed);
                 let buf = &mut *big_ptr.add(slot);
-                return Some(uni_net_driver::TxTsoBufHandle(
-                    uni_net_driver::TxBufHandle {
-                        data_ptr: buf.data.as_mut_ptr(),
-                        data_cap: MAX_ETH_FRAME_BIG as u32,
-                        driver_token: encode_token(worker, slot, POOL_ID_BIG),
-                        release_fn: release_tx_slot,
-                    },
-                ));
+                return Some(nic_api::TxTsoBufHandle(nic_api::TxBufHandle {
+                    data_ptr: buf.data.as_mut_ptr(),
+                    data_cap: MAX_ETH_FRAME_BIG as u32,
+                    driver_token: encode_token(worker, slot, POOL_ID_BIG),
+                    release_fn: release_tx_slot,
+                }));
             }
         }
     }
@@ -1407,11 +1405,7 @@ fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
     None
 }
 
-fn submit_tx(
-    handle: uni_net_driver::TxBufHandle,
-    frame_len: usize,
-    csum: uni_net_driver::CsumOffload,
-) {
+fn submit_tx(handle: nic_api::TxBufHandle, frame_len: usize, csum: nic_api::CsumOffload) {
     use core::sync::atomic::Ordering;
     let (worker, slot, _pool) = decode_token(handle.driver_token);
     // mem::forget skips `Drop`'s `release_fn` — the slot is
@@ -1506,7 +1500,7 @@ fn tso_available() -> bool {
 }
 
 fn submit_tx_tso(
-    handle: uni_net_driver::TxTsoBufHandle,
+    handle: nic_api::TxTsoBufHandle,
     frame_len: usize,
     hdr_len: u16,
     csum_start: u16,
@@ -1689,7 +1683,7 @@ static TX_SMALL_ACQUIRES: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 static TX_BIG_FULL_RETURNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static TX_BIG_ACQUIRES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-fn tx_diag() -> uni_net_driver::TxDiag {
+fn tx_diag() -> nic_api::TxDiag {
     use core::sync::atomic::Ordering::Relaxed;
     let mut packets = [0u64; DIAG_QP_CAP];
     let mut inflight = [0u32; DIAG_QP_CAP];
@@ -1711,7 +1705,7 @@ fn tx_diag() -> uni_net_driver::TxDiag {
             inflight[i] = (q.avail_idx().wrapping_sub(q.used_idx())) as u32;
         }
     }
-    uni_net_driver::TxDiag {
+    nic_api::TxDiag {
         packets_per_qp: packets,
         inflight_per_qp: inflight,
         tx_bytes_per_qp: tx_bytes,
@@ -2295,7 +2289,7 @@ fn poll(callback: fn(Chain<OwnedIOBuf>)) -> usize {
 // The active-driver slot stores `&'static NicOps`; every dispatcher
 // call does one Acquire load + one direct call.
 
-use uni_net_driver::{NicDiagOps, NicIdleOps, NicOps};
+use nic_api::{NicDiagOps, NicIdleOps, NicOps};
 
 /// `init()` is NOT idempotent — it re-runs PCI/MMIO probe + queue
 /// realloc + MSI-X rebind, corrupting in-flight state if called after
@@ -2355,4 +2349,4 @@ static VIRTIO_NET_OPS: NicOps = NicOps {
     diag: Some(&VIRTIO_NET_DIAG_OPS),
 };
 
-uni_net_driver::register_ethernet_driver!(VIRTIO_NET_OPS);
+nic_api::register_ethernet_driver!(VIRTIO_NET_OPS);

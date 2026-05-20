@@ -2844,9 +2844,9 @@ mod tests {
     use super::*;
     use core::ptr::NonNull;
     use iobuf::IOBufDropFn;
+    use nic_api::{CsumOffload, NicOps, set_active_ops};
     use std::sync::{Mutex, Once};
     use types::Ipv4Addr;
-    use uni_net_driver::{CsumOffload, NicOps, set_active_ops};
 
     const SERVER_IP: [u8; 4] = [10, 0, 0, 1];
     const CLIENT_IP: [u8; 4] = [10, 0, 0, 2];

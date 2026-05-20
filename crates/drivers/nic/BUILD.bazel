@@ -2,7 +2,7 @@ load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
-# NIC dispatch shim: thin wrappers over the `uni_net_driver`
+# NIC dispatch shim: thin wrappers over the `nic_api`
 # active-ops slot (`send`, `poll`, `acquire_tx_buf`, …). Standalone
 # host-buildable crate — its only dependency is the host-buildable
 # `//crates/drivers/nic-api` interface crate — so the TX-side net

@@ -25,7 +25,7 @@ rust_library(
         "//crates/runtime/worker",
         "//crates/runtime/platform",
         "//crates/runtime/executor",
-        # `uni_net_driver::TxDiag` is re-exported from both backends
+        # `nic_api::TxDiag` is re-exported from both backends
         # so `uni::diagnostics::NetTxDiag` is the same type on both
         # native (stub) and bare-metal (driver-filled). The driver
         # leaf crate is dependency-light (just `//crates/util/iobuf`), so it

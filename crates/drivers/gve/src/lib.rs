@@ -41,8 +41,8 @@
 
 extern crate bus;
 extern crate iobuf;
+extern crate nic_api;
 extern crate uni_kernel;
-extern crate uni_net_driver;
 
 mod adminq;
 mod diag;
@@ -1818,17 +1818,17 @@ fn current_qp() -> Option<usize> {
     Some(if core < num_qp { core as usize } else { 0 })
 }
 
-fn acquire_tx_udp_gso_buf() -> Option<uni_net_driver::TxUdpGsoBufHandle> {
+fn acquire_tx_udp_gso_buf() -> Option<nic_api::TxUdpGsoBufHandle> {
     // Share the big pool with TSO — same slot shape (16 KiB), same
     // pool_id encoding. We just rewrap as the type-distinct handle
     // so the API surface routes UDP-GSO slots through
     // `submit_tx_udp_gso` (different descriptor bytes vs TSO).
     let tso = acquire_tx_tso_buf()?;
-    Some(uni_net_driver::TxUdpGsoBufHandle(tso.0))
+    Some(nic_api::TxUdpGsoBufHandle(tso.0))
 }
 
 fn submit_tx_udp_gso(
-    handle: uni_net_driver::TxUdpGsoBufHandle,
+    handle: nic_api::TxUdpGsoBufHandle,
     frame_len: usize,
     hdr_len: u16,
     csum_start: u16,
@@ -1849,7 +1849,7 @@ fn submit_tx_udp_gso(
 /// frame). A DQO direct-fill landed once but always stalled on
 /// real c3 hardware under load, so it was removed; everything
 /// goes through `send_on_qp_dqo` until that's diagnosed.
-fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
+fn acquire_tx_buf() -> Option<nic_api::TxBufHandle> {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
         return None;
     }
@@ -1860,17 +1860,13 @@ fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
 /// handle (slot returns to pool on device completion). GQI_QPL
 /// only: callers never get a real handle in DQO mode (acquire
 /// returns None), so there's no DQO branch.
-fn submit_tx(
-    handle: uni_net_driver::TxBufHandle,
-    frame_len: usize,
-    csum: uni_net_driver::CsumOffload,
-) {
+fn submit_tx(handle: nic_api::TxBufHandle, frame_len: usize, csum: nic_api::CsumOffload) {
     gqi::submit_tx_inner(handle, frame_len, csum);
 }
 
 /// Public TSO acquire — picks the calling worker's qp and returns
 /// a 16 KiB big-pool handle (or `None` on DQO / pool saturation).
-fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
+fn acquire_tx_tso_buf() -> Option<nic_api::TxTsoBufHandle> {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
         return None;
     }
@@ -1881,7 +1877,7 @@ fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
 /// 1 TSO + 1 SEG descriptor; the device segments the payload into
 /// `gso_size`-byte chunks with TCP/IP headers fixed up per segment.
 fn submit_tx_tso(
-    handle: uni_net_driver::TxTsoBufHandle,
+    handle: nic_api::TxTsoBufHandle,
     frame_len: usize,
     hdr_len: u16,
     csum_start: u16,
@@ -1963,7 +1959,7 @@ fn enable_deferred_tx_kick() {
 /// (device hasn't caught up) or the frame exceeds the format's
 /// per-packet limit. Dispatches to GQI_QPL or DQO_RDA based on
 /// the queue format committed at init time.
-fn send_on_qp(qp: usize, data: &[u8], csum: uni_net_driver::CsumOffload) -> bool {
+fn send_on_qp(qp: usize, data: &[u8], csum: nic_api::CsumOffload) -> bool {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
         dqo::send_on_qp(qp, data, csum)
     } else {
@@ -1975,7 +1971,7 @@ fn send_on_qp(qp: usize, data: &[u8], csum: uni_net_driver::CsumOffload) -> bool
 /// fits within `num_qp`, else falls back to qp 0. Matches the
 /// virtio-net "send on your own core's queue" semantics so Tier 1
 /// scaling keeps working.
-fn send(data: &[u8], csum: uni_net_driver::CsumOffload) {
+fn send(data: &[u8], csum: nic_api::CsumOffload) {
     if let Some(qp) = current_qp() {
         let _ = send_on_qp(qp, data, csum);
     }
@@ -2114,7 +2110,7 @@ const _: u32 = DEVICE_STATUS_RESET;
 // call through the pointer. gve is polling-only — no NAPI, no MSI-X,
 // so `idle` is `None` and the dispatcher's idle path skips it.
 
-use uni_net_driver::{NicDiagOps, NicOps};
+use nic_api::{NicDiagOps, NicOps};
 
 /// `init()` internally short-circuits on `GVNIC_OK`, but we also
 /// check `probe_ok` here so multi-probe driver walks don't re-enter
@@ -2175,4 +2171,4 @@ static GVE_OPS: NicOps = NicOps {
 
 fn noop() {}
 
-uni_net_driver::register_ethernet_driver!(GVE_OPS);
+nic_api::register_ethernet_driver!(GVE_OPS);

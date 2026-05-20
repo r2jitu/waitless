@@ -21,7 +21,7 @@
 
 extern crate alloc;
 pub extern crate net_types as ip;
-extern crate uni_net_driver;
+extern crate nic_api;
 
 pub mod event;
 pub mod launcher;

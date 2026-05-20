@@ -50,9 +50,7 @@ crates/
    `crates/api/`: `uni`, `uni_macros`, `uni_net`. Two further carve-outs
    for external/internal collisions: `uni_aes_gcm` (RustCrypto's
    `aes-gcm` crate is pulled in via `@crates//:aes-gcm`) and
-   `uni_kernel` (the bare `kernel` name is too overloaded). The
-   `EthernetDriver` trait crate is `uni_net_driver` for now while
-   consumers settle; it may shorten to `nic_api` later.
+   `uni_kernel` (the bare `kernel` name is too overloaded).
 4. **Cargo package name** (publishable leaves only, if/when published):
    chosen at publish time for crates.io availability. Internal name is
    unchanged. See [§Publishing](#publishing).
@@ -111,15 +109,15 @@ external `@crates//:...` deps are omitted for readability.
 
 | Crate | Deps |
 | --- | --- |
-| `uni_net_driver` | `iobuf` |
-| `executor` | `net_types`, `iobuf`, `uni_net_driver`, `platform`, `worker` |
+| `nic_api` | `iobuf` |
+| `executor` | `net_types`, `iobuf`, `nic_api`, `platform`, `worker` |
 
 ### Tier 3 — kernel core + kernel-dependent leaves
 
 | Crate | Deps |
 | --- | --- |
 | `kernel_core` | `net_types`, `iobuf`, `executor`, `worker`, `atomic_fn`, `tagged_treiber` |
-| `nic` | `uni_net_driver` |
+| `nic` | `nic_api` |
 | `ethernet_send` | `ethernet`, `net_types`, `nic` |
 | `ipv4` | `net_checksum`, `net_from_bytes`, `net_types`, `kernel_core` |
 | `ndp` | `net_types`, `kernel_core` |
@@ -138,7 +136,7 @@ external `@crates//:...` deps are omitted for readability.
 
 | Crate | Deps |
 | --- | --- |
-| `tcp` | `net_checksum`, `ethernet`, `net_from_bytes`, `ipv4`, `ipv6`, `ipv6_send`, `mac_resolve`, `net_types`, `nic`, `uni_net_driver`, `kernel_core`, `iobuf`, `executor`, `worker` |
+| `tcp` | `net_checksum`, `ethernet`, `net_from_bytes`, `ipv4`, `ipv6`, `ipv6_send`, `mac_resolve`, `net_types`, `nic`, `nic_api`, `kernel_core`, `iobuf`, `executor`, `worker` |
 | `udp` | same as `tcp` minus `kernel_core` and `worker` |
 | `dhcp` | `arp`, `ethernet`, `net_from_bytes`, `ipv4`, `net_types`, `uni_kernel`, `executor` |
 | `bus` | `uni_kernel` |
@@ -148,21 +146,21 @@ external `@crates//:...` deps are omitted for readability.
 | Crate | Deps |
 | --- | --- |
 | `uni_net_stack` | `arp`, `net_classify`, `dhcp`, `ethernet`, `ethernet_send`, `icmpv6`, `ipv4`, `ipv6`, `ipv6_send`, `ndp`, `tcp`, `net_types`, `udp`, `nic`, `uni_kernel`, `iobuf`, `executor` |
-| `gve` | `bus`, `uni_kernel`, `iobuf`, `uni_net_driver` |
-| `virtio_net` | `bus`, `uni_kernel`, `net_checksum`, `iobuf`, `uni_net_driver` |
+| `gve` | `bus`, `uni_kernel`, `iobuf`, `nic_api` |
+| `virtio_net` | `bus`, `uni_kernel`, `net_checksum`, `iobuf`, `nic_api` |
 
 ### Tier 7 — facade plumbing
 
 | Crate | Deps |
 | --- | --- |
-| `uni_net` (`api/net`) | `uni_net_driver`; on `os:none` also `uni_net_stack` |
+| `uni_net` (`api/net`) | `nic_api`; on `os:none` also `uni_net_stack` |
 | `uni_macros` | proc-macro; no runtime deps |
 
 ### Tier 8 — backend
 
 | Crate | Deps |
 | --- | --- |
-| `backend` | `iobuf`, `worker`, `platform`, `executor`, `uni_net_driver`; on `os:none` also `nic`, `uni_kernel`, `uni_net_stack`, `tcp`, `gve` |
+| `backend` | `iobuf`, `worker`, `platform`, `executor`, `nic_api`; on `os:none` also `nic`, `uni_kernel`, `uni_net_stack`, `tcp`, `gve` |
 
 ### Tier 9 — facade
 
@@ -176,7 +174,7 @@ external `@crates//:...` deps are omitted for readability.
 | --- | --- | --- |
 | `http` | 10 | `uni`, `iobuf`, `worker` |
 | `tls` | 11 | `uni`, `uni_aes_gcm`, `http`, `iobuf`, `worker`; on `os:none` also `uni_kernel` |
-| `quic` | 12 | `uni`, `iobuf`, `uni_net_driver`, `executor`, `tls` |
+| `quic` | 12 | `uni`, `iobuf`, `nic_api`, `executor`, `tls` |
 | `http3` | 13 | `uni`, `http`, `quic` |
 
 ### Tier 14 — boot entries + apps
@@ -219,7 +217,7 @@ consumers write `uni_kernel::percpu::...` and don't see the split.
 
 ```
                      ┌──────────────────────┐
-                     │    uni_net_driver    │  EthernetDriver trait
+                     │    nic_api    │  EthernetDriver trait
                      │   (drivers/nic-api)  │  + ACTIVE_OPS slot
                      └──────────┬───────────┘
                 ┌───────────────┼────────────────┐
@@ -236,7 +234,7 @@ consumers write `uni_kernel::percpu::...` and don't see the split.
 The split exists so the TX-side network crates (`tcp`, `udp`, `arp`,
 `ethernet_send`, `uni_net_stack`) can call `nic::send(...)` without
 depending on the `os:none` driver implementations. They link against
-`nic` (dispatch shim) and `uni_net_driver` (trait), both
+`nic` (dispatch shim) and `nic_api` (trait), both
 host-buildable.
 
 ## What goes above vs below the facade

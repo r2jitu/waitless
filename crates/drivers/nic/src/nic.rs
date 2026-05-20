@@ -1,8 +1,8 @@
 // drivers/nic.rs — the `nic` crate: NIC dispatch through
-// `uni_net_driver::active_ops()`.
+// `nic_api::active_ops()`.
 //
 // Standalone host-buildable crate whose only dependency is the
-// host-buildable `uni_net_driver` interface crate. Sibling of the
+// host-buildable `nic_api` interface crate. Sibling of the
 // os:none `//drivers` (`bus`) hardware-access crate, kept
 // separate so the TX-side net crates that call these dispatchers
 // (`net_eth_tx`, `tcp`, …) stay host-buildable — they depend on
@@ -17,11 +17,11 @@
 
 #![no_std]
 
-use uni_net_driver::{
+use nic_api::{
     Chain, OwnedIOBuf, active_ops, is_installed, linked_ethernet_drivers, set_active_ops,
 };
 
-pub use uni_net_driver::CsumOffload;
+pub use nic_api::CsumOffload;
 
 // ---- Init / lifecycle -----------------------------------------------------
 
@@ -71,7 +71,7 @@ pub fn poll_qp(qp: usize, callback: fn(Chain<OwnedIOBuf>)) -> usize {
 /// and submits it; `csum` is the L4 checksum-offload descriptor
 /// (see [`submit_tx`]). Pass [`CsumOffload::NONE`] for a frame that
 /// already carries a full checksum or needs none (ARP, ...).
-pub fn send(data: &[u8], csum: uni_net_driver::CsumOffload) {
+pub fn send(data: &[u8], csum: nic_api::CsumOffload) {
     (active_ops().send)(data, csum)
 }
 
@@ -88,7 +88,7 @@ pub fn send(data: &[u8], csum: uni_net_driver::CsumOffload) {
 ///   * Dropping the handle without submission returns the slot
 ///     to the pool (the caller's error path doesn't need to do
 ///     bookkeeping).
-pub fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
+pub fn acquire_tx_buf() -> Option<nic_api::TxBufHandle> {
     let f = active_ops().acquire_tx_buf?;
     f()
 }
@@ -96,13 +96,9 @@ pub fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
 /// Submit a previously-acquired TX buffer with `frame_len` bytes of
 /// frame data at the head of `handle.data_mut()`. Consumes the
 /// handle. `csum` is the optional L4-checksum-offload hint — pass
-/// [`uni_net_driver::CsumOffload::NONE`] when the caller already
+/// [`nic_api::CsumOffload::NONE`] when the caller already
 /// computed and stamped the L4 checksum.
-pub fn submit_tx(
-    handle: uni_net_driver::TxBufHandle,
-    frame_len: usize,
-    csum: uni_net_driver::CsumOffload,
-) {
+pub fn submit_tx(handle: nic_api::TxBufHandle, frame_len: usize, csum: nic_api::CsumOffload) {
     if let Some(f) = active_ops().submit_tx {
         f(handle, frame_len, csum);
     } else {
@@ -132,7 +128,7 @@ pub fn tso_available() -> bool {
 /// Returns a [`TxTsoBufHandle`] — type-distinct from
 /// [`TxBufHandle`] so it can only be submitted via
 /// [`submit_tx_tso`], not via [`submit_tx`].
-pub fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
+pub fn acquire_tx_tso_buf() -> Option<nic_api::TxTsoBufHandle> {
     let f = active_ops().acquire_tx_tso_buf?;
     f()
 }
@@ -148,7 +144,7 @@ pub fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
 /// this; if the surface is unavailable, the slot is returned
 /// to the pool and no traffic emitted.
 pub fn submit_tx_tso(
-    handle: uni_net_driver::TxTsoBufHandle,
+    handle: nic_api::TxTsoBufHandle,
     frame_len: usize,
     hdr_len: u16,
     csum_start: u16,
@@ -169,7 +165,7 @@ pub fn udp_gso_available() -> bool {
 /// Acquire a 16-KiB big-slot for a UDP-GSO super-packet. None
 /// when the surface isn't supported or the big pool is full;
 /// caller falls back to per-datagram `acquire_tx_buf` sends.
-pub fn acquire_tx_udp_gso_buf() -> Option<uni_net_driver::TxUdpGsoBufHandle> {
+pub fn acquire_tx_udp_gso_buf() -> Option<nic_api::TxUdpGsoBufHandle> {
     let f = active_ops().acquire_tx_udp_gso_buf?;
     f()
 }
@@ -177,10 +173,10 @@ pub fn acquire_tx_udp_gso_buf() -> Option<uni_net_driver::TxUdpGsoBufHandle> {
 /// Submit a UDP-GSO super-packet. The slot bytes are laid out as
 /// `[Eth | IP | UDP | seg₀ | seg₁ | … | seg_N]` and the device
 /// emits N UDP datagrams with the UDP header replicated per
-/// segment. See [`uni_net_driver::NicOps::submit_tx_udp_gso`] for
+/// segment. See [`nic_api::NicOps::submit_tx_udp_gso`] for
 /// field semantics.
 pub fn submit_tx_udp_gso(
-    handle: uni_net_driver::TxUdpGsoBufHandle,
+    handle: nic_api::TxUdpGsoBufHandle,
     frame_len: usize,
     hdr_len: u16,
     csum_start: u16,
@@ -255,7 +251,7 @@ pub fn rx_used_cursors() -> [(u16, u16); 8] {
 /// active or the active driver hasn't wired up the `tx_diag`
 /// accessor (it's `Option`-shaped on `NicDiagOps` so legacy
 /// drivers compile without filling the struct).
-pub fn tx_diag() -> Option<uni_net_driver::TxDiag> {
+pub fn tx_diag() -> Option<nic_api::TxDiag> {
     active_ops().diag.and_then(|d| d.tx_diag).map(|f| f())
 }
 
@@ -263,7 +259,7 @@ pub fn tx_diag() -> Option<uni_net_driver::TxDiag> {
 /// caller's buffer. Returns 0 when no driver is active or when the
 /// driver doesn't keep a per-descriptor log (currently only gve
 /// does, for TSO debug on GCE).
-pub fn tx_desc_log_snapshot(out: &mut [uni_net_driver::TxDescLogEntry]) -> usize {
+pub fn tx_desc_log_snapshot(out: &mut [nic_api::TxDescLogEntry]) -> usize {
     active_ops()
         .diag
         .and_then(|d| d.tx_desc_log_snapshot)
@@ -271,7 +267,7 @@ pub fn tx_desc_log_snapshot(out: &mut [uni_net_driver::TxDescLogEntry]) -> usize
         .unwrap_or(0)
 }
 
-pub use uni_net_driver::{DIAG_QP_CAP, TxDescLogEntry, TxDiag};
+pub use nic_api::{DIAG_QP_CAP, TxDescLogEntry, TxDiag};
 
 /// Cold-path: used by `uni::Net::enable` to tell "no driver linked"
 /// from "drivers linked but none bound hardware".

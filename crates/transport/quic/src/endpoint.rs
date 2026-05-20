@@ -59,7 +59,7 @@ use tls::TlsServerConfig;
 
 /// Ship one popped [`DatagramBuf`] to the wire. Dispatches on the
 /// variant:
-///   * `TxSlot` — extracts the [`uni_net_driver::TxBufHandle`] and
+///   * `TxSlot` — extracts the [`nic_api::TxBufHandle`] and
 ///     calls [`UdpSocket::send_via_tx_handle`]. The bare-metal UDP
 ///     backend fills the L2/L3/L4 headers in the slot's headroom
 ///     in place and submits the contiguous frame to the driver,
