@@ -18,8 +18,8 @@ Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework 
 │   Userspace protos (above facade)    │  crates/proto/{tls, http,
 │                                      │                    quic, http3}
 ├──────────────────────────────────────┤
-│    Facade (uni — kernel↔userspace)   │  crates/{uni, uni-macros,
-│                                      │           uni-net, uni-backend}
+│    Facade (uni — kernel↔userspace)   │  crates/uni/ + nested
+│                                      │  macros, net, backend
 ├──────────────────────────────────────┤
 │       Network Stack (below facade)   │  crates/net/ (TCP, UDP, IPv4/6,
 │                                      │              ARP, NDP, DHCP, ...)

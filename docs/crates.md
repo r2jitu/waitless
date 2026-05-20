@@ -32,7 +32,9 @@ crates/
                   ethernet_send, arp, ipv4, ipv6, icmpv6, ndp, mac_resolve,
                   ipv6_send, classify, udp, dhcp
   proto/       tls/  quic/  http/  http3/
-  uni/  uni-macros/  uni-net/  uni-backend/   (flat — `uni` is a facade with 3 satellites, not a domain)
+  uni/         macros/  net/  backend/        (uni is the facade and
+                                                the parent of its
+                                                three satellites)
 ```
 
 (`tests/integration/` at repo root holds the boot-and-verify
@@ -43,12 +45,12 @@ to live alongside the real apps under `apps/`.)
 
 1. **Directory tree.** Crates live at `crates/<domain>/<name>/` for
    most crates. Domains: `util crypto runtime kernel boot drivers net
-   proto`. The `uni` facade plus its three satellites
-   (`uni-macros`, `uni-net`, `uni-backend`) live flat at the top of
-   `crates/` rather than under a `uni/` domain folder — they're not a
-   domain of peer crates, they're one facade crate plus three crates
-   that exist solely to support it (proc-macro pairing, cfg-gated net
-   re-export, cfg-gated platform impl). Kebab-case throughout.
+   proto`. The `uni` facade is special — it's BOTH a crate (at
+   `crates/uni/`) AND the parent of its three satellites
+   (`crates/uni/{macros, net, backend}/`). The satellites exist
+   solely to support uni (proc-macro pairing, cfg-gated net
+   re-export, cfg-gated platform impl), so nesting them under uni
+   honestly reflects that relationship. Kebab-case throughout.
 2. **Bazel target.** Default target = directory name. `//crates/net/tcp`
    is shorthand for `//crates/net/tcp:tcp`. No hyphenated explicit
    target names — the target's `name = "..."` always matches its

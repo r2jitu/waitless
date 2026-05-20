@@ -11,7 +11,7 @@ package(default_visibility = ["//visibility:public"])
 # `uni/lib.rs` unconditionally `pub use`s from here; the symbol
 # surface is identical on both sides.
 rust_library(
-    name = "uni-backend",
+    name = "backend",
     srcs = [
         "src/lib.rs",
         "src/native/mod.rs",
