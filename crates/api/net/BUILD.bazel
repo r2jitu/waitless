@@ -1,0 +1,17 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# `Net::enable`, error types, and the bare-metal net umbrella facade.
+# Re-exports `nic_api`'s `NicOps` / `NetError` etc. so apps see them
+# under `uni::net`. On `os:none` also pulls the full L2-L4 stack.
+rust_library(
+    name = "net",
+    srcs = ["src/lib.rs"],
+    crate_name = "uni_net",
+    crate_root = "src/lib.rs",
+    deps = ["//crates/drivers/nic-api"] + select({
+        "//bazel/platforms:native": [],
+        "//conditions:default": ["//crates/net/stack"],
+    }),
+)

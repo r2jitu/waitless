@@ -1,0 +1,27 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# HTTP/1.1 server. Also hosts the `Tls` / `TlsConn` traits that
+# `//crates/transport/tls` implements — keeps the HTTP path TLS-unaware so apps
+# without `uni_tls` link zero TLS / crypto code.
+rust_library(
+    name = "http",
+    srcs = ["src/lib.rs"],
+    crate_name = "uni_http",
+    deps = [
+        "//crates/api/uni",
+        "//crates/util/iobuf",
+        "//crates/runtime/worker",
+    ],
+)
+
+# Inline #[cfg(test)] unit tests — request parser (chunked-TE
+# rejection, Host-header port parsing). Run via:
+#   bazel test //crates/transport/http:uni_http_test
+rust_test(
+    name = "uni_http_test",
+    size = "small",
+    crate = ":http",
+)

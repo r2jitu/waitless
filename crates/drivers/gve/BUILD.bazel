@@ -1,0 +1,24 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Google Virtual Ethernet driver (GCE). Uses `//drivers` only for
+# MMIO + PCI; gve has its own BAR-register ABI, not VirtIO.
+rust_library(
+    name = "gve",
+    srcs = [
+        "src/adminq.rs",
+        "src/diag.rs",
+        "src/dqo.rs",
+        "src/gqi.rs",
+        "src/lib.rs",
+    ],
+    crate_name = "gve",
+    target_compatible_with = ["@platforms//os:none"],
+    deps = [
+        "//crates/drivers/bus",
+        "//crates/kernel/sys",
+        "//crates/util/iobuf",
+        "//crates/drivers/nic-api",
+    ],
+)

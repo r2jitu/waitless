@@ -1,0 +1,51 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_doc_test", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Shared async runtime — task arena + Waker + Sleep. Calls
+# `uni_platform::now_ticks()` directly for time reads; no register/
+# plug-in indirection. Future reactor hooks (P4 UDP, P5 TCP) that
+# carry waker state will land here with their own mechanism.
+rust_library(
+    name = "executor",
+    srcs = [
+        "src/event.rs",
+        "src/launcher.rs",
+        "src/lib.rs",
+        "src/net/mod.rs",
+        "src/net/tcp.rs",
+        "src/net/udp.rs",
+        "src/select.rs",
+        "src/sleep.rs",
+        "src/task.rs",
+    ],
+    crate_name = "uni_runtime",
+    deps = [
+        "//crates/net:types",
+        "//crates/util/iobuf",
+        "//crates/drivers/nic-api",
+        "//crates/runtime/platform",
+        "//crates/runtime/worker",
+    ],
+)
+
+# Inline #[cfg(test)] unit tests — item-F `RecvChunkGuard`
+# round-trips. The crate flips to `std` under `--test` via the
+# `#![cfg_attr(not(test), no_std)]` in `src/lib.rs`. Run via:
+#   bazel test //crates/runtime/executor:uni_runtime_test
+rust_test(
+    name = "uni_runtime_test",
+    size = "small",
+    crate = ":executor",
+)
+
+# Doc-test target — runs the `///` examples, including the
+# `compile_fail` block on `TcpStream::recv_chunk` that asserts two
+# `RecvChunkGuard`s cannot be held at once. Run via:
+#   bazel test //crates/runtime/executor:uni_runtime_doc_test
+rust_doc_test(
+    name = "uni_runtime_doc_test",
+    size = "small",
+    crate = ":executor",
+)

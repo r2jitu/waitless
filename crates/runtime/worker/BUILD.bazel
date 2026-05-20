@@ -1,0 +1,43 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Cross-platform per-worker primitives.
+#
+# `CurrentWorker` is a ZST token whose existence proves the holder
+# is running on a specific worker (core on bare-metal, thread on
+# native). `PerWorker<T, N>` is the matching typed per-worker
+# array; `T` provides its own interior mutability (`Atomic*`,
+# `UnsafeCell` behind SPSC / owning-worker discipline). Both are
+# used by `//kernel` for its per-core state, by `//crates/runtime/executor`
+# for task arenas, and by `//crates/runtime/backend` for per-worker timer
+# storage.
+#
+# `CurrentWorker::enter` calls `uni_platform::current_worker()`
+# directly; `uni-platform` is the leaf crate that owns the cfg-
+# gated read.
+rust_library(
+    name = "worker",
+    srcs = [
+        "src/lib.rs",
+        "src/once.rs",
+        "src/timer.rs",
+    ],
+    crate_name = "uni_worker",
+    deps = ["//crates/runtime/platform"],
+)
+
+rust_test(
+    name = "once_test",
+    size = "small",
+    srcs = ["src/once.rs"],
+    crate_root = "src/once.rs",
+)
+
+rust_test(
+    name = "timer_test",
+    size = "small",
+    srcs = ["src/timer.rs"],
+    crate_root = "src/timer.rs",
+)

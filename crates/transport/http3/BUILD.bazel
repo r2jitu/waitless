@@ -1,0 +1,35 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# HTTP/3 server over //crates/transport/quic.
+#
+# Layered: H3 frames + QPACK (static-only) + H3Server. Re-uses the
+# `uni_http::Request` / `uni_http::Response` shape so a single
+# handler closure serves HTTP/1.1 over TCP+TLS and HTTP/3 over QUIC
+# without any changes.
+rust_library(
+    name = "http3",
+    srcs = [
+        "src/diag.rs",
+        "src/frame.rs",
+        "src/huffman.rs",
+        "src/lib.rs",
+        "src/qpack.rs",
+        "src/server.rs",
+        "src/static_table.rs",
+    ],
+    crate_name = "uni_http3",
+    deps = [
+        "//crates/api/uni",
+        "//crates/transport/http",
+        "//crates/transport/quic",
+    ],
+)
+
+rust_test(
+    name = "uni_http3_test",
+    size = "small",
+    crate = ":http3",
+)

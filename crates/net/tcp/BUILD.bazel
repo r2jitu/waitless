@@ -1,0 +1,41 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# TCP state machine, per-core connection pool, ring buffers, async
+# accept / recv. Lives in its own package (vs the //crates/net shared
+# package the wire-format leaves use) because the single file is large
+# enough to justify submodule splitting, and the per-crate dep list is
+# the longest of any net protocol — easier to read on its own.
+rust_library(
+    name = "tcp",
+    srcs = ["src/lib.rs"],
+    crate_name = "net_tcp",
+    crate_root = "src/lib.rs",
+    deps = [
+        "//crates/drivers/nic",
+        "//crates/drivers/nic-api",
+        "//crates/kernel/core",
+        "//crates/net:checksum",
+        "//crates/net:ethernet",
+        "//crates/net:from_bytes",
+        "//crates/net:ipv4",
+        "//crates/net:ipv6",
+        "//crates/net:ipv6_send",
+        "//crates/net:mac_resolve",
+        "//crates/net:types",
+        "//crates/runtime/executor",
+        "//crates/runtime/worker",
+        "//crates/util/iobuf",
+        "@crates//:bitflags",
+    ],
+)
+
+# Host-native TCP conformance harness — drives scripted segments into
+# `tcp_receive` against a mock `NicOps` that captures TX frames.
+rust_test(
+    name = "tcp_test",
+    size = "small",
+    crate = ":tcp",
+)

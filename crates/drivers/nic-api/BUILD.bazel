@@ -1,0 +1,27 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# `EthernetDriver` trait + link-time registry. Pure leaf — drivers
+# depend on this without forming a `drivers → uni_net → net → drivers`
+# cycle. Extracted from the former `//uni-net:driver` so the trait crate
+# lives in the driver domain rather than buried inside the facade.
+rust_library(
+    name = "nic-api",
+    srcs = [
+        "src/error.rs",
+        "src/lib.rs",
+    ],
+    crate_name = "uni_net_driver",
+    crate_root = "src/lib.rs",
+    deps = ["//crates/util/iobuf"],
+)
+
+# Host-native unit tests for the shared error hierarchy.
+rust_test(
+    name = "error_test",
+    size = "small",
+    srcs = ["src/error.rs"],
+    crate_root = "src/error.rs",
+)

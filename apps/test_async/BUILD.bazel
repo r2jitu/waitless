@@ -9,7 +9,7 @@ rust_library(
     name = "app",
     srcs = ["src/main.rs"],
     crate_root = "src/main.rs",
-    deps = ["//uni"],
+    deps = ["//crates/api/uni"],
 )
 
 # Single-core is enough — the executor is per-core and the test only
@@ -21,7 +21,7 @@ unikernel_binary(
     name = "test_async",
     app = ":app",
     cpus = 1,
-    drivers = ["//uni-driver-virtio-net"],
+    drivers = ["//crates/drivers/virtio-net"],
 )
 
 # Async-runtime smoke test. Runs on HVF and both QEMU TCG arches;

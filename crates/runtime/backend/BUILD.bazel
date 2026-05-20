@@ -1,0 +1,50 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Platform adapter for `uni`. One crate, two cfg-gated impls:
+#
+#   * `unikernel` (bare-metal) — glue onto //kernel + //drivers + //net
+#   * `native`    (POSIX)      — libc sockets, pthread workers,
+#                                kqueue/epoll event loop
+#
+# `uni/lib.rs` unconditionally `pub use`s from here; the symbol
+# surface is identical on both sides.
+rust_library(
+    name = "backend",
+    srcs = [
+        "src/lib.rs",
+        "src/native/mod.rs",
+        "src/native/tcp.rs",
+        "src/native/udp.rs",
+        "src/unikernel.rs",
+    ],
+    crate_name = "uni_backend",
+    deps = [
+        "//crates/util/iobuf",
+        "//crates/runtime/worker",
+        "//crates/runtime/platform",
+        "//crates/runtime/executor",
+        # `uni_net_driver::TxDiag` is re-exported from both backends
+        # so `uni::diagnostics::NetTxDiag` is the same type on both
+        # native (stub) and bare-metal (driver-filled). The driver
+        # leaf crate is dependency-light (just `//crates/util/iobuf`), so it
+        # adds no real native footprint.
+        "//crates/drivers/nic-api",
+    ] + select({
+        "//bazel/platforms:native": ["//crates/util/atomic-fn"],
+        "//conditions:default": [
+            "//crates/drivers/nic",
+            "//crates/kernel/sys",
+            "//crates/net/stack",
+            # `net_tcp` crate, for `tcp_diag()`'s TCP-stack counters.
+            # `gve` driver crate, for `gve_diag()`'s NIC counters.
+            # Both are bare-metal-only; `uni-backend` is the right
+            # home for these deps (it is the platform-split crate),
+            # and reading the atomics here keeps application crates
+            # off direct, native-build-breaking `os:none` deps.
+            "//crates/net/tcp",
+            "//crates/drivers/gve",
+        ],
+    }),
+)

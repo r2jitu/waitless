@@ -93,8 +93,8 @@ def _label_crate_name(label):
     component) and replace non-identifier characters with `_`.
 
     Label forms accepted:
-      `//uni-driver-virtio-net`                     → `uni_driver_virtio_net`
-      `//uni-driver-virtio-net:uni-driver-virtio-net` → `uni_driver_virtio_net`
+      `//crates/drivers/virtio-net`                     → `uni_driver_virtio_net`
+      `//crates/drivers/virtio-net` → `uni_driver_virtio_net`
       `:foo-bar`                                    → `foo_bar`
     """
     if ":" in label:
@@ -192,7 +192,7 @@ def unikernel_binary(
         name: Base name for all output targets.
         app: A rust_library target with a #[uni::init] entry point.
         drivers: list of NIC driver crate labels (e.g.
-          `//uni-driver-virtio-net`). Each is `extern crate`d at the
+          `//crates/drivers/virtio-net`). Each is `extern crate`d at the
           unikernel binary's crate root so its
           `register_ethernet_driver!` entry survives rlib DCE. Not
           used by the `_native` binary — native networking flows
@@ -236,7 +236,7 @@ def unikernel_binary(
     # Common deps for both .elf paths. multiboot (x86_64 multiboot/PVH stub)
     # is added per-target below since it's incompatible with higher-half
     # linking and only needed for the QEMU direct-boot ELF.
-    _common_deps = [app, "//boot:entry", "//boot:limine", "//boot:mem_stubs"] + drivers
+    _common_deps = [app, "//crates/boot:entry", "//crates/boot:limine", "//crates/boot:mem_stubs"] + drivers
     _unikernel_flags = _LINK_FLAGS + _LINK_FLAGS_ARCH
 
     # Per-binary crate root. Every boot/driver crate is an rlib; rustc
@@ -300,7 +300,7 @@ def unikernel_binary(
         srcs = [":" + elf_main_rule],
         crate_root = elf_main_rs,
         deps = _common_deps + select({
-            "//bazel/platforms:x86_64": ["//boot:multiboot"],
+            "//bazel/platforms:x86_64": ["//crates/boot:multiboot"],
             "//conditions:default": [],
         }),
         linker_script = select({
@@ -349,7 +349,7 @@ def unikernel_binary(
     # ── Limine higher-half ELF (x86_64 Limine boot) ─────────────────────
     #
     # Uses a standalone linker script (unikernel_limine.ld) that places
-    # the kernel at 0xFFFFFFFF80100000. Excludes //boot:multiboot because
+    # the kernel at 0xFFFFFFFF80100000. Excludes //crates/boot:multiboot because
     # boot.S has 32-bit absolute relocations that can't reach higher-half;
     # Limine enters at limine_entry() directly so the multiboot stub
     # isn't needed. The runner_iso config also adds `-Ccode-model=kernel`
@@ -382,11 +382,11 @@ def unikernel_binary(
         srcs = select({
             "//bazel/platforms:aarch64": [
                 ":" + name + ".elf",
-                "//boot:limine.conf",
+                "//crates/boot:limine.conf",
             ],
             "//conditions:default": [
                 ":" + name + ".limine.elf",
-                "//boot:limine.conf",
+                "//crates/boot:limine.conf",
             ],
         }),
         outs = [name + ".iso"],
@@ -394,12 +394,12 @@ def unikernel_binary(
             "//bazel/platforms:aarch64": """
                 $(location //scripts:make_limine_iso) \
                     $(location :{name_elf}) $@ \
-                    --arch aarch64 --conf $(location //boot:limine.conf)
+                    --arch aarch64 --conf $(location //crates/boot:limine.conf)
             """.format(name_elf = name + ".elf"),
             "//conditions:default": """
                 $(location //scripts:make_limine_iso) \
                     $(location :{name_limine_elf}) $@ \
-                    --arch x86_64 --conf $(location //boot:limine.conf)
+                    --arch x86_64 --conf $(location //crates/boot:limine.conf)
             """.format(name_limine_elf = name + ".limine.elf"),
         }),
         tools = ["//scripts:make_limine_iso"],
@@ -430,7 +430,7 @@ def unikernel_binary(
         rust_binary(
             name = name + "_bin",
             srcs = ["//bazel/rules:native_main.rs"],
-            deps = [app, "//uni"],
+            deps = [app, "//crates/api/uni"],
             rustc_flags = select({
                 "@platforms//os:macos": ["-C", "link-arg=-lSystem"],
                 # Linux musl: static binary, no external sysroot needed.

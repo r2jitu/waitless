@@ -1,0 +1,40 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Network-stack byte-buffer primitive. Shared between every layer
+# that touches packet payloads: app (uni-http body parts), QUIC
+# (SendStream chunks, outbound packet buffers), TLS (record
+# header/tag prepend), TCP/IP/Eth (per-layer header prepend), NIC
+# (zero-copy RX descriptor wrapping).
+#
+# Lives in its own crate so transport (uni-quic) and application
+# (uni-http) can both depend on it — neither is allowed to depend
+# on the other (transport ↛ app), so the shared primitive sits
+# below them.
+#
+# `no_std` and core-only — its one dependency, the shared Treiber
+# stack core, is itself a zero-dep `core` crate — so it can also be
+# pulled into the kernel proper (driver layers) without dragging the
+# runtime in.
+rust_library(
+    name = "iobuf",
+    srcs = [
+        "src/chain.rs",
+        "src/lib.rs",
+        "src/pool.rs",
+        "src/storage.rs",
+    ],
+    crate_name = "uni_iobuf",
+    # `IOBufPool`'s free list delegates to the shared Treiber stack
+    # core. `iobuf_test` (crate = ":iobuf") inherits this dep.
+    deps = ["//crates/util/tagged-treiber"],
+)
+
+# Inline #[cfg(test)] unit tests. Run via:
+#   bazel test //crates/util/iobuf:iobuf_test
+rust_test(
+    name = "iobuf_test",
+    crate = ":iobuf",
+)

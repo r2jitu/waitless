@@ -24,11 +24,11 @@ rust_library(
     ],
     crate_root = "src/main.rs",
     deps = [
-        "//uni",
-        "//uni-http",
-        "//uni-http3",
-        "//uni-quic",
-        "//uni-tls",
+        "//crates/api/uni",
+        "//crates/transport/http",
+        "//crates/transport/http3",
+        "//crates/transport/quic",
+        "//crates/transport/tls",
     ],
 )
 
@@ -39,8 +39,8 @@ unikernel_binary(
     # QEMU / HVF / the default GCE image; gve covers GCE instances
     # launched with --network-interface=nic-type=GVNIC.
     drivers = [
-        "//uni-driver-virtio-net",
-        "//uni-driver-gve",
+        "//crates/drivers/virtio-net",
+        "//crates/drivers/gve",
     ],
     port_forwards = [
         port_fwd(

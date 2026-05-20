@@ -1,0 +1,85 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["limine.conf"])
+
+# Boot/entry code: rust_library crates supplying the `#[no_mangle]`
+# symbols that assembly resolves at link time (kernel_main,
+# limine_entry, memcpy) plus the kernel's sole `#[panic_handler]`
+# (in `entry`).
+#
+# These were `rust_static_library` until the LTO work. A staticlib is
+# a self-contained `.a` — it bundles a full copy of every Rust
+# dependency (kernel/uni/net/…), so `kernel`'s statics, e.g.
+# `fdt::G_INFO`, were duplicated between the boot `.a` and the binary
+# (which also links those crates via `app`). A non-LTO link collapsed
+# the duplicate global symbols via `--allow-multiple-definition`; LTO
+# internalises them, so the copies diverge — `fdt::init` (called from
+# `kernel_main` in the boot `.a`) initialised one `G_INFO`, while
+# `fdt::info` (in the LTO'd binary) read the other, still-zeroed one,
+# and boot panicked. As plain rlibs each dependency crate appears
+# exactly once in the binary, so there is nothing to duplicate.
+_UNIKERNEL_ONLY = ["@platforms//os:none"]
+
+# `mem_stubs` (naive `memcpy`/`memset` byte loops — LLVM's loop-idiom
+# pass can rewrite them into self-recursive `memcpy` calls) and
+# `multiboot` (pure `global_asm!`, nothing to optimise) opt out of LTO.
+# `entry` and `limine` carry real logic and are LTO'd with the rest.
+_NO_LTO = ["-Clto=off"]
+
+rust_library(
+    name = "entry",
+    srcs = ["src/entry.rs"],
+    compile_data = select({
+        "//bazel/platforms:x86_64": [
+            "src/x86_64/idt_stubs.S",
+            "src/x86_64/ap_boot.S",
+        ],
+        "//bazel/platforms:aarch64": ["src/aarch64/boot.S"],
+        "//conditions:default": [
+            "src/x86_64/idt_stubs.S",
+            "src/x86_64/ap_boot.S",
+        ],
+    }),
+    crate_root = "src/entry.rs",
+    target_compatible_with = _UNIKERNEL_ONLY,
+    deps = [
+        "//crates/drivers/bus",
+        "//crates/drivers/nic",
+        "//crates/kernel/sys",
+        "//crates/net/stack",
+        "//crates/api/uni",
+    ],
+)
+
+# x86_64 multiboot/PVH stub. Excluded from the Limine higher-half
+# target: boot.S has 32-bit absolute relocations that can't be linked
+# into higher-half, and Limine enters at limine_entry() directly.
+rust_library(
+    name = "multiboot",
+    srcs = ["src/multiboot.rs"],
+    compile_data = ["src/x86_64/boot.S"],
+    crate_root = "src/multiboot.rs",
+    rustc_flags = _NO_LTO,
+    target_compatible_with = _UNIKERNEL_ONLY,
+)
+
+rust_library(
+    name = "limine",
+    srcs = ["src/limine_entry.rs"],
+    crate_root = "src/limine_entry.rs",
+    target_compatible_with = _UNIKERNEL_ONLY,
+    deps = [
+        "//crates/kernel/sys",
+        "@crates//:limine",
+    ],
+)
+
+rust_library(
+    name = "mem_stubs",
+    srcs = ["src/mem_stubs.rs"],
+    crate_root = "src/mem_stubs.rs",
+    rustc_flags = _NO_LTO,
+    target_compatible_with = _UNIKERNEL_ONLY,
+)

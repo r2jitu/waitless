@@ -1,0 +1,18 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# VirtIO ethernet driver — registers into the NIC active-ops slot.
+rust_library(
+    name = "virtio-net",
+    srcs = ["src/lib.rs"],
+    crate_name = "virtio_net",
+    target_compatible_with = ["@platforms//os:none"],
+    deps = [
+        "//crates/drivers/bus",
+        "//crates/kernel/sys",
+        "//crates/net:checksum",
+        "//crates/util/iobuf",
+        "//crates/drivers/nic-api",
+    ],
+)

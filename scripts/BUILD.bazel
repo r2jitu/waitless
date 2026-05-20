@@ -11,7 +11,7 @@ exports_files([
 sh_binary(
     name = "make_limine_iso",
     srcs = ["make-limine-iso.sh"],
-    data = ["//boot:limine.conf"],
+    data = ["//crates/boot:limine.conf"],
 )
 
 # Shared Python utilities for py_test integration tests: QEMU detection,

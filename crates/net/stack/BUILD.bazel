@@ -1,0 +1,38 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Full-stack umbrella: RX poll scheduling, the receive pipeline
+# (Ethernet → L3 → L4), and the IPv6 ND/SLAAC control plane. Wires
+# every per-protocol leaf in //crates/net into one bare-metal crate
+# the facade can `pub use *` from.
+rust_library(
+    name = "stack",
+    srcs = [
+        "src/ipv6_nd.rs",
+        "src/lib.rs",
+        "src/rx.rs",
+        "src/sched.rs",
+    ],
+    crate_name = "uni_net_stack",
+    crate_root = "src/lib.rs",
+    deps = [
+        "//crates/drivers/nic",
+        "//crates/kernel/sys",
+        "//crates/net:arp",
+        "//crates/net:classify",
+        "//crates/net:dhcp",
+        "//crates/net:ethernet",
+        "//crates/net:ethernet_send",
+        "//crates/net:icmpv6",
+        "//crates/net:ipv4",
+        "//crates/net:ipv6",
+        "//crates/net:ipv6_send",
+        "//crates/net:ndp",
+        "//crates/net:types",
+        "//crates/net:udp",
+        "//crates/net/tcp",
+        "//crates/runtime/executor",
+        "//crates/util/iobuf",
+    ],
+)
