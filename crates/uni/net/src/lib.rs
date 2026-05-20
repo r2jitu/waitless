@@ -14,9 +14,15 @@ pub use nic_api::{
 mod error;
 pub use error::{DhcpError, NetError};
 
-// Bare-metal pulls the full net umbrella; native uses POSIX sockets.
-#[cfg(target_os = "none")]
-pub use uni_net_stack::*;
+// uni_net_stack is the bare-metal net implementation. We depend
+// on it for our own use (`Net::enable` below calls into
+// `uni_net_stack::{bringup_dhcp, bringup_static}`) but DON'T
+// re-export `uni_net_stack::*`. A glob re-export used to leak the
+// umbrella's internal lifecycle entry points (`init_stack`,
+// `init_ipv6`, `net_receive`, `poll`) into `uni::net::*`, where no
+// app should reach them. Apps that want raw protocol-layer access
+// can add an enumerated re-export here when there's a concrete
+// consumer; no app currently uses one.
 
 // ---- Public net-stack API -------------------------------------------------
 
@@ -190,7 +196,7 @@ impl Net {
     pub fn local_ip(&self) -> Ipv4Addr {
         #[cfg(target_os = "none")]
         {
-            let o = crate::types::CONFIG.ip().octets();
+            let o = uni_net_stack::types::CONFIG.ip().octets();
             Ipv4Addr(o)
         }
         #[cfg(not(target_os = "none"))]
@@ -211,7 +217,7 @@ impl Net {
     pub fn gateway(&self) -> Ipv4Addr {
         #[cfg(target_os = "none")]
         {
-            let o = crate::types::CONFIG.gateway().octets();
+            let o = uni_net_stack::types::CONFIG.gateway().octets();
             Ipv4Addr(o)
         }
         #[cfg(not(target_os = "none"))]
