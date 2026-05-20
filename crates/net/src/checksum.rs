@@ -65,10 +65,10 @@ pub fn l4_pseudo_partial(src: IpAddr, dst: IpAddr, proto: u8, l4_len: usize) -> 
     let sum: u32 = match (src, dst) {
         (IpAddr::V4(s), IpAddr::V4(d)) => {
             let mut s32: u32 = 0;
-            s32 += (s.addr & 0xFFFF) as u32;
-            s32 += (s.addr >> 16) as u32;
-            s32 += (d.addr & 0xFFFF) as u32;
-            s32 += (d.addr >> 16) as u32;
+            s32 += s.addr & 0xFFFF;
+            s32 += s.addr >> 16;
+            s32 += d.addr & 0xFFFF;
+            s32 += d.addr >> 16;
             s32 += (proto as u32) << 8; // proto byte in LE high
             s32 += htons(l4_len as u16) as u32;
             s32
@@ -79,8 +79,8 @@ pub fn l4_pseudo_partial(src: IpAddr, dst: IpAddr, proto: u8, l4_len: usize) -> 
                 s32 += u16::from_le_bytes([chunk[0], chunk[1]]) as u32;
             }
             let len_be = (l4_len as u32).to_be();
-            s32 += (len_be & 0xffff) as u32;
-            s32 += (len_be >> 16) as u32;
+            s32 += len_be & 0xffff;
+            s32 += len_be >> 16;
             s32 += (proto as u32) << 8;
             s32
         }
@@ -113,8 +113,8 @@ pub fn l4_checksum_v6(
     // u32 upper-layer length, big-endian → split into LE u16 halves.
     let len32 = len as u32;
     let len_be = len32.to_be();
-    sum += (len_be & 0xffff) as u32;
-    sum += (len_be >> 16) as u32;
+    sum += len_be & 0xffff;
+    sum += len_be >> 16;
     // 3 zero bytes + 1 next_header byte. Same trick as v4: treat
     // as LE u16 (zero | proto<<8) then (zero | zero<<8).
     sum += (proto as u32) << 8;

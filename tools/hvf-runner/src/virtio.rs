@@ -257,7 +257,7 @@ impl VirtioNet {
                 val
             }
             // Device config: MAC[6] + status[2] + max_virtqueue_pairs[2]
-            off if off >= CONFIG_BASE && off < CONFIG_BASE + 12 => {
+            off if (CONFIG_BASE..CONFIG_BASE + 12).contains(&off) => {
                 let cfg_off = (off - CONFIG_BASE) as usize;
                 match cfg_off {
                     0..=3 => {

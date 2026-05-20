@@ -37,6 +37,12 @@ pub struct Ring<T: Copy + Zero> {
 // item can be transferred between cores.
 unsafe impl<T: Copy + Zero + Send> Sync for Ring<T> {}
 
+impl<T: Copy + Zero> Default for Ring<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Copy + Zero> Ring<T> {
     pub const fn new() -> Self {
         Ring {

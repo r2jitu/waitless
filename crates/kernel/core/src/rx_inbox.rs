@@ -283,6 +283,12 @@ pub struct RxNodePool<T, const N: usize> {
     free_count: AtomicUsize,
 }
 
+impl<T: Send, const N: usize> Default for RxNodePool<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Send, const N: usize> RxNodePool<T, N> {
     /// Build an *uninitialised* pool — every node present but the
     /// free-list empty. Call [`init`](Self::init) once before use.

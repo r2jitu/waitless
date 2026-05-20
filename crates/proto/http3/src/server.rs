@@ -281,11 +281,11 @@ pub(crate) struct FramingPool {
     bufs: core::cell::RefCell<Vec<alloc::boxed::Box<[u8]>>>,
 }
 
-/// Each framing buffer holds the H3 HEADERS frame header (≤16 B)
-/// + QPACK body (typical 30-200 B, capped at 256) + optional
-/// DATA frame header (≤16 B). 288 B (256 + 16 + 16) covers
-/// every shape comfortably; pick a power-of-two-ish size for
-/// allocator-friendliness.
+/// Each framing buffer holds the H3 HEADERS frame header
+/// (≤16 B) + QPACK body (typical 30-200 B, capped at 256) +
+/// optional DATA frame header (≤16 B). 288 B (256 + 16 + 16)
+/// covers every shape comfortably; pick a power-of-two-ish
+/// size for allocator-friendliness.
 const FRAMING_BUF_SIZE: usize = 288;
 
 /// Cap on per-conn pool retention. A burst of pipelined H3

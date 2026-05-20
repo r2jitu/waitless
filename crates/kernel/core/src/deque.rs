@@ -66,6 +66,12 @@ pub struct Deque {
 //     one of {owner-pop, thief-steal} is told it owns the value.
 unsafe impl Sync for Deque {}
 
+impl Default for Deque {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Deque {
     pub const fn new() -> Self {
         Deque {

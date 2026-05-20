@@ -316,7 +316,7 @@ impl Vm {
         // Value 0x0 = Aff0=0 (core 0). Default 0x80000000 = any PE.
         if cpu_count > 1 {
             let intid = 32 + VIRTIO_MMIO_SPI; // SPI 3 → INTID 35
-            let irouter_off = (0x6000 + intid * 8) as u32;
+            let irouter_off = 0x6000 + intid * 8;
             unsafe {
                 hv_gic_set_distributor_reg(irouter_off, 0x0);
             }
@@ -493,8 +493,8 @@ fn run_vcpu(
                     }
                     EC_DATA_ABORT_LOWER | EC_DATA_ABORT_SAME => {
                         let fault_ipa = exit.exception.physical_address;
-                        if fault_ipa >= YIELD_MMIO_BASE
-                            && fault_ipa < YIELD_MMIO_BASE + YIELD_MMIO_SIZE
+                        if (YIELD_MMIO_BASE..YIELD_MMIO_BASE + YIELD_MMIO_SIZE)
+                            .contains(&fault_ipa)
                         {
                             // Cooperative yield — block in the inline
                             // poll until host I/O arrives. The vCPU
@@ -733,7 +733,7 @@ fn handle_mmio(
     })?;
 
     // Route by IPA to the correct device.
-    if fault_ipa >= VIRTIO_CONSOLE_BASE && fault_ipa < VIRTIO_CONSOLE_BASE + VIRTIO_CONSOLE_SIZE {
+    if (VIRTIO_CONSOLE_BASE..VIRTIO_CONSOLE_BASE + VIRTIO_CONSOLE_SIZE).contains(&fault_ipa) {
         let offset = fault_ipa - VIRTIO_CONSOLE_BASE;
         let mut tx_kicked = false;
         {
@@ -760,7 +760,7 @@ fn handle_mmio(
         if tx_kicked {
             virtio_console::process_tx_queue();
         }
-    } else if fault_ipa >= GICD_BASE && fault_ipa < GICD_BASE + 0x1_0000 {
+    } else if (GICD_BASE..GICD_BASE + 0x1_0000).contains(&fault_ipa) {
         // GIC distributor MMIO.
         let offset = (fault_ipa - GICD_BASE) as u32;
         if access.is_write {
@@ -796,7 +796,7 @@ fn handle_mmio(
                 set_reg(vcpu, HvReg::gpr(access.rt as u32), val);
             }
         }
-    } else if fault_ipa >= VIRTIO_MMIO_BASE && fault_ipa < VIRTIO_MMIO_BASE + VIRTIO_MMIO_SIZE {
+    } else if (VIRTIO_MMIO_BASE..VIRTIO_MMIO_BASE + VIRTIO_MMIO_SIZE).contains(&fault_ipa) {
         let offset = fault_ipa - VIRTIO_MMIO_BASE;
 
         let mut notify_queue: Option<u32> = None;

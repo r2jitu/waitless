@@ -89,6 +89,7 @@ impl Connection {
     ///   2. update `largest_acked`,
     ///   3. take an RTT sample from the largest newly-acked
     ///      ack-eliciting packet (RFC 9002 §5.1).
+    ///
     /// `ack_delay` is the peer's reported delay before generating
     /// the ACK, in microseconds (already scaled by their
     /// ack_delay_exponent on the wire — we treat the value as μs

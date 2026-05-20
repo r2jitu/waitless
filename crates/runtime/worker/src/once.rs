@@ -15,6 +15,12 @@ pub struct InitOnce<T> {
 // also sound at the value level.
 unsafe impl<T: Sync + Send> Sync for InitOnce<T> {}
 
+impl<T> Default for InitOnce<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> InitOnce<T> {
     pub const fn new() -> Self {
         InitOnce {

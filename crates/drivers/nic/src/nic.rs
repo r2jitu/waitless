@@ -110,10 +110,10 @@ pub fn submit_tx(handle: nic_api::TxBufHandle, frame_len: usize, csum: nic_api::
     }
 }
 
-/// True iff the driver negotiated TSOv4 (`VIRTIO_NET_F_HOST_TSO4`
-/// + `VIRTIO_NET_F_CSUM`, or equivalent). When true,
-/// [`acquire_tx_tso_buf`] returns 16-KiB-capacity slots that
-/// the TCP layer fills with a single super-segment and ships
+/// True iff the driver negotiated TSOv4
+/// (`VIRTIO_NET_F_HOST_TSO4` + `VIRTIO_NET_F_CSUM`, or equivalent).
+/// When true, [`acquire_tx_tso_buf`] returns 16-KiB-capacity slots
+/// that the TCP layer fills with a single super-segment and ships
 /// via [`submit_tx_tso`].
 pub fn tso_available() -> bool {
     (active_ops().tso_available)()

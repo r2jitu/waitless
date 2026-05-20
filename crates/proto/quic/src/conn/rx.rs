@@ -608,9 +608,9 @@ impl Connection {
 
     /// Remove header protection AND open the AEAD on a complete
     /// packet buffer in place. Returns the reconstructed full PN.
-    /// `buf` enters with protected first byte + protected PN bytes
-    /// + ciphertext + tag; exits with unprotected first byte +
-    /// PN bytes + decrypted plaintext (tag verified discarded).
+    /// `buf` enters as: protected first byte, protected PN bytes,
+    /// ciphertext, tag. Exits as: unprotected first byte, PN
+    /// bytes, decrypted plaintext (tag verified, then discarded).
     pub(super) fn unprotect_and_decrypt(
         &self,
         buf: &mut [u8],

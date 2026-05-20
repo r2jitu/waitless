@@ -613,6 +613,7 @@ pub struct Connection {
     /// (response sent + FIN'd, both ends drained) used to:
     ///   1. resurrect a `recv_stream` from the pool,
     ///   2. push the sid back onto `opened_streams`,
+    ///
     /// then `reap_finished_streams` would kill the resurrected
     /// recv_stream on the very next flush (because the matching
     /// `send_stream` was still satisfying the reap conditions),

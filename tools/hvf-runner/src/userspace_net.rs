@@ -351,11 +351,11 @@ struct TcpListen {
     family: IpFamily,
 }
 
-/// One UDP-relay sibling, scoped to a single vCPU's IoState. The
-/// enclosing relay opens `cpu_count` SO_REUSEPORT-bound siblings at
-/// `start()` time; vCPU `N` owns sibling `N`, and `UDP_RELAYS` below
-/// keeps a flat `Vec<i32>` so the TX-side `handle_udp_v4` can still look
-/// up "this vCPU's sibling" when the guest sends a reply.
+// One UDP-relay sibling, scoped to a single vCPU's IoState. The
+// enclosing relay opens `cpu_count` SO_REUSEPORT-bound siblings at
+// `start()` time; vCPU `N` owns sibling `N`, and `UDP_RELAYS` below
+// keeps a flat `Vec<i32>` so the TX-side `handle_udp_v4` can still look
+// up "this vCPU's sibling" when the guest sends a reply.
 
 /// IP family tag shared by `TcpListen`, `ProxyConn`, and the UDP
 /// listener thread's per-fd table.
@@ -1674,11 +1674,11 @@ fn alloc_src_port_for_vcpu(target_vcpu: usize, cpu_count: usize, dst_port: u16) 
     alloc_src_port()
 }
 
-/// Drain a UDP relay sibling fd owned by this worker, injecting frames
-/// into the worker's own RX queue. Because each worker owns its own
-/// sibling fd (distributed by SO_REUSEPORT hashing at bind time), there's
-/// no cross-worker software RSS needed — the kernel already routed the
-/// datagram to us.
+// Drain a UDP relay sibling fd owned by this worker, injecting frames
+// into the worker's own RX queue. Because each worker owns its own
+// sibling fd (distributed by SO_REUSEPORT hashing at bind time), there's
+// no cross-worker software RSS needed — the kernel already routed the
+// datagram to us.
 // ============================================================================
 // UDP listener thread
 // ============================================================================
@@ -2224,10 +2224,10 @@ const VM_IPV6: [u8; 16] = [
     GUEST_MAC[5],
 ];
 
-/// Worker-side IPv6 UDP RX. Reads from the AF_INET6 sibling fd,
-/// records the `(guest_port, client_port) → sockaddr_in6` mapping
-/// in `udp_clients_v6`, and injects a UDP-over-IPv6 frame into
-/// the guest. Mirrors `handle_udp_rx` for v4.
+// Worker-side IPv6 UDP RX. Reads from the AF_INET6 sibling fd,
+// records the `(guest_port, client_port) → sockaddr_in6` mapping
+// in `udp_clients_v6`, and injects a UDP-over-IPv6 frame into
+// the guest. Mirrors `handle_udp_rx` for v4.
 // `handle_udp_rx_v6` removed — replaced by the listener thread's
 // `listener_drain_v6` upstream.
 
@@ -2874,8 +2874,8 @@ fn build_grat_arp_frame(mac: &[u8; 6]) -> TxFrame {
     f
 }
 
-/// Write a TCP frame into `buf`. Returns the total frame length.
-/// Header layout: [virtio_net_hdr 12B][Eth 14B][IP 20B][TCP 20B][payload]
+// Write a TCP frame into `buf`. Returns the total frame length.
+// Header layout: [virtio_net_hdr 12B][Eth 14B][IP 20B][TCP 20B][payload]
 // ---- Family-aware TCP reply builders ----------------------------------------
 //
 // These three functions previously existed as v4/v6 pairs (eight

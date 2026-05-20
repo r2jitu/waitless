@@ -71,6 +71,12 @@ pub struct Request {
     pub(crate) reject: bool,
 }
 
+impl Default for Request {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Request {
     pub fn new() -> Self {
         Request {
@@ -375,7 +381,7 @@ fn find_header_end_from(data: &[u8], start: usize) -> Option<usize> {
 fn parse_usize(data: &[u8]) -> usize {
     let mut n: usize = 0;
     for &b in data {
-        if b >= b'0' && b <= b'9' {
+        if (b'0'..=b'9').contains(&b) {
             n = n * 10 + (b - b'0') as usize;
         } else {
             break;

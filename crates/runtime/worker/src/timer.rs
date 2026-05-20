@@ -60,6 +60,12 @@ pub struct TimerWheel {
     total: usize,
 }
 
+impl Default for TimerWheel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TimerWheel {
     pub const fn new() -> Self {
         TimerWheel {

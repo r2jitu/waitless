@@ -412,7 +412,7 @@ pub fn open<'a>(
         return Err(RecordError::UnexpectedOpaqueType);
     }
     let record_len = u16::from_be_bytes([input[3], input[4]]) as usize;
-    if record_len > MAX_RECORD_LEN || record_len < TAG_LEN + 1 {
+    if !(TAG_LEN + 1..=MAX_RECORD_LEN).contains(&record_len) {
         return Err(RecordError::RecordTooLarge);
     }
     let total = HEADER_LEN + record_len;

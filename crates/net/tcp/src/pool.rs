@@ -213,6 +213,7 @@ pub static TCP_SYNACK_TX: AtomicU64 = AtomicU64::new(0);
 ///     `External` IOBuf with no copy;
 ///   * the **ring-drain** fallback — the per-conn `rx_ring` copied
 ///     into a fresh `Heap` IOBuf.
+///
 /// `stash / (stash + ring_drain)` is the live measure of how often
 /// the streaming-body `recv_chunk` path is actually zero-copy — the
 /// signal item H's HVF-vs-GCE divergence needs to settle (item H

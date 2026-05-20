@@ -31,9 +31,9 @@
 /// Marker trait for types that can be safely reinterpreted from a byte
 /// slice. Safety: implementers MUST be `#[repr(C, packed)]` (alignment
 /// 1) AND any bit pattern of `size_of::<Self>()` bytes must be a valid
-/// `Self`. Concretely: integer fields, byte arrays, and other plain
-/// `Copy` POD types are fine; `bool`, `enum`, references, and `NonZero*`
-/// are NOT.
+///    `Self`. Concretely: integer fields, byte arrays, and other plain
+///    `Copy` POD types are fine; `bool`, `enum`, references, and `NonZero*`
+///    are NOT.
 pub unsafe trait FromBytes: Sized {
     /// Try to interpret the prefix of `bytes` as `&Self`. Returns `None`
     /// if `bytes.len() < size_of::<Self>()`.

@@ -116,10 +116,10 @@ pub enum Stage {
     /// HKDF cascade for application traffic secrets
     /// (`KeySchedule::enter_application`).
     HkdfAp = 9,
-    /// Resumption-only: HKDF cascade for the PSK binder + HMAC verify
-    /// + transcript-hash setup. Replaces `cv_sign` time on the
-    /// resumed path; both stages stay separate so the report shows
-    /// where each handshake type spent its cycles.
+    /// Resumption-only: HKDF cascade for the PSK binder, HMAC
+    /// verify, and transcript-hash setup. Replaces `cv_sign` time
+    /// on the resumed path; both stages stay separate so the report
+    /// shows where each handshake type spent its cycles.
     PskBinder = 10,
 }
 

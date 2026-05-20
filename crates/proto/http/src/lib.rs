@@ -46,6 +46,7 @@ pub use stream::{BufferedBody, HttpStream, NullStream};
 ///   * TLS: encrypts the chain into a fresh record buffer.
 ///   * HTTP/3: HEADERS/DATA frame headers are wrapped in a
 ///     separate IOBuf the H3 framer pushes ahead of body parts.
+///
 /// So body IOBufs only need to hold their own bytes.
 ///
 /// One per-request heap allocation (typically a few-KiB

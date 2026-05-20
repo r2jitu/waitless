@@ -1428,6 +1428,7 @@ fn lookup_eph_position(worker: u32, slot_idx: u32) -> Option<&'static EphSlot> {
 ///     the scan stays cheap. Delivery routes to the receiving
 ///     worker's inbox — server `run` listeners spawn one task per
 ///     worker and the NIC's flow hash has already steered here.
+///
 /// Deliver a UDP datagram to its bound socket's inbox.
 ///
 /// The caller threads an owned `IOBuf` whose visible payload is the

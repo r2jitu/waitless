@@ -142,6 +142,12 @@ pub struct TxStaging {
 // SAFETY: producer/consumer discipline above; release/acquire on `ready`.
 unsafe impl Sync for TxStaging {}
 
+impl Default for TxStaging {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TxStaging {
     pub const fn new() -> Self {
         TxStaging {

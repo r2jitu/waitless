@@ -290,6 +290,12 @@ pub struct ConfigStore {
     dns: core::sync::atomic::AtomicU32,
 }
 
+impl Default for ConfigStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConfigStore {
     pub const fn new() -> Self {
         ConfigStore {

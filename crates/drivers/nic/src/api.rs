@@ -235,6 +235,7 @@ pub struct NicOps {
     ///   * the big pool is full, OR
     ///   * the driver doesn't expose this surface (`None`
     ///     variant of the option).
+    ///
     /// Caller falls back to per-MSS segmentation via
     /// [`acquire_tx_buf`] when None.
     ///

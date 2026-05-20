@@ -137,6 +137,12 @@ pub struct PerWorker<T> {
 // (though in practice each slot is owned by one worker).
 unsafe impl<T: Sync + Send> Sync for PerWorker<T> {}
 
+impl<T> Default for PerWorker<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> PerWorker<T> {
     /// Construct an empty cell. Allocation happens later in `init()`.
     /// Const-callable so the cell can live in a `static`.
@@ -318,6 +324,12 @@ pub struct WorkerLocal<T> {
 // is the worker the value was constructed for, even though in
 // practice each value never moves.
 unsafe impl<T: Send> Sync for WorkerLocal<T> {}
+
+impl<T> Default for WorkerLocal<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl<T> WorkerLocal<T> {
     /// Empty cell. Allocation happens in `init()`.

@@ -34,6 +34,12 @@ pub struct AsyncEvent {
 // spinlock; `set` is atomic.
 unsafe impl Sync for AsyncEvent {}
 
+impl Default for AsyncEvent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AsyncEvent {
     pub const fn new() -> Self {
         AsyncEvent {
