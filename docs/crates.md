@@ -22,7 +22,7 @@ The `crates/` tree:
 crates/
   util/        atomic-fn/  tagged-treiber/  iobuf/
   crypto/      aes-gcm/
-  runtime/     platform/  worker/  executor/  backend/
+  runtime/     platform/  worker/  executor/
   kernel/      core/  sys/
   boot/        entry, limine, mem_stubs, multiboot   (shared Bazel package)
   drivers/     bus/  nic-api/  nic/  virtio-net/  gve/
@@ -31,8 +31,12 @@ crates/
                   ethernet_send, arp, ipv4, ipv6, icmpv6, ndp, mac_resolve,
                   ipv6_send, classify, udp, dhcp
   proto/       tls/  quic/  http/  http3/
-  api/         uni/  macros/  net/
+  uni/         uni/  macros/  net/  backend/
 ```
+
+(`tests/integration/` at repo root holds the boot-and-verify
+integration tests — `async/`, `percpu/`, `smp/`, `tls/` — that used
+to live alongside the real apps under `apps/`.)
 
 ## Naming rules
 
@@ -47,10 +51,11 @@ crates/
    shadow `std`/`core` or collide with a common external crate. Current
    qualified names: `net_types`, `net_checksum`, `net_from_bytes`,
    `net_classify`, `kernel_core`, `uni_net_stack`. Carve-outs under
-   `crates/api/`: `uni`, `uni_macros`, `uni_net`. Two further carve-outs
-   for external/internal collisions: `uni_aes_gcm` (RustCrypto's
-   `aes-gcm` crate is pulled in via `@crates//:aes-gcm`) and
-   `uni_kernel` (the bare `kernel` name is too overloaded).
+   `crates/uni/`: `uni`, `uni_macros`, `uni_net` (the facade family).
+   Two further carve-outs for external/internal collisions:
+   `uni_aes_gcm` (RustCrypto's `aes-gcm` crate is pulled in via
+   `@crates//:aes-gcm`) and `uni_kernel` (the bare `kernel` name is
+   too overloaded).
 4. **Cargo package name** (publishable leaves only, if/when published):
    chosen at publish time for crates.io availability. Internal name is
    unchanged. See [§Publishing](#publishing).
@@ -153,14 +158,14 @@ external `@crates//:...` deps are omitted for readability.
 
 | Crate | Deps |
 | --- | --- |
-| `uni_net` (`api/net`) | `nic_api`; on `os:none` also `uni_net_stack` |
+| `uni_net` (`uni/net`) | `nic_api`; on `os:none` also `uni_net_stack`. Defines `NetError`/`DhcpError` here (the facade-level errors); `NicError` re-exported from `nic_api`. |
 | `uni_macros` | proc-macro; no runtime deps |
 
-### Tier 8 — backend
+### Tier 8 — facade backend
 
 | Crate | Deps |
 | --- | --- |
-| `backend` | `iobuf`, `worker`, `platform`, `executor`, `nic_api`; on `os:none` also `nic`, `uni_kernel`, `uni_net_stack`, `tcp`, `gve` |
+| `backend` (`uni/backend`) | `iobuf`, `worker`, `platform`, `executor`, `nic_api`; on `os:none` also `nic`, `uni_kernel`, `uni_net_stack`, `tcp`, `gve` |
 
 ### Tier 9 — facade
 
@@ -217,7 +222,7 @@ consumers write `uni_kernel::percpu::...` and don't see the split.
 
 ```
                      ┌──────────────────────┐
-                     │    nic_api    │  EthernetDriver trait
+                     │       nic_api        │  EthernetDriver trait
                      │   (drivers/nic-api)  │  + ACTIVE_OPS slot
                      └──────────┬───────────┘
                 ┌───────────────┼────────────────┐
