@@ -154,7 +154,6 @@ pub fn close(handle: *mut (), generation: u16) {
                 &[],
             );
             free_connection(core, slot);
-            return;
         }
         _ => {
             free_connection(core, slot);

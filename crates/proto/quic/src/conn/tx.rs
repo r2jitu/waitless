@@ -850,7 +850,7 @@ impl Connection {
     #[allow(clippy::too_many_arguments)]
     fn seal_packet(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut [u8],
         header_start: usize,
         pn_offset: usize,
         payload_offset: usize,

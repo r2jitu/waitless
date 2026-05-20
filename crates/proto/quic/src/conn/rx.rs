@@ -651,7 +651,7 @@ impl Connection {
             truncated = (truncated << 8) | buf[pn_offset + i] as u64;
         }
         // Reconstruct against the largest seen PN in this space.
-        let space = match (buf[0] & 0xc0) | 0 {
+        let space = match buf[0] & 0xc0 {
             // Initial = type 00 in long header (0xc0..0xcf range)
             x if x & HEADER_FORM_LONG != 0 => {
                 let lt = (buf[0] >> 4) & 0x3;
@@ -775,7 +775,7 @@ impl Connection {
                             let new_stream = self
                                 .recv_pool
                                 .pop()
-                                .unwrap_or_else(crate::streams::RecvStream::default);
+                                .unwrap_or_default();
                             self.recv_streams.insert(stream_id, new_stream);
                         }
                         let s = self.recv_streams.get_mut(&stream_id).unwrap();

@@ -141,7 +141,7 @@ fn open_udp_relay(app_port: u16, owner_worker: Option<u32>) -> Result<(), ()> {
         None => {
             // Server fanout: NUM_THREADS SO_REUSEPORT siblings.
             let want = NUM_THREADS.load(Ordering::Acquire).max(1);
-            for i in 0..want {
+            for (i, fd_slot) in fds.iter_mut().enumerate().take(want) {
                 let fd = open_udp_sibling(bind_port, true);
                 if fd < 0 {
                     if i == 0 {
@@ -149,7 +149,7 @@ fn open_udp_relay(app_port: u16, owner_worker: Option<u32>) -> Result<(), ()> {
                     }
                     break;
                 }
-                fds[i] = fd;
+                *fd_slot = fd;
             }
         }
         Some(w) => {

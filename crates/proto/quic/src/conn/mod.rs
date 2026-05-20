@@ -304,7 +304,7 @@ impl DatagramBuf {
     pub fn vec_mut(&mut self) -> &mut Vec<u8> {
         match self {
             DatagramBuf::Heap(v) => v,
-            DatagramBuf::TxSlot { vec, .. } => &mut **vec,
+            DatagramBuf::TxSlot { vec, .. } => vec,
         }
     }
 
@@ -312,7 +312,7 @@ impl DatagramBuf {
     pub fn vec(&self) -> &Vec<u8> {
         match self {
             DatagramBuf::Heap(v) => v,
-            DatagramBuf::TxSlot { vec, .. } => &**vec,
+            DatagramBuf::TxSlot { vec, .. } => vec,
         }
     }
 
@@ -759,7 +759,7 @@ impl Connection {
             let new_stream = self
                 .send_pool
                 .pop()
-                .unwrap_or_else(crate::streams::SendStream::default);
+                .unwrap_or_default();
             self.send_streams.insert(sid, new_stream);
             crate::diag::bump(&crate::diag::COUNTERS.send_streams_created);
         }
@@ -854,7 +854,7 @@ impl Connection {
                 let recv_done = self
                     .recv_streams
                     .get(sid)
-                    .map_or(false, |r| r.is_closed() && r.buffer.is_empty());
+                    .is_some_and(|r| r.is_closed() && r.buffer.is_empty());
                 if recv_done { Some(*sid) } else { None }
             })
             .collect();

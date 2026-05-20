@@ -574,7 +574,7 @@ unsafe fn absorb_8_arm(
     let h = neon::load_h_powers(h_powers);
     let mut acc = neon::acc_zero();
 
-    for i in 0..BATCH_BLOCKS {
+    for (i, &hi) in h.iter().enumerate().take(BATCH_BLOCKS) {
         let x_raw = vld1q_u8(chunk.as_ptr().add(i * BLOCK_LEN));
         let x_rev = vqtbl1q_u8(x_raw, bswap);
         let yi = if i == 0 {
@@ -582,7 +582,7 @@ unsafe fn absorb_8_arm(
         } else {
             x_rev
         };
-        neon::karatsuba_accumulate(&mut acc, yi, h[i]);
+        neon::karatsuba_accumulate(&mut acc, yi, hi);
     }
     let result = neon::acc_reduce(acc);
     vst1q_u8(y.as_mut_ptr(), result);

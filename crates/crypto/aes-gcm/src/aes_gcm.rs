@@ -98,8 +98,8 @@ impl Aes128GcmFast {
         let mut ks_buf = [GenericArray::<u8, _>::default(); CHUNK_BLOCKS];
         let mut chunks = buffer.chunks_exact_mut(CHUNK_LEN);
         for chunk in chunks.by_ref() {
-            for i in 0..CHUNK_BLOCKS {
-                ks_buf[i].copy_from_slice(&counter);
+            for ks in ks_buf.iter_mut().take(CHUNK_BLOCKS) {
+                ks.copy_from_slice(&counter);
                 counter = increment_be32(&counter);
             }
             self.aes.encrypt_blocks(&mut ks_buf);
@@ -184,8 +184,8 @@ impl Aes128GcmFast {
             g.absorb_8(ct_chunk);
 
             // Then decrypt.
-            for i in 0..CHUNK_BLOCKS {
-                ks_buf[i].copy_from_slice(&counter);
+            for ks in ks_buf.iter_mut().take(CHUNK_BLOCKS) {
+                ks.copy_from_slice(&counter);
                 counter = increment_be32(&counter);
             }
             self.aes.encrypt_blocks(&mut ks_buf);

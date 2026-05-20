@@ -845,11 +845,11 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
     // `LISTENS` global below, not stored per-IoState. Each IoState
     // gets the read end of its wake pipe.
     let mut vcpu_ios: Vec<Mutex<IoState>> = Vec::with_capacity(cpu_count);
-    for id in 0..cpu_count {
+    for (id, &wake_read) in wake_reads.iter().enumerate().take(cpu_count) {
         vcpu_ios.push(Mutex::new(IoState {
             id,
             outbound_udp: HashMap::new(),
-            wake_pipe_read: wake_reads[id],
+            wake_pipe_read: wake_read,
             guest_mac: mac,
             read_buf: [0u8; 2048],
             rx_last: 0,
@@ -1577,7 +1577,7 @@ fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) ->
 
     // Periodic closed-conn cleanup.
     io.cleanup_ctr = io.cleanup_ctr.wrapping_add(1);
-    if io.cleanup_ctr % 1000 == 0 {
+    if io.cleanup_ctr.is_multiple_of(1000) {
         let mut conns = shared.conns.lock().unwrap();
         conns.retain(|_, c| c.state < ConnState::Closed || c.host_fd >= 0);
     }

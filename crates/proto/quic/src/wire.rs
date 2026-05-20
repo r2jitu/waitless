@@ -133,8 +133,8 @@ pub fn write_varint(value: u64, out: &mut [u8]) -> Result<usize, WireError> {
         return Err(WireError::OutputTooSmall);
     }
     // Big-endian assembly with the prefix OR'd into the high byte.
-    for i in 0..len {
-        out[i] = ((value >> (8 * (len - 1 - i))) & 0xff) as u8;
+    for (i, b) in out.iter_mut().enumerate().take(len) {
+        *b = ((value >> (8 * (len - 1 - i))) & 0xff) as u8;
     }
     out[0] |= prefix;
     Ok(len)
@@ -384,7 +384,7 @@ pub fn parse_short_header<'a>(
 /// the candidate closest to `expected = largest_pn + 1`, with the
 /// half-window distance check to disambiguate wrap edges.
 pub fn decode_packet_number(largest_pn: u64, truncated_pn: u64, truncated_pn_len: usize) -> u64 {
-    debug_assert!(matches!(truncated_pn_len, 1 | 2 | 3 | 4));
+    debug_assert!(matches!(truncated_pn_len, 1..=4));
     let pn_nbits: u64 = (truncated_pn_len as u64) * 8;
     let expected_pn = largest_pn.wrapping_add(1);
     let pn_win: u64 = 1u64 << pn_nbits;
@@ -448,8 +448,8 @@ pub fn encode_packet_number(
         (1u32 << (len * 8)) - 1
     };
     let truncated = (pn as u32) & mask;
-    for i in 0..len {
-        out[i] = ((truncated >> (8 * (len - 1 - i))) & 0xff) as u8;
+    for (i, b) in out.iter_mut().enumerate().take(len) {
+        *b = ((truncated >> (8 * (len - 1 - i))) & 0xff) as u8;
     }
     Ok(len)
 }

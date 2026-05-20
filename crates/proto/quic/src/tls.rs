@@ -831,11 +831,7 @@ impl RxBuf {
             self.contiguous.extend_from_slice(data);
             self.consumed += data.len() as u64;
             // See if pending entries can now be folded in.
-            loop {
-                let next_off = match self.pending.iter().next() {
-                    Some((&k, _)) => k,
-                    None => break,
-                };
+            while let Some((&next_off, _)) = self.pending.iter().next() {
                 if next_off > self.consumed {
                     break;
                 }

@@ -256,8 +256,8 @@ pub fn aes_gcm_fast_kat() -> Result<(), KatFailure> {
     // 256 bytes = 2 full batched chunks; no tail. Pattern designed
     // to make every byte unique so a one-byte XOR error is visible.
     let mut plaintext = [0u8; 256];
-    for i in 0..256 {
-        plaintext[i] = (i as u8).wrapping_mul(37).wrapping_add(13);
+    for (i, p) in plaintext.iter_mut().enumerate() {
+        *p = (i as u8).wrapping_mul(37).wrapping_add(13);
     }
 
     // Reference: upstream aes-gcm.

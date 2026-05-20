@@ -170,7 +170,7 @@ impl Deque {
     pub fn len(&self) -> usize {
         let b = self.bottom.load(Ordering::Relaxed);
         let t = self.top.load(Ordering::Relaxed);
-        if b >= t { b - t } else { 0 }
+        b.saturating_sub(t)
     }
 
     /// True if the deque is empty (best-effort snapshot).

@@ -184,7 +184,7 @@ where
                 {
                     let prebuf = &buf[body_start..prebuf_end];
                     let mut body = BodyReader::new(&mut stream, prebuf, content_length);
-                    resp = (&*handler)(&req, &mut body).await;
+                    resp = (*handler)(&req, &mut body).await;
                     // Drain any leftover body bytes the handler
                     // didn't consume. Keep-alive contract requires
                     // the connection to be positioned at the start

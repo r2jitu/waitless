@@ -230,11 +230,7 @@ impl RecvStream {
             self.offset += data.len() as u64;
             produced = !data.is_empty();
             // Try to fold any waiting gap entries in.
-            loop {
-                let next_off = match self.gap_buffer.iter().next() {
-                    Some((&k, _)) => k,
-                    None => break,
-                };
+            while let Some((&next_off, _)) = self.gap_buffer.iter().next() {
                 if next_off > self.offset {
                     break;
                 }

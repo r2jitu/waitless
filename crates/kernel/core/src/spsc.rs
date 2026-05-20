@@ -91,7 +91,7 @@ impl<T: Copy + Zero> Ring<T> {
     pub fn len(&self) -> usize {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Relaxed);
-        if tail >= head { tail - head } else { 0 }
+        tail.saturating_sub(head)
     }
 
     /// True if the ring is empty.

@@ -420,7 +420,7 @@ where
 
         // Try to parse complete frames off the front.
         loop {
-            let (f, used) = match frame::parse_frame(&buf) {
+            let (f, used) = match frame::parse_frame(buf) {
                 Ok(x) => x,
                 Err(frame::FrameError::Truncated) => break,
                 Err(e) => {
@@ -520,7 +520,7 @@ where
         let mut name_scratch = [0u8; 4096];
         let mut value_scratch = [0u8; 4096];
         if let Err(e) = qpack::decode_field_section_into(
-            &headers_value,
+            headers_value,
             &mut name_scratch,
             &mut value_scratch,
             &mut sink,

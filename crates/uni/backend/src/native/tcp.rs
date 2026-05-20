@@ -105,8 +105,8 @@ fn async_tcp_listen_hook(app_port: u16) -> Result<(), ()> {
         // Register the shared fd in every worker's event queue.
         let want = NUM_THREADS.load(Ordering::Acquire).max(1);
         let threads = &mut *THREADS.0.get();
-        for worker_id in 0..want {
-            threads[worker_id].register_fd(fd);
+        for thread in threads.iter_mut().take(want) {
+            thread.register_fd(fd);
         }
         Ok(())
     }

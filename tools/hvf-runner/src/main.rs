@@ -51,7 +51,7 @@ fn usage(prog: &str) {
 
 fn parse_port_mapping(spec: &str) -> Result<PortMapping, String> {
     let mut parts = spec.splitn(3, ':');
-    let proto_s = parts.next().ok_or_else(|| format!("empty mapping"))?;
+    let proto_s = parts.next().ok_or_else(|| "empty mapping".to_string())?;
     let host_s = parts
         .next()
         .ok_or_else(|| format!("missing host port in '{spec}'"))?;

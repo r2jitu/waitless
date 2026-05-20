@@ -330,7 +330,7 @@ impl VirtioNet {
                         };
                         // Set VIRTQ_USED_F_NO_NOTIFY on all RX queues
                         // (even-indexed: 0, 2, 4, ...).
-                        if qi % 2 == 0 && qi < 2 * self.num_queue_pairs as usize {
+                        if qi.is_multiple_of(2) && qi < 2 * self.num_queue_pairs as usize {
                             unsafe {
                                 let flags_ptr = snap.gpa_to_host(snap.used_addr) as *mut u16;
                                 core::ptr::write_volatile(flags_ptr, 1);

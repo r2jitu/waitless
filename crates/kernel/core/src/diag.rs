@@ -65,9 +65,9 @@ pub fn append(bytes: &[u8]) {
 /// pulling in `core::fmt`.
 pub fn append_hex(value: u64) {
     let mut buf = [0u8; 16];
-    for i in 0..16 {
+    for (i, b) in buf.iter_mut().enumerate() {
         let nibble = ((value >> ((15 - i) * 4)) & 0xF) as u8;
-        buf[i] = if nibble < 10 {
+        *b = if nibble < 10 {
             b'0' + nibble
         } else {
             b'a' + (nibble - 10)

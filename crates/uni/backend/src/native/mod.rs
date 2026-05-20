@@ -450,9 +450,9 @@ impl ThreadState {
                     MAX_EVENTS as i32,
                     &ts,
                 );
-                for i in 0..n.max(0) as usize {
-                    let fd = events[i].udata as i32;
-                    let is_write = events[i].filter == EVFILT_WRITE;
+                for ev in events.iter().take(n.max(0) as usize) {
+                    let fd = ev.udata as i32;
+                    let is_write = ev.filter == EVFILT_WRITE;
                     if self.dispatch_ready_fd(fd, is_write) {
                         udp_work = true;
                     }
@@ -656,10 +656,10 @@ fn init_native() {
         executor::init(num_threads as u32);
 
         let threads = &mut *THREADS.0.get();
-        for i in 0..num_threads {
-            threads[i].thread_id = i as u32;
-            threads[i].init_event_queue();
-            threads[i].init_udp_tables();
+        for (i, t) in threads.iter_mut().enumerate().take(num_threads) {
+            t.thread_id = i as u32;
+            t.init_event_queue();
+            t.init_udp_tables();
         }
 
         // Cast through a function pointer first; rust 1.93+ rejects
@@ -873,8 +873,8 @@ pub fn run_worker(worker_id: u32) {
 
         // 1. IO poll callbacks (network, future storage, etc)
         let n = IO_POLL_COUNT.load(Ordering::Acquire).min(IO_POLL_MAX);
-        for i in 0..n {
-            if let Some(f) = IO_POLL[i].load()
+        for slot in IO_POLL.iter().take(n) {
+            if let Some(f) = slot.load()
                 && f(worker_id)
             {
                 did_work = true;
@@ -984,13 +984,13 @@ pub fn run(config: RunConfig) -> i32 {
 
         // Start worker threads
         let mut thread_handles = [0usize; MAX_THREADS];
-        for i in 1..num_threads {
-            pthread_create(
-                &mut thread_handles[i],
-                ptr::null(),
-                worker_thread,
-                i as *mut u8,
-            );
+        for (i, handle) in thread_handles
+            .iter_mut()
+            .enumerate()
+            .take(num_threads)
+            .skip(1)
+        {
+            pthread_create(handle, ptr::null(), worker_thread, i as *mut u8);
         }
 
         // Main thread is worker 0
@@ -998,9 +998,9 @@ pub fn run(config: RunConfig) -> i32 {
         native_worker_loop(0);
 
         // Join workers
-        for i in 1..num_threads {
-            if thread_handles[i] != 0 {
-                pthread_join(thread_handles[i], ptr::null_mut());
+        for handle in thread_handles.iter().take(num_threads).skip(1) {
+            if *handle != 0 {
+                pthread_join(*handle, ptr::null_mut());
             }
         }
 
