@@ -37,14 +37,9 @@ pub mod rng;
 
 pub use boot_info::{BootInfo, NicInfo, boot_info};
 
+// The facade-level net errors. The types live in `uni_net` so
+// driver crates can reach them without depending on `uni`.
 pub use net::{DhcpError, NetError, NicError};
-
-/// Also reachable as `uni::error::NetError`, etc. The types live in
-/// `uni_net` so driver crates can reach them without depending on
-/// `uni`.
-pub mod error {
-    pub use crate::net::{DhcpError, NetError, NicError};
-}
 
 // ----------------------------------------------------------------------------
 // Lifetime model — listeners run forever, no user-side bag
@@ -223,8 +218,6 @@ macro_rules! println {
 /// Re-export of the shared async runtime. `use uni::runtime::spawn;`
 /// works on both unikernel and native.
 pub mod runtime {
-    pub use backend::runtime::{Sleep, sleep_us, spawn};
-    pub use executor::{SpawnError, TaskHandle};
     pub use executor::event::{AsyncEvent, WaitEvent};
     /// Family-agnostic IP address used in `UdpSocket::recv_from` /
     /// `send_to` and elsewhere on the runtime API. Re-exported so
@@ -238,12 +231,8 @@ pub mod runtime {
         tcp_listen, udp_listen,
     };
     pub use executor::select::{Either, Three, join, join3, select, select3, timeout_us};
+    pub use executor::{Sleep, SpawnError, TaskHandle, sleep_us, spawn};
 }
-
-// Top-level shortcuts for the most common runtime calls. The full
-// `uni::runtime::*` namespace stays available for power users who
-// need raw handle ownership (tests, manual teardown).
-pub use executor::reactor::UdpClient;
 
 /// Listen for TCP on `port`; the listener runs for the rest of
 /// the process. The returned `Result` reports bind success or

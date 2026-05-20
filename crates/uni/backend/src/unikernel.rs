@@ -92,11 +92,6 @@ pub fn cycles_per_us() -> u64 {
     kernel_bare::time::cycles_per_us()
 }
 
-// ---- Async runtime re-exports ---------------------------------------------
-
-pub mod runtime {
-    pub use executor::{Sleep, sleep_us, spawn};
-}
 
 // ---- Heap stats -----------------------------------------------------------
 

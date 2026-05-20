@@ -15,12 +15,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicUsize, Ordering};
 use std::task::Waker;
 
-/// Re-export of the shared runtime's executor surface — apps
-/// reach these via `uni::runtime::{spawn,sleep_us,Sleep,…}`.
-pub mod runtime {
-    pub use executor::{Sleep, has_pending, sleep_us, spawn, tick};
-}
-
 mod ffi;
 mod tcp;
 mod udp;
