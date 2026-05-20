@@ -8,9 +8,12 @@ extern crate alloc;
 
 extern crate nic_api;
 pub use nic_api::{
-    DhcpError, EthernetDriverReg, NetError, NicDiagOps, NicError, NicIdleOps, NicOps,
-    linked_ethernet_drivers, register_ethernet_driver,
+    EthernetDriverReg, NicDiagOps, NicError, NicIdleOps, NicOps, linked_ethernet_drivers,
+    register_ethernet_driver,
 };
+
+mod error;
+pub use error::{DhcpError, NetError};
 
 // Bare-metal pulls the full net umbrella; native uses POSIX sockets.
 #[cfg(target_os = "none")]

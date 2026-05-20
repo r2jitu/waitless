@@ -4,7 +4,7 @@
 #![no_std]
 
 pub mod error;
-pub use error::{DhcpError, NetError, NicError};
+pub use error::NicError;
 
 pub use iobuf::{Chain, IOBuf, IOBufChain, OwnedIOBuf};
 

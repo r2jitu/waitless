@@ -1,17 +1,34 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# `Net::enable`, error types, and the bare-metal net umbrella facade.
-# Re-exports `nic_api`'s `NicOps` / `NetError` etc. so apps see them
-# under `uni::net`. On `os:none` also pulls the full L2-L4 stack.
+# `Net::enable`, facade-level error types (NetError, DhcpError), and
+# the bare-metal net umbrella facade. Re-exports `nic_api`'s `NicOps`
+# / `NicError` etc. so apps see them under `uni::net`. On `os:none`
+# also pulls the full L2-L4 stack.
 rust_library(
     name = "net",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/error.rs",
+        "src/lib.rs",
+    ],
     crate_name = "uni_net",
     crate_root = "src/lib.rs",
     deps = ["//crates/drivers/nic-api"] + select({
         "//bazel/platforms:native": [],
         "//conditions:default": ["//crates/net/stack"],
     }),
+)
+
+# Host-native unit tests for NetError + DhcpError, the facade-level
+# error hierarchy (size invariants, From conversions, Display). The
+# nic_api dep here is the lone upstream needed for the NicError
+# variant; this is the same dep the production rust_library has.
+rust_test(
+    name = "error_test",
+    size = "small",
+    srcs = ["src/error.rs"],
+    crate_root = "src/error.rs",
+    deps = ["//crates/drivers/nic-api"],
 )
