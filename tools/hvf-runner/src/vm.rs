@@ -61,10 +61,7 @@ use crate::virtio_console;
 // ── Global vCPU handles for IO thread wakeup ────────────────────────────────
 // Stored as AtomicU64 so the IO thread can read without locking.
 // Set once when each vCPU is created; never modified after.
-static VCPU_HANDLES: [AtomicU64; MAX_VCPUS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_VCPUS]
-};
+static VCPU_HANDLES: [AtomicU64; MAX_VCPUS] = [const { AtomicU64::new(0) }; MAX_VCPUS];
 
 /// Kick a specific vCPU out of `hv_vcpu_run`. Used by the userspace
 /// net accept thread to doorbell a vCPU when it hands it a new conn —

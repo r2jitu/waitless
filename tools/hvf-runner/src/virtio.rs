@@ -167,11 +167,8 @@ impl QueueSnapshot {
 }
 
 /// Per-queue snapshots — set once at QUEUE_READY, immutable after.
-static QUEUE_SNAPS: [OnceLock<QueueSnapshot>; MAX_QUEUES] = {
-    // OnceLock::new() is const, but array-init requires a const block
-    const INIT: OnceLock<QueueSnapshot> = OnceLock::new();
-    [INIT; MAX_QUEUES]
-};
+static QUEUE_SNAPS: [OnceLock<QueueSnapshot>; MAX_QUEUES] =
+    [const { OnceLock::new() }; MAX_QUEUES];
 
 pub fn queue_snapshot(index: usize) -> QueueSnapshot {
     if index < MAX_QUEUES {
