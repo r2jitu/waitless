@@ -1,0 +1,192 @@
+// TX dispatch — the public send/submit entry points and the GQI vs
+// DQO mode switch on the send path.
+//
+// Each function here checks `QUEUE_FORMAT_DQO` once (one Acquire load
+// + branch), then jumps to the per-format datapath in `gqi` / `dqo`.
+// Slot acquisition (small / TSO / UDP-GSO direct-fill) is GQI-only —
+// DQO acquire functions return `None` and callers fall back to the
+// slice-shaped `send_on_qp` path (one extra memcpy per frame).
+//
+// Doorbell-batching policy lives here too: `flush_tx_kick_if_dirty_qp`
+// is what makes the deferred-kick mode safe — the kernel event loop
+// calls it once per service pass so anything `send_on_qp` enqueued
+// without a doorbell write lands on the wire before the CPU idles.
+
+use core::sync::atomic::Ordering;
+
+use crate::{
+    BAR2_VA, DEFERRED_KICK, MAX_QUEUE_PAIRS, NUM_QP, QUEUE_FORMAT_DQO, TX_QUEUES, dqo, gqi,
+};
+
+/// Queue-pair index for the current core, or `None` if the driver
+/// isn't ready (`num_qp == 0`). Tier 1 mode pins core N to qp N when
+/// `N < num_qp`; cores beyond fall back to qp 0 (no NIC TX from them
+/// in practice — they handle handlers, not the polling path).
+#[inline]
+pub(crate) fn current_qp() -> Option<usize> {
+    let num_qp = NUM_QP.load(Ordering::Acquire) as u32;
+    if num_qp == 0 {
+        return None;
+    }
+    let core = kernel_bare::cpu_id();
+    Some(if core < num_qp { core as usize } else { 0 })
+}
+
+pub(crate) fn acquire_tx_udp_gso_buf() -> Option<nic_api::TxUdpGsoBufHandle> {
+    // Share the big pool with TSO — same slot shape (16 KiB), same
+    // pool_id encoding. We just rewrap as the type-distinct handle
+    // so the API surface routes UDP-GSO slots through
+    // `submit_tx_udp_gso` (different descriptor bytes vs TSO).
+    let tso = acquire_tx_tso_buf()?;
+    Some(nic_api::TxUdpGsoBufHandle(tso.0))
+}
+
+pub(crate) fn submit_tx_udp_gso(
+    handle: nic_api::TxUdpGsoBufHandle,
+    frame_len: usize,
+    hdr_len: u16,
+    csum_start: u16,
+    gso_size: u16,
+) {
+    if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
+        return;
+    }
+    gqi::submit_tx_udp_gso_inner(handle, frame_len, hdr_len, csum_start, gso_size);
+}
+
+/// Public direct-fill TX entry — picks the calling worker's qp,
+/// scans for a free slot, returns a handle into the per-slot
+/// QPL page (GQI_QPL only).
+///
+/// On DQO_RDA returns `None` so callers fall through to the
+/// slice-shaped `send_on_qp_dqo` path (one extra memcpy per
+/// frame). A DQO direct-fill landed once but always stalled on
+/// real c3 hardware under load, so it was removed; everything
+/// goes through `send_on_qp_dqo` until that's diagnosed.
+pub(crate) fn acquire_tx_buf() -> Option<nic_api::TxBufHandle> {
+    if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
+        return None;
+    }
+    gqi::acquire_tx_buf_for_qp(current_qp()?)
+}
+
+/// Public submit — paired with [`acquire_tx_buf`]. Consumes the
+/// handle (slot returns to pool on device completion). GQI_QPL
+/// only: callers never get a real handle in DQO mode (acquire
+/// returns None), so there's no DQO branch.
+pub(crate) fn submit_tx(handle: nic_api::TxBufHandle, frame_len: usize, csum: nic_api::CsumOffload) {
+    gqi::submit_tx_inner(handle, frame_len, csum);
+}
+
+/// Public TSO acquire — picks the calling worker's qp and returns
+/// a 16 KiB big-pool handle (or `None` on DQO / pool saturation).
+pub(crate) fn acquire_tx_tso_buf() -> Option<nic_api::TxTsoBufHandle> {
+    if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
+        return None;
+    }
+    gqi::acquire_tx_tso_buf_for_qp(current_qp()?)
+}
+
+/// Public TSO submit — paired with [`acquire_tx_tso_buf`]. Emits
+/// 1 TSO + 1 SEG descriptor; the device segments the payload into
+/// `gso_size`-byte chunks with TCP/IP headers fixed up per segment.
+pub(crate) fn submit_tx_tso(
+    handle: nic_api::TxTsoBufHandle,
+    frame_len: usize,
+    hdr_len: u16,
+    csum_start: u16,
+    gso_size: u16,
+) {
+    // GQI_QPL only — `acquire_tx_tso_buf` returns None on DQO so
+    // we never get a real big-pool handle in DQO mode. Just in
+    // case (e.g. a saved handle), drop it cleanly.
+    if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
+        // Dropping `handle` releases the slot via release_fn.
+        return;
+    }
+    gqi::submit_tx_tso_inner(handle, frame_len, hdr_len, csum_start, gso_size);
+}
+
+/// Flush the deferred TX kick for the given queue pair. Returns
+/// true if a doorbell write was issued. Called by the event loop
+/// after each service pass to push whatever `send_on_qp` batched
+/// onto the wire before the CPU sits idle.
+pub(crate) fn flush_tx_kick_if_dirty_qp(qp: usize) -> bool {
+    if qp >= MAX_QUEUE_PAIRS {
+        return false;
+    }
+    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+    if tx_ptr.is_null() {
+        return false;
+    }
+    let tx = unsafe { &*tx_ptr };
+    let fill = tx.fill_cnt.load(Ordering::Relaxed);
+    let kicked = tx.last_kicked.load(Ordering::Relaxed);
+    if fill == kicked {
+        return false;
+    }
+    let bar2_va = BAR2_VA.load(Ordering::Acquire);
+    if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
+        // DQO doorbell wants the masked tail position; raw cumulative
+        // fill_cnt wraps differently than what the device expects
+        // and wedges the queue after the first ring cycle.
+        let mask = (tx.ring_entries - 1) as u32;
+        dqo::doorbell_write_le(bar2_va, tx.db_offset, fill & mask);
+    } else {
+        gqi::doorbell_write(bar2_va, tx.db_offset, fill);
+    }
+    tx.last_kicked.store(fill, Ordering::Relaxed);
+    true
+}
+
+/// Flush the current core's TX queue if dirty. Matches the
+/// `NicOps::flush_tx_kick_if_dirty` signature so the `nic` dispatch
+/// crate can call it through the active-ops slot.
+pub(crate) fn flush_tx_kick_if_dirty() -> bool {
+    match current_qp() {
+        Some(qp) => flush_tx_kick_if_dirty_qp(qp),
+        None => false,
+    }
+}
+
+/// Flush every TX queue's pending kick. Not strictly needed in
+/// per-core-queue Tier 1 mode (each core's `flush_tx_kick_if_dirty`
+/// covers its own queue), but useful if something batches sends
+/// across cores. Called from the shim's `flush_tx_staging()`.
+pub(crate) fn flush_all_tx_kicks() {
+    let n = NUM_QP.load(Ordering::Acquire) as usize;
+    for qp in 0..n.min(MAX_QUEUE_PAIRS) {
+        flush_tx_kick_if_dirty_qp(qp);
+    }
+}
+
+/// Turn on batched TX doorbells. Called once by the kernel after
+/// it has wired `flush_tx_kick_if_dirty` into the event loop —
+/// without that guarantee the device would never see the doorbell
+/// writes and TX would stall once the ring fills.
+pub(crate) fn enable_deferred_tx_kick() {
+    DEFERRED_KICK.store(true, Ordering::Release);
+}
+
+/// Submit a single-segment packet on queue pair `qp`. Returns
+/// `true` on success, `false` when the ring has no free slots
+/// (device hasn't caught up) or the frame exceeds the format's
+/// per-packet limit. Dispatches to GQI_QPL or DQO_RDA based on
+/// the queue format committed at init time.
+fn send_on_qp(qp: usize, data: &[u8], csum: nic_api::CsumOffload) -> bool {
+    if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
+        dqo::send_on_qp(qp, data, csum)
+    } else {
+        gqi::send_on_qp(qp, data, csum)
+    }
+}
+
+/// Per-core TX. Picks the queue pair matching `cpu_id()` when that
+/// fits within `num_qp`, else falls back to qp 0. Matches the
+/// virtio-net "send on your own core's queue" semantics so Tier 1
+/// scaling keeps working.
+pub(crate) fn send(data: &[u8], csum: nic_api::CsumOffload) {
+    if let Some(qp) = current_qp() {
+        let _ = send_on_qp(qp, data, csum);
+    }
+}
