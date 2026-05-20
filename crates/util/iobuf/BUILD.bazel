@@ -26,7 +26,7 @@ rust_library(
         "src/pool.rs",
         "src/storage.rs",
     ],
-    crate_name = "uni_iobuf",
+    crate_name = "iobuf",
     # `IOBufPool`'s free list delegates to the shared Treiber stack
     # core. `iobuf_test` (crate = ":iobuf") inherits this dep.
     deps = ["//crates/util/tagged-treiber"],

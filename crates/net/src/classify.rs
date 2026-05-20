@@ -3,7 +3,7 @@
 // Pure leaf crate (`net_classify`): turns a received frame's part-0 bytes
 // into a `Classified` verdict — eth + L3 parse, once, IPv4 and IPv6
 // alike — and maps a TCP/UDP flow to an owning core. Depends only on
-// the pure wire-format leaves (net_ethernet / net_ipv4 / net_ipv6 /
+// the pure wire-format leaves (ethernet / ipv4 / ipv6 /
 // net_types) — no driver, no kernel — so the verdict logic and the
 // flow hash are host-unit-testable.
 //
@@ -14,9 +14,9 @@
 
 #![cfg_attr(not(test), no_std)]
 
-extern crate net_ethernet as ethernet;
-extern crate net_ipv4 as ipv4;
-extern crate net_ipv6 as ipv6;
+extern crate ethernet as ethernet;
+extern crate ipv4 as ipv4;
+extern crate ipv6 as ipv6;
 extern crate net_types as types;
 
 use types::{IpAddr, Ipv6Addr, MacAddr, ParsedL3};

@@ -18,18 +18,18 @@
 //               Appendix A).
 //   server.rs   `H3Server` — opens server-side control stream,
 //               accepts client control + request streams, parses
-//               H3 frames into `uni_http::Request`, dispatches to
-//               the user handler, encodes `uni_http::Response`
+//               H3 frames into `http::Request`, dispatches to
+//               the user handler, encodes `http::Response`
 //               back through QPACK + DATA + FIN.
 //
 // Public API (re-exported through this module's root):
 //   * `listen(port, handler, cert, key)` — bind a UDP port,
 //     terminate QUIC + HTTP/3, dispatch requests to `handler`.
 //
-// HTTPS handler model matches `uni_http::listen` exactly:
+// HTTPS handler model matches `http::listen` exactly:
 // `H: AsyncFn(&Request) -> Response`. The same handler code can
 // serve HTTP/1.1 over TCP+TLS and HTTP/3 over QUIC by wiring up
-// both `uni_http::listen_https` and `uni_http3::listen` against
+// both `http::listen_https` and `http3::listen` against
 // the same closure.
 
 #![cfg_attr(not(test), no_std)]

@@ -9,15 +9,15 @@
 
 extern crate alloc;
 
+use http::{Request, Response};
 use uni::net::Net;
-use uni_http::{Request, Response};
 
-async fn hello(_: &Request, _: &mut uni_http::BodyReader<'_, uni::runtime::TcpStream>) -> Response {
+async fn hello(_: &Request, _: &mut http::BodyReader<'_, uni::runtime::TcpStream>) -> Response {
     Response::ok(b"text/plain", b"Hello from bare metal!\n")
 }
 
 #[uni::init]
 async fn init() {
     Net::up().await.expect("Net::up failed");
-    uni_http::listen(80, hello).expect("http bind");
+    http::listen(80, hello).expect("http bind");
 }

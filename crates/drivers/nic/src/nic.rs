@@ -3,9 +3,9 @@
 //
 // Standalone host-buildable crate whose only dependency is the
 // host-buildable `uni_net_driver` interface crate. Sibling of the
-// os:none `//drivers` (`uni_drivers`) hardware-access crate, kept
+// os:none `//drivers` (`bus`) hardware-access crate, kept
 // separate so the TX-side net crates that call these dispatchers
-// (`net_eth_tx`, `net_tcp`, …) stay host-buildable — they depend on
+// (`net_eth_tx`, `tcp`, …) stay host-buildable — they depend on
 // `//drivers:nic` directly, never on the os:none `//drivers`.
 //
 // `init()` walks `linked_ethernet_drivers()`, calls the `probe` fn

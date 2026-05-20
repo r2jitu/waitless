@@ -73,7 +73,7 @@ use aes_gcm::aes::cipher::BlockEncrypt;
 
 use crate::tls::{CryptoLevel, QuicTls, QuicTlsError, QuicTlsState};
 use core::mem::ManuallyDrop;
-use uni_tls::TlsServerConfig;
+use tls::TlsServerConfig;
 
 // ============================================================================
 // Errors
@@ -386,7 +386,7 @@ pub enum ConnState {
 ///     `out.split_at_mut`, slice indexing — never `reserve`).
 pub enum DatagramBuf {
     /// Heap-allocated Vec. Used as fallback when
-    /// [`uni_runtime::net::acquire_tx_buf`] returns `None`.
+    /// [`executor::net::acquire_tx_buf`] returns `None`.
     Heap(Vec<u8>),
     /// Vec wrapping a driver TX-pool slot. The handle's `Drop`
     /// returns the slot to the pool if the buf is dropped
@@ -897,7 +897,7 @@ impl Connection {
     /// allocates a slot and then disappears entirely (no further
     /// datagrams) still gets reaped after the idle window.
     pub fn set_last_recv_now(&mut self) {
-        self.last_recv_us = uni_tls::ticket::now_us();
+        self.last_recv_us = tls::ticket::now_us();
     }
 
     /// Microseconds-since-boot timestamp of the most recent inbound
@@ -929,7 +929,7 @@ impl Connection {
     /// No-op when no close is pending.
     pub fn flush_close(&mut self) {
         if let Some((error_code, reason)) = self.close_pending.take() {
-            use uni_runtime::net::MAX_L2_HEADROOM;
+            use executor::net::MAX_L2_HEADROOM;
             let mut datagram = self.take_datagram_buf(256);
             if self
                 .encode_close_packet(datagram.vec_mut(), error_code, &reason)
@@ -1044,7 +1044,7 @@ impl Connection {
             1 => CryptoLevel::Handshake,
             _ => CryptoLevel::OneRtt,
         };
-        use uni_runtime::net::MAX_L2_HEADROOM;
+        use executor::net::MAX_L2_HEADROOM;
         let mut datagram = self.take_datagram_buf(64);
         if self.encode_ping_probe(datagram.vec_mut(), level).is_ok()
             && datagram.len() > MAX_L2_HEADROOM
@@ -1082,7 +1082,7 @@ impl Connection {
         // counts — even one we'll fail to decrypt below — because
         // the peer is clearly still trying. RFC 9000 §10.1 only
         // requires receipt, not successful processing.
-        self.last_recv_us = uni_tls::ticket::now_us();
+        self.last_recv_us = tls::ticket::now_us();
         // Anti-amplification accounting (RFC 9000 §8.1.2): all
         // bytes received from the peer's address count toward our
         // 3× send credit, including ones that fail to decrypt.
@@ -1239,10 +1239,10 @@ impl Connection {
     /// the encoder captures `header_start = out.len()` after the
     /// resize.
     fn take_datagram_buf(&mut self, fallback_capacity: usize) -> DatagramBuf {
-        use uni_runtime::net::MAX_L2_HEADROOM;
+        use executor::net::MAX_L2_HEADROOM;
 
         // Hot path: acquire a slot from the driver's TX pool.
-        if let Some(handle) = uni_runtime::net::acquire_tx_buf() {
+        if let Some(handle) = executor::net::acquire_tx_buf() {
             // Wrap the slot's data region as a Vec via raw
             // construction. Capacity == handle.data_cap (1514 B);
             // the encoder won't push beyond that for any single
@@ -1377,7 +1377,7 @@ impl Connection {
         self.ensure_send_stream(sid).write_owned(data);
     }
 
-    /// Append a pre-built [`uni_iobuf::IOBuf`] chunk to stream
+    /// Append a pre-built [`iobuf::IOBuf`] chunk to stream
     /// `sid`'s outbound chain. Use this when the caller has
     /// already built an IOBuf — typically a heap-allocated
     /// buffer with reserved headroom (so a layer below can
@@ -1385,7 +1385,7 @@ impl Connection {
     /// already written. The IOBuf moves into the SendStream's
     /// VecDeque; subsequent `pop_chunk_into` calls drain its
     /// `data()` slice straight into the packet's frames buffer.
-    pub fn stream_send_iobuf(&mut self, sid: u64, data: uni_iobuf::IOBuf) {
+    pub fn stream_send_iobuf(&mut self, sid: u64, data: iobuf::IOBuf) {
         self.ensure_send_stream(sid).write_iobuf(data);
     }
 
@@ -2317,7 +2317,7 @@ impl Connection {
     }
 
     fn flush_outbound(&mut self, _config: &TlsServerConfig) -> Result<(), ConnError> {
-        use uni_runtime::net::MAX_L2_HEADROOM;
+        use executor::net::MAX_L2_HEADROOM;
 
         // CONNECTION_CLOSE short-circuits the normal flush flow.
         // RFC 9000 §10.2.1: once we decide to close, we send one
@@ -3199,7 +3199,7 @@ impl Connection {
         // PN is newly acked AND its packet was ack-eliciting.
         if let Some(pkt) = largest_pkt {
             if pkt.ack_eliciting {
-                let now = uni_tls::ticket::now_us();
+                let now = tls::ticket::now_us();
                 let latest = now.saturating_sub(pkt.time_sent_us);
                 self.update_rtt(latest, ack_delay);
             }
@@ -3247,7 +3247,7 @@ impl Connection {
             .map(|s| s.max(self.latest_rtt_us.unwrap_or(0)))
             .unwrap_or(self.latest_rtt_us.unwrap_or(0));
         let time_threshold_us = ((max_rtt * 9) / 8).max(K_GRANULARITY_US);
-        let now = uni_tls::ticket::now_us();
+        let now = tls::ticket::now_us();
 
         // Stack-array scratch for the lost-PN list — typical case
         // is 0 lost; even under heavy loss, more than ~32 packets
@@ -3347,7 +3347,7 @@ impl Connection {
         ack_eliciting: bool,
         byte_count: u32,
     ) {
-        let now = uni_tls::ticket::now_us();
+        let now = tls::ticket::now_us();
         let pkt = SentPacket {
             time_sent_us: now,
             ack_eliciting,
@@ -3447,7 +3447,7 @@ mod tests {
     ///              keys our connection derived
     #[test]
     fn end_to_end_self_handshake() {
-        use uni_tls::handshake::{
+        use tls::handshake::{
             LEGACY_VERSION_TLS12, VERSION_TLS13, cipher_suite, ext_type, msg_type as mt,
             named_group,
         };
@@ -3579,7 +3579,7 @@ mod tests {
         let pkt = conn
             .pop_packet_owned()
             .expect("server reply datagram queued");
-        let reply = &pkt.vec()[uni_runtime::net::MAX_L2_HEADROOM..];
+        let reply = &pkt.vec()[executor::net::MAX_L2_HEADROOM..];
         assert!(!reply.is_empty(), "non-empty reply datagram");
 
         // First packet should be Initial. Re-derive server-side

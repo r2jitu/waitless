@@ -19,7 +19,7 @@ rust_library(
         "src/native/udp.rs",
         "src/unikernel.rs",
     ],
-    crate_name = "uni_backend",
+    crate_name = "backend",
     deps = [
         "//crates/util/iobuf",
         "//crates/runtime/worker",
@@ -37,7 +37,7 @@ rust_library(
             "//crates/drivers/nic",
             "//crates/kernel/sys",
             "//crates/net/stack",
-            # `net_tcp` crate, for `tcp_diag()`'s TCP-stack counters.
+            # `tcp` crate, for `tcp_diag()`'s TCP-stack counters.
             # `gve` driver crate, for `gve_diag()`'s NIC counters.
             # Both are bare-metal-only; `uni-backend` is the right
             # home for these deps (it is the platform-split crate),

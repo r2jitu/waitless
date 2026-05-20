@@ -16,8 +16,8 @@
 
 extern crate uni;
 
-use uni_tls::aead as tls_crypto;
-use uni_tls::schedule as tls;
+use ::tls::aead as tls_crypto;
+use ::tls::schedule as tls;
 
 fn logn(msg: &[u8]) {
     uni::log(msg);

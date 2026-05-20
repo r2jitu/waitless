@@ -263,7 +263,7 @@ pub fn since_boot_us() -> u64 {
 // to this `#[no_mangle]` symbol — mirroring `__uni_kernel_cpu_id` and
 // `__uni_kernel_rng_fill`. `kernel_core` is the lower crate and cannot
 // call up into `//kernel`, so it declares the `extern "Rust"` symbol
-// and `//kernel` defines it here. This is what lets `net_tcp`'s
+// and `//kernel` defines it here. This is what lets `tcp`'s
 // RFC 6298 retransmission timer read a monotonic millisecond clock on
 // `os:none` while resolving to a test-controllable mock under host
 // unit tests.

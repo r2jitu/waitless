@@ -3,7 +3,7 @@
 // Single crate with two cfg-gated impls: `unikernel` (bare-metal)
 // and `native` (POSIX). Selected by `target_os`. The exported symbol
 // surface is the same on both sides so `uni/lib.rs` can unconditionally
-// `pub use uni_backend::*;`.
+// `pub use backend::*;`.
 
 #![cfg_attr(target_os = "none", no_std)]
 

@@ -2,7 +2,7 @@
 //
 // `now_ms()` is the monotonic-millisecond time source for the
 // host-buildable crates that sit below `//uni` and so cannot reach a
-// `//kernel` clock directly — chiefly `net_tcp`, whose RFC 6298
+// `//kernel` clock directly — chiefly `tcp`, whose RFC 6298
 // retransmission timer needs a coarse wall-clock.
 //
 // It mirrors the `cpu_id` / `rng::fill_bytes` link seams:

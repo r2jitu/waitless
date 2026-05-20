@@ -3,7 +3,7 @@
 //
 // A `TaggedTreiberStack` is a lock-free LIFO of `u32` slot indices —
 // the free-list machinery that backs a fixed-size object pool. Two
-// pools in this workspace use it: `uni_iobuf::IOBufPool` (the gVNIC
+// pools in this workspace use it: `iobuf::IOBufPool` (the gVNIC
 // GQI RX slab recycler) and `uni_kernel::rx_inbox::RxNodePool` (the
 // Tier-2 cross-core hand-off node pool). Each used to carry its own
 // byte-identical copy of this ~40-line CAS core; this crate is the

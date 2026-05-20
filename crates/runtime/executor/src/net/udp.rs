@@ -14,7 +14,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU32, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use uni_worker::{CurrentWorker, PerWorker, num_workers};
+use worker::{CurrentWorker, PerWorker, num_workers};
 
 use super::{SpinLock, install_worker_task, register_net_launcher, release_launcher_slot};
 

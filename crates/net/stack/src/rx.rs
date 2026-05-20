@@ -26,8 +26,8 @@
 //! returns), reposting the buffer(s) via each part's drop callback.
 
 use crate::{arp, ipv6_nd, ndp, sched, tcp, types, udp};
+use iobuf::{Chain, OwnedIOBuf};
 use net_classify::{Classified, classify, owner};
-use uni_iobuf::{Chain, OwnedIOBuf};
 use uni_kernel::percpu;
 
 // ── Entry points — the tier adapters ────────────────────────────────

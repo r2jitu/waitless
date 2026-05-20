@@ -12,8 +12,8 @@ use core::ptr;
 use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 
-use uni_drivers::mmio_write32;
-use uni_iobuf::{Chain, IOBufDropFn, OwnedIOBuf};
+use bus::mmio_write32;
+use iobuf::{Chain, IOBufDropFn, OwnedIOBuf};
 
 use crate::{
     BAR2_VA, DEFERRED_KICK, MAX_QUEUE_PAIRS, RX_BUF_REPOST_COUNT, RX_BUFFER_SIZE, RX_BYTES_PER_QP,

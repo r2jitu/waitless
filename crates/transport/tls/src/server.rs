@@ -589,7 +589,7 @@ impl TlsServer {
     /// loops this until the chain is drained.
     pub fn seal_app_data(
         &mut self,
-        src_chain: &mut uni_iobuf::IOBufChain,
+        src_chain: &mut iobuf::IOBufChain,
         dst: &mut [u8],
     ) -> Result<usize, HandshakeError> {
         if self.state != State::Established {

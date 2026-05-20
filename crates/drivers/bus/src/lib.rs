@@ -1,4 +1,4 @@
-// drivers/lib.rs — the `uni_drivers` crate: shared hardware-access
+// drivers/lib.rs — the `bus` crate: shared hardware-access
 // layer for the NIC driver crates.
 //
 // PCI bus enumeration, VirtIO transport (legacy + modern PCI + MMIO),

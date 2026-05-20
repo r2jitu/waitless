@@ -8,24 +8,24 @@
 
 extern crate alloc;
 extern crate bitflags;
+extern crate ethernet as ethernet;
+extern crate executor;
+extern crate ipv4 as ipv4;
+extern crate ipv6 as ipv6;
+extern crate ipv6_send as ipv6_send;
 extern crate kernel_core;
+extern crate mac_resolve as mac_resolve;
 extern crate net_checksum as checksum;
-extern crate net_ethernet as ethernet;
 extern crate net_from_bytes as from_bytes;
-extern crate net_ipv4 as ipv4;
-extern crate net_ipv6 as ipv6;
-extern crate net_ipv6_send as ipv6_send;
-extern crate net_mac_resolve as mac_resolve;
 extern crate net_types as types;
 extern crate nic;
-extern crate uni_runtime;
 
 use alloc::boxed::Box;
 use core::ptr;
 use core::task::Waker;
 use from_bytes::FromBytes;
+use iobuf::{Chain, IOBuf, OwnedIOBuf};
 use types::{IpAddr, MacAddr, htonl, htons, ntohl, ntohs};
-use uni_iobuf::{Chain, IOBuf, OwnedIOBuf};
 
 bitflags::bitflags! {
     struct TcpFlags: u8 {
@@ -618,7 +618,7 @@ impl TcpConnection {
     /// over the chain `async_try_send_chain` already transmitted — so
     /// the RTO timer can retransmit them, and start the timer if it
     /// is not already running (RFC 6298 §5.1).
-    fn rtx_on_data_sent(&mut self, total: usize, cur: &mut uni_iobuf::Cursor<'_>) {
+    fn rtx_on_data_sent(&mut self, total: usize, cur: &mut iobuf::Cursor<'_>) {
         if total == 0 || self.rtx_overflow {
             return; // nothing to retain, or coverage already suspended
         }
@@ -1536,7 +1536,7 @@ fn send_super_segment_from_cursor(
     ack: u32,
     flags: u8,
     window: u16,
-    cursor: &mut uni_iobuf::Cursor<'_>,
+    cursor: &mut iobuf::Cursor<'_>,
     payload_len: usize,
 ) {
     let dst_mac = match mac_resolve::resolve(dst_ip) {
@@ -1750,7 +1750,7 @@ fn send_per_mss_fallback(
     ack: u32,
     flags: u8,
     window: u16,
-    cursor: &mut uni_iobuf::Cursor<'_>,
+    cursor: &mut iobuf::Cursor<'_>,
     payload_len: usize,
 ) {
     let mss = mss_for(local_ip);
@@ -1777,7 +1777,7 @@ fn send_segment_from_cursor(
     ack: u32,
     flags: u8,
     window: u16,
-    cursor: &mut uni_iobuf::Cursor<'_>,
+    cursor: &mut iobuf::Cursor<'_>,
     payload_len: usize,
 ) {
     let dst_mac = match mac_resolve::resolve(dst_ip) {
@@ -2074,7 +2074,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             // which is the same core that owns this conn slot, so
             // the reactor's per-worker waker fires the right task.
             let port = c.listener_port;
-            uni_runtime::net::deliver_tcp_ready(port);
+            executor::net::deliver_tcp_ready(port);
         } else if c.state == TcpState::LastAck {
             free_connection(core, slot);
             return;
@@ -2344,15 +2344,15 @@ pub fn listen_on_core(core: u32, port: u16) -> *mut () {
 }
 
 /// Accept a connection on the **current core** by port — the
-/// entry point used by `uni_runtime::net::TcpListener`'s backend
+/// entry point used by `executor::net::TcpListener`'s backend
 /// hook. Returns `TcpStream::NULL` if no connection is ready
 /// on this core.
-pub fn accept_on_port(port: u16) -> uni_runtime::net::TcpStream {
+pub fn accept_on_port(port: u16) -> executor::net::TcpStream {
     accept_on_port_core(kernel_core::cpu_id(), port)
 }
 
-fn accept_on_port_core(core: u32, port: u16) -> uni_runtime::net::TcpStream {
-    use uni_runtime::net::TcpStream;
+fn accept_on_port_core(core: u32, port: u16) -> executor::net::TcpStream {
+    use executor::net::TcpStream;
     let cap = pool_capacity(core);
     for i in 0..cap {
         // SAFETY: per-core ownership.
@@ -2520,7 +2520,7 @@ pub fn async_recv(handle: *mut (), generation: u16, buf: &mut [u8]) -> usize {
 
 /// Park the current task's waker on this conn, to be woken when
 /// data arrives or the peer FINs. Called from
-/// `uni_runtime::net::TcpRecv::poll` on the owning core. A
+/// `executor::net::TcpRecv::poll` on the owning core. A
 /// `generation` mismatch fires the waker immediately so the task
 /// observes closure on its next poll.
 pub fn register_recv_waker(handle: *mut (), generation: u16, waker: &Waker) {
@@ -2695,7 +2695,7 @@ pub fn do_recv_chunk(handle: *mut (), generation: u16) -> Option<IOBuf> {
 pub fn async_try_send_chain(
     handle: *mut (),
     generation: u16,
-    chain: &mut uni_iobuf::IOBufChain,
+    chain: &mut iobuf::IOBufChain,
 ) -> Result<usize, ()> {
     let (core, slot) = decode_handle(handle).ok_or(())?;
     // SAFETY: per-core ownership; the worker that registered this
@@ -2843,9 +2843,9 @@ pub fn clear_send_waker(_handle: *mut (), _generation: u16) {
 mod tests {
     use super::*;
     use core::ptr::NonNull;
+    use iobuf::IOBufDropFn;
     use std::sync::{Mutex, Once};
     use types::Ipv4Addr;
-    use uni_iobuf::IOBufDropFn;
     use uni_net_driver::{CsumOffload, NicOps, set_active_ops};
 
     const SERVER_IP: [u8; 4] = [10, 0, 0, 1];
@@ -2923,7 +2923,7 @@ mod tests {
     fn harness() -> std::sync::MutexGuard<'static, ()> {
         let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         SETUP.call_once(|| {
-            uni_worker::set_num_workers(1);
+            worker::set_num_workers(1);
             super::init(); // TCP per-core pools
             ipv4::init(); // per-core IP-ID counter (the TX path stamps it)
             ethernet::set_our_mac(SERVER_MAC);
@@ -3434,7 +3434,7 @@ mod tests {
         let (handle, generation) = conn_handle(CP, SP);
         clear_tx();
         let body = b"unacked-response-body";
-        let mut chain = uni_iobuf::IOBufChain::from(body.to_vec());
+        let mut chain = iobuf::IOBufChain::from(body.to_vec());
         let sent = super::async_try_send_chain(handle, generation, &mut chain)
             .expect("an established connection accepts the send");
         assert_eq!(sent, body.len(), "the whole body is handed to the wire");
@@ -3496,7 +3496,7 @@ mod tests {
         let (handle, generation) = conn_handle(CP, SP);
         clear_tx();
         let body = b"acked-response";
-        let mut chain = uni_iobuf::IOBufChain::from(body.to_vec());
+        let mut chain = iobuf::IOBufChain::from(body.to_vec());
         super::async_try_send_chain(handle, generation, &mut chain)
             .expect("an established connection accepts the send");
 

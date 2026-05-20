@@ -41,7 +41,7 @@ rust_library(
         "//apps/webserver/dev_certs:dev_cert.der",
         "//apps/webserver/dev_certs:dev_key.der",
     ],
-    crate_name = "uni_tls",
+    crate_name = "tls",
     rustc_flags = [
         # `tls_debug` is the opt-in diagnostic-trace cfg. Declaring
         # any `--check-cfg` turns on cfg-checking for the whole
@@ -76,9 +76,9 @@ rust_library(
     deps = [
         "//crates/api/uni",
         "//crates/crypto/aes-gcm",
+        "//crates/runtime/worker",
         "//crates/transport/http",
         "//crates/util/iobuf",
-        "//crates/runtime/worker",
         "@crates//:aes",
         "@crates//:aes-gcm",
         "@crates//:getrandom",

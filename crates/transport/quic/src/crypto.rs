@@ -31,7 +31,7 @@ use aes_gcm::aes::Aes128;
 use aes_gcm::aes::cipher::BlockEncrypt;
 use aes_gcm::aes::cipher::generic_array::GenericArray;
 
-use uni_tls::schedule::hkdf_expand_label;
+use tls::schedule::hkdf_expand_label;
 
 /// SHA-256 output / key-schedule hash length.
 pub const HASH_LEN: usize = 32;

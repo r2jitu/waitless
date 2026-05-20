@@ -65,7 +65,7 @@ pub struct Field {
 /// "1 alloc per literal field" and "0 allocs per field" on the
 /// H3 request hot path. The H3 server's `RequestSink` (in
 /// `server.rs`) implements this trait by memcpy'ing names and
-/// values straight into the fixed-size `uni_http::Request`
+/// values straight into the fixed-size `http::Request`
 /// header arrays — no intermediate `Field` materialization.
 ///
 /// Pattern matches what nghttp3 / lsqpack / quiche all do; the

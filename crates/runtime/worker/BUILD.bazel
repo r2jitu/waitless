@@ -14,7 +14,7 @@ package(default_visibility = ["//visibility:public"])
 # for task arenas, and by `//crates/runtime/backend` for per-worker timer
 # storage.
 #
-# `CurrentWorker::enter` calls `uni_platform::current_worker()`
+# `CurrentWorker::enter` calls `platform::current_worker()`
 # directly; `uni-platform` is the leaf crate that owns the cfg-
 # gated read.
 rust_library(
@@ -24,7 +24,7 @@ rust_library(
         "src/once.rs",
         "src/timer.rs",
     ],
-    crate_name = "uni_worker",
+    crate_name = "worker",
     deps = ["//crates/runtime/platform"],
 )
 

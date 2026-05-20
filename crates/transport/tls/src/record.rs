@@ -303,7 +303,7 @@ pub fn seal(
 pub fn seal_chain(
     traffic_key: &mut tls::TrafficKey,
     inner_type: u8,
-    src_chain: &mut uni_iobuf::IOBufChain,
+    src_chain: &mut iobuf::IOBufChain,
     dst: &mut [u8],
 ) -> Result<usize, RecordError> {
     let _bracket = bracket(&TLS_ENCRYPT_CYCLES);
@@ -628,13 +628,13 @@ mod tests {
 
         // Multi-part src chain, chosen lengths to exercise the
         // 16-byte AES-GCM block-straddle path through GHASH.
-        let mut src_chain = uni_iobuf::IOBufChain::new();
+        let mut src_chain = iobuf::IOBufChain::new();
         for chunk in &[
             &b"HTTP/1.1 200 OK\r\n"[..],
             &b"Content-Length: 5\r\n\r\n"[..],
             &b"Hello"[..],
         ] {
-            let mut buf = uni_iobuf::IOBuf::new_with_reserved(0, chunk.len(), 0);
+            let mut buf = iobuf::IOBuf::new_with_reserved(0, chunk.len(), 0);
             buf.append_slice(chunk).unwrap();
             src_chain.push_back(buf);
         }
@@ -682,11 +682,11 @@ mod tests {
         // the first call, ~8.7 KiB remains for the second.
         let part1: alloc::vec::Vec<u8> = (0u32..15000).map(|i| i as u8).collect();
         let part2: alloc::vec::Vec<u8> = (0u32..10000).map(|i| (i ^ 0x55) as u8).collect();
-        let mut src_chain = uni_iobuf::IOBufChain::new();
-        let mut b1 = uni_iobuf::IOBuf::new_with_reserved(0, part1.len(), 0);
+        let mut src_chain = iobuf::IOBufChain::new();
+        let mut b1 = iobuf::IOBuf::new_with_reserved(0, part1.len(), 0);
         b1.append_slice(&part1).unwrap();
         src_chain.push_back(b1);
-        let mut b2 = uni_iobuf::IOBuf::new_with_reserved(0, part2.len(), 0);
+        let mut b2 = iobuf::IOBuf::new_with_reserved(0, part2.len(), 0);
         b2.append_slice(&part2).unwrap();
         src_chain.push_back(b2);
         let total_before = src_chain.total_len();

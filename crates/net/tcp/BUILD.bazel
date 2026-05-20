@@ -11,7 +11,7 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "tcp",
     srcs = ["src/lib.rs"],
-    crate_name = "net_tcp",
+    crate_name = "tcp",
     crate_root = "src/lib.rs",
     deps = [
         "//crates/drivers/nic",

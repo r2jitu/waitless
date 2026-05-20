@@ -221,7 +221,7 @@ pub fn fill_bytes(dest: &mut [u8]) {
 // to this `#[no_mangle]` symbol. `kernel_core` is the lower crate and
 // cannot call up into `//kernel`, so it declares the `extern "Rust"`
 // symbol and `//kernel` defines it here — mirroring `__uni_kernel_cpu_id`.
-// This is what lets RNG-dependent host-buildable crates (`net_tcp`'s
+// This is what lets RNG-dependent host-buildable crates (`tcp`'s
 // TCP initial-sequence-number selection) reach the real generator on
 // `os:none` while resolving to a deterministic stream under host
 // unit tests.

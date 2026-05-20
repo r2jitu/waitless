@@ -18,7 +18,7 @@ use std::task::Waker;
 /// Re-export of the shared runtime's executor surface — apps
 /// reach these via `uni::runtime::{spawn,sleep_us,Sleep,…}`.
 pub mod runtime {
-    pub use uni_runtime::{Sleep, has_pending, sleep_us, spawn, tick};
+    pub use executor::{Sleep, has_pending, sleep_us, spawn, tick};
 }
 
 mod tcp;
@@ -793,11 +793,11 @@ fn drain_udp_sibling(fd: i32, app_port: u16) {
         // in memory in network byte order; `to_ne_bytes` extracts
         // those four bytes intact regardless of host endianness.
         let src_octets = src_addr.sin_addr.to_ne_bytes();
-        let src_ip = uni_runtime::ip::IpAddr::V4(uni_runtime::ip::Ipv4Addr {
+        let src_ip = executor::ip::IpAddr::V4(executor::ip::Ipv4Addr {
             addr: u32::from_ne_bytes(src_octets),
         });
         let src_port = u16::from_be(src_addr.sin_port);
-        let _ = uni_runtime::net::deliver_udp(app_port, src_ip, src_port, &buf[..n]);
+        let _ = executor::net::deliver_udp(app_port, src_ip, src_port, &buf[..n]);
     }
 }
 
@@ -840,7 +840,7 @@ unsafe extern "C" fn sigint_handler(_sig: i32) {
 
 /// Native UDP backend vtable. `bind`/`unbind` open and close the
 /// per-port SO_REUSEPORT sibling fds; `send` is the `sendto` path.
-static NATIVE_UDP_BACKEND: uni_runtime::net::UdpBackend = uni_runtime::net::UdpBackend {
+static NATIVE_UDP_BACKEND: executor::net::UdpBackend = executor::net::UdpBackend {
     bind: Some(udp::udp_backend_bind),
     unbind: Some(udp::udp_backend_unbind),
     send: udp::udp_send,
@@ -871,8 +871,8 @@ fn init_native() {
         // Publish to `uni-worker` so all `PerWorker<T>` users size
         // themselves correctly, then init the shared runtime's
         // per-worker tables (timer wheels + task arenas).
-        uni_worker::set_num_workers(num_threads as u32);
-        uni_runtime::init(num_threads as u32);
+        worker::set_num_workers(num_threads as u32);
+        executor::init(num_threads as u32);
 
         let threads = &mut *THREADS.0.get();
         for i in 0..num_threads {
@@ -890,8 +890,8 @@ fn init_native() {
     }
 
     // Wire the UDP + TCP reactors. Each module owns its vtable.
-    uni_runtime::net::register_udp_backend(&NATIVE_UDP_BACKEND);
-    uni_runtime::net::register_tcp_backend(&tcp::NATIVE_TCP_BACKEND);
+    executor::net::register_udp_backend(&NATIVE_UDP_BACKEND);
+    executor::net::register_tcp_backend(&tcp::NATIVE_TCP_BACKEND);
 
     // Register TCP/UDP polling as the first IO poll callback.
     // Runs on every worker's event-loop tick and drains the worker's
@@ -981,11 +981,11 @@ pub fn request_shutdown() {
 }
 
 pub fn wait_for_events() {
-    thread_state(uni_platform::current_worker()).wait_for_events();
+    thread_state(platform::current_worker()).wait_for_events();
 }
 
 pub fn poll_events() -> bool {
-    thread_state(uni_platform::current_worker()).poll_events()
+    thread_state(platform::current_worker()).poll_events()
 }
 
 pub fn num_workers() -> u32 {
@@ -1110,7 +1110,7 @@ pub fn run_worker(worker_id: u32) {
         // 2a. Async runtime: every worker advances its own timer
         // list and polls its own arena — same per-core pattern as
         // the unikernel, driven by `//uni-runtime` under the hood.
-        if uni_runtime::tick(worker_id) {
+        if executor::tick(worker_id) {
             did_work = true;
         }
 
@@ -1134,7 +1134,7 @@ unsafe extern "Rust" {
 
 extern "C" fn worker_thread(arg: *mut u8) -> *mut u8 {
     let tid = arg as u32;
-    uni_platform::set_current_worker(tid);
+    platform::set_current_worker(tid);
 
     // Workers call the same service_core() as the unikernel APs.
     // The Server is set up by the main thread before workers start.
@@ -1213,7 +1213,7 @@ pub fn run(config: RunConfig) -> i32 {
         }
 
         // Main thread is worker 0
-        uni_platform::set_current_worker(0);
+        platform::set_current_worker(0);
         native_worker_loop(0);
 
         // Join workers
@@ -1234,7 +1234,7 @@ pub fn run(config: RunConfig) -> i32 {
 /// Called by each worker thread (including main).
 #[unsafe(no_mangle)]
 pub extern "C" fn native_worker_loop(thread_id: u32) {
-    uni_platform::set_current_worker(thread_id);
+    platform::set_current_worker(thread_id);
     run_worker(thread_id);
 }
 

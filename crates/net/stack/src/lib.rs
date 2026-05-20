@@ -11,25 +11,25 @@
 #![no_std]
 
 extern crate alloc;
+extern crate executor;
+extern crate iobuf;
 extern crate nic;
-extern crate uni_iobuf;
 extern crate uni_kernel;
-extern crate uni_runtime;
 
 extern crate net_classify;
 
-pub extern crate net_arp as arp;
-pub extern crate net_dhcp as dhcp;
-pub extern crate net_ethernet as ethernet;
-pub extern crate net_ethernet_send as ethernet_send;
-pub extern crate net_icmpv6 as icmpv6;
-pub extern crate net_ipv4 as ipv4;
-pub extern crate net_ipv6 as ipv6;
-pub extern crate net_ipv6_send as ipv6_send;
-pub extern crate net_ndp as ndp;
-pub extern crate net_tcp as tcp;
+pub extern crate arp as arp;
+pub extern crate dhcp as dhcp;
+pub extern crate ethernet as ethernet;
+pub extern crate ethernet_send as ethernet_send;
+pub extern crate icmpv6 as icmpv6;
+pub extern crate ipv4 as ipv4;
+pub extern crate ipv6 as ipv6;
+pub extern crate ipv6_send as ipv6_send;
+pub extern crate ndp as ndp;
 pub extern crate net_types as types;
-pub extern crate net_udp as udp;
+pub extern crate tcp as tcp;
+pub extern crate udp as udp;
 
 use uni_kernel::percpu;
 
@@ -52,7 +52,7 @@ pub use crate::sched::{init_eventloop, poll};
 /// plumbing is wired through anyway for forward-compatibility
 /// with a future TX-backpressure implementation. `unlisten` is
 /// `None` — there's no per-listener teardown on bare-metal today.
-static BARE_TCP_BACKEND: uni_runtime::net::TcpBackend = uni_runtime::net::TcpBackend {
+static BARE_TCP_BACKEND: executor::net::TcpBackend = executor::net::TcpBackend {
     listen: tcp_backend_listen,
     accept: tcp_backend_accept,
     unlisten: None,
@@ -85,7 +85,7 @@ fn bare_shutdown_all() {
 
 /// Bare-metal UDP backend vtable. No `bind` / `unbind` — routing
 /// is purely `UDP_REGISTRY` lookups on the NIC RX path.
-static BARE_UDP_BACKEND: uni_runtime::net::UdpBackend = uni_runtime::net::UdpBackend {
+static BARE_UDP_BACKEND: executor::net::UdpBackend = executor::net::UdpBackend {
     bind: None,
     unbind: None,
     send: udp::send,
@@ -110,10 +110,10 @@ pub fn init_stack() {
     // owns its own per-port accept pool); accept reads the
     // current core's pool and returns the first Established+
     // !accepted conn.
-    uni_runtime::net::register_tcp_backend(&BARE_TCP_BACKEND);
+    executor::net::register_tcp_backend(&BARE_TCP_BACKEND);
     // UDP backend — `UdpSocket::send_to` hands datagrams to the
     // protocol stack via `udp::send`.
-    uni_runtime::net::register_udp_backend(&BARE_UDP_BACKEND);
+    executor::net::register_udp_backend(&BARE_UDP_BACKEND);
 }
 
 fn tcp_backend_listen(port: u16) -> Result<(), ()> {
@@ -131,7 +131,7 @@ fn tcp_backend_listen(port: u16) -> Result<(), ()> {
     Ok(())
 }
 
-fn tcp_backend_accept(port: u16) -> uni_runtime::net::TcpStream {
+fn tcp_backend_accept(port: u16) -> executor::net::TcpStream {
     tcp::accept_on_port(port)
 }
 

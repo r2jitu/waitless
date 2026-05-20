@@ -10,7 +10,7 @@
 use core::mem::size_of;
 use core::ptr;
 
-use uni_drivers::log;
+use bus::log;
 use uni_kernel::sync::Spinlock;
 
 use crate::{host_dma_fence, log_hex32, put_be32, read_be32, reg_read32, reg_write32};

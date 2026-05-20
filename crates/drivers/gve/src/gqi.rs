@@ -17,8 +17,8 @@
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
-use uni_drivers::mmio_write32;
-use uni_iobuf::{Chain, OwnedIOBuf};
+use bus::mmio_write32;
+use iobuf::{Chain, OwnedIOBuf};
 
 use crate::{
     _GVE_RX_PAD, BAR2_VA, COUNTER_ARRAY_VA, DEFERRED_KICK, GQI_RECYCLE_POOL_EXHAUSTED,
@@ -717,7 +717,7 @@ pub(crate) fn submit_tx_udp_gso_inner(
 /// unlike DQO — it cannot lend a device QPL page up the stack and
 /// rely on an auto-repost when the chain drops. Instead each frame
 /// is copied into a slab from the queue's recycle pool
-/// ([`uni_iobuf::IOBufPool`]); the device page is reposted in the
+/// ([`iobuf::IOBufPool`]); the device page is reposted in the
 /// batch-end `fill_cnt` advance + doorbell below, and the *slab*
 /// travels up the stack, recycling to the pool when its IOBuf
 /// drops. `consumed` counts completions drained (= device buffers

@@ -56,7 +56,7 @@
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use uni_worker::{PerWorker, num_workers};
+use worker::{PerWorker, num_workers};
 
 /// Type-erased launcher closure. Captures any state needed for the
 /// per-worker fan-out (typically `Arc`s shared with the owning

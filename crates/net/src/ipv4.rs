@@ -192,7 +192,7 @@ mod tests {
         // not reject it — it clamps the part-0 payload view to the
         // bytes present and leaves the rest to `tcp_receive`'s chain
         // walk. (The real function — the parallel-logic check in
-        // `protocol_tests.rs` predates `net_ipv4` being host-testable.)
+        // `protocol_tests.rs` predates `ipv4` being host-testable.)
         let mut f = [0u8; 24]; // 20-byte header + 4 payload bytes
         f[0] = 0x45;
         f[2..4].copy_from_slice(&50_000u16.to_be_bytes());

@@ -53,9 +53,9 @@ use core::cell::RefCell;
 use core::mem::ManuallyDrop;
 use core::ptr::addr_of_mut;
 
-use uni_worker::{CurrentWorker, WorkerLocal};
+use worker::{CurrentWorker, WorkerLocal};
 
-use uni_http::{IOBuf, IOBufChain};
+use http::{IOBuf, IOBufChain};
 
 // Sans-io TLS primitives (formerly //net:tls{,_crypto,_handshake,_record}).
 // Pub because //uni-quic reaches into `schedule`, `aead`, `handshake`
@@ -163,7 +163,7 @@ pub enum ListenError {
 
 /// One-call HTTPS listener. Parses `cert_der` + `key_der`, binds
 /// TCP on `port`, accepts each connection, wraps it in a
-/// `TlsStream`, and drives `uni_http::serve_conn` on top.
+/// `TlsStream`, and drives `http::serve_conn` on top.
 ///
 /// Apps that want to advertise an HTTP/3 endpoint via `Alt-Svc`
 /// emit it themselves per-response — read `req.host_port()` and
@@ -179,9 +179,9 @@ pub fn listen<H>(
 ) -> Result<(), ListenError>
 where
     H: for<'a, 'b> AsyncFn(
-            &'a uni_http::Request,
-            &'a mut uni_http::BodyReader<'b, TlsStream>,
-        ) -> uni_http::Response
+            &'a http::Request,
+            &'a mut http::BodyReader<'b, TlsStream>,
+        ) -> http::Response
         + Send
         + Sync
         + 'static,
@@ -201,7 +201,7 @@ where
             uni::rng::fill_bytes(&mut seed);
             let tls = build_tls_conn(seed, cfg, pool);
             let stream = TlsStream::new(tcp, tls);
-            uni_http::serve_conn(handler, stream).await;
+            http::serve_conn(handler, stream).await;
         }
     });
     uni::_retain(h);
@@ -404,7 +404,7 @@ impl PooledTlsConn {
 
     fn seal_app_data(
         &mut self,
-        src_chain: &mut uni_iobuf::IOBufChain,
+        src_chain: &mut iobuf::IOBufChain,
         dst: &mut [u8],
     ) -> Result<usize, ()> {
         self.inner.tls.seal_app_data(src_chain, dst).map_err(|_| ())
@@ -608,7 +608,7 @@ impl TlsStream {
     }
 }
 
-impl uni_http::HttpStream for TlsStream {
+impl http::HttpStream for TlsStream {
     async fn recv(&mut self, buf: &mut [u8]) -> usize {
         loop {
             // Try plaintext first — `pump_rx` may have decrypted

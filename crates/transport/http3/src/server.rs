@@ -6,7 +6,7 @@
 //      with no entries (defaults are fine).
 //   2. For each accepted peer stream:
 //      - Bidi (id & 0x3 == 0): a request stream. Read HEADERS +
-//        DATA frames until FIN, build `uni_http::Request`, hand
+//        DATA frames until FIN, build `http::Request`, hand
 //        to the user handler, encode response (HEADERS + DATA +
 //        FIN), close stream.
 //      - Uni (id & 0x3 == 0x2): peer's control / QPACK encoder /
@@ -22,9 +22,9 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use uni_quic::{QuicConn, QuicListenError, quic_listen};
+use quic::{QuicConn, QuicListenError, quic_listen};
 
-use uni_http::{BodyReader, Method, NullStream, Request, Response};
+use http::{BodyReader, Method, NullStream, Request, Response};
 
 use crate::frame::{self, ftype as h3_ftype};
 use crate::qpack::{self, FieldSink};
@@ -37,7 +37,7 @@ const STREAM_TYPE_QPACK_DECODER: u64 = 0x03;
 
 #[derive(Debug)]
 pub enum ListenError {
-    Bind(uni_quic::QuicListenError),
+    Bind(quic::QuicListenError),
     CertOrKey,
 }
 
@@ -55,7 +55,7 @@ impl From<QuicListenError> for ListenError {
 /// `handler` returns a `Response`; the framework sends it back as
 /// HEADERS + DATA + FIN on the request stream.
 ///
-/// `cert_der` and `key_pkcs8_der` are the same blobs `uni_tls::
+/// `cert_der` and `key_pkcs8_der` are the same blobs `tls::
 /// acceptor` accepts.
 ///
 /// Returns once the server is bound; the listener stays alive for
@@ -80,7 +80,7 @@ where
     //   * `huffman::preinit` builds the QPACK static Huffman
     //     decoder tree (~4 KiB Vec) that's otherwise allocated
     //     on the first decoded request header.
-    //   * `uni_quic::preinit` (which delegates to uni_tls)
+    //   * `quic::preinit` (which delegates to tls)
     //     exercises the RustCrypto primitives (p256 sign +
     //     verify, ChaCha20-Poly1305 seal + open, X25519 ECDH)
     //     so any internal precomputed-table allocations on
@@ -90,7 +90,7 @@ where
     // a fixed cushion (~12 KiB / ~10 allocs in measurements
     // before this lands); with them it can demand `delta == 0`.
     crate::huffman::preinit();
-    uni_quic::preinit();
+    quic::preinit();
 
     let handler = Arc::new(handler);
     let listener = quic_listen(port, cert_der, key_pkcs8_der, move |conn: QuicConn| {
@@ -306,7 +306,7 @@ impl FramingPool {
     /// starts empty; caller writes via `extend_uninit` /
     /// `append_slice` / `prepend` and the IOBuf releases its
     /// storage back to this pool when it drops.
-    fn take(self: &alloc::sync::Arc<Self>) -> uni_http::IOBuf {
+    fn take(self: &alloc::sync::Arc<Self>) -> http::IOBuf {
         // Pop existing storage, or allocate fresh if pool is empty.
         let storage = self
             .bufs
@@ -336,7 +336,7 @@ impl FramingPool {
         // framing buffer is genuinely owned heap storage, so the
         // widening is the infallible, zero-copy `From<OwnedIOBuf>`.
         unsafe {
-            uni_http::OwnedIOBuf::wrap_owned(
+            http::OwnedIOBuf::wrap_owned(
                 base,
                 FRAMING_BUF_SIZE as u32,
                 0,
@@ -383,7 +383,7 @@ where
     // sequence: HEADERS frame, then 0+ DATA frames, then FIN.
     //
     // Buffer cap: enough for our worst-case single request (path +
-    // headers + small body). Match `uni_http::Request`'s 8 KiB body.
+    // headers + small body). Match `http::Request`'s 8 KiB body.
     // `scratch` is per-conn; we clear and reuse capacity across
     // requests on the same connection.
     const RECV_CAP: usize = 16 * 1024;
@@ -700,7 +700,7 @@ fn write_response(
 /// IOBufs natively, so we move the chunk through without
 /// converting to a Vec — preserves any reserved
 /// headroom/tailroom for layers below to prepend / append.
-fn queue_chunk(conn: &QuicConn, sid: u64, b: uni_http::IOBuf) {
+fn queue_chunk(conn: &QuicConn, sid: u64, b: http::IOBuf) {
     conn.send_iobuf(sid, b);
 }
 

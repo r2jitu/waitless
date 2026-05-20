@@ -2,9 +2,9 @@
 //
 // Layer 2 wire format only: MAC addresses, the frame header, parse,
 // and in-place header fill. Pure — no driver dependency — so this
-// is a host-testable leaf crate (the `net_ipv6` model). The
+// is a host-testable leaf crate (the `ipv6` model). The
 // os:none send path (`ethernet_send`, `init_mac`) lives in the
-// sibling `net_ethernet_send` crate, which depends on this one plus
+// sibling `ethernet_send` crate, which depends on this one plus
 // `//drivers`.
 
 #![cfg_attr(not(test), no_std)]
@@ -34,12 +34,12 @@ unsafe impl FromBytes for EthernetHeader {}
 /// Cached MAC address. Packed into the low 48 bits of an `AtomicU64` so
 /// the cross-core publish is data-race-free without depending on
 /// `uni_kernel::once::InitOnce` (this leaf crate has no kernel dep).
-/// `net_ethernet_send::init_mac` writes it once on the BSP after virtio-net
+/// `ethernet_send::init_mac` writes it once on the BSP after virtio-net
 /// init via `set_our_mac`; readers on every core load via Acquire.
 static OUR_MAC_PACKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Store the NIC's MAC into the cross-core cache. Called once at boot
-/// by `net_ethernet_send::init_mac`, which reads the MAC from the driver —
+/// by `ethernet_send::init_mac`, which reads the MAC from the driver —
 /// the store lives here because the cache static and its readers do.
 pub fn set_our_mac(bytes: [u8; 6]) {
     let packed = (bytes[0] as u64)

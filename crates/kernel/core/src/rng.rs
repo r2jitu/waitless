@@ -2,7 +2,7 @@
 //
 // `fill_bytes` is the entropy entry point for the host-buildable
 // crates that sit below `//uni` and so cannot reach the `uni::rng`
-// seam — chiefly `net_tcp`, which draws its TCP initial sequence
+// seam — chiefly `tcp`, which draws its TCP initial sequence
 // number here.
 //
 // It mirrors the `cpu_id` link seam:

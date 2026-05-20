@@ -18,7 +18,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use uni_worker::{CurrentWorker, PerWorker};
+use worker::{CurrentWorker, PerWorker};
 
 // ---- Task arena ------------------------------------------------------------
 
@@ -218,7 +218,7 @@ fn waker_wake_by_ref(data: *const ()) {
     let packed = data as usize;
     let slot_idx = packed & WAKER_SLOT_MASK;
     let worker_id = (packed >> WAKER_WORKER_SHIFT) as u32;
-    if worker_id >= uni_worker::num_workers() || slot_idx >= TASKS_PER_WORKER {
+    if worker_id >= worker::num_workers() || slot_idx >= TASKS_PER_WORKER {
         return;
     }
     let prev = ARENAS
@@ -234,8 +234,8 @@ fn waker_wake_by_ref(data: *const ()) {
     //     mid-tick or about to tick — another bit doesn't change
     //     the wake semantics, and an extra IPI per packet under
     //     heavy load just adds overhead).
-    if prev == 0 && worker_id != uni_platform::current_worker() {
-        uni_platform::wake_worker(worker_id);
+    if prev == 0 && worker_id != platform::current_worker() {
+        platform::wake_worker(worker_id);
     }
 }
 
@@ -256,7 +256,7 @@ fn make_waker_for(worker_id: u32, slot_idx: usize) -> Waker {
 /// ready slot in its arena. Backends call this once per event-loop
 /// iteration.
 pub fn tick(worker_id: u32) -> bool {
-    if worker_id >= uni_worker::num_workers() {
+    if worker_id >= worker::num_workers() {
         return false;
     }
     // SAFETY: caller guarantees `worker_id` is the running worker.
@@ -319,7 +319,7 @@ pub fn tick(worker_id: u32) -> bool {
 /// They are not concurrently writing to their arenas during this
 /// window, so cross-worker mutable access is race-free.
 pub fn drain_all_arenas() {
-    let n = uni_worker::num_workers();
+    let n = worker::num_workers();
     for worker_id in 0..n {
         let arena = ARENAS.at(worker_id);
         for slot in arena.slots.iter() {
@@ -344,7 +344,7 @@ pub fn drain_all_arenas() {
 /// True if the worker has outstanding async work — either a
 /// scheduled timer in its wheel or a task slot flagged ready.
 pub fn has_pending(worker_id: u32) -> bool {
-    if worker_id >= uni_worker::num_workers() {
+    if worker_id >= worker::num_workers() {
         return false;
     }
     // SAFETY: caller guarantees `worker_id` is the running worker.

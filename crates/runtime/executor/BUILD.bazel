@@ -4,7 +4,7 @@ load("//bazel/rules:rust.bzl", "rust_doc_test", "rust_test")
 package(default_visibility = ["//visibility:public"])
 
 # Shared async runtime — task arena + Waker + Sleep. Calls
-# `uni_platform::now_ticks()` directly for time reads; no register/
+# `platform::now_ticks()` directly for time reads; no register/
 # plug-in indirection. Future reactor hooks (P4 UDP, P5 TCP) that
 # carry waker state will land here with their own mechanism.
 rust_library(
@@ -20,13 +20,13 @@ rust_library(
         "src/sleep.rs",
         "src/task.rs",
     ],
-    crate_name = "uni_runtime",
+    crate_name = "executor",
     deps = [
-        "//crates/net:types",
-        "//crates/util/iobuf",
         "//crates/drivers/nic-api",
+        "//crates/net:types",
         "//crates/runtime/platform",
         "//crates/runtime/worker",
+        "//crates/util/iobuf",
     ],
 )
 

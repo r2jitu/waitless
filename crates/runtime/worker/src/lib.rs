@@ -5,7 +5,7 @@
 // `CurrentWorker` — zero-sized token whose existence proves the holder
 // is running on a specific worker (core on bare-metal, POSIX thread
 // on native). `!Send + !Sync` so it cannot migrate. Obtained via
-// `CurrentWorker::enter()`, which calls `uni_platform::current_worker()`
+// `CurrentWorker::enter()`, which calls `platform::current_worker()`
 // directly — cfg-gated asm on bare-metal, thread-local on native.
 //
 // `PerWorker<T>` — typed array of slots indexed by worker id, sized at
@@ -78,21 +78,21 @@ pub struct CurrentWorker {
 }
 
 impl CurrentWorker {
-    /// Read the current worker id from `uni_platform` and bind it
+    /// Read the current worker id from `platform` and bind it
     /// into a token.
     #[inline(always)]
     pub fn enter() -> Self {
         CurrentWorker {
-            id: uni_platform::current_worker(),
+            id: platform::current_worker(),
             _not_send: PhantomData,
         }
     }
 
     /// Construct a token from a worker id the caller already knows
     /// matches the current worker (e.g. threaded through from an
-    /// event-loop callback dispatch). Saves the `uni_platform` read.
+    /// event-loop callback dispatch). Saves the `platform` read.
     ///
-    /// SAFETY: caller must guarantee that `id == uni_platform::
+    /// SAFETY: caller must guarantee that `id == platform::
     /// current_worker()` at the time of the call AND that the token
     /// does not outlive the iteration (which can never cross threads
     /// because `CurrentWorker` is `!Send`).

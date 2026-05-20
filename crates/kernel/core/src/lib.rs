@@ -33,7 +33,7 @@ pub mod types;
 /// `kernel_core` is the lower crate and cannot call up into the
 /// arch modules, so it declares the symbol and `//kernel` defines
 /// it. On a host build there is one logical CPU, so it is `0` —
-/// which is what makes `net_tcp` (a `cpu_id` caller) host-testable.
+/// which is what makes `tcp` (a `cpu_id` caller) host-testable.
 ///
 /// Compile-time `cfg`, not a function pointer: the per-packet
 /// callers (`tcp_receive`, the Tier-2 RX distributor) pay nothing

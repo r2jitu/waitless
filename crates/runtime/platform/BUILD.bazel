@@ -11,5 +11,5 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "platform",
     srcs = ["src/lib.rs"],
-    crate_name = "uni_platform",
+    crate_name = "platform",
 )

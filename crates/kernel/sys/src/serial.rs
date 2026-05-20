@@ -541,7 +541,7 @@ pub fn init() {
 }
 
 /// Try to upgrade the early-boot console to virtio-console-pci.
-/// Caller must run this AFTER `uni_drivers::pci::init()` has
+/// Caller must run this AFTER `bus::pci::init()` has
 /// populated the PCI device table. Returns `true` if the upgrade
 /// succeeded — caller can use this to log a "console:
 /// virtio-console-pci" diagnostic.

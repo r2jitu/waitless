@@ -289,7 +289,7 @@ pub struct ClientHello<'a> {
     /// Raw bytes of the `quic_transport_parameters` extension if
     /// the client sent one. `None` for plain TLS-over-TCP CHs;
     /// QUIC clients always include this. The server interprets
-    /// the bytes via `uni_quic::transport_params::parse_client_params`.
+    /// the bytes via `quic::transport_params::parse_client_params`.
     pub quic_transport_parameters: Option<&'a [u8]>,
     /// Raw bytes of the `application_layer_protocol_negotiation`
     /// extension's body if the client offered ALPN. The body is

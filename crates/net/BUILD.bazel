@@ -66,7 +66,7 @@ rust_test(
 rust_library(
     name = "ethernet",
     srcs = ["src/ethernet.rs"],
-    crate_name = "net_ethernet",
+    crate_name = "ethernet",
     crate_root = "src/ethernet.rs",
     deps = [
         ":from_bytes",
@@ -87,7 +87,7 @@ rust_test(
 rust_library(
     name = "ethernet_send",
     srcs = ["src/ethernet_send.rs"],
-    crate_name = "net_ethernet_send",
+    crate_name = "ethernet_send",
     crate_root = "src/ethernet_send.rs",
     deps = [
         ":ethernet",
@@ -99,7 +99,7 @@ rust_library(
 rust_library(
     name = "arp",
     srcs = ["src/arp.rs"],
-    crate_name = "net_arp",
+    crate_name = "arp",
     crate_root = "src/arp.rs",
     deps = [
         ":ethernet",
@@ -118,7 +118,7 @@ rust_library(
 rust_library(
     name = "ipv4",
     srcs = ["src/ipv4.rs"],
-    crate_name = "net_ipv4",
+    crate_name = "ipv4",
     crate_root = "src/ipv4.rs",
     deps = [
         ":checksum",
@@ -142,7 +142,7 @@ rust_test(
 rust_library(
     name = "ipv6",
     srcs = ["src/ipv6.rs"],
-    crate_name = "net_ipv6",
+    crate_name = "ipv6",
     crate_root = "src/ipv6.rs",
     deps = [
         ":from_bytes",
@@ -163,7 +163,7 @@ rust_test(
 rust_library(
     name = "icmpv6",
     srcs = ["src/icmpv6.rs"],
-    crate_name = "net_icmpv6",
+    crate_name = "icmpv6",
     crate_root = "src/icmpv6.rs",
     deps = [
         ":checksum",
@@ -183,7 +183,7 @@ rust_test(
 rust_library(
     name = "ndp",
     srcs = ["src/ndp.rs"],
-    crate_name = "net_ndp",
+    crate_name = "ndp",
     crate_root = "src/ndp.rs",
     deps = [
         ":types",
@@ -205,7 +205,7 @@ rust_test(
 rust_library(
     name = "mac_resolve",
     srcs = ["src/mac_resolve.rs"],
-    crate_name = "net_mac_resolve",
+    crate_name = "mac_resolve",
     crate_root = "src/mac_resolve.rs",
     deps = [
         ":arp",
@@ -224,7 +224,7 @@ rust_library(
 rust_library(
     name = "ipv6_send",
     srcs = ["src/ipv6_send.rs"],
-    crate_name = "net_ipv6_send",
+    crate_name = "ipv6_send",
     crate_root = "src/ipv6_send.rs",
     deps = [
         ":ethernet",
@@ -242,7 +242,7 @@ rust_library(
 rust_library(
     name = "udp",
     srcs = ["src/udp.rs"],
-    crate_name = "net_udp",
+    crate_name = "udp",
     crate_root = "src/udp.rs",
     deps = [
         ":checksum",
@@ -254,9 +254,9 @@ rust_library(
         ":mac_resolve",
         ":types",
         "//crates/drivers/nic",
-        "//crates/util/iobuf",
         "//crates/drivers/nic-api",
         "//crates/runtime/executor",
+        "//crates/util/iobuf",
     ],
 )
 
@@ -273,7 +273,7 @@ rust_library(
         "src/dhcp.rs",
         "src/dhcp_parse.rs",
     ],
-    crate_name = "net_dhcp",
+    crate_name = "dhcp",
     crate_root = "src/dhcp.rs",
     deps = [
         ":arp",

@@ -302,7 +302,7 @@ pub enum SendState {
 /// Per-stream send state. The connection layer drives
 /// `pop_chunk_into` on each outbound 1-RTT packet build.
 ///
-/// Outbound bytes are held as a chain of [`uni_iobuf::IOBuf`]
+/// Outbound bytes are held as a chain of [`iobuf::IOBuf`]
 /// chunks — static-borrowed, heap-owned, or (in future) shared
 /// with refcount. `head_consumed` tracks how many bytes of the
 /// FRONT chunk have already been emitted in prior pop_chunk_into
@@ -319,7 +319,7 @@ pub enum SendState {
 /// the headroom; it just passes the IOBuf along.
 pub struct SendStream {
     /// Outbound chunks, FIFO. Empty payloads are not pushed.
-    pub outbound: alloc::collections::VecDeque<uni_iobuf::IOBuf>,
+    pub outbound: alloc::collections::VecDeque<iobuf::IOBuf>,
     /// Bytes already emitted from the head chunk's front.
     /// `0..head_consumed` of `outbound[0]` is "drained";
     /// `head_consumed..` is the remaining bytes. Reset to 0
@@ -368,7 +368,7 @@ impl SendStream {
     /// Canonical append. Takes any pre-built [`IOBuf`] (static
     /// borrow, heap-owned, with or without reserved
     /// headroom/tailroom) and queues it.
-    pub fn write_iobuf(&mut self, data: uni_iobuf::IOBuf) {
+    pub fn write_iobuf(&mut self, data: iobuf::IOBuf) {
         if matches!(self.state, SendState::FinSent) || data.is_empty() {
             return;
         }
@@ -380,7 +380,7 @@ impl SendStream {
     /// capacity (typical for `Vec::with_capacity` + extend
     /// flows); otherwise `into_boxed_slice` may shrink-realloc.
     pub fn write_owned(&mut self, data: Vec<u8>) {
-        self.write_iobuf(uni_iobuf::IOBuf::from(data));
+        self.write_iobuf(iobuf::IOBuf::from(data));
     }
 
     pub fn close(&mut self) {

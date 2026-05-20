@@ -12,7 +12,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use uni_worker::InitOnce;
+use worker::InitOnce;
 
 /// Description of one network interface as reported at boot.
 #[derive(Clone, Debug, PartialEq, Eq)]

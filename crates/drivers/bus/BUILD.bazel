@@ -14,7 +14,7 @@ rust_library(
         "src/virtio.rs",
         "src/virtio_console.rs",
     ],
-    crate_name = "uni_drivers",
+    crate_name = "bus",
     crate_root = "src/lib.rs",
     deps = [
         "//crates/kernel/sys",

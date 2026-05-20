@@ -6,7 +6,7 @@
 pub mod error;
 pub use error::{DhcpError, NetError, NicError};
 
-pub use uni_iobuf::{Chain, IOBuf, IOBufChain, OwnedIOBuf};
+pub use iobuf::{Chain, IOBuf, IOBufChain, OwnedIOBuf};
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 

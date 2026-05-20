@@ -136,13 +136,13 @@ static INIT: AtomicU8 = AtomicU8::new(0); // 0=fresh 1=building 2=ready
 static mut TREE: Option<Tree> = None;
 
 /// Force the lazy Huffman tree to build now. Idempotent. Called
-/// from `uni_http3::listen` so the ~4 KiB tree allocation lands
+/// from `http3::listen` so the ~4 KiB tree allocation lands
 /// in the heap *before* `uni::set_ready` snapshots HEAP_BASELINE
 /// — without this, the first H3 request charges the alloc to
 /// the leak-check delta as a one-time first-use cost and trips
 /// `HEAP_LEAK_CHECK LEAK` for tests that run a single conn.
 ///
-/// Paired with [`uni_tls::preinit`] / [`uni_quic::preinit`] —
+/// Paired with [`tls::preinit`] / [`quic::preinit`] —
 /// same deterministic-startup contract.
 pub fn preinit() {
     let _ = ensure_tree();

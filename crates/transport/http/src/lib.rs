@@ -2,24 +2,22 @@
 // accepts, reads, parses, dispatches, and writes back.
 //
 // Per-core listener + connection set; routes are shared read-only.
-// This crate is TLS-agnostic: HTTPS lives in `uni_tls`, which
+// This crate is TLS-agnostic: HTTPS lives in `tls`, which
 // defines its own `HttpStream` impl (TLS over TCP) and calls
 // `serve_conn` to drive the same request/response machinery.
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+extern crate iobuf;
 extern crate uni;
-extern crate uni_iobuf;
 
-// Re-export the shared IOBuf primitive so `uni_http::IOBuf` /
-// `uni_http::IOBufChain` keep working at every existing call
+// Re-export the shared IOBuf primitive so `http::IOBuf` /
+// `http::IOBufChain` keep working at every existing call
 // site. The crate moved out so `uni-quic` (transport, can't
 // depend on `uni-http`) can use the same type without crossing
 // the transport↛app dependency boundary.
-pub use uni_iobuf::{
-    Cursor as IOBufCursor, IOBuf, IOBufChain, IOBufError, IOBufWriter, OwnedIOBuf,
-};
+pub use iobuf::{Cursor as IOBufCursor, IOBuf, IOBufChain, IOBufError, IOBufWriter, OwnedIOBuf};
 
 use alloc::sync::Arc;
 use core::marker::PhantomData;
@@ -52,7 +50,7 @@ use core::marker::PhantomData;
 ///
 /// ```ignore
 /// async fn page(_req: &Request) -> Response {
-///     let mut body = uni_http::body_iobuf(12 * 1024);
+///     let mut body = http::body_iobuf(12 * 1024);
 ///     {
 ///         let mut w = body.writer();
 ///         // render content
@@ -757,7 +755,7 @@ const IDLE_TIMEOUT_US: u64 = 30_000_000;
 //
 // `HttpStream` is the byte-level interface the conn handler uses
 // to talk to a peer. Plain HTTP impls it directly over
-// `TcpStream`; HTTPS impls it via `uni_tls::TlsStream`, which
+// `TcpStream`; HTTPS impls it via `tls::TlsStream`, which
 // pumps the TLS state machine inside `recv` / `send` so the
 // handler stays protocol-agnostic.
 //
@@ -795,7 +793,7 @@ pub trait HttpStream {
     /// request body to the HTTP layer pre-buffered ([`NullStream`],
     /// the HTTP/3 case) has no streaming chunk path, and
     /// `BodyReader` then serves the body from its prebuf alone.
-    /// `uni::runtime::TcpStream` and `uni_tls::TlsStream` override
+    /// `uni::runtime::TcpStream` and `tls::TlsStream` override
     /// this with their real `recv_chunk` implementations.
     ///
     /// `&mut self` is load-bearing, not incidental — the returned
@@ -957,8 +955,8 @@ where
 /// idle timeout fires, or the buffer overflows on a too-large
 /// request.
 ///
-/// Public so transport-specific listeners (HTTPS in `uni_tls`,
-/// HTTP/3 in `uni_http3`) can drive their own `HttpStream` impls
+/// Public so transport-specific listeners (HTTPS in `tls`,
+/// HTTP/3 in `http3`) can drive their own `HttpStream` impls
 /// through the same request/response machinery.
 pub async fn serve_conn<S, H>(handler: Arc<H>, mut stream: S)
 where

@@ -5,4 +5,4 @@
 // cross-worker MPSC. Callers inside the kernel keep using
 // `uni_kernel::timer::…` unchanged.
 
-pub use uni_worker::timer::{Timer, TimerWheel};
+pub use worker::timer::{Timer, TimerWheel};

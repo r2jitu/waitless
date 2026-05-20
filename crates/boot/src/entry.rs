@@ -14,9 +14,9 @@ extern crate alloc;
 
 use core::ptr;
 
+extern crate bus;
 extern crate nic;
 extern crate uni;
-extern crate uni_drivers;
 extern crate uni_kernel;
 extern crate uni_net_stack as net;
 
@@ -467,12 +467,9 @@ unsafe fn kernel_boot(info: &BootInfo) {
         #[cfg(target_arch = "x86_64")]
         klog!("console: 16550 UART @ COM1\n");
 
-        uni_drivers::pci::init();
-        klog!(
-            "pci: {} devices on bus 0\n",
-            uni_drivers::pci::device_count()
-        );
-        uni_drivers::pci::log_devices();
+        bus::pci::init();
+        klog!("pci: {} devices on bus 0\n", bus::pci::device_count());
+        bus::pci::log_devices();
 
         // Two-stage console: 16550 (x86) gives us early-boot output
         // before the PCI bus is scanned; once `pci::init` completes we

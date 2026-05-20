@@ -212,7 +212,7 @@ def unikernel_binary(
           `UNIKERNEL_CPUS`.
         build_native: when True (the default), also emit a
           `<name>_native` rust_binary that links the app against
-          libstd and the `uni_backend` POSIX impl. Kernel-only
+          libstd and the `backend` POSIX impl. Kernel-only
           smoke tests (test_smp, test_percpu) whose `app` depends on
           `//kernel` must pass `build_native = False`; otherwise
           `bazel run :<name>_native` fails with a transitive

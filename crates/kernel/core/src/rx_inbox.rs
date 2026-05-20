@@ -61,7 +61,7 @@
 //     `alloc`s / `free`s — no single-allocator discipline is load-
 //     bearing for soundness (Tier 2 happens to serialise
 //     distributors under `RX_LOCK`, but that is now only a
-//     performance fact). `uni_iobuf::IOBufPool` is the other
+//     performance fact). `iobuf::IOBufPool` is the other
 //     consumer of that shared stack core.
 //
 //   * Inbox — a lock-free MPSC list rooted at `RxInbox::head`, one

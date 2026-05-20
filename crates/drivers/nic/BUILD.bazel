@@ -6,7 +6,7 @@ package(default_visibility = ["//visibility:public"])
 # active-ops slot (`send`, `poll`, `acquire_tx_buf`, …). Standalone
 # host-buildable crate — its only dependency is the host-buildable
 # `//crates/drivers/nic-api` interface crate — so the TX-side net
-# crates (`net_ethernet_send`, `net_tcp`, …) can call the dispatchers
+# crates (`ethernet_send`, `tcp`, …) can call the dispatchers
 # without being dragged onto the os:none `//crates/drivers/bus`.
 rust_library(
     name = "nic",

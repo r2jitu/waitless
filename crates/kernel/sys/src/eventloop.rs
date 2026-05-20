@@ -31,7 +31,7 @@ pub struct CoreStats {
     pub poll_work: AtomicU64,
     pub drain_work: AtomicU64,
     pub service_work: AtomicU64,
-    /// Iterations where `uni_runtime::tick` reported work — the
+    /// Iterations where `executor::tick` reported work — the
     /// async executor polled a ready task. On apps like the
     /// webserver that route accepted conns through async-task
     /// spawns this is where the bulk of real work shows up
@@ -298,7 +298,7 @@ pub fn run(core_id: u32) -> ! {
         // 3a. Async runtime: advance timers (drain pending MPSC + fire
         // expired), then poll every ready task slot in the per-core
         // arena. Spawned futures live here. See uni_kernel::runtime.
-        if uni_runtime::tick(core_id) {
+        if executor::tick(core_id) {
             did_work = true;
             runtime_work += 1;
         }
@@ -410,7 +410,7 @@ pub fn run(core_id: u32) -> ! {
             // segment generates no RX event, so without this the core
             // would sleep clean past the RTO deadline.
             let net_timer_pending = NET_HAS_TIMERS.load().map(|f| f()).unwrap_or(false);
-            if uni_runtime::has_pending(core_id) || net_timer_pending {
+            if executor::has_pending(core_id) || net_timer_pending {
                 // Force a local-timer-bounded idle so we wake promptly.
                 let cycles_per_ms = crate::time::cycles_per_us().saturating_mul(1000);
                 crate::cpu::idle_until_cycles(cycles_per_ms);

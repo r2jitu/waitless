@@ -40,17 +40,17 @@ use alloc::vec::Vec;
 
 use p256::ecdsa::{Signature as EcdsaSignature, signature::Signer};
 
-use uni_tls::handshake::{
+use tls::handshake::{
     ClientHello, ParseError, build_certificate, build_certificate_verify,
     build_encrypted_extensions, build_finished, build_server_hello, encode_handshake, msg_type,
     parse_finished, parse_handshake, sign_content_server_cert_verify,
 };
-use uni_tls::schedule::{
+use tls::schedule::{
     ApplicationSecrets, HASH_LEN, HandshakeSecrets, KeySchedule, Transcript, X25519ServerKey,
 };
 
-use uni_tls::TlsServerConfig;
-use uni_tls::keys::{ct_eq_32, derive_finished_key, hmac_sha256};
+use tls::TlsServerConfig;
+use tls::keys::{ct_eq_32, derive_finished_key, hmac_sha256};
 
 // ============================================================================
 // Public types
@@ -394,7 +394,7 @@ impl QuicTls {
             let alpn = ch.alpn_protocol_list.and_then(|list| {
                 let mut h3 = None;
                 let mut first = None;
-                for p in uni_tls::handshake::iter_alpn(list) {
+                for p in tls::handshake::iter_alpn(list) {
                     if first.is_none() {
                         first = Some(p.to_vec());
                     }
@@ -416,7 +416,7 @@ impl QuicTls {
                 // `try_resume` expects the FULL handshake message
                 // (4-byte header + body), which is `rx_initial[..total_len]`.
                 let full_hs = &self.rx_initial[..total_len];
-                uni_tls::handlers::try_resume(full_hs, psk_offer, ch.psk_ke_modes)
+                tls::handlers::try_resume(full_hs, psk_offer, ch.psk_ke_modes)
             } else {
                 None
             };
@@ -513,13 +513,13 @@ impl QuicTls {
         let mut extras: alloc::vec::Vec<(u16, &[u8])> = alloc::vec::Vec::new();
         if !self.server_transport_params.is_empty() {
             extras.push((
-                uni_tls::handshake::ext_type::QUIC_TRANSPORT_PARAMETERS,
+                tls::handshake::ext_type::QUIC_TRANSPORT_PARAMETERS,
                 self.server_transport_params.as_slice(),
             ));
         }
         if let Some(blob) = &alpn_body {
             extras.push((
-                uni_tls::handshake::ext_type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
+                tls::handshake::ext_type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
                 blob.as_slice(),
             ));
         }
@@ -539,7 +539,7 @@ impl QuicTls {
         // — early_data acceptance follows automatically on resumption.
         if resumed {
             extras.push((
-                uni_tls::handshake::ext_type::EARLY_DATA,
+                tls::handshake::ext_type::EARLY_DATA,
                 &[], // empty body in EE
             ));
         }
@@ -704,15 +704,15 @@ impl QuicTls {
         getrandom::getrandom(&mut age_bytes).map_err(|_| QuicTlsError::Internal)?;
         let age_add = u32::from_be_bytes(age_bytes);
 
-        let pt = uni_tls::ticket::TicketPlaintext {
-            version: uni_tls::ticket::TICKET_VERSION,
+        let pt = tls::ticket::TicketPlaintext {
+            version: tls::ticket::TICKET_VERSION,
             resumption_master_secret: rms,
             ticket_age_add: age_add,
-            issued_at_cycles: uni_tls::ticket::now_cycles(),
-            cipher_suite: uni_tls::handshake::cipher_suite::TLS_AES_128_GCM_SHA256,
+            issued_at_cycles: tls::ticket::now_cycles(),
+            cipher_suite: tls::handshake::cipher_suite::TLS_AES_128_GCM_SHA256,
         };
-        let mut sealed = [0u8; uni_tls::ticket::SEALED_LEN];
-        let n = uni_tls::ticket::seal_ticket(&pt, &mut sealed).ok_or(QuicTlsError::Internal)?;
+        let mut sealed = [0u8; tls::ticket::SEALED_LEN];
+        let n = tls::ticket::seal_ticket(&pt, &mut sealed).ok_or(QuicTlsError::Internal)?;
 
         // RFC 8446 §4.6.1 NewSessionTicket layout, plus the
         // RFC 9001 §4.6.1 `early_data` extension carrying the
@@ -722,14 +722,13 @@ impl QuicTls {
         // accepts 0-RTT". RFC 9001 mandates exactly this value
         // for QUIC; any other is a connection error.
         let mut early_data_ext = [0u8; 8];
-        early_data_ext[0..2]
-            .copy_from_slice(&uni_tls::handshake::ext_type::EARLY_DATA.to_be_bytes());
+        early_data_ext[0..2].copy_from_slice(&tls::handshake::ext_type::EARLY_DATA.to_be_bytes());
         early_data_ext[2..4].copy_from_slice(&4u16.to_be_bytes());
         early_data_ext[4..8].copy_from_slice(&0xffff_ffffu32.to_be_bytes());
 
         let mut nst_body = alloc::vec![0u8; n + 64];
-        let body_len = uni_tls::handshake::build_new_session_ticket(
-            uni_tls::ticket::TICKET_LIFETIME_SECONDS,
+        let body_len = tls::handshake::build_new_session_ticket(
+            tls::ticket::TICKET_LIFETIME_SECONDS,
             age_add,
             &[], // empty ticket_nonce — one ticket per connection
             &sealed[..n],
@@ -739,8 +738,8 @@ impl QuicTls {
         .ok_or(QuicTlsError::Internal)?;
 
         let mut nst_msg = alloc::vec![0u8; body_len + 4];
-        let msg_len = uni_tls::handshake::encode_handshake(
-            uni_tls::handshake::msg_type::NEW_SESSION_TICKET,
+        let msg_len = tls::handshake::encode_handshake(
+            tls::handshake::msg_type::NEW_SESSION_TICKET,
             &nst_body[..body_len],
             &mut nst_msg,
         )
@@ -883,7 +882,7 @@ impl core::ops::Deref for RxBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uni_tls::handshake::{LEGACY_VERSION_TLS12, cipher_suite, ext_type, named_group};
+    use tls::handshake::{LEGACY_VERSION_TLS12, cipher_suite, ext_type, named_group};
 
     /// Hand-rolled minimal TLS 1.3 ClientHello body — same shape
     /// the existing `parse_synthetic_client_hello` test in

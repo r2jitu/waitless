@@ -13,7 +13,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use uni_worker::{CurrentWorker, PerWorker, num_workers};
+use worker::{CurrentWorker, PerWorker, num_workers};
 
 use super::{
     SpinLock, install_worker_task, register_net_launcher, release_launcher_slot,
@@ -38,7 +38,7 @@ use super::{
 // to accept".
 //
 // Accepted connections are returned as `TcpStream(*mut ())` —
-// the same opaque handle `uni_backend::tcp_accept` returns today.
+// the same opaque handle `backend::tcp_accept` returns today.
 // Higher layers wrap it into `uni::TcpStream` for the typed API.
 
 /// Static cap on concurrently bound TCP listening ports. Sized to
@@ -135,7 +135,7 @@ impl TcpStream {
     /// already used, now applied uniformly across the API.
     ///
     /// ```compile_fail
-    /// # async fn two_reads(s: &mut uni_runtime::net::TcpStream) {
+    /// # async fn two_reads(s: &mut executor::net::TcpStream) {
     /// let mut a = [0u8; 16];
     /// let mut b = [0u8; 16];
     /// let r1 = s.recv(&mut a);
@@ -167,7 +167,7 @@ impl TcpStream {
     /// borrow-check error:
     ///
     /// ```compile_fail
-    /// # async fn two_guards(s: &mut uni_runtime::net::TcpStream) {
+    /// # async fn two_guards(s: &mut executor::net::TcpStream) {
     /// let g1 = s.recv_chunk().await;
     /// let g2 = s.recv_chunk().await; // ERROR: `*s` already borrowed
     /// let _ = (g1, g2);
@@ -177,7 +177,7 @@ impl TcpStream {
     /// The same calls with one guard live at a time compile fine:
     ///
     /// ```no_run
-    /// # async fn sequential(s: &mut uni_runtime::net::TcpStream) {
+    /// # async fn sequential(s: &mut executor::net::TcpStream) {
     /// { let _g = s.recv_chunk().await; }
     /// { let _g = s.recv_chunk().await; }
     /// # }
@@ -229,7 +229,7 @@ impl TcpStream {
     /// opaque-handle aliasing is invisible to the borrow checker —
     /// the exclusive borrow is what serialises sends per stream.
     #[inline]
-    pub fn send<'a>(&'a mut self, chain: &'a mut uni_iobuf::IOBufChain) -> TcpSendChain<'a> {
+    pub fn send<'a>(&'a mut self, chain: &'a mut iobuf::IOBufChain) -> TcpSendChain<'a> {
         TcpSendChain::new(self.handle, self.generation, chain)
     }
 
@@ -283,9 +283,9 @@ impl TcpStream {
         // the `IOBuf::Borrowed` wrapping `data` therefore can't
         // outlive `data`'s borrow. No drop callback — the bytes
         // are borrowed, not owned.
-        let mut chain = uni_iobuf::IOBufChain::new();
+        let mut chain = iobuf::IOBufChain::new();
         let iobuf = unsafe {
-            uni_iobuf::IOBuf::borrow(
+            iobuf::IOBuf::borrow(
                 core::ptr::NonNull::new_unchecked(data.as_ptr() as *mut u8),
                 data.len() as u32,
                 0,
@@ -409,7 +409,7 @@ pub struct TcpBackend {
     /// `clear_recv_waker`) are reused — readiness is a conn-level
     /// signal, and a conn never has both a `recv` and a
     /// `recv_chunk` future parked at once.
-    pub do_recv_chunk: Option<fn(handle: *mut (), generation: u16) -> Option<uni_iobuf::IOBuf>>,
+    pub do_recv_chunk: Option<fn(handle: *mut (), generation: u16) -> Option<iobuf::IOBuf>>,
     pub set_chunk_buf_slot: Option<fn(handle: *mut (), generation: u16)>,
     pub clear_chunk_buf_slot: Option<fn(handle: *mut (), generation: u16)>,
 
@@ -445,11 +445,8 @@ pub struct TcpBackend {
     ///     and re-polls.
     ///   * `Err(())`: fatal conn error / stale `gen` — caller
     ///     drops the conn.
-    pub try_send: fn(
-        handle: *mut (),
-        generation: u16,
-        chain: &mut uni_iobuf::IOBufChain,
-    ) -> Result<usize, ()>,
+    pub try_send:
+        fn(handle: *mut (), generation: u16, chain: &mut iobuf::IOBufChain) -> Result<usize, ()>,
     /// Park `waker` on the conn's send slot; a subsequent writable
     /// event fires it. Stale `gen` fires immediately.
     pub register_send_waker: fn(handle: *mut (), generation: u16, waker: &Waker),
@@ -885,7 +882,7 @@ impl<'a> Drop for TcpRecv<'a> {
 // `recv_chunk` resolve to `None` on its first poll.
 
 /// RAII guard returned by [`TcpStream::recv_chunk`]. Owns the
-/// surfaced [`IOBuf`](uni_iobuf::IOBuf) and carries the `&'a mut`
+/// surfaced [`IOBuf`](iobuf::IOBuf) and carries the `&'a mut`
 /// borrow of the stream it came from.
 ///
 /// The borrow is the load-bearing part: it makes "at most one
@@ -895,7 +892,7 @@ impl<'a> Drop for TcpRecv<'a> {
 /// prevents the stream from being re-read, and those bytes
 /// overwritten, while the guard is live.
 pub struct RecvChunkGuard<'a> {
-    iobuf: uni_iobuf::IOBuf,
+    iobuf: iobuf::IOBuf,
     /// Ties the guard to the `&'a mut self` of `recv_chunk`. The
     /// inner type is opaque (`()`) so one guard type can serve
     /// every stream — `TcpStream` here, `TlsStream` later.
@@ -903,7 +900,7 @@ pub struct RecvChunkGuard<'a> {
 }
 
 impl<'a> RecvChunkGuard<'a> {
-    /// Wrap a transport-surfaced [`IOBuf`](uni_iobuf::IOBuf) in a
+    /// Wrap a transport-surfaced [`IOBuf`](iobuf::IOBuf) in a
     /// guard. The guard's `'a` is inferred at the call site — a
     /// `recv_chunk` binds it to the `&'a mut self` it took, so the
     /// borrow checker keeps that stream mutably borrowed (hence
@@ -919,7 +916,7 @@ impl<'a> RecvChunkGuard<'a> {
     /// `TlsRecvChunkGuard` — is what lets item H's `BodyReader`
     /// stay generic over the stream.
     #[inline]
-    pub fn new(iobuf: uni_iobuf::IOBuf) -> Self {
+    pub fn new(iobuf: iobuf::IOBuf) -> Self {
         RecvChunkGuard {
             iobuf,
             _borrow: PhantomData,
@@ -941,7 +938,7 @@ impl<'a> RecvChunkGuard<'a> {
     /// guard's borrow — e.g. a proxy forwarding the chunk into an
     /// outbound `send`.
     #[inline]
-    pub fn into_owned(self) -> uni_iobuf::IOBuf {
+    pub fn into_owned(self) -> iobuf::IOBuf {
         self.iobuf.into_owned()
     }
 }
@@ -1057,13 +1054,13 @@ impl<'a> Drop for RecvChunk<'a> {
 pub struct TcpSendChain<'a> {
     handle: *mut (),
     generation: u16,
-    chain: &'a mut uni_iobuf::IOBufChain,
+    chain: &'a mut iobuf::IOBufChain,
     _not_send: PhantomData<*mut ()>,
 }
 
 impl<'a> TcpSendChain<'a> {
     #[inline]
-    pub fn new(handle: *mut (), generation: u16, chain: &'a mut uni_iobuf::IOBufChain) -> Self {
+    pub fn new(handle: *mut (), generation: u16, chain: &'a mut iobuf::IOBufChain) -> Self {
         TcpSendChain {
             handle,
             generation,
@@ -1143,7 +1140,7 @@ pub fn deliver_tcp_ready(dst_port: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::RecvChunkGuard;
-    use uni_iobuf::IOBuf;
+    use iobuf::IOBuf;
 
     /// `RecvChunkGuard::into_owned` round-trips bytes for an
     /// already-owned (`Heap`) IOBuf — the bare-metal NIC-RX shape,

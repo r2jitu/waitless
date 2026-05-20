@@ -74,11 +74,11 @@ pub use tls::{CryptoLevel, QuicTls, QuicTlsError, QuicTlsState};
 /// `HEAP_BASELINE` at boot rather than being charged to the first
 /// connection as a per-conn delta. Idempotent.
 ///
-/// Today this delegates entirely to [`uni_tls::preinit`] — every
+/// Today this delegates entirely to [`::tls::preinit`] — every
 /// QUIC primitive that allocates lazily (ECDSA, ChaCha20-Poly1305,
 /// X25519) lives inside the TLS sans-io modules. If a future QUIC-
 /// only primitive (e.g. AES-128-GCM for Initial-packet protection)
 /// ever grows its own lazy state, the exercise for it goes here.
 pub fn preinit() {
-    uni_tls::preinit();
+    ::tls::preinit();
 }

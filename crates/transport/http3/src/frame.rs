@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 
 // Re-use the QUIC varint codec from //uni-quic — H3 frames use the
 // exact same encoding (RFC 9114 §7).
-use uni_quic::wire::{WireError, read_varint, write_varint};
+use quic::wire::{WireError, read_varint, write_varint};
 
 /// Frame type codes (RFC 9114 §11.2.1 / §7.2).
 pub mod ftype {

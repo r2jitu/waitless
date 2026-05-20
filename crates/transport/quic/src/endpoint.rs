@@ -55,7 +55,7 @@ use crate::conn::{ConnError, ConnState, Connection, ConnectionId, DatagramBuf};
 use crate::inbox::{
     ConnInbox, Datagram, SERVER_CID_LEN, SlotTable, make_local_cid, parse_local_cid,
 };
-use uni_tls::TlsServerConfig;
+use tls::TlsServerConfig;
 
 /// Ship one popped [`DatagramBuf`] to the wire. Dispatches on the
 /// variant:
@@ -201,7 +201,7 @@ impl QuicConn {
     /// diagnose it.
     pub async fn recv(&self, sid: u64, out: &mut [u8]) -> (usize, bool) {
         const STUCK_THRESHOLD_US: u64 = 5_000_000; // 5 s
-        let entered_us = uni_tls::ticket::now_us();
+        let entered_us = tls::ticket::now_us();
         let mut warned = false;
         loop {
             {
@@ -215,7 +215,7 @@ impl QuicConn {
                 }
             }
             if !warned {
-                let elapsed = uni_tls::ticket::now_us().saturating_sub(entered_us);
+                let elapsed = tls::ticket::now_us().saturating_sub(entered_us);
                 if elapsed > STUCK_THRESHOLD_US {
                     let state = self.conn.borrow().recv_stream_state(sid);
                     crate::quic_drop!(
@@ -257,7 +257,7 @@ impl QuicConn {
         self.drain_outbound();
     }
 
-    /// Append a pre-built [`uni_iobuf::IOBuf`] chunk to stream
+    /// Append a pre-built [`iobuf::IOBuf`] chunk to stream
     /// `sid`. The IOBuf may be a static borrow, a heap-owned
     /// buffer, or a heap buffer with reserved headroom that a
     /// downstream layer (the H3 framing prefix builder, for
@@ -267,7 +267,7 @@ impl QuicConn {
     /// visible payload via `IOBuf::data()`. Callers that want
     /// a per-request IOBuf scratch / pool plumb the `Drop`-on-
     /// chunk-completion pathway (future work).
-    pub fn send_iobuf(&self, sid: u64, data: uni_iobuf::IOBuf) {
+    pub fn send_iobuf(&self, sid: u64, data: iobuf::IOBuf) {
         {
             let mut c = self.conn.borrow_mut();
             c.stream_send_iobuf(sid, data);
@@ -320,7 +320,7 @@ impl QuicConn {
 }
 
 /// Start a per-worker QUIC server bound to `port`. `cert_der` and
-/// `key_pkcs8_der` are the same blobs `uni_tls::acceptor` accepts
+/// `key_pkcs8_der` are the same blobs `tls::acceptor` accepts
 /// — typically `include_bytes!`'d at compile time. `handler` runs
 /// once per accepted connection as `async fn(QuicConn) -> ()`.
 ///
@@ -655,7 +655,7 @@ async fn conn_task<H, F>(
             let c = conn.borrow();
             (c.idle_timeout_us(), c.last_recv_us(), c.pto_deadline_us())
         };
-        let now = uni_tls::ticket::now_us();
+        let now = tls::ticket::now_us();
         let elapsed = now.saturating_sub(last_recv_us);
         if elapsed >= idle_us {
             crate::quic_event!(
@@ -681,7 +681,7 @@ async fn conn_task<H, F>(
             uni::runtime::Either::Right(()) => {
                 // Timer fired. Distinguish PTO vs idle by which
                 // deadline was earlier and is now in the past.
-                let after = uni_tls::ticket::now_us();
+                let after = tls::ticket::now_us();
                 if let Some(p) = pto_deadline {
                     if after >= p && p < idle_deadline {
                         // PTO fired first — emit a probe and loop

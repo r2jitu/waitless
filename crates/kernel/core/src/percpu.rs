@@ -17,7 +17,7 @@ use crate::rx_inbox::{RxInbox, RxNodePool};
 use crate::spsc;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use uni_iobuf::{Chain, OwnedIOBuf};
+use iobuf::{Chain, OwnedIOBuf};
 
 // ── Tier 2 cross-core RX inbox ──────────────────────────────────────
 //
@@ -67,7 +67,7 @@ pub fn rx_node_pool() -> &'static RxNodePool<RxChain, RX_NODE_POOL_CAP> {
 // `CurrentWorker` + `PerWorker<T>` (runtime-sized) live in `//uni-worker`
 // so native can share them. Kept under the `uni_kernel::percpu` path via
 // re-export so existing callers don't shift.
-pub use uni_worker::{CurrentWorker, PerWorker};
+pub use worker::{CurrentWorker, PerWorker};
 
 /// Maximum packet size for TX staging.
 const TX_BUF_SIZE: usize = 1514;
@@ -227,13 +227,13 @@ static AP_POLL_FN: crate::sync::AtomicFn<fn(u32) -> bool> = crate::sync::AtomicF
 /// `count` via `set_num_workers` so every `PerWorker<T>` (here, in
 /// `uni-runtime`, in `net::*`) sizes itself the same.
 pub unsafe fn init(count: u32) {
-    uni_worker::set_num_workers(count);
+    worker::set_num_workers(count);
     CORES.init(count, |i| PerCore::new(i));
     // Link the shared Tier-2 cross-core RX node pool's free-list.
     // BSP-only, single-threaded — no AP has started, so this races
     // nothing.
     RX_NODE_POOL.init();
-    uni_runtime::init(count);
+    executor::init(count);
 }
 
 /// Get a shared reference to a core's state.
@@ -246,9 +246,9 @@ pub unsafe fn get(id: u32) -> &'static PerCore {
 }
 
 /// Total number of cores. Bare-metal-friendly alias for
-/// `uni_worker::num_workers()`.
+/// `worker::num_workers()`.
 pub fn num_cores() -> u32 {
-    uni_worker::num_workers()
+    worker::num_workers()
 }
 
 // `CurrentWorker` used to expose a `.percore()` convenience that walked

@@ -45,7 +45,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
 
-use uni_worker::{CurrentWorker, PerWorker};
+use worker::{CurrentWorker, PerWorker};
 
 pub mod tcp;
 pub mod udp;
@@ -154,7 +154,7 @@ pub(crate) fn install_worker_task(
 // Any reactor's `run`-style method registers a type-erased launcher
 // closure in `NET_LAUNCHERS` (a `LaunchTable`) via
 // `register_net_launcher`. `fire_pending_net_launchers` — called
-// from `uni_runtime::tick` on every worker every iteration — walks
+// from `executor::tick` on every worker every iteration — walks
 // the table from that worker's cursor to the global count and
 // invokes each live launcher. Each launcher typically calls
 // `spawn(body(...))` on the calling worker.
@@ -179,7 +179,7 @@ pub(crate) fn release_launcher_slot(idx: usize) {
 
 /// Fire every net launcher added since `worker_id` last called
 /// here. Thin wrapper over `NET_LAUNCHERS.fire_pending` so
-/// `uni_runtime::tick` has a named entry point.
+/// `executor::tick` has a named entry point.
 #[inline]
 pub fn fire_pending_net_launchers(worker_id: u32) {
     NET_LAUNCHERS.fire_pending(worker_id);

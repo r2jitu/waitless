@@ -15,24 +15,24 @@
 
 #![no_std]
 
-extern crate net_arp as arp;
-extern crate net_ethernet as ethernet;
+extern crate arp as arp;
+extern crate ethernet as ethernet;
+extern crate executor;
+extern crate ipv4 as ipv4;
 extern crate net_from_bytes as from_bytes;
-extern crate net_ipv4 as ipv4;
 extern crate net_types as types;
 extern crate uni_kernel;
-extern crate uni_runtime;
 
 mod dhcp_parse;
 
 use arp::arp_announce;
 use ethernet::ethernet_our_mac;
+use executor::event::AsyncEvent;
+use executor::net::UdpSocket;
+use executor::select::timeout_us;
 use from_bytes::FromBytes;
 use types::{CONFIG, Ipv4Addr, htonl, htons};
 use uni_kernel::sync::Spinlock;
-use uni_runtime::event::AsyncEvent;
-use uni_runtime::net::UdpSocket;
-use uni_runtime::select::timeout_us;
 
 /// Fixed DHCP/BOOTP header. 236 bytes + 4-byte magic cookie = 240
 /// bytes. Options follow.

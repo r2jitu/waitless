@@ -52,10 +52,10 @@ pub fn gve_diag() -> crate::GveDiag {
 pub fn tcp_diag() -> crate::TcpDiag {
     use core::sync::atomic::Ordering::Relaxed;
     crate::TcpDiag {
-        syn_rx: net_tcp::TCP_SYN_RX.load(Relaxed),
-        synack_tx: net_tcp::TCP_SYNACK_TX.load(Relaxed),
-        rx_chunk_stash_hits: net_tcp::RX_CHUNK_STASH_HITS.load(Relaxed),
-        rx_chunk_ring_drain: net_tcp::RX_CHUNK_RING_DRAIN.load(Relaxed),
+        syn_rx: tcp::TCP_SYN_RX.load(Relaxed),
+        synack_tx: tcp::TCP_SYNACK_TX.load(Relaxed),
+        rx_chunk_stash_hits: tcp::RX_CHUNK_STASH_HITS.load(Relaxed),
+        rx_chunk_ring_drain: tcp::RX_CHUNK_RING_DRAIN.load(Relaxed),
     }
 }
 
@@ -71,7 +71,7 @@ pub use uni_kernel::percpu::num_cores as num_workers;
 ///   * `poll_work`     — iterations where the net-poll callback returned true
 ///   * `drain_work`    — iterations where the net-drain callback returned true
 ///   * `service_work`  — iterations where the app-service callback returned true
-///   * `runtime_work`  — iterations where `uni_runtime::tick` polled a ready task
+///   * `runtime_work`  — iterations where `executor::tick` polled a ready task
 ///                       (the webserver's TCP/TLS/QUIC accept loops live here)
 ///   * `idle_enters`   — number of times the core actually slept (HLT/WFI)
 ///   * `busy_cycles`   — cumulative cycles spent in the loop body (non-idle)
@@ -95,7 +95,7 @@ pub fn cycles_per_us() -> u64 {
 // ---- Async runtime re-exports ---------------------------------------------
 
 pub mod runtime {
-    pub use uni_runtime::{Sleep, sleep_us, spawn};
+    pub use executor::{Sleep, sleep_us, spawn};
 }
 
 // ---- Heap stats -----------------------------------------------------------

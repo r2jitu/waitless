@@ -9,9 +9,9 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
-use uni_platform::now_ticks;
-use uni_worker::timer::{Timer, TimerWheel};
-use uni_worker::{CurrentWorker, WorkerLocal};
+use platform::now_ticks;
+use worker::timer::{Timer, TimerWheel};
+use worker::{CurrentWorker, WorkerLocal};
 
 // ---- Per-worker timer storage ----------------------------------------------
 

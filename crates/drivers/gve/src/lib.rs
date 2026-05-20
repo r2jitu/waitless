@@ -39,8 +39,8 @@
 
 #![no_std]
 
-extern crate uni_drivers;
-extern crate uni_iobuf;
+extern crate bus;
+extern crate iobuf;
 extern crate uni_kernel;
 extern crate uni_net_driver;
 
@@ -49,7 +49,7 @@ mod diag;
 pub mod dqo;
 mod gqi;
 
-use uni_iobuf::{Chain, IOBufPool, OwnedIOBuf};
+use iobuf::{Chain, IOBufPool, OwnedIOBuf};
 
 // Re-export diagnostic counters + descriptor-log helpers so the
 // DQO/GQI submodules can `use crate::TX_PACKETS_PER_QP` etc.
@@ -70,12 +70,12 @@ use adminq::{
     AdminqCommand, OP_CONFIGURE_DEVICE_RESOURCES, OP_CONFIGURE_RSS, OP_CREATE_RX_QUEUE,
     OP_CREATE_TX_QUEUE, OP_DESCRIBE_DEVICE, OP_REGISTER_PAGE_LIST,
 };
+use bus::pci;
+use bus::{log, mmio_read32, mmio_write32};
 use core::ptr;
 use core::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
 };
-use uni_drivers::pci;
-use uni_drivers::{log, mmio_read32, mmio_write32};
 use uni_kernel::mm::{alloc_pages, phys_to_virt};
 use uni_kernel::sync::Spinlock;
 
@@ -195,7 +195,7 @@ struct State {
     rx: [Option<RxQueue>; MAX_QUEUE_PAIRS],
 }
 
-/// Matches `uni_drivers::virtio_net::MAX_QUEUE_PAIRS`. Upper bound for
+/// Matches `bus::virtio_net::MAX_QUEUE_PAIRS`. Upper bound for
 /// `net_rx_counts()` / `net_rx_used_cursors()` array sizes so the
 /// two drivers stay signature-compatible.
 pub(crate) const MAX_QUEUE_PAIRS: usize = 8;
@@ -1984,7 +1984,7 @@ fn send(data: &[u8], csum: uni_net_driver::CsumOffload) {
 // ---- virtio-net-compatible public surface --------------------------------
 
 /// Copy the device MAC into `mac_out` (6 bytes). Matches the
-/// signature of `uni_drivers::virtio_net::get_mac` so the dispatch
+/// signature of `bus::virtio_net::get_mac` so the dispatch
 /// shim can call either driver the same way. The caller is
 /// responsible for `mac_out` pointing at 6 writable bytes — same
 /// unwritten contract virtio-net's version has.

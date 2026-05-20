@@ -12,7 +12,7 @@
 // `sample` under tls_handshake_max showed worker 0 doing all TLS
 // crypto while worker 1 sat 95% idle in kevent — all accepts
 // funnelled to thread 0 via the siblings layout. The shared-fd
-// "first-to-accept-wins" pattern is what `uni_http`'s sync path
+// "first-to-accept-wins" pattern is what `http`'s sync path
 // used to get 5.9 k hs/s on 2 t; siblings-plus-async was capping
 // at 3.7 k.
 //
@@ -135,10 +135,10 @@ fn async_tcp_unlisten_hook(app_port: u16) {
     }
 }
 
-fn async_tcp_accept_hook(app_port: u16) -> uni_runtime::net::TcpStream {
-    use uni_runtime::net::TcpStream;
+fn async_tcp_accept_hook(app_port: u16) -> executor::net::TcpStream {
+    use executor::net::TcpStream;
     unsafe {
-        let tid = uni_platform::current_worker();
+        let tid = platform::current_worker();
         let count = ASYNC_TCP_COUNT.load(Ordering::Acquire);
         let listeners = &*ASYNC_TCP_LISTENERS.0.get();
         for entry in listeners.iter().take(count) {
@@ -192,7 +192,7 @@ pub(super) fn async_tcp_dispatch(fd: i32) -> bool {
                 None => continue,
             };
             if l.fd == fd {
-                uni_runtime::net::deliver_tcp_ready(l.app_port);
+                executor::net::deliver_tcp_ready(l.app_port);
                 return true;
             }
         }
@@ -204,7 +204,7 @@ pub(super) fn async_tcp_dispatch(fd: i32) -> bool {
 // Async TCP recv / send hooks
 // ============================================================================
 //
-// Called from `uni_runtime::net::TcpRecv::poll` / `TcpSend::poll` via
+// Called from `executor::net::TcpRecv::poll` / `TcpSend::poll` via
 // the function pointers in `NATIVE_TCP_BACKEND`. Each operates on a
 // `NativeConn *` obtained from `async_tcp_accept_hook` and lives in
 // the owning worker's `ThreadState.conns`. No locking — the conn's
@@ -279,7 +279,7 @@ fn native_tcp_do_recv(handle: *mut (), generation: u16, buf: &mut [u8]) -> usize
 /// instead of `None`, so handlers (and `BodyReader`) can use the
 /// `recv_chunk` API on every backend without a `recv` fallback.
 /// `into_owned()` on the resulting `Heap` IOBuf is then zero-copy.
-fn native_tcp_do_recv_chunk(handle: *mut (), generation: u16) -> Option<uni_iobuf::IOBuf> {
+fn native_tcp_do_recv_chunk(handle: *mut (), generation: u16) -> Option<iobuf::IOBuf> {
     unsafe {
         let (c, live) = check_gen(handle, generation);
         if !live {
@@ -306,7 +306,7 @@ fn native_tcp_do_recv_chunk(handle: *mut (), generation: u16) -> Option<uni_iobu
         }
         (*c).has_pending_data = false;
         v.truncate(n as usize);
-        Some(uni_iobuf::IOBuf::from(v))
+        Some(iobuf::IOBuf::from(v))
     }
 }
 
@@ -349,7 +349,7 @@ fn native_tcp_clear_recv_waker(handle: *mut (), generation: u16) {
 fn native_tcp_try_send_chain(
     handle: *mut (),
     generation: u16,
-    chain: &mut uni_iobuf::IOBufChain,
+    chain: &mut iobuf::IOBufChain,
 ) -> Result<usize, ()> {
     unsafe {
         let (c, live) = check_gen(handle, generation);
@@ -437,7 +437,7 @@ fn native_tcp_try_send_chain(
 /// parts, advance the front part's visible payload past the
 /// committed bytes for any partial-send remainder. Used by the
 /// iovec path on partial `writev` to advance the chain in place.
-fn drain_chain_prefix(chain: &mut uni_iobuf::IOBufChain, n: usize) {
+fn drain_chain_prefix(chain: &mut iobuf::IOBufChain, n: usize) {
     let mut remaining = n;
     while remaining > 0 {
         let head_len = match chain.front_mut() {
@@ -469,7 +469,7 @@ fn native_tcp_register_send_waker(handle: *mut (), generation: u16, waker: &Wake
         // `clear_send_waker` so sends that finish in one try_send
         // round never touch the event queue.
         if !(*c).send_registered {
-            let tid = uni_platform::current_worker();
+            let tid = platform::current_worker();
             thread_state(tid).arm_write_fd((*c).fd);
             (*c).send_registered = true;
         }
@@ -488,7 +488,7 @@ fn native_tcp_clear_send_waker(handle: *mut (), generation: u16) {
         }
         (*c).send_waker = None;
         if (*c).send_registered {
-            let tid = uni_platform::current_worker();
+            let tid = platform::current_worker();
             thread_state(tid).disarm_write_fd((*c).fd);
             (*c).send_registered = false;
         }
@@ -509,13 +509,13 @@ fn tcp_close(handle: *mut (), generation: u16) {
             return;
         }
     }
-    let tid = uni_platform::current_worker();
+    let tid = platform::current_worker();
     thread_state(tid).release_conn(c);
 }
 
 /// Native TCP backend vtable. Wired into the runtime by
 /// `init_native`.
-pub(super) static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend = uni_runtime::net::TcpBackend {
+pub(super) static NATIVE_TCP_BACKEND: executor::net::TcpBackend = executor::net::TcpBackend {
     listen: async_tcp_listen_hook,
     accept: async_tcp_accept_hook,
     unlisten: Some(async_tcp_unlisten_hook),
@@ -559,5 +559,5 @@ pub(super) static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend = uni_runtime
 /// inline). Returns `true` iff a UDP sibling was drained — tells
 /// the event loop to skip its idle sleep and run another iteration.
 pub(super) fn tcp_poll() -> bool {
-    thread_state(uni_platform::current_worker()).poll_events()
+    thread_state(platform::current_worker()).poll_events()
 }

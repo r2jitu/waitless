@@ -5,15 +5,15 @@ package(default_visibility = ["//visibility:public"])
 
 # HTTP/1.1 server. Also hosts the `Tls` / `TlsConn` traits that
 # `//crates/transport/tls` implements — keeps the HTTP path TLS-unaware so apps
-# without `uni_tls` link zero TLS / crypto code.
+# without `tls` link zero TLS / crypto code.
 rust_library(
     name = "http",
     srcs = ["src/lib.rs"],
-    crate_name = "uni_http",
+    crate_name = "http",
     deps = [
         "//crates/api/uni",
-        "//crates/util/iobuf",
         "//crates/runtime/worker",
+        "//crates/util/iobuf",
     ],
 )
 

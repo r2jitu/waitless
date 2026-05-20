@@ -19,9 +19,9 @@ extern crate alloc;
 
 use core::fmt::Write as _;
 
+use http::{IOBufChain, Request, Response};
 use uni::net::Net;
 use uni::runtime::{TcpStream, UdpClient};
-use uni_http::{IOBufChain, Request, Response};
 
 // ---- Configuration ----------------------------------------------------------
 
@@ -55,7 +55,7 @@ async fn init() {
     // run once per boot.
     {
         use uni::diagnostics as diag;
-        match uni_tls::aead::rfc8439_kat() {
+        match tls::aead::rfc8439_kat() {
             Ok(()) => {
                 uni::println!("aead-kat: ok");
                 diag::diag_append(b"aead-kat: ok\n");
@@ -90,7 +90,7 @@ async fn init() {
         // a live TLS tag-verify failure later. Mirrors the
         // upstream/fast cross-check in
         // `aes_gcm_fast::tests::matches_aes_gcm_crate_roundtrip`.
-        match uni_tls::aead::aes_gcm_fast_kat() {
+        match tls::aead::aes_gcm_fast_kat() {
             Ok(()) => {
                 uni::println!("aead-fast-kat: ok");
                 diag::diag_append(b"aead-fast-kat: ok\n");
@@ -136,10 +136,10 @@ async fn init() {
         backend_ip[3],
         GATEWAY_BACKEND_PORT
     );
-    uni_http::listen(HTTP_PORT, handle_request).expect("http bind");
+    http::listen(HTTP_PORT, handle_request).expect("http bind");
     uni::println!("listen tcp://:{} (http)", HTTP_PORT);
 
-    let h3_up = match uni_http3::listen(
+    let h3_up = match http3::listen(
         HTTPS_PORT,
         handle_request_h3,
         DEV_CERT_DER,
@@ -164,7 +164,7 @@ async fn init() {
     if h3_up {
         install_alt_svc_for_h3(HTTPS_PORT);
     }
-    match uni_tls::listen(
+    match tls::listen(
         HTTPS_PORT,
         handle_request_https,
         DEV_CERT_DER,
@@ -244,9 +244,9 @@ fn alt_svc_value() -> Option<&'static [u8]> {
 /// `handle_request` (used by both HTTPS and H3 paths) and, when
 /// the H3 listener is up, layers a cached `Alt-Svc` header onto
 /// the response.
-async fn handle_request_https<S: uni_http::HttpStream>(
+async fn handle_request_https<S: http::HttpStream>(
     req: &Request,
-    body: &mut uni_http::BodyReader<'_, S>,
+    body: &mut http::BodyReader<'_, S>,
 ) -> Response {
     let resp = handle_request(req, body).await;
     match alt_svc_value() {
@@ -263,8 +263,8 @@ async fn handle_request_https<S: uni_http::HttpStream>(
 /// between them means the future was constructed but never
 /// polled, which would be a runtime/scheduler bug rather than
 /// handler-internal work.
-async fn handle_request_h3(req: Request, body: &mut uni_http::BufferedBody<'_>) -> Response {
-    uni_http3::diag::bump(&uni_http3::diag::COUNTERS.user_handler_polled);
+async fn handle_request_h3(req: Request, body: &mut http::BufferedBody<'_>) -> Response {
+    http3::diag::bump(&http3::diag::COUNTERS.user_handler_polled);
     handle_request(&req, body).await
 }
 
@@ -329,9 +329,9 @@ async fn gateway(mut stream: TcpStream, backend_ip: [u8; 4]) {
 
 // ---- Request dispatch -------------------------------------------------------
 
-async fn handle_request<S: uni_http::HttpStream>(
+async fn handle_request<S: http::HttpStream>(
     req: &Request,
-    body: &mut uni_http::BodyReader<'_, S>,
+    body: &mut http::BodyReader<'_, S>,
 ) -> Response {
     match req.path() {
         // ── HTML pages ───────────────────────────────────────────
@@ -391,7 +391,7 @@ async fn handle_request<S: uni_http::HttpStream>(
         }
         b"/tls_profile" => tls_profile_response(),
         b"/tls_profile_reset" => {
-            uni_tls::tls_profile_reset();
+            tls::tls_profile_reset();
             Response::ok(b"text/plain; charset=utf-8", b"tls profile reset\n")
         }
         b"/diag-panic" => diag_panic_response(),
@@ -538,13 +538,13 @@ fn shell_body(active: &str, title: &str, body: IOBufChain) -> IOBufChain {
     // them. Transport-framing reserves (TLS record header, AEAD
     // tag) live inside the IOBuf out of the app's view.
     let title_cap = title.len().max(1);
-    let mut title_buf = uni_http::body_iobuf(title_cap);
+    let mut title_buf = http::body_iobuf(title_cap);
     let _ = title_buf.append_slice(title.as_bytes());
 
     // 512 B covers the current 6-link nav with active-class flip;
     // the writer truncates above that.
     const NAV_CAP: usize = 512;
-    let mut nav_buf = uni_http::body_iobuf(NAV_CAP);
+    let mut nav_buf = http::body_iobuf(NAV_CAP);
     {
         let mut w = nav_buf.writer();
         for (path, label) in NAV {
@@ -557,7 +557,7 @@ fn shell_body(active: &str, title: &str, body: IOBufChain) -> IOBufChain {
         }
     }
 
-    let mut chain = uni_http::IOBufChain::with_capacity(8 + body.part_count());
+    let mut chain = http::IOBufChain::with_capacity(8 + body.part_count());
     chain.push_static(SHELL_HEAD_BEFORE_TITLE);
     chain.push_back(title_buf);
     chain.push_static(SHELL_HEAD_AFTER_TITLE);
@@ -574,7 +574,7 @@ fn shell_body(active: &str, title: &str, body: IOBufChain) -> IOBufChain {
     chain
 }
 
-fn html_response(active: &str, title: &str, body: impl Into<uni_http::IOBufChain>) -> Response {
+fn html_response(active: &str, title: &str, body: impl Into<http::IOBufChain>) -> Response {
     Response::ok(
         b"text/html; charset=utf-8",
         shell_body(active, title, body.into()),
@@ -644,7 +644,7 @@ from the kernel; every read of a socket crosses a syscall boundary; \
 every received packet involves a context switch from kernel to user. \
 This unikernel collapses that — there's exactly one address space, \
 exactly one privilege level (ring 0), and exactly one binary. A \
-function call from <code>uni_http::handle_request</code> down to \
+function call from <code>http::handle_request</code> down to \
 <code>virtio_net::send</code> is just a function call.</p>\
 <h2>Boot sequence</h2>\
 <p>On x86_64 we boot via Limine in higher-half (kernel mapped to \
@@ -810,7 +810,7 @@ Use <code>./scripts/open-browser-h3.sh</code> to launch Chrome with \
 RTTs swing the race the other way.</div>\
 <h2>Live counters</h2>\
 <p>Every hot-path drop and positive event in the QUIC stack is \
-counted in <code>uni_quic::diag</code>. Render them as JSON at \
+counted in <code>quic::diag</code>. Render them as JSON at \
 <a href=\"/quic_stats\"><code>/quic_stats</code></a> or via the \
 <a href=\"/diagnostics\">Diagnostics</a> page. Set the boot arg \
 <code>quic.log=events</code> to also emit human-readable lines per \
@@ -836,7 +836,7 @@ fn page_diagnostics() -> Response {
     // when called inside a handler (zero alloc) and falls back
     // to a fresh allocation otherwise — apps don't pick.
     const PAYLOAD_CAP: usize = 12 * 1024;
-    let mut body = uni_http::body_iobuf(PAYLOAD_CAP);
+    let mut body = http::body_iobuf(PAYLOAD_CAP);
     {
         let mut w = body.writer();
 
@@ -918,7 +918,7 @@ auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
         // ── QUIC counters ─────────────────────────────────────────────
         let _ = w.write_str("<h2>QUIC events &amp; drops</h2>");
         let _ = w.write_str("<table><tr><th>Counter</th><th>Value</th></tr>");
-        for (name, value) in uni_quic::diag::snapshot() {
+        for (name, value) in quic::diag::snapshot() {
             let _ = write!(
                 w,
                 "<tr><td><code>{}</code></td><td class=\"num\">{}</td></tr>",
@@ -930,7 +930,7 @@ auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
         // ── HTTP/3 counters ───────────────────────────────────────────
         let _ = w.write_str("<h2>HTTP/3 events &amp; drops</h2>");
         let _ = w.write_str("<table><tr><th>Counter</th><th>Value</th></tr>");
-        for (name, value) in uni_http3::diag::snapshot() {
+        for (name, value) in http3::diag::snapshot() {
             let _ = write!(
                 w,
                 "<tr><td><code>{}</code></td><td class=\"num\">{}</td></tr>",
@@ -1119,7 +1119,7 @@ fn stats_response() -> Response {
     // 4 KiB body region — covers nqp ≤ 8 plus per-qp TX/RX byte
     // arrays, per-core CPU stats, and TLS/QUIC AEAD counters.
     // /stats is on the slow path so the extra reservation is free.
-    let mut body = uni_http::body_iobuf(4096);
+    let mut body = http::body_iobuf(4096);
     {
         let mut w = body.writer();
         let _ = w.write_str("{");
@@ -1316,17 +1316,17 @@ fn stats_response() -> Response {
         // well below the per-core AEAD ceiling means non-crypto
         // overhead dominates).
         let (tls_enc_b, tls_enc_r, tls_enc_cyc, tls_dec_b, tls_dec_r, tls_dec_cyc) =
-            uni_tls::record::encrypt_stats();
-        let qenc_b = uni_quic::diag::COUNTERS
+            tls::record::encrypt_stats();
+        let qenc_b = quic::diag::COUNTERS
             .aead_seal_bytes
             .load(core::sync::atomic::Ordering::Relaxed);
-        let qenc_p = uni_quic::diag::COUNTERS
+        let qenc_p = quic::diag::COUNTERS
             .aead_seal_packets
             .load(core::sync::atomic::Ordering::Relaxed);
-        let qdec_b = uni_quic::diag::COUNTERS
+        let qdec_b = quic::diag::COUNTERS
             .aead_open_bytes
             .load(core::sync::atomic::Ordering::Relaxed);
-        let qdec_p = uni_quic::diag::COUNTERS
+        let qdec_p = quic::diag::COUNTERS
             .aead_open_packets
             .load(core::sync::atomic::Ordering::Relaxed);
         let _ = write!(
@@ -1364,7 +1364,7 @@ fn heap_response() -> Response {
     // handled inside the IOBuf out of view, so the encrypt-in-
     // place path in `TlsStream::send` applies for HTTPS.
     let s = uni::diagnostics::heap_stats();
-    let mut body = uni_http::body_iobuf(256);
+    let mut body = http::body_iobuf(256);
     let _ = write!(
         body.writer(),
         "{{\"allocated_bytes\":{},\"available_bytes\":{},\"claimed_bytes\":{},\
@@ -1379,19 +1379,19 @@ fn heap_response() -> Response {
     Response::ok(&b"application/json"[..], body)
 }
 
-/// Snapshot of the QUIC-stack counters (`uni_quic::diag::snapshot`).
+/// Snapshot of the QUIC-stack counters (`quic::diag::snapshot`).
 /// Same numbers the Diagnostics page renders, exposed as JSON for
 /// programmatic monitoring.
 fn quic_stats_response() -> Response {
     // 1 KiB body region covers ~37 named u64 counters (the
     // current snapshot size); render in place to skip the
     // String → IOBuf copy.
-    let mut body = uni_http::body_iobuf(1024);
+    let mut body = http::body_iobuf(1024);
     {
         let mut w = body.writer();
         let _ = w.write_str("{");
         let mut first = true;
-        for (name, value) in uni_quic::diag::snapshot() {
+        for (name, value) in quic::diag::snapshot() {
             if !first {
                 let _ = w.write_str(",");
             }
@@ -1453,7 +1453,7 @@ fn diag_gve_response() -> Response {
 
     // ~80 bytes per row × 32 rows = 2.5 KiB; round up.
     const CAP: usize = 4096;
-    let mut body = uni_http::body_iobuf(CAP);
+    let mut body = http::body_iobuf(CAP);
     {
         let mut w = body.writer();
         let _ = writeln!(
@@ -1479,7 +1479,7 @@ const PROFILE_BUF_LEN: usize = 4096;
 
 fn tls_profile_response() -> Response {
     let mut buf = alloc::vec![0u8; PROFILE_BUF_LEN];
-    let n = uni_tls::tls_profile_report(buf.as_mut_slice());
+    let n = tls::tls_profile_report(buf.as_mut_slice());
     buf.truncate(n);
     Response::ok(b"text/plain; charset=utf-8", buf)
 }
