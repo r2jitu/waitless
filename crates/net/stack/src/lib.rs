@@ -31,11 +31,12 @@ mod ipv6_nd;
 mod rx;
 mod sched;
 
-// The split moved these entry points into modules; re-export them so
-// the crate's public API surface is unchanged.
-pub use crate::ipv6_nd::init_ipv6;
-pub use crate::rx::net_receive;
-pub use crate::sched::{init_eventloop, poll};
+// init_eventloop is the only stack-lifecycle fn called from
+// outside this crate (`boot/entry.rs` wires it during boot). The
+// other lifecycle entry points — `init_ipv6`, `net_receive`,
+// `poll` — are `pub(crate)` and live in their respective modules,
+// reached internally via `crate::{ipv6_nd, rx, sched}` paths.
+pub use crate::sched::init_eventloop;
 
 /// Bare-metal TCP backend vtable. Listener hooks open one TCB per
 /// core; per-stream hooks use the generation-aware variants so a
@@ -96,7 +97,7 @@ pub fn init_stack() {
     sched::JUST_DISTRIBUTED.init(n, |_| core::sync::atomic::AtomicBool::new(false));
     arp::init();
     ipv4::init();
-    init_ipv6();
+    ipv6_nd::init_ipv6();
 
     // Wire up the async `uni::runtime::TcpListener` reactor and
     // the per-stream recv/send reactors — all via a single backend

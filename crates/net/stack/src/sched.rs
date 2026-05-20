@@ -77,8 +77,11 @@ fn rtx_tick_if_due() {
 /// directly — no distributor, no RX_LOCK, no inbox.
 /// In Tier 2 single-queue mode, any idle core can become the distributor
 /// by acquiring the RX lock.
-/// Returns true if any network work was done.
-pub fn poll() -> bool {
+/// Returns true if any network work was done. `pub(crate)` because
+/// it's only called from `net_poll_cb` in this same module — apps
+/// drive the event loop via `init_eventloop`'s registered callbacks,
+/// not by calling `poll` directly.
+pub(crate) fn poll() -> bool {
     // Drive RFC 6298 retransmission timers before the RX work — a
     // lost outbound segment is resent here, not on an RX event.
     rtx_tick_if_due();

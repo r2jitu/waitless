@@ -34,9 +34,11 @@ use net_classify::{Classified, classify, owner};
 
 /// Single-core / Tier-1 RX callback. Classifies one frame and
 /// delivers it on this core. No distribution: single-core has
-/// nowhere else to send it, and Tier 1's NIC already hashed the flow
-/// to this core's own RX queue.
-pub fn net_receive(chain: Chain<OwnedIOBuf>) {
+/// nowhere else to send it, and Tier 1's NIC already hashed the
+/// flow to this core's own RX queue. `pub(crate)` because it's
+/// passed as a fn pointer to `nic::poll` from within `sched`;
+/// no external caller.
+pub(crate) fn net_receive(chain: Chain<OwnedIOBuf>) {
     // Part 0 carries the L2/L3/L4 headers contiguously.
     let Some(first) = chain.iter().next() else {
         return;

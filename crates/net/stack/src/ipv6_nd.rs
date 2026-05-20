@@ -78,9 +78,11 @@ fn ipv6_global() -> Option<types::Ipv6Addr> {
     Some(types::Ipv6Addr { octets: o })
 }
 
-/// Initialise our IPv6 link-local address from the cached MAC. Idempotent;
-/// the BSP calls this once after `ethernet::init_mac`.
-pub fn init_ipv6() {
+/// Initialise our IPv6 link-local address from the cached MAC.
+/// Idempotent; the BSP calls this once from `init_stack` after
+/// `ethernet::init_mac`. `pub(crate)` because it's only called
+/// from within this crate (the umbrella's lifecycle code).
+pub(crate) fn init_ipv6() {
     if IPV6_INITIALIZED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
