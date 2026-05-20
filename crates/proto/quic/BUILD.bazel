@@ -37,7 +37,17 @@ rust_library(
         "src/wire.rs",
         # TLS-handshake-over-CRYPTO-frames driver + connection state
         # machine + async inbox + UDP endpoint + streams.
-        "src/conn.rs",
+        # `conn` is split across submodules under `src/conn/` —
+        # `mod.rs` holds the `Connection` struct + cheap accessors,
+        # `keys.rs` the per-direction packet-protection ciphers,
+        # `rx.rs` the inbound packet path, `tx.rs` outbound assembly
+        # + AEAD seal, `loss.rs` the RFC 9002 loss / RTT machinery.
+        "src/conn/mod.rs",
+        "src/conn/cfg.rs",
+        "src/conn/keys.rs",
+        "src/conn/loss.rs",
+        "src/conn/rx.rs",
+        "src/conn/tx.rs",
         "src/endpoint.rs",
         "src/inbox.rs",
         "src/streams.rs",
