@@ -6,10 +6,12 @@
 
 extern crate alloc;
 
-pub use nic_api::{
-    EthernetDriverReg, NicDiagOps, NicError, NicIdleOps, NicOps, linked_ethernet_drivers,
-    register_ethernet_driver,
-};
+// Only `NicError` crosses the facade — it's the user-visible error
+// type surfaced via `NetError::Nic`. The other `nic_api` items
+// (`NicOps`, `EthernetDriverReg`, `register_ethernet_driver`, …) are
+// the driver-author API; NIC crates depend on `nic_api` directly and
+// have no reason to reach for them through the `uni::net` facade.
+pub use nic_api::NicError;
 
 mod error;
 pub use error::{DhcpError, NetError};
