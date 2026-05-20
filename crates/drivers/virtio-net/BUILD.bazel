@@ -5,7 +5,14 @@ package(default_visibility = ["//visibility:public"])
 # VirtIO ethernet driver — registers into the NIC active-ops slot.
 rust_library(
     name = "virtio-net",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/diag.rs",
+        "src/init.rs",
+        "src/irq.rs",
+        "src/lib.rs",
+        "src/rx.rs",
+        "src/tx.rs",
+    ],
     crate_name = "virtio_net",
     target_compatible_with = ["@platforms//os:none"],
     deps = [
