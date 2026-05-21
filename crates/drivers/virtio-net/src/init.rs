@@ -162,7 +162,7 @@ pub(crate) fn init_pci_modern() -> bool {
     }
 
     // Read max queue pairs from device config (offset 8, u16)
-    // Use UNIKERNEL_CPUS env var (set in QEMU args) since percpu::init()
+    // Use WAITLESS_CPUS env var (set in QEMU args) since percpu::init()
     // hasn't run yet. Fall back to 1 if not available.
     #[cfg(target_arch = "x86_64")]
     let desired_pairs = unsafe { kernel_bare::x86_64::acpi::detect_cpus() as u16 };
@@ -696,6 +696,6 @@ pub(crate) fn init_mmio() -> bool {
 // now use the gve driver as the preferred NIC. In every other
 // x86_64 environment we test (QEMU 9.x, KVM-on-host) the
 // `init_pci_modern` path succeeds. Resurrect from git history
-// (`uni-driver-virtio-net: remove unreachable legacy PCI init`)
+// (`waitless-driver-virtio-net: remove unreachable legacy PCI init`)
 // if a future hypervisor surfaces one that only exposes the
 // legacy I/O-port surface.

@@ -31,7 +31,7 @@
 #                                                              # raw loadgen call,
 #                                                              # bypass bench harness
 #
-# Env overrides: same as deploy-gcloud.sh (UNIKERNEL_GCE_*) plus
+# Env overrides: same as deploy-gcloud.sh (WAITLESS_GCE_*) plus
 #   GCP_KVM_VM_NAME (default: `kvm-vm`)
 #   GCP_KVM_VM_ZONE (default: same as deploy zone)
 
@@ -40,12 +40,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-UNI_NAME="${UNIKERNEL_GCE_NAME:-unikernel-webserver}"
+UNI_NAME="${WAITLESS_GCE_NAME:-unikernel-webserver}"
 # us-west1-c: c3 family availability + matches deploy-gcloud.sh's
 # zone default. Both VMs must co-locate (cross-zone same-region
 # RTT is ~5 ms — enough to RTT-bound `get_tcp_fresh` to single-
 # digit-kHz instead of the >100k the server stack can sustain).
-UNI_ZONE="${UNIKERNEL_GCE_ZONE:-us-west1-c}"
+UNI_ZONE="${WAITLESS_GCE_ZONE:-us-west1-c}"
 
 KVM_NAME="${GCP_KVM_VM_NAME:-kvm-vm}"
 KVM_ZONE="${GCP_KVM_VM_ZONE:-$UNI_ZONE}"
@@ -126,9 +126,9 @@ done
 [ -n "$duration" ] || duration="$DEFAULT_DURATION"
 
 # Resolve project for gcloud calls (same shape as deploy-gcloud.sh).
-PROJECT="${UNIKERNEL_GCE_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
+PROJECT="${WAITLESS_GCE_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
 if [ -z "$PROJECT" ]; then
-    echo "Error: no GCP project (set UNIKERNEL_GCE_PROJECT or 'gcloud config set project')" >&2
+    echo "Error: no GCP project (set WAITLESS_GCE_PROJECT or 'gcloud config set project')" >&2
     exit 1
 fi
 

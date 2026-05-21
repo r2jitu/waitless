@@ -121,9 +121,9 @@ pub fn preinit() {
         };
         let scalar = [0xFFu8; 32];
         if let Ok(sk) = SigningKey::from_slice(&scalar) {
-            let sig: Signature = sk.sign(b"uni-tls preinit");
+            let sig: Signature = sk.sign(b"waitless-tls preinit");
             let vk = VerifyingKey::from(&sk);
-            let _ = vk.verify(b"uni-tls preinit", &sig);
+            let _ = vk.verify(b"waitless-tls preinit", &sig);
         }
     }
 

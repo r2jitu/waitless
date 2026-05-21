@@ -1,7 +1,7 @@
 load("@rules_python//python:defs.bzl", "py_test")
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:unikernel.bzl", "unikernel_binary")
-load("//bazel/rules:variants.bzl", "unikernel_app_test")
+load("//bazel/rules:waitless.bzl", "waitless_binary")
+load("//bazel/rules:variants.bzl", "waitless_app_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -17,7 +17,7 @@ rust_library(
 # Virtio-net is linked so the TCP stack (`net::init_stack`) wires up
 # its backend hooks; the socket-lifecycle tests need `TcpListener::
 # bind` to succeed. No actual traffic is sent either way.
-unikernel_binary(
+waitless_binary(
     name = "test_async",
     app = ":app",
     cpus = 1,
@@ -27,7 +27,7 @@ unikernel_binary(
 # Async-runtime smoke test. Runs on HVF and both QEMU TCG arches;
 # native excluded because the test exercises `kernel::executor`,
 # which is bare-metal-only.
-unikernel_app_test(
+waitless_app_test(
     name = "test",
     timeout = "short",
     srcs = ["test.py"],

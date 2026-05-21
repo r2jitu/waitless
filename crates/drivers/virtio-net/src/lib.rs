@@ -419,7 +419,7 @@ fn get_mac(mac_out: *mut u8) {
 // ── Registration ────────────────────────────────────────────────────────────
 //
 // A static `NicOps` struct of fn pointers, registered into the
-// `.uni_drivers_ethernet` section via `register_ethernet_driver!`.
+// `.waitless_drivers_ethernet` section via `register_ethernet_driver!`.
 // The active-driver slot stores `&'static NicOps`; every dispatcher
 // call does one Acquire load + one direct call.
 

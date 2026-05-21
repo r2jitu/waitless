@@ -3,7 +3,7 @@
 
 Companion to `test.py` (single-vCPU), intentionally narrower:
 
-    * Boots the webserver at `UNIKERNEL_CPUS=4` so the kernel actually
+    * Boots the webserver at `WAITLESS_CPUS=4` so the kernel actually
       exercises the Tier-1 multi-queue path (each vCPU polls its own
       RX queue pair; `activate_multi_queue()` in `Net::enable`
       negotiates N queue pairs via `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET`).
@@ -53,7 +53,7 @@ UDP_PORT = int(os.environ.get("TEST_UDP_PORT", 19007))
 TCP_ECHO_PORT = int(os.environ.get("TEST_TCP_ECHO_PORT", 19009))
 
 # Boot at 4 vCPUs. Every Apple Silicon / modern x86 host has at least
-# this many; `UNIKERNEL_CPUS` is read by every variant's launcher
+# this many; `WAITLESS_CPUS` is read by every variant's launcher
 # (hvf / qemu_* / native) — see `bazel/rules/variants.bzl`'s
 # `default_cpus` attr.
 CPU_COUNT = 4
@@ -61,11 +61,11 @@ CPU_COUNT = 4
 
 def _launcher_env() -> dict[str, str]:
     return {
-        "UNIKERNEL_CPUS": str(CPU_COUNT),
-        "UNIKERNEL_TCP_80": str(PORT),
-        "UNIKERNEL_TCP_443": str(TLS_PORT),
-        "UNIKERNEL_UDP_7": str(UDP_PORT),
-        "UNIKERNEL_TCP_9": str(TCP_ECHO_PORT),
+        "WAITLESS_CPUS": str(CPU_COUNT),
+        "WAITLESS_TCP_80": str(PORT),
+        "WAITLESS_TCP_443": str(TLS_PORT),
+        "WAITLESS_UDP_7": str(UDP_PORT),
+        "WAITLESS_TCP_9": str(TCP_ECHO_PORT),
     }
 
 
@@ -90,7 +90,7 @@ class WebserverMultiCoreTest(unittest.TestCase):
                 pass
             cls.launcher.terminate()
             raise RuntimeError(
-                f"HTTP not ready on :{PORT} after 30s (UNIKERNEL_CPUS={CPU_COUNT})"
+                f"HTTP not ready on :{PORT} after 30s (WAITLESS_CPUS={CPU_COUNT})"
             )
 
     @classmethod
@@ -102,7 +102,7 @@ class WebserverMultiCoreTest(unittest.TestCase):
 
     def test_boot_reports_requested_cpu_count(self) -> None:
         """boot_info ships `cpus=N` through the serial log — if the
-        launcher's `UNIKERNEL_CPUS` plumbing is broken we'll silently
+        launcher's `WAITLESS_CPUS` plumbing is broken we'll silently
         test single-vCPU here and miss the whole MQ path."""
         log = self._log()
         marker = f"cpus={CPU_COUNT}".encode()

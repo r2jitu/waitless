@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Generated launcher for the `_iso_<arch>` variant of a
-# unikernel_binary target. The variant rule symlinks the Limine
+# waitless_binary target. The variant rule symlinks the Limine
 # ISO and `//scripts:helpers.sh` next to this script under the
 # filenames substituted into %ISO% / %HELPERS_NAME%, so both are
 # reachable via `$SELF_DIR/<basename>` regardless of whether the
@@ -22,7 +22,7 @@ QEMU_BIN="%QEMU_BIN%"
 VIRTIO_DEV="%VIRTIO_DEV%"
 
 run_qemu \
-    "${UNIKERNEL_MEMORY:-%DEFAULT_RAM%}" \
-    "${UNIKERNEL_CPUS:-%DEFAULT_CPUS%}" \
+    "${WAITLESS_MEMORY:-%DEFAULT_RAM%}" \
+    "${WAITLESS_CPUS:-%DEFAULT_CPUS%}" \
     "%HOSTFWD%" \
     %QEMU_MACHINE% -cdrom "$ISO"

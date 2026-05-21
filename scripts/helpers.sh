@@ -86,7 +86,7 @@ detect_qemu() {
 #   HOSTFWD is a comma-joined list of QEMU `hostfwd=…` forwards,
 #   e.g. `hostfwd=tcp::8080-:80,hostfwd=udp::8007-:7`. Built by the
 #   per-variant launcher template from each app's `port_forwards`
-#   attr on `unikernel_binary`. Empty string = no port forwarding.
+#   attr on `waitless_binary`. Empty string = no port forwarding.
 # Prereq: QEMU_BIN and VIRTIO_DEV must be set (via detect_qemu).
 run_qemu() {
     local memory="$1" cpus="$2" hostfwd="$3"

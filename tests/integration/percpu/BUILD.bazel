@@ -1,7 +1,7 @@
 load("@rules_python//python:defs.bzl", "py_test")
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:unikernel.bzl", "unikernel_binary")
-load("//bazel/rules:variants.bzl", "unikernel_app_test")
+load("//bazel/rules:waitless.bzl", "waitless_binary")
+load("//bazel/rules:variants.bzl", "waitless_app_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -17,7 +17,7 @@ rust_library(
 
 # Defaults to 4 vCPUs because the per-core state tests need them.
 # Serial-log-only assertions → no port forwards needed.
-unikernel_binary(
+waitless_binary(
     name = "test_percpu",
     app = ":app",
     # App depends on `//kernel` (per-core state primitives), which is
@@ -28,7 +28,7 @@ unikernel_binary(
 
 # Per-core state test. Runs on HVF (real aarch64 hardware) + both
 # QEMU TCG arches. Native excluded (test exercises kernel::percpu).
-unikernel_app_test(
+waitless_app_test(
     name = "test",
     timeout = "short",
     srcs = ["test.py"],

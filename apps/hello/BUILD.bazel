@@ -1,5 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:unikernel.bzl", "port_fwd", "unikernel_binary")
+load("//bazel/rules:waitless.bzl", "port_fwd", "waitless_binary")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -21,7 +21,7 @@ rust_library(
 # forward — HTTPS + UDP echo forwards would just sit idle.
 # hello doesn't target gVNIC instances, so it skips the gve crate;
 # a gVNIC-flavoured variant would add `//crates/drivers/gve` too.
-unikernel_binary(
+waitless_binary(
     name = "hello",
     app = ":app",
     drivers = ["//crates/drivers/virtio-net"],

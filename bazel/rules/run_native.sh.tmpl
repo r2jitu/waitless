@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Generated launcher for the `_native` variant of a unikernel_binary
+# Generated launcher for the `_native` variant of a waitless_binary
 # target. The variant rule symlinks the host-built rust_binary next to
 # this script (filename in BIN= below) and substitutes a block of
-# `export UNIKERNEL_<PROTO>_<GUEST>="${...:-host}"` lines built from
+# `export WAITLESS_<PROTO>_<GUEST>="${...:-host}"` lines built from
 # the app's `port_forwards` attr — baking the BUILD-declared host port
 # as the default while letting a caller-set env var override. Same
 # `${VAR:-default}` shell-expansion convention as the HVF / QEMU

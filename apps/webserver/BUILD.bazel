@@ -1,8 +1,8 @@
 load("@pip//:requirements.bzl", "requirement")
 load("@rules_python//python:defs.bzl", "py_test")
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:unikernel.bzl", "port_fwd", "unikernel_binary")
-load("//bazel/rules:variants.bzl", "unikernel_app_test")
+load("//bazel/rules:waitless.bzl", "port_fwd", "waitless_binary")
+load("//bazel/rules:variants.bzl", "waitless_app_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -36,7 +36,7 @@ rust_library(
     ],
 )
 
-unikernel_binary(
+waitless_binary(
     name = "webserver",
     app = ":app",
     # Runtime picks whichever probes successfully: virtio-net covers
@@ -79,7 +79,7 @@ unikernel_binary(
 # `:test_qemu_aarch64`, `:test_qemu_x86_64`). test.py reads
 # `LAUNCHER_NAME` from env to resolve the per-variant runfile —
 # runner-agnostic. HVF auto-skips on non-macOS hosts.
-unikernel_app_test(
+waitless_app_test(
     name = "test",
     timeout = "short",
     srcs = ["test.py"],
@@ -105,7 +105,7 @@ unikernel_app_test(
 # need to actually exercise. QEMU/TCG's 4-vCPU boot is slow enough
 # that adding another 30-second test per `bazel test //...` run
 # isn't worth it for a fallback path.
-unikernel_app_test(
+waitless_app_test(
     name = "test_mc",
     timeout = "short",
     srcs = ["test_mc.py"],

@@ -28,7 +28,7 @@
 // merger from //crates/net:tls into //crates/proto/tls. `tls_crypto` was a separate
 // crate; it's now this crate's sibling `aead` module.)
 
-// Note: TrafficKey caches a `uni_aes_gcm::Aes128GcmFast` — our
+// Note: TrafficKey caches a `waitless_aes_gcm::Aes128GcmFast` — our
 // hand-rolled stitched AES-128-GCM with batched + deferred-
 // reduction GHASH — bypassing the upstream `aes-gcm` crate's
 // two-pass / per-block-reduction structure. See `//crates/crypto/aes-gcm`
@@ -224,7 +224,7 @@ pub fn empty_transcript_hash() -> [u8; HASH_LEN] {
 /// raw key.
 #[derive(Clone)]
 pub struct TrafficKey {
-    cipher: uni_aes_gcm::Aes128GcmFast,
+    cipher: waitless_aes_gcm::Aes128GcmFast,
     pub iv: [u8; IV_LEN],
     pub seq: u64,
 }
@@ -254,7 +254,7 @@ impl TrafficKey {
         let mut iv = [0u8; IV_LEN];
         hkdf_expand_label(secret, b"key", &[], &mut key);
         hkdf_expand_label(secret, b"iv", &[], &mut iv);
-        let cipher = uni_aes_gcm::Aes128GcmFast::new(&key);
+        let cipher = waitless_aes_gcm::Aes128GcmFast::new(&key);
         // Wipe the raw key now that it's been folded into the
         // cipher's round-key state — no plaintext key bytes
         // outlive this call.
@@ -310,7 +310,7 @@ impl TrafficKey {
         aad: &[u8],
         data: &mut [u8],
         tag: &[u8; 16],
-    ) -> Result<(), uni_aes_gcm::AeadError> {
+    ) -> Result<(), waitless_aes_gcm::AeadError> {
         let nonce = self.nonce_for_seq(self.seq);
         self.cipher.open(&nonce, aad, data, tag)?;
         self.seq = self.seq.wrapping_add(1);

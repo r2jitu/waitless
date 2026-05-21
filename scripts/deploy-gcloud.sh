@@ -34,8 +34,8 @@
 # accumulates across deploys.
 #
 # Env overrides:
-#   UNIKERNEL_GCE_PROJECT, UNIKERNEL_GCE_ZONE, UNIKERNEL_GCE_MACHINE,
-#   UNIKERNEL_GCS_BUCKET, UNIKERNEL_GCE_NAME
+#   WAITLESS_GCE_PROJECT, WAITLESS_GCE_ZONE, WAITLESS_GCE_MACHINE,
+#   WAITLESS_GCS_BUCKET, WAITLESS_GCE_NAME
 
 set -euo pipefail
 
@@ -44,17 +44,17 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 MODE="${1:-deploy}"
 
-NAME="${UNIKERNEL_GCE_NAME:-unikernel-webserver}"
+NAME="${WAITLESS_GCE_NAME:-unikernel-webserver}"
 # Default zone us-west1-c: only us-west1 zone with c3-highcpu-8.
-ZONE="${UNIKERNEL_GCE_ZONE:-us-west1-c}"
+ZONE="${WAITLESS_GCE_ZONE:-us-west1-c}"
 # c3-highcpu-8 by default: 8 vCPU room for multi-core bench scaling.
 # (Both c3 and n2 negotiate `GqiQpl` from the gVNIC device on the
 # GCE images we've tested — DQO_RDA is on the c3 menu in principle
 # but isn't advertised in our deploy path.) Override with
-# `UNIKERNEL_GCE_MACHINE=n2-highcpu-8` to bench the older NIC class
+# `WAITLESS_GCE_MACHINE=n2-highcpu-8` to bench the older NIC class
 # on the same gve driver.
-MACHINE_TYPE="${UNIKERNEL_GCE_MACHINE:-c3-highcpu-8}"
-BUCKET="${UNIKERNEL_GCS_BUCKET:-${NAME}-images}"
+MACHINE_TYPE="${WAITLESS_GCE_MACHINE:-c3-highcpu-8}"
+BUCKET="${WAITLESS_GCS_BUCKET:-${NAME}-images}"
 
 # Single-slot deploy: the image / tarball / workdir all use stable
 # names, so each deploy just overwrites the previous one. GCE images
@@ -67,11 +67,11 @@ WORKDIR="/tmp/${NAME}-deploy"
 DISK_FILE="${WORKDIR}/disk.raw"
 TARBALL="${WORKDIR}/${TARBALL_NAME}"
 
-PROJECT="${UNIKERNEL_GCE_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
+PROJECT="${WAITLESS_GCE_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
 
 _require_project() {
     if [ -z "$PROJECT" ]; then
-        echo "Error: no GCP project set (env UNIKERNEL_GCE_PROJECT or gcloud config)" >&2
+        echo "Error: no GCP project set (env WAITLESS_GCE_PROJECT or gcloud config)" >&2
         exit 1
     fi
 }
@@ -269,13 +269,13 @@ deploy() {
     # VMs can be reclaimed with 30 s notice at any time — fine for
     # short bench runs and dev iteration, not for steady serving.
     # `kvm-vm` is already spot for the same reason. Set
-    # `UNIKERNEL_GCE_PREEMPTIBLE=0` for on-demand provisioning if
+    # `WAITLESS_GCE_PREEMPTIBLE=0` for on-demand provisioning if
     # you need uninterruptible runs. The flag adds
     # `--provisioning-model=SPOT` plus the required
     # `--no-restart-on-failure` / `--maintenance-policy=TERMINATE`
     # companions.
     local preempt_args=()
-    if [[ "${UNIKERNEL_GCE_PREEMPTIBLE:-1}" == "1" ]]; then
+    if [[ "${WAITLESS_GCE_PREEMPTIBLE:-1}" == "1" ]]; then
         echo "    (preemptible / SPOT provisioning)"
         preempt_args=(
             --provisioning-model=SPOT

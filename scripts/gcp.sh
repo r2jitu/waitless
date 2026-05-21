@@ -33,10 +33,10 @@ GCP_PROJECT="${GCP_PROJECT:-unikernel-dev}"
 GCP_ZONE="${GCP_ZONE:-us-west1-c}"
 GCP_INSTANCE="${GCP_INSTANCE:-kvm-vm}"
 SSH_HOST="${GCP_SSH_HOST:-gcp}"
-MEMORY="${UNIKERNEL_MEMORY:-128}"
+MEMORY="${WAITLESS_MEMORY:-128}"
 TEST_PORT=19099
 
-# Resolve the guest vCPU count — `UNIKERNEL_CPUS` if set, else the
+# Resolve the guest vCPU count — `WAITLESS_CPUS` if set, else the
 # remote host's `nproc`. Deferred into a function (rather than a
 # top-level `$(...)` assignment) so `gcp.sh status`/`stop`/`ip` don't
 # ssh to the instance just to populate a variable they never read —
@@ -44,8 +44,8 @@ TEST_PORT=19099
 # ~75 s, which made every `gcp-bench.sh` invocation look hung right
 # after the build step finished.
 _cpus() {
-    if [ -n "${UNIKERNEL_CPUS:-}" ]; then
-        echo "$UNIKERNEL_CPUS"
+    if [ -n "${WAITLESS_CPUS:-}" ]; then
+        echo "$WAITLESS_CPUS"
     else
         ssh "$SSH_HOST" nproc 2>/dev/null || echo 1
     fi
@@ -537,8 +537,8 @@ Environment:
   GCP_ZONE=us-west1-c          GCP zone
   GCP_INSTANCE=kvm-vm          Instance name
   GCP_SSH_HOST=gcp             SSH config alias
-  UNIKERNEL_MEMORY=128         VM memory in MB
-  UNIKERNEL_CPUS=<nproc>        vCPU count (default: all host cores)
+  WAITLESS_MEMORY=128         VM memory in MB
+  WAITLESS_CPUS=<nproc>        vCPU count (default: all host cores)
 USAGE
     ;;
 esac

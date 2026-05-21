@@ -584,7 +584,7 @@ impl Drop for BorrowGuard {
 // than as silent UAF later.
 //
 // Active only under `cfg(test)`. The tracker needs `std` — a
-// `thread_local!` and a `Vec` — and the no_std `x86_64-unikernel-none`
+// `thread_local!` and a `Vec` — and the no_std `x86_64-waitless-none`
 // unikernel target has no `std` crate to link, so it cannot compile
 // there. It is therefore gated to `cfg(test)` (cargo test / the
 // `iobuf_test` bazel target), which always builds against std; in

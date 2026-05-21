@@ -168,7 +168,7 @@ pub fn set_net_rearm_rx(f: ArmFn) {
 }
 
 /// Signal that the app has finished initialization and the event loop
-/// can start processing. Called by boot code after uni_init() returns.
+/// can start processing. Called by boot code after waitless_init() returns.
 pub fn set_ready() {
     READY.store(true, Ordering::Release);
     // Wake all cores so they stop waiting and enter the loop.

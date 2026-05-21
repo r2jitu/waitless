@@ -1,27 +1,27 @@
 """Build rules for unikernel images.
 
-Provides unikernel_binary() which packages a Rust application library
+Provides waitless_binary() which packages a Rust application library
 into bootable kernel images using rustc + rust-lld.
 """
 
 load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@rules_rust//rust:defs.bzl", "rust_binary")
-load("//bazel/rules:variants.bzl", "unikernel_variants")
+load("//bazel/rules:variants.bzl", "waitless_variants")
 
 # ── Public launch-config helpers ─────────────────────────────────────────
 #
-# `port_fwd` lives here alongside `unikernel_binary` (not in
+# `port_fwd` lives here alongside `waitless_binary` (not in
 # `variants.bzl`) so apps only pull one `.bzl` for the rule + its
 # attr-construction helpers. Lists of these go into
-# `unikernel_binary(port_forwards = [...])`.
+# `waitless_binary(port_forwards = [...])`.
 
 def port_fwd(proto, guest, host):
     """Build a validated port-forward entry for the `port_forwards` attr.
 
     Returns a struct with the three fields, validated up front so
     errors surface at macro-call time rather than deep inside rule
-    analysis. The struct is carried through the `unikernel_binary`
-    → `unikernel_variants` macro chain and serialised into a
+    analysis. The struct is carried through the `waitless_binary`
+    → `waitless_variants` macro chain and serialised into a
     `string_list` attr only at the rule boundary (callers never
     see the encoding).
 
@@ -32,8 +32,8 @@ def port_fwd(proto, guest, host):
       * `guest` is fixed — baked into the variant launcher; matches
         the port the app listens on inside the guest.
       * `host` is the default external port the launcher exposes.
-      * At runtime, `UNIKERNEL_<PROTO>_<GUEST>` (e.g.
-        `UNIKERNEL_TCP_80`) overrides the host port; otherwise
+      * At runtime, `WAITLESS_<PROTO>_<GUEST>` (e.g.
+        `WAITLESS_TCP_80`) overrides the host port; otherwise
         `host` is used. Same convention is honored by the native
         binary (`:<name>_native`), so users override ports the
         same way regardless of runner.
@@ -60,14 +60,14 @@ def port_fwd(proto, guest, host):
 # Every label that flows into a rule-attribute value or a `select()` key
 # from inside a macro body must be a `Label()` object, not a bare `//…`
 # string. A bare string is resolved against the *calling* BUILD file's
-# repository, so an external app calling `unikernel_binary` would look
-# for `@theapp//crates/boot:entry` (and fail) instead of unikernel's own
+# repository, so an external app calling `waitless_binary` would look
+# for `@theapp//crates/boot:entry` (and fail) instead of waitless's own
 # `//crates/boot:entry`. A `Label()` evaluated here binds to this `.bzl`
-# file's repo (`@unikernel`) and stays fixed regardless of caller.
+# file's repo (`@waitless`) and stays fixed regardless of caller.
 #
 # Pseudo-labels (`//conditions:default`, `//command_line_option:*`,
 # `//visibility:*`) and `attr` / `transition` definition-time defaults are
-# intentionally NOT wrapped — those already resolve in unikernel's
+# intentionally NOT wrapped — those already resolve in waitless's
 # context, at definition time.
 _AARCH64 = Label("//bazel/platforms:aarch64")
 _X86_64 = Label("//bazel/platforms:x86_64")
@@ -82,9 +82,9 @@ _BOOT_MULTIBOOT = Label("//crates/boot:multiboot")
 _LIMINE_CONF = Label("//crates/boot:limine.conf")
 _VIRTIO_CONSOLE = Label("//crates/drivers/virtio-console")
 
-_LD_ARM64 = Label("//bazel/toolchain:unikernel_arm64.ld")
-_LD_X86_64 = Label("//bazel/toolchain:unikernel.ld")
-_LD_LIMINE = Label("//bazel/toolchain:unikernel_limine.ld")
+_LD_ARM64 = Label("//bazel/toolchain:waitless_arm64.ld")
+_LD_X86_64 = Label("//bazel/toolchain:waitless.ld")
+_LD_LIMINE = Label("//bazel/toolchain:waitless_limine.ld")
 
 _MAKE_LIMINE_ISO = Label("//scripts:make_limine_iso")
 _NATIVE_MAIN_RS = Label("//bazel/rules:native_main.rs")
@@ -128,8 +128,8 @@ def _label_crate_name(label):
     component) and replace non-identifier characters with `_`.
 
     Label forms accepted:
-      `//crates/drivers/virtio-net`                     → `uni_driver_virtio_net`
-      `//crates/drivers/virtio-net` → `uni_driver_virtio_net`
+      `//crates/drivers/virtio-net`                     → `waitless_driver_virtio_net`
+      `//crates/drivers/virtio-net` → `waitless_driver_virtio_net`
       `:foo-bar`                                    → `foo_bar`
     """
     if ":" in label:
@@ -147,7 +147,7 @@ def _label_crate_name(label):
 # builds and `:<name>_native` stay non-LTO regardless. LTO is `off` by
 # default — opt in with `--//bazel/rules:lto={fat,thin}` (or the
 # `--config=lto-fat` / `--config=lto-thin` shortcuts).
-def _unikernel_elf_transition_impl(settings, _attr):
+def _waitless_elf_transition_impl(settings, _attr):
     is_aarch64 = any([
         p.package == "bazel/platforms" and p.name.startswith("aarch64")
         for p in settings["//command_line_option:platforms"]
@@ -160,8 +160,8 @@ def _unikernel_elf_transition_impl(settings, _attr):
         "@rules_rust//rust/settings:lto": settings["//bazel/rules:lto"],
     }
 
-_unikernel_elf_transition = transition(
-    implementation = _unikernel_elf_transition_impl,
+_waitless_elf_transition = transition(
+    implementation = _waitless_elf_transition_impl,
     inputs = ["//command_line_option:platforms", "//bazel/rules:lto"],
     outputs = [
         "@rules_rust//:extra_rustc_flag",
@@ -169,18 +169,18 @@ _unikernel_elf_transition = transition(
     ],
 )
 
-def _unikernel_elf_impl(ctx):
+def _waitless_elf_impl(ctx):
     binary = ctx.attr.binary[0]
     return [DefaultInfo(
         files = binary[DefaultInfo].files,
         runfiles = binary[DefaultInfo].default_runfiles,
     )]
 
-_unikernel_elf = rule(
-    implementation = _unikernel_elf_impl,
+_waitless_elf = rule(
+    implementation = _waitless_elf_impl,
     attrs = {
         "binary": attr.label(
-            cfg = _unikernel_elf_transition,
+            cfg = _waitless_elf_transition,
             mandatory = True,
             allow_files = True,
         ),
@@ -190,7 +190,7 @@ _unikernel_elf = rule(
     },
 )
 
-def unikernel_binary(
+def waitless_binary(
         name,
         app,
         drivers = [],
@@ -218,7 +218,7 @@ def unikernel_binary(
       - <name>_qemu_aarch64 : aarch64 unikernel + QEMU TCG.
       - <name>_qemu_x86_64  : x86_64 unikernel + QEMU TCG.
 
-    The VM variants are generated via `unikernel_variants`; native
+    The VM variants are generated via `waitless_variants`; native
     is a plain rust_binary because `native_main.rs` links libstd
     (so `bazel test`'s `-Cpanic=unwind` works without a Bazel
     transition resetting it).
@@ -236,15 +236,15 @@ def unikernel_binary(
           with `-` replaced by `_`.
         port_forwards: list of entries built via `port_fwd()`. Each
           entry baked into the variant launchers as a `host_port →
-          guest_port` forward, with `UNIKERNEL_*`-style env vars
+          guest_port` forward, with `WAITLESS_*`-style env vars
           overriding the host port at run time. Defaults to `[]`
           (no forwards) so non-interactive test apps stay clean;
           server apps opt in with `port_forwards =
           HTTP_HTTPS_UDP_FORWARDS` (or their own list).
         ram_mb: default guest RAM in MB, overridable at run time
-          via `UNIKERNEL_MEMORY`.
+          via `WAITLESS_MEMORY`.
         cpus: default vCPU count, overridable at run time via
-          `UNIKERNEL_CPUS`.
+          `WAITLESS_CPUS`.
         build_native: when True (the default), also emit a
           `<name>_native` rust_binary that links the app against
           libstd and the `backend` POSIX impl. Kernel-only
@@ -264,9 +264,9 @@ def unikernel_binary(
     # rather than failing to compile no_std code / emit unikernel-
     # specific link sections. Variant transitions
     # (//bazel/rules:variants.bzl) flip the platform to aarch64 /
-    # x86_64 `_unikernel` (both `os:none`), so the variant dep-chain
+    # x86_64 `_waitless` (both `os:none`), so the variant dep-chain
     # (`:<name>_hvf` → `:<name>.img` → `:<name>.elf`) builds fine.
-    _unikernel_only = [_OS_NONE]
+    _waitless_only = [_OS_NONE]
 
     # Common deps for both .elf paths. multiboot (x86_64 multiboot/PVH stub)
     # is added per-target below since it's incompatible with higher-half
@@ -278,7 +278,7 @@ def unikernel_binary(
         _BOOT_MEM_STUBS,
         _VIRTIO_CONSOLE,
     ] + drivers
-    _unikernel_flags = _LINK_FLAGS + _LINK_FLAGS_ARCH
+    _waitless_flags = _LINK_FLAGS + _LINK_FLAGS_ARCH
 
     # Per-binary crate root. Every boot/driver crate is an rlib; rustc
     # prunes an rlib the binary never names in Rust source, and the
@@ -288,7 +288,7 @@ def unikernel_binary(
     # multiboot ELF and the Limine ELF reach the kernel through
     # different entry crates, so each gets its own crate root.
     main_base = [
-        "// Generated by unikernel_binary(). Do not edit — edit the macro instead.",
+        "// Generated by waitless_binary(). Do not edit — edit the macro instead.",
         "#![no_std]",
         "#![no_main]",
         "",
@@ -322,7 +322,7 @@ def unikernel_binary(
             "extern crate multiboot;",
             "",
         ],
-        target_compatible_with = _unikernel_only,
+        target_compatible_with = _waitless_only,
     )
 
     # Limine ELF crate root: no `multiboot` — Limine enters via
@@ -334,7 +334,7 @@ def unikernel_binary(
         name = limine_main_rule,
         out = limine_main_rs,
         content = main_base + [""],
-        target_compatible_with = _unikernel_only,
+        target_compatible_with = _waitless_only,
     )
 
     # ── Unikernel ELF ────────────────────────────────────────────────────
@@ -351,14 +351,14 @@ def unikernel_binary(
             _AARCH64: _LD_ARM64,
             "//conditions:default": _LD_X86_64,
         }),
-        rustc_flags = _unikernel_flags,
-        target_compatible_with = _unikernel_only,
+        rustc_flags = _waitless_flags,
+        target_compatible_with = _waitless_only,
         visibility = ["//visibility:private"],
     )
-    _unikernel_elf(
+    _waitless_elf(
         name = name + ".elf",
         binary = ":" + name + ".elf_inner",
-        target_compatible_with = _unikernel_only,
+        target_compatible_with = _waitless_only,
         visibility = visibility,
     )
 
@@ -386,13 +386,13 @@ def unikernel_binary(
             fi
             $$OC -O binary $(location :{name_elf}) $@
         """.format(name_elf = name + ".elf"),
-        target_compatible_with = _unikernel_only,
+        target_compatible_with = _waitless_only,
         visibility = visibility,
     )
 
     # ── Limine higher-half ELF (x86_64 Limine boot) ─────────────────────
     #
-    # Uses a standalone linker script (unikernel_limine.ld) that places
+    # Uses a standalone linker script (waitless_limine.ld) that places
     # the kernel at 0xFFFFFFFF80100000. Excludes //crates/boot:multiboot because
     # boot.S has 32-bit absolute relocations that can't reach higher-half;
     # Limine enters at limine_entry() directly so the multiboot stub
@@ -406,14 +406,14 @@ def unikernel_binary(
         crate_root = limine_main_rs,
         deps = _common_deps,
         linker_script = _LD_LIMINE,
-        rustc_flags = _unikernel_flags,
-        target_compatible_with = _unikernel_only,
+        rustc_flags = _waitless_flags,
+        target_compatible_with = _waitless_only,
         visibility = ["//visibility:private"],
     )
-    _unikernel_elf(
+    _waitless_elf(
         name = name + ".limine.elf",
         binary = ":" + name + ".limine.elf_inner",
-        target_compatible_with = _unikernel_only,
+        target_compatible_with = _waitless_only,
         visibility = visibility,
     )
 
@@ -425,7 +425,7 @@ def unikernel_binary(
     # `cmd` can't hold `Label` objects (it's a shell string), and the
     # `$(location …)` make-var resolves its label against the genrule's
     # package — the *caller's* package. Formatting `str(Label("//…"))`
-    # in yields the canonical `@@unikernel+//…` label, which `$(location)`
+    # in yields the canonical `@@waitless+//…` label, which `$(location)`
     # resolves unambiguously and which matches the `srcs` / `tools`
     # `Label` entries below.
     native.genrule(
@@ -463,7 +463,7 @@ def unikernel_binary(
         }),
         tools = [_MAKE_LIMINE_ISO],
         local = True,
-        target_compatible_with = _unikernel_only,
+        target_compatible_with = _waitless_only,
         visibility = visibility,
     )
 
@@ -472,7 +472,7 @@ def unikernel_binary(
     # The actual host-OS binary lives at `:<name>_bin`;
     # `:<name>_native` is the launcher emitted by the native variant
     # rule (in variants.bzl) which wraps it with the same
-    # `${UNIKERNEL_TCP_80:-8080}`-style port-default expansion the
+    # `${WAITLESS_TCP_80:-8080}`-style port-default expansion the
     # HVF / QEMU launchers do. The `_bin` suffix is unqualified
     # (no `_native_`) because the native variant is the only consumer
     # — there's no other rust_binary the suffix could collide with.
@@ -515,7 +515,7 @@ def unikernel_binary(
     # flag, analysis cache preserved across variants. The VM-shape
     # config (port forwards, RAM, CPUs) passes through to each
     # variant's launcher template.
-    unikernel_variants(
+    waitless_variants(
         name = name,
         port_forwards = port_forwards,
         ram_mb = ram_mb,

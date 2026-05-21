@@ -48,7 +48,7 @@ mod state;
 mod tests;
 
 // Public API — preserves the pre-split surface so consumers (`net_stack`,
-// `executor::reactor::tcp` backend, `waitless_backend::unikernel`) compile
+// `executor::reactor::tcp` backend, `waitless_backend::bare`) compile
 // unchanged.
 pub use listener::{
     accept_on_port, async_recv, clear_chunk_buf_slot, clear_recv_buf_slot, clear_recv_waker,

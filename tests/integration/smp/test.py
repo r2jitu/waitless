@@ -3,7 +3,7 @@
 
 Boots the test_smp launcher (which handles the per-variant QEMU /
 HVF invocation, including the 4-vCPU default from the
-unikernel_binary attr) via `run_variant_and_capture`, then asserts
+waitless_binary attr) via `run_variant_and_capture`, then asserts
 against the captured serial log:
   * All 4 cores come online.
   * Each AP logs its own online message.

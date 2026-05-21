@@ -4,13 +4,13 @@ load("//bazel/rules:rust.bzl", "rust_test")
 package(default_visibility = ["//visibility:public"])
 
 # Network-stack byte-buffer primitive. Shared between every layer
-# that touches packet payloads: app (uni-http body parts), QUIC
+# that touches packet payloads: app (waitless-http body parts), QUIC
 # (SendStream chunks, outbound packet buffers), TLS (record
 # header/tag prepend), TCP/IP/Eth (per-layer header prepend), NIC
 # (zero-copy RX descriptor wrapping).
 #
-# Lives in its own crate so transport (uni-quic) and application
-# (uni-http) can both depend on it — neither is allowed to depend
+# Lives in its own crate so transport (waitless-quic) and application
+# (waitless-http) can both depend on it — neither is allowed to depend
 # on the other (transport ↛ app), so the shared primitive sits
 # below them.
 #

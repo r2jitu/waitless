@@ -15,7 +15,7 @@ bazel_dep(name = "rules_rust", version = "0.69.0")
 # `/usr/bin/env python3` finds on the host. Avoids the toolchain-
 # resolution dead-end we hit with the hermetic toolchain: it gets
 # registered with @platforms//os:{linux,macos,...} constraints, so
-# under --config=hvf (target platform = aarch64_unikernel with
+# under --config=hvf (target platform = aarch64_waitless with
 # os:none) Bazel can't find a matching toolchain even though the
 # test itself runs on the host.
 #
@@ -69,8 +69,8 @@ single_version_override(
 )
 
 register_toolchains(
-    "//bazel/toolchain:unikernel_cc_toolchain_x86_64",
-    "//bazel/toolchain:unikernel_cc_toolchain_aarch64",
+    "//bazel/toolchain:waitless_cc_toolchain_x86_64",
+    "//bazel/toolchain:waitless_cc_toolchain_aarch64",
     "//bazel/toolchain:cc_toolchain_aarch64_macos",
     "//bazel/toolchain:cc_toolchain_x86_64_linux",
 )
@@ -117,13 +117,13 @@ register_toolchains("@rust_toolchains//:all")
 # ── x86_64 hard-float bare-metal toolchain ──────────────────────────────────
 # Builds a hard-float `core`/`compiler_builtins`/`alloc` sysroot from pinned
 # rust-src and emits a `rust_toolchain` targeting the custom
-# `//bazel/toolchain:x86_64-none.json` spec. This replaces the soft-float
+# `//bazel/toolchain:x86_64-waitless-none.json` spec. This replaces the soft-float
 # builtin `x86_64-unknown-none` toolchain for the unikernel so the whole
 # x86_64 build -- kernel and crypto -- has one consistent hard-float ABI and
 # needs no `-Ctarget-feature` ABI toggle (rust-lang/rust#116344). See
 # //bazel/buildstd:extensions.bzl for the full rationale.
 hardfloat = use_extension("//bazel/buildstd:extensions.bzl", "hardfloat")
-hardfloat.toolchain(target_json = "//bazel/toolchain:x86_64-unikernel-none.json")
+hardfloat.toolchain(target_json = "//bazel/toolchain:x86_64-waitless-none.json")
 use_repo(hardfloat, "hardfloat_x86_64_none")
 
 register_toolchains("@hardfloat_x86_64_none//:toolchain")

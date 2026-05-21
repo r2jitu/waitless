@@ -2,7 +2,7 @@
 """tests/integration/percpu/test.py — Per-core state independence integration test.
 
 Boots the test_percpu launcher (4 vCPUs by default from the
-unikernel_binary attr) via `run_variant_and_capture` and asserts
+waitless_binary attr) via `run_variant_and_capture` and asserts
 that every core saw its own slot of TEST_DATA, tx_staging
 round-tripped through each AP, etc.
 """

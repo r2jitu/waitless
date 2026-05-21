@@ -611,7 +611,7 @@ pub(crate) fn log_mac(mac: &[u8; 6]) {
 // NicOps registration
 // ============================================================================
 //
-// Registered into the `.uni_drivers_ethernet` section as a static
+// Registered into the `.waitless_drivers_ethernet` section as a static
 // `NicOps`. Every dispatcher call does one Acquire load + one direct
 // call through the pointer. gve is polling-only — no NAPI, no MSI-X,
 // so `idle` is `None` and the dispatcher's idle path skips it.

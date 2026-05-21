@@ -88,7 +88,7 @@ impl NetCell {
 }
 
 // SAFETY: every read/write of `NET` is on the boot CPU:
-//   - `Net::enable` runs from `uni_init` (BSP on unikernel, main
+//   - `Net::enable` runs from `waitless_init` (BSP on unikernel, main
 //     thread on native).
 //   - `clear_on_shutdown` runs from `waitless::shutdown_and_drop`, called
 //     only from the BSP shutdown branch of the kernel event loop.

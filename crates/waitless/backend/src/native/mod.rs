@@ -24,12 +24,12 @@ mod udp;
 // did when these declarations lived inline in this file.
 use ffi::*;
 
-/// Read `UNIKERNEL_<PROTO>_<GUEST>` (e.g. `UNIKERNEL_TCP_80`) and
+/// Read `WAITLESS_<PROTO>_<GUEST>` (e.g. `WAITLESS_TCP_80`) and
 /// parse as a u16. Matches the name derivation baked into the VM
-/// launchers by `variants.bzl`, so `UNIKERNEL_TCP_80=18080
+/// launchers by `variants.bzl`, so `WAITLESS_TCP_80=18080
 /// :<app>_native` and `… :<app>_hvf` both bind to the same host port.
 fn read_port_env(proto: &str, guest_port: u16) -> Option<u16> {
-    std::env::var(format!("UNIKERNEL_{proto}_{guest_port}"))
+    std::env::var(format!("WAITLESS_{proto}_{guest_port}"))
         .ok()?
         .parse()
         .ok()
@@ -591,7 +591,7 @@ static THREADS: ThreadsCell = ThreadsCell(UnsafeCell::new(
     [const { ThreadState::new(0) }; MAX_THREADS],
 ));
 
-/// Populated once by `init_native` from UNIKERNEL_CPUS / num_cpus;
+/// Populated once by `init_native` from WAITLESS_CPUS / num_cpus;
 /// then read by all worker paths. Atomic so cross-thread reads are
 /// race-free without the `&static mut` dance.
 static NUM_THREADS: AtomicUsize = AtomicUsize::new(1);
@@ -629,7 +629,7 @@ static NATIVE_UDP_BACKEND: executor::reactor::UdpBackend = executor::reactor::Ud
 
 fn init_native() {
     unsafe {
-        // Per-port overrides (`UNIKERNEL_<PROTO>_<GUEST>`) are read
+        // Per-port overrides (`WAITLESS_<PROTO>_<GUEST>`) are read
         // lazily inside `tcp::async_tcp_listen_hook` / `udp::udp_backend_bind`,
         // keyed by the caller-supplied app port — same derivation
         // as `variants.bzl` bakes into the VM launcher templates.
@@ -637,7 +637,7 @@ fn init_native() {
         // LAUNCHER points at.
 
         // Determine thread count from environment or CPU count.
-        let num_threads = std::env::var("UNIKERNEL_CPUS")
+        let num_threads = std::env::var("WAITLESS_CPUS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or_else(|| num_cpus().min(MAX_THREADS));
@@ -764,7 +764,7 @@ pub fn poll_events() -> bool {
 }
 
 pub fn num_workers() -> u32 {
-    // NUM_THREADS is set by init_native() from UNIKERNEL_CPUS or
+    // NUM_THREADS is set by init_native() from WAITLESS_CPUS or
     // num_cpus() as default. Use it directly — don't override with
     // num_cpus().
     NUM_THREADS.load(Ordering::Acquire) as u32
@@ -847,7 +847,7 @@ fn is_ready() -> bool {
 /// Run the worker event loop on this thread. Same structure as the
 /// unikernel's. Called by `native_worker_loop` after thread setup.
 pub fn run_worker(worker_id: u32) {
-    // Worker 0 skips the READY wait: `uni_init` now only spawns the
+    // Worker 0 skips the READY wait: `waitless_init` now only spawns the
     // app's boot body as an async task; worker 0 is what polls it,
     // and the task's `waitless::run(app)` is what eventually calls
     // `set_ready` to release the other workers. Blocking here would
@@ -904,7 +904,7 @@ pub fn run_worker(worker_id: u32) {
 // returns nothing. `#[no_mangle]` on the emitting `#[waitless::init]`
 // macro gives the symbol a stable link-time name.
 unsafe extern "Rust" {
-    fn uni_init();
+    fn waitless_init();
 }
 
 extern "C" fn worker_thread(arg: *mut u8) -> *mut u8 {
@@ -973,7 +973,7 @@ pub fn run(config: RunConfig) -> i32 {
     (config.boot_info_fn)(host_cpus as u32, host_ram_bytes());
 
     unsafe {
-        uni_init();
+        waitless_init();
         let num_threads = NUM_THREADS.load(Ordering::Acquire);
 
         // Start worker threads
@@ -1051,7 +1051,7 @@ pub fn gve_diag() -> crate::GveDiag {
 }
 
 /// Native stub for the TCP/IP-stack counters — the bare-metal
-/// `net` stack isn't linked on native. Mirrors `unikernel::tcp_diag`.
+/// `net` stack isn't linked on native. Mirrors `bare::tcp_diag`.
 pub fn tcp_diag() -> crate::TcpDiag {
     crate::TcpDiag::default()
 }

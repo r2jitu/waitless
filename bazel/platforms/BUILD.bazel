@@ -1,7 +1,7 @@
 package(default_visibility = ["//visibility:public"])
 
 platform(
-    name = "x86_64_unikernel",
+    name = "x86_64_waitless",
     constraint_values = [
         "@platforms//cpu:x86_64",
         "@platforms//os:none",
@@ -9,7 +9,7 @@ platform(
 )
 
 platform(
-    name = "aarch64_unikernel",
+    name = "aarch64_waitless",
     constraint_values = [
         "@platforms//cpu:aarch64",
         "@platforms//os:none",
@@ -77,22 +77,22 @@ config_setting(
 )
 
 # ── Runner selection ──────────────────────────────────────────────────────────
-# Matches the `//bazel/rules:uni_runner` string_flag (default "native",
-# one of "native" / "hvf" / "qemu" / "iso"). Used by unikernel_binary()'s
+# Matches the `//bazel/rules:waitless_runner` string_flag (default "native",
+# one of "native" / "hvf" / "qemu" / "iso"). Used by waitless_binary()'s
 # `srcs` / `data` select() to pick the right launcher script + data
 # deps. `.bazelrc` shortcut configs (`build:hvf` etc.) and per-variant
 # transitions in `//bazel/rules:variants.bzl` both flip the flag.
 config_setting(
     name = "runner_qemu",
-    flag_values = {"//bazel/rules:uni_runner": "qemu"},
+    flag_values = {"//bazel/rules:waitless_runner": "qemu"},
 )
 
 config_setting(
     name = "runner_hvf",
-    flag_values = {"//bazel/rules:uni_runner": "hvf"},
+    flag_values = {"//bazel/rules:waitless_runner": "hvf"},
 )
 
 config_setting(
     name = "runner_iso",
-    flag_values = {"//bazel/rules:uni_runner": "iso"},
+    flag_values = {"//bazel/rules:waitless_runner": "iso"},
 )

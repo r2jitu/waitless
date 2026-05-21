@@ -196,7 +196,7 @@ static GLOBAL_TICKET_KEY: OnceTicketKey = OnceTicketKey::new();
 /// Get (and on first call, generate) the process-wide ticket key.
 /// Generation pulls 48 bytes from the kernel RNG (16 for the name,
 /// 32 for the AEAD key). The bare-metal RNG is wired up before
-/// `uni_init` runs, so the first handshake always sees a usable
+/// `waitless_init` runs, so the first handshake always sees a usable
 /// entropy source.
 pub fn current_ticket_key() -> &'static TicketKey {
     GLOBAL_TICKET_KEY.get_or_init(|| {

@@ -195,14 +195,14 @@
   "moduleExtensions": {
     "//bazel/buildstd:extensions.bzl%hardfloat": {
       "general": {
-        "bzlTransitiveDigest": "R2T6Gq3xgiu5mxtBDiH1beFLCcfy+cQJN8BxLv5yNvY=",
-        "usagesDigest": "PbSng7SyiGboZ6PI8a2wNZ+uLyGEUG1XTOFTKonYXb8=",
+        "bzlTransitiveDigest": "pZ7NNaqmVQlHGCfPdDIT4Vm8y5ZpUMf7GAu3CzveXMY=",
+        "usagesDigest": "iGN/Oh1dEFg32/b+CtrYK3d5hT0yNKsmlRvXi/GOebg=",
         "recordedInputs": [],
         "generatedRepoSpecs": {
           "hardfloat_x86_64_none": {
             "repoRuleId": "@@//bazel/buildstd:extensions.bzl%_hardfloat_sysroot",
             "attributes": {
-              "target_json": "@@//bazel/toolchain:x86_64-unikernel-none.json"
+              "target_json": "@@//bazel/toolchain:x86_64-waitless-none.json"
             }
           }
         }
@@ -513,7 +513,7 @@
           "REPO_MAPPING:rules_rust+,rules_rust rules_rust+",
           "FILE:@@//Cargo.Bazel.lock a224eb0346d61b2927afbc1eff363a8d97ab17d9ebfceaa0b8c9b3e3eb407708",
           "FILE:@@//.cargo/config.toml 820454eae96d442a43c1a4d51544180c2f784681c8680868f70036b8a1ce5717",
-          "FILE:@@//Cargo.toml 3580a5c47dad9786efb22f0a6fd4a00a6f8b23b4d27a867b73001f5a07ff3b05",
+          "FILE:@@//Cargo.toml 6a15ebad3f4ae28be60a423cc0e525a3382dfe114066fb4a2a1133bc484178c7",
           "FILE:@@//tools/hvf-runner/Cargo.toml ccff2de8a5134f94ef9c059eef62a4790039151e7122890ff06d206d457d4360",
           "FILE:@@//bazel/crates-bridge/Cargo.toml fdfed66a494d7bc46612edeeb43188dd9b6b65168e79b582662ebd161baa9aed"
         ],

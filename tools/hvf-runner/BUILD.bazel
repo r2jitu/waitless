@@ -42,7 +42,7 @@ rust_binary(
 # cfg), so it's built for the host platform regardless of what the
 # outer build is targeting. Without this, target-cfg rules that
 # depend on this genrule (e.g. a variant rule running under its
-# aarch64_unikernel transition) would drag the inner rust_binary
+# aarch64_waitless transition) would drag the inner rust_binary
 # onto the unikernel platform and fail its os:macos constraint.
 # Host-native unit tests for the aarch64 MMIO instruction decoder.
 # Pure-logic — given a 32-bit instruction word, return the

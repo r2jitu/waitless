@@ -20,7 +20,7 @@ exports_files(["limine.conf"])
 # `fdt::info` (in the LTO'd binary) read the other, still-zeroed one,
 # and boot panicked. As plain rlibs each dependency crate appears
 # exactly once in the binary, so there is nothing to duplicate.
-_UNIKERNEL_ONLY = ["@platforms//os:none"]
+_WAITLESS_ONLY = ["@platforms//os:none"]
 
 # `mem_stubs` (naive `memcpy`/`memset` byte loops — LLVM's loop-idiom
 # pass can rewrite them into self-recursive `memcpy` calls) and
@@ -43,7 +43,7 @@ rust_library(
         ],
     }),
     crate_root = "src/entry.rs",
-    target_compatible_with = _UNIKERNEL_ONLY,
+    target_compatible_with = _WAITLESS_ONLY,
     deps = [
         "//crates/drivers/bus",
         "//crates/drivers/nic",
@@ -62,14 +62,14 @@ rust_library(
     compile_data = ["src/x86_64/boot.S"],
     crate_root = "src/multiboot.rs",
     rustc_flags = _NO_LTO,
-    target_compatible_with = _UNIKERNEL_ONLY,
+    target_compatible_with = _WAITLESS_ONLY,
 )
 
 rust_library(
     name = "limine",
     srcs = ["src/limine_entry.rs"],
     crate_root = "src/limine_entry.rs",
-    target_compatible_with = _UNIKERNEL_ONLY,
+    target_compatible_with = _WAITLESS_ONLY,
     deps = [
         "//crates/kernel/bare",
         "@crates//:limine",
@@ -81,5 +81,5 @@ rust_library(
     srcs = ["src/mem_stubs.rs"],
     crate_root = "src/mem_stubs.rs",
     rustc_flags = _NO_LTO,
-    target_compatible_with = _UNIKERNEL_ONLY,
+    target_compatible_with = _WAITLESS_ONLY,
 )

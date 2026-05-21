@@ -11,7 +11,7 @@ exports_files([
     "run_native.sh.tmpl",
     "run_qemu.sh.tmpl",
     "native_main.rs",
-    "unikernel_main.rs",
+    "waitless_main.rs",
 ])
 
 # `bazel test` flips this to True via `.bazelrc`. The `rust_test`
@@ -34,15 +34,15 @@ config_setting(
 )
 
 # Runner selector consumed by `//bazel/platforms`'s runner
-# config_settings, which the unikernel_binary macro's `srcs` /
+# config_settings, which the waitless_binary macro's `srcs` /
 # `data` select() queries. Flipped by the per-variant transitions
 # in `//bazel/rules:variants.bzl`; no whole-build `.bazelrc` config
 # sets it (runner selection is per-target, not per-invocation).
-# Previously this lived on `--define=uni_runner=<val>`, but
+# Previously this lived on `--define=waitless_runner=<val>`, but
 # Starlark transitions cannot set `--define`, so we migrated to a
 # user-defined `string_flag` (which transitions DO support).
 string_flag(
-    name = "uni_runner",
+    name = "waitless_runner",
     build_setting_default = "native",
     values = [
         "native",
@@ -53,7 +53,7 @@ string_flag(
 )
 
 # Link-time-optimization mode for the unikernel image. The transitions
-# in `//bazel/rules:{unikernel,variants}.bzl` read this and set
+# in `//bazel/rules:{waitless,variants}.bzl` read this and set
 # `@rules_rust//rust/settings:lto` on the unikernel sub-graph to its
 # value — so LTO covers the kernel/app/driver crates only, and host
 # `rust_test` / `:<app>_native` builds (which don't take those

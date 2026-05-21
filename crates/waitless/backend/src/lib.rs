@@ -1,6 +1,6 @@
 // crates/waitless/backend/src/lib.rs — Platform adapter for `waitless`.
 //
-// Single crate with two cfg-gated impls: `unikernel` (bare-metal)
+// Single crate with two cfg-gated impls: `bare` (bare-metal)
 // and `native` (POSIX). Selected by `target_os`. The exported symbol
 // surface is the same on both sides so `waitless/lib.rs` can unconditionally
 // `pub use waitless_backend::*;`.
@@ -72,9 +72,9 @@ pub struct TcpDiag {
 #[cfg(not(target_os = "none"))]
 mod native;
 #[cfg(target_os = "none")]
-mod unikernel;
+mod bare;
 
 #[cfg(not(target_os = "none"))]
 pub use native::*;
 #[cfg(target_os = "none")]
-pub use unikernel::*;
+pub use bare::*;

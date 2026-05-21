@@ -14,8 +14,8 @@
  * progressively dropped these guarantees and would require us to set
  * up our own page-table entries for MMIO.
  *
- * Layout mirrors unikernel.ld but with `__kernel_base` fixed to
- * higher-half. We don't share unikernel.ld + an override script: lld
+ * Layout mirrors waitless.ld but with `__kernel_base` fixed to
+ * higher-half. We don't share waitless.ld + an override script: lld
  * evaluates SECTIONS at script-parse time, so a `--defsym` or
  * supplemental `-T` arrives too late to influence the location counter.
  */
@@ -66,17 +66,17 @@ SECTIONS {
         *(.rodata .rodata.*)
     } :rodata
 
-    /* Ethernet driver registration table. Each linked `uni-driver-*`
+    /* Ethernet driver registration table. Each linked `waitless-driver-*`
        crate emits one EthernetDriverReg into this section via
        register_ethernet_driver!; `drivers::net::init` walks
        [__start, __stop) to discover registered drivers. Empty when no
        driver crate is linked (compute-only apps). ALIGN(8) matches the
        two-pointer alignment of `&'static dyn EthernetDriver`. `:rodata`
        because the entries are read-only. */
-    .uni_drivers_ethernet ALIGN(8) : {
-        __start_uni_drivers_ethernet = .;
-        KEEP(*(.uni_drivers_ethernet))
-        __stop_uni_drivers_ethernet = .;
+    .waitless_drivers_ethernet ALIGN(8) : {
+        __start_waitless_drivers_ethernet = .;
+        KEEP(*(.waitless_drivers_ethernet))
+        __stop_waitless_drivers_ethernet = .;
     } :rodata
 
     /* Limine boot protocol requests — contiguous, between start/end markers.

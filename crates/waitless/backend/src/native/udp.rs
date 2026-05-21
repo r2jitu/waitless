@@ -133,7 +133,7 @@ pub(super) fn udp_backend_unbind(app_port: u16) {
 /// higher layers surface that as `UdpBindError::BackendFailed`.
 fn open_udp_relay(app_port: u16, owner_worker: Option<u32>) -> Result<(), ()> {
     // Per-port override keyed on the app's requested port:
-    // `UNIKERNEL_UDP_<port>` swaps in a different host-bind port.
+    // `WAITLESS_UDP_<port>` swaps in a different host-bind port.
     let bind_port = read_port_env("UDP", app_port).unwrap_or(app_port);
 
     let mut fds = [-1i32; MAX_THREADS];

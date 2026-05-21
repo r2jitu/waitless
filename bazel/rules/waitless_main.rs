@@ -1,4 +1,4 @@
-// bazel/rules/unikernel_main.rs — Root crate for unikernel rust_binary
+// bazel/rules/waitless_main.rs — Root crate for waitless rust_binary
 //
 // Thin wrapper that forces linking of the app and kernel entry crates.
 // The actual entry point (_start) comes from boot.S assembly (included

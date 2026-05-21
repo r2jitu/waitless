@@ -1,4 +1,4 @@
-/* unikernel_arm64.ld — Linker script for ARM64 unikernel (PIE)
+/* waitless_arm64.ld — Linker script for ARM64 unikernel (PIE)
  *
  * Link address: 0x00000000
  * Runtime load address: 0x40000000 (QEMU virt RAM base, also used by the
@@ -35,16 +35,16 @@ SECTIONS {
         *(.rodata .rodata.*)
     }
 
-    /* Ethernet driver registration table. Each linked `uni-driver-*`
+    /* Ethernet driver registration table. Each linked `waitless-driver-*`
        crate emits one EthernetDriverReg into this section via
        register_ethernet_driver!; `drivers::net::init` walks
        [__start, __stop) to discover registered drivers. Empty when no
        driver crate is linked (compute-only apps). ALIGN(8) matches the
        two-pointer alignment of `&'static dyn EthernetDriver`. */
-    .uni_drivers_ethernet ALIGN(8) : {
-        __start_uni_drivers_ethernet = .;
-        KEEP(*(.uni_drivers_ethernet))
-        __stop_uni_drivers_ethernet = .;
+    .waitless_drivers_ethernet ALIGN(8) : {
+        __start_waitless_drivers_ethernet = .;
+        KEEP(*(.waitless_drivers_ethernet))
+        __stop_waitless_drivers_ethernet = .;
     }
 
     /* Limine boot protocol requests — contiguous, between start/end markers.

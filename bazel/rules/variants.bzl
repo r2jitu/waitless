@@ -1,14 +1,14 @@
 """Per-runner variant targets for unikernel apps.
 
-For each `unikernel_binary(name, app)` declaration, this file
+For each `waitless_binary(name, app)` declaration, this file
 produces one runnable `:<name>_<variant>` target per supported
-runner, plus a sibling `unikernel_app_test(name, app_base, test_rule,
+runner, plus a sibling `waitless_app_test(name, app_base, test_rule,
 ...)` macro that fans a test target out across the same variant
 list. Adding a new variant is a single edit to `_VARIANT_SPECS`
 below; every app + app-test picks it up automatically.
 
 Each variant rule transitions its target-side deps (ELF / IMG / ISO)
-into the matching platform + `uni_runner` + `-Cpanic=abort` sub-
+into the matching platform + `waitless_runner` + `-Cpanic=abort` sub-
 configuration, symlinks them into the rule's own output directory
 under filenames that encode the variant name, and template-expands
 a per-variant launcher script with those filenames baked in. Net
@@ -39,9 +39,9 @@ Variants produced (names & platform compat defined in _VARIANT_SPECS):
 # inside a macro body must be `Label()` objects, not bare `//…` strings:
 # a bare string resolves against the BUILD file calling the macro, so an
 # external app would look for these targets in its own repo and fail.
-# `Label()` evaluated here binds to `@unikernel`. (Pseudo-labels and
+# `Label()` evaluated here binds to `@waitless`. (Pseudo-labels and
 # `attr` / `transition` definition-time defaults are left as strings —
-# they already resolve in unikernel's context.)
+# they already resolve in waitless's context.)
 _OS_MACOS = Label("@platforms//os:macos")
 _PLATFORM_NATIVE = Label("//bazel/platforms:native")
 _HVF_RUNNER = Label("//tools/hvf-runner:run_hvf")
@@ -53,7 +53,7 @@ _INCOMPATIBLE = Label("@platforms//:incompatible")
 # Each transition flips the same five keys:
 #
 #   * `//command_line_option:platforms` — target platform.
-#   * `//bazel/rules:uni_runner`        — string_flag driving runner
+#   * `//bazel/rules:waitless_runner`        — string_flag driving runner
 #                                         config_settings.
 #   * `@rules_rust//:extra_rustc_flag`  — `-Cpanic=abort`, plus aarch64
 #                                         PIC (PIE kernel + runtime
@@ -74,9 +74,9 @@ _INCOMPATIBLE = Label("@platforms//:incompatible")
 #                                         sub-graph builds no
 #                                         rust_test targets.
 
-def _make_variant_transition(platform, uni_runner, target_arch):
+def _make_variant_transition(platform, waitless_runner, target_arch):
     outputs = [
-        "//bazel/rules:uni_runner",
+        "//bazel/rules:waitless_runner",
         "@rules_rust//:extra_rustc_flag",
         "@rules_rust//rust/settings:lto",
         "//bazel/rules:tests_need_std",
@@ -90,7 +90,7 @@ def _make_variant_transition(platform, uni_runner, target_arch):
 
     def _impl(settings, _attr):
         out = {
-            "//bazel/rules:uni_runner": uni_runner,
+            "//bazel/rules:waitless_runner": waitless_runner,
             "@rules_rust//:extra_rustc_flag": rustc_flags,
             "@rules_rust//rust/settings:lto": settings["//bazel/rules:lto"],
             "//bazel/rules:tests_need_std": False,
@@ -106,28 +106,28 @@ def _make_variant_transition(platform, uni_runner, target_arch):
     )
 
 _hvf_transition = _make_variant_transition(
-    platform = "//bazel/platforms:aarch64_unikernel",
-    uni_runner = "hvf",
+    platform = "//bazel/platforms:aarch64_waitless",
+    waitless_runner = "hvf",
     target_arch = "aarch64",
 )
 _iso_x86_64_transition = _make_variant_transition(
-    platform = "//bazel/platforms:x86_64_unikernel",
-    uni_runner = "iso",
+    platform = "//bazel/platforms:x86_64_waitless",
+    waitless_runner = "iso",
     target_arch = "x86_64",
 )
 _iso_aarch64_transition = _make_variant_transition(
-    platform = "//bazel/platforms:aarch64_unikernel",
-    uni_runner = "iso",
+    platform = "//bazel/platforms:aarch64_waitless",
+    waitless_runner = "iso",
     target_arch = "aarch64",
 )
 _qemu_aarch64_transition = _make_variant_transition(
-    platform = "//bazel/platforms:aarch64_unikernel",
-    uni_runner = "qemu",
+    platform = "//bazel/platforms:aarch64_waitless",
+    waitless_runner = "qemu",
     target_arch = "aarch64",
 )
 _qemu_x86_64_transition = _make_variant_transition(
-    platform = "//bazel/platforms:x86_64_unikernel",
-    uni_runner = "qemu",
+    platform = "//bazel/platforms:x86_64_waitless",
+    waitless_runner = "qemu",
     target_arch = "x86_64",
 )
 
@@ -152,22 +152,22 @@ def _expand_launcher(ctx, substitutions):
 
 # ── Port-forward launcher-string builders ────────────────────────────────
 #
-# `port_fwd()` in unikernel.bzl returns a `struct(proto, guest, host)`.
+# `port_fwd()` in waitless.bzl returns a `struct(proto, guest, host)`.
 # These helpers turn a list of such structs into the finished launcher
 # argument string for each runner (HVF `-p` flags / QEMU `hostfwd=…`
 # entries). Rule attrs can't hold structs, so we format up-front at
 # macro time and pass the single resulting string through a `string`
 # attr — no encode / parse pair on the rule-impl side.
 #
-# Env-var override name is derived as `UNIKERNEL_<PROTO>_<GUEST>`
-# (e.g. `UNIKERNEL_TCP_80`). Same convention is honored by the
+# Env-var override name is derived as `WAITLESS_<PROTO>_<GUEST>`
+# (e.g. `WAITLESS_TCP_80`). Same convention is honored by the
 # native binary (`waitless::native`), so users override the host port
 # the same way regardless of runner. Bash-style default expansion
 # — `${…:-<host>}` — falls back to the BUILD-declared default.
 
 def _port_fwd_env_var(pf):
     """Derive the runtime override env-var name for a port_fwd() struct."""
-    return "UNIKERNEL_{}_{}".format(pf.proto.upper(), pf.guest)
+    return "WAITLESS_{}_{}".format(pf.proto.upper(), pf.guest)
 
 def _build_hvf_port_flags(port_forwards):
     """Build HVF runner `-p proto:host:guest` arg string."""
@@ -197,7 +197,7 @@ def _build_qemu_hostfwd(port_forwards):
     return ",".join(parts)
 
 def _build_native_port_envs(port_forwards):
-    """Build native launcher `export UNIKERNEL_<PROTO>_<GUEST>=…` block.
+    """Build native launcher `export WAITLESS_<PROTO>_<GUEST>=…` block.
 
     Native has no separate runner — `read_port_env` in
     `waitless-backend/src/native/{tcp,udp}.rs` reads the env var per-listen
@@ -293,7 +293,7 @@ def _iso_impl(ctx):
 def _native_impl(ctx):
     # Underlying rust_binary stays in the host config (no transition);
     # the launcher just symlinks it next to itself and execs with
-    # `${UNIKERNEL_<PROTO>_<GUEST>:-host}` defaults exported. Same
+    # `${WAITLESS_<PROTO>_<GUEST>:-host}` defaults exported. Same
     # co-located-runfile pattern as HVF (img + runner sit beside the
     # launcher in `bazel-bin/<package>/`).
     #
@@ -367,7 +367,7 @@ _HELPERS_ATTR = {
 
 # Every variant rule takes `default_ram_mb` and `default_cpus` — the
 # impl substitutes them into its launcher template. Runtime
-# `UNIKERNEL_MEMORY` / `UNIKERNEL_CPUS` env-vars still override
+# `WAITLESS_MEMORY` / `WAITLESS_CPUS` env-vars still override
 # per-invocation; these set the defaults that kick in when no env
 # override is present. Port-forward config is injected per-variant
 # via `hvf_port_flags` / `qemu_hostfwd` (pre-formatted launcher
@@ -375,11 +375,11 @@ _HELPERS_ATTR = {
 _VM_CONFIG_ATTRS = {
     "default_ram_mb": attr.int(
         default = 128,
-        doc = "Default guest RAM in MB (overridable via UNIKERNEL_MEMORY).",
+        doc = "Default guest RAM in MB (overridable via WAITLESS_MEMORY).",
     ),
     "default_cpus": attr.int(
         default = 1,
-        doc = "Default vCPU count (overridable via UNIKERNEL_CPUS).",
+        doc = "Default vCPU count (overridable via WAITLESS_CPUS).",
     ),
 }
 
@@ -415,7 +415,7 @@ _hvf_variant = _build_variant_rule(
             cfg = _hvf_transition,
             mandatory = True,
             allow_single_file = True,
-            doc = "The <name>.img of the underlying unikernel_binary (transitioned).",
+            doc = "The <name>.img of the underlying waitless_binary (transitioned).",
         ),
         "hvf_runner": attr.label(
             mandatory = True,
@@ -430,7 +430,7 @@ _hvf_variant = _build_variant_rule(
 # Native: no transition (the rust_binary already builds for the host
 # platform), no runner (the rust_binary is itself the executable).
 # Launcher is a thin shell wrapper that exports
-# `UNIKERNEL_<PROTO>_<GUEST>` defaults and execs the binary. Built
+# `WAITLESS_<PROTO>_<GUEST>` defaults and execs the binary. Built
 # directly via `rule()` rather than `_build_variant_rule` because
 # the latter wires in the function-transition allowlist, which Bazel
 # rejects on rules that don't actually carry a `cfg=` transition.
@@ -447,10 +447,10 @@ _native_variant = rule(
         ),
         "bin": attr.label(
             mandatory = True,
-            doc = "The <name>_bin rust_binary of the underlying unikernel_binary.",
+            doc = "The <name>_bin rust_binary of the underlying waitless_binary.",
         ),
         "native_port_envs": attr.string(
-            doc = "Pre-formatted `export UNIKERNEL_…=…` block; built by `_build_native_port_envs`.",
+            doc = "Pre-formatted `export WAITLESS_…=…` block; built by `_build_native_port_envs`.",
         ),
     }),
 )
@@ -472,7 +472,7 @@ def _make_iso_variant(variant_transition, qemu_bin, virtio_dev, qemu_machine):
                     cfg = variant_transition,
                     mandatory = True,
                     allow_single_file = True,
-                    doc = "The <name>.iso of the underlying unikernel_binary (transitioned).",
+                    doc = "The <name>.iso of the underlying waitless_binary (transitioned).",
                 ),
                 "qemu_hostfwd": attr.string(
                     doc = "Pre-formatted QEMU `hostfwd=…` string; built by `_build_qemu_hostfwd`.",
@@ -516,13 +516,13 @@ def _make_qemu_variant(variant_transition):
                 "elf": attr.label(
                     cfg = variant_transition,
                     mandatory = True,
-                    doc = "The <name>.elf of the underlying unikernel_binary (transitioned).",
+                    doc = "The <name>.elf of the underlying waitless_binary (transitioned).",
                 ),
                 "img": attr.label(
                     cfg = variant_transition,
                     mandatory = True,
                     allow_single_file = True,
-                    doc = "The <name>.img of the underlying unikernel_binary (transitioned).",
+                    doc = "The <name>.img of the underlying waitless_binary (transitioned).",
                 ),
                 "qemu_hostfwd": attr.string(
                     doc = "Pre-formatted QEMU `hostfwd=…` string; built by `_build_qemu_hostfwd`.",
@@ -548,7 +548,7 @@ _qemu_x86_64_variant = _make_qemu_variant(_qemu_x86_64_transition)
 #                           auto-skips variants the current host
 #                           doesn't satisfy (hvf → macOS only;
 #                           qemu_* and iso run anywhere with QEMU).
-#   * `in_default_test_set` — whether `unikernel_app_test` includes
+#   * `in_default_test_set` — whether `waitless_app_test` includes
 #                             this variant when the caller doesn't
 #                             pass an explicit `variants = [...]`.
 
@@ -616,8 +616,8 @@ _VARIANT_SPECS = [
     ),
     struct(
         # Native: `:<name>_native` is a launcher around the
-        # `:<name>_bin` rust_binary (declared in `unikernel_binary`).
-        # The launcher exports `UNIKERNEL_<PROTO>_<GUEST>=${...:-host}`
+        # `:<name>_bin` rust_binary (declared in `waitless_binary`).
+        # The launcher exports `WAITLESS_<PROTO>_<GUEST>=${...:-host}`
         # defaults so the native variant honors `port_forwards` the
         # same way HVF / QEMU launchers do via shell expansion.
         suffix = "native",
@@ -662,7 +662,7 @@ def _instantiate_variant(spec, name, base, vm_config, visibility):
 # ── Public macros ─────────────────────────────────────────────────────────
 
 # buildifier: disable=unnamed-macro
-def unikernel_variants(
+def waitless_variants(
         name,
         port_forwards,
         ram_mb,
@@ -671,22 +671,22 @@ def unikernel_variants(
         visibility = None):
     """Generate `:<name>_<variant>` runnable targets for every runner in _VARIANT_SPECS.
 
-    Called from `unikernel_binary` after the artefact targets are
+    Called from `waitless_binary` after the artefact targets are
     declared (`:<name>.img` / `:<name>.elf` / `:<name>.iso` must
     exist in the same package). Every config arg is required —
-    `unikernel_binary` handles defaults (`port_fwd()` entries,
+    `waitless_binary` handles defaults (`port_fwd()` entries,
     `ram_mb=128`, `cpus=1`) so this internal macro stays explicit.
 
     `name` is a prefix for the generated targets, not a target of
-    its own — the underlying unikernel_binary intentionally does
+    its own — the underlying waitless_binary intentionally does
     not expose a unified `:<name>` launcher.
 
     Args:
-      name: target-name prefix (matches the enclosing unikernel_binary).
+      name: target-name prefix (matches the enclosing waitless_binary).
       port_forwards: per-app forwarding config (entries built via
-        `port_fwd()` in unikernel.bzl).
-      ram_mb: default guest RAM in MB (overridable via UNIKERNEL_MEMORY).
-      cpus: default vCPU count (overridable via UNIKERNEL_CPUS).
+        `port_fwd()` in waitless.bzl).
+      ram_mb: default guest RAM in MB (overridable via WAITLESS_MEMORY).
+      cpus: default vCPU count (overridable via WAITLESS_CPUS).
       build_native: whether the underlying `:<name>_bin`
         rust_binary exists. When False (kernel-only apps), the native
         variant entry is skipped so we don't try to wrap a target
@@ -709,10 +709,10 @@ def unikernel_variants(
             visibility,
         )
 
-def unikernel_app_test(name, app_base, test_rule, extra_data = None, variants = None, **kwargs):
+def waitless_app_test(name, app_base, test_rule, extra_data = None, variants = None, **kwargs):
     """Generate `:<name>_<variant>` test targets for every requested runner.
 
-    For each variant produced by `unikernel_variants(name = app_base)`,
+    For each variant produced by `waitless_variants(name = app_base)`,
     instantiate `test_rule` with the variant target added as a data
     dep and `LAUNCHER_NAME` set in the test env so the test script
     can resolve the variant's co-located runfiles.
@@ -728,7 +728,7 @@ def unikernel_app_test(name, app_base, test_rule, extra_data = None, variants = 
 
     Args:
       name: base name for the test targets (`:<name>_<variant>`).
-      app_base: name passed to the app's `unikernel_binary` —
+      app_base: name passed to the app's `waitless_binary` —
         the variant targets it generated are `:<app_base>_<variant>`.
       test_rule: test-rule function to instantiate (e.g. py_test,
         sh_test). Caller loads + passes it in directly.
@@ -745,7 +745,7 @@ def unikernel_app_test(name, app_base, test_rule, extra_data = None, variants = 
         `kwargs` is an error.
     """
     if "target_compatible_with" in kwargs:
-        fail("unikernel_app_test: `target_compatible_with` is set per-variant " +
+        fail("waitless_app_test: `target_compatible_with` is set per-variant " +
              "from `host_compat` in variants.bzl; drop it from your call.")
 
     # Pull `srcs` and common tags out of kwargs. Each variant gets
@@ -753,7 +753,7 @@ def unikernel_app_test(name, app_base, test_rule, extra_data = None, variants = 
     # `srcs` here and supply per-variant lists inside the loop.
     srcs = kwargs.pop("srcs", None)
     if not srcs or len(srcs) != 1:
-        fail("unikernel_app_test: `srcs` must be a single-element list " +
+        fail("waitless_app_test: `srcs` must be a single-element list " +
              "(the test entry-point script).")
     src_file = srcs[0]
     caller_tags = list(kwargs.pop("tags", []))
@@ -761,7 +761,7 @@ def unikernel_app_test(name, app_base, test_rule, extra_data = None, variants = 
     selected = variants if variants != None else _DEFAULT_TEST_VARIANT_SUFFIXES
     for suffix in selected:
         if suffix not in _SUFFIX_TO_SPEC:
-            fail("unikernel_app_test: unknown variant '{}' (known: {})".format(
+            fail("waitless_app_test: unknown variant '{}' (known: {})".format(
                 suffix,
                 ", ".join(_ALL_VARIANT_SUFFIXES),
             ))
@@ -795,7 +795,7 @@ def unikernel_app_test(name, app_base, test_rule, extra_data = None, variants = 
         # targets instead of failing toolchain resolution (there's
         # no default_test_toolchain registered for bare-metal). The
         # rust-analyzer discover aspect relies on this when it runs
-        # `bazel build //...` under `--platforms=*_unikernel` to
+        # `bazel build //...` under `--platforms=*_waitless` to
         # generate crate specs with `cfg(target_os = "none")` active.
         test_rule(
             name = name + "_" + suffix,

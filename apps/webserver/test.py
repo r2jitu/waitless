@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """apps/webserver/test.py — end-to-end test for the webserver app.
 
-Runner-agnostic: depends on :webserver (the unikernel_binary launcher)
+Runner-agnostic: depends on :webserver (the waitless_binary launcher)
 as a data dep and spawns it as a subprocess. One test file covers every
 runner config (hvf / aarch64-qemu / x86_64-iso / native) because the
 launcher hides the per-runner specifics.
@@ -45,7 +45,7 @@ ROOT = runfiles_root()
 LAUNCHER_NAME = os.environ["LAUNCHER_NAME"]
 LAUNCHER = ROOT / "apps" / "webserver" / LAUNCHER_NAME
 DEV_CERT = ROOT / "apps" / "webserver" / "dev_certs" / "dev_cert.pem"
-# Stable end-of-init marker emitted by `#[uni::init]` after the
+# Stable end-of-init marker emitted by `#[waitless::init]` after the
 # user's body returns. Same line on every runner (HVF / QEMU / native).
 BOOT_MARKER = b"ready"
 
@@ -60,16 +60,16 @@ def _launcher_env(
 ) -> dict[str, str]:
     """Env vars spanning every launcher variant.
 
-    Name convention is `UNIKERNEL_<PROTO>_<GUEST>` — derived from
+    Name convention is `WAITLESS_<PROTO>_<GUEST>` — derived from
     the guest-side port the app binds, matching `port_fwd()` in
     BUILD and `variants.bzl`'s launcher templates. VM launchers
-    (hvf / qemu_*) and the native binary (`uni::native::
+    (hvf / qemu_*) and the native binary (`waitless::native::
     read_port_env`) both read this name, so the caller can stay
     ignorant of which variant LAUNCHER points at.
     """
     return {
-        "UNIKERNEL_TCP_80": str(port),
-        "UNIKERNEL_TCP_443": str(tls_port),
+        "WAITLESS_TCP_80": str(port),
+        "WAITLESS_TCP_443": str(tls_port),
         # H3 listens on UDP/443 inside the guest; the launcher maps it
         # to the same host port as HTTPS so a single port number
         # addresses both. Omitting this would leave H3 at its
@@ -78,9 +78,9 @@ def _launcher_env(
         # be `h3=":<host_header_port>"` (correct per request), but
         # `test_h3_health` connects directly to `tls_port` over UDP and
         # would silently fail.
-        "UNIKERNEL_UDP_443": str(tls_port),
-        "UNIKERNEL_UDP_7": str(udp_port),
-        "UNIKERNEL_TCP_9": str(tcp_echo_port),
+        "WAITLESS_UDP_443": str(tls_port),
+        "WAITLESS_UDP_7": str(udp_port),
+        "WAITLESS_TCP_9": str(tcp_echo_port),
     }
 
 
@@ -217,7 +217,7 @@ class WebserverServiceTest(unittest.TestCase):
         `ssl` module and openssl tolerate the omission and proceed
         on HTTP/1.1 anyway. Hardcoded `b"http/1.1"` here is the
         only protocol our HTTPS path supports; the H3/QUIC stack
-        echoes `h3` independently in `uni-quic`."""
+        echoes `h3` independently in `waitless-quic`."""
         if not DEV_CERT.is_file():
             self.skipTest("dev_cert.pem missing from runfiles")
         ctx = ssl.create_default_context(cafile=str(DEV_CERT))
@@ -268,8 +268,8 @@ class WebserverServiceTest(unittest.TestCase):
     def test_h3_health(self) -> None:
         """End-to-end HTTP/3 GET against the same handler that
         serves HTTPS/1.1 — exercises the full stack
-        `uni-quic` (QUIC v1 transport) → `uni-http3` (H3 frames +
-        QPACK static-only) → `uni-http` Request/Response.
+        `waitless-quic` (QUIC v1 transport) → `waitless-http3` (H3 frames +
+        QPACK static-only) → `waitless-http` Request/Response.
         Skips if `aioquic` isn't available locally.
         """
         status, body = h3_get("/health", port=TLS_PORT)
@@ -431,9 +431,9 @@ class WebserverServiceTest(unittest.TestCase):
         self._skip_unless_v6_bridge()
         self.assertEqual(udp_echo(host="::1", port=UDP_PORT), b"hello")
 
-    # ── Async TCP reactor end-to-end (uni::runtime::TcpListener) ──
+    # ── Async TCP reactor end-to-end (waitless::runtime::TcpListener) ──
     def test_tcp_echo(self) -> None:
-        """Validates `uni::runtime::TcpListener::bind(9)?.run(...)` —
+        """Validates `waitless::runtime::TcpListener::bind(9)?.run(...)` —
         bare-metal + native both exercise the full reactor path:
         accept future wakes on new connection, handler runs on owning
         worker, recv/send round-trip succeeds."""
@@ -450,7 +450,7 @@ class WebserverServiceTest(unittest.TestCase):
     # ── boot_info surfaces through the serial log ───────────────
     def test_boot_info_logged(self) -> None:
         """Webserver's startup log must contain an `app: ram=...` line
-        sourced from `uni::boot_info()` — the user-facing API check
+        sourced from `waitless::boot_info()` — the user-facing API check
         that the boot snapshot makes it through the runfiles bundle on
         whichever runner this test happens to be running under
         (hvf / qemu / iso / native). Kernel-side hardware info appears
@@ -718,7 +718,7 @@ class WebserverShutdownTest(unittest.TestCase):
         User-reported leak in this exact shape was
         `delta=+12412B,+10allocs` after Chrome auto-refreshed
         /diagnostics on a kept-open tab. The cold-conn lazy-init
-        portion (~12 KB) was killed by `uni_tls::preinit` +
+        portion (~12 KB) was killed by `waitless_tls::preinit` +
         `huffman::warmup`; the small Chrome-specific residue that
         survives is tracked under item O in
         `docs/tx-path-optimizations.md` and only reproduces on

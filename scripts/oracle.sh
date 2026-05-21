@@ -27,9 +27,9 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 SSH_HOST="${ORACLE_SSH_HOST:-oracle}"
 INSTANCE_OCID="${ORACLE_INSTANCE_OCID:-}"
-MEMORY="${UNIKERNEL_MEMORY:-128}"
-CPUS="${UNIKERNEL_CPUS:-1}"
-HOST_PORT="${UNIKERNEL_TCP_80:-8080}"
+MEMORY="${WAITLESS_MEMORY:-128}"
+CPUS="${WAITLESS_CPUS:-1}"
+HOST_PORT="${WAITLESS_TCP_80:-8080}"
 TEST_PORT=19099 # internal port for automated tests (avoids conflicts)
 
 cmd="${1:-help}"
@@ -216,9 +216,9 @@ Commands:
 Environment:
   ORACLE_SSH_HOST=oracle        SSH config alias (default: oracle)
   ORACLE_INSTANCE_OCID=ocid1... Instance OCID for start/stop
-  UNIKERNEL_MEMORY=128          VM memory in MB
-  UNIKERNEL_CPUS=1              vCPU count
-  UNIKERNEL_TCP_80=8080         Local port forwarded to VM port 80 (run only)
+  WAITLESS_MEMORY=128          VM memory in MB
+  WAITLESS_CPUS=1              vCPU count
+  WAITLESS_TCP_80=8080         Local port forwarded to VM port 80 (run only)
 USAGE
     ;;
 esac

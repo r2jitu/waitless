@@ -459,7 +459,7 @@ WORKLOADS = [
     # (reason)` row in the per-cores loop so the gap stays
     # visible every run; they never consume bench time.
     # TLS-over-TCP 0-RTT cold path. Server-side: TCP record-layer
-    # never derives client_early_traffic_secret (uni-tls flag
+    # never derives client_early_traffic_secret (waitless-tls flag
     # exists, no record-path wire-up). Loadgen: needs 0-RTT mode
     # (ticket cache + early-data send).
     {
@@ -470,7 +470,7 @@ WORKLOADS = [
         "desc": "TLS 1.3 0-RTT (early-data) cold path",
     },
     # QUIC 0-RTT cold path. Server-side IS implemented in
-    # uni-quic (early-data sentinel + handshake wiring). Blocked
+    # waitless-quic (early-data sentinel + handshake wiring). Blocked
     # on loadgen: needs QUIC 0-RTT send (ticket cache + early data).
     {
         "name": "get_quic_fresh_0rtt",

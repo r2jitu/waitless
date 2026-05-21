@@ -4,7 +4,7 @@ package(default_visibility = ["//visibility:public"])
 
 # Platform adapter for `waitless`. One crate, two cfg-gated impls:
 #
-#   * `unikernel` (bare-metal) — glue onto //kernel + //drivers + //net
+#   * `bare`      (bare-metal) — glue onto //kernel + //drivers + //net
 #   * `native`    (POSIX)      — libc sockets, pthread workers,
 #                                kqueue/epoll event loop
 #
@@ -18,7 +18,7 @@ rust_library(
         "src/native/mod.rs",
         "src/native/tcp.rs",
         "src/native/udp.rs",
-        "src/unikernel.rs",
+        "src/bare.rs",
     ],
     crate_name = "waitless_backend",
     deps = [

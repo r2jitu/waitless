@@ -85,7 +85,7 @@ fi
 if [ $need_native -eq 1 ]; then
     # `:webserver_bin` is the underlying rust_binary;
     # `:webserver_native` is a launcher script that bakes BUILD-default
-    # `UNIKERNEL_*` env vars. Bench sets every var explicitly, so the
+    # `WAITLESS_*` env vars. Bench sets every var explicitly, so the
     # launcher's defaults are no-ops — staging the raw binary skips
     # the launcher's runfile bookkeeping.
     bench_args+=(--native-bin "\$HOME/$REMOTE_DIR/webserver_bin")

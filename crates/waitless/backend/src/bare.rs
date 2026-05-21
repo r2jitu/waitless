@@ -1,4 +1,4 @@
-// crates/waitless/backend/src/unikernel.rs — Bare-metal dispatch.
+// crates/waitless/backend/src/bare.rs — Bare-metal dispatch.
 
 use kernel_bare::serial;
 

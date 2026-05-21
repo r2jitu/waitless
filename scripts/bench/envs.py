@@ -375,7 +375,7 @@ class NativeEnv:
         )
         # Bypass the `:webserver_native` launcher (which sets BUILD
         # port-fwd defaults) and build the underlying rust_binary
-        # directly — `start()` sets every `UNIKERNEL_*` it needs, so
+        # directly — `start()` sets every `WAITLESS_*` it needs, so
         # the launcher's defaults would be no-ops anyway.
         subprocess.run(
             ["bazel", "build", f"--config={config}", "//apps/webserver:webserver_bin"],
@@ -391,16 +391,16 @@ class NativeEnv:
         if not os.path.exists(bin_path):
             return None
         env = os.environ.copy()
-        env["UNIKERNEL_TCP_80"] = str(port)
-        env["UNIKERNEL_TCP_443"] = str(port + self.tls_port_offset)
-        env["UNIKERNEL_UDP_7"] = str(port + 1)
+        env["WAITLESS_TCP_80"] = str(port)
+        env["WAITLESS_TCP_443"] = str(port + self.tls_port_offset)
+        env["WAITLESS_UDP_7"] = str(port + 1)
         # H3/QUIC listener (guest UDP:443).
-        env["UNIKERNEL_UDP_443"] = str(port + NativeEnv.h3_port_offset)
+        env["WAITLESS_UDP_443"] = str(port + NativeEnv.h3_port_offset)
         # Async TCP echo benches target guest port 9 via the
         # `tcp_echo_offset` offset below.
-        env["UNIKERNEL_TCP_9"] = str(port + NativeEnv.tcp_echo_offset)
-        env["UNIKERNEL_TCP_9000"] = str(port + NativeEnv.gateway_offset)
-        env["UNIKERNEL_CPUS"] = str(cpus)
+        env["WAITLESS_TCP_9"] = str(port + NativeEnv.tcp_echo_offset)
+        env["WAITLESS_TCP_9000"] = str(port + NativeEnv.gateway_offset)
+        env["WAITLESS_CPUS"] = str(cpus)
         return subprocess.Popen(
             [bin_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
         )

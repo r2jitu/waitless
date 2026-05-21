@@ -491,7 +491,7 @@ pub struct TxDiag {
 
 // ---- Link-time registry ---------------------------------------------------
 
-/// One entry per linked driver crate, placed in `.uni_drivers_ethernet`
+/// One entry per linked driver crate, placed in `.waitless_drivers_ethernet`
 /// by `register_ethernet_driver!`.
 #[repr(C)]
 pub struct EthernetDriverReg {
@@ -499,7 +499,7 @@ pub struct EthernetDriverReg {
 }
 
 /// Register a driver with `waitless_net` at link time. Expands to a
-/// `static EthernetDriverReg` in the `.uni_drivers_ethernet` section;
+/// `static EthernetDriverReg` in the `.waitless_drivers_ethernet` section;
 /// `init()` discovers it via section-boundary symbols.
 ///
 /// ```ignore
@@ -510,7 +510,7 @@ pub struct EthernetDriverReg {
 macro_rules! register_ethernet_driver {
     ($ops:expr) => {
         #[used]
-        #[unsafe(link_section = ".uni_drivers_ethernet")]
+        #[unsafe(link_section = ".waitless_drivers_ethernet")]
         static ETHERNET_DRIVER_REG: $crate::EthernetDriverReg =
             $crate::EthernetDriverReg { ops: &$ops };
     };
@@ -520,8 +520,8 @@ macro_rules! register_ethernet_driver {
 // no custom script, so `linked_ethernet_drivers()` stubs to `&[]`.
 #[cfg(target_os = "none")]
 unsafe extern "Rust" {
-    static __start_uni_drivers_ethernet: EthernetDriverReg;
-    static __stop_uni_drivers_ethernet: EthernetDriverReg;
+    static __start_waitless_drivers_ethernet: EthernetDriverReg;
+    static __stop_waitless_drivers_ethernet: EthernetDriverReg;
 }
 
 /// All ethernet drivers linked into this binary.
@@ -531,8 +531,8 @@ pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
     // run of `EthernetDriverReg` values (the macro is the only
     // writer). Entries live in `.rodata`, materialised at link time.
     unsafe {
-        let start = &__start_uni_drivers_ethernet as *const EthernetDriverReg;
-        let end = &__stop_uni_drivers_ethernet as *const EthernetDriverReg;
+        let start = &__start_waitless_drivers_ethernet as *const EthernetDriverReg;
+        let end = &__stop_waitless_drivers_ethernet as *const EthernetDriverReg;
         let count = end.offset_from(start) as usize;
         core::slice::from_raw_parts(start, count)
     }

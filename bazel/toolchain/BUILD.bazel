@@ -1,12 +1,12 @@
 load(":toolchains.bzl", "register_cc_toolchain")
 
 exports_files([
-    "unikernel.ld",
-    "unikernel_arm64.ld",
-    "unikernel_limine.ld",
+    "waitless.ld",
+    "waitless_arm64.ld",
+    "waitless_limine.ld",
     # Hard-float x86_64 bare-metal target spec. Consumed by the `hardfloat`
     # module extension (//bazel/buildstd) to build the sysroot + toolchain.
-    "x86_64-unikernel-none.json",
+    "x86_64-waitless-none.json",
 ])
 
 filegroup(name = "empty")
@@ -17,14 +17,14 @@ filegroup(
 )
 
 register_cc_toolchain(
-    name = "unikernel_cc_toolchain_x86_64",
+    name = "waitless_cc_toolchain_x86_64",
     cpu = "x86_64",
     os = "none",
     target_system = "x86_64-unknown-none",
 )
 
 register_cc_toolchain(
-    name = "unikernel_cc_toolchain_aarch64",
+    name = "waitless_cc_toolchain_aarch64",
     cpu = "aarch64",
     os = "none",
     pic = True,

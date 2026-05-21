@@ -7,7 +7,7 @@ override -- an ABI-changing toggle that rust-lang/rust#116344 is turning
 into a hard error. See the long comment in MODULE.bazel.
 
 This extension builds `core`, `compiler_builtins` and `alloc` from pinned
-`rust-src` against `//bazel/toolchain:x86_64-unikernel-none.json` -- a
+`rust-src` against `//bazel/toolchain:x86_64-waitless-none.json` -- a
 hard-float spec (SSE2 ABI, no `rustc-abi: softfloat`) -- and emits a
 `rust_toolchain`, so the *entire* x86_64 unikernel (kernel and crypto
 alike) compiles with one consistent hard-float ABI and no
@@ -28,7 +28,7 @@ aarch64-macos dev boxes and x86_64-linux GCE/CI alike.
 # the rustc target triple, the `rust_toolchain` target name, and the stem
 # of the committed `//bazel/toolchain:<triple>.json` spec. Rename in all
 # three places together if rebranding the ABI.
-_TARGET_TRIPLE = "x86_64-unikernel-none"
+_TARGET_TRIPLE = "x86_64-waitless-none"
 
 # Pinned to the rules_rust toolchain version (`rust.toolchain(versions=...)`
 # in MODULE.bazel). Bump both together; rustc rejects a mismatched `core`.
@@ -58,7 +58,7 @@ _COMPILER_BUILTINS_CFGS = [
 #
 # Bitcode is left embedded (rustc's default — no `-Cembed-bitcode=no`).
 # The unikernel image can be built with LTO (`--//bazel/rules:lto`, off
-# by default — see //bazel/rules:unikernel.bzl and :variants.bzl); when
+# by default — see //bazel/rules:waitless.bzl and :variants.bzl); when
 # it is, the final binary's LTO reaches `core` / `compiler_builtins` /
 # `alloc` as crate deps, and without a `.llvmbc` section in these rlibs
 # rustc aborts the link with "failed to get bitcode from object file

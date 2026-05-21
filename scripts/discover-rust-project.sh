@@ -67,7 +67,7 @@ trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
 #   - `rust_proc_macro` in `//bazel/rules:rust.bzl` (otherwise
 #     `//crates/waitless/macros` resolves to the `*-unknown-none` rust toolchain
 #     and can't build a proc-macro).
-#   - `unikernel_app_test` py_test variants in `//bazel/rules:variants.bzl`
+#   - `waitless_app_test` py_test variants in `//bazel/rules:variants.bzl`
 #     (no default_test_toolchain is registered for bare-metal).
 # Both carry a `select({os_none: [@platforms//:incompatible], ...})`
 # so wildcard expansion silently skips them in the unikernel config;
@@ -82,8 +82,8 @@ case "$(uname -sm)" in
     ;;
 esac
 case "$(uname -m)" in
-arm64 | aarch64) TARGET_PLATFORM="//bazel/platforms:aarch64_unikernel" ;;
-x86_64) TARGET_PLATFORM="//bazel/platforms:x86_64_unikernel" ;;
+arm64 | aarch64) TARGET_PLATFORM="//bazel/platforms:aarch64_waitless" ;;
+x86_64) TARGET_PLATFORM="//bazel/platforms:x86_64_waitless" ;;
 esac
 
 bazel \

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated launcher for the `_qemu_<arch>` variant of a unikernel_binary
+# Generated launcher for the `_qemu_<arch>` variant of a waitless_binary
 # target. The variant rule symlinks the guest ELF, the raw .img, AND
 # `//scripts:helpers.sh` next to this script — under the filenames
 # substituted into %ELF% / %IMG% / %HELPERS_NAME% — so all three are
@@ -20,7 +20,7 @@ source "$HELPERS"
 detect_qemu "$ELF" "$IMG"
 
 run_qemu \
-    "${UNIKERNEL_MEMORY:-%DEFAULT_RAM%}" \
-    "${UNIKERNEL_CPUS:-%DEFAULT_CPUS%}" \
+    "${WAITLESS_MEMORY:-%DEFAULT_RAM%}" \
+    "${WAITLESS_CPUS:-%DEFAULT_CPUS%}" \
     "%HOSTFWD%" \
     "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG"

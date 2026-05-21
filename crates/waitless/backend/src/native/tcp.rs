@@ -41,7 +41,7 @@ struct AsyncTcpListener {
 }
 
 struct AsyncTcpListenersCell(UnsafeCell<[Option<AsyncTcpListener>; MAX_ASYNC_TCP_LISTENERS]>);
-// SAFETY: populated only on the main thread during `uni_init`
+// SAFETY: populated only on the main thread during `waitless_init`
 // (via `async_tcp_listen_hook` from `waitless::runtime::TcpListener::bind`);
 // read from workers afterwards without further mutation.
 unsafe impl Sync for AsyncTcpListenersCell {}

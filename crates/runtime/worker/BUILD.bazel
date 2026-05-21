@@ -15,7 +15,7 @@ package(default_visibility = ["//visibility:public"])
 # storage.
 #
 # `CurrentWorker::enter` calls `platform::current_worker()`
-# directly; `uni-platform` is the leaf crate that owns the cfg-
+# directly; `waitless-platform` is the leaf crate that owns the cfg-
 # gated read.
 rust_library(
     name = "worker",

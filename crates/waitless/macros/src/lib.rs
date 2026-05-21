@@ -1,6 +1,6 @@
 // waitless/macros/lib.rs — Proc macro for `#[waitless::init]`.
 //
-// The platform entry point is a Rust-ABI symbol named `uni_init`
+// The platform entry point is a Rust-ABI symbol named `waitless_init`
 // with `#[no_mangle]` so boot/entry.rs (bare-metal) and
 // crates/waitless/backend/src/native/mod.rs can resolve it at link time. Since
 // both sides are Rust and the function takes no args / returns
@@ -9,7 +9,7 @@
 //
 // The macro keeps the user's `fn init()` / `async fn init()`
 // intact (so the IDE lints its body correctly), then emits a
-// `uni_init` wrapper that spawns the init future on core 0's
+// `waitless_init` wrapper that spawns the init future on core 0's
 // task arena.
 //
 // Running init as a task means the event loop is already ticking
@@ -59,7 +59,7 @@ pub fn init(_attr: TokenStream, item: TokenStream) -> TokenStream {
 {user_fn}
 
 #[unsafe(no_mangle)]
-pub fn uni_init() {{
+pub fn waitless_init() {{
     let _ = ::waitless::runtime::spawn(async move {{
         {body_call};
         ::waitless::_install_shutdown_hook();

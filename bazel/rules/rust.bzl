@@ -16,7 +16,7 @@ load(
 # Labels used as `select()` keys / `target_compatible_with` values from
 # inside these wrapper macros must be `Label()` objects, not bare `//…`
 # strings: a bare string resolves against the BUILD file calling the
-# wrapper (an external app's repo), not `@unikernel`. `Label()` evaluated
+# wrapper (an external app's repo), not `@waitless`. `Label()` evaluated
 # here binds to this `.bzl` file's repo and stays fixed regardless of
 # caller. (`//conditions:default` is a pseudo-label — left as a string.)
 _TESTS_NEED_STD_ON = Label("//bazel/rules:tests_need_std_on")

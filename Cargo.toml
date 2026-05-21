@@ -98,14 +98,14 @@ hkdf = { version = "0.12", default-features = false }
 # that protects mid-IRQ SIMD).
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "zeroize"] }
 # `aes` and `polyval` are direct deps for the hand-rolled stitched
-# AES-128-GCM in `uni-tls::aes_gcm_fast` — see comments there for
+# AES-128-GCM in `waitless-tls::aes_gcm_fast` — see comments there for
 # why bypassing aes-gcm's wrapper gets us a single-pass loop that's
 # multiple-x faster than the upstream two-pass implementation
 # (which has an open TODO to interleave AES + GHASH).
 aes = { version = "0.8", default-features = false }
 # `ghash` wraps `polyval` with the AES-GCM byte-reversal that
 # turns POLYVAL semantics into GHASH semantics. We need GHASH
-# (not POLYVAL) for `uni-tls::aes_gcm_fast`'s hand-rolled
+# (not POLYVAL) for `waitless-tls::aes_gcm_fast`'s hand-rolled
 # stitched + 8-way batched implementation.
 ghash = { version = "0.5", default-features = false }
 # Key exchange: X25519 is the only MTI group for TLS 1.3 and QUIC.

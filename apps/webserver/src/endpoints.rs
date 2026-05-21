@@ -300,7 +300,7 @@ pub(crate) fn stats_response() -> Response {
         );
 
         // gve NIC-driver counters, via `waitless::diagnostics::gve_diag`
-        // — NOT a direct `uni_driver_gve` reference: the gve driver
+        // — NOT a direct `waitless_driver_gve` reference: the gve driver
         // is `os:none`-only, so reaching into it from this app crate
         // makes `app` (hence the native `webserver_bin` and the
         // `--env native` / `--env docker` benches) unbuildable. The
