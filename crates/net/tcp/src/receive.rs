@@ -256,6 +256,14 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
         // the delta to drop acknowledged bytes from the retransmit
         // ring (RFC 6298 §5.2 / §5.3).
         let old_una = c.snd_una;
+        // RFC 5681 §2: a duplicate ACK — a pure ACK that does not
+        // advance `snd_una`, carries no data, has no SYN/FIN, and
+        // arrives while data is in flight. Classified before the
+        // state machine below mutates `snd_una`.
+        let is_dup_ack = ack == c.snd_una
+            && payload_len == 0
+            && flags & (TCP_SYN | TCP_FIN) == 0
+            && seq_lt(c.snd_una, c.snd_nxt);
         if c.state == TcpState::SynReceived {
             c.state = TcpState::Established;
             c.snd_una = ack;
@@ -293,6 +301,15 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
         // `LastAck` branch above already `return`ed — the connection
         // is gone, so it is correctly skipped here.)
         c.rtx_on_ack(old_una);
+        // RFC 5681 §3.2 fast retransmit / fast recovery: a duplicate
+        // ACK advances the dup-ACK count (the third triggers an
+        // immediate retransmit without waiting for the RTO); any ACK
+        // of new data ends a dup-ACK run and the recovery episode.
+        if is_dup_ack {
+            c.on_dup_ack();
+        } else if c.snd_una != old_una {
+            c.on_new_data_ack();
+        }
     }
 
     // Process data

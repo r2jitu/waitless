@@ -924,6 +924,186 @@ fn rto_ssthresh_has_a_two_segment_floor() {
     );
 }
 
+// ---- RFC 5681 §3.2 fast retransmit / fast recovery --------------------
+
+/// Three duplicate ACKs are taken as a loss signal: the server
+/// fast-retransmits the missing segment immediately — no RTO wait —
+/// and moves `cwnd` / `ssthresh` per RFC 5681 §3.2. The duplicate
+/// ACKs themselves model the receiver's reported gap.
+#[test]
+fn three_dup_acks_trigger_fast_retransmit() {
+    let _g = harness();
+    const SP: u16 = 9121;
+    const CP: u16 = 50121;
+    const CLIENT_ISN: u32 = 0xD000;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+    let (handle, generation) = conn_handle(CP, SP);
+    clear_tx();
+    let body = b"fast-retransmit-payload";
+    let mut chain = iobuf::IOBufChain::from(body.to_vec());
+    super::async_try_send_chain(handle, generation, &mut chain)
+        .expect("an established connection accepts the send");
+    assert_eq!(tx().len(), 1, "the response goes out as one segment");
+
+    // A duplicate ACK: `ack` still at snd_una, no payload — the
+    // receiver is missing the segment.
+    let dup = Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    };
+    clear_tx();
+    deliver(&dup);
+    deliver(&dup);
+    assert!(tx().is_empty(), "the first two duplicate ACKs do not retransmit");
+
+    // The third duplicate ACK fast-retransmits — with the mock clock
+    // untouched, so this cannot be the RTO timer.
+    deliver(&dup);
+    let rtx = tx();
+    assert_eq!(
+        rtx.len(),
+        1,
+        "the third duplicate ACK fast-retransmits, without an RTO",
+    );
+    let h = tcp_hdr(&rtx[0]);
+    assert_eq!(
+        h.seq,
+        server_isn.wrapping_add(1),
+        "the retransmit re-sends from snd_una",
+    );
+    assert_eq!(
+        &rtx[0][34 + TCP_HDR_LEN..],
+        body,
+        "the fast retransmit carries the original payload",
+    );
+
+    // RFC 5681 §3.2: ssthresh halved against the flight size (floored
+    // at 2·SMSS), cwnd inflated to ssthresh + 3·SMSS.
+    let smss = 1460u32;
+    let expect_ssthresh = ((body.len() as u32) / 2).max(2 * smss);
+    let (cwnd, ssthresh) = conn_cwnd_ssthresh(CP, SP);
+    assert_eq!(
+        ssthresh, expect_ssthresh,
+        "ssthresh drops to flight/2, floored at 2·SMSS",
+    );
+    assert_eq!(
+        cwnd,
+        expect_ssthresh + 3 * smss,
+        "cwnd is inflated to ssthresh + 3·SMSS",
+    );
+}
+
+/// In fast recovery each extra duplicate ACK inflates `cwnd` by one
+/// SMSS; the recovering ACK (covering new data) deflates `cwnd` back
+/// to `ssthresh` and exits recovery — RFC 5681 §3.2 steps 4 and 6.
+#[test]
+fn fast_recovery_inflates_then_deflates_cwnd() {
+    let _g = harness();
+    const SP: u16 = 9122;
+    const CP: u16 = 50122;
+    const CLIENT_ISN: u32 = 0xD100;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+    let (handle, generation) = conn_handle(CP, SP);
+    let body = b"recovery-window-payload";
+    let mut chain = iobuf::IOBufChain::from(body.to_vec());
+    super::async_try_send_chain(handle, generation, &mut chain)
+        .expect("an established connection accepts the send");
+
+    let dup = Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    };
+    // Three duplicate ACKs → fast retransmit + fast recovery.
+    deliver(&dup);
+    deliver(&dup);
+    deliver(&dup);
+    let smss = 1460u32;
+    let (cwnd_at_entry, ssthresh) = conn_cwnd_ssthresh(CP, SP);
+    assert_eq!(
+        cwnd_at_entry,
+        ssthresh + 3 * smss,
+        "fast retransmit inflates cwnd to ssthresh + 3·SMSS",
+    );
+
+    // A fourth duplicate ACK inflates cwnd by one more SMSS.
+    deliver(&dup);
+    let (cwnd_inflated, _) = conn_cwnd_ssthresh(CP, SP);
+    assert_eq!(
+        cwnd_inflated,
+        cwnd_at_entry + smss,
+        "an extra duplicate ACK in recovery inflates cwnd by one SMSS",
+    );
+
+    // The recovering ACK covers the retransmitted data — cwnd
+    // deflates to ssthresh and recovery ends.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1 + body.len() as u32),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    let (cwnd_final, ssthresh_final) = conn_cwnd_ssthresh(CP, SP);
+    assert_eq!(
+        cwnd_final, ssthresh_final,
+        "the recovering ACK deflates cwnd back to ssthresh",
+    );
+}
+
+/// Fewer than three duplicate ACKs are not a loss signal — no
+/// retransmit, and the congestion window is left untouched.
+#[test]
+fn two_dup_acks_do_not_fast_retransmit() {
+    let _g = harness();
+    const SP: u16 = 9123;
+    const CP: u16 = 50123;
+    const CLIENT_ISN: u32 = 0xD200;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+    let (handle, generation) = conn_handle(CP, SP);
+    let body = b"two-dup-acks";
+    let mut chain = iobuf::IOBufChain::from(body.to_vec());
+    super::async_try_send_chain(handle, generation, &mut chain)
+        .expect("an established connection accepts the send");
+    let before = conn_cwnd_ssthresh(CP, SP);
+
+    let dup = Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    };
+    clear_tx();
+    deliver(&dup);
+    deliver(&dup);
+    assert!(tx().is_empty(), "two duplicate ACKs do not trigger a retransmit");
+    assert_eq!(
+        conn_cwnd_ssthresh(CP, SP),
+        before,
+        "fewer than three duplicate ACKs leave the congestion window untouched",
+    );
+}
+
 /// The lossy-network egress fixture itself: a dropped first
 /// transmission is invisible to the stack — the bytes stay in the
 /// RFC 6298 retransmit ring — and the RTO timer recovers it. Validates
@@ -1412,6 +1592,25 @@ fn conn_state(client_port: u16, server_port: u16) -> Option<TcpState> {
         }
     }
     None
+}
+
+/// The `(cwnd, ssthresh)` of the live connection for a client/server
+/// port pair — lets a scenario assert on the RFC 5681 controller.
+fn conn_cwnd_ssthresh(client_port: u16, server_port: u16) -> (u32, u32) {
+    let core = 0u32;
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        // SAFETY: single worker, test-serialised by `TEST_LOCK`.
+        let c = unsafe { &*conn_ptr(core, i) };
+        if c.state != TcpState::Closed
+            && c.state != TcpState::Listen
+            && c.local_port == server_port
+            && c.remote_port == client_port
+        {
+            return (c.cwnd, c.ssthresh);
+        }
+    }
+    panic!("no live connection for ports {client_port} -> {server_port}");
 }
 
 /// Drive a full three-way handshake on `(server_port, client_port)`

@@ -338,6 +338,15 @@ pub struct TcpConnection {
     /// above it, congestion avoidance (linear). Starts effectively
     /// infinite and drops to half the flight size on loss.
     pub(crate) ssthresh: u32,
+    /// Consecutive duplicate ACKs observed (RFC 5681 §3.2). The third
+    /// triggers fast retransmit; further duplicates while in fast
+    /// recovery inflate `cwnd`. Reset by any ACK of new data.
+    pub(crate) dup_acks: u8,
+    /// True between the fast-retransmit trigger and the recovering
+    /// ACK — RFC 5681 §3.2 fast recovery. While set, extra duplicate
+    /// ACKs inflate `cwnd`; the first new-data ACK deflates it back
+    /// to `ssthresh` and clears this.
+    pub(crate) in_fast_recovery: bool,
     /// Free-list link. When this slot is on the free list (state ==
     /// Closed AND the slot has been returned to the pool), this
     /// holds the index of the next free slot, or `NULL_SLOT` for
@@ -387,6 +396,8 @@ impl TcpConnection {
             fin_retx_count: 0,
             cwnd: 0,
             ssthresh: 0,
+            dup_acks: 0,
+            in_fast_recovery: false,
             next_free: NULL_SLOT,
         }
     }
@@ -742,21 +753,15 @@ impl TcpConnection {
         }
     }
 
-    /// Retransmit the oldest unacked segment (RFC 6298 §5.4-§5.6):
-    /// re-send up to one MSS from `snd_una`, double the RTO (§5.5),
-    /// and re-arm the timer. Called by `on_tcp_tick` when the
-    /// deadline has passed.
-    pub(crate) fn retransmit_oldest(&mut self, now: u64) {
+    /// Re-send up to one MSS of unacknowledged data starting at
+    /// `snd_una`. Shared by the RFC 6298 RTO path and RFC 5681 fast
+    /// retransmit; the caller owns the congestion-window adjustment
+    /// and the RTO-timer bookkeeping. No-op when nothing is buffered.
+    fn retransmit_oldest_segment(&mut self) {
         let n = (self.rtx_len as usize).min(mss_for(self.local_ip));
         if n == 0 {
-            self.rtx_deadline_ms = 0; // nothing to retransmit
             return;
         }
-        // RFC 5681 §3.1: the timeout is a congestion signal — halve
-        // ssthresh (first RTO of the episode) and collapse cwnd back
-        // to one segment. Done before the `rtx_backoff` bump below so
-        // `rtx_backoff == 0` still marks that first timeout.
-        self.congestion_on_rto();
         // Copy the (≤ MSS) bytes out of the ring into a contiguous
         // scratch buffer — the ring segment may wrap, and `send_segment`
         // takes a flat slice. Off the steady-state path (only fires on
@@ -764,7 +769,6 @@ impl TcpConnection {
         let mut scratch = [0u8; MSS_MAX];
         {
             let Some(buf) = self.rtx_buf.as_ref() else {
-                self.rtx_deadline_ms = 0;
                 return;
             };
             let head = self.rtx_head as usize;
@@ -793,6 +797,23 @@ impl TcpConnection {
         // is now ambiguous — a later ACK could be for either the
         // original transmission or this one — so discard it.
         self.rtt_anchor_active = false;
+    }
+
+    /// Retransmit the oldest unacked segment on RTO expiry (RFC 6298
+    /// §5.4-§5.6): re-send up to one MSS from `snd_una`, double the
+    /// RTO (§5.5), and re-arm the timer. Called by `on_tcp_tick` when
+    /// the deadline has passed.
+    pub(crate) fn retransmit_oldest(&mut self, now: u64) {
+        if self.rtx_len == 0 {
+            self.rtx_deadline_ms = 0; // nothing to retransmit
+            return;
+        }
+        // RFC 5681 §3.1: the timeout is a congestion signal — halve
+        // ssthresh (first RTO of the episode) and collapse cwnd back
+        // to one segment. Done before the `rtx_backoff` bump below so
+        // `rtx_backoff == 0` still marks that first timeout.
+        self.congestion_on_rto();
+        self.retransmit_oldest_segment();
         // §5.5: back the RTO off exponentially, capped at the ceiling.
         self.rtx_backoff = self.rtx_backoff.saturating_add(1);
         self.rto_ms = self.rto_ms.saturating_mul(2).min(RTO_MAX_MS);
@@ -885,6 +906,49 @@ impl TcpConnection {
             self.ssthresh = (flight / 2).max(2 * smss);
         }
         self.cwnd = smss;
+    }
+
+    /// RFC 5681 §3.2 fast retransmit: the third duplicate ACK is
+    /// taken as a loss signal without waiting for the RTO. Halve
+    /// `ssthresh` against the flight size, re-send the segment the
+    /// duplicates are missing, and inflate `cwnd` to
+    /// `ssthresh + 3·SMSS` — each of the three duplicate ACKs implies
+    /// a segment that has left the network.
+    fn fast_retransmit(&mut self) {
+        let smss = mss_for(self.local_ip) as u32;
+        let flight = self.snd_nxt.wrapping_sub(self.snd_una);
+        self.ssthresh = (flight / 2).max(2 * smss);
+        self.retransmit_oldest_segment();
+        self.cwnd = self.ssthresh.saturating_add(3 * smss);
+    }
+
+    /// Fold a duplicate ACK into the RFC 5681 §3.2 fast-retransmit /
+    /// fast-recovery state. The third duplicate triggers fast
+    /// retransmit and entry into fast recovery; each further
+    /// duplicate while in recovery inflates `cwnd` by one SMSS (the
+    /// segment it implies has left the network).
+    pub(crate) fn on_dup_ack(&mut self) {
+        let smss = mss_for(self.local_ip) as u32;
+        self.dup_acks = self.dup_acks.saturating_add(1);
+        if self.dup_acks == 3 {
+            self.fast_retransmit();
+            self.in_fast_recovery = true;
+        } else if self.dup_acks > 3 && self.in_fast_recovery {
+            // §3.2 step 4: inflate for the additional duplicate.
+            self.cwnd = self.cwnd.saturating_add(smss);
+        }
+    }
+
+    /// Fold an ACK of new data into the fast-recovery state. It ends
+    /// any duplicate-ACK run; if the connection was in fast recovery
+    /// it deflates `cwnd` back to `ssthresh` and exits recovery
+    /// (RFC 5681 §3.2 step 6).
+    pub(crate) fn on_new_data_ack(&mut self) {
+        self.dup_acks = 0;
+        if self.in_fast_recovery {
+            self.cwnd = self.ssthresh;
+            self.in_fast_recovery = false;
+        }
     }
 }
 
