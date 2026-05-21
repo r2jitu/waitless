@@ -77,8 +77,6 @@
 // raw pointers: the only `unsafe` left is the `UnsafeCell` payload
 // access, guarded by the producer/consumer discipline below.
 
-#![allow(dead_code)]
-
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 

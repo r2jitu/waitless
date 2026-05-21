@@ -42,8 +42,6 @@
 // and CI this is fine. Production reseeding + a properly audited
 // entropy collector is tracked under "Deferred work" in ROADMAP.md.
 
-#![allow(unsafe_op_in_unsafe_fn)] // SAFETY documented per call site
-
 use core::cell::UnsafeCell;
 use sha2::{Digest, Sha256};
 

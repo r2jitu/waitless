@@ -1,4 +1,3 @@
-#![allow(unsafe_op_in_unsafe_fn)]
 // kernel/x86_64/smp.rs — Multi-core boot for x86_64.
 //
 // Uses INIT-SIPI-SIPI to start secondary cores (APs).
@@ -71,12 +70,10 @@ pub fn num_cores_online() -> u32 {
 ///
 /// # Safety
 ///
-/// Only the Limine MP boot path may call this, once per AP. Limine
-/// must have already placed this core in 64-bit long mode on its own
-/// page tables with a valid stack, and the BSP must have completed
-/// `mm::init` / `apic::init` / `idt::init` / `acpi::detect_cpus`
-/// before any AP starts. `apic_id` must be this core's true LAPIC ID.
-/// Does not return.
+/// Must be invoked exactly once per AP, by the Limine MP boot path,
+/// with `apic_id` set to that AP's real LAPIC ID. The AP must already
+/// be in 64-bit long mode on a valid stack. ACPI topology must have
+/// been parsed on the BSP first.
 pub unsafe extern "C" fn ap_entry_via_limine(apic_id: u32) -> ! {
     // Enable SSE + AVX on this AP. Limine puts us in long mode but
     // doesn't touch CR4 / XCR0 — those are per-CPU register bits the
@@ -127,135 +124,137 @@ pub unsafe extern "C" fn ap_entry_via_limine(apic_id: u32) -> ! {
             out("rdx") _,
             options(att_syntax),
         );
-    }
 
-    super::gdt::load_on_ap();
-    apic::init_ap();
+        super::gdt::load_on_ap();
+        apic::init_ap();
 
-    let topo = super::acpi::topology();
-    let mut logical_id = 0u32;
-    for i in 0..topo.cpu_count as usize {
-        if topo.apic_ids[i] as u32 == apic_id {
-            logical_id = i as u32;
-            break;
+        let topo = super::acpi::topology();
+        let mut logical_id = 0u32;
+        for i in 0..topo.cpu_count as usize {
+            if topo.apic_ids[i] as u32 == apic_id {
+                logical_id = i as u32;
+                break;
+            }
         }
-    }
-    init_tls(logical_id);
-    super::idt::load_idt_on_ap();
+        init_tls(logical_id);
+        super::idt::load_idt_on_ap();
 
-    // AcqRel pairs with the Acquire in `num_cores_online()`; matches
-    // the aarch64 sibling. SeqCst would add a redundant fence.
-    NUM_CORES_ONLINE.fetch_add(1, Ordering::AcqRel);
+        // AcqRel pairs with the Acquire in `num_cores_online()`; matches
+        // the aarch64 sibling. SeqCst would add a redundant fence.
+        NUM_CORES_ONLINE.fetch_add(1, Ordering::AcqRel);
 
-    let id = cpu_id();
-    let mut buf = [0u8; 24];
-    let mut pos = 0;
-    for &b in b"[SMP] core " {
-        buf[pos] = b;
-        pos += 1;
-    }
-    pos += fmt_u32(&mut buf[pos..], id);
-    for &b in b" online\n" {
-        buf[pos] = b;
-        pos += 1;
-    }
-    serial::puts(&buf[..pos]);
+        let id = cpu_id();
+        let mut buf = [0u8; 24];
+        let mut pos = 0;
+        for &b in b"[SMP] core " {
+            buf[pos] = b;
+            pos += 1;
+        }
+        pos += fmt_u32(&mut buf[pos..], id);
+        for &b in b" online\n" {
+            buf[pos] = b;
+            pos += 1;
+        }
+        serial::puts(&buf[..pos]);
 
-    core::arch::asm!("sti", options(nomem, nostack));
-    crate::eventloop::run(id);
+        core::arch::asm!("sti", options(nomem, nostack));
+        crate::eventloop::run(id);
+    }
 }
 
 /// Boot secondary cores via INIT-SIPI-SIPI (Multiboot2 / PVH path).
 ///
 /// # Safety
 ///
-/// BSP-only, called once. Used only on the Multiboot2 / PVH boot
-/// path, where low physical memory (including the trampoline page at
-/// `AP_TRAMPOLINE_ADDR`) is identity-mapped — never under Limine.
-/// `mm::init`, `apic::init`, `idt::init`, and `acpi::detect_cpus`
-/// must have run, and `cpu_count` must match the ACPI topology. This
-/// overwrites the page at `AP_TRAMPOLINE_ADDR` with the AP trampoline.
+/// Must run once on the BSP, before any AP starts, only on the
+/// Multiboot2 / PVH boot path where low physical memory (including
+/// the trampoline page at 0x8000) is identity-mapped. ACPI topology
+/// must already be parsed. Overwrites the physical page at
+/// `AP_TRAMPOLINE_ADDR`.
 pub unsafe fn start_secondary_cores(cpu_count: u32) {
-    if cpu_count <= 1 {
-        return;
-    }
-    let count = cpu_count;
-    serial::puts(b"[SMP] Starting secondary cores...\n");
-
-    // Copy AP trampoline to physical 0x8000. Multiboot2 / PVH leave
-    // low memory identity-mapped, so we can write there by virtual
-    // address directly; this path never runs under Limine (Limine
-    // uses its own MP request via ap_entry_via_limine), so no HHDM
-    // indirection needed here.
-    unsafe extern "C" {
-        static ap_trampoline_start: u8;
-        static ap_trampoline_end: u8;
-    }
-    let trampoline_src = &ap_trampoline_start as *const u8;
-    let trampoline_size = (&ap_trampoline_end as *const u8 as usize) - (trampoline_src as usize);
-    let trampoline_dst = AP_TRAMPOLINE_ADDR as *mut u8;
-
-    core::ptr::copy_nonoverlapping(trampoline_src, trampoline_dst, trampoline_size);
-
-    // Set up the GDT at offset 0xF00 in the trampoline page
-    let gdt_ptr_addr = (AP_TRAMPOLINE_ADDR + 0xF00) as *mut u8;
-    setup_ap_gdt(gdt_ptr_addr);
-
-    // AP inherits BSP's CR3: under Multiboot2 / PVH that PML4 already
-    // identity-maps low memory (including the trampoline page at
-    // 0x8000) and the kernel's load range, which is exactly what the
-    // trampoline's real-mode → long-mode transition needs.
-    let cr3: u64;
-    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
-
-    // Write PML4 address at offset 0xFF0
-    let pml4_slot = (AP_TRAMPOLINE_ADDR + 0xFF0) as *mut u32;
-    core::ptr::write_volatile(pml4_slot, cr3 as u32);
-
-    let sipi_vector = (AP_TRAMPOLINE_ADDR / 0x1000) as u8;
-
-    // Broadcast INIT to all APs at once and pay the 10 ms post-INIT
-    // wait (Intel SDM Vol 3 8.4.4.1) only once instead of per AP.
-    // After INIT each AP is in wait-for-SIPI; SIPIs are still sent
-    // sequentially because each AP needs its own stack written into
-    // the shared trampoline page at offset 0xFF8 before it runs.
-    apic::send_init_broadcast();
-    time::udelay(10_000);
-
-    let topo = super::acpi::topology();
-    for i in 1..count {
-        let stack_pages = AP_STACK_SIZE / 4096;
-        let stack_base = mm::alloc_pages(stack_pages);
-        if stack_base == 0 {
-            serial::puts(b"[SMP] Failed to allocate AP stack\n");
-            continue;
+    unsafe {
+        if cpu_count <= 1 {
+            return;
         }
-        let stack_top = stack_base + AP_STACK_SIZE as u64;
-        let stack_slot = (AP_TRAMPOLINE_ADDR + 0xFF8) as *mut u64;
-        core::ptr::write_volatile(stack_slot, stack_top);
+        let count = cpu_count;
+        serial::puts(b"[SMP] Starting secondary cores...\n");
 
-        let target_apic_id = topo.apic_ids[i as usize] as u32;
-        let expected = num_cores_online() + 1;
-
-        apic::send_sipi(target_apic_id, sipi_vector);
-        time::udelay(200); // 200 µs between SIPIs (per SDM)
-        apic::send_sipi(target_apic_id, sipi_vector);
-
-        // Wait up to 100 ms for the AP to come online before starting
-        // the next one (the trampoline page at 0x8000 is reused).
-        let deadline = time::now_cycles().wrapping_add(100_000 * time::cycles_per_us());
-        while num_cores_online() < expected && time::now_cycles() < deadline {
-            core::hint::spin_loop();
+        // Copy AP trampoline to physical 0x8000. Multiboot2 / PVH leave
+        // low memory identity-mapped, so we can write there by virtual
+        // address directly; this path never runs under Limine (Limine
+        // uses its own MP request via ap_entry_via_limine), so no HHDM
+        // indirection needed here.
+        unsafe extern "C" {
+            static ap_trampoline_start: u8;
+            static ap_trampoline_end: u8;
         }
-    }
+        let trampoline_src = &ap_trampoline_start as *const u8;
+        let trampoline_size =
+            (&ap_trampoline_end as *const u8 as usize) - (trampoline_src as usize);
+        let trampoline_dst = AP_TRAMPOLINE_ADDR as *mut u8;
 
-    // No outer wait or count snapshot. Each AP prints its own
-    // `[SMP] core N online` line from `ap_entry_x86`; that's the
-    // source of truth. The per-AP wait above is still required
-    // (the trampoline page at 0x8000 is shared and must be reused
-    // for the next AP). See `aarch64::smp::start_secondary_cores`
-    // for the same removal rationale on the ARM side.
-    let _ = count;
+        core::ptr::copy_nonoverlapping(trampoline_src, trampoline_dst, trampoline_size);
+
+        // Set up the GDT at offset 0xF00 in the trampoline page
+        let gdt_ptr_addr = (AP_TRAMPOLINE_ADDR + 0xF00) as *mut u8;
+        setup_ap_gdt(gdt_ptr_addr);
+
+        // AP inherits BSP's CR3: under Multiboot2 / PVH that PML4 already
+        // identity-maps low memory (including the trampoline page at
+        // 0x8000) and the kernel's load range, which is exactly what the
+        // trampoline's real-mode → long-mode transition needs.
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+
+        // Write PML4 address at offset 0xFF0
+        let pml4_slot = (AP_TRAMPOLINE_ADDR + 0xFF0) as *mut u32;
+        core::ptr::write_volatile(pml4_slot, cr3 as u32);
+
+        let sipi_vector = (AP_TRAMPOLINE_ADDR / 0x1000) as u8;
+
+        // Broadcast INIT to all APs at once and pay the 10 ms post-INIT
+        // wait (Intel SDM Vol 3 8.4.4.1) only once instead of per AP.
+        // After INIT each AP is in wait-for-SIPI; SIPIs are still sent
+        // sequentially because each AP needs its own stack written into
+        // the shared trampoline page at offset 0xFF8 before it runs.
+        apic::send_init_broadcast();
+        time::udelay(10_000);
+
+        let topo = super::acpi::topology();
+        for i in 1..count {
+            let stack_pages = AP_STACK_SIZE / 4096;
+            let stack_base = mm::alloc_pages(stack_pages);
+            if stack_base == 0 {
+                serial::puts(b"[SMP] Failed to allocate AP stack\n");
+                continue;
+            }
+            let stack_top = stack_base + AP_STACK_SIZE as u64;
+            let stack_slot = (AP_TRAMPOLINE_ADDR + 0xFF8) as *mut u64;
+            core::ptr::write_volatile(stack_slot, stack_top);
+
+            let target_apic_id = topo.apic_ids[i as usize] as u32;
+            let expected = num_cores_online() + 1;
+
+            apic::send_sipi(target_apic_id, sipi_vector);
+            time::udelay(200); // 200 µs between SIPIs (per SDM)
+            apic::send_sipi(target_apic_id, sipi_vector);
+
+            // Wait up to 100 ms for the AP to come online before starting
+            // the next one (the trampoline page at 0x8000 is reused).
+            let deadline = time::now_cycles().wrapping_add(100_000 * time::cycles_per_us());
+            while num_cores_online() < expected && time::now_cycles() < deadline {
+                core::hint::spin_loop();
+            }
+        }
+
+        // No outer wait or count snapshot. Each AP prints its own
+        // `[SMP] core N online` line from `ap_entry_x86`; that's the
+        // source of truth. The per-AP wait above is still required
+        // (the trampoline page at 0x8000 is shared and must be reused
+        // for the next AP). See `aarch64::smp::start_secondary_cores`
+        // for the same removal rationale on the ARM side.
+        let _ = count;
+    }
 }
 
 /// IPI wakeup vector (must not conflict with PIC IRQs 32-47 or exceptions 0-31).
@@ -327,32 +326,34 @@ pub fn request_shutdown() {
 /// Format: 2 bytes limit + 4 bytes base (32-bit GDT pointer for lgdt in 16/32-bit mode)
 /// followed by GDT entries.
 unsafe fn setup_ap_gdt(addr: *mut u8) {
-    // GDT entries start at addr + 6 (after the 6-byte GDT pointer)
-    let gdt_base = addr.add(6);
+    unsafe {
+        // GDT entries start at addr + 6 (after the 6-byte GDT pointer)
+        let gdt_base = addr.add(6);
 
-    // Entry 0 (0x00): null descriptor
-    core::ptr::write_bytes(gdt_base, 0, 8);
+        // Entry 0 (0x00): null descriptor
+        core::ptr::write_bytes(gdt_base, 0, 8);
 
-    // Entry 1 (0x08): 32-bit code segment (for real→protected mode)
-    let e1 = gdt_base.add(8) as *mut u64;
-    // Limit=0xFFFFF, Base=0, Access=0x9A, Flags=0xC0 (G=1,D=1,L=0)
-    core::ptr::write_volatile(e1, 0x00CF9A000000FFFFu64);
+        // Entry 1 (0x08): 32-bit code segment (for real→protected mode)
+        let e1 = gdt_base.add(8) as *mut u64;
+        // Limit=0xFFFFF, Base=0, Access=0x9A, Flags=0xC0 (G=1,D=1,L=0)
+        core::ptr::write_volatile(e1, 0x00CF9A000000FFFFu64);
 
-    // Entry 2 (0x10): 32-bit data segment
-    let e2 = gdt_base.add(16) as *mut u64;
-    // Limit=0xFFFFF, Base=0, Access=0x92, Flags=0xC0 (G=1,D=1)
-    core::ptr::write_volatile(e2, 0x00CF92000000FFFFu64);
+        // Entry 2 (0x10): 32-bit data segment
+        let e2 = gdt_base.add(16) as *mut u64;
+        // Limit=0xFFFFF, Base=0, Access=0x92, Flags=0xC0 (G=1,D=1)
+        core::ptr::write_volatile(e2, 0x00CF92000000FFFFu64);
 
-    // Entry 3 (0x18): 64-bit code segment (for protected→long mode)
-    let e3 = gdt_base.add(24) as *mut u64;
-    // Limit=0, Base=0, Access=0x9A, Flags=0xA0 (L=1,D=0)
-    core::ptr::write_volatile(e3, 0x00209A0000000000u64);
+        // Entry 3 (0x18): 64-bit code segment (for protected→long mode)
+        let e3 = gdt_base.add(24) as *mut u64;
+        // Limit=0, Base=0, Access=0x9A, Flags=0xA0 (L=1,D=0)
+        core::ptr::write_volatile(e3, 0x00209A0000000000u64);
 
-    // GDT pointer: limit (4 entries × 8 - 1 = 31), base = physical addr of GDT
-    let ptr = addr as *mut u16;
-    core::ptr::write_volatile(ptr, 31); // limit
-    let base_ptr = addr.add(2) as *mut u32;
-    core::ptr::write_volatile(base_ptr, gdt_base as u32);
+        // GDT pointer: limit (4 entries × 8 - 1 = 31), base = physical addr of GDT
+        let ptr = addr as *mut u16;
+        core::ptr::write_volatile(ptr, 31); // limit
+        let base_ptr = addr.add(2) as *mut u32;
+        core::ptr::write_volatile(base_ptr, gdt_base as u32);
+    }
 }
 
 fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {
