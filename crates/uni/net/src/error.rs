@@ -18,8 +18,8 @@
 // Self-contained outside `nic_api::NicError` — only `core::` plus
 // the one upstream import — so this file also compiles as a
 // standalone `rust_test` for host-native unit tests.
-
-#![allow(dead_code)] // Some variants are reserved for future use.
+//
+// Some variants are reserved for future use.
 
 use core::fmt;
 use nic_api::NicError;

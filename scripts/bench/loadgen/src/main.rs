@@ -11,7 +11,7 @@
 //
 // Anything else on stdout is informational. Stderr is for logs.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
@@ -327,22 +327,4 @@ fn print_result(r: WorkloadResult) {
     println!("RPS {:.3}", r.ops as f64 / secs);
     println!("P50_US {}", r.p50_us);
     println!("P99_US {}", r.p99_us);
-}
-
-/// Convenience: run `body` until `deadline` and return how many
-/// times it succeeded plus the latency samples it produced. Used
-/// by both workloads under the hood.
-#[allow(dead_code)]
-pub async fn loop_until<F, Fut>(deadline: Instant, mut body: F) -> u64
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let mut count = 0u64;
-    while Instant::now() < deadline {
-        if body().await {
-            count += 1;
-        }
-    }
-    count
 }

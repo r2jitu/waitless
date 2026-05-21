@@ -18,6 +18,11 @@
 
 #![allow(non_camel_case_types)]
 #![allow(non_upper_case_globals)]
+// This is an FFI binding file: it intentionally declares the complete
+// Hypervisor.framework SDK surface transcribed from the headers, so
+// the bindings stay a faithful 1:1 mirror and future call sites don't
+// need to add declarations piecemeal. ~13 binding items are unused by
+// the runner today; the unused entries are expected, not stale code.
 #![allow(dead_code)]
 
 use std::ffi::c_void;

@@ -138,11 +138,6 @@ const PSCI_SUCCESS: u64 = 0;
 const PSCI_ALREADY_ON: u64 = (-4i64) as u64;
 const PSCI_NOT_SUPPORTED: u64 = (-1i64) as u64;
 
-// Virtual timer PPI (INTID 27). Not currently injected by the runner
-// but wanted as soon as we add vtimer support, so keep the constant.
-#[allow(dead_code)]
-const VTIMER_INTID: u32 = 27;
-
 /// Maximum number of vCPUs we support.
 const MAX_VCPUS: usize = 8;
 
