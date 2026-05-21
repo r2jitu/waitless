@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Generated launcher for the `_hvf` variant of a unikernel_binary
-# target. The variant rule symlinks the guest image next to this
-# script under the filename substituted into %IMG%; the HVF runner
-# binary is reachable via the launcher-relative path in %RUNNER%;
+# target. The variant rule symlinks both the guest image and the
+# HVF runner binary next to this script, under the filenames
+# substituted into %IMG% and %RUNNER% respectively (so they resolve
+# the same way whether the runner ships in this repo or in the
+# unikernel Bazel module an external app depends on);
 # `%PORT_FLAGS%` is the `-p proto:host:guest` argument sequence
 # built from the app's `port_forwards` attr, with env-var defaults
 # baked in per forward.

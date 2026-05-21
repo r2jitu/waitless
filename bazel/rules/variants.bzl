@@ -150,19 +150,6 @@ def _expand_launcher(ctx, substitutions):
     )
     return out
 
-def _relpath_from_launcher_to(ctx, target_file):
-    """Return `$SELF_DIR`-relative path from launcher to `target_file`.
-
-    The launcher is declared at `<package>/<name>` in runfiles; its
-    runtime `$SELF_DIR` is the package directory. To reach a file at
-    `target_file.short_path`, we walk up `package_depth` levels to
-    the runfiles root and then down via `short_path`. Lets us
-    reference shared runfiles (e.g. `//scripts:helpers.sh`) without
-    symlinking a per-variant copy next to the launcher.
-    """
-    package_depth = ctx.label.package.count("/") + 1 if ctx.label.package else 0
-    return ("../" * package_depth) + target_file.short_path
-
 # ── Port-forward launcher-string builders ────────────────────────────────
 #
 # `port_fwd()` in unikernel.bzl returns a `struct(proto, guest, host)`.
@@ -254,13 +241,20 @@ def _hvf_impl(ctx):
         ctx.label.name + ".img",
     )
 
-    # `hvf_runner` is a host-cfg label (no [0], no transition); consume
-    # it from its natural runfiles path via a launcher-relative path,
-    # same pattern used for `helpers.sh` in the iso / qemu variants.
-    runner = ctx.attr.hvf_runner[DefaultInfo].files.to_list()[0]
+    # `hvf_runner` is a host-cfg label (no [0], no transition).
+    # Symlink it into the launcher's own outdir — same treatment as
+    # the guest image above — so it's reachable as `$SELF_DIR/<name>`
+    # regardless of which repo the runner came from. A launcher-
+    # relative `short_path` would only resolve when runner and app
+    # share a repo, breaking external Bazel-module consumers.
+    runner = _symlink_into_outdir(
+        ctx,
+        ctx.attr.hvf_runner[DefaultInfo].files.to_list()[0],
+        ctx.label.name + ".run-hvf",
+    )
     launcher = _expand_launcher(ctx, {
         "%IMG%": img.basename,
-        "%RUNNER%": _relpath_from_launcher_to(ctx, runner),
+        "%RUNNER%": runner.basename,
         "%PORT_FLAGS%": ctx.attr.hvf_port_flags,
         "%DEFAULT_RAM%": str(ctx.attr.default_ram_mb),
         "%DEFAULT_CPUS%": str(ctx.attr.default_cpus),
