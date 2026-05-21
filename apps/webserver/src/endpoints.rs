@@ -9,7 +9,7 @@ use core::fmt::Write as _;
 
 use http::Response;
 
-pub(crate) const HEALTH_JSON: &[u8] = b"{\"status\":\"ok\",\"runtime\":\"unikernel\",\"version\":\"0.1.0\"}";
+pub(crate) const HEALTH_JSON: &[u8] = b"{\"status\":\"ok\",\"runtime\":\"waitless\",\"version\":\"0.1.0\"}";
 
 /// All-zero bench-throughput body that lives in `.bss` — zero image
 /// bytes. A plain `static [u8; N]` is an LLVM `constant` and lands in

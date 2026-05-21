@@ -1216,7 +1216,7 @@ HTTPS/1.1 and HTTP/3 simultaneously — see `apps/webserver/src/main.rs`.
 ```bash
 $(brew --prefix curl)/bin/curl --http3-only -k \
     https://127.0.0.1:8443/health
-# {"status":"ok","runtime":"unikernel","version":"0.1.0"}
+# {"status":"ok","runtime":"waitless","version":"0.1.0"}
 ```
 
 ---

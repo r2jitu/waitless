@@ -62,7 +62,7 @@ if command -v grub-mkrescue &>/dev/null; then
     cat >"$ISODIR/boot/grub/grub.cfg" <<'GRUB_EOF'
 set timeout=0
 set default=0
-menuentry "unikernel" {
+menuentry "waitless" {
     multiboot2 /boot/kernel.elf
     boot
 }

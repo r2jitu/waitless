@@ -223,7 +223,7 @@ deploy() {
     echo "==> Creating GCE image: $IMAGE_NAME"
     gcloud compute images create "$IMAGE_NAME" \
         --source-uri="gs://$BUCKET/${TARBALL_NAME}" \
-        --family=unikernel \
+        --family=waitless \
         --guest-os-features=UEFI_COMPATIBLE,GVNIC \
         --project="$PROJECT" \
         --quiet
@@ -405,7 +405,7 @@ clean_stale() {
 
     local stale_images
     stale_images="$(gcloud compute images list \
-        --filter="family=unikernel AND name!=$IMAGE_NAME" \
+        --filter="family=waitless AND name!=$IMAGE_NAME" \
         --format='value(name)' --project="$PROJECT" 2>/dev/null)"
     if [ -n "$stale_images" ]; then
         local n
@@ -434,7 +434,7 @@ clean_stale() {
     fi
 }
 
-# Full teardown: VM, every image in the `unikernel` family, every
+# Full teardown: VM, every image in the `waitless` family, every
 # tarball in the GCS bucket, and the firewall rule. Intended for
 # "I'm done with this experiment, zero it all out."
 purge() {
@@ -446,12 +446,12 @@ purge() {
         echo "    instance: deleted" ||
         echo "    instance: (not present)"
 
-    # Delete every image in the unikernel family. `--filter` keeps us
+    # Delete every image in the waitless family. `--filter` keeps us
     # from nuking unrelated images that happen to live in the same
     # project.
     local images
     images="$(gcloud compute images list \
-        --filter="family=unikernel" \
+        --filter="family=waitless" \
         --format='value(name)' --project="$PROJECT" 2>/dev/null)"
     if [ -n "$images" ]; then
         # shellcheck disable=SC2086
