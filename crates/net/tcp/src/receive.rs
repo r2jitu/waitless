@@ -256,17 +256,26 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             // the reactor's per-worker waker fires the right task.
             let port = c.listener_port;
             executor::reactor::deliver_tcp_ready(port);
-        } else if c.state == TcpState::LastAck {
+        } else if c.state == TcpState::LastAck && ack == c.snd_nxt {
+            // The peer acknowledged our FIN — passive close complete.
+            // The `ack == snd_nxt` guard matters: a peer retransmitting
+            // its own FIN (because it never saw our ACK of it) carries
+            // an `ack` below `snd_nxt`, and must not free the slot
+            // before our FIN is confirmed — the FIN timer keeps
+            // retransmitting and re-acknowledging until it is.
             free_connection(core, slot);
             return;
         } else if c.state == TcpState::FinWait1 && ack == c.snd_nxt {
-            // Peer ACK'd our FIN. Move to FinWait2 to await the peer's
-            // FIN. Without this transition the slot stays in FinWait1
-            // forever if the peer doesn't piggyback its FIN with the
-            // ACK (Linux clients on a half-closed conn frequently send
-            // the ACK and the FIN as separate segments).
+            // Peer ACK'd our FIN. Disarm the FIN-retransmit timer and
+            // move to FinWait2 to await the peer's FIN. Without this
+            // transition the slot stays in FinWait1 forever if the
+            // peer doesn't piggyback its FIN with the ACK (Linux
+            // clients on a half-closed conn frequently send the ACK
+            // and the FIN as separate segments).
             c.state = TcpState::FinWait2;
             c.snd_una = ack;
+            c.lifecycle_deadline_ms = 0;
+            c.fin_retx_count = 0;
         } else {
             c.snd_una = ack;
         }

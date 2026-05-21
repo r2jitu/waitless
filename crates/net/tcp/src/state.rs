@@ -29,7 +29,7 @@ pub(crate) const TCP_RST: u8 = TcpFlags::RST.bits();
 pub(crate) const TCP_PSH: u8 = TcpFlags::PSH.bits();
 pub(crate) const TCP_ACK: u8 = TcpFlags::ACK.bits();
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TcpState {
     Closed = 0,
@@ -123,7 +123,7 @@ pub(crate) fn mss_for(local_ip: IpAddr) -> usize {
 //
 // Every unacknowledged outbound byte is kept in a per-conn ring
 // (`rtx_buf`) alongside a millisecond RTO deadline. A periodic tick
-// (`on_rtx_tick`, driven by the net poll loop) retransmits the oldest
+// (`on_tcp_tick`, driven by the net poll loop) retransmits the oldest
 // unacked data once the deadline passes and doubles the RTO each time
 // (§5.5 exponential backoff). Before this a lost *outbound* segment
 // was never resent — an RFC 9293 MUST violation, and a real
@@ -152,6 +152,23 @@ pub(crate) const RTO_MAX_MS: u32 = 60_000;
 /// ~100 s of total wait — in line with the RFC 9293 §3.8.3 "R2"
 /// lower bound for aborting a broken connection.
 pub(crate) const RTX_MAX_RETRIES: u8 = 8;
+
+// ─── Connection-lifecycle timers ─────────────────────────────────────────────
+//
+// `close()`'s FIN occupies one sequence number but carries no payload,
+// so it is not held in the RFC 6298 data ring (`rtx_buf`). A dedicated
+// timer (`lifecycle_deadline_ms` + `fin_retx_count`) retransmits the
+// FIN in `FinWait1` (active close) and `LastAck` (passive close) until
+// the peer acknowledges it or the bounded retry count runs out. Before
+// this a single dropped FIN stranded the connection until the peer's
+// keepalive fired — invisible on a LAN, an availability bug on a WAN.
+
+/// FIN retransmissions before a half-closed connection (`FinWait1`
+/// active close / `LastAck` passive close) is forced shut — the
+/// RFC 9293 §3.8.3 "give up on a dead peer" bound. Five retransmits
+/// with exponential backoff off the RTO estimate (~63 s total at the
+/// 1 s initial RTO) before teardown.
+pub(crate) const FIN_RETX_MAX: u8 = 5;
 
 /// Active `TcpRecv` future's destination buffer. The future
 /// registers this pointer + capacity when it parks, so a subsequent
@@ -291,6 +308,18 @@ pub struct TcpConnection {
     /// sample is taken, and on any retransmission — Karn's algorithm
     /// forbids deriving an RTT from a segment that was retransmitted.
     pub(crate) rtt_anchor_active: bool,
+    /// Absolute deadline (`kernel_core::clock::now_ms`) for the next
+    /// connection-lifecycle timer action — the FIN retransmit in
+    /// `FinWait1` (active close) and `LastAck` (passive close). 0 =
+    /// disarmed. Separate from `rtx_deadline_ms` (RFC 6298 data
+    /// retransmission): a connection closing with still-unacked data
+    /// has both timers armed at once.
+    pub(crate) lifecycle_deadline_ms: u64,
+    /// Consecutive FIN retransmissions with no acknowledgement — the
+    /// exponential-backoff exponent and the `FIN_RETX_MAX` give-up
+    /// counter. Meaningful only while `lifecycle_deadline_ms` is armed
+    /// in `FinWait1` / `LastAck`.
+    pub(crate) fin_retx_count: u8,
     /// Free-list link. When this slot is on the free list (state ==
     /// Closed AND the slot has been returned to the pool), this
     /// holds the index of the next free slot, or `NULL_SLOT` for
@@ -336,6 +365,8 @@ impl TcpConnection {
             rtt_anchor_ms: 0,
             rtt_anchor_seq: 0,
             rtt_anchor_active: false,
+            lifecycle_deadline_ms: 0,
+            fin_retx_count: 0,
             next_free: NULL_SLOT,
         }
     }
@@ -690,7 +721,7 @@ impl TcpConnection {
 
     /// Retransmit the oldest unacked segment (RFC 6298 §5.4-§5.6):
     /// re-send up to one MSS from `snd_una`, double the RTO (§5.5),
-    /// and re-arm the timer. Called by `on_rtx_tick` when the
+    /// and re-arm the timer. Called by `on_tcp_tick` when the
     /// deadline has passed.
     pub(crate) fn retransmit_oldest(&mut self, now: u64) {
         let n = (self.rtx_len as usize).min(mss_for(self.local_ip));
@@ -738,6 +769,40 @@ impl TcpConnection {
         self.rtx_backoff = self.rtx_backoff.saturating_add(1);
         self.rto_ms = self.rto_ms.saturating_mul(2).min(RTO_MAX_MS);
         self.rtx_deadline_ms = now + self.rto_ms as u64;
+    }
+
+    // ─── Connection-lifecycle timers ─────────────────────────────────────
+
+    /// Arm (or re-arm) the FIN-retransmit timer. The interval backs
+    /// off exponentially with `fin_retx_count` (RFC 6298 §5.5-style)
+    /// off the connection's RTO estimate, capped at `RTO_MAX_MS`.
+    pub(crate) fn arm_fin_timer(&mut self, now: u64) {
+        let interval = ((self.estimated_rto() as u64) << self.fin_retx_count.min(16))
+            .min(RTO_MAX_MS as u64);
+        self.lifecycle_deadline_ms = now + interval;
+    }
+
+    /// Retransmit the connection's FIN (`FinWait1` / `LastAck`) and
+    /// re-arm the timer with one more step of backoff. The FIN
+    /// occupies sequence number `snd_nxt - 1` — `close()` advanced
+    /// `snd_nxt` past it when the FIN was first sent. Called by
+    /// `on_tcp_tick` once the lifecycle deadline has passed.
+    pub(crate) fn retransmit_fin(&mut self, now: u64) {
+        send_segment(
+            &SegmentMeta {
+                local_ip: self.local_ip,
+                dst_ip: self.remote_ip,
+                src_port: self.local_port,
+                dst_port: self.remote_port,
+                seq: self.snd_nxt.wrapping_sub(1),
+                ack: self.rcv_nxt,
+                flags: TCP_FIN | TCP_ACK,
+                window: self.rx_free() as u16,
+            },
+            &[],
+        );
+        self.fin_retx_count = self.fin_retx_count.saturating_add(1);
+        self.arm_fin_timer(now);
     }
 }
 

@@ -18,8 +18,10 @@
 //                      `async_try_send_chain` send-side reactor hook.
 //   * [`receive`]    — `tcp_receive` — the inbound entry point and
 //                      state-machine driver.
-//   * [`retransmit`] — RFC 6298 per-core tick (`on_rtx_tick`) +
-//                      `has_armed_rtx_timers` idle gate.
+//   * [`retransmit`] — per-core TCP timer tick (`on_tcp_tick`):
+//                      RFC 6298 data retransmission + the FIN
+//                      retransmit, plus the `has_armed_timers`
+//                      event-loop idle gate.
 //   * [`listener`]   — the rest of the public TCP API the
 //                      `executor::reactor::tcp` backend wires into:
 //                      `init`, `listen_on_core`, `accept_on_port`,
@@ -57,7 +59,7 @@ pub use listener::{
 };
 pub use pool::{RX_CHUNK_RING_DRAIN, RX_CHUNK_STASH_HITS, TCP_SYN_RX, TCP_SYNACK_TX};
 pub use receive::tcp_receive;
-pub use retransmit::{has_armed_rtx_timers, on_rtx_tick};
+pub use retransmit::{has_armed_timers, on_tcp_tick};
 pub use send::{async_try_send_chain, try_send_tso};
 pub use state::{TcpConnection, TcpState};
 
@@ -72,5 +74,6 @@ pub(crate) use pool::{conn_ptr, encode_handle, free_connection, pool_capacity};
 pub(crate) use send::TCP_HDR_LEN;
 #[cfg(test)]
 pub(crate) use state::{
-    RTO_INITIAL_MS, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, TcpHeader,
+    FIN_RETX_MAX, RTO_INITIAL_MS, RTO_MAX_MS, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN,
+    TcpHeader,
 };

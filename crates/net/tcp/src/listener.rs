@@ -142,6 +142,10 @@ pub fn close(handle: *mut (), generation: u16) {
             );
             c.snd_nxt = c.snd_nxt.wrapping_add(1);
             c.state = TcpState::FinWait1;
+            // Arm the FIN-retransmit timer: a FIN lost on a lossy WAN
+            // is resent by `on_tcp_tick` rather than stranding the
+            // connection until the peer's keepalive fires.
+            c.arm_fin_timer(kernel_core::clock::now_ms());
         }
         TcpState::CloseWait => {
             send_segment(
@@ -157,7 +161,13 @@ pub fn close(handle: *mut (), generation: u16) {
                 },
                 &[],
             );
-            free_connection(core, slot);
+            // The FIN consumes one sequence number. Move to LastAck
+            // and wait for the peer to acknowledge it — freeing the
+            // slot here (the pre-WAN behaviour) dropped the connection
+            // before the ACK and lost the FIN-retransmit guarantee.
+            c.snd_nxt = c.snd_nxt.wrapping_add(1);
+            c.state = TcpState::LastAck;
+            c.arm_fin_timer(kernel_core::clock::now_ms());
         }
         _ => {
             free_connection(core, slot);

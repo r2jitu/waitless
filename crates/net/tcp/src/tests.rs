@@ -161,7 +161,7 @@ fn harness() -> std::sync::MutexGuard<'static, ()> {
         set_active_ops(&MOCK_OPS);
     });
     TX.lock().unwrap().clear();
-    // Hand every scenario a pristine connection pool — `on_rtx_tick`
+    // Hand every scenario a pristine connection pool — `on_tcp_tick`
     // walks the whole pool, so a leftover armed conn would pollute it.
     reset_pool();
     // Clear any egress drop policy so a loss armed by an earlier
@@ -186,7 +186,7 @@ fn clear_tx() {
 }
 
 /// Free every connection slot on core 0 so each scenario starts with a
-/// pristine pool. The retransmission tick (`on_rtx_tick`) and the
+/// pristine pool. The retransmission tick (`on_tcp_tick`) and the
 /// lifecycle tick walk the whole per-core pool, so a connection left
 /// armed by an earlier scenario would otherwise fire a timer into this
 /// scenario's `TX` capture — distinct 4-tuples isolate hash lookups
@@ -704,12 +704,12 @@ fn rto_retransmits_unacked_data_with_backoff() {
     // Before the RTO elapses the tick does nothing.
     clear_tx();
     kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 - 1);
-    super::on_rtx_tick();
+    super::on_tcp_tick();
     assert!(tx().is_empty(), "no retransmit before the RTO elapses");
 
     // Crossing the RTO retransmits the segment verbatim.
     kernel_core::clock::mock::advance(2);
-    super::on_rtx_tick();
+    super::on_tcp_tick();
     let rtx = tx();
     assert_eq!(rtx.len(), 1, "exactly one retransmit fires at the RTO");
     let r = tcp_hdr(&rtx[0]);
@@ -724,13 +724,13 @@ fn rto_retransmits_unacked_data_with_backoff() {
     // the first time — is now not enough for the second expiry.
     clear_tx();
     kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64);
-    super::on_rtx_tick();
+    super::on_tcp_tick();
     assert!(
         tx().is_empty(),
         "the backed-off (2x) RTO has not elapsed after only one RTO of wait",
     );
     kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64);
-    super::on_rtx_tick();
+    super::on_tcp_tick();
     assert_eq!(
         tx().len(),
         1,
@@ -771,7 +771,7 @@ fn ack_stops_the_retransmission_timer() {
     // tick produces nothing.
     clear_tx();
     kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 * 4);
-    super::on_rtx_tick();
+    super::on_tcp_tick();
     assert!(
         tx().is_empty(),
         "fully-acknowledged data is never retransmitted",
@@ -850,13 +850,241 @@ fn egress_drop_fixture_loses_a_segment_then_rto_recovers_it() {
     // the retransmit ring. Crossing the RTO retransmits them, and the
     // fixture (next-1 exhausted) now lets the frame through.
     kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 + 1);
-    super::on_rtx_tick();
+    super::on_tcp_tick();
     let rtx = tx();
     assert_eq!(rtx.len(), 1, "the RTO retransmit recovers the lost segment");
     assert_eq!(
         &rtx[0][34 + TCP_HDR_LEN..],
         body,
         "the recovered segment carries the original payload",
+    );
+}
+
+// ---- connection-lifecycle corners — LastAck / FIN retransmit ----------
+
+/// Passive close: a peer FIN moves the connection to `CloseWait`; the
+/// app's `close()` must then send its own FIN and wait in `LastAck`
+/// for the acknowledgement — not free the slot immediately (the
+/// pre-WAN behaviour, which lost the FIN-retransmit guarantee).
+#[test]
+fn closewait_close_enters_lastack() {
+    let _g = harness();
+    const SP: u16 = 9112;
+    const CP: u16 = 50112;
+    const CLIENT_ISN: u32 = 0xC000;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+    // The peer half-closes — Established → CloseWait.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_FIN | TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert_eq!(
+        conn_state(CP, SP),
+        Some(TcpState::CloseWait),
+        "a peer FIN moves the connection to CloseWait",
+    );
+
+    // The app closes — we send our FIN and wait in LastAck.
+    let (handle, generation) = conn_handle(CP, SP);
+    clear_tx();
+    super::close(handle, generation);
+    let frames = tx();
+    assert_eq!(frames.len(), 1, "close() in CloseWait sends exactly one FIN");
+    assert_eq!(
+        tcp_hdr(&frames[0]).flags,
+        TCP_FIN | TCP_ACK,
+        "the close segment is FIN|ACK",
+    );
+    assert_eq!(
+        conn_state(CP, SP),
+        Some(TcpState::LastAck),
+        "close() in CloseWait waits for the ACK in LastAck — it does not free the slot",
+    );
+}
+
+/// `LastAck` completes only when the peer acknowledges our FIN: the
+/// slot is freed and a follow-up segment finds no TCB.
+#[test]
+fn lastack_ack_frees_the_conn() {
+    let _g = harness();
+    const SP: u16 = 9113;
+    const CP: u16 = 50113;
+    const CLIENT_ISN: u32 = 0xC100;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_FIN | TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    let (handle, generation) = conn_handle(CP, SP);
+    super::close(handle, generation);
+    assert_eq!(conn_state(CP, SP), Some(TcpState::LastAck));
+
+    // The peer ACKs our FIN. Our FIN occupied seq `server_isn + 1`
+    // (the handshake left `snd_nxt` there); `close()` advanced
+    // `snd_nxt` to `server_isn + 2`, which is the `ack` we expect.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(2),
+        ack: server_isn.wrapping_add(2),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert_eq!(
+        conn_state(CP, SP),
+        None,
+        "the ACK of our FIN frees the LastAck slot",
+    );
+}
+
+/// A `LastAck` FIN lost on the wire is retransmitted once the RTO
+/// elapses — without it a single dropped FIN strands the connection
+/// until the peer's keepalive fires.
+#[test]
+fn lastack_retransmits_lost_fin() {
+    let _g = harness();
+    const SP: u16 = 9114;
+    const CP: u16 = 50114;
+    const CLIENT_ISN: u32 = 0xC200;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_FIN | TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+
+    let (handle, generation) = conn_handle(CP, SP);
+    clear_tx();
+    // The wire loses our FIN.
+    drop_next_egress(1);
+    super::close(handle, generation);
+    assert!(tx().is_empty(), "the FIN was dropped by the fixture");
+    assert_eq!(egress_drops(), 1);
+    assert_eq!(conn_state(CP, SP), Some(TcpState::LastAck));
+
+    // No retransmit before the RTO elapses.
+    kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 - 1);
+    super::on_tcp_tick();
+    assert!(tx().is_empty(), "no FIN retransmit before the RTO elapses");
+
+    // Crossing the RTO retransmits the FIN.
+    kernel_core::clock::mock::advance(2);
+    super::on_tcp_tick();
+    let rtx = tx();
+    assert_eq!(rtx.len(), 1, "the FIN is retransmitted at the RTO");
+    let h = tcp_hdr(&rtx[0]);
+    assert_eq!(h.flags, TCP_FIN | TCP_ACK, "the retransmit is FIN|ACK");
+    assert_eq!(
+        h.seq,
+        server_isn.wrapping_add(1),
+        "the FIN retransmit re-sends from the FIN's sequence number",
+    );
+    assert_eq!(
+        conn_state(CP, SP),
+        Some(TcpState::LastAck),
+        "the connection still awaits the ACK",
+    );
+}
+
+/// A `LastAck` connection whose FIN is never acknowledged is forced
+/// shut after `FIN_RETX_MAX` retransmissions — a dead peer must not
+/// leak the half-closed slot forever.
+#[test]
+fn lastack_gives_up_after_bounded_retries() {
+    let _g = harness();
+    const SP: u16 = 9115;
+    const CP: u16 = 50115;
+    const CLIENT_ISN: u32 = 0xC300;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_FIN | TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+
+    let (handle, generation) = conn_handle(CP, SP);
+    clear_tx();
+    // Every FIN — the initial one and every retransmit — is lost.
+    drop_egress_where(|_| true);
+    super::close(handle, generation);
+    assert_eq!(conn_state(CP, SP), Some(TcpState::LastAck));
+
+    // Tick past each backed-off deadline. The backoff caps at
+    // `RTO_MAX_MS`, so advancing past it crosses every interval.
+    for _ in 0..=FIN_RETX_MAX {
+        kernel_core::clock::mock::advance(RTO_MAX_MS as u64 + 1);
+        super::on_tcp_tick();
+    }
+    assert_eq!(
+        conn_state(CP, SP),
+        None,
+        "the connection is freed after FIN_RETX_MAX unacknowledged retransmits",
+    );
+    assert_eq!(
+        egress_drops(),
+        FIN_RETX_MAX as u32 + 1,
+        "the initial FIN plus FIN_RETX_MAX retransmits were all sent (and lost)",
+    );
+}
+
+/// Active close: an app `close()` on an Established connection sends a
+/// FIN and enters `FinWait1`. A FIN lost there is retransmitted at the
+/// RTO, the same mechanism as the passive-close `LastAck` path.
+#[test]
+fn finwait1_retransmits_lost_fin() {
+    let _g = harness();
+    const SP: u16 = 9116;
+    const CP: u16 = 50116;
+    const CLIENT_ISN: u32 = 0xC400;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+    let (handle, generation) = conn_handle(CP, SP);
+    clear_tx();
+    drop_next_egress(1);
+    super::close(handle, generation);
+    assert!(tx().is_empty(), "the FIN was dropped by the fixture");
+    assert_eq!(
+        conn_state(CP, SP),
+        Some(TcpState::FinWait1),
+        "active close enters FinWait1",
+    );
+
+    kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 + 1);
+    super::on_tcp_tick();
+    let rtx = tx();
+    assert_eq!(rtx.len(), 1, "the FIN is retransmitted at the RTO");
+    let h = tcp_hdr(&rtx[0]);
+    assert_eq!(h.flags, TCP_FIN | TCP_ACK, "the retransmit is FIN|ACK");
+    assert_eq!(
+        h.seq,
+        server_isn.wrapping_add(1),
+        "the FIN retransmit re-sends from the FIN's sequence number",
     );
 }
 
@@ -878,6 +1106,27 @@ fn conn_handle(client_port: u16, server_port: u16) -> (*mut (), u16) {
         }
     }
     panic!("no live connection for ports {client_port} -> {server_port}");
+}
+
+/// The `TcpState` of the live connection for a client/server port
+/// pair, or `None` if the slot has been freed. Lets a scenario assert
+/// on state-machine transitions (CloseWait, LastAck, …) and on
+/// teardown.
+fn conn_state(client_port: u16, server_port: u16) -> Option<TcpState> {
+    let core = 0u32;
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        // SAFETY: single worker, test-serialised by `TEST_LOCK`.
+        let c = unsafe { &*conn_ptr(core, i) };
+        if c.state != TcpState::Closed
+            && c.state != TcpState::Listen
+            && c.local_port == server_port
+            && c.remote_port == client_port
+        {
+            return Some(c.state);
+        }
+    }
+    None
 }
 
 /// Drive a full three-way handshake on `(server_port, client_port)`

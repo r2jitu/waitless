@@ -153,7 +153,7 @@ optional feature.
 ### RFC 6298 — retransmission timeout
 
 - **Have**: the full mechanism. A per-conn retransmit ring holds the
-  unacked window; an RTO timer (`on_rtx_tick`, driven by the net poll
+  unacked window; an RTO timer (`on_tcp_tick`, driven by the net poll
   loop, with an event-loop idle hook so an idle core does not strand
   it) retransmits the oldest unacked segment and backs the RTO off
   exponentially (§5.5); the SRTT/RTTVAR estimator (§2.2/§2.3) makes
