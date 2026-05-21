@@ -49,12 +49,9 @@ rust_library(
         # depend back on `//kernel`.
         "//crates/net:types",
         "//crates/kernel/core",
-        "//crates/util/iobuf",
         "//crates/runtime/executor",
         "//crates/runtime/worker",
         "//crates/runtime/platform",
-        "//crates/util/atomic-fn",
-        "//crates/util/tagged-treiber",
         "@crates//:getrandom",
         "@crates//:sha2",
         "@crates//:talc",
