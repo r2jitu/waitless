@@ -19,8 +19,6 @@
 //   Reserved frame types (h3 grease + h2 frame-type clash range)
 //   — we skip-by-length on receive.
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 
 // Re-use the QUIC varint codec from //crates/proto/quic — H3 frames use the

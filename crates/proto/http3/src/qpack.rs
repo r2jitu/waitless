@@ -19,8 +19,6 @@
 // Decode supports H=1 (Huffman) for both names and values (curl
 // uses Huffman). Encode never sets H; emits raw octets.
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 
 use crate::huffman;

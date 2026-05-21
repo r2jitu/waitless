@@ -17,8 +17,6 @@
 // Sans-allocation hot path: each request reuses `Request` /
 // `BufWriter`-style scratch buffers from the conn handler.
 
-#![allow(dead_code)]
-
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -31,9 +29,6 @@ use crate::qpack::{self, FieldSink};
 
 /// Stream-type byte for HTTP/3 control streams (RFC 9114 §6.2.1).
 const STREAM_TYPE_CONTROL: u64 = 0x00;
-const STREAM_TYPE_PUSH: u64 = 0x01;
-const STREAM_TYPE_QPACK_ENCODER: u64 = 0x02;
-const STREAM_TYPE_QPACK_DECODER: u64 = 0x03;
 
 #[derive(Debug)]
 pub enum ListenError {

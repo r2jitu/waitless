@@ -17,8 +17,6 @@
 // either at the root (clean boundary) OR we're descending only
 // 1-bits since the last leaf (legal padding).
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

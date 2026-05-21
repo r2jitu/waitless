@@ -15,8 +15,6 @@
 // in field-line representations, which is fine — our encoder uses
 // the smallest legal form for each.
 
-#![allow(dead_code)]
-
 /// One static-table entry. References borrow from `'static`
 /// arrays in the binary, so lookups are zero-allocation.
 pub struct Entry {
