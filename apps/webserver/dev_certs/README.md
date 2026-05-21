@@ -27,8 +27,8 @@ the host.
   `ERR_SSL_PROTOCOL_ERROR`. macOS's bundled LibreSSL also refuses
   Ed25519 signature verification. ECDSA P-256 is the first scheme in
   every modern client's preference list and works everywhere.
-- Subject: `CN=unikernel.local, O=UniKernel Dev, OU=Development Only`
-- SAN: `DNS:unikernel.local, DNS:localhost, IP:127.0.0.1, IP:10.0.2.15`
+- Subject: `CN=waitless.local, O=Waitless Dev, OU=Development Only`
+- SAN: `DNS:waitless.local, DNS:localhost, IP:127.0.0.1, IP:10.0.2.15`
   covers the hostnames used by the `bazel run` HVF / QEMU user-mode
   networking paths, and the default HVF userspace-proxy IP.
 - Validity: **10 years** from the day the cert was generated. We'll
@@ -45,8 +45,8 @@ openssl genpkey -algorithm EC \
     -pkeyopt ec_param_enc:named_curve \
     -out dev_key.pem
 openssl req -new -x509 -key dev_key.pem -out dev_cert.pem -days 3650 \
-    -subj "/CN=unikernel.local/O=UniKernel Dev/OU=Development Only" \
-    -addext "subjectAltName=DNS:unikernel.local,DNS:localhost,IP:127.0.0.1,IP:10.0.2.15" \
+    -subj "/CN=waitless.local/O=Waitless Dev/OU=Development Only" \
+    -addext "subjectAltName=DNS:waitless.local,DNS:localhost,IP:127.0.0.1,IP:10.0.2.15" \
     -sha256
 openssl pkey  -in dev_key.pem  -outform DER -out dev_key.der
 openssl x509  -in dev_cert.pem -outform DER -out dev_cert.der
@@ -103,5 +103,5 @@ curl --cacert apps/webserver/dev_certs/dev_cert.pem https://localhost:8443/healt
 
 # raw TLS 1.3 handshake + cipher / group dump
 openssl s_client -connect localhost:8443 -tls1_3 \
-    -CAfile apps/webserver/dev_certs/dev_cert.pem -servername unikernel.local
+    -CAfile apps/webserver/dev_certs/dev_cert.pem -servername waitless.local
 ```

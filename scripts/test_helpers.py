@@ -335,7 +335,7 @@ def https_get(
     host: str = "127.0.0.1",
     port: int,
     ca_file: Optional[Path] = None,
-    sni: str = "unikernel.local",
+    sni: str = "waitless.local",
     timeout: float = 5.0,
 ) -> tuple[int, bytes]:
     if ca_file is not None:
@@ -356,7 +356,7 @@ def https_session_resume_check(
     host: str = "127.0.0.1",
     port: int,
     ca_file: Optional[Path] = None,
-    sni: str = "unikernel.local",
+    sni: str = "waitless.local",
     timeout: float = 5.0,
 ) -> tuple[bool, bool]:
     """Open two TLS connections back-to-back to `host:port`, sharing

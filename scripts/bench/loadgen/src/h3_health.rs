@@ -187,7 +187,7 @@ pub async fn run(
             // any string works.
             let conn = match timeout(
                 PER_OP_TIMEOUT,
-                quinn_ep.connect(server_addr, "unikernel.local").unwrap(),
+                quinn_ep.connect(server_addr, "waitless.local").unwrap(),
             )
             .await
             {

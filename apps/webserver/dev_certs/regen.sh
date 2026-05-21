@@ -25,8 +25,8 @@ cd "$(dirname "$0")"
 
 # 10-year validity so CI doesn't break on expiry.
 DAYS=3650
-SUBJECT="/CN=unikernel.local/O=UniKernel Dev/OU=Development Only"
-SAN="subjectAltName=DNS:unikernel.local,DNS:localhost,IP:127.0.0.1,IP:10.0.2.15"
+SUBJECT="/CN=waitless.local/O=Waitless Dev/OU=Development Only"
+SAN="subjectAltName=DNS:waitless.local,DNS:localhost,IP:127.0.0.1,IP:10.0.2.15"
 
 echo "==> Generating ECDSA P-256 private key..."
 openssl genpkey -algorithm EC \

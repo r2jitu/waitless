@@ -43,7 +43,7 @@ fi
 # Same SAN list as regen.sh, plus `[::1]` so the v6 reachability tests
 # (`test_http_health_v6` etc.) work against an mkcert-issued cert too.
 SANS=(
-    unikernel.local
+    waitless.local
     localhost
     127.0.0.1
     ::1

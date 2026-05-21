@@ -338,7 +338,7 @@ how the keys flow.</p>\
 exposed at <a href=\"/tls_profile\"><code>/tls_profile</code></a> as plain \
 text. <code>/tls_profile_reset</code> clears the running average.</p>\
 <div class=\"note\">The dev cert is a self-signed ECDSA P-256 with \
-SAN <code>localhost / 127.0.0.1 / ::1 / unikernel.local</code>. \
+SAN <code>localhost / 127.0.0.1 / ::1 / waitless.local</code>. \
 For a Chrome-trusted local cert run \
 <code>apps/webserver/dev_certs/regen-mkcert.sh</code> after \
 <code>mkcert -install</code>.</div>";

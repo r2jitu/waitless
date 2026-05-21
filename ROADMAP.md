@@ -946,7 +946,7 @@ refuse it for server auth — see commit `6cc283a`).
 - [x] **Pre-generated dev cert**:
       `apps/webserver/dev_certs/dev_cert.{der,pem}` +
       `dev_key.{der,pem}` (ECDSA P-256 + SHA-256, 10y validity,
-      SAN covers `unikernel.local` / `localhost` / `127.0.0.1` /
+      SAN covers `waitless.local` / `localhost` / `127.0.0.1` /
       `10.0.2.15`). DER for `include_bytes!()`, PEM for host-side
       `curl --cacert` / `openssl s_client`. Regen via
       `dev_certs/regen.sh`.
@@ -1161,7 +1161,7 @@ The trade-off is surface area. Scope discipline is critical:
 - [ ] **`//uni:http3`** — HTTP/3 over QUIC streams
       (HEADERS + DATA frames, static QPACK table only).
 - [ ] **External-client interop**: `curl --http3 --cacert
-      dev_cert.pem https://unikernel.local:8443/health`
+      dev_cert.pem https://waitless.local:8443/health`
       succeeds. Acceptance test for "QUIC works."
 
 **Fallback**: if the own-QUIC implementation stalls (complexity or

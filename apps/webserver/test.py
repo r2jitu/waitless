@@ -224,7 +224,7 @@ class WebserverServiceTest(unittest.TestCase):
         ctx.set_alpn_protocols(["h2", "http/1.1"])
         sock = socket.create_connection(("127.0.0.1", TLS_PORT), timeout=5.0)
         try:
-            with ctx.wrap_socket(sock, server_hostname="unikernel.local") as ssock:
+            with ctx.wrap_socket(sock, server_hostname="waitless.local") as ssock:
                 self.assertEqual(
                     ssock.selected_alpn_protocol(),
                     "http/1.1",
@@ -400,7 +400,7 @@ class WebserverServiceTest(unittest.TestCase):
         self.assertEqual(status, 200)
 
     def test_https_health_v6(self) -> None:
-        # Dev cert's SANs only cover 127.0.0.1 / localhost / unikernel.local,
+        # Dev cert's SANs only cover 127.0.0.1 / localhost / waitless.local,
         # so a verified handshake to `[::1]` would fail Python's IP-SAN
         # check. Pass `ca_file=None` to exercise just the TLS-over-IPv6
         # transport — the verified-cert path is already covered by

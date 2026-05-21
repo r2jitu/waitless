@@ -255,7 +255,7 @@ def _tls_handshake_worker(args):
             # it here matches the server-side fix in
             # `uni/native.rs::tcp_accept`.
             s.setsockopt(sock_mod.IPPROTO_TCP, sock_mod.TCP_NODELAY, 1)
-            ssock = ctx.wrap_socket(s, server_hostname="unikernel.local")
+            ssock = ctx.wrap_socket(s, server_hostname="waitless.local")
             ssock.send(request)
             resp = b""
             while b"\r\n\r\n" not in resp and len(resp) < 4096:
