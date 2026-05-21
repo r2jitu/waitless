@@ -16,10 +16,10 @@ pub use nic_api::NicError;
 mod error;
 pub use error::{DhcpError, NetError};
 
-// uni_net_stack is the bare-metal net implementation. We depend
+// net_stack is the bare-metal net implementation. We depend
 // on it for our own use (`Net::enable` below calls into
-// `uni_net_stack::{bringup_dhcp, bringup_static}`) but DON'T
-// re-export `uni_net_stack::*`. A glob re-export used to leak the
+// `net_stack::{bringup_dhcp, bringup_static}`) but DON'T
+// re-export `net_stack::*`. A glob re-export used to leak the
 // umbrella's internal lifecycle entry points (`init_stack`,
 // `ipv6_nd::init`, `net_receive`, `poll`) into `uni::net::*`, where
 // no app should reach them. Apps that want raw protocol-layer access
@@ -198,7 +198,7 @@ impl Net {
     pub fn local_ip(&self) -> Ipv4Addr {
         #[cfg(target_os = "none")]
         {
-            let o = uni_net_stack::types::CONFIG.ip().octets();
+            let o = net_stack::types::CONFIG.ip().octets();
             Ipv4Addr(o)
         }
         #[cfg(not(target_os = "none"))]
@@ -219,7 +219,7 @@ impl Net {
     pub fn gateway(&self) -> Ipv4Addr {
         #[cfg(target_os = "none")]
         {
-            let o = uni_net_stack::types::CONFIG.gateway().octets();
+            let o = net_stack::types::CONFIG.gateway().octets();
             Ipv4Addr(o)
         }
         #[cfg(not(target_os = "none"))]
@@ -253,7 +253,7 @@ pub fn clear_on_shutdown() {
 async fn bringup(cfg: NetBringUp) -> Result<(), NetError> {
     match cfg {
         NetBringUp::Dhcp => {
-            if uni_net_stack::bringup_dhcp().await {
+            if net_stack::bringup_dhcp().await {
                 Ok(())
             } else {
                 // No implicit static fallback — surfacing the
@@ -267,7 +267,7 @@ async fn bringup(cfg: NetBringUp) -> Result<(), NetError> {
             gateway,
             netmask,
         } => {
-            uni_net_stack::bringup_static(
+            net_stack::bringup_static(
                 to_net_ipv4(ip),
                 to_net_ipv4(gateway),
                 to_net_ipv4(netmask),
@@ -291,7 +291,7 @@ async fn bringup(_cfg: NetBringUp) -> Result<(), NetError> {
 /// standalone helper rather than a `From` impl so we don't need a
 /// cross-crate orphan dance.
 #[cfg(target_os = "none")]
-fn to_net_ipv4(a: Ipv4Addr) -> uni_net_stack::types::Ipv4Addr {
+fn to_net_ipv4(a: Ipv4Addr) -> net_stack::types::Ipv4Addr {
     let [o0, o1, o2, o3] = a.0;
-    uni_net_stack::types::Ipv4Addr::from(o0, o1, o2, o3)
+    net_stack::types::Ipv4Addr::from(o0, o1, o2, o3)
 }

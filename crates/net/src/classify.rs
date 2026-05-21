@@ -7,7 +7,7 @@
 // net_types) — no driver, no kernel — so the verdict logic and the
 // flow hash are host-unit-testable.
 //
-// `uni_net_stack`'s `rx` module is the thin os:none shell around
+// `net_stack`'s `rx` module is the thin os:none shell around
 // this: it supplies the IPv6 dst-address accept-list (a closure,
 // called only for v6 frames) and then `deliver`s the verdict to the
 // transport stack.
@@ -148,7 +148,7 @@ fn summarize_ipv6(eth: EthFrame<'_>, accept_v6: impl Fn(&Ipv6Addr) -> bool) -> O
 /// Map a Tier-2 TCP/UDP flow to its owning core. A pure function of
 /// the 4-tuple, so every segment of a flow lands on the same core
 /// and the per-core TCP connection pool stays consistent. Called by
-/// the Tier-2 distributor (`uni_net_stack`'s `distribute_frame`);
+/// the Tier-2 distributor (`net_stack`'s `distribute_frame`);
 /// Tier 1 leaves distribution to the NIC's hardware RSS.
 pub fn owner(parsed: &ParsedL3, frame: &[u8], num_cores: u32) -> u32 {
     // L4 ports are the first 4 bytes of the segment `classify` located.

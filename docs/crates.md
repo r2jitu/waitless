@@ -59,7 +59,7 @@ to live alongside the real apps under `apps/`.)
    `gve`). Qualify with one domain word only when the bare name would
    shadow `std`/`core` or collide with a common external crate. Current
    qualified names: `net_types`, `net_checksum`, `net_from_bytes`,
-   `net_classify`, `kernel_core`, `uni_net_stack`. The uni facade
+   `net_classify`, `kernel_core`, `net_stack`. The uni facade
    family keeps the `uni_` prefix as a meaningful "satellite of uni"
    marker: `uni`, `uni_macros`, `uni_net`. Two further carve-outs
    for external/internal collisions: `uni_aes_gcm` (RustCrypto's
@@ -163,7 +163,7 @@ external `@crates//:...` deps are omitted for readability.
 
 | Crate | Deps |
 | --- | --- |
-| `uni_net_stack` | `arp`, `net_classify`, `dhcp`, `ethernet`, `ethernet_send`, `icmpv6`, `ipv4`, `ipv6`, `ipv6_send`, `ndp`, `tcp`, `net_types`, `udp`, `nic`, `kernel_bare`, `iobuf`, `executor` |
+| `net_stack` | `arp`, `net_classify`, `dhcp`, `ethernet`, `ethernet_send`, `icmpv6`, `ipv4`, `ipv6`, `ipv6_send`, `ndp`, `tcp`, `net_types`, `udp`, `nic`, `kernel_bare`, `iobuf`, `executor` |
 | `gve` | `bus`, `kernel_bare`, `iobuf`, `nic_api` |
 | `virtio_net` | `bus`, `kernel_bare`, `net_checksum`, `iobuf`, `nic_api` |
 
@@ -171,20 +171,20 @@ external `@crates//:...` deps are omitted for readability.
 
 | Crate | Deps |
 | --- | --- |
-| `uni_net` (`uni/net`) | `nic_api`; on `os:none` also `uni_net_stack`. Defines `NetError`/`DhcpError` here (the facade-level errors); `NicError` re-exported from `nic_api`. |
+| `uni_net` (`uni/net`) | `nic_api`; on `os:none` also `net_stack`. Defines `NetError`/`DhcpError` here (the facade-level errors); `NicError` re-exported from `nic_api`. |
 | `uni_macros` | proc-macro; no runtime deps |
 
 ### Tier 8 — facade backend
 
 | Crate | Deps |
 | --- | --- |
-| `backend` (`uni/backend`) | `iobuf`, `worker`, `platform`, `executor`, `nic_api`; on `os:none` also `nic`, `kernel_bare`, `uni_net_stack`, `tcp`, `gve` |
+| `uni_backend` (`uni/backend`) | `iobuf`, `worker`, `platform`, `executor`, `nic_api`; on `os:none` also `nic`, `kernel_bare`, `net_stack`, `tcp`, `gve` |
 
 ### Tier 9 — facade
 
 | Crate | Deps |
 | --- | --- |
-| `uni` | `backend`, `uni_net`, `executor`, `worker`; on `os:none` also `kernel_bare`; proc-macro `uni_macros` |
+| `uni` | `uni_backend`, `uni_net`, `executor`, `worker`; on `os:none` also `kernel_bare`; proc-macro `uni_macros` |
 
 ### Tiers 10–13 — userspace network protocols
 
@@ -246,11 +246,11 @@ consumers write `kernel_bare::percpu::...` and don't see the split.
           └──────────┘    └──────────┘    └──────────┘   ACTIVE_OPS at boot
                 ▲
                 │
-       (called by uni_net_stack, tcp, udp, arp, ethernet_send, …)
+       (called by net_stack, tcp, udp, arp, ethernet_send, …)
 ```
 
 The split exists so the TX-side network crates (`tcp`, `udp`, `arp`,
-`ethernet_send`, `uni_net_stack`) can call `nic::send(...)` without
+`ethernet_send`, `net_stack`) can call `nic::send(...)` without
 depending on the `os:none` driver implementations. They link against
 `nic` (dispatch shim) and `nic_api` (trait), both
 host-buildable.

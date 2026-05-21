@@ -14,7 +14,7 @@ rust_library(
         "src/rx.rs",
         "src/sched.rs",
     ],
-    crate_name = "uni_net_stack",
+    crate_name = "net_stack",
     crate_root = "src/lib.rs",
     deps = [
         "//crates/drivers/nic",

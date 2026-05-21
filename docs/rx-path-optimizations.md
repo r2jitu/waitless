@@ -2135,7 +2135,7 @@ req/s — positive scaling, p50 122–223 µs, confirming the rewrite is
 perf-neutral on real Tier-2 hardware.
 
 The `classify` verdict has no host-native unit test: `classify`
-lives in `uni_net_stack`, whose `os:none` dep chain (`//kernel`)
+lives in `net_stack`, whose `os:none` dep chain (`//kernel`)
 blocks a `rust_test` — the same blocker recorded for item M's
 `tcp_receive` test and the "Test & bench infrastructure" follow-up.
 IPv6 Tier-2 correctness rests on `ipv6_receive` being host-tested

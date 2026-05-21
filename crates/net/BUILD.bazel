@@ -302,8 +302,8 @@ rust_test(
 
 # RX classify stage + Tier-2 flow distribution. Pure leaf — depends
 # only on the wire-format leaves — so the classify verdict logic and
-# the flow hash are host-unit-testable. `uni_net_stack`'s `rx` module
-# is the os:none shell that supplies the IPv6 accept-list + delivers.
+# the flow hash are host-unit-testable. `net_stack`'s `rx` module is
+# the os:none shell that supplies the IPv6 accept-list + delivers.
 rust_library(
     name = "classify",
     srcs = ["src/classify.rs"],
