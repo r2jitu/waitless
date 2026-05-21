@@ -169,6 +169,12 @@ pub(crate) const RTX_MAX_RETRIES: u8 = 8;
 /// with exponential backoff off the RTO estimate (~63 s total at the
 /// 1 s initial RTO) before teardown.
 pub(crate) const FIN_RETX_MAX: u8 = 5;
+/// `TimeWait` hold time: 2×MSL (RFC 9293 §3.10.7.4) with MSL taken as
+/// 30 s. After an active close completes the TCB lingers here so a
+/// delayed duplicate from the old 4-tuple cannot be delivered into a
+/// new connection that reuses the ports, and so a retransmitted peer
+/// FIN still finds a TCB to re-acknowledge.
+pub(crate) const TIME_WAIT_MS: u64 = 60_000;
 
 /// Active `TcpRecv` future's destination buffer. The future
 /// registers this pointer + capacity when it parks, so a subsequent
@@ -803,6 +809,14 @@ impl TcpConnection {
         );
         self.fin_retx_count = self.fin_retx_count.saturating_add(1);
         self.arm_fin_timer(now);
+    }
+
+    /// Arm the `TimeWait` 2×MSL drop timer — `on_tcp_tick` frees the
+    /// connection once this deadline passes. Reuses the lifecycle
+    /// deadline field; in `TimeWait` the tick reads it as a drop
+    /// deadline rather than a FIN-retransmit deadline.
+    pub(crate) fn arm_time_wait(&mut self, now: u64) {
+        self.lifecycle_deadline_ms = now + TIME_WAIT_MS;
     }
 }
 

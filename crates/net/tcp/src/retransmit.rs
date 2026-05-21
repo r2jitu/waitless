@@ -1,9 +1,9 @@
 // Per-core TCP timer tick. Walks every connection on the current core
 // and services the per-conn timers: RFC 6298 data retransmission, and
 // the connection-lifecycle timers (the FIN retransmit in `FinWait1` /
-// `LastAck`). The per-conn estimator, retransmit ring, and
-// lifecycle-timer methods live on `TcpConnection` (see `state.rs`);
-// this module just drives the per-core poll cadence.
+// `LastAck`, and the `TimeWait` 2×MSL drop). The per-conn estimator,
+// retransmit ring, and lifecycle-timer methods live on `TcpConnection`
+// (see `state.rs`); this module just drives the per-core poll cadence.
 
 use crate::pool::{conn_ptr, free_connection, pool_capacity};
 use crate::state::{FIN_RETX_MAX, RTX_MAX_RETRIES, TcpState};
@@ -20,6 +20,8 @@ use crate::state::{FIN_RETX_MAX, RTX_MAX_RETRIES, TcpState};
 ///     (passive close) connection whose FIN went unacknowledged gets
 ///     it retransmitted with exponential backoff, or is forced shut
 ///     after `FIN_RETX_MAX` attempts.
+///   * `TimeWait` expiry — a connection that completed its active
+///     close is freed once the 2×MSL hold has elapsed.
 pub fn on_tcp_tick() {
     let core = kernel_core::cpu_id();
     let now = kernel_core::clock::now_ms();
@@ -37,7 +39,8 @@ pub fn on_tcp_tick() {
             c.retransmit_oldest(now);
         }
 
-        // Connection-lifecycle timers — the FIN retransmit.
+        // Connection-lifecycle timers — the FIN retransmit and the
+        // TimeWait 2×MSL drop.
         if c.lifecycle_deadline_ms != 0 && now >= c.lifecycle_deadline_ms {
             match c.state {
                 TcpState::FinWait1 | TcpState::LastAck => {
@@ -48,6 +51,11 @@ pub fn on_tcp_tick() {
                     } else {
                         c.retransmit_fin(now);
                     }
+                }
+                TcpState::TimeWait => {
+                    // 2×MSL elapsed — the window for a delayed
+                    // duplicate or a retransmitted peer FIN is over.
+                    free_connection(core, i);
                 }
                 // A lifecycle deadline armed on a state that no longer
                 // owns one — disarm defensively.

@@ -1088,6 +1088,184 @@ fn finwait1_retransmits_lost_fin() {
     );
 }
 
+// ---- connection-lifecycle corners — TimeWait / 2×MSL ------------------
+
+/// Active close completed by the peer: the server's `close()` enters
+/// `FinWait1`, the peer's ACK moves it to `FinWait2`, and the peer's
+/// FIN must then enter `TimeWait` — holding the TCB, not freeing it.
+#[test]
+fn finwait2_peer_fin_enters_timewait() {
+    let _g = harness();
+    const SP: u16 = 9117;
+    const CP: u16 = 50117;
+    const CLIENT_ISN: u32 = 0xC500;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+    let (handle, generation) = conn_handle(CP, SP);
+    super::close(handle, generation);
+    assert_eq!(conn_state(CP, SP), Some(TcpState::FinWait1));
+
+    // Peer ACKs our FIN → FinWait2.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(2),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert_eq!(conn_state(CP, SP), Some(TcpState::FinWait2));
+
+    // Peer FIN → TimeWait, and the FIN is acknowledged.
+    clear_tx();
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(2),
+        flags: TCP_FIN | TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    let frames = tx();
+    assert!(!frames.is_empty(), "the peer FIN must elicit an ACK");
+    let h = tcp_hdr(frames.last().unwrap());
+    assert_ne!(h.flags & TCP_ACK, 0, "the reply carries ACK");
+    assert_eq!(
+        h.ack,
+        CLIENT_ISN.wrapping_add(2),
+        "the ACK covers the peer's FIN",
+    );
+    assert_eq!(
+        conn_state(CP, SP),
+        Some(TcpState::TimeWait),
+        "FinWait2 + peer FIN enters TimeWait — the slot is held, not freed",
+    );
+}
+
+/// Simultaneous close: a peer FIN that arrives in `FinWait1` without
+/// acknowledging our FIN shortcuts straight to `TimeWait` (the stack
+/// has no separate `Closing` state).
+#[test]
+fn finwait1_simultaneous_close_enters_timewait() {
+    let _g = harness();
+    const SP: u16 = 9120;
+    const CP: u16 = 50120;
+    const CLIENT_ISN: u32 = 0xC800;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+    let (handle, generation) = conn_handle(CP, SP);
+    super::close(handle, generation);
+    assert_eq!(conn_state(CP, SP), Some(TcpState::FinWait1));
+
+    // Peer FIN whose `ack` does NOT cover our FIN — the conn is still
+    // in FinWait1 when the FIN handler runs.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_FIN | TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert_eq!(
+        conn_state(CP, SP),
+        Some(TcpState::TimeWait),
+        "FinWait1 + a peer FIN that doesn't ack our FIN shortcuts to TimeWait",
+    );
+}
+
+/// A `TimeWait` connection is freed once the 2×MSL hold elapses —
+/// not before.
+#[test]
+fn timewait_drops_after_2msl() {
+    let _g = harness();
+    const SP: u16 = 9118;
+    const CP: u16 = 50118;
+    const CLIENT_ISN: u32 = 0xC600;
+    super::listen_on_core(0, SP);
+    enter_timewait(SP, CP, CLIENT_ISN);
+    assert_eq!(conn_state(CP, SP), Some(TcpState::TimeWait));
+
+    // Before 2×MSL the tick leaves it alone.
+    kernel_core::clock::mock::advance(TIME_WAIT_MS - 1);
+    super::on_tcp_tick();
+    assert_eq!(
+        conn_state(CP, SP),
+        Some(TcpState::TimeWait),
+        "TimeWait holds the TCB until 2×MSL elapses",
+    );
+
+    // Crossing 2×MSL frees it.
+    kernel_core::clock::mock::advance(2);
+    super::on_tcp_tick();
+    assert_eq!(
+        conn_state(CP, SP),
+        None,
+        "the TimeWait slot is freed once 2×MSL has elapsed",
+    );
+}
+
+/// A retransmitted peer FIN arriving in `TimeWait` (its ACK was lost)
+/// is re-acknowledged without advancing state, and restarts the
+/// 2×MSL timer so the connection outlives the original deadline.
+#[test]
+fn timewait_absorbs_retransmitted_fin() {
+    let _g = harness();
+    const SP: u16 = 9119;
+    const CP: u16 = 50119;
+    const CLIENT_ISN: u32 = 0xC700;
+    super::listen_on_core(0, SP);
+    let server_isn = enter_timewait(SP, CP, CLIENT_ISN);
+    assert_eq!(conn_state(CP, SP), Some(TcpState::TimeWait));
+
+    // Advance to just shy of the original 2×MSL deadline, then the
+    // peer retransmits its FIN.
+    kernel_core::clock::mock::advance(TIME_WAIT_MS - 100);
+    clear_tx();
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(2),
+        flags: TCP_FIN | TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    let frames = tx();
+    assert_eq!(
+        frames.len(),
+        1,
+        "a retransmitted FIN in TimeWait elicits exactly one ACK",
+    );
+    let h = tcp_hdr(&frames[0]);
+    assert_ne!(h.flags & TCP_ACK, 0, "the reply carries ACK");
+    assert_eq!(
+        h.ack,
+        CLIENT_ISN.wrapping_add(2),
+        "the re-ACK still covers the peer's FIN",
+    );
+    assert_eq!(
+        conn_state(CP, SP),
+        Some(TcpState::TimeWait),
+        "a retransmitted FIN does not advance TimeWait — it only re-ACKs",
+    );
+
+    // Past the *original* deadline: the connection survives because
+    // the retransmitted FIN restarted the 2×MSL timer.
+    kernel_core::clock::mock::advance(200);
+    super::on_tcp_tick();
+    assert_eq!(
+        conn_state(CP, SP),
+        Some(TcpState::TimeWait),
+        "the retransmitted FIN restarted the 2×MSL timer",
+    );
+}
+
 /// Locate the live (non-listener) connection for a client/server
 /// port pair and return its `(handle, generation)` so a scenario
 /// can drive the real send path (`async_try_send_chain`).
@@ -1148,6 +1326,35 @@ fn handshake(server_port: u16, client_port: u16, client_isn: u32) -> u32 {
         seq: client_isn.wrapping_add(1),
         ack: server_isn.wrapping_add(1),
         flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    server_isn
+}
+
+/// Drive a connection through a full active close into `TimeWait`:
+/// handshake, `close()` (→ FinWait1), the peer's ACK of our FIN
+/// (→ FinWait2), then the peer's FIN (→ TimeWait). Returns the
+/// server ISN.
+fn enter_timewait(server_port: u16, client_port: u16, client_isn: u32) -> u32 {
+    let server_isn = handshake(server_port, client_port, client_isn);
+    let (handle, generation) = conn_handle(client_port, server_port);
+    super::close(handle, generation);
+    deliver(&Seg {
+        src_port: client_port,
+        dst_port: server_port,
+        seq: client_isn.wrapping_add(1),
+        ack: server_isn.wrapping_add(2),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    deliver(&Seg {
+        src_port: client_port,
+        dst_port: server_port,
+        seq: client_isn.wrapping_add(1),
+        ack: server_isn.wrapping_add(2),
+        flags: TCP_FIN | TCP_ACK,
         window: 65535,
         payload: Vec::new(),
     });

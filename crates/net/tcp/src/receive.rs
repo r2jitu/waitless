@@ -241,6 +241,11 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
 
     let c = unsafe { &mut *conn_ptr(core, slot) };
 
+    // State on entry, before this segment drives any transition —
+    // the TimeWait retransmitted-FIN branch below needs to know the
+    // connection was *already* in TimeWait (vs entering it this call).
+    let prev_state = c.state;
+
     // Process ACK
     if flags & TCP_ACK != 0 {
         // `snd_una` before this ACK advances it — `rtx_on_ack` needs
@@ -442,25 +447,55 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             TcpState::Established | TcpState::SynReceived => {
                 c.state = TcpState::CloseWait;
             }
-            TcpState::FinWait1 => {
-                free_connection(core, slot);
-            }
-            TcpState::FinWait2 => {
-                free_connection(core, slot);
+            TcpState::FinWait1 | TcpState::FinWait2 => {
+                // Peer FIN — enter TimeWait and hold the TCB for
+                // 2×MSL (RFC 9293 §3.10.7.4) instead of freeing it
+                // immediately. FinWait1 here is the simultaneous-close
+                // case (the peer FIN'd before acknowledging our FIN);
+                // the stack has no separate Closing state, so it
+                // shortcuts straight to TimeWait. The lifecycle timer,
+                // armed as a FIN-retransmit deadline in FinWait1, is
+                // re-armed here as the 2×MSL drop deadline.
+                c.state = TcpState::TimeWait;
+                c.fin_retx_count = 0;
+                c.arm_time_wait(kernel_core::clock::now_ms());
             }
             _ => {}
         }
-        // Peer FIN is also a readable-state transition: any pending
-        // `recv_ready` must resolve so the handler can observe the
-        // close via `is_closed()` / `recv() == 0`. `free_connection`
-        // above already resets the whole conn (including `recv_waker`)
-        // via `TcpConnection::new()`; in the CloseWait branch we still
-        // hold the waker, so fire it here.
+        // Peer FIN is also a readable-state transition: a handler
+        // parked on `recv` must wake so it observes the close via
+        // `is_closed()` / `recv() == 0`. Only CloseWait carries a live
+        // handler here (FinWait* / TimeWait are reached only after the
+        // app already called `close()`), so fire the waker there.
         if c.state == TcpState::CloseWait
             && let Some(w) = c.recv_waker.take()
         {
             w.wake();
         }
+    }
+
+    // RFC 9293 §3.10.7.4: in TimeWait the only segment expected is a
+    // retransmitted peer FIN (its ACK was lost). Re-acknowledge it and
+    // restart the 2×MSL timer; the state never advances. The
+    // in-sequence FIN handler above does not fire for the retransmit —
+    // its sequence number sits one below `rcv_nxt` — so this is a
+    // distinct branch, gated on the *entry* state so the segment that
+    // first drove the connection into TimeWait is not double-handled.
+    if prev_state == TcpState::TimeWait && flags & TCP_FIN != 0 {
+        send_segment(
+            &SegmentMeta {
+                local_ip: dst_ip,
+                dst_ip: src_ip,
+                src_port: dst_port,
+                dst_port: src_port,
+                seq: c.snd_nxt,
+                ack: c.rcv_nxt,
+                flags: TCP_ACK,
+                window: c.rx_free() as u16,
+            },
+            &[],
+        );
+        c.arm_time_wait(kernel_core::clock::now_ms());
     }
 }
 
