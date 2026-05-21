@@ -9,14 +9,14 @@
 
 #![no_std]
 
-#[uni::init]
+#[waitless::init]
 fn init() {
-    uni::log(b"test_async: boot\n");
+    waitless::log(b"test_async: boot\n");
 
-    let spawn_result = uni::runtime::spawn(async {
-        uni::log(b"test_async: task started\n");
-        uni::runtime::sleep_us(50_000).await;
-        uni::log(b"test_async: task woke up\n");
+    let spawn_result = waitless::runtime::spawn(async {
+        waitless::log(b"test_async: task started\n");
+        waitless::runtime::sleep_us(50_000).await;
+        waitless::log(b"test_async: task woke up\n");
 
         // ── Socket cleanup coverage ──────────────────────────
         // Each phase binds the SAME port twice: if Drop failed
@@ -28,30 +28,30 @@ fn init() {
         run_tcp_bind_drop_cycle();
         run_tcp_fanout_drop_cycle();
 
-        let nested = uni::runtime::spawn(async {
-            uni::runtime::sleep_us(10_000).await;
-            uni::log(b"test_async: nested task done\n");
-            uni::request_shutdown();
+        let nested = waitless::runtime::spawn(async {
+            waitless::runtime::sleep_us(10_000).await;
+            waitless::log(b"test_async: nested task done\n");
+            waitless::request_shutdown();
         });
         match nested {
-            Ok(_handle) => uni::log(b"test_async: nested spawn ok\n"),
+            Ok(_handle) => waitless::log(b"test_async: nested spawn ok\n"),
             Err(_) => {
-                uni::log(b"test_async: nested spawn FAILED\n");
-                uni::request_shutdown();
+                waitless::log(b"test_async: nested spawn FAILED\n");
+                waitless::request_shutdown();
             }
         }
     });
 
     match spawn_result {
-        Ok(_handle) => uni::log(b"test_async: spawn ok\n"),
+        Ok(_handle) => waitless::log(b"test_async: spawn ok\n"),
         Err(_) => {
-            uni::log(b"test_async: spawn FAILED\n");
-            uni::request_shutdown();
+            waitless::log(b"test_async: spawn FAILED\n");
+            waitless::request_shutdown();
         }
     }
 
     // Release the event loop / worker pool so tasks start being polled.
-    uni::set_ready();
+    waitless::set_ready();
 }
 
 /// Phase 1: `UdpSocket::bind` + `drop` + re-bind same port.
@@ -62,20 +62,20 @@ fn run_udp_bind_drop_cycle() {
     // anything < 1024 would EACCES) and unused by the webserver
     // tests that may run in parallel.
     const PORT: u16 = 17017;
-    match uni::runtime::UdpSocket::bind(PORT) {
+    match waitless::runtime::UdpSocket::bind(PORT) {
         Ok(sock) => {
-            uni::log(b"test_async: udp bind ok\n");
+            waitless::log(b"test_async: udp bind ok\n");
             drop(sock);
-            uni::log(b"test_async: udp drop ok\n");
+            waitless::log(b"test_async: udp drop ok\n");
         }
         Err(_) => {
-            uni::log(b"test_async: udp bind FAILED\n");
+            waitless::log(b"test_async: udp bind FAILED\n");
             return;
         }
     }
-    match uni::runtime::UdpSocket::bind(PORT) {
-        Ok(_sock) => uni::log(b"test_async: udp rebind ok\n"),
-        Err(_) => uni::log(b"test_async: udp rebind FAILED\n"),
+    match waitless::runtime::UdpSocket::bind(PORT) {
+        Ok(_sock) => waitless::log(b"test_async: udp rebind ok\n"),
+        Err(_) => waitless::log(b"test_async: udp rebind FAILED\n"),
     }
     // The second `_sock` drops at end of scope — keeps the port
     // clean for the next phase if we ever reuse PORT.
@@ -86,7 +86,7 @@ fn run_udp_bind_drop_cycle() {
 /// the port (not one or the other).
 fn run_udp_fanout_drop_cycle() {
     const PORT: u16 = 17019;
-    match uni::runtime::UdpSocket::bind(PORT) {
+    match waitless::runtime::UdpSocket::bind(PORT) {
         Ok(sock) => {
             // Body never receives in this test (nothing is sending
             // to PORT) but the per-worker recv tasks get spawned
@@ -98,16 +98,16 @@ fn run_udp_fanout_drop_cycle() {
                 }
             });
             drop(handle);
-            uni::log(b"test_async: udp fanout drop ok\n");
+            waitless::log(b"test_async: udp fanout drop ok\n");
         }
         Err(_) => {
-            uni::log(b"test_async: udp fanout bind FAILED\n");
+            waitless::log(b"test_async: udp fanout bind FAILED\n");
             return;
         }
     }
-    match uni::runtime::UdpSocket::bind(PORT) {
-        Ok(_sock) => uni::log(b"test_async: udp fanout rebind ok\n"),
-        Err(_) => uni::log(b"test_async: udp fanout rebind FAILED\n"),
+    match waitless::runtime::UdpSocket::bind(PORT) {
+        Ok(_sock) => waitless::log(b"test_async: udp fanout rebind ok\n"),
+        Err(_) => waitless::log(b"test_async: udp fanout rebind FAILED\n"),
     }
 }
 
@@ -115,20 +115,20 @@ fn run_udp_fanout_drop_cycle() {
 /// `TcpListener::Drop` releases the port slot.
 fn run_tcp_bind_drop_cycle() {
     const PORT: u16 = 17021;
-    match uni::runtime::TcpListener::bind(PORT) {
+    match waitless::runtime::TcpListener::bind(PORT) {
         Ok(listener) => {
-            uni::log(b"test_async: tcp bind ok\n");
+            waitless::log(b"test_async: tcp bind ok\n");
             drop(listener);
-            uni::log(b"test_async: tcp drop ok\n");
+            waitless::log(b"test_async: tcp drop ok\n");
         }
         Err(_) => {
-            uni::log(b"test_async: tcp bind FAILED\n");
+            waitless::log(b"test_async: tcp bind FAILED\n");
             return;
         }
     }
-    match uni::runtime::TcpListener::bind(PORT) {
-        Ok(_listener) => uni::log(b"test_async: tcp rebind ok\n"),
-        Err(_) => uni::log(b"test_async: tcp rebind FAILED\n"),
+    match waitless::runtime::TcpListener::bind(PORT) {
+        Ok(_listener) => waitless::log(b"test_async: tcp rebind ok\n"),
+        Err(_) => waitless::log(b"test_async: tcp rebind FAILED\n"),
     }
 }
 
@@ -136,7 +136,7 @@ fn run_tcp_bind_drop_cycle() {
 /// UDP fanout test on the accept side.
 fn run_tcp_fanout_drop_cycle() {
     const PORT: u16 = 17023;
-    match uni::runtime::TcpListener::bind(PORT) {
+    match waitless::runtime::TcpListener::bind(PORT) {
         Ok(listener) => {
             // Accept-loop body is never invoked here — no client
             // connects to port 23 during this test. The per-
@@ -144,15 +144,15 @@ fn run_tcp_fanout_drop_cycle() {
             // what we want Drop to clean up.
             let handle = listener.run(|_stream| async {});
             drop(handle);
-            uni::log(b"test_async: tcp fanout drop ok\n");
+            waitless::log(b"test_async: tcp fanout drop ok\n");
         }
         Err(_) => {
-            uni::log(b"test_async: tcp fanout bind FAILED\n");
+            waitless::log(b"test_async: tcp fanout bind FAILED\n");
             return;
         }
     }
-    match uni::runtime::TcpListener::bind(PORT) {
-        Ok(_listener) => uni::log(b"test_async: tcp fanout rebind ok\n"),
-        Err(_) => uni::log(b"test_async: tcp fanout rebind FAILED\n"),
+    match waitless::runtime::TcpListener::bind(PORT) {
+        Ok(_listener) => waitless::log(b"test_async: tcp fanout rebind ok\n"),
+        Err(_) => waitless::log(b"test_async: tcp fanout rebind FAILED\n"),
     }
 }

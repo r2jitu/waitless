@@ -24,7 +24,7 @@ rust_library(
     deps = [
         "//crates/proto/http",
         "//crates/proto/quic",
-        "//crates/uni",
+        "//crates/waitless",
     ],
 )
 

@@ -656,7 +656,7 @@ pub(super) fn handle_udp_outbound(guest_src_port: u16, dst_ip: [u8; 4], dst_port
         sin_addr: libc::in_addr {
             // 127.0.0.1 in network-byte-order memory; see the
             // matching `from_ne_bytes` rationale in
-            // uni-backend/native::udp_send.
+            // waitless-backend/native::udp_send.
             s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
         },
         sin_zero: [0; 8],

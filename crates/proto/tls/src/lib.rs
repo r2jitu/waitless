@@ -158,7 +158,7 @@ pub enum ListenError {
     /// Couldn't parse the cert / key bytes.
     Cert,
     /// `TcpListener::bind` failed (port in use, registry full, …).
-    Bind(uni::runtime::TcpBindError),
+    Bind(waitless::runtime::TcpBindError),
 }
 
 /// One-call HTTPS listener. Parses `cert_der` + `key_der`, binds
@@ -190,7 +190,7 @@ where
     let cfg = Arc::new(cfg);
     let pool = TlsConnPool::new();
 
-    let listener = uni::runtime::TcpListener::bind(port).map_err(ListenError::Bind)?;
+    let listener = waitless::runtime::TcpListener::bind(port).map_err(ListenError::Bind)?;
     let handler = Arc::new(handler);
     let h = listener.run(move |tcp| {
         let handler = Arc::clone(&handler);
@@ -198,13 +198,13 @@ where
         let pool = Arc::clone(&pool);
         async move {
             let mut seed = [0u8; 32];
-            uni::rng::fill_bytes(&mut seed);
+            waitless::rng::fill_bytes(&mut seed);
             let tls = build_tls_conn(seed, cfg, pool);
             let stream = TlsStream::new(tcp, tls);
             http::serve_conn(handler, stream).await;
         }
     });
-    uni::_retain(h);
+    waitless::_retain(h);
     Ok(())
 }
 
@@ -284,7 +284,7 @@ impl TlsConnPool {
         let pool = TlsConnPool {
             slots: WorkerLocal::new(),
         };
-        pool.slots.ensure_init(uni::num_workers(), |_| {
+        pool.slots.ensure_init(waitless::num_workers(), |_| {
             RefCell::new(Vec::with_capacity(POOL_CAP))
         });
         Arc::new(pool)
@@ -447,7 +447,7 @@ const CIPHER_BUF_LEN: usize = 8192;
 /// `send` encrypts via `seal_app_data` and flushes ciphertext to
 /// TCP.
 pub struct TlsStream {
-    tcp: uni::runtime::TcpStream,
+    tcp: waitless::runtime::TcpStream,
     tls: PooledTlsConn,
     /// Inline ciphertext scratch reused across recvs. Folded into
     /// the struct so the future state machine that holds the
@@ -469,7 +469,7 @@ pub struct TlsStream {
 }
 
 impl TlsStream {
-    fn new(tcp: uni::runtime::TcpStream, tls: PooledTlsConn) -> Self {
+    fn new(tcp: waitless::runtime::TcpStream, tls: PooledTlsConn) -> Self {
         TlsStream {
             tcp,
             tls,
@@ -664,7 +664,7 @@ impl http::HttpStream for TlsStream {
     /// TLS path has no `ExternalOwned` plaintext buffer to hand out
     /// for free; closing that last copy is the documented Phase-4
     /// in-place-decrypt follow-up).
-    async fn recv_chunk(&mut self) -> Option<uni::runtime::RecvChunkGuard<'_>> {
+    async fn recv_chunk(&mut self) -> Option<waitless::runtime::RecvChunkGuard<'_>> {
         // Drive the conn until `pt_buf` holds decrypted plaintext.
         // Handshake records produce none, so early iterations just
         // advance the handshake — same loop shape as `recv`.
@@ -703,7 +703,7 @@ impl http::HttpStream for TlsStream {
         //  * The `Borrowed` IOBuf drops with the guard, ending the
         //    borrow before the next `recv` / `recv_chunk` can run.
         let iobuf = unsafe { IOBuf::borrow(core::ptr::NonNull::new_unchecked(base), len, 0, len) };
-        Some(uni::runtime::RecvChunkGuard::new(iobuf))
+        Some(waitless::runtime::RecvChunkGuard::new(iobuf))
     }
 
     async fn send(&mut self, src: &mut IOBufChain) -> Result<(), ()> {

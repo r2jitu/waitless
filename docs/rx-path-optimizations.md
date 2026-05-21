@@ -1616,14 +1616,14 @@ differently, each cleanly:
   `impl HttpStream for TlsStream`, so the inherent `recv_chunk`
   (item G) just *becomes* the trait-impl override — body moved
   verbatim, inherent method deleted, no collision left to footgun.
-- **`TcpStream` forwards.** `uni::runtime::TcpStream` can't impl an
+- **`TcpStream` forwards.** `waitless::runtime::TcpStream` can't impl an
   proto/http trait (the dependency runs the other way) and item-F
   doc-tests call its inherent `recv_chunk`, so that method stays;
   the trait impl forwards to it. The forward is written as a plain
   `fn` returning the *concrete* `RecvChunk` future — not an
   `async fn` block, and not the trait's opaque `impl Future` — so it
   is type-checked against the inherent method. If the inherent
-  method were ever deleted, `uni::runtime::TcpStream::recv_chunk`
+  method were ever deleted, `waitless::runtime::TcpStream::recv_chunk`
   would resolve to the *trait* method (opaque return), and the
   mismatch against `-> RecvChunk<'_>` is a compile error rather than
   the silent infinite recursion an `impl Future` return would let

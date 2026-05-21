@@ -11,7 +11,7 @@ exports_files(["limine.conf"])
 #
 # These were `rust_static_library` until the LTO work. A staticlib is
 # a self-contained `.a` — it bundles a full copy of every Rust
-# dependency (kernel/uni/net/…), so `kernel`'s statics, e.g.
+# dependency (kernel/waitless/net/…), so `kernel`'s statics, e.g.
 # `fdt::G_INFO`, were duplicated between the boot `.a` and the binary
 # (which also links those crates via `app`). A non-LTO link collapsed
 # the duplicate global symbols via `--allow-multiple-definition`; LTO
@@ -49,7 +49,7 @@ rust_library(
         "//crates/drivers/nic",
         "//crates/kernel/bare",
         "//crates/net/stack",
-        "//crates/uni",
+        "//crates/waitless",
     ],
 )
 

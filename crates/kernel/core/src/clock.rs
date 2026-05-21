@@ -1,7 +1,7 @@
 // kernel_core/clock.rs — host-buildable monotonic-clock link seam.
 //
 // `now_ms()` is the monotonic-millisecond time source for the
-// host-buildable crates that sit below `//uni` and so cannot reach a
+// host-buildable crates that sit below `//crates/waitless` and so cannot reach a
 // `//crates/kernel/bare` clock directly — chiefly `tcp`, whose RFC 6298
 // retransmission timer needs a coarse wall-clock.
 //

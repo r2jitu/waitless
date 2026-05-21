@@ -5,8 +5,8 @@
 // pointers to avoid circular crate dependencies.
 //
 // All cores enter eventloop::run() after boot. Core 0 drives the
-// spawned init task (see `#[uni::init]`); APs wait for `set_ready`
-// from the app's `uni::run(app)`. The loop runs until shutdown.
+// spawned init task (see `#[waitless::init]`); APs wait for `set_ready`
+// from the app's `waitless::run(app)`. The loop runs until shutdown.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -60,7 +60,7 @@ impl CoreStats {
 
 /// Fixed per-core stats array. Sized to match the rest of the tree's
 /// 8-core ceiling (`MAX_QUEUE_PAIRS` in the drivers, the 8-deep diag
-/// arrays in `uni_net`). Sufficient for every machine type we
+/// arrays in `waitless_net`). Sufficient for every machine type we
 /// target in production today.
 pub const MAX_CORE_STATS: usize = 8;
 
@@ -109,7 +109,7 @@ static CHECK_SHUTDOWN: AtomicFn<BoolFn> = AtomicFn::null();
 static NET_HAS_TIMERS: AtomicFn<BoolFn> = AtomicFn::null();
 static IDLE: AtomicFn<IdleFn> = AtomicFn::null();
 /// Invoked on the BSP exactly once, right after the loop breaks and
-/// before the machine powers off. Lets upper layers (e.g. `uni`'s
+/// before the machine powers off. Lets upper layers (e.g. `waitless`'s
 /// App dispatch) run `destroy`-style teardown while the heap is
 /// still intact. Nothing else in the kernel depends on a running
 /// app at this point, so ordering is simple.
@@ -157,7 +157,7 @@ pub fn set_idle(f: IdleFn) {
 }
 
 /// Register a teardown callback invoked on the BSP between the event
-/// loop exit and the architectural power-off. `uni` uses this to run
+/// loop exit and the architectural power-off. `waitless` uses this to run
 /// `App::destroy` with the heap still live.
 pub fn set_on_shutdown(f: VoidFn) {
     ON_SHUTDOWN.store(f);
@@ -199,7 +199,7 @@ pub fn run(core_id: u32) -> ! {
     // APs wait for the app's `set_ready` so they don't hammer the
     // NIC / inbox machinery before listeners are registered. Core 0
     // skips this wait — its event loop drives the spawned init task
-    // (see `#[uni::init]`), and that task is what eventually calls
+    // (see `#[waitless::init]`), and that task is what eventually calls
     // `set_ready`. Blocking here would deadlock because nothing
     // else polls the runtime.
     if core_id != 0 {

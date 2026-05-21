@@ -1,4 +1,4 @@
-// uni/rng.rs — platform-agnostic entropy source.
+// waitless/rng.rs — platform-agnostic entropy source.
 //
 // Thin cfg-switch over the two backends:
 //
@@ -9,7 +9,7 @@
 //     macOS + Linux glibc/musl).
 //
 // Callers (TLS handshake seed, test harness, …) get one name
-// regardless of runner. Previously `uni::http::fill_tls_seed` held
+// regardless of runner. Previously `waitless::http::fill_tls_seed` held
 // the cfg-switch inline; extracting it lets `//tests/integration/tls` drop
 // its direct `kernel_bare::rng` dep, which in turn lets test_tls run
 // natively without pulling the kernel crate into the native

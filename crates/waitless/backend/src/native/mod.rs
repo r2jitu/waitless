@@ -1,4 +1,4 @@
-// Host POSIX backend for `uni`. libc-FFI sockets, kqueue/epoll,
+// Host POSIX backend for `waitless`. libc-FFI sockets, kqueue/epoll,
 // pthread workers, cross-worker event loop.
 //
 // Listener distribution: one nonblocking listen fd registered in every
@@ -678,7 +678,7 @@ fn init_native() {
 }
 
 // ============================================================================
-// Platform API — called from uni/lib.rs backend dispatch
+// Platform API — called from waitless/lib.rs backend dispatch
 // ============================================================================
 
 pub fn log(msg: &[u8]) {
@@ -849,7 +849,7 @@ fn is_ready() -> bool {
 pub fn run_worker(worker_id: u32) {
     // Worker 0 skips the READY wait: `uni_init` now only spawns the
     // app's boot body as an async task; worker 0 is what polls it,
-    // and the task's `uni::run(app)` is what eventually calls
+    // and the task's `waitless::run(app)` is what eventually calls
     // `set_ready` to release the other workers. Blocking here would
     // deadlock because nothing else drives the runtime.
     if worker_id != 0 {
@@ -901,7 +901,7 @@ pub fn run_worker(worker_id: u32) {
 // ============================================================================
 
 // Rust ABI — both sides are Rust and the function takes no args /
-// returns nothing. `#[no_mangle]` on the emitting `#[uni::init]`
+// returns nothing. `#[no_mangle]` on the emitting `#[waitless::init]`
 // macro gives the symbol a stable link-time name.
 unsafe extern "Rust" {
     fn uni_init();
@@ -922,20 +922,20 @@ extern "C" fn worker_thread(arg: *mut u8) -> *mut u8 {
     ptr::null_mut()
 }
 
-/// Config for `run()`. Holds the two uni-side hooks we'd otherwise
+/// Config for `run()`. Holds the two waitless-side hooks we'd otherwise
 /// need to call across the crate boundary:
 ///
-///   * `boot_info_fn` — fills `uni::boot_info` with the native host's
+///   * `boot_info_fn` — fills `waitless::boot_info` with the native host's
 ///     CPU count / RAM bytes right after thread-pool init.
 ///   * `shutdown_fn` — called after all workers join, to drop the app
-///     box and clear the net slot (`uni::shutdown_and_drop`).
+///     box and clear the net slot (`waitless::shutdown_and_drop`).
 ///
 pub struct RunConfig {
     pub boot_info_fn: fn(num_cpus: u32, ram_bytes: usize),
     pub shutdown_fn: fn(),
 }
 
-/// Native-binary entry point — called from `uni::native::run` (which
+/// Native-binary entry point — called from `waitless::native::run` (which
 /// in turn is called from `bazel/rules/native_main.rs`'s `fn main()`).
 /// Returns the process exit code.
 pub fn run(config: RunConfig) -> i32 {
@@ -967,7 +967,7 @@ pub fn run(config: RunConfig) -> i32 {
     log(format!("cpu: {} \u{00d7} host\n", host_cpus).as_bytes());
     log(format!("mem: {} MB (host)\n", ram_mb).as_bytes());
 
-    // Publish the boot-time snapshot via the uni-side callback. The
+    // Publish the boot-time snapshot via the waitless-side callback. The
     // native backend has no NIC driver (POSIX sockets go through the
     // host stack), so nic info is filled in by the callback as empty.
     (config.boot_info_fn)(host_cpus as u32, host_ram_bytes());
@@ -998,7 +998,7 @@ pub fn run(config: RunConfig) -> i32 {
             }
         }
 
-        // App teardown — drops whatever the user handed to `uni::run`
+        // App teardown — drops whatever the user handed to `waitless::run`
         // (firing its `Drop` impl). Idempotent; ordered after workers
         // have stopped touching app state.
         (config.shutdown_fn)();
@@ -1045,7 +1045,7 @@ pub fn net_tx_desc_log_snapshot(_out: &mut [NetTxDescLogEntry]) -> usize {
 /// Native stub for the gve NIC-driver counters — gve is a
 /// bare-metal-only driver, so there is nothing to report. Mirrors
 /// the unikernel side's `gve_diag()` so cross-platform callers
-/// (`uni::diagnostics::gve_diag`) see one type on both backends.
+/// (`waitless::diagnostics::gve_diag`) see one type on both backends.
 pub fn gve_diag() -> crate::GveDiag {
     crate::GveDiag::default()
 }

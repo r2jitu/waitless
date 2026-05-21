@@ -1,4 +1,4 @@
-// crates/uni/backend/src/unikernel.rs — Bare-metal dispatch.
+// crates/waitless/backend/src/unikernel.rs — Bare-metal dispatch.
 
 use kernel_bare::serial;
 
@@ -27,7 +27,7 @@ pub use nic::{
 /// (so all-zero under virtio-net). The native backend has no gve
 /// driver and stubs this all-zero (`native::gve_diag`), so an
 /// application can surface these counters through
-/// `uni::diagnostics` *without* itself depending on the
+/// `waitless::diagnostics` *without* itself depending on the
 /// `os:none`-only gve driver crate — the dependency that, placed
 /// in app code, breaks the native build.
 pub fn gve_diag() -> crate::GveDiag {
@@ -47,7 +47,7 @@ pub fn gve_diag() -> crate::GveDiag {
 /// TCP/IP-stack diagnostic counters (`/stats`). Reads the
 /// bare-metal `net` stack's atomics; the native backend has no
 /// `net` stack and stubs this all-zero (`native::tcp_diag`), so an
-/// application reads them through `uni::diagnostics` without a
+/// application reads them through `waitless::diagnostics` without a
 /// direct dependency on the `os:none` `net` crate.
 pub fn tcp_diag() -> crate::TcpDiag {
     use core::sync::atomic::Ordering::Relaxed;

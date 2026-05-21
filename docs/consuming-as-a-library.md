@@ -9,8 +9,8 @@ boilerplate every external app must supply itself.
 
 `unikernel_binary` and the `rust_*` wrappers in
 [`bazel/rules/`](../bazel/rules) are repo-hygienic — every label they
-emit internally is a `Label()` object bound to `@unikernel`, so an app
-calling them resolves `//crates/boot:entry`, `//crates/uni`, the linker
+emit internally is a `Label()` object bound to `@waitless`, so an app
+calling them resolves `//crates/boot:entry`, `//crates/waitless`, the linker
 scripts, etc. against unikernel's repo, not its own. No mirror `alias()`
 packages required.
 
@@ -24,12 +24,12 @@ that set.
 ```python
 module(name = "myapp", version = "0.0.0")
 
-# 1. Depend on unikernel + point Bazel at the checkout. Any override
+# 1. Depend on waitless + point Bazel at the checkout. Any override
 #    works (git_override, archive_override); local_path_override is the
 #    simplest for a sibling checkout.
-bazel_dep(name = "unikernel", version = "0.1.0")
+bazel_dep(name = "waitless", version = "0.1.0")
 local_path_override(
-    module_name = "unikernel",
+    module_name = "waitless",
     path = "../unikernel",
 )
 
@@ -99,28 +99,28 @@ for the minimal example:
 
 ```python
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("@unikernel//bazel/rules:unikernel.bzl", "port_fwd", "unikernel_binary")
+load("@waitless//bazel/rules:unikernel.bzl", "port_fwd", "unikernel_binary")
 
 rust_library(
     name = "app",
     srcs = ["src/main.rs"],
     crate_root = "src/main.rs",
     deps = [
-        "@unikernel//crates/proto/http",
-        "@unikernel//crates/uni",
+        "@waitless//crates/proto/http",
+        "@waitless//crates/waitless",
     ],
 )
 
 unikernel_binary(
     name = "myapp",
     app = ":app",
-    drivers = ["@unikernel//crates/drivers/virtio-net"],
+    drivers = ["@waitless//crates/drivers/virtio-net"],
     port_forwards = [port_fwd("tcp", guest = 80, host = 8080)],
 )
 ```
 
-In-tree apps write `//crates/uni` because they *are* in unikernel's repo;
-external apps write `@unikernel//crates/uni` so the label resolves to the
+In-tree apps write `//crates/waitless` because they *are* in unikernel's repo;
+external apps write `@waitless//crates/waitless` so the label resolves to the
 dependency. `unikernel_binary` then produces the usual variant targets
 (`:myapp_hvf`, `:myapp_iso_x86_64`, `:myapp_qemu_aarch64`, …), runnable
 with plain `bazel run` / `bazel test`.

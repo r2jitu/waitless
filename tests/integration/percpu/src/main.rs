@@ -50,16 +50,16 @@ fn test_service(core_id: u32) -> bool {
     true
 }
 
-#[uni::init]
+#[waitless::init]
 fn init() {
-    uni::println!("Per-core state test starting.");
+    waitless::println!("Per-core state test starting.");
 
     let num_cores = kernel_bare::percpu::num_cores();
-    uni::println!("Cores: {}", num_cores);
+    waitless::println!("Cores: {}", num_cores);
 
     if num_cores <= 1 {
-        uni::println!("SKIP: need >1 core for per-core test");
-        uni::println!("Per-core state test complete.");
+        waitless::println!("SKIP: need >1 core for per-core test");
+        waitless::println!("Per-core state test complete.");
         return;
     }
 
@@ -96,16 +96,16 @@ fn init() {
 
     // Print results — include core 0 (its test runs inline, so it's
     // always populated) so the test harness can assert on every core.
-    // Each line is printed via `uni::println!` so the whole line emits
+    // Each line is printed via `waitless::println!` so the whole line emits
     // under one serial-lock acquisition; without that, multiple
-    // `uni::log(bytes)` calls let AP eventloop diagnostics slot in
+    // `waitless::log(bytes)` calls let AP eventloop diagnostics slot in
     // between fragments and break the test's contiguous-string match.
     for i in 0..num_cores {
         let result = RESULTS[i as usize].load(Ordering::Acquire);
         match result {
-            1 => uni::println!("Core {}: inbox OK, tx_staging OK, id OK", i),
-            2 => uni::println!("Core {}: FAIL", i),
-            _ => uni::println!("Core {}: TIMEOUT (no result)", i),
+            1 => waitless::println!("Core {}: inbox OK, tx_staging OK, id OK", i),
+            2 => waitless::println!("Core {}: FAIL", i),
+            _ => waitless::println!("Core {}: TIMEOUT (no result)", i),
         }
     }
 
@@ -125,11 +125,11 @@ fn init() {
     }
 
     if tx_ok == expected {
-        uni::println!("Core 0: verified TX staging from all APs");
+        waitless::println!("Core 0: verified TX staging from all APs");
     } else {
-        uni::println!("Core 0: FAIL TX staging verification");
+        waitless::println!("Core 0: FAIL TX staging verification");
     }
 
-    uni::println!("Per-core state test complete.");
+    waitless::println!("Per-core state test complete.");
     kernel_bare::eventloop::request_shutdown();
 }

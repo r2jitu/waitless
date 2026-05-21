@@ -4,24 +4,24 @@ load("//bazel/rules:rust.bzl", "rust_test")
 package(default_visibility = ["//visibility:public"])
 
 rust_library(
-    name = "uni",
+    name = "waitless",
     srcs = [
         "src/boot_info.rs",
         "src/lib.rs",
         "src/rng.rs",
     ],
     crate_root = "src/lib.rs",
-    proc_macro_deps = ["//crates/uni/macros:uni_macros"],
-    # `//crates/uni/net` re-exported as `uni::net`.
-    # `//crates/uni/backend:uni_backend` is the cfg-selected platform
+    proc_macro_deps = ["//crates/waitless/macros:waitless_macros"],
+    # `//crates/waitless/net` re-exported as `waitless::net`.
+    # `//crates/waitless/backend:waitless_backend` is the cfg-selected platform
     # adapter (bare-metal or POSIX). `//kernel` stays as a bare-metal-
-    # only direct dep because `uni/lib.rs` itself calls into it for
+    # only direct dep because `waitless/lib.rs` itself calls into it for
     # `cpu_id`, `eventloop::set_on_shutdown`, and `rng::fill_bytes`.
     deps = [
         "//crates/runtime/executor",
         "//crates/runtime/worker",
-        "//crates/uni/backend:uni_backend",
-        "//crates/uni/net",
+        "//crates/waitless/backend:waitless_backend",
+        "//crates/waitless/net",
     ] + select({
         "//bazel/platforms:native": [],
         "//conditions:default": ["//crates/kernel/bare"],

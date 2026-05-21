@@ -1,4 +1,4 @@
-// crates/uni/backend/src/native/udp.rs — POSIX UDP backend.
+// crates/waitless/backend/src/native/udp.rs — POSIX UDP backend.
 //
 // Server-style binds use SO_REUSEPORT siblings (one fd per worker
 // thread; kernel distributes inbound by 4-tuple hash). Owner-pinned

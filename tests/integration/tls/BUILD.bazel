@@ -11,11 +11,11 @@ rust_library(
     crate_root = "src/main.rs",
     # No `//kernel` dep: the test used to hit `kernel::rng` directly,
     # which pinned the app to the unikernel platform; it now goes
-    # through `uni::rng::fill_bytes` (platform-agnostic wrapper), so
+    # through `waitless::rng::fill_bytes` (platform-agnostic wrapper), so
     # the whole test runs natively too.
     deps = [
         "//crates/proto/tls",
-        "//crates/uni",
+        "//crates/waitless",
     ],
 )
 
@@ -24,7 +24,7 @@ unikernel_binary(
     app = ":app",
 )
 
-# TLS primitives smoke test. Uses `uni::rng::fill_bytes` (cfg-
+# TLS primitives smoke test. Uses `waitless::rng::fill_bytes` (cfg-
 # switched between kernel RNG on unikernel and getentropy(2) on
 # native), so the same source runs under every variant in the
 # default test set — no explicit `variants = [...]` needed. Native

@@ -1,24 +1,24 @@
 // Platform abstraction: `TcpListener`, `TcpStream`, `log`, etc.
-// Dispatch goes through `//crates/uni/backend` which cfg-selects the
-// unikernel or POSIX impl internally — `uni/lib.rs` stays uniform.
+// Dispatch goes through `//crates/waitless/backend` which cfg-selects the
+// unikernel or POSIX impl internally — `waitless/lib.rs` stays uniform.
 
 #![no_std]
 
 extern crate alloc;
 
-pub use uni_macros::init;
+pub use waitless_macros::init;
 
-pub use uni_net as net;
+pub use waitless_net as net;
 
 /// Native entry from `native_main.rs`. Plugs boot_info and shutdown
-/// callbacks into `uni_backend::run` so the backend doesn't need a
-/// dep back on `uni`.
+/// callbacks into `waitless_backend::run` so the backend doesn't need a
+/// dep back on `waitless`.
 #[cfg(not(target_os = "none"))]
 pub fn native_run() -> i32 {
     use crate::boot_info::BootInfoParams;
     use alloc::vec::Vec;
 
-    uni_backend::run(uni_backend::RunConfig {
+    waitless_backend::run(waitless_backend::RunConfig {
         boot_info_fn: |num_cpus, ram_bytes| {
             crate::boot_info::init_boot_info(BootInfoParams {
                 ram_bytes,
@@ -35,8 +35,8 @@ pub fn native_run() -> i32 {
 pub mod boot_info;
 pub mod rng;
 
-// `uni::boot_info()` returns the populated `&'static BootInfo`. The
-// `BootInfo` / `NicInfo` types live in `uni::boot_info::*` — boot
+// `waitless::boot_info()` returns the populated `&'static BootInfo`. The
+// `BootInfo` / `NicInfo` types live in `waitless::boot_info::*` — boot
 // shims reach them there (along with `BootInfoParams`, the init
 // type), and apps that just read the snapshot don't need to name
 // the types thanks to method-chain inference.
@@ -91,7 +91,7 @@ pub fn shutdown_and_drop() {
     debug_assert_eq!(
         kernel_bare::cpu_id(),
         0,
-        "uni::shutdown_and_drop must run on BSP",
+        "waitless::shutdown_and_drop must run on BSP",
     );
 
     // SAFETY: boot-CPU-only; see `unsafe impl Sync for Bag`.
@@ -120,7 +120,7 @@ pub fn shutdown_and_drop() {
     // zeros (libstd's allocator exposes no counters), so the line
     // is informational only; on unikernel it's the actual talc
     // counters and a leaked allocation shows up as `LEAK +Nbytes`.
-    let s = uni_backend::heap_stats();
+    let s = waitless_backend::heap_stats();
     let bsl_b = HEAP_BASELINE_BYTES.load(core::sync::atomic::Ordering::Acquire);
     let bsl_a = HEAP_BASELINE_ALLOCS.load(core::sync::atomic::Ordering::Acquire);
     if s.allocated_bytes > bsl_b || s.allocation_count > bsl_a {
@@ -155,13 +155,13 @@ static HEAP_BASELINE_ALLOCS: core::sync::atomic::AtomicUsize =
 
 /// Signal that boot is complete and worker cores can leave their
 /// READY-wait spin. Snapshots the heap allocation counters so
-/// `shutdown_and_drop` can detect a leak. Called from the `#[uni::init]`
+/// `shutdown_and_drop` can detect a leak. Called from the `#[waitless::init]`
 /// macro after the user's `init()` body returns.
 pub fn set_ready() {
-    let s = uni_backend::heap_stats();
+    let s = waitless_backend::heap_stats();
     HEAP_BASELINE_BYTES.store(s.allocated_bytes, core::sync::atomic::Ordering::Release);
     HEAP_BASELINE_ALLOCS.store(s.allocation_count, core::sync::atomic::Ordering::Release);
-    uni_backend::set_ready();
+    waitless_backend::set_ready();
 }
 
 /// Route `shutdown_and_drop` into the platform-specific event-loop
@@ -181,16 +181,16 @@ pub fn _install_shutdown_hook() {}
 
 // Hot platform calls every app uses. `check_shutdown` and
 // `HeapStats` are NOT re-exported here — neither has any qualified
-// `uni::*` consumer; `check_shutdown` is wired into the event loop
+// `waitless::*` consumer; `check_shutdown` is wired into the event loop
 // directly from `crates/boot/src/entry.rs` via the kernel callback
 // (no app-facing surface), and `HeapStats` is only the return type
-// of `uni::diagnostics::heap_stats()` and named there as
-// `uni_backend::HeapStats`.
-pub use uni_backend::{log, num_workers, request_shutdown, wait_for_events};
+// of `waitless::diagnostics::heap_stats()` and named there as
+// `waitless_backend::HeapStats`.
+pub use waitless_backend::{log, num_workers, request_shutdown, wait_for_events};
 
-/// Format-and-log helper for `uni::log!("…", args)`. Allocates a
+/// Format-and-log helper for `waitless::log!("…", args)`. Allocates a
 /// scratch `String` because `core::fmt::write` doesn't have a
-/// no-alloc collector. For static-message logs prefer `uni::log`
+/// no-alloc collector. For static-message logs prefer `waitless::log`
 /// directly to skip the allocation.
 #[doc(hidden)]
 pub fn _log_fmt(args: core::fmt::Arguments<'_>) {
@@ -200,7 +200,7 @@ pub fn _log_fmt(args: core::fmt::Arguments<'_>) {
     log(s.as_bytes());
 }
 
-/// Formatted log line, no trailing newline added. `uni::log!("x={}", x)`.
+/// Formatted log line, no trailing newline added. `waitless::log!("x={}", x)`.
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {{
@@ -209,7 +209,7 @@ macro_rules! log {
 }
 
 /// Formatted log line + trailing `\n`. The expected serial-output
-/// shape — `uni::println!("hello {}", name)` is the no_std analog
+/// shape — `waitless::println!("hello {}", name)` is the no_std analog
 /// of `println!`.
 #[macro_export]
 macro_rules! println {
@@ -223,7 +223,7 @@ macro_rules! println {
 
 // ---- Async runtime --------------------------------------------------------
 
-/// Re-export of the shared async runtime. `use uni::runtime::spawn;`
+/// Re-export of the shared async runtime. `use waitless::runtime::spawn;`
 /// works on both unikernel and native.
 pub mod runtime {
     pub use executor::event::{AsyncEvent, WaitEvent};
@@ -291,46 +291,46 @@ pub fn cpu_id() -> u32 {
 
 /// Observability surface — runtime counters and snapshots most
 /// apps don't need but debug endpoints / monitoring agents do.
-/// Kept under its own namespace so the top-level `uni::*` view
+/// Kept under its own namespace so the top-level `waitless::*` view
 /// stays focused on what apps actually call.
 pub mod diagnostics {
     /// Per-queue RX frame counts (Tier 1 multi-queue NIC). Index
     /// is the queue-pair number; `[0..num_queue_pairs()]` are
     /// meaningful, the rest are zero.
     pub fn net_rx_counts() -> [u64; 8] {
-        uni_backend::net_rx_counts()
+        waitless_backend::net_rx_counts()
     }
 
     /// Negotiated RX/TX queue-pair count. Tier 2 (single-queue)
     /// reports 1; Tier 1 reports the per-vCPU count.
     pub fn net_num_queue_pairs() -> u16 {
-        uni_backend::net_num_queue_pairs()
+        waitless_backend::net_num_queue_pairs()
     }
 
     /// Per-queue used-ring cursors `(device, driver)`. Useful for
     /// spotting "device produced but driver didn't consume" gaps
     /// (cursors apart) vs "host not delivering" (both stuck).
     pub fn net_rx_used_cursors() -> [(u16, u16); 8] {
-        uni_backend::net_rx_used_cursors()
+        waitless_backend::net_rx_used_cursors()
     }
 
     /// gve NIC-driver diagnostic counters (RX-path items B/H —
     /// surfaced on the `/stats` endpoint). Real values on a
     /// bare-metal gve NIC; all-zero on native and under virtio-net.
-    /// Routed through `uni_backend` so application crates need no
+    /// Routed through `waitless_backend` so application crates need no
     /// direct — and native-build-breaking — dependency on the
     /// `os:none`-only gve driver crate.
-    pub fn gve_diag() -> uni_backend::GveDiag {
-        uni_backend::gve_diag()
+    pub fn gve_diag() -> waitless_backend::GveDiag {
+        waitless_backend::gve_diag()
     }
 
     /// TCP/IP-stack diagnostic counters (`/stats`): SYN ingress vs
     /// SYN-ACK egress, and the RX item-H `recv_chunk` zero-copy
     /// stash-vs-ring-drain split. Real on bare-metal; all-zero on
-    /// native. Routed through `uni_backend` for the same reason as
+    /// native. Routed through `waitless_backend` for the same reason as
     /// [`gve_diag`] — app crates stay off a direct `net`-crate dep.
-    pub fn tcp_diag() -> uni_backend::TcpDiag {
-        uni_backend::tcp_diag()
+    pub fn tcp_diag() -> waitless_backend::TcpDiag {
+        waitless_backend::tcp_diag()
     }
 
     /// TX-side hot-path counters: per-qp packet counts + small/big
@@ -349,8 +349,8 @@ pub mod diagnostics {
     /// `small_pool_full_spins` and `big_pool_full_returns` flag
     /// pool sizing — a steady non-zero rate means the pool is
     /// undersized for the load.
-    pub fn net_tx_diag() -> Option<uni_backend::NetTxDiag> {
-        uni_backend::net_tx_diag()
+    pub fn net_tx_diag() -> Option<waitless_backend::NetTxDiag> {
+        waitless_backend::net_tx_diag()
     }
 
     /// Snapshot the active driver's TX descriptor capture log into
@@ -358,8 +358,8 @@ pub mod diagnostics {
     /// written. Returns 0 on native and on drivers without per-
     /// descriptor instrumentation (currently only gve has it,
     /// for TSO-on-GCE debug). Surfaced via `/diag-gve`.
-    pub fn net_tx_desc_log_snapshot(out: &mut [uni_backend::NetTxDescLogEntry]) -> usize {
-        uni_backend::net_tx_desc_log_snapshot(out)
+    pub fn net_tx_desc_log_snapshot(out: &mut [waitless_backend::NetTxDescLogEntry]) -> usize {
+        waitless_backend::net_tx_desc_log_snapshot(out)
     }
 
     /// Per-core event-loop stats: `(loops, poll_work, drain_work,
@@ -371,43 +371,43 @@ pub mod diagnostics {
     /// going to net poll / inbox drain / app service. All zeros
     /// on native (the OS owns scheduling).
     pub fn core_stats(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
-        uni_backend::core_stats(core_id)
+        waitless_backend::core_stats(core_id)
     }
 
     /// Cycles-per-microsecond multiplier — divide cycle deltas by
     /// this to get microseconds. 0 on native.
     pub fn cycles_per_us() -> u64 {
-        uni_backend::cycles_per_us()
+        waitless_backend::cycles_per_us()
     }
 
-    pub use uni_backend::NET_DIAG_QP_CAP;
-    pub use uni_backend::NetTxDescLogEntry;
-    pub use uni_backend::NetTxDiag;
+    pub use waitless_backend::NET_DIAG_QP_CAP;
+    pub use waitless_backend::NetTxDescLogEntry;
+    pub use waitless_backend::NetTxDiag;
 
     /// Snapshot the heap. Cheap on bare-metal (O(1) + spinlock);
     /// best-effort zero on native.
-    pub fn heap_stats() -> uni_backend::HeapStats {
-        uni_backend::heap_stats()
+    pub fn heap_stats() -> waitless_backend::HeapStats {
+        waitless_backend::heap_stats()
     }
 
     /// Append a byte slice to the in-band diag buffer. For boot-time
     /// KATs and one-shot probes that want their results to land in
     /// `/diag-panic` alongside any later panic traces.
     pub fn diag_append(bytes: &[u8]) {
-        uni_backend::diag_append(bytes)
+        waitless_backend::diag_append(bytes)
     }
 
     /// Append a 16-char hex-encoded u64 (no `0x` prefix). Pairs with
     /// `diag_append` for format-free logging from boot-critical code
     /// paths.
     pub fn diag_append_hex(value: u64) {
-        uni_backend::diag_append_hex(value)
+        waitless_backend::diag_append_hex(value)
     }
 
     /// Append a 2-char hex-encoded u8. For dumps of byte windows
     /// where the u64 form would print 14 leading zeros per byte.
     pub fn diag_append_hex_u8(value: u8) {
-        uni_backend::diag_append_hex_u8(value)
+        waitless_backend::diag_append_hex_u8(value)
     }
 
     /// Snapshot the in-band diag-capture buffer (kernel panics +
@@ -420,18 +420,18 @@ pub mod diagnostics {
     /// (or the same core after recovery, if it didn't actually
     /// halt). See `kernel::diag` for the format.
     pub fn diag_snapshot(out: &mut [u8]) -> usize {
-        uni_backend::diag_snapshot(out)
+        waitless_backend::diag_snapshot(out)
     }
 
     /// Bytes captured so far. Cheap "is there anything to show?"
     /// check for the `/diag-panic` endpoint.
     pub fn diag_captured_len() -> usize {
-        uni_backend::diag_captured_len()
+        waitless_backend::diag_captured_len()
     }
 
     /// Reset the diag buffer to empty. Used by debugger workflows
     /// that want a fresh capture per repro iteration.
     pub fn diag_reset() {
-        uni_backend::diag_reset()
+        waitless_backend::diag_reset()
     }
 }

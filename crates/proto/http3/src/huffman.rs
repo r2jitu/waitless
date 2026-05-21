@@ -135,7 +135,7 @@ static mut TREE: Option<Tree> = None;
 
 /// Force the lazy Huffman tree to build now. Idempotent. Called
 /// from `http3::listen` so the ~4 KiB tree allocation lands
-/// in the heap *before* `uni::set_ready` snapshots HEAP_BASELINE
+/// in the heap *before* `waitless::set_ready` snapshots HEAP_BASELINE
 /// — without this, the first H3 request charges the alloc to
 /// the leak-check delta as a one-time first-use cost and trips
 /// `HEAP_LEAK_CHECK LEAK` for tests that run a single conn.

@@ -1,4 +1,4 @@
-// uni/net/src/error.rs — Facade-level net errors.
+// waitless/net/src/error.rs — Facade-level net errors.
 //
 // `NetError` (the top-level error for `Net::enable` / interface
 // bring-up) and `DhcpError` (DHCP-client failure modes) live here in

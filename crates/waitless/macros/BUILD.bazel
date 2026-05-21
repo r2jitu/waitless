@@ -3,6 +3,6 @@ load("//bazel/rules:rust.bzl", "rust_proc_macro")
 package(default_visibility = ["//visibility:public"])
 
 rust_proc_macro(
-    name = "uni_macros",
+    name = "waitless_macros",
     srcs = ["src/lib.rs"],
 )

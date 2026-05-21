@@ -8,7 +8,7 @@
 // Used for the "publish a fn pointer once at boot, read it from any
 // core later" pattern that recurs across the kernel / net / runtime.
 // Extracted from `kernel_bare::sync` into its own crate so downstream
-// consumers (`//crates/net:protocol`, `//crates/uni/net:driver`, `//uni:uni`
+// consumers (`//crates/net:protocol`, `//crates/waitless/net`, `//crates/waitless:waitless`
 // native backend, future `//util:*` hosts) can depend on it
 // without inheriting kernel's transitive deps (RustCrypto, talc,
 // …) — those pull in `panic=abort` crates that collide with

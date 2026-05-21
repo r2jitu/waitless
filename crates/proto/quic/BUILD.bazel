@@ -66,7 +66,7 @@ rust_library(
         "//crates/drivers/nic:api",
         "//crates/proto/tls",
         "//crates/runtime/executor",
-        "//crates/uni",
+        "//crates/waitless",
         "//crates/util/iobuf",
         "@crates//:aes-gcm",
         "@crates//:getrandom",

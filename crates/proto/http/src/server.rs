@@ -45,17 +45,17 @@ const IDLE_TIMEOUT_US: u64 = 30_000_000;
 /// closure is shared across every accepted connection (wrapped in
 /// `Arc` once internally) and the per-conn task awaits it inline,
 /// so a slow handler suspends only its own connection.
-pub fn listen<H>(port: u16, handler: H) -> Result<(), uni::runtime::TcpBindError>
+pub fn listen<H>(port: u16, handler: H) -> Result<(), waitless::runtime::TcpBindError>
 where
     H: for<'a, 'b> AsyncFn(
             &'a Request,
-            &'a mut BodyReader<'b, uni::runtime::TcpStream>,
+            &'a mut BodyReader<'b, waitless::runtime::TcpStream>,
         ) -> Response
         + Send
         + Sync
         + 'static,
 {
-    let listener = uni::runtime::TcpListener::bind(port)?;
+    let listener = waitless::runtime::TcpListener::bind(port)?;
     let handler = Arc::new(handler);
     let h = listener.run(move |stream| {
         let handler = Arc::clone(&handler);
@@ -63,7 +63,7 @@ where
             serve_conn(handler, stream).await;
         }
     });
-    uni::_retain(h);
+    waitless::_retain(h);
     Ok(())
 }
 
@@ -131,7 +131,7 @@ where
             return;
         }
         let recv_fut = stream.recv(&mut buf[buf_len..]);
-        let got = match uni::runtime::timeout_us(IDLE_TIMEOUT_US, recv_fut).await {
+        let got = match waitless::runtime::timeout_us(IDLE_TIMEOUT_US, recv_fut).await {
             Some(n) => n,
             None => return, // idle timeout
         };

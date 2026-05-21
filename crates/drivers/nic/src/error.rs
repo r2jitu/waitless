@@ -3,7 +3,7 @@
 // `NicError` is referenced by `NicOps` fn-pointer signatures, so it
 // has to live in the trait crate. The application-level error types
 // (`NetError`, `DhcpError`) used to live here too but moved to
-// `crates/uni/net/src/error.rs` — they're facade-level concerns, not
+// `crates/waitless/net/src/error.rs` — they're facade-level concerns, not
 // part of the driver ABI, and shouldn't be dragged into the build of
 // every NIC driver crate.
 //

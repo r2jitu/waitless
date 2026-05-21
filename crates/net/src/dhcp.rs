@@ -11,7 +11,7 @@
 // plus an `on_frame(&[u8])` hook let `net::net_receive` forward raw
 // frames here during bring-up because we couldn't bind port 68 via
 // the normal UDP path. That code is gone — everything DHCP needs
-// is available to any user of `uni::runtime::UdpSocket`.
+// is available to any user of `waitless::runtime::UdpSocket`.
 
 #![no_std]
 

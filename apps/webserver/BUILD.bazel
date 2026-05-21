@@ -11,7 +11,7 @@ package(default_visibility = ["//visibility:public"])
 # Deliberately depends on NO driver crate. `app` is compiled into
 # both the unikernel image and the native `webserver_bin`; any
 # `os:none`-only crate in its deps (the gve driver, once, for
-# `/stats` counters — now reached via `uni::diagnostics::gve_diag`)
+# `/stats` counters — now reached via `waitless::diagnostics::gve_diag`)
 # makes the native binary unbuildable. The `:test_native` variant
 # of `:test` below builds and runs `webserver_bin`, so `bazel test`
 # catches such a leak.
@@ -32,7 +32,7 @@ rust_library(
         "//crates/proto/http3",
         "//crates/proto/quic",
         "//crates/proto/tls",
-        "//crates/uni",
+        "//crates/waitless",
     ],
 )
 

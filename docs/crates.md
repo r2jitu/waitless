@@ -32,7 +32,7 @@ crates/
                   ethernet_send, arp, ipv4, ipv6, icmpv6, ndp, mac_resolve,
                   ipv6_send, classify, udp, dhcp
   proto/       tls/  quic/  http/  http3/
-  uni/         macros/  net/  backend/        (uni is the facade and
+  waitless/    macros/  net/  backend/        (waitless is the facade and
                                                 the parent of its
                                                 three satellites)
 ```
@@ -45,11 +45,11 @@ to live alongside the real apps under `apps/`.)
 
 1. **Directory tree.** Crates live at `crates/<domain>/<name>/` for
    most crates. Domains: `util crypto runtime kernel boot drivers net
-   proto`. The `uni` facade is special — it's BOTH a crate (at
-   `crates/uni/`) AND the parent of its three satellites
-   (`crates/uni/{macros, net, backend}/`). The satellites exist
-   solely to support uni (proc-macro pairing, cfg-gated net
-   re-export, cfg-gated platform impl), so nesting them under uni
+   proto`. The `waitless` facade is special — it's BOTH a crate (at
+   `crates/waitless/`) AND the parent of its three satellites
+   (`crates/waitless/{macros, net, backend}/`). The satellites exist
+   solely to support waitless (proc-macro pairing, cfg-gated net
+   re-export, cfg-gated platform impl), so nesting them under waitless
    honestly reflects that relationship. Kebab-case throughout.
 2. **Bazel target.** Default target = directory name. `//crates/net/tcp`
    is shorthand for `//crates/net/tcp:tcp`. No hyphenated explicit
@@ -59,9 +59,9 @@ to live alongside the real apps under `apps/`.)
    `gve`). Qualify with one domain word only when the bare name would
    shadow `std`/`core` or collide with a common external crate. Current
    qualified names: `net_types`, `net_checksum`, `net_from_bytes`,
-   `net_classify`, `kernel_core`, `net_stack`. The uni facade
-   family keeps the `uni_` prefix as a meaningful "satellite of uni"
-   marker: `uni`, `uni_macros`, `uni_net`. Two further carve-outs
+   `net_classify`, `kernel_core`, `net_stack`. The waitless facade
+   family keeps the `waitless_` prefix as a meaningful "satellite of waitless"
+   marker: `waitless`, `waitless_macros`, `waitless_net`. Two further carve-outs
    for external/internal collisions: `uni_aes_gcm` (RustCrypto's
    `aes-gcm` crate is pulled in via `@crates//:aes-gcm`). The kernel's
    os:none half is `kernel_bare`, chosen for sibling symmetry with
@@ -171,35 +171,35 @@ external `@crates//:...` deps are omitted for readability.
 
 | Crate | Deps |
 | --- | --- |
-| `uni_net` (`uni/net`) | `nic_api`; on `os:none` also `net_stack`. Defines `NetError`/`DhcpError` here (the facade-level errors); `NicError` re-exported from `nic_api`. |
-| `uni_macros` | proc-macro; no runtime deps |
+| `waitless_net` (`waitless/net`) | `nic_api`; on `os:none` also `net_stack`. Defines `NetError`/`DhcpError` here (the facade-level errors); `NicError` re-exported from `nic_api`. |
+| `waitless_macros` | proc-macro; no runtime deps |
 
 ### Tier 8 — facade backend
 
 | Crate | Deps |
 | --- | --- |
-| `uni_backend` (`uni/backend`) | `iobuf`, `worker`, `platform`, `executor`, `nic_api`; on `os:none` also `nic`, `kernel_bare`, `net_stack`, `tcp`, `gve` |
+| `waitless_backend` (`waitless/backend`) | `iobuf`, `worker`, `platform`, `executor`, `nic_api`; on `os:none` also `nic`, `kernel_bare`, `net_stack`, `tcp`, `gve` |
 
 ### Tier 9 — facade
 
 | Crate | Deps |
 | --- | --- |
-| `uni` | `uni_backend`, `uni_net`, `executor`, `worker`; on `os:none` also `kernel_bare`; proc-macro `uni_macros` |
+| `waitless` | `waitless_backend`, `waitless_net`, `executor`, `worker`; on `os:none` also `kernel_bare`; proc-macro `waitless_macros` |
 
 ### Tiers 10–13 — userspace network protocols
 
 | Crate | Tier | Deps |
 | --- | --- | --- |
-| `http` | 10 | `uni`, `iobuf`, `worker` |
-| `tls` | 11 | `uni`, `uni_aes_gcm`, `http`, `iobuf`, `worker`; on `os:none` also `kernel_bare` |
-| `quic` | 12 | `uni`, `iobuf`, `nic_api`, `executor`, `tls` |
-| `http3` | 13 | `uni`, `http`, `quic` |
+| `http` | 10 | `waitless`, `iobuf`, `worker` |
+| `tls` | 11 | `waitless`, `uni_aes_gcm`, `http`, `iobuf`, `worker`; on `os:none` also `kernel_bare` |
+| `quic` | 12 | `waitless`, `iobuf`, `nic_api`, `executor`, `tls` |
+| `http3` | 13 | `waitless`, `http`, `quic` |
 
 ### Tier 14 — boot entries + apps
 
-`crates/boot/entry` consumes the kernel, drivers, net stack, and `uni`
+`crates/boot/entry` consumes the kernel, drivers, net stack, and `waitless`
 to assemble the bare-metal entrypoint. Apps under `apps/` depend on
-`uni` plus the protocols they choose (`http`, `tls`, `quic`, `http3`).
+`waitless` plus the protocols they choose (`http`, `tls`, `quic`, `http3`).
 
 ## Three architectural cuts worth understanding
 
@@ -257,7 +257,7 @@ host-buildable.
 
 ## What goes above vs below the facade
 
-The `uni` facade is the kernel↔userspace boundary, structurally
+The `waitless` facade is the kernel↔userspace boundary, structurally
 equivalent to the syscall surface in a conventional OS. The rule:
 
 - **Below the facade** (`net/`, `drivers/`, `kernel/`): crates that
@@ -282,7 +282,7 @@ wire-format crates. Don't "fix" this by moving it up.
 
 ## Publishing
 
-Framework crates (`uni`, `tls`, `http`, `quic`, …) are not on
+Framework crates (`waitless`, `tls`, `http`, `quic`, …) are not on
 crates.io and won't be — they're welded to the `unikernel_binary`
 build and not consumable standalone; the protocol crates are coupled
 internally. crates.io is a library registry, not the right venue for

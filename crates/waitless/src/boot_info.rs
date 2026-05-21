@@ -1,7 +1,7 @@
-// uni/boot_info.rs — Read-only snapshot of boot-time facts.
+// waitless/boot_info.rs — Read-only snapshot of boot-time facts.
 //
 // Populated once per boot before `uni_init` runs; immutable thereafter.
-// Apps read it via `uni::boot_info()` to size per-core structures,
+// Apps read it via `waitless::boot_info()` to size per-core structures,
 // decide which NIC driver is active, log runtime identity, etc.
 //
 // The bare-metal side populates the struct from `boot/entry.rs` after

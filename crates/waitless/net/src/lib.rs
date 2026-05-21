@@ -1,6 +1,6 @@
 // `Net::enable` API + re-exports. The `NicOps` POD + link-time
 // registry live in the sibling `nic_api` leaf crate so NIC
-// drivers can depend there without forming a `drivers → uni` cycle.
+// drivers can depend there without forming a `drivers → waitless` cycle.
 
 #![no_std]
 
@@ -10,7 +10,7 @@ extern crate alloc;
 // type surfaced via `NetError::Nic`. The other `nic_api` items
 // (`NicOps`, `EthernetDriverReg`, `register_ethernet_driver`, …) are
 // the driver-author API; NIC crates depend on `nic_api` directly and
-// have no reason to reach for them through the `uni::net` facade.
+// have no reason to reach for them through the `waitless::net` facade.
 pub use nic_api::NicError;
 
 mod error;
@@ -21,7 +21,7 @@ pub use error::{DhcpError, NetError};
 // `net_stack::{bringup_dhcp, bringup_static}`) but DON'T
 // re-export `net_stack::*`. A glob re-export used to leak the
 // umbrella's internal lifecycle entry points (`init_stack`,
-// `ipv6_nd::init`, `net_receive`, `poll`) into `uni::net::*`, where
+// `ipv6_nd::init`, `net_receive`, `poll`) into `waitless::net::*`, where
 // no app should reach them. Apps that want raw protocol-layer access
 // can add an enumerated re-export here when there's a concrete
 // consumer; no app currently uses one.
@@ -75,9 +75,9 @@ pub struct Net {
 
 // ---- NET slot --------------------------------------------------------------
 //
-// Mirrors the `APP_SLOT` pattern in `uni/lib.rs`: a single static
+// Mirrors the `APP_SLOT` pattern in `waitless/lib.rs`: a single static
 // holding `Option<Box<Net>>`, written only on the boot CPU, cleared
-// only from `uni::shutdown_and_drop` (also BSP).
+// only from `waitless::shutdown_and_drop` (also BSP).
 
 struct NetCell(UnsafeCell<Option<alloc::boxed::Box<Net>>>);
 
@@ -90,7 +90,7 @@ impl NetCell {
 // SAFETY: every read/write of `NET` is on the boot CPU:
 //   - `Net::enable` runs from `uni_init` (BSP on unikernel, main
 //     thread on native).
-//   - `clear_on_shutdown` runs from `uni::shutdown_and_drop`, called
+//   - `clear_on_shutdown` runs from `waitless::shutdown_and_drop`, called
 //     only from the BSP shutdown branch of the kernel event loop.
 unsafe impl Sync for NetCell {}
 
@@ -235,7 +235,7 @@ pub fn is_enabled() -> bool {
     unsafe { (*NET.0.get()).is_some() }
 }
 
-/// Clear the NET slot. Called from `uni::shutdown_and_drop` on the
+/// Clear the NET slot. Called from `waitless::shutdown_and_drop` on the
 /// graceful-shutdown path so a re-entrant runtime (native's
 /// `main` → rerun) sees a fresh slot. Idempotent.
 pub fn clear_on_shutdown() {
@@ -287,7 +287,7 @@ async fn bringup(_cfg: NetBringUp) -> Result<(), NetError> {
     Ok(())
 }
 
-/// `uni_net::Ipv4Addr` → bare-metal `net_types::Ipv4Addr`. Kept as a
+/// `waitless_net::Ipv4Addr` → bare-metal `net_types::Ipv4Addr`. Kept as a
 /// standalone helper rather than a `From` impl so we don't need a
 /// cross-crate orphan dance.
 #[cfg(target_os = "none")]

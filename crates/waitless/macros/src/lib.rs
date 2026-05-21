@@ -1,8 +1,8 @@
-// uni/macros/lib.rs — Proc macro for `#[uni::init]`.
+// waitless/macros/lib.rs — Proc macro for `#[waitless::init]`.
 //
 // The platform entry point is a Rust-ABI symbol named `uni_init`
 // with `#[no_mangle]` so boot/entry.rs (bare-metal) and
-// crates/uni/backend/src/native/mod.rs can resolve it at link time. Since
+// crates/waitless/backend/src/native/mod.rs can resolve it at link time. Since
 // both sides are Rust and the function takes no args / returns
 // nothing, there's no point pretending this is an FFI boundary —
 // `extern "C"` is unnecessary ceremony.
@@ -19,7 +19,7 @@
 // (with its deferred-kick workaround) goes away entirely.
 //
 // Why the macro spawns (not the bare-metal / native entry points):
-// there's exactly one `#[uni::init]` per binary and it's the only
+// there's exactly one `#[waitless::init]` per binary and it's the only
 // place that has the user's async body in Rust scope. Handing a
 // `Pin<Box<dyn Future>>` across the entry-point boundary would
 // need either FFI-over-futures or a link-time registry for a
@@ -49,7 +49,7 @@ pub fn init(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Wrap the user's body in an async block that installs the
     // shutdown hook + signals readiness as a final step. Listener
-    // handles registered via `uni::tcp_listen` etc. live in the
+    // handles registered via `waitless::tcp_listen` etc. live in the
     // runtime's leak slot; nothing else needs to happen on the
     // user's part once `init()` returns.
     let body_call = if is_async { "init().await" } else { "init()" };
@@ -60,11 +60,11 @@ pub fn init(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 #[unsafe(no_mangle)]
 pub fn uni_init() {{
-    let _ = ::uni::runtime::spawn(async move {{
+    let _ = ::waitless::runtime::spawn(async move {{
         {body_call};
-        ::uni::_install_shutdown_hook();
-        ::uni::set_ready();
-        ::uni::log(b"ready\n");
+        ::waitless::_install_shutdown_hook();
+        ::waitless::set_ready();
+        ::waitless::log(b"ready\n");
     }});
 }}
 "#,

@@ -1,4 +1,4 @@
-// crates/uni/backend/src/native/tcp.rs — POSIX TCP backend.
+// crates/waitless/backend/src/native/tcp.rs — POSIX TCP backend.
 //
 // One nonblocking listen fd per port, registered in every worker's
 // kqueue/epoll. When a SYN arrives, whichever worker's event queue
@@ -42,7 +42,7 @@ struct AsyncTcpListener {
 
 struct AsyncTcpListenersCell(UnsafeCell<[Option<AsyncTcpListener>; MAX_ASYNC_TCP_LISTENERS]>);
 // SAFETY: populated only on the main thread during `uni_init`
-// (via `async_tcp_listen_hook` from `uni::runtime::TcpListener::bind`);
+// (via `async_tcp_listen_hook` from `waitless::runtime::TcpListener::bind`);
 // read from workers afterwards without further mutation.
 unsafe impl Sync for AsyncTcpListenersCell {}
 static ASYNC_TCP_LISTENERS: AsyncTcpListenersCell =

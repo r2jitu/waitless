@@ -5,7 +5,7 @@ package(default_visibility = ["//visibility:public"])
 
 # `Net::enable`, facade-level error types (NetError, DhcpError), and
 # the bare-metal net umbrella facade. Re-exports `nic_api`'s `NicOps`
-# / `NicError` etc. so apps see them under `uni::net`. On `os:none`
+# / `NicError` etc. so apps see them under `waitless::net`. On `os:none`
 # also pulls the full L2-L4 stack.
 rust_library(
     name = "net",
@@ -13,7 +13,7 @@ rust_library(
         "src/error.rs",
         "src/lib.rs",
     ],
-    crate_name = "uni_net",
+    crate_name = "waitless_net",
     crate_root = "src/lib.rs",
     deps = ["//crates/drivers/nic:api"] + select({
         "//bazel/platforms:native": [],

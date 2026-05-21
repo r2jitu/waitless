@@ -54,7 +54,7 @@ impl From<QuicListenError> for ListenError {
 /// acceptor` accepts.
 ///
 /// Returns once the server is bound; the listener stays alive for
-/// the duration of the program (uni's task system retains it).
+/// the duration of the program (waitless's task system retains it).
 pub fn listen<H>(
     port: u16,
     handler: H,
@@ -94,7 +94,7 @@ where
             handle_conn(conn, handler).await;
         }
     })?;
-    uni::_retain(listener);
+    waitless::_retain(listener);
     Ok(())
 }
 

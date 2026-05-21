@@ -99,7 +99,7 @@ pub fn init_stack() {
     ipv4::init();
     ipv6_nd::init();
 
-    // Wire up the async `uni::runtime::TcpListener` reactor and
+    // Wire up the async `waitless::runtime::TcpListener` reactor and
     // the per-stream recv/send reactors — all via a single backend
     // vtable. Listening requires one slot per core (each core
     // owns its own per-port accept pool); accept reads the
@@ -131,7 +131,7 @@ fn tcp_backend_accept(port: u16) -> executor::reactor::TcpStream {
 }
 
 // ============================================================================
-// IP-config bring-up primitives — `uni::net::Net::enable` dispatches here.
+// IP-config bring-up primitives — `waitless::net::Net::enable` dispatches here.
 // ============================================================================
 
 /// Returns `true` on success, `false` on DHCP timeout.

@@ -142,7 +142,7 @@ impl<'a, T> Drop for SpinlockGuard<'a, T> {
 // ============================================================================
 //
 // The implementation lives in `//util:atomic_fn` (crate
-// `atomic_fn`): `uni/lib.rs`'s native IO-poll slots and a few
+// `atomic_fn`): `waitless/lib.rs`'s native IO-poll slots and a few
 // other indirection points share the same pattern but can't
 // depend on `//crates/kernel/bare` without inheriting the RustCrypto / talc
 // deps that break `rust_test`'s panic=unwind. A no-dep leaf

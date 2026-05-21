@@ -10,13 +10,13 @@
 extern crate alloc;
 
 use http::{Request, Response};
-use uni::net::Net;
+use waitless::net::Net;
 
-async fn hello(_: &Request, _: &mut http::BodyReader<'_, uni::runtime::TcpStream>) -> Response {
+async fn hello(_: &Request, _: &mut http::BodyReader<'_, waitless::runtime::TcpStream>) -> Response {
     Response::ok(b"text/plain", b"Hello from bare metal!\n")
 }
 
-#[uni::init]
+#[waitless::init]
 async fn init() {
     Net::up().await.expect("Net::up failed");
     http::listen(80, hello).expect("http bind");

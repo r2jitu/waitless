@@ -4,7 +4,7 @@
 // Each section lives at its own URL (`/`, `/architecture`,
 // `/network`, `/tls`, `/quic`, `/diagnostics`).
 //
-// `#[uni::init]` is the entry point. The macro spawns the body as
+// `#[waitless::init]` is the entry point. The macro spawns the body as
 // a task; once it returns, listeners (registered via the `listen`
 // helpers) keep running for the lifetime of the process. Shutdown
 // (SIGINT / serial Ctrl-C) tears every retained listener down and
@@ -26,8 +26,8 @@
 extern crate alloc;
 
 use http::{IOBufChain, Request, Response};
-use uni::net::Net;
-use uni::runtime::{TcpStream, UdpClient};
+use waitless::net::Net;
+use waitless::runtime::{TcpStream, UdpClient};
 
 // HTML site (the `page_*` views + shared shell) and the machine-
 // facing data/diagnostic endpoints each live in their own module;
@@ -53,7 +53,7 @@ const DEV_KEY_PKCS8_DER: &[u8] = include_bytes!("../dev_certs/dev_key.der");
 
 // ---- Boot -------------------------------------------------------------------
 
-#[uni::init]
+#[waitless::init]
 async fn init() {
     log_boot_info();
 
@@ -69,14 +69,14 @@ async fn init() {
     // for operators with serial access. Cheap (~few µs); safe to
     // run once per boot.
     {
-        use uni::diagnostics as diag;
+        use waitless::diagnostics as diag;
         match tls::aead::rfc8439_kat() {
             Ok(()) => {
-                uni::println!("aead-kat: ok");
+                waitless::println!("aead-kat: ok");
                 diag::diag_append(b"aead-kat: ok\n");
             }
             Err(f) => {
-                uni::println!(
+                waitless::println!(
                     "aead-kat: FAIL at byte {}: expected=0x{:02x} got=0x{:02x}",
                     f.first_diverge_at,
                     f.expected,
@@ -107,11 +107,11 @@ async fn init() {
         // `aes_gcm_fast::tests::matches_aes_gcm_crate_roundtrip`.
         match tls::aead::aes_gcm_fast_kat() {
             Ok(()) => {
-                uni::println!("aead-fast-kat: ok");
+                waitless::println!("aead-fast-kat: ok");
                 diag::diag_append(b"aead-fast-kat: ok\n");
             }
             Err(f) => {
-                uni::println!(
+                waitless::println!(
                     "aead-fast-kat: FAIL at byte {}: expected=0x{:02x} got=0x{:02x}",
                     f.first_diverge_at,
                     f.expected,
@@ -137,12 +137,12 @@ async fn init() {
     let net = Net::up().await.expect("Net::up failed");
     let backend_ip = net.gateway().0;
 
-    uni::udp_listen(7, udp_echo).expect("udp echo bind");
-    uni::println!("listen udp://:7 (echo)");
-    uni::tcp_listen(9, tcp_echo).expect("tcp echo bind");
-    uni::println!("listen tcp://:9 (echo)");
-    uni::tcp_listen(GATEWAY_PORT, move |s| gateway(s, backend_ip)).expect("gateway bind");
-    uni::println!(
+    waitless::udp_listen(7, udp_echo).expect("udp echo bind");
+    waitless::println!("listen udp://:7 (echo)");
+    waitless::tcp_listen(9, tcp_echo).expect("tcp echo bind");
+    waitless::println!("listen tcp://:9 (echo)");
+    waitless::tcp_listen(GATEWAY_PORT, move |s| gateway(s, backend_ip)).expect("gateway bind");
+    waitless::println!(
         "listen tcp://:{} (gateway → udp://{}.{}.{}.{}:{})",
         GATEWAY_PORT,
         backend_ip[0],
@@ -152,7 +152,7 @@ async fn init() {
         GATEWAY_BACKEND_PORT
     );
     http::listen(HTTP_PORT, handle_request).expect("http bind");
-    uni::println!("listen tcp://:{} (http)", HTTP_PORT);
+    waitless::println!("listen tcp://:{} (http)", HTTP_PORT);
 
     let h3_up = match http3::listen(
         HTTPS_PORT,
@@ -161,11 +161,11 @@ async fn init() {
         DEV_KEY_PKCS8_DER,
     ) {
         Ok(()) => {
-            uni::println!("listen udp://:{} (h3, TLS_AES_128_GCM_SHA256)", HTTPS_PORT);
+            waitless::println!("listen udp://:{} (h3, TLS_AES_128_GCM_SHA256)", HTTPS_PORT);
             true
         }
         Err(_) => {
-            uni::println!("[WARN] h3 disabled (cert/key invalid or bind failed)");
+            waitless::println!("[WARN] h3 disabled (cert/key invalid or bind failed)");
             false
         }
     };
@@ -185,11 +185,11 @@ async fn init() {
         DEV_CERT_DER,
         DEV_KEY_PKCS8_DER,
     ) {
-        Ok(()) => uni::println!(
+        Ok(()) => waitless::println!(
             "listen tcp://:{} (https, TLS_AES_128_GCM_SHA256)",
             HTTPS_PORT
         ),
-        Err(_) => uni::println!("[WARN] https disabled (cert/key invalid)"),
+        Err(_) => waitless::println!("[WARN] https disabled (cert/key invalid)"),
     }
 }
 
@@ -285,7 +285,7 @@ async fn handle_request_h3(req: Request, body: &mut http::BufferedBody<'_>) -> R
 
 // ---- Listener bodies --------------------------------------------------------
 
-async fn udp_echo(sock: alloc::sync::Arc<uni::runtime::UdpSocket>) {
+async fn udp_echo(sock: alloc::sync::Arc<waitless::runtime::UdpSocket>) {
     let mut buf = [0u8; 1500];
     loop {
         let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
@@ -304,7 +304,7 @@ async fn tcp_echo(mut stream: TcpStream) {
         // TX with no intermediate copy on bare-metal. Contrast the
         // old `recv` + `send_bytes`: device buf → `buf` → TX,
         // two copies.
-        let guard = match uni::runtime::timeout_us(30_000_000, stream.recv_chunk()).await {
+        let guard = match waitless::runtime::timeout_us(30_000_000, stream.recv_chunk()).await {
             Some(Some(g)) => g,
             // inner `None`: peer close / EOF. outer `None`: idle
             // timeout. Either ends the connection.
@@ -319,7 +319,7 @@ async fn tcp_echo(mut stream: TcpStream) {
 }
 
 async fn gateway(mut stream: TcpStream, backend_ip: [u8; 4]) {
-    let backend = uni::runtime::IpAddr::V4(uni::runtime::Ipv4Addr {
+    let backend = waitless::runtime::IpAddr::V4(waitless::runtime::Ipv4Addr {
         addr: u32::from_ne_bytes(backend_ip),
     });
     let Ok(udp) = UdpClient::connect(backend, GATEWAY_BACKEND_PORT) else {
@@ -411,7 +411,7 @@ async fn handle_request<S: http::HttpStream>(
         }
         b"/diag-panic" => diag_panic_response(),
         b"/diag-panic-reset" => {
-            uni::diagnostics::diag_reset();
+            waitless::diagnostics::diag_reset();
             Response::ok(b"text/plain; charset=utf-8", b"diag reset\n")
         }
         b"/diag-gve" => diag_gve_response(),
@@ -421,8 +421,8 @@ async fn handle_request<S: http::HttpStream>(
 }
 
 fn log_boot_info() {
-    let bi = uni::boot_info();
-    uni::println!(
+    let bi = waitless::boot_info();
+    waitless::println!(
         "app: ram={}MB cpus={} nics={}",
         bi.ram_bytes / (1024 * 1024),
         bi.num_cpus,

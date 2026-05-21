@@ -161,7 +161,7 @@ def _expand_launcher(ctx, substitutions):
 #
 # Env-var override name is derived as `UNIKERNEL_<PROTO>_<GUEST>`
 # (e.g. `UNIKERNEL_TCP_80`). Same convention is honored by the
-# native binary (`uni::native`), so users override the host port
+# native binary (`waitless::native`), so users override the host port
 # the same way regardless of runner. Bash-style default expansion
 # — `${…:-<host>}` — falls back to the BUILD-declared default.
 
@@ -200,7 +200,7 @@ def _build_native_port_envs(port_forwards):
     """Build native launcher `export UNIKERNEL_<PROTO>_<GUEST>=…` block.
 
     Native has no separate runner — `read_port_env` in
-    `uni-backend/src/native/{tcp,udp}.rs` reads the env var per-listen
+    `waitless-backend/src/native/{tcp,udp}.rs` reads the env var per-listen
     — so the launcher just exports each forward with a `${VAR:-host}`
     default and execs the underlying rust_binary. Caller-set env wins,
     matching the HVF / QEMU launchers' shell-expansion semantic.

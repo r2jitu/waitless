@@ -225,13 +225,13 @@ enum ChunkSource<'a> {
     /// must not be mutated while the chunk is live.
     Prebuf(IOBuf, PhantomData<&'a mut ()>),
     /// Body bytes past the prebuf: the transport's own buffer, held
-    /// behind the [`RecvChunkGuard`](uni::runtime::RecvChunkGuard)
+    /// behind the [`RecvChunkGuard`](waitless::runtime::RecvChunkGuard)
     /// that `stream.recv_chunk()` surfaced (which already carries
     /// the `&'a mut` borrow). `len` is the delivered byte count —
     /// equal to the surfaced chunk length except when a chunk
     /// straddles the `Content-Length` boundary, where it is capped.
     Stream {
-        guard: uni::runtime::RecvChunkGuard<'a>,
+        guard: waitless::runtime::RecvChunkGuard<'a>,
         len: usize,
     },
 }

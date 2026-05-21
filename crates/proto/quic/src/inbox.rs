@@ -35,7 +35,7 @@ use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
-use uni::runtime::AsyncEvent;
+use waitless::runtime::AsyncEvent;
 
 /// One inbound UDP datagram waiting to be processed by a
 /// connection task. Owned `Vec<u8>` rather than a borrow into a
@@ -44,7 +44,7 @@ use uni::runtime::AsyncEvent;
 /// copy.
 #[derive(Clone)]
 pub struct Datagram {
-    pub src_ip: uni::runtime::IpAddr,
+    pub src_ip: waitless::runtime::IpAddr,
     pub src_port: u16,
     pub bytes: Vec<u8>,
 }
@@ -231,7 +231,7 @@ struct Slot {
     /// spoofing a single source) cannot consume more than
     /// `PER_IP_SLOT_LIMIT` slots, leaving room for legitimate
     /// new connections from other peers.
-    src_ip: uni::runtime::IpAddr,
+    src_ip: waitless::runtime::IpAddr,
     /// Free-list link. `NULL_SLOT` when this slot is allocated;
     /// otherwise the index of the next free slot in the chain
     /// (or `NULL_SLOT` for end-of-list). The pool's `free_head`
@@ -244,7 +244,7 @@ impl Default for Slot {
         Slot {
             generation: 0,
             inbox: None,
-            src_ip: uni::runtime::IpAddr::V4_ANY,
+            src_ip: waitless::runtime::IpAddr::V4_ANY,
             next_free: NULL_SLOT,
         }
     }
@@ -263,10 +263,10 @@ const NULL_SLOT: u16 = 0xFFFF;
 /// types don't), so we go through this fold for the per-IP
 /// counter map. The top bit distinguishes v4 (0) from v6 (1) so
 /// the v4 0.0.0.0 → 0u128 fold can't collide with v6 ::0.
-fn ip_key(ip: uni::runtime::IpAddr) -> u128 {
+fn ip_key(ip: waitless::runtime::IpAddr) -> u128 {
     match ip {
-        uni::runtime::IpAddr::V4(a) => a.addr as u128,
-        uni::runtime::IpAddr::V6(a) => (1u128 << 127) | u128::from_be_bytes(a.octets),
+        waitless::runtime::IpAddr::V4(a) => a.addr as u128,
+        waitless::runtime::IpAddr::V6(a) => (1u128 << 127) | u128::from_be_bytes(a.octets),
     }
 }
 
@@ -429,7 +429,7 @@ impl SlotTable {
     /// pop. The previous implementation walked every slot on every
     /// allocate to find the first dead slot AND count per-IP
     /// usage in one pass; both walks are gone.
-    pub fn allocate(&self, src_ip: uni::runtime::IpAddr) -> Option<(u16, u16)> {
+    pub fn allocate(&self, src_ip: waitless::runtime::IpAddr) -> Option<(u16, u16)> {
         const PER_IP_SLOT_LIMIT: u16 = 64;
         // Global cap — reject before bumping any state.
         if self.live.get() >= self.max_capacity {
@@ -617,7 +617,7 @@ mod tests {
 
     fn dgram(byte: u8) -> Datagram {
         Datagram {
-            src_ip: uni::runtime::IpAddr::V4(uni::runtime::Ipv4Addr {
+            src_ip: waitless::runtime::IpAddr::V4(waitless::runtime::Ipv4Addr {
                 addr: u32::from_ne_bytes([127, 0, 0, 1]),
             }),
             src_port: 5000,
@@ -654,8 +654,8 @@ mod tests {
         assert!(!inbox.push(dgram(0x02)));
     }
 
-    fn ip(b: u8) -> uni::runtime::IpAddr {
-        uni::runtime::IpAddr::V4(uni::runtime::Ipv4Addr {
+    fn ip(b: u8) -> waitless::runtime::IpAddr {
+        waitless::runtime::IpAddr::V4(waitless::runtime::Ipv4Addr {
             addr: u32::from_be_bytes([10, 0, 0, b]),
         })
     }

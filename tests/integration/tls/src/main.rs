@@ -18,7 +18,7 @@ use ::tls::aead as tls_crypto;
 use ::tls::schedule as tls;
 
 fn logn(msg: &[u8]) {
-    uni::log(msg);
+    waitless::log(msg);
 }
 
 fn pass(name: &[u8]) {
@@ -33,7 +33,7 @@ fn fail(name: &[u8]) {
     logn(b"\n");
 }
 
-#[uni::init]
+#[waitless::init]
 fn init() {
     logn(b"TLS 1.3 primitive test starting.\n");
 
@@ -302,7 +302,7 @@ fn init() {
         }
     }
 
-    // ---- 6. uni::rng — fill_bytes produces non-trivial output ------
+    // ---- 6. waitless::rng — fill_bytes produces non-trivial output ------
     // Smoke-tests the platform-appropriate entropy source: on
     // unikernel that's the kernel's SHA-256 hash-chain PRNG seeded
     // from TSC/CNTVCT + RDRAND; on native it's getentropy(2). We can't
@@ -312,8 +312,8 @@ fn init() {
     {
         let mut buf1 = [0u8; 32];
         let mut buf2 = [0u8; 32];
-        uni::rng::fill_bytes(&mut buf1);
-        uni::rng::fill_bytes(&mut buf2);
+        waitless::rng::fill_bytes(&mut buf1);
+        waitless::rng::fill_bytes(&mut buf2);
 
         let nonzero = buf1.iter().any(|&b| b != 0);
         let differ = buf1 != buf2;

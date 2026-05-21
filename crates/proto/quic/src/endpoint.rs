@@ -47,7 +47,7 @@ use core::future::Future;
 
 use crate::wire::{FIXED_BIT, HEADER_FORM_LONG, long_packet_type, parse_long_header_preamble};
 
-use uni::runtime::{AsyncEvent, UdpSocket, spawn};
+use waitless::runtime::{AsyncEvent, UdpSocket, spawn};
 
 use crate::conn::{ConnError, ConnState, Connection, ConnectionId, DatagramBuf};
 use crate::inbox::{
@@ -74,7 +74,7 @@ use tls::TlsServerConfig;
 fn ship_datagram(
     sock: &UdpSocket,
     conn: &RefCell<Connection>,
-    peer_ip: uni::runtime::IpAddr,
+    peer_ip: waitless::runtime::IpAddr,
     peer_port: u16,
     pkt: DatagramBuf,
 ) {
@@ -103,16 +103,16 @@ pub const SLOTS_PER_WORKER: usize = 1024;
 #[derive(Debug)]
 pub enum QuicListenError {
     /// UDP bind failed (port in use, registry full, …).
-    Bind(uni::runtime::UdpBindError),
+    Bind(waitless::runtime::UdpBindError),
     /// Cert / key parse failure.
     CertOrKey,
 }
 
 /// Handle returned by `quic_listen`. Drops the listener (and all
 /// active connections) when this falls out of scope. Same pattern
-/// as `uni::runtime::UdpHandle` / `TcpHandle`.
+/// as `waitless::runtime::UdpHandle` / `TcpHandle`.
 pub struct QuicListener {
-    _udp: uni::runtime::UdpHandle,
+    _udp: waitless::runtime::UdpHandle,
 }
 
 /// Public per-connection handle the user's handler closure
@@ -137,7 +137,7 @@ pub struct QuicConn {
     /// Peer 4-tuple. Updated by the conn task on every inbound
     /// datagram so connection migration "just works" — handler
     /// reads the latest values when it sends a reply.
-    peer_ip: Rc<Cell<uni::runtime::IpAddr>>,
+    peer_ip: Rc<Cell<waitless::runtime::IpAddr>>,
     peer_port: Rc<Cell<u16>>,
     /// Wakes the handler when the conn task ingested an inbound
     /// datagram (new stream data may be available, conn state
@@ -327,7 +327,7 @@ impl QuicConn {
 /// (the app's main struct, leaked into a static, etc.) so the
 /// listener persists.
 ///
-/// **Per-worker shape:** internally calls `uni::runtime::udp_listen`
+/// **Per-worker shape:** internally calls `waitless::runtime::udp_listen`
 /// with a per-worker body. Each worker gets its own `SlotTable` and
 /// its own listener loop; QUIC connections stay pinned to the
 /// worker that received their first Initial.
@@ -650,7 +650,7 @@ where
     // iteration and refresh last_recv there).
     conn.borrow_mut().set_last_recv_now();
     let progress = Rc::new(AsyncEvent::new());
-    let peer_ip: Rc<Cell<uni::runtime::IpAddr>> = Rc::new(Cell::new(uni::runtime::IpAddr::V4_ANY));
+    let peer_ip: Rc<Cell<waitless::runtime::IpAddr>> = Rc::new(Cell::new(waitless::runtime::IpAddr::V4_ANY));
     let peer_port: Rc<Cell<u16>> = Rc::new(Cell::new(0));
     let mut handler_spawned = false;
 
@@ -685,11 +685,11 @@ where
         };
         let remaining = timer_deadline.saturating_sub(now).max(1);
 
-        let dgram = match uni::runtime::select(inbox.pop(), uni::runtime::sleep_us(remaining)).await
+        let dgram = match waitless::runtime::select(inbox.pop(), waitless::runtime::sleep_us(remaining)).await
         {
-            uni::runtime::Either::Left(Some(d)) => d,
-            uni::runtime::Either::Left(None) => break, // inbox closed
-            uni::runtime::Either::Right(()) => {
+            waitless::runtime::Either::Left(Some(d)) => d,
+            waitless::runtime::Either::Left(None) => break, // inbox closed
+            waitless::runtime::Either::Right(()) => {
                 // Timer fired. Distinguish PTO vs idle by which
                 // deadline was earlier and is now in the past.
                 let after = tls::ticket::now_us();

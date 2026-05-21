@@ -166,7 +166,7 @@ pub fn close(handle: *mut (), generation: u16) {
 }
 
 /// RST every active connection in every core's pool. Called from
-/// `uni::shutdown_and_drop` so the peer sees an immediate close
+/// `waitless::shutdown_and_drop` so the peer sees an immediate close
 /// instead of a silently-vanishing VM (which would only time out
 /// via TCP keepalive — minutes later). Walks every slot once,
 /// emits one RST per non-Closed/Listen conn, frees the slot.

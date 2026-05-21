@@ -1,5 +1,5 @@
 module(
-    name = "unikernel",
+    name = "waitless",
     version = "0.1.0",
     compatibility_level = 1,
 )
@@ -151,13 +151,13 @@ crate.from_cargo(
     # We deliberately do NOT also set crate_universe's own
     # `lockfile = "//:cargo-bazel-lock.json"` JSON cache. That file
     # carries a `checksum` computed over the Cargo manifest *labels*,
-    # and those labels differ depending on whether unikernel is the
+    # and those labels differ depending on whether waitless is the
     # root module (`//:Cargo.toml`) or a dependency of an external app
-    # (`@@unikernel+//:Cargo.toml`). A committed JSON lockfile can
+    # (`@@waitless+//:Cargo.toml`). A committed JSON lockfile can
     # therefore never match when an external app builds against
-    # unikernel: crate_universe would either hard-fail on the checksum
+    # waitless: crate_universe would either hard-fail on the checksum
     # mismatch or — with `CARGO_BAZEL_REPIN` — rewrite the committed
-    # file and corrupt it for unikernel's own builds. `Cargo.Bazel.lock`
+    # file and corrupt it for waitless's own builds. `Cargo.Bazel.lock`
     # is context-independent, so it is the only lockfile we commit.
     cargo_lockfile = "//:Cargo.Bazel.lock",
     manifests = [

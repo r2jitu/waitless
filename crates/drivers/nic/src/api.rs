@@ -498,7 +498,7 @@ pub struct EthernetDriverReg {
     pub ops: &'static NicOps,
 }
 
-/// Register a driver with `uni_net` at link time. Expands to a
+/// Register a driver with `waitless_net` at link time. Expands to a
 /// `static EthernetDriverReg` in the `.uni_drivers_ethernet` section;
 /// `init()` discovers it via section-boundary symbols.
 ///

@@ -1,7 +1,7 @@
 // kernel_core/rng.rs — host-buildable RNG link seam.
 //
 // `fill_bytes` is the entropy entry point for the host-buildable
-// crates that sit below `//uni` and so cannot reach the `uni::rng`
+// crates that sit below `//crates/waitless` and so cannot reach the `waitless::rng`
 // seam — chiefly `tcp`, which draws its TCP initial sequence
 // number here.
 //
@@ -17,7 +17,7 @@
 //   * host build → a deterministic SplitMix64 stream. RNG-dependent
 //     unit tests (a `tcp_receive` conformance harness asserting on
 //     the server's ISN) want a reproducible sequence, not real
-//     entropy — this is the deliberate difference from `uni::rng`,
+//     entropy — this is the deliberate difference from `waitless::rng`,
 //     whose host branch calls `getentropy(2)`.
 
 /// Fill `dest` with random bytes.

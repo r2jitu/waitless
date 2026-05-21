@@ -65,7 +65,7 @@ trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
 # The inner `//...` wildcard under unikernel relies on two bazel
 # rules marking their targets incompatible with `os:none`:
 #   - `rust_proc_macro` in `//bazel/rules:rust.bzl` (otherwise
-#     `//uni/macros` resolves to the `*-unknown-none` rust toolchain
+#     `//crates/waitless/macros` resolves to the `*-unknown-none` rust toolchain
 #     and can't build a proc-macro).
 #   - `unikernel_app_test` py_test variants in `//bazel/rules:variants.bzl`
 #     (no default_test_toolchain is registered for bare-metal).

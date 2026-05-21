@@ -39,7 +39,7 @@ use super::{
 //
 // Accepted connections are returned as `TcpStream(*mut ())` —
 // the same opaque handle `backend::tcp_accept` returns today.
-// Higher layers wrap it into `uni::TcpStream` for the typed API.
+// Higher layers wrap it into `waitless::TcpStream` for the typed API.
 
 /// Static cap on concurrently bound TCP listening ports. Sized to
 /// match `MAX_UDP_SOCKETS` so the two registries scale together.

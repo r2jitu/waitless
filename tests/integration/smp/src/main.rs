@@ -4,7 +4,7 @@
 
 #![no_std]
 
-#[uni::init]
+#[waitless::init]
 fn init() {
     // Wait until every configured core has come up. The kernel's
     // `start_secondary_cores` no longer waits BSP-side, so we
@@ -14,10 +14,10 @@ fn init() {
     // are guaranteed to be in the serial log when the test driver
     // captures it).
     if !kernel_bare::wait_for_cores_online(2_000_000) {
-        uni::log(b"SMP test: not all cores came up within 2 s\n");
+        waitless::log(b"SMP test: not all cores came up within 2 s\n");
     }
 
-    uni::log(b"SMP test: cores booted.\n");
+    waitless::log(b"SMP test: cores booted.\n");
 
     // Test IPI: core 0 sends SGI to core 1, check that it was received
     #[cfg(target_arch = "aarch64")]
@@ -45,11 +45,11 @@ fn init() {
 
         let after = kernel_bare::aarch64::smp::ipi_count();
         if after > before {
-            uni::log(b"IPI test: PASS (SGI delivered to core 1)\n");
+            waitless::log(b"IPI test: PASS (SGI delivered to core 1)\n");
         } else {
-            uni::log(b"IPI test: FAIL (SGI not received)\n");
+            waitless::log(b"IPI test: FAIL (SGI not received)\n");
         }
     }
 
-    uni::log(b"SMP test complete. Shutting down.\n");
+    waitless::log(b"SMP test complete. Shutting down.\n");
 }

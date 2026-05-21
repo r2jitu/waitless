@@ -97,7 +97,7 @@ pub fn generate(
     }
 
     // /chosen — kernel command line. Kernel reads `bootargs` and
-    // exposes it as `uni::boot_info().boot_args`. Apps key
+    // exposes it as `waitless::boot_info().boot_args`. Apps key
     // configuration (e.g. `quic.log=events`) off this string. Empty
     // bootargs are still emitted as an empty `bootargs = "";`
     // property — the kernel's parser tolerates either form, but

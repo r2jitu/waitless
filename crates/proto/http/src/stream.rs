@@ -51,7 +51,7 @@ pub trait HttpStream {
     /// request body to the HTTP layer pre-buffered ([`NullStream`],
     /// the HTTP/3 case) has no streaming chunk path, and
     /// `BodyReader` then serves the body from its prebuf alone.
-    /// `uni::runtime::TcpStream` and `tls::TlsStream` override
+    /// `waitless::runtime::TcpStream` and `tls::TlsStream` override
     /// this with their real `recv_chunk` implementations.
     ///
     /// `&mut self` is load-bearing, not incidental — the returned
@@ -59,8 +59,8 @@ pub trait HttpStream {
     /// the transport cannot re-read (hence overwrite) the surfaced
     /// buffer while the chunk is still held. See item F's write-up.
     ///
-    /// [`RecvChunkGuard`]: uni::runtime::RecvChunkGuard
-    async fn recv_chunk(&mut self) -> Option<uni::runtime::RecvChunkGuard<'_>> {
+    /// [`RecvChunkGuard`]: waitless::runtime::RecvChunkGuard
+    async fn recv_chunk(&mut self) -> Option<waitless::runtime::RecvChunkGuard<'_>> {
         None
     }
 
@@ -128,19 +128,19 @@ impl HttpStream for NullStream {
     }
 }
 
-impl HttpStream for uni::runtime::TcpStream {
+impl HttpStream for waitless::runtime::TcpStream {
     async fn recv(&mut self, buf: &mut [u8]) -> usize {
         (*self).recv(buf).await
     }
 
-    /// Forwards to the inherent `uni::runtime::TcpStream::recv_chunk`.
+    /// Forwards to the inherent `waitless::runtime::TcpStream::recv_chunk`.
     ///
     /// Deliberately a plain `fn` returning the *concrete* `RecvChunk`
     /// future — not an `async fn` block, and not the trait's opaque
     /// `impl Future` — so the forward is type-checked against the
     /// inherent method: the inherent method is the only thing that
     /// produces a `RecvChunk`. Were it ever removed,
-    /// `uni::runtime::TcpStream::recv_chunk` here would resolve to
+    /// `waitless::runtime::TcpStream::recv_chunk` here would resolve to
     /// *this* trait method, whose return type is opaque, and the
     /// mismatch against `-> RecvChunk<'_>` is a compile error —
     /// rather than the silent infinite recursion an `impl Future`
@@ -148,8 +148,8 @@ impl HttpStream for uni::runtime::TcpStream {
     /// `refining_impl_trait_reachable` allow below is intentional:
     /// the refinement *is* the footgun guard.
     #[allow(refining_impl_trait_reachable)]
-    fn recv_chunk(&mut self) -> uni::runtime::RecvChunk<'_> {
-        uni::runtime::TcpStream::recv_chunk(self)
+    fn recv_chunk(&mut self) -> waitless::runtime::RecvChunk<'_> {
+        waitless::runtime::TcpStream::recv_chunk(self)
     }
 
     async fn send(&mut self, chain: &mut IOBufChain) -> Result<(), ()> {

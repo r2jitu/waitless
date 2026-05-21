@@ -39,7 +39,7 @@ fn usage(prog: &str) {
     eprintln!("  --ram=MB              Guest RAM in MiB (default: 128)");
     eprintln!("  --cpus=N              vCPU count (default: 1)");
     eprintln!("  --bootargs=STR        Kernel command line passed via FDT chosen.bootargs.");
-    eprintln!("                        Read by the guest as `uni::boot_info().boot_args`.");
+    eprintln!("                        Read by the guest as `waitless::boot_info().boot_args`.");
     eprintln!("                        Example: --bootargs=\"quic.log=events\"");
     eprintln!("  -p PROTO:HOST:GUEST   Port forward (repeatable).");
     eprintln!("                        PROTO = tcp | udp.");
@@ -82,7 +82,7 @@ struct Args {
     cpu_count: usize,
     mappings: Vec<PortMapping>,
     /// Kernel command line forwarded into the FDT `chosen.bootargs`
-    /// property. Apps consume it via `uni::boot_info().boot_args`.
+    /// property. Apps consume it via `waitless::boot_info().boot_args`.
     /// Whitespace-separated `key=value` tokens by convention; the
     /// QUIC stack's verbosity knob is `quic.log=silent|drops|events`.
     bootargs: String,

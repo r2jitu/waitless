@@ -143,10 +143,10 @@ pub(crate) fn max_min_ratio_x100(observed: &[u64]) -> u64 {
 ///   * TSO super-segments are saturating their pool
 ///     (tx_big_full_returns climbing)
 pub(crate) fn stats_response() -> Response {
-    let counts = uni::diagnostics::net_rx_counts();
-    let cursors = uni::diagnostics::net_rx_used_cursors();
-    let nqp = uni::diagnostics::net_num_queue_pairs() as usize;
-    let tx = uni::diagnostics::net_tx_diag();
+    let counts = waitless::diagnostics::net_rx_counts();
+    let cursors = waitless::diagnostics::net_rx_used_cursors();
+    let nqp = waitless::diagnostics::net_num_queue_pairs() as usize;
+    let tx = waitless::diagnostics::net_tx_diag();
 
     // Project the (device_idx, driver_cursor) tuple into separate
     // u16 slices so `emit_json_array` can render them — needed
@@ -257,7 +257,7 @@ pub(crate) fn stats_response() -> Response {
         // Per-core arrays so RSS imbalance (one core hot, others
         // idle) is visible. cycles_per_us is emitted once so /stats
         // consumers can convert cycle deltas to µs.
-        let nc = (uni::num_workers() as usize).min(8);
+        let nc = (waitless::num_workers() as usize).min(8);
         let mut loops = [0u64; 8];
         let mut poll_work = [0u64; 8];
         let mut drain_work = [0u64; 8];
@@ -267,7 +267,7 @@ pub(crate) fn stats_response() -> Response {
         let mut busy_cyc = [0u64; 8];
         let mut idle_cyc = [0u64; 8];
         for i in 0..nc {
-            let s = uni::diagnostics::core_stats(i as u32);
+            let s = waitless::diagnostics::core_stats(i as u32);
             loops[i] = s.0;
             poll_work[i] = s.1;
             drain_work[i] = s.2;
@@ -296,10 +296,10 @@ pub(crate) fn stats_response() -> Response {
         let _ = write!(
             w,
             ",\"cycles_per_us\":{}",
-            uni::diagnostics::cycles_per_us()
+            waitless::diagnostics::cycles_per_us()
         );
 
-        // gve NIC-driver counters, via `uni::diagnostics::gve_diag`
+        // gve NIC-driver counters, via `waitless::diagnostics::gve_diag`
         // — NOT a direct `uni_driver_gve` reference: the gve driver
         // is `os:none`-only, so reaching into it from this app crate
         // makes `app` (hence the native `webserver_bin` and the
@@ -317,7 +317,7 @@ pub(crate) fn stats_response() -> Response {
         //     shortfall means a chain's IOBuf isn't dropping.
         //   * gqi_recycle_pool_exhausted: 0 unless GQI's recycle
         //     pool can't keep up with a slow consumer.
-        let gve = uni::diagnostics::gve_diag();
+        let gve = waitless::diagnostics::gve_diag();
         let _ = write!(
             w,
             ",\"dqo_tx_miss_compl\":{},\"dqo_tx_reinject_compl\":{}\
@@ -337,8 +337,8 @@ pub(crate) fn stats_response() -> Response {
         //   client SYNs > tcp_syn_rx  → RX driver / NIC dropping
         //   tcp_syn_rx == tcp_synack_tx ≠ client SYN-ACK received
         //                             → egress drop after our TX.
-        // TCP/IP-stack counters, via `uni::diagnostics::tcp_diag`
-        // — NOT a direct `uni::net::tcp` reference: `net` is the
+        // TCP/IP-stack counters, via `waitless::diagnostics::tcp_diag`
+        // — NOT a direct `waitless::net::tcp` reference: `net` is the
         // `os:none` bare-metal stack, and reaching into it from
         // this app crate breaks the native build (same trap as the
         // gve block above). Zeros on native.
@@ -353,7 +353,7 @@ pub(crate) fn stats_response() -> Response {
         //     `recv_chunk` zero-copy device-buffer stash vs the
         //     copying ring-drain fallback; stash / (stash +
         //     ring_drain) is the live zero-copy hit ratio.
-        let tcp = uni::diagnostics::tcp_diag();
+        let tcp = waitless::diagnostics::tcp_diag();
         let _ = write!(
             w,
             ",\"tcp_syn_rx\":{},\"tcp_synack_tx\":{}\
@@ -419,7 +419,7 @@ pub(crate) fn heap_response() -> Response {
     // scratch via `body_iobuf`; transport-framing reserves are
     // handled inside the IOBuf out of view, so the encrypt-in-
     // place path in `TlsStream::send` applies for HTTPS.
-    let s = uni::diagnostics::heap_stats();
+    let s = waitless::diagnostics::heap_stats();
     let mut body = http::body_iobuf(256);
     let _ = write!(
         body.writer(),
@@ -471,7 +471,7 @@ pub(crate) fn diag_panic_response() -> Response {
     // without allocating beyond `body_iobuf`.
     const CAP: usize = 4096;
     let mut tmp = alloc::vec![0u8; CAP];
-    let n = uni::diagnostics::diag_snapshot(&mut tmp);
+    let n = waitless::diagnostics::diag_snapshot(&mut tmp);
     tmp.truncate(n);
     if n == 0 {
         return Response::ok(
@@ -495,9 +495,9 @@ pub(crate) fn diag_panic_response() -> Response {
 pub(crate) fn diag_gve_response() -> Response {
     use core::fmt::Write as _;
 
-    let mut entries: alloc::vec::Vec<uni::diagnostics::NetTxDescLogEntry> =
+    let mut entries: alloc::vec::Vec<waitless::diagnostics::NetTxDescLogEntry> =
         alloc::vec![Default::default(); 32];
-    let n = uni::diagnostics::net_tx_desc_log_snapshot(&mut entries);
+    let n = waitless::diagnostics::net_tx_desc_log_snapshot(&mut entries);
     if n == 0 {
         return Response::ok(
             &b"text/plain; charset=utf-8"[..],

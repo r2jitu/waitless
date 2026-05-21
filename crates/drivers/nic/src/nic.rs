@@ -269,7 +269,7 @@ pub fn tx_desc_log_snapshot(out: &mut [nic_api::TxDescLogEntry]) -> usize {
 
 pub use nic_api::{DIAG_QP_CAP, TxDescLogEntry, TxDiag};
 
-/// Cold-path: used by `uni::Net::enable` to tell "no driver linked"
+/// Cold-path: used by `waitless::Net::enable` to tell "no driver linked"
 /// from "drivers linked but none bound hardware".
 pub fn installed() -> bool {
     is_installed()

@@ -315,7 +315,7 @@ pub fn tick(worker_id: u32) -> bool {
 
 /// Force-drop every live task in every worker's arena.
 ///
-/// Called once from `uni::shutdown_and_drop` after listener handles
+/// Called once from `waitless::shutdown_and_drop` after listener handles
 /// have been dropped (which sets the abort flag on per-worker
 /// recv/accept tasks, but doesn't actually free their `Box<dyn
 /// Future>` storage — that drop normally happens on the next `tick`,

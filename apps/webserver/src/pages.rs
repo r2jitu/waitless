@@ -232,7 +232,7 @@ function call from <code>http::handle_request</code> down to \
 PIE-linked stub that processes <code>R_AARCH64_RELATIVE</code> \
 relocations from <code>.rela.dyn</code> before jumping to Rust. \
 Either way the path is:</p>\
-<pre><code>firmware  →  boot stub (asm)\n          →  early init: paging, percpu, IDT/GDT or GICv3\n          →  heap init (talc allocator)\n          →  device discovery (FDT or ACPI)\n          →  driver bring-up (virtio-net or gve)\n          →  async runtime start\n          →  app `#[uni::init]` body</code></pre>\
+<pre><code>firmware  →  boot stub (asm)\n          →  early init: paging, percpu, IDT/GDT or GICv3\n          →  heap init (talc allocator)\n          →  device discovery (FDT or ACPI)\n          →  driver bring-up (virtio-net or gve)\n          →  async runtime start\n          →  app `#[waitless::init]` body</code></pre>\
 <h2>Async runtime</h2>\
 <p>Single-threaded per-core cooperative multitasking. Tasks are \
 heap-allocated futures owned by per-core arenas; <code>spawn</code> \
@@ -292,7 +292,7 @@ NS on cache miss for outbound v6 packets, mirroring v4's ARP-on-miss.</li>\
 page renders these in a more readable shape.</p>\
 <h2>Async at the socket layer</h2>\
 <p>Listeners are plain async fns:</p>\
-<pre><code>uni::tcp_listen(80, |stream| async move {\n    let mut buf = [0u8; 4096];\n    loop {\n        let n = stream.recv(&mut buf).await?;\n        if n == 0 { return; }\n        // ... handle bytes ...\n    }\n});</code></pre>\
+<pre><code>waitless::tcp_listen(80, |stream| async move {\n    let mut buf = [0u8; 4096];\n    loop {\n        let n = stream.recv(&mut buf).await?;\n        if n == 0 { return; }\n        // ... handle bytes ...\n    }\n});</code></pre>\
 <p>The reactor wakes <code>recv</code> when the corresponding TCP control \
 block has bytes; until then the task parks with no host CPU cost \
 (under HVF, the vCPU thread literally sleeps via a yield-MMIO \
@@ -429,7 +429,7 @@ auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
         );
 
         // ── Heap ──────────────────────────────────────────────────────
-        let heap = uni::diagnostics::heap_stats();
+        let heap = waitless::diagnostics::heap_stats();
         let _ = w.write_str("<h2>Heap</h2><table>");
         let _ = w.write_str("<tr><th>Field</th><th>Value</th></tr>");
         let _ = write!(
@@ -469,9 +469,9 @@ auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
         let _ = w.write_str("<p><a href=\"/heap\"><code>/heap</code></a> · raw JSON</p>");
 
         // ── NIC RX queues ─────────────────────────────────────────────
-        let counts = uni::diagnostics::net_rx_counts();
-        let cursors = uni::diagnostics::net_rx_used_cursors();
-        let nqp = uni::diagnostics::net_num_queue_pairs() as usize;
+        let counts = waitless::diagnostics::net_rx_counts();
+        let cursors = waitless::diagnostics::net_rx_used_cursors();
+        let nqp = waitless::diagnostics::net_num_queue_pairs() as usize;
         let nqp_clamped = nqp.min(counts.len()).min(cursors.len());
         let _ = w.write_str("<h2>NIC RX queues</h2>");
         let _ = write!(

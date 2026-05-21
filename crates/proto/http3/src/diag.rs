@@ -4,7 +4,7 @@
 // for every drop reason and lifecycle event, plus `h3_drop!` /
 // `h3_event!` macros gated by a runtime log level. Default level
 // is `Drops`; override via the `h3.log=silent|drops|events` token
-// in `uni::boot_info().boot_args`. Counters are always live so a
+// in `waitless::boot_info().boot_args`. Counters are always live so a
 // future stats endpoint can dump them.
 
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -143,11 +143,11 @@ pub fn log_level() -> LogLevel {
 }
 
 fn init_from_boot_args() {
-    if !uni::boot_info::is_initialized() {
+    if !waitless::boot_info::is_initialized() {
         LEVEL_INIT.store(true, Ordering::Relaxed);
         return;
     }
-    let args = uni::boot_info().boot_args;
+    let args = waitless::boot_info().boot_args;
     for tok in args.split_whitespace() {
         if let Some(v) = tok.strip_prefix("h3.log=") {
             let lvl = match v {
@@ -243,7 +243,7 @@ macro_rules! h3_drop {
     ($field:ident, $($arg:tt)*) => {{
         $crate::diag::bump(&$crate::diag::COUNTERS.$field);
         if $crate::diag::should_log_drop() {
-            uni::println!("[h3-drop {}] {}", stringify!($field),
+            waitless::println!("[h3-drop {}] {}", stringify!($field),
                 ::core::format_args!($($arg)*));
         }
     }};
@@ -256,7 +256,7 @@ macro_rules! h3_event {
     ($field:ident, $($arg:tt)*) => {{
         $crate::diag::bump(&$crate::diag::COUNTERS.$field);
         if $crate::diag::should_log_event() {
-            uni::println!("[h3-event {}] {}", stringify!($field),
+            waitless::println!("[h3-event {}] {}", stringify!($field),
                 ::core::format_args!($($arg)*));
         }
     }};

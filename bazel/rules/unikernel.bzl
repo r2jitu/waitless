@@ -88,13 +88,13 @@ _LD_LIMINE = Label("//bazel/toolchain:unikernel_limine.ld")
 
 _MAKE_LIMINE_ISO = Label("//scripts:make_limine_iso")
 _NATIVE_MAIN_RS = Label("//bazel/rules:native_main.rs")
-_UNI = Label("//crates/uni")
+_UNI = Label("//crates/waitless")
 
 # Bare-metal linker flags (passed to rust-lld via -C link-arg).
 #
 # No `--allow-multiple-definition`: it used to be needed because the
 # boot crates were `rust_static_library`, each bundling its own copy
-# of `kernel`/`uni`/`net` (duplicate statics) plus its own dummy
+# of `kernel`/`waitless`/`net` (duplicate statics) plus its own dummy
 # `#[panic_handler]`. With the boot crates now plain rlibs and a
 # single `#[panic_handler]` in `entry`, every symbol is defined once,
 # so the link is clean — and dropping the flag means a genuine
@@ -201,7 +201,7 @@ def unikernel_binary(
         visibility = None):
     """Package a Rust application into bootable unikernel images.
 
-    The application is a rust_library with a #[uni::init] entry point.
+    The application is a rust_library with a #[waitless::init] entry point.
 
     Artifact targets produced:
       - <name>.elf        : Bare-metal ELF (QEMU direct boot)
@@ -225,7 +225,7 @@ def unikernel_binary(
 
     Args:
         name: Base name for all output targets.
-        app: A rust_library target with a #[uni::init] entry point.
+        app: A rust_library target with a #[waitless::init] entry point.
         drivers: list of NIC driver crate labels (e.g.
           `//crates/drivers/virtio-net`). Each is `extern crate`d at the
           unikernel binary's crate root so its
@@ -477,8 +477,8 @@ def unikernel_binary(
     # (no `_native_`) because the native variant is the only consumer
     # — there's no other rust_binary the suffix could collide with.
     # `native_main.rs` is a std binary (libstd provides panic handler
-    # / allocator / eh_personality); the dep-chain rlibs (uni,
-    # uni-net, net/*, app) stay `#![no_std]` but compile cleanly under
+    # / allocator / eh_personality); the dep-chain rlibs (waitless,
+    # waitless-net, net/*, app) stay `#![no_std]` but compile cleanly under
     # any panic strategy because rlibs don't own a panic handler.
     #
     # Skipped entirely when `build_native = False` so kernel-only apps

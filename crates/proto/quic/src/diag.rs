@@ -5,7 +5,7 @@
 // The macro both:
 //
 //   1. Increments a typed counter in `Counters` (atomic, lock-free)
-//   2. Emits a single-line log via `uni::println!` so the operator can
+//   2. Emits a single-line log via `waitless::println!` so the operator can
 //      see the failure in real time
 //
 // `quic_event!` mirrors the same shape for non-failure events worth
@@ -15,11 +15,11 @@
 // "client times out 30 seconds later, no idea why".
 //
 // Cost: each call site is one atomic increment + (gated) one
-// `uni::println!`. The println is gated by the runtime log level
+// `waitless::println!`. The println is gated by the runtime log level
 // (`LogLevel` below) so benchmark builds pay only the increment.
 // Default is `Drops` — failure events log, normal events don't.
 // Override via the `quic.log=silent|drops|events` token in
-// `uni::boot_info().boot_args`, parsed on first macro invocation.
+// `waitless::boot_info().boot_args`, parsed on first macro invocation.
 // The counters are always live so a future `/debug/quic_stats`
 // endpoint can dump them on demand without code changes.
 
@@ -376,11 +376,11 @@ fn init_from_boot_args() {
     // Boot info is published before app `init()` runs on every
     // backend, so the call here is safe — but we still guard to
     // avoid a panic if some test-only code path runs us before init.
-    if !uni::boot_info::is_initialized() {
+    if !waitless::boot_info::is_initialized() {
         LEVEL_INIT.store(true, Ordering::Relaxed);
         return;
     }
-    let args = uni::boot_info().boot_args;
+    let args = waitless::boot_info().boot_args;
     for tok in args.split_whitespace() {
         if let Some(v) = tok.strip_prefix("quic.log=") {
             let lvl = match v {
@@ -557,7 +557,7 @@ macro_rules! quic_drop {
     ($reason:ident, $($detail:tt)*) => {{
         $crate::diag::bump(&$crate::diag::COUNTERS.$reason);
         if $crate::diag::should_log_drop() {
-            ::uni::println!(
+            ::waitless::println!(
                 "[quic-drop {}] {}",
                 stringify!($reason),
                 ::core::format_args!($($detail)*),
@@ -567,7 +567,7 @@ macro_rules! quic_drop {
     ($reason:ident) => {{
         $crate::diag::bump(&$crate::diag::COUNTERS.$reason);
         if $crate::diag::should_log_drop() {
-            ::uni::println!("[quic-drop {}]", stringify!($reason));
+            ::waitless::println!("[quic-drop {}]", stringify!($reason));
         }
     }};
 }
@@ -581,7 +581,7 @@ macro_rules! quic_event {
     ($reason:ident, $($detail:tt)*) => {{
         $crate::diag::bump(&$crate::diag::COUNTERS.$reason);
         if $crate::diag::should_log_event() {
-            ::uni::println!(
+            ::waitless::println!(
                 "[quic-event {}] {}",
                 stringify!($reason),
                 ::core::format_args!($($detail)*),
@@ -591,7 +591,7 @@ macro_rules! quic_event {
     ($reason:ident) => {{
         $crate::diag::bump(&$crate::diag::COUNTERS.$reason);
         if $crate::diag::should_log_event() {
-            ::uni::println!("[quic-event {}]", stringify!($reason));
+            ::waitless::println!("[quic-event {}]", stringify!($reason));
         }
     }};
 }
