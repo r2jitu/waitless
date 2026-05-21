@@ -33,7 +33,7 @@ mod sched;
 
 // init_eventloop is the only stack-lifecycle fn called from
 // outside this crate (`boot/entry.rs` wires it during boot). The
-// other lifecycle entry points — `init_ipv6`, `net_receive`,
+// other lifecycle entry points — `ipv6_nd::init`, `net_receive`,
 // `poll` — are `pub(crate)` and live in their respective modules,
 // reached internally via `crate::{ipv6_nd, rx, sched}` paths.
 pub use crate::sched::init_eventloop;
@@ -97,7 +97,7 @@ pub fn init_stack() {
     sched::JUST_DISTRIBUTED.init(n, |_| core::sync::atomic::AtomicBool::new(false));
     arp::init();
     ipv4::init();
-    ipv6_nd::init_ipv6();
+    ipv6_nd::init();
 
     // Wire up the async `uni::runtime::TcpListener` reactor and
     // the per-stream recv/send reactors — all via a single backend

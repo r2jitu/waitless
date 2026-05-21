@@ -21,8 +21,8 @@ pub use error::{DhcpError, NetError};
 // `uni_net_stack::{bringup_dhcp, bringup_static}`) but DON'T
 // re-export `uni_net_stack::*`. A glob re-export used to leak the
 // umbrella's internal lifecycle entry points (`init_stack`,
-// `init_ipv6`, `net_receive`, `poll`) into `uni::net::*`, where no
-// app should reach them. Apps that want raw protocol-layer access
+// `ipv6_nd::init`, `net_receive`, `poll`) into `uni::net::*`, where
+// no app should reach them. Apps that want raw protocol-layer access
 // can add an enumerated re-export here when there's a concrete
 // consumer; no app currently uses one.
 

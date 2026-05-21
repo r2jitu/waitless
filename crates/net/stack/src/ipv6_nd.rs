@@ -6,13 +6,13 @@
 //! sits interleaved with the RX poll machinery. The receive pipeline
 //! (`crate::rx`) calls `v6_addr_is_ours` as the dst-address accept
 //! predicate and `handle_icmpv6` to service an inbound ICMPv6
-//! packet; `init_ipv6` is invoked once from `crate::init_stack`.
+//! packet; `init` is invoked once from `crate::init_stack`.
 
 use crate::{ethernet, icmpv6, ipv6, ipv6_send, types};
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// Our link-local IPv6 address, derived from the NIC MAC at
-/// `init_ipv6` time via modified EUI-64 (RFC 4291). Stored as 16
+/// `init` time via modified EUI-64 (RFC 4291). Stored as 16
 /// `AtomicU8`s so a multi-core read-during-init never races.
 /// Single writer (BSP at boot); many readers (per-core RX paths).
 static IPV6_LL_OCTETS: [AtomicU8; 16] = [
@@ -82,7 +82,11 @@ fn ipv6_global() -> Option<types::Ipv6Addr> {
 /// Idempotent; the BSP calls this once from `init_stack` after
 /// `ethernet::init_mac`. `pub(crate)` because it's only called
 /// from within this crate (the umbrella's lifecycle code).
-pub(crate) fn init_ipv6() {
+///
+/// Module-scoped name (`ipv6_nd::init`) — matches the other
+/// per-protocol bring-up entry points (`arp::init`, `ipv4::init`,
+/// `tcp::init`) for symmetry.
+pub(crate) fn init() {
     if IPV6_INITIALIZED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
