@@ -17,7 +17,11 @@ package(default_visibility = ["//visibility:public"])
 # catches such a leak.
 rust_library(
     name = "app",
-    srcs = ["src/main.rs"],
+    srcs = [
+        "src/endpoints.rs",
+        "src/main.rs",
+        "src/pages.rs",
+    ],
     compile_data = [
         "//apps/webserver/dev_certs:dev_cert.der",
         "//apps/webserver/dev_certs:dev_key.der",
