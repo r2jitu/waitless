@@ -1029,130 +1029,119 @@ pub fn vcpu_poll(vcpu_id: usize, timeout_ms: i32) -> bool {
     poll_worker_iteration(&mut io, cpu_count, timeout_ms)
 }
 
-fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) -> bool {
-    let id = io.id;
-    let single_queue = cpu_count <= 1;
-    let shared = worker_shared(id);
-
-    // First call: worker 0 broadcasts a gratuitous ARP so the host
-    // learns our MAC. Done here (instead of `start()`) so the frame is
-    // injected from the vCPU thread that owns the queue.
-    if !io.primed {
-        if id == 0 {
-            shared
-                .tx_replies
-                .lock()
-                .unwrap()
-                .push_back(build_grat_arp_frame(&io.guest_mac));
-        }
-        io.primed = true;
+/// `dsb sy` + — in single-queue mode — the level-triggered GIC SPI
+/// doorbell that tells the guest its RX ring advanced. Called after
+/// every batch of injected frames. Idempotent: an extra call after a
+/// no-op inject is harmless (the barrier is free, the SPI is
+/// edge-cycled true→false).
+fn signal_rx_doorbell(single_queue: bool) {
+    // SAFETY: `dsb sy` is a bare barrier with no operands; the GIC
+    // SPI calls are the documented HVF doorbell API.
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack));
     }
-
-    // In multi-queue mode, each worker's queue pair is (id*2, id*2+1).
-    // In single-queue mode, there's one shared queue pair at (0, 1).
-    let qsnap = if single_queue {
-        virtio::rx_queue_snapshot()
-    } else {
-        virtio::queue_snapshot(id * 2)
-    };
-
-    let mut any_injected = false;
-
-    // ── Drain reply frames staged by handle_tcp/handle_udp_v4/handle_arp ──
-    {
-        let mut replies = shared.tx_replies.lock().unwrap();
-        let mut any = false;
-        while let Some(f) = replies.pop_front() {
-            if !qsnap.ready || !inject_frame(f.as_slice(), &qsnap, &mut io.rx_last) {
-                replies.push_front(f);
-                break;
-            }
-            any = true;
-        }
-        drop(replies);
-        if any {
-            unsafe {
-                core::arch::asm!("dsb sy", options(nostack));
-            }
-            if single_queue {
-                unsafe {
-                    hvf::hv_gic_set_spi(35, true);
-                    hvf::hv_gic_set_spi(35, false);
-                }
-            }
-            any_injected = true;
+    if single_queue {
+        unsafe {
+            hvf::hv_gic_set_spi(35, true);
+            hvf::hv_gic_set_spi(35, false);
         }
     }
+}
 
-    // ── Drain UDP frames forwarded here by another vCPU's
-    //    `handle_udp_rx` (4-tuple hash routing). Identical
-    //    inject pattern to `tx_replies` above; kept separate
-    //    because forwarded frames are MTU-sized Vec<u8>s rather
-    //    than the 600-byte fixed `TxFrame` reply records.
-    {
-        let mut fwd = shared.forwarded_rx.lock().unwrap();
-        let mut any = false;
-        while let Some(f) = fwd.pop_front() {
-            if !qsnap.ready || !inject_frame(&f, &qsnap, &mut io.rx_last) {
-                fwd.push_front(f);
-                break;
-            }
-            any = true;
+/// Drain reply frames staged by the `guest_tx` handlers (`handle_tcp`
+/// / `handle_udp_v4` / `handle_arp`) into this vCPU's RX ring.
+/// Returns whether any frame was injected.
+fn drain_tx_replies(
+    io: &mut IoState,
+    shared: &WorkerShared,
+    qsnap: &virtio::QueueSnapshot,
+    single_queue: bool,
+) -> bool {
+    let mut replies = shared.tx_replies.lock().unwrap();
+    let mut any = false;
+    while let Some(f) = replies.pop_front() {
+        if !qsnap.ready || !inject_frame(f.as_slice(), qsnap, &mut io.rx_last) {
+            replies.push_front(f);
+            break;
         }
-        drop(fwd);
-        if any {
-            unsafe {
-                core::arch::asm!("dsb sy", options(nostack));
-            }
-            if single_queue {
-                unsafe {
-                    hvf::hv_gic_set_spi(35, true);
-                    hvf::hv_gic_set_spi(35, false);
-                }
-            }
-            any_injected = true;
+        any = true;
+    }
+    drop(replies);
+    if any {
+        signal_rx_doorbell(single_queue);
+    }
+    any
+}
+
+/// Drain UDP frames forwarded to this vCPU by another vCPU's
+/// `handle_udp_rx` (4-tuple hash routing). Same inject pattern as
+/// `drain_tx_replies`; separate because forwarded frames are
+/// MTU-sized `Vec<u8>`s rather than the 600-byte fixed `TxFrame`
+/// reply records.
+fn drain_forwarded_rx(
+    io: &mut IoState,
+    shared: &WorkerShared,
+    qsnap: &virtio::QueueSnapshot,
+    single_queue: bool,
+) -> bool {
+    let mut fwd = shared.forwarded_rx.lock().unwrap();
+    let mut any = false;
+    while let Some(f) = fwd.pop_front() {
+        if !qsnap.ready || !inject_frame(&f, qsnap, &mut io.rx_last) {
+            fwd.push_front(f);
+            break;
+        }
+        any = true;
+    }
+    drop(fwd);
+    if any {
+        signal_rx_doorbell(single_queue);
+    }
+    any
+}
+
+/// Flush buffered data for conns that reached `Established` while the
+/// RX queue was not yet ready. Returns whether any frame was injected.
+fn flush_established_pending(
+    io: &mut IoState,
+    shared: &WorkerShared,
+    qsnap: &virtio::QueueSnapshot,
+    single_queue: bool,
+) -> bool {
+    let mut conns = shared.conns.lock().unwrap();
+    let mut flushed = false;
+    for c in conns.values_mut() {
+        if c.state == ConnState::Established && !c.pending.is_empty() && qsnap.ready {
+            let p = std::mem::take(&mut c.pending);
+            inject_data_frames(c, &p, &GUEST_MAC, qsnap, &mut io.rx_last, &mut io.frame_buf);
+            flushed = true;
         }
     }
-
-    // ── Flush pending data for conns that just became ESTABLISHED ──
-    {
-        let mut conns = shared.conns.lock().unwrap();
-        let mut flushed = false;
-        for c in conns.values_mut() {
-            if c.state == ConnState::Established && !c.pending.is_empty() && qsnap.ready {
-                let p = std::mem::take(&mut c.pending);
-                inject_data_frames(
-                    c,
-                    &p,
-                    &GUEST_MAC,
-                    &qsnap,
-                    &mut io.rx_last,
-                    &mut io.frame_buf,
-                );
-                flushed = true;
-            }
-        }
-        drop(conns);
-        if flushed {
-            unsafe {
-                core::arch::asm!("dsb sy", options(nostack));
-            }
-            if single_queue {
-                unsafe {
-                    hvf::hv_gic_set_spi(35, true);
-                    hvf::hv_gic_set_spi(35, false);
-                }
-            }
-            any_injected = true;
-        }
+    drop(conns);
+    if flushed {
+        signal_rx_doorbell(single_queue);
     }
+    flushed
+}
 
-    // ── Build pollfds: wake pipe, UDP siblings, TCP listens, conns ─
-    // Slot 0 is the wake pipe; then UDP siblings; then shared TCP
-    // listen fds (polled by every vCPU so inline accept wins
-    // first-come-first-served); then this vCPU's assigned TCP conn
-    // fds. `conn_ports` is parallel to `pollfds` with a 0 entry in
-    // every non-conn slot; only the conn range carries valid ports.
+/// Slot offsets into `io.pollfds` produced by `build_pollfds`.
+/// `pollfds[0]` is the wake pipe; `[listen_slot_start..]` the shared
+/// TCP listen fds; `[outbound_slot_start..]` the outbound-UDP NAT
+/// fds; `[fixed_slots..]` this vCPU's assigned TCP conn fds.
+struct PollLayout {
+    listen_slot_start: usize,
+    outbound_slot_start: usize,
+    fixed_slots: usize,
+    /// `(guest_src_port, flow)` snapshot of this vCPU's outbound-UDP
+    /// table, parallel to the `outbound_slot_start` pollfd range.
+    outbound_drain: Vec<(u16, OutboundUdp)>,
+}
+
+/// Rebuild `io.pollfds` / `io.conn_ports` for this iteration: the
+/// wake pipe, then the shared TCP listen fds, then this vCPU's
+/// outbound-UDP NAT fds, then its assigned TCP conn fds. Returns the
+/// slot layout the post-`poll` phases index with.
+fn build_pollfds(io: &mut IoState, shared: &WorkerShared, listens: &[TcpListen]) -> PollLayout {
     io.pollfds.clear();
     io.conn_ports.clear();
     io.pollfds.push(libc::pollfd {
@@ -1166,7 +1155,6 @@ fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) ->
     // each vCPU's `forwarded_rx` mailbox (drained at the top of
     // this poll loop).
     let listen_slot_start = io.pollfds.len();
-    let listens: &[TcpListen] = LISTENS.get().map(|v| v.as_slice()).unwrap_or(&[]);
     for l in listens {
         io.pollfds.push(libc::pollfd {
             fd: l.fd,
@@ -1210,54 +1198,35 @@ fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) ->
             io.conn_ports.push(c.src_port);
         }
     }
-
-    let ready = unsafe { libc::poll(io.pollfds.as_mut_ptr(), io.pollfds.len() as u32, timeout_ms) };
-    if ready <= 0 {
-        return any_injected;
+    PollLayout {
+        listen_slot_start,
+        outbound_slot_start,
+        fixed_slots,
+        outbound_drain,
     }
+}
 
-    // ── Drain wake pipe doorbell ───────────────────────────────────
-    // The bytes are signals from another thread (the accept thread, or
-    // the stdin reader after delivering a Ctrl-C byte through virtio-
-    // console). The actual work (new conn, RX queue update) was done
-    // before the doorbell — we drain so it doesn't refire on the next
-    // poll, and flag `any_injected=true` so the yield-handler caller
-    // can break out and let the guest observe whatever just landed.
-    if io.pollfds[0].revents & libc::POLLIN != 0 {
-        let mut tmp = [0u8; 64];
-        loop {
-            let n = unsafe { libc::read(io.wake_pipe_read, tmp.as_mut_ptr() as *mut _, tmp.len()) };
-            if n <= 0 {
-                break;
-            }
-        }
-        any_injected = true;
-    }
-
-    // ── Inline accept on shared TCP listen fds ─────────────────────
-    // Every vCPU polls the same listen fds; whichever one's `poll`
-    // returned POLLIN tries to accept. `accept` is non-blocking and
-    // thread-safe across the listen fd, so concurrent vCPUs racing
-    // here all end up with exactly one winner per pending SYN — the
-    // rest see `EAGAIN` and move on. We loop to drain the listen
-    // backlog in one shot; `EAGAIN` breaks the inner loop.
-    //
-    // On a successful accept we:
-    //   1. Flip client to non-blocking + TCP_NODELAY so the
-    //      subsequent data plane sees low-latency small writes.
-    //   2. Allocate a guest-visible pseudo-ephemeral source port.
-    //   3. Build a synthetic SYN frame from the fake client and
-    //      push it onto this vCPU's own `tx_replies`. The SYN
-    //      gets drained and injected into the guest RX queue on
-    //      the next iteration of this same `vcpu_poll` call —
-    //      one `poll(2)` cycle of latency, replacing the previous
-    //      mutex-locked hand-off + wake-pipe + `hv_vcpus_exit`
-    //      doorbell chain from the dedicated accept thread.
-    //   4. Insert the matching `ProxyConn` into this vCPU's own
-    //      `WORKERS[id].conns` so the subsequent SYN+ACK / ACK /
-    //      payload frames all thread through this vCPU's state.
-    //      No cross-vCPU mutex contention — only one vCPU ever
-    //      writes to a given `WORKERS[id]`.
+/// Inline-accept the backlog on every shared TCP listen fd that fired
+/// POLLIN. Every vCPU polls the same listen fds; `accept` is non-
+/// blocking and thread-safe, so racing vCPUs each win exactly one
+/// pending SYN and the rest see `EAGAIN`. Each accept allocates a
+/// guest-visible pseudo-ephemeral source port, queues a synthetic SYN
+/// onto this vCPU's `tx_replies`, and inserts the `ProxyConn` into
+/// this vCPU's own `WORKERS[id].conns` — no cross-vCPU contention.
+/// v4 ports are flow-hash-aware so the conn stays on one guest core;
+/// v6 takes the next free port.
+fn accept_listen_backlog(
+    io: &mut IoState,
+    shared: &WorkerShared,
+    qsnap: &virtio::QueueSnapshot,
+    cpu_count: usize,
+    listens: &[TcpListen],
+    listen_slot_start: usize,
+    any_injected: &mut bool,
+) {
+    // `single_queue` is derived rather than passed — keeps the arg
+    // count at clippy's `too_many_arguments` ceiling of 7.
+    let single_queue = cpu_count <= 1;
     if !listens.is_empty() {
         let mut accepted_any = false;
         for (i, listen) in listens.iter().enumerate() {
@@ -1330,14 +1299,14 @@ fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) ->
             // accepted something.
             let mut replies = shared.tx_replies.lock().unwrap();
             while let Some(f) = replies.pop_front() {
-                if !qsnap.ready || !inject_frame(f.as_slice(), &qsnap, &mut io.rx_last) {
+                if !qsnap.ready || !inject_frame(f.as_slice(), qsnap, &mut io.rx_last) {
                     replies.push_front(f);
                     break;
                 }
-                any_injected = true;
+                *any_injected = true;
             }
             drop(replies);
-            if any_injected {
+            if *any_injected {
                 unsafe {
                     core::arch::asm!("dsb sy", options(nostack));
                 }
@@ -1351,12 +1320,20 @@ fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) ->
         }
     }
 
-    // ── Drain outbound-UDP NAT replies ─────────────────────────────
-    // For each outbound flow whose fd fired POLLIN, recvfrom in a
-    // loop until EAGAIN, build a UDP frame back to the guest using
-    // the flow's saved `last_dst_*` (so the guest's stack accepts
-    // the reply as coming from the original destination), and push
-    // it to `tx_replies` for injection on the next iteration.
+}
+
+/// Drain outbound-UDP NAT replies: for each guest-initiated UDP flow
+/// whose host fd fired POLLIN, `recv` until `EAGAIN` and queue a UDP
+/// reply frame (addressed from the flow's saved `last_dst_*` so the
+/// guest's stack accepts it) onto `tx_replies` for injection next
+/// iteration.
+fn drain_outbound_udp(
+    io: &IoState,
+    shared: &WorkerShared,
+    outbound_drain: &[(u16, OutboundUdp)],
+    outbound_slot_start: usize,
+    any_injected: &mut bool,
+) {
     if !outbound_drain.is_empty() {
         for (i, (gport, o)) in outbound_drain.iter().enumerate() {
             if io.pollfds[outbound_slot_start + i].revents & (libc::POLLIN | libc::POLLHUP) == 0 {
@@ -1377,17 +1354,27 @@ fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) ->
                     payload,
                 );
                 shared.tx_replies.lock().unwrap().push_back(frame);
-                any_injected = true;
+                *any_injected = true;
             }
         }
     }
 
-    // ── Zero-copy RX from established TCP conns ────────────────────
-    // v4 header: virtio(12) + eth(14) + ip(20) + tcp(20) = 66.
-    // v6 header: virtio(12) + eth(14) + ipv6(40) + tcp(20) = 86.
-    // MTU 1500 caps the v4 MSS at 1460 and the v6 MSS at 1440;
-    // we read at most that many bytes into the right offset of
-    // the guest descriptor before stamping headers around it.
+}
+
+/// Zero-copy RX from this vCPU's established TCP conns. For each conn
+/// fd that fired POLLIN, read the host payload straight into the
+/// guest RX descriptor, stamp Eth/IP/TCP headers around it, and
+/// publish the used-ring entry; on host EOF synthesise a FIN+ACK and
+/// close the host fd. When the RX queue is not yet ready the data is
+/// buffered into the conn's `pending` instead.
+fn drain_conn_rx(
+    io: &mut IoState,
+    shared: &WorkerShared,
+    qsnap: &virtio::QueueSnapshot,
+    single_queue: bool,
+    fixed_slots: usize,
+    any_injected: &mut bool,
+) {
     const HDR_LEN_V4: usize = VIRTIO_NET_HDR_SIZE + 14 + 20 + 20;
     const HDR_LEN_V6: usize = VIRTIO_NET_HDR_SIZE + 14 + 40 + 20;
     const MAX_PAYLOAD_V4: usize = 1460;
@@ -1543,7 +1530,7 @@ fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) ->
                             libc::close(c.host_fd);
                         }
                         c.host_fd = -1;
-                        inject_frame(frame.as_slice(), &qsnap, &mut io.rx_last);
+                        inject_frame(frame.as_slice(), qsnap, &mut io.rx_last);
                         injected = true;
                     } else {
                         c.my_seq = c.my_seq.wrapping_add(r.seq_advance);
@@ -1562,7 +1549,7 @@ fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) ->
                     hvf::hv_gic_set_spi(35, false);
                 }
             }
-            any_injected = true;
+            *any_injected = true;
         }
     } else {
         // RX queue not ready — buffer data in pending.
@@ -1589,6 +1576,98 @@ fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) ->
             }
         }
     }
+
+}
+
+fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) -> bool {
+    let id = io.id;
+    let single_queue = cpu_count <= 1;
+    let shared = worker_shared(id);
+
+    // First call: worker 0 broadcasts a gratuitous ARP so the host
+    // learns our MAC. Done here (instead of `start()`) so the frame is
+    // injected from the vCPU thread that owns the queue.
+    if !io.primed {
+        if id == 0 {
+            shared
+                .tx_replies
+                .lock()
+                .unwrap()
+                .push_back(build_grat_arp_frame(&io.guest_mac));
+        }
+        io.primed = true;
+    }
+
+    // In multi-queue mode, each worker's queue pair is (id*2, id*2+1).
+    // In single-queue mode, there's one shared queue pair at (0, 1).
+    let qsnap = if single_queue {
+        virtio::rx_queue_snapshot()
+    } else {
+        virtio::queue_snapshot(id * 2)
+    };
+
+    // RX injection — staged replies, cross-vCPU forwards, and the
+    // backlog buffered for conns that have since become Established.
+    let mut any_injected = false;
+    any_injected |= drain_tx_replies(io, shared, &qsnap, single_queue);
+    any_injected |= drain_forwarded_rx(io, shared, &qsnap, single_queue);
+    any_injected |= flush_established_pending(io, shared, &qsnap, single_queue);
+
+    // Rebuild the pollfd set (wake pipe / TCP listens / outbound-UDP
+    // NAT fds / assigned conn fds) and poll it. `conn_ports` is kept
+    // parallel to `pollfds`, valid only in the conn range.
+    let listens: &[TcpListen] = LISTENS.get().map(|v| v.as_slice()).unwrap_or(&[]);
+    let layout = build_pollfds(io, shared, listens);
+
+    let ready = unsafe { libc::poll(io.pollfds.as_mut_ptr(), io.pollfds.len() as u32, timeout_ms) };
+    if ready <= 0 {
+        return any_injected;
+    }
+
+    // ── Drain wake pipe doorbell ───────────────────────────────────
+    // The bytes are signals from another thread (the accept thread, or
+    // the stdin reader after delivering a Ctrl-C byte through virtio-
+    // console). The actual work (new conn, RX queue update) was done
+    // before the doorbell — we drain so it doesn't refire on the next
+    // poll, and flag `any_injected=true` so the yield-handler caller
+    // can break out and let the guest observe whatever just landed.
+    if io.pollfds[0].revents & libc::POLLIN != 0 {
+        let mut tmp = [0u8; 64];
+        loop {
+            let n = unsafe { libc::read(io.wake_pipe_read, tmp.as_mut_ptr() as *mut _, tmp.len()) };
+            if n <= 0 {
+                break;
+            }
+        }
+        any_injected = true;
+    }
+
+    // ── Post-poll work: accept new conns, drain outbound-UDP NAT
+    //    replies, then pull RX from this vCPU's established conns.
+    accept_listen_backlog(
+        io,
+        shared,
+        &qsnap,
+        cpu_count,
+        listens,
+        layout.listen_slot_start,
+        &mut any_injected,
+    );
+    drain_outbound_udp(
+        io,
+        shared,
+        &layout.outbound_drain,
+        layout.outbound_slot_start,
+        &mut any_injected,
+    );
+    drain_conn_rx(
+        io,
+        shared,
+        &qsnap,
+        single_queue,
+        layout.fixed_slots,
+        &mut any_injected,
+    );
 
     // Periodic closed-conn cleanup.
     io.cleanup_ctr = io.cleanup_ctr.wrapping_add(1);
