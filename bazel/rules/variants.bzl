@@ -43,10 +43,19 @@ Variants produced (names & platform compat defined in _VARIANT_SPECS):
 # `attr` / `transition` definition-time defaults are left as strings —
 # they already resolve in waitless's context.)
 _OS_MACOS = Label("@platforms//os:macos")
-_PLATFORM_NATIVE = Label("//bazel/platforms:native")
 _HVF_RUNNER = Label("//tools/hvf-runner:run_hvf")
 _OS_NONE_SETTING = Label("//bazel/platforms:os_none")
 _INCOMPATIBLE = Label("@platforms//:incompatible")
+
+# `target_compatible_with` value pinning a target to native host
+# platforms: incompatible on a unikernel (os:none) target platform,
+# unconstrained on os:macos / os:linux. The native variant uses it;
+# bare-metal variants pass `[]` (they run anywhere their transition
+# lands).
+_NATIVE_ONLY = select({
+    _OS_NONE_SETTING: [_INCOMPATIBLE],
+    "//conditions:default": [],
+})
 
 # ── Transitions ────────────────────────────────────────────────────────────
 #
@@ -625,7 +634,7 @@ _VARIANT_SPECS = [
         src_attrs = {"bin": "_bin"},
         host_attrs = {},
         port_forward_kwargs = _native_port_forward_kwargs,
-        host_compat = [_PLATFORM_NATIVE],
+        host_compat = _NATIVE_ONLY,
         extra_test_tags = [],
         in_default_test_set = True,
     ),

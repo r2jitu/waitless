@@ -81,8 +81,8 @@ rust_library(
         "//crates/crypto/aes-gcm",
         "//crates/proto/http",
         "//crates/runtime/worker",
-        "//crates/waitless",
         "//crates/util/iobuf",
+        "//crates/waitless",
         "@crates//:aes",
         "@crates//:aes-gcm",
         "@crates//:getrandom",
@@ -92,8 +92,8 @@ rust_library(
         "@crates//:sha2",
         "@crates//:x25519-dalek",
     ] + select({
-        "//bazel/platforms:native": [],
-        "//conditions:default": ["//crates/kernel/bare"],
+        "//bazel/platforms:os_none": ["//crates/kernel/bare"],
+        "//conditions:default": [],
     }),
 )
 

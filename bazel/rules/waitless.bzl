@@ -71,9 +71,9 @@ def port_fwd(proto, guest, host):
 # context, at definition time.
 _AARCH64 = Label("//bazel/platforms:aarch64")
 _X86_64 = Label("//bazel/platforms:x86_64")
-_PLATFORM_NATIVE = Label("//bazel/platforms:native")
 _OS_NONE = Label("@platforms//os:none")
 _OS_MACOS = Label("@platforms//os:macos")
+_INCOMPATIBLE = Label("@platforms//:incompatible")
 
 _BOOT_ENTRY = Label("//crates/boot:entry")
 _BOOT_LIMINE = Label("//crates/boot:limine")
@@ -503,7 +503,10 @@ def waitless_binary(
                     "link-arg=-lc",
                 ],
             }),
-            target_compatible_with = [_PLATFORM_NATIVE],
+            target_compatible_with = select({
+                _OS_NONE: [_INCOMPATIBLE],
+                "//conditions:default": [],
+            }),
             visibility = visibility,
         )
 

@@ -13,12 +13,12 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "waitless_backend",
     srcs = [
+        "src/bare.rs",
         "src/lib.rs",
         "src/native/ffi.rs",
         "src/native/mod.rs",
         "src/native/tcp.rs",
         "src/native/udp.rs",
-        "src/bare.rs",
     ],
     crate_name = "waitless_backend",
     deps = [
@@ -33,8 +33,7 @@ rust_library(
         # adds no real native footprint.
         "//crates/drivers/nic:api",
     ] + select({
-        "//bazel/platforms:native": ["//crates/util/atomic-fn"],
-        "//conditions:default": [
+        "//bazel/platforms:os_none": [
             "//crates/drivers/nic",
             "//crates/kernel/bare",
             "//crates/net/stack",
@@ -47,5 +46,6 @@ rust_library(
             "//crates/net/tcp",
             "//crates/drivers/gve",
         ],
+        "//conditions:default": ["//crates/util/atomic-fn"],
     }),
 )

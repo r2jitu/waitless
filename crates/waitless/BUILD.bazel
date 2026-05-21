@@ -23,8 +23,8 @@ rust_library(
         "//crates/waitless/backend:waitless_backend",
         "//crates/waitless/net",
     ] + select({
-        "//bazel/platforms:native": [],
-        "//conditions:default": ["//crates/kernel/bare"],
+        "//bazel/platforms:os_none": ["//crates/kernel/bare"],
+        "//conditions:default": [],
     }),
 )
 

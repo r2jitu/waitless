@@ -16,8 +16,8 @@ rust_library(
     crate_name = "waitless_net",
     crate_root = "src/lib.rs",
     deps = ["//crates/drivers/nic:api"] + select({
-        "//bazel/platforms:native": [],
-        "//conditions:default": ["//crates/net/stack"],
+        "//bazel/platforms:os_none": ["//crates/net/stack"],
+        "//conditions:default": [],
     }),
 )
 
