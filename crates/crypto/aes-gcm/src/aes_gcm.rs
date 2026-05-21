@@ -31,6 +31,10 @@
 //     GHASH path surfaces on every boot, not just on the
 //     tail-only records that fit in <=127 bytes.
 
+// Rust 2024 requires explicit `unsafe {}` blocks inside `unsafe fn`.
+// Every `unsafe fn` in this file is a pure-SIMD-intrinsic body; an
+// outer file-level allow is cleaner than wrapping every line of
+// every such body in an inner `unsafe {}` block.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use aes::Aes128;
