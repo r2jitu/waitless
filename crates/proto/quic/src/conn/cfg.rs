@@ -8,8 +8,10 @@
 // from `crates/proto/quic/src/conn/` to reach
 // `apps/webserver/dev_certs/`, one more `../` than the original
 // flat `conn.rs` needed.
-
-#![cfg(test)]
+//
+// The `mod cfg;` include in `conn/mod.rs` is already
+// `#[cfg(test)]`; an inner `#![cfg(test)]` here would trip
+// `clippy::duplicated-attributes`.
 
 use super::*;
 use crate::crypto::{

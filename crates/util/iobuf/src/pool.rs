@@ -531,9 +531,9 @@ mod tests {
         // design this body is a use-after-free.
         let buf = {
             let pool = IOBufPool::new(4, 256);
-            let buf = pool.alloc(b"data").expect("fresh pool has slabs");
-            buf
-            // every `pool` handle drops here; `buf` keeps the region alive
+            // `pool` drops at the end of this block; `buf` keeps the
+            // slab region alive via its Arc strong reference.
+            pool.alloc(b"data").expect("fresh pool has slabs")
         };
         // Reading the slab is sound — the region is still mapped.
         assert_eq!(buf.data(), b"data");

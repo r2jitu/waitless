@@ -10,7 +10,9 @@
 // are process-global, so the scenarios cannot run concurrently:
 // `TEST_LOCK` serialises them, and each uses a distinct 4-tuple so
 // connection-pool state never bleeds between tests.
-#![cfg(test)]
+//
+// The module include in `lib.rs` is already `#[cfg(test)]`; an inner
+// `#![cfg(test)]` here would be a duplicated-attribute clippy lint.
 
 use super::*;
 use alloc::boxed::Box;

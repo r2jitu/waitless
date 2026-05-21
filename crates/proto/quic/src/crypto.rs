@@ -306,7 +306,7 @@ mod tests {
 
     // ── tiny hex parsers (const) ─────────────────────────────────
     const fn parse_hex_byte(c0: u8, c1: u8) -> u8 {
-        ((nyb(c0) as u8) << 4) | (nyb(c1) as u8)
+        (nyb(c0) << 4) | nyb(c1)
     }
     const fn nyb(c: u8) -> u8 {
         match c {
@@ -520,7 +520,7 @@ mod tests {
             let mut i = 0;
             let mut j = 0;
             while i < hex_bytes.len() {
-                out[j] = ((nyb_for(hex_bytes[i]) as u8) << 4) | nyb_for(hex_bytes[i + 1]) as u8;
+                out[j] = (nyb_for(hex_bytes[i]) << 4) | nyb_for(hex_bytes[i + 1]);
                 i += 2;
                 j += 1;
             }

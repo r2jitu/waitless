@@ -76,7 +76,7 @@ pub fn parse_options(opts: &[u8]) -> ParsedOptions {
             OPT_SUBNET if val.len() >= 4 => out.subnet = Some([val[0], val[1], val[2], val[3]]),
             OPT_ROUTER if val.len() >= 4 => out.gateway = Some([val[0], val[1], val[2], val[3]]),
             OPT_DNS if val.len() >= 4 => out.dns = Some([val[0], val[1], val[2], val[3]]),
-            OPT_MSG_TYPE if val.len() >= 1 => out.msg_type = val[0],
+            OPT_MSG_TYPE if !val.is_empty() => out.msg_type = val[0],
             OPT_SERVER_ID if val.len() >= 4 => {
                 out.server_id = Some([val[0], val[1], val[2], val[3]])
             }

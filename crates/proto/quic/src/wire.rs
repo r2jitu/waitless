@@ -696,7 +696,7 @@ mod tests {
         let mut out = [0u8; 4];
         let n = encode_packet_number(101, Some(100), &mut out).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(out[0], 101 as u8);
+        assert_eq!(out[0], 101u8);
     }
 
     #[test]
@@ -708,8 +708,8 @@ mod tests {
             let mut out = [0u8; 4];
             let n = encode_packet_number(pn, Some(largest), &mut out).unwrap();
             let mut truncated = 0u64;
-            for i in 0..n {
-                truncated = (truncated << 8) | out[i] as u64;
+            for &byte in &out[..n] {
+                truncated = (truncated << 8) | byte as u64;
             }
             let decoded = decode_packet_number(largest, truncated, n);
             assert_eq!(decoded, pn, "pn={pn} largest={largest} bytes={n}");

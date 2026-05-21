@@ -446,7 +446,7 @@ mod tests {
             buf.append_slice(b"END").unwrap();
             assert_eq!(buf.data(), b"PREabcdefghEND");
             for byte in buf.data_mut().unwrap() {
-                if (b'a'..=b'z').contains(byte) {
+                if byte.is_ascii_lowercase() {
                     *byte ^= 0x20;
                 }
             }
@@ -471,7 +471,7 @@ mod tests {
         buf.append_slice(b"END").unwrap();
         assert_eq!(buf.data(), b"PREabcdefghEND");
         for byte in buf.data_mut().unwrap() {
-            if (b'a'..=b'z').contains(byte) {
+            if byte.is_ascii_lowercase() {
                 *byte ^= 0x20;
             }
         }

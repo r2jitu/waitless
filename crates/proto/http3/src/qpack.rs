@@ -462,15 +462,14 @@ mod tests {
     fn decode_huffman_value() {
         // Manually construct a section where the value is Huffman-
         // encoded "no-cache" (RFC 7541 §C.4.2).
-        let mut buf = Vec::new();
-        buf.push(0); // RIC = 0
-        buf.push(0); // Base = 0
-        // Literal Field Line With Literal Name: 0 0 1 N=0 H=0 len[3]=
-        // (name "x" len=1)
-        buf.push(0b0010_0001); // 0010 0 001 → name len=1, H=0
-        buf.push(b'x');
-        // Value: H=1, len=6 bytes.
-        buf.push(0b1000_0110); // H=1 len=6
+        // Section prefix + one Literal Field Line With Literal Name:
+        //   [0]      RIC = 0
+        //   [1]      Base = 0
+        //   [2]      0b0010_0001 → 0010 0 001: name len=1, H=0
+        //   [3]      b'x'        → name "x"
+        //   [4]      0b1000_0110 → value H=1, len=6
+        let mut buf = vec![0u8, 0, 0b0010_0001, b'x', 0b1000_0110];
+        // Value bytes: Huffman-encoded "no-cache" (6 bytes).
         buf.extend_from_slice(&[0xa8, 0xeb, 0x10, 0x64, 0x9c, 0xbf]);
         let decoded = decode_field_section(&buf).unwrap();
         assert_eq!(&*decoded[0].name, b"x".as_slice());
