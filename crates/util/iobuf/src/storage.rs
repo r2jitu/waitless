@@ -29,143 +29,10 @@ use core::ptr::NonNull;
 
 use crate::{IOBufError, IOBufRead};
 
-// ============================================================================
-// Borrow tracker — debug-mode aliasing detection for `BorrowedView`.
-//
-// Every `IOBuf::borrow(base, capacity, ...)` registers its
-// `[base..base+capacity)` region in a per-thread interval list. A
-// second `borrow` overlapping any live entry panics on the spot,
-// surfacing aliasing-arithmetic bugs (e.g. the body-scratch sub-range
-// allocator's cursor going wrong) at the point of construction rather
-// than as silent UAF later.
-//
-// Active only where borrow-tracking is both wanted and possible:
-// `any(test, debug_assertions)` AND a hosted target. The real tracker
-// needs `std` (`thread_local!`), so on the bare-metal unikernel target
-// (`target_os = "none"`) it is always the no-op variant — including
-// under the clippy aspect, which compiles `debug_assertions` code even
-// for `os:none`. In bazel release builds (`-Copt-level=2` →
-// `debug_assertions` off) it is likewise a no-op, so production pays
-// nothing. In `cargo test`, the iobuf_test bazel target, and any
-// hosted debug build of a consumer, the tracker is on.
-//
-// The tracker lives on a per-thread `Vec` (via `std::thread_local!`)
-// because `BorrowedView`s are `!Send` — a borrowed view is bound to
-// the worker / thread that constructed it, so cross-thread sharing of
-// the tracker state is structurally impossible. The `Vec` is bounded
-// in practice by the number of live `BorrowedView`s on this thread;
-// typical depths are < 4 (one for body scratch, one for TLS scratch,
-// occasional inner sub-views).
-// ============================================================================
-#[cfg(all(any(test, debug_assertions), not(target_os = "none")))]
-mod borrow_tracker {
-    extern crate std;
-
-    use alloc::vec::Vec;
-    use core::cell::RefCell;
-    use core::ptr::NonNull;
-
-    /// One live `[base..base+capacity)` byte region.
-    #[derive(Copy, Clone)]
-    struct Region {
-        base: usize,
-        end: usize,
-    }
-
-    std::thread_local! {
-        static ACTIVE: RefCell<Vec<Region>> = const { RefCell::new(Vec::new()) };
-    }
-
-    /// Register a new borrowed region. Panics on overlap with any
-    /// already-live region — the typical failure mode is the body-
-    /// scratch sub-range allocator's cursor arithmetic going wrong,
-    /// or a re-entered scratch-acquire path minting a second view
-    /// over the same per-worker buffer.
-    pub(crate) fn register(base: NonNull<u8>, capacity: u32) {
-        let base_addr = base.as_ptr() as usize;
-        let end_addr = base_addr.wrapping_add(capacity as usize);
-        ACTIVE.with(|r| {
-            let mut reg = r.borrow_mut();
-            for existing in reg.iter() {
-                // Open-interval overlap test: [a, b) ∩ [c, d) ≠ ∅
-                // iff a < d ∧ c < b.
-                let overlap = base_addr < existing.end && existing.base < end_addr;
-                if overlap {
-                    panic!(
-                        "overlapping IOBuf::borrow mint: new=[{:#x}..{:#x}) \
-                         overlaps existing=[{:#x}..{:#x}); aliasing bug?",
-                        base_addr, end_addr, existing.base, existing.end,
-                    );
-                }
-            }
-            reg.push(Region {
-                base: base_addr,
-                end: end_addr,
-            });
-        });
-    }
-
-    /// Drop a previously-registered region. Panics if no matching
-    /// entry exists — that would indicate a balance error in the
-    /// register/unregister pairing (e.g. a borrowed view
-    /// constructed without going through `register`).
-    pub(crate) fn unregister(base: NonNull<u8>, capacity: u32) {
-        let base_addr = base.as_ptr() as usize;
-        let end_addr = base_addr.wrapping_add(capacity as usize);
-        ACTIVE.with(|r| {
-            let mut reg = r.borrow_mut();
-            // LIFO-friendly scan (borrowed views usually drop in
-            // reverse construction order on a synchronous code path).
-            for i in (0..reg.len()).rev() {
-                if reg[i].base == base_addr && reg[i].end == end_addr {
-                    reg.swap_remove(i);
-                    return;
-                }
-            }
-            panic!(
-                "IOBuf::borrow unregister with no matching register: \
-                 [{:#x}..{:#x}); register/unregister imbalance?",
-                base_addr, end_addr,
-            );
-        });
-    }
-}
-
-#[cfg(not(all(any(test, debug_assertions), not(target_os = "none"))))]
-mod borrow_tracker {
-    use core::ptr::NonNull;
-    #[inline(always)]
-    pub(crate) fn register(_: NonNull<u8>, _: u32) {}
-    #[inline(always)]
-    pub(crate) fn unregister(_: NonNull<u8>, _: u32) {}
-}
-
-/// Per-`BorrowedView` Drop guard that owns the tracker's
-/// register/unregister pairing. Carried as a field of the struct —
-/// its Drop fires when the `BorrowedView` (and thus the `IOBuf`)
-/// drops, so a live registration can't be orphaned. In release
-/// builds (`!debug_assertions`) the guard is absent entirely (the
-/// field is `#[cfg]`-gated off).
-#[cfg(any(test, debug_assertions))]
-struct BorrowGuard {
-    base: NonNull<u8>,
-    capacity: u32,
-}
-
-#[cfg(any(test, debug_assertions))]
-impl BorrowGuard {
-    fn new(base: NonNull<u8>, capacity: u32) -> Self {
-        borrow_tracker::register(base, capacity);
-        Self { base, capacity }
-    }
-}
-
-#[cfg(any(test, debug_assertions))]
-impl Drop for BorrowGuard {
-    fn drop(&mut self) {
-        borrow_tracker::unregister(self.base, self.capacity);
-    }
-}
+// The borrow tracker (`cfg(test)`-only aliasing detection for
+// `BorrowedView`) and its `BorrowGuard` live at the *end* of this
+// file: clippy's `items_after_test_module` treats any `#[cfg(test)]`
+// module as a test module and wants production items before it.
 
 /// Drop callback signature for [`ExternalOwned`]. Receives the
 /// original `(base, capacity, ctx)` from `wrap_owned`, regardless
@@ -554,9 +421,9 @@ pub struct BorrowedView {
     len: u32,
     /// Makes `BorrowedView` (and therefore `IOBuf`) `!Send + !Sync`.
     _not_send: PhantomData<*const ()>,
-    /// Debug-mode aliasing-tracker registration guard. ZST + no-op
-    /// Drop in release; the field is absent entirely there.
-    #[cfg(any(test, debug_assertions))]
+    /// Test-mode aliasing-tracker registration guard. The field is
+    /// absent entirely outside `cfg(test)` (the tracker needs std).
+    #[cfg(test)]
     _guard: BorrowGuard,
 }
 
@@ -572,7 +439,7 @@ impl BorrowedView {
             offset,
             len,
             _not_send: PhantomData,
-            #[cfg(any(test, debug_assertions))]
+            #[cfg(test)]
             _guard: BorrowGuard::new(base, capacity),
         }
     }
@@ -672,5 +539,137 @@ impl IOBufRead for BorrowedView {
     #[inline]
     fn tailroom(&self) -> usize {
         (self.capacity as usize).saturating_sub(self.offset as usize + self.len as usize)
+    }
+}
+
+// In non-test builds there is no `borrow_tracker` module at all:
+// `BorrowGuard` (its only caller) is itself `cfg(test)`-only, so a
+// no-op stub would just be dead code.
+
+/// Per-`BorrowedView` Drop guard that owns the tracker's
+/// register/unregister pairing. Carried as a field of the struct —
+/// its Drop fires when the `BorrowedView` (and thus the `IOBuf`)
+/// drops, so a live registration can't be orphaned. In every
+/// non-test build the guard is absent entirely (the field is
+/// `#[cfg]`-gated off), matching the `cfg(test)`-only tracker.
+#[cfg(test)]
+struct BorrowGuard {
+    base: NonNull<u8>,
+    capacity: u32,
+}
+
+#[cfg(test)]
+impl BorrowGuard {
+    fn new(base: NonNull<u8>, capacity: u32) -> Self {
+        borrow_tracker::register(base, capacity);
+        Self { base, capacity }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BorrowGuard {
+    fn drop(&mut self) {
+        borrow_tracker::unregister(self.base, self.capacity);
+    }
+}
+
+// ============================================================================
+// Borrow tracker — debug-mode aliasing detection for `BorrowedView`.
+//
+// Every `IOBuf::borrow(base, capacity, ...)` registers its
+// `[base..base+capacity)` region in a per-thread interval list. A
+// second `borrow` overlapping any live entry panics on the spot,
+// surfacing aliasing-arithmetic bugs (e.g. the body-scratch sub-range
+// allocator's cursor going wrong) at the point of construction rather
+// than as silent UAF later.
+//
+// Active only under `cfg(test)`. The tracker needs `std` — a
+// `thread_local!` and a `Vec` — and the no_std `x86_64-unikernel-none`
+// unikernel target has no `std` crate to link, so it cannot compile
+// there. It is therefore gated to `cfg(test)` (cargo test / the
+// `iobuf_test` bazel target), which always builds against std; in
+// every non-test build (including a default `fastbuild` bazel build,
+// where `debug_assertions` is *on*) the tracker compiles to a no-op
+// and production pays nothing.
+//
+// The tracker lives on a per-thread `Vec` (via `std::thread_local!`)
+// because `BorrowedView`s are `!Send` — a borrowed view is bound to
+// the worker / thread that constructed it, so cross-thread sharing of
+// the tracker state is structurally impossible. The `Vec` is bounded
+// in practice by the number of live `BorrowedView`s on this thread;
+// typical depths are < 4 (one for body scratch, one for TLS scratch,
+// occasional inner sub-views).
+// ============================================================================
+#[cfg(test)]
+mod borrow_tracker {
+    extern crate std;
+
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+    use core::ptr::NonNull;
+
+    /// One live `[base..base+capacity)` byte region.
+    #[derive(Copy, Clone)]
+    struct Region {
+        base: usize,
+        end: usize,
+    }
+
+    std::thread_local! {
+        static ACTIVE: RefCell<Vec<Region>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Register a new borrowed region. Panics on overlap with any
+    /// already-live region — the typical failure mode is the body-
+    /// scratch sub-range allocator's cursor arithmetic going wrong,
+    /// or a re-entered scratch-acquire path minting a second view
+    /// over the same per-worker buffer.
+    pub(crate) fn register(base: NonNull<u8>, capacity: u32) {
+        let base_addr = base.as_ptr() as usize;
+        let end_addr = base_addr.wrapping_add(capacity as usize);
+        ACTIVE.with(|r| {
+            let mut reg = r.borrow_mut();
+            for existing in reg.iter() {
+                // Open-interval overlap test: [a, b) ∩ [c, d) ≠ ∅
+                // iff a < d ∧ c < b.
+                let overlap = base_addr < existing.end && existing.base < end_addr;
+                if overlap {
+                    panic!(
+                        "overlapping IOBuf::borrow mint: new=[{:#x}..{:#x}) \
+                         overlaps existing=[{:#x}..{:#x}); aliasing bug?",
+                        base_addr, end_addr, existing.base, existing.end,
+                    );
+                }
+            }
+            reg.push(Region {
+                base: base_addr,
+                end: end_addr,
+            });
+        });
+    }
+
+    /// Drop a previously-registered region. Panics if no matching
+    /// entry exists — that would indicate a balance error in the
+    /// register/unregister pairing (e.g. a borrowed view
+    /// constructed without going through `register`).
+    pub(crate) fn unregister(base: NonNull<u8>, capacity: u32) {
+        let base_addr = base.as_ptr() as usize;
+        let end_addr = base_addr.wrapping_add(capacity as usize);
+        ACTIVE.with(|r| {
+            let mut reg = r.borrow_mut();
+            // LIFO-friendly scan (borrowed views usually drop in
+            // reverse construction order on a synchronous code path).
+            for i in (0..reg.len()).rev() {
+                if reg[i].base == base_addr && reg[i].end == end_addr {
+                    reg.swap_remove(i);
+                    return;
+                }
+            }
+            panic!(
+                "IOBuf::borrow unregister with no matching register: \
+                 [{:#x}..{:#x}); register/unregister imbalance?",
+                base_addr, end_addr,
+            );
+        });
     }
 }

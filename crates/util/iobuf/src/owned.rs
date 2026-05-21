@@ -39,7 +39,11 @@ pub struct OwnedIOBuf {
 
 /// Storage backing an [`OwnedIOBuf`] — the owning subset of `Inner`.
 enum OwnedInner {
-    /// Heap-owned `Box<[u8]>`.
+    /// Heap-owned `Box<[u8]>`. Modelled for completeness (it is one
+    /// of the two owning storage structs and keeps `From<OwnedIOBuf>`
+    /// total), but no current `OwnedIOBuf` constructor mints it — the
+    /// RX path only produces `External`. Not constructed in any build.
+    #[allow(dead_code)]
     Heap(HeapStorage),
     /// A foreign region owned via a drop callback.
     External(ExternalOwned),
