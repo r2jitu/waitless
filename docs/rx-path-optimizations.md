@@ -51,7 +51,7 @@ bufs past the callback).
 | # | Step | Site | Cost per byte | Notes |
 |---|------|------|---|---|
 | 1 | Device DMA → driver buf | gVNIC DQO / virtio-net / gVNIC GQI | 0 | DMA into per-driver pool buffer |
-| 2 | Driver callback | [`uni/net/src/driver.rs`](uni/net/src/driver.rs), `NicOps::poll_qp` | 0 | Slice into device buf for callback duration |
+| 2 | Driver callback | [`crates/waitless/net/src/driver.rs`](crates/waitless/net/src/driver.rs), `NicOps::poll_qp` | 0 | Slice into device buf for callback duration |
 | 3 | Cross-core inbox push | [`kernel/src/percpu.rs:115`](kernel/src/percpu.rs#L115) | **1× memcpy** (only multi-core path) | Copies frame into `RxPacket.data: [u8; 1514]` |
 | 4 | TCP fast path (parked recv) | [`net/src/tcp.rs:331`](net/src/tcp.rs#L331) | **1× memcpy** | `ptr::copy_nonoverlapping` directly into user buf |
 | 4'| TCP slow path (no parked recv) | [`net/src/tcp.rs:303`](net/src/tcp.rs#L303) | **1× memcpy** (into ring) + **1× memcpy** (out at recv) | Per-conn 16 KiB byte ring |
@@ -130,7 +130,7 @@ AEAD.
 ### B. NicOps RX callback delivers `IOBufChain`
 - **Status**: [x] landed 2026-05-16 — commit `103202d`
 - **Where**:
-  * [`uni/net/src/driver.rs`](uni/net/src/driver.rs) — `NicOps`
+  * [`crates/waitless/net/src/driver.rs`](crates/waitless/net/src/driver.rs) — `NicOps`
     struct (change `poll_qp: fn(usize, fn(&[u8])) -> usize` to
     `fn(usize, fn(IOBufChain)) -> usize`; same for `poll_rx`).
   * [`crates/drivers/gve/src/dqo.rs`](crates/drivers/gve/src/dqo.rs) —
@@ -405,7 +405,7 @@ AEAD.
 ### K. Driver-delivered RX frame (fold the inbox node into the driver)
 - **Status**: [ ]
 - **Where**: the `NicOps` RX-callback surface
-  ([`uni/net/src/driver.rs`](uni/net/src/driver.rs)); all three
+  ([`crates/waitless/net/src/driver.rs`](crates/waitless/net/src/driver.rs)); all three
   drivers; [`kernel/src/rx_inbox.rs`](kernel/src/rx_inbox.rs) — the
   `RxNodePool` free-list is deleted.
 - **What**: item C's cross-core inbox node lives in a kernel-side
@@ -621,7 +621,7 @@ deliver a coalesced super-segment.
 ### Per-commit local
 
 - `bazel build //apps/webserver:webserver_qemu_x86_64`
-- `bazel build //apps/webserver:webserver.elf --platforms=//bazel/platforms:aarch64_unikernel`
+- `bazel build //apps/webserver:webserver.elf --platforms=//bazel/platforms:aarch64_waitless`
 - `bazel test //apps/webserver:test_hvf`
 - Per-item unit tests (see "Tests" sub-bullet on each item).
 
@@ -648,7 +648,7 @@ triggers "halt and investigate."
 
 - **After B** (NicOps signature change; GQI uses recycle pool):
   DQO bench (expect ±0% — pure refactor for DQO). GQI bench
-  with `UNIKERNEL_GCE_MACHINE=n2-highcpu-8` (expect 5–15% RPS
+  with `WAITLESS_GCE_MACHINE=n2-highcpu-8` (expect 5–15% RPS
   drop — the accepted GQI memcpy cost; > 20% triggers
   investigation).
 - **After D** (`tcp_receive` takes IOBufChain): DQO bench
@@ -1099,7 +1099,7 @@ and GQI both read flat. The GQI slab-copy specifically is ~0 %
 (even slightly favourable on `upload`): the copy is one cache-hot
 MTU read+write. The GQI 1/4/8 sweep was first attempted on spot
 VMs and repeatedly corrupted by n2 preemption; the figures above
-are a clean re-run on **on-demand** n2 (`UNIKERNEL_GCE_PREEMPTIBLE=0`).
+are a clean re-run on **on-demand** n2 (`WAITLESS_GCE_PREEMPTIBLE=0`).
 
 **Functional validation** (the part that de-risks the new code):
 >2 billion buffer reposts cycled across the DQO+GQI runs under
@@ -1283,7 +1283,7 @@ this session); it picks up the `udp_receive` signature change there.
 
 Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
 `bazel build //apps/webserver:webserver.elf
---platforms=//bazel/platforms:aarch64_unikernel`;
+--platforms=//bazel/platforms:aarch64_waitless`;
 `bazel test //crates/util/iobuf:iobuf_test` (+1 test —
 `owned_iobuf_narrow_clamps_window_keeps_backing`, asserting a
 narrowed buffer still reposts its original `(base, capacity)`);
@@ -1355,7 +1355,7 @@ flagged).
 
 Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
 `bazel build //apps/webserver:webserver.elf
---platforms=//bazel/platforms:aarch64_unikernel`;
+--platforms=//bazel/platforms:aarch64_waitless`;
 `bazel test //crates/proto/http:http_test` (13 tests — 8 new + the 5
 now-running `host_port_tests`); `bazel test
 //apps/webserver:test_hvf` (TCP + TLS round-trips, 30-conn
@@ -1446,7 +1446,7 @@ pinned to the double-borrow and not to an unrelated error.
 
 Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
 `bazel build //apps/webserver:webserver.elf
---platforms=//bazel/platforms:aarch64_unikernel`; `bazel test
+--platforms=//bazel/platforms:aarch64_waitless`; `bazel test
 //apps/webserver:test_hvf` (TCP + TLS round-trips, 30-conn burst);
 `bazel test //crates/runtime/executor:executor_test` (2 tests —
 `RecvChunkGuard::into_owned` round-trips an owned `Heap` source
@@ -1532,11 +1532,11 @@ scope.
 `TcpBackend` vtable (`do_recv_chunk` / `set_chunk_buf_slot` /
 `clear_chunk_buf_slot`) and updated the bare-metal initializer in
 `net/src/tcp.rs`, but missed the native one in
-`uni/backend/src/native/tcp.rs`. Item F's gate set — two bare-metal
+`crates/waitless/backend/src/native/tcp.rs`. Item F's gate set — two bare-metal
 `bazel build`s + `test_hvf` — never compiles the native backend
 (it is `select`'d in only for host builds), so the breakage slipped
 through; `tls_test` catches it because `proto/tls → uni →
-uni/backend` pulls the native backend into a host-native test
+crates/waitless/backend` pulls the native backend into a host-native test
 compile. Fixed by wiring the three hooks as `None` — the documented
 native-POSIX behaviour (`recv()` copies at the syscall boundary, so
 there is no device buffer to lend; `recv_chunk` resolves to `None`
@@ -1556,7 +1556,7 @@ the functional gate the plan designates for G.
 
 Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
 `bazel build //apps/webserver:webserver.elf
---platforms=//bazel/platforms:aarch64_unikernel`; `bazel test
+--platforms=//bazel/platforms:aarch64_waitless`; `bazel test
 //apps/webserver:test_hvf`; `bazel test //crates/runtime/executor:executor_test
 //crates/runtime/executor:executor_doc_test //crates/proto/tls:tls_test` (the last
 unblocked by the native-backend fix). The `4d3dda2` + `a0c9acf`
@@ -1683,7 +1683,7 @@ path, now runs body bytes through it live).
 Verified per commit: `bazel build
 //apps/webserver:webserver_qemu_x86_64`; `bazel build
 //apps/webserver:webserver.elf
---platforms=//bazel/platforms:aarch64_unikernel`; `bazel test
+--platforms=//bazel/platforms:aarch64_waitless`; `bazel test
 //crates/proto/http:http_test //apps/webserver:test_hvf` (TCP + TLS
 round-trips, 30-conn burst); plus `tls_test` on the proto/tls
 commit.
@@ -2077,7 +2077,7 @@ is exercised end-to-end by `test_hvf`.
 
 Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
 `bazel build //apps/webserver:webserver.elf
---platforms=//bazel/platforms:aarch64_unikernel`; `bazel test
+--platforms=//bazel/platforms:aarch64_waitless`; `bazel test
 //apps/webserver:test_hvf`; `bazel test //net:ipv6_test
 //net:protocol_tests`.
 

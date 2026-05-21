@@ -2,12 +2,12 @@
 
 The `apps/` in this repo are examples. The intended way to build a real
 Waitless app is a **separate repository** that depends on this one as a
-Bazel module and calls the `unikernel_binary` rule. This page covers the
+Bazel module and calls the `waitless_binary` rule. This page covers the
 boilerplate every external app must supply itself.
 
 ## Why an external app needs boilerplate
 
-`unikernel_binary` and the `rust_*` wrappers in
+`waitless_binary` and the `rust_*` wrappers in
 [`bazel/rules/`](../bazel/rules) are repo-hygienic — every label they
 emit internally is a `Label()` object bound to `@waitless`, so an app
 calling them resolves `//crates/boot:entry`, `//crates/waitless`, the linker
@@ -99,7 +99,7 @@ for the minimal example:
 
 ```python
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("@waitless//bazel/rules:unikernel.bzl", "port_fwd", "unikernel_binary")
+load("@waitless//bazel/rules:waitless.bzl", "port_fwd", "waitless_binary")
 
 rust_library(
     name = "app",
@@ -111,7 +111,7 @@ rust_library(
     ],
 )
 
-unikernel_binary(
+waitless_binary(
     name = "myapp",
     app = ":app",
     drivers = ["@waitless//crates/drivers/virtio-net"],
@@ -121,6 +121,6 @@ unikernel_binary(
 
 In-tree apps write `//crates/waitless` because they *are* in Waitless's repo;
 external apps write `@waitless//crates/waitless` so the label resolves to the
-dependency. `unikernel_binary` then produces the usual variant targets
+dependency. `waitless_binary` then produces the usual variant targets
 (`:myapp_hvf`, `:myapp_iso_x86_64`, `:myapp_qemu_aarch64`, …), runnable
 with plain `bazel run` / `bazel test`.

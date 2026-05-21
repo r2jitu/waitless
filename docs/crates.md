@@ -2,13 +2,13 @@
 
 Canonical reference for the crate organization of this repository. Every
 library crate is a Bazel `rust_library` target; the apps under `apps/`
-build via the `unikernel_binary` macro on top of them. There are no
+build via the `waitless_binary` macro on top of them. There are no
 Cargo crates in the bare-metal build — see [§Publishing](#publishing).
 
 ## Repo layout
 
 ```
-apps/        unikernel binaries (built via the unikernel_binary rule)
+apps/        unikernel binaries (built via the waitless_binary rule)
 bazel/       build infrastructure
 crates/      all library crates, grouped by domain
 docs/        this directory
@@ -62,7 +62,7 @@ to live alongside the real apps under `apps/`.)
    `net_classify`, `kernel_core`, `net_stack`. The waitless facade
    family keeps the `waitless_` prefix as a meaningful "satellite of waitless"
    marker: `waitless`, `waitless_macros`, `waitless_net`. Two further carve-outs
-   for external/internal collisions: `uni_aes_gcm` (RustCrypto's
+   for external/internal collisions: `waitless_aes_gcm` (RustCrypto's
    `aes-gcm` crate is pulled in via `@crates//:aes-gcm`). The kernel's
    os:none half is `kernel_bare`, chosen for sibling symmetry with
    `kernel_core` (a bare `kernel` name would be too overloaded).
@@ -110,7 +110,7 @@ external `@crates//:...` deps are omitted for readability.
 | `platform` | `runtime/platform` | `current_worker()`, `now_ticks()` (cfg-gated leaf) |
 | `net_types` | `net/` (shared) | Wire-format type defs (load-bearing — see [cycle break](#why-net_types-is-a-separate-crate-the-cycle-break)) |
 | `net_from_bytes` | `net/` (shared) | `try_ref_from(&[u8])` for packed packet headers |
-| `uni_aes_gcm` | `crypto/aes-gcm` | Hand-rolled AES-128-GCM (external `aes` only) |
+| `waitless_aes_gcm` | `crypto/aes-gcm` | Hand-rolled AES-128-GCM (external `aes` only) |
 
 ### Tier 1 — primitives
 
@@ -191,7 +191,7 @@ external `@crates//:...` deps are omitted for readability.
 | Crate | Tier | Deps |
 | --- | --- | --- |
 | `http` | 10 | `waitless`, `iobuf`, `worker` |
-| `tls` | 11 | `waitless`, `uni_aes_gcm`, `http`, `iobuf`, `worker`; on `os:none` also `kernel_bare` |
+| `tls` | 11 | `waitless`, `waitless_aes_gcm`, `http`, `iobuf`, `worker`; on `os:none` also `kernel_bare` |
 | `quic` | 12 | `waitless`, `iobuf`, `nic_api`, `executor`, `tls` |
 | `http3` | 13 | `waitless`, `http`, `quic` |
 
@@ -283,17 +283,17 @@ wire-format crates. Don't "fix" this by moving it up.
 ## Publishing
 
 Framework crates (`waitless`, `tls`, `http`, `quic`, …) are not on
-crates.io and won't be — they're welded to the `unikernel_binary`
+crates.io and won't be — they're welded to the `waitless_binary`
 build and not consumable standalone; the protocol crates are coupled
 internally. crates.io is a library registry, not the right venue for
 this project. The project itself lives at GitHub.
 
 Four leaves are *structured* to allow publishing if a specific reason
-arises: `atomic_fn`, `tagged_treiber`, `iobuf`, `uni_aes_gcm`. Each is
+arises: `atomic_fn`, `tagged_treiber`, `iobuf`, `waitless_aes_gcm`. Each is
 zero-or-one first-party dep, host-buildable, and host-tested.
 Publishing any would require adding a `Cargo.toml` alongside its
 `BUILD.bazel`, joining the workspace `Cargo.toml`, and picking a
-crates.io-available package name at publish time (e.g. `uni_aes_gcm`
+crates.io-available package name at publish time (e.g. `waitless_aes_gcm`
 would publish as `aes-gcm-batched` or similar; RustCrypto already owns
-`aes-gcm`). The decision is deferred; `uni_aes_gcm` carries a
+`aes-gcm`). The decision is deferred; `waitless_aes_gcm` carries a
 crypto-maintainer duty of care beyond the others if ever published.

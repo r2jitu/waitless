@@ -27,7 +27,7 @@ The system has five layers:
 
 > The GCE VMs live in zone **`us-west1-c`**. Every script defaults
 > there (`gcp.sh` via `GCP_ZONE`, `gcp-deploy-bench.sh` /
-> `deploy-gcloud.sh` via `UNIKERNEL_GCE_ZONE`); set those env vars
+> `deploy-gcloud.sh` via `WAITLESS_GCE_ZONE`); set those env vars
 > only to target a different zone.
 
 ---
@@ -202,7 +202,7 @@ It calls `deploy-gcloud.sh deploy` (unless `--no-redeploy`), syncs the
 harness to `kvm-vm`, builds `loadgen` there, tunes the loadgen VM's
 sysctls (`tcp_tw_reuse`, widened `ip_local_port_range` — fresh-conn
 workloads exhaust ephemeral ports otherwise), then runs `bench.py --env
-remote --target <unikernel-webserver IP>`. Env vars: `UNIKERNEL_GCE_*`
+remote --target <unikernel-webserver IP>`. Env vars: `WAITLESS_GCE_*`
 (see below) plus `GCP_KVM_VM_NAME` / `GCP_KVM_VM_ZONE`.
 
 ---
@@ -228,8 +228,8 @@ calls it under the hood.
 
 Env vars: `GCP_PROJECT` (`unikernel-dev`), `GCP_ZONE`
 (`us-west1-c`), `GCP_INSTANCE` (`kvm-vm`),
-`GCP_SSH_HOST` (`gcp`), `UNIKERNEL_MEMORY` (`128` MB),
-`UNIKERNEL_CPUS` (remote `nproc`).
+`GCP_SSH_HOST` (`gcp`), `WAITLESS_MEMORY` (`128` MB),
+`WAITLESS_CPUS` (remote `nproc`).
 
 ## Image deployment — `deploy-gcloud.sh`
 
@@ -245,10 +245,10 @@ launch with serial logging.
 ./scripts/deploy-gcloud.sh qemu-test     # smoke-boot disk.raw locally
 ```
 
-Env vars: `UNIKERNEL_GCE_PROJECT`, `UNIKERNEL_GCE_ZONE` (`us-west1-c`),
-`UNIKERNEL_GCE_MACHINE` (`c3-highcpu-8`), `UNIKERNEL_GCE_NAME`
-(`unikernel-webserver`), `UNIKERNEL_GCS_BUCKET`, `QUEUE_COUNT` (`8` —
-match vCPUs), `UNIKERNEL_GCE_PREEMPTIBLE` (`1` = SPOT),
+Env vars: `WAITLESS_GCE_PROJECT`, `WAITLESS_GCE_ZONE` (`us-west1-c`),
+`WAITLESS_GCE_MACHINE` (`c3-highcpu-8`), `WAITLESS_GCE_NAME`
+(`unikernel-webserver`), `WAITLESS_GCS_BUCKET`, `QUEUE_COUNT` (`8` —
+match vCPUs), `WAITLESS_GCE_PREEMPTIBLE` (`1` = SPOT),
 `LEGACY_VIRTIO_NIC` (`1` = legacy virtio instead of gVNIC, for A/B
 comparison).
 
@@ -288,7 +288,7 @@ deploy-gcloud.sh ───────► unikernel-webserver   (build a GCE cus
 - **Co-locate the GCE VMs.** Both must share a zone; cross-zone RTT
   (~5 ms) RTT-bounds fresh-connection workloads.
 - **SPOT preemption.** The VMs are preemptible — fine for iteration,
-  but a run can be interrupted. Set `UNIKERNEL_GCE_PREEMPTIBLE=0` for
+  but a run can be interrupted. Set `WAITLESS_GCE_PREEMPTIBLE=0` for
   an on-demand VM when a clean multi-point sweep matters.
 - **`SKIP (not ready)` on `gcp-bench.sh --env kvm` — nested
   virtualization on `kvm-vm`.** *Diagnosed + fixed 2026-05-18.* `kvm-vm`

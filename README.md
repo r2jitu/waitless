@@ -85,7 +85,7 @@ for the full methodology.
 
 ## Build Configurations
 
-`unikernel_binary(name, app)` generates one runnable target per runner — pick
+`waitless_binary(name, app)` generates one runnable target per runner — pick
 the variant by name, no `--config=` flags needed (see
 [`bazel/rules/variants.bzl`](bazel/rules/variants.bzl)):
 
@@ -175,11 +175,11 @@ async fn init() {
 
 `#[waitless::init]` marks the async entry point the runtime polls once the
 kernel, drivers, and network are up. The crate's `BUILD.bazel` wires it to the
-`unikernel_binary` rule:
+`waitless_binary` rule:
 
 ```python
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:unikernel.bzl", "port_fwd", "unikernel_binary")
+load("//bazel/rules:waitless.bzl", "port_fwd", "waitless_binary")
 
 rust_library(
     name = "app",
@@ -191,7 +191,7 @@ rust_library(
     ],
 )
 
-unikernel_binary(
+waitless_binary(
     name = "hello",
     app = ":app",
     drivers = ["//crates/drivers/virtio-net"],
@@ -225,7 +225,7 @@ labels that resolve into the dependency:
 
 ```python
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("@waitless//bazel/rules:unikernel.bzl", "port_fwd", "unikernel_binary")
+load("@waitless//bazel/rules:waitless.bzl", "port_fwd", "waitless_binary")
 
 rust_library(
     name = "app",
@@ -237,7 +237,7 @@ rust_library(
     ],
 )
 
-unikernel_binary(
+waitless_binary(
     name = "website",
     app = ":app",
     drivers = ["@waitless//crates/drivers/virtio-net"],
@@ -268,7 +268,7 @@ waitless/
 │   ├── crypto/        AEAD helpers
 │   ├── util/          Zero-copy buffers and lock-free primitives
 │   └── boot/          Arch entry, page tables, the Limine boot protocol
-├── bazel/             Toolchains, platforms, and the unikernel_binary rule
+├── bazel/             Toolchains, platforms, and the waitless_binary rule
 ├── docs/              Architecture and subsystem deep-dives
 ├── scripts/           Benchmark, deploy, and dev tooling
 └── tools/hvf-runner/  Native macOS/arm64 HVF runner used by the dev loop
@@ -291,7 +291,7 @@ waitless/
 ./scripts/deploy-gcloud.sh deploy
 
 # Defaults: n2-highcpu-4 + gVNIC + queue-count=4. Override via env:
-UNIKERNEL_GCE_MACHINE=n2-standard-2 QUEUE_COUNT=2 ./scripts/deploy-gcloud.sh deploy
+WAITLESS_GCE_MACHINE=n2-standard-2 QUEUE_COUNT=2 ./scripts/deploy-gcloud.sh deploy
 
 # Tail the serial console; stop / delete the instance.
 ./scripts/deploy-gcloud.sh logs

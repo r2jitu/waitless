@@ -110,8 +110,8 @@ Required for pulling in crypto (`ring`), QUIC (`quiche`/`quinn`), etc.
 
 **Try it:**
 ```bash
-bazel build --platforms=//bazel/platforms:aarch64_unikernel @crates//:bitflags   # bare-metal aarch64
-bazel build --platforms=//bazel/platforms:x86_64_unikernel  @crates//:bitflags   # bare-metal x86_64
+bazel build --platforms=//bazel/platforms:aarch64_waitless @crates//:bitflags   # bare-metal aarch64
+bazel build --platforms=//bazel/platforms:x86_64_waitless  @crates//:bitflags   # bare-metal x86_64
 ```
 
 ---
@@ -535,7 +535,7 @@ INIT-SIPI-SIPI after init is done.
 - [x] AP trampoline (boot.S): EL2->EL1 drop, MMU enable, VBAR, stack, jump to Rust
 - [x] aarch64: per-core GIC redistributor init (init_ap)
 - [x] FDT parser: count cpu@N nodes for CPU count
-- [x] UNIKERNEL_CPUS env var for configurable SMP count in QEMU
+- [x] WAITLESS_CPUS env var for configurable SMP count in QEMU
 - [x] x86_64: extend boot page tables to 4GB (covers APIC MMIO at 0xFEE00000)
 - [x] x86_64: APIC detected + logged (SVR enable deferred to avoid PIC conflict)
 - [x] x86_64: ACPI MADT parsing (kernel/x86_64/acpi.rs, detects 4 CPUs)
@@ -575,7 +575,7 @@ bazel test //tests/integration/smp:test_qemu_x86_64    # same on x86_64 QEMU
 - [x] bench.py `QemuEnv` / `KvmEnv` pass `mq=on,vectors=2N+2` + `queues=N` (tap/vhost)
 - [x] bench.py compares 1-core vs N-core throughput by default
 - [x] HVF runner (Apple Silicon native): multi-queue Tier 1 via SO_REUSEPORT UDP siblings + TCP accept dispatcher
-- [x] `bazel run //apps/webserver:webserver`: pass `mq=on,queues=N,vectors=2N+2` when `UNIKERNEL_CPUS > 1`
+- [x] `bazel run //apps/webserver:webserver`: pass `mq=on,queues=N,vectors=2N+2` when `WAITLESS_CPUS > 1`
 
 **Not implemented / deferred:**
 - [ ] **aarch64 QEMU MSI routing** — virtio-mmio driver creates N queue pairs but only
@@ -597,7 +597,7 @@ bazel test //tests/integration/smp:test_qemu_x86_64    # same on x86_64 QEMU
 **Try it (the big milestone):**
 ```bash
 # Webserver on 4 cores — each core owns its own virtio queue pair
-UNIKERNEL_CPUS=4 bazel run //apps/webserver:webserver
+WAITLESS_CPUS=4 bazel run //apps/webserver:webserver
 # Serial: "virtio_net: MSI-X enabled (4 RX vectors)"
 #         "virtio_net: MQ activated"
 #         "[net] Tier 1: per-core RX queues (4 queue pairs)"
@@ -647,8 +647,8 @@ replaced it; see MEMORY.md). Tier 2 is still the code path for any single-queue 
 
 **Try it:**
 ```bash
-UNIKERNEL_CPUS=4 bazel test //apps/webserver:test_qemu_aarch64 --test_env=UNIKERNEL_CPUS=4
-UNIKERNEL_CPUS=4 bazel test //apps/webserver:test_qemu_x86_64  --test_env=UNIKERNEL_CPUS=4
+WAITLESS_CPUS=4 bazel test //apps/webserver:test_qemu_aarch64 --test_env=WAITLESS_CPUS=4
+WAITLESS_CPUS=4 bazel test //apps/webserver:test_qemu_x86_64  --test_env=WAITLESS_CPUS=4
 # Serial: "[net] Tier 2: software distribution (4 cores)"
 # UDP multi-core benchmark:
 ./scripts/bench_udp.sh
@@ -1438,11 +1438,11 @@ The cpufeatures fix is currently a **per-crate** rustc_flags
 annotation in `MODULE.bazel`. Every new crypto crate that hits
 LLVM's "Do not know how to split the result of this operator!"
 needs to be added to the annotation list. A cleaner long-term
-approach is a custom `x86_64-unikernel.json` Rust target spec that
+approach is a custom `x86_64-waitless.json` Rust target spec that
 sets `features: "+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+aes,
 +pclmul,+avx,+avx2,+fma,+bmi1,+bmi2"` as the baseline.
 
-- [ ] Write `bazel/targets/x86_64-unikernel.json` based on
+- [ ] Write `bazel/targets/x86_64-waitless.json` based on
       `x86_64-unknown-none` with the SSE/AVX baseline.
 - [ ] Update the rust toolchain registration in MODULE.bazel to
       register the new triple.
@@ -1613,7 +1613,7 @@ std (`thiserror`, `tracing`, `parking_lot`, `tokio`, …),
 
 ### Cooperative-drain shutdown phase
 
-Today's `shutdown_and_drop` (in `uni/src/lib.rs`) is force-abort:
+Today's `shutdown_and_drop` (in `crates/waitless/src/lib.rs`) is force-abort:
 listeners drop → `drain_all_arenas` force-drops every live future
 → `shutdown_all_tcp` RSTs every active conn → power off. Clean (the
 `HEAP_LEAK_CHECK ok` test in `apps/webserver:test_hvf` proves
@@ -1664,18 +1664,18 @@ load-bearing only for *who controls the implementation*.
 
 **What the move would actually require:**
 
-- [ ] Promote `tcp` → `uni-tcp` and `udp` → `uni-udp`
+- [ ] Promote `tcp` → `waitless-tcp` and `udp` → `waitless-udp`
       above `executor`. Both crates are already `#![no_std]`
       with no `nic_api` dep; the `kernel_bare::cpu_id` /
       `rng::fill_bytes` / `percpu::PerCpu` calls have
       `worker` equivalents in use across `executor::reactor`.
 - [ ] Move the bare-metal `BARE_TCP_BACKEND` /
       `BARE_UDP_BACKEND` registration out of `crates/net/stack/src/lib.rs`
-      into `uni_tcp::install()` / `uni_udp::install()` (mirrors
+      into `waitless_tcp::install()` / `waitless_udp::install()` (mirrors
       `tls::install()` style). App calls `install()` from
       its boot sequence.
 - [ ] Define one new `Ipv4Send` vtable that the platform
-      registers and `uni-tcp` / `uni-udp` call instead of
+      registers and `waitless-tcp` / `waitless-udp` call instead of
       `ipv4_send` directly. Keeps IPv4/ARP/Ethernet below the
       line as the "platform's wire glue"; only L4 lifts.
 - [ ] Move the `tcp_dispatch` / `udp_dispatch` registry hooks
@@ -1813,7 +1813,7 @@ Separate test apps that boot QEMU, exercise features, report via serial.
 
 ```python
 rust_library(name = "app", srcs = ["main.rs"], deps = ["//uni", "//kernel"])
-unikernel_binary(name = "test_smp", app = ":app")
+waitless_binary(name = "test_smp", app = ":app")
 sh_test(name = "test", srcs = ["test.sh"], data = [":test_smp.elf"])
 ```
 

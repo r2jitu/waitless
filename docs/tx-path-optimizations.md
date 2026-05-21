@@ -98,7 +98,7 @@ AEAD to the NIC.
   + `submit_tx`; caller (TCP and QUIC) writes straight into a
   slot of the existing 64-slot `tx_pool`, no intermediate stack
   buffer + memcpy.
-  * Implementation: new `TxBufHandle` struct in `uni/net::driver`
+  * Implementation: new `TxBufHandle` struct in `crates/waitless/net::driver`
     with `Drop` returning the slot to the pool unused; `submit_tx`
     `mem::forget`s the handle to skip release.
   * virtio-net: per-qp scan, Tier-1 only (Tier-2 shared qp returns
