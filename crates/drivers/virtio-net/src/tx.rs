@@ -26,9 +26,6 @@ pub(crate) fn qp_needs_lock() -> bool {
     nqp == 1 && nw > 1
 }
 
-/// Flag: set by APs when they stage TX.
-static TX_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
 /// TX lock: protects the VirtIO TX queue. Any core can acquire to
 /// flush or send. Wraps `()` because the underlying state lives in
 /// `(*tx_q(0))` and is mutable through the existing
@@ -97,10 +94,6 @@ pub(crate) fn tx_drain_qp(qp: usize) {
     }
 }
 
-pub(crate) fn tx_drain() {
-    tx_drain_qp(0);
-}
-
 // ---- Slice-shaped send convenience ------------------------------------------
 
 /// Slice-shaped send convenience wrapper. Acquires a TX-pool slot
@@ -151,10 +144,10 @@ pub(crate) fn send(data: &[u8], csum: nic_api::CsumOffload) {
 // `None` from `acquire_tx_buf` — the caller falls back to the
 // legacy `send(&[u8])` + per-core staging path.
 
-/// Pool ID embedded in `TxBufHandle::driver_token` so `release_fn` +
-/// `submit_tx*` know which pool's `_used` array to update and
+/// Pool ID embedded in `TxBufHandle::driver_token` so `release_fn`
+/// and `submit_tx*` know which pool's `_used` array to update and
 /// which slot array to index. Only two pools today (small + big),
-/// one bit of the token is sufficient.
+/// so one bit of the token is sufficient.
 const POOL_ID_SMALL: u8 = 0;
 const POOL_ID_BIG: u8 = 1;
 
@@ -513,23 +506,15 @@ pub(crate) fn flush_tx_staging() {
 }
 
 /// Enable deferred TX kick mode. After this, kick() on the TX queue
-/// is a no-op; the caller must call flush_tx_kick() to issue the
-/// actual MMIO write. Batches multiple send_segment() calls into
-/// one virtio notification, reducing MMIO exits.
+/// is a no-op; the caller must call `flush_tx_kick_if_dirty()` to
+/// issue the actual MMIO write. Batches multiple send_segment()
+/// calls into one virtio notification, reducing MMIO exits.
 pub(crate) fn enable_deferred_tx_kick() {
     let nqp = unsafe { (*ndev()).num_queue_pairs } as usize;
     for qp in 0..nqp {
         unsafe {
             (*tx_q(qp)).set_deferred_kick(true);
         }
-    }
-}
-
-/// Flush deferred TX kick — issues one MMIO notify for all batched TX.
-/// Only kicks if new buffers were added since last flush (kick_dirty).
-pub(crate) fn flush_tx_kick() {
-    unsafe {
-        (*tx_q(0)).flush_kick();
     }
 }
 

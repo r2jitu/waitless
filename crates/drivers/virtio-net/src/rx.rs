@@ -1,7 +1,5 @@
 // RX path: per-queue NAPI-style polling, owned-IOBuf delivery
-// with a repost-on-drop callback, RX-side IRQ arm + napi rearm,
-// and the legacy "batch into a flat buffer" poll variant kept
-// for callers that want a copying drain (`poll_batch`).
+// with a repost-on-drop callback, and RX-side IRQ arm + napi rearm.
 
 use core::ptr;
 use core::ptr::NonNull;
@@ -16,119 +14,6 @@ use crate::tx::{TX_LOCK, tx_drain_qp};
 use crate::{
     BUFFER_SIZE, DIAG_QP_CAP, Transport, VIRTIO_NET_HDR_SIZE, ndev, qps, rx_q,
 };
-
-/// Maximum frames per batch poll.
-pub(crate) const BATCH_SIZE: usize = 32;
-
-/// A batch of received frames. Frames are stored contiguously with
-/// a length prefix: [len: u16][frame data][len: u16][frame data]...
-pub(crate) struct RxBatch {
-    pub data: [u8; BATCH_SIZE * 1600], // worst case: 32 × 1514-byte frames
-    pub len: usize,                    // bytes used in data
-    pub count: usize,                  // number of frames
-}
-
-impl RxBatch {
-    pub const fn new() -> Self {
-        RxBatch {
-            data: [0; BATCH_SIZE * 1600],
-            len: 0,
-            count: 0,
-        }
-    }
-
-    /// Iterate over frames in the batch.
-    pub fn iter(&self) -> RxBatchIter<'_> {
-        RxBatchIter {
-            data: &self.data[..self.len],
-            pos: 0,
-        }
-    }
-}
-
-pub(crate) struct RxBatchIter<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Iterator for RxBatchIter<'a> {
-    type Item = &'a [u8];
-    fn next(&mut self) -> Option<&'a [u8]> {
-        if self.pos + 2 > self.data.len() {
-            return None;
-        }
-        let len = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]) as usize;
-        self.pos += 2;
-        if self.pos + len > self.data.len() {
-            return None;
-        }
-        let frame = &self.data[self.pos..self.pos + len];
-        self.pos += len;
-        Some(frame)
-    }
-}
-
-/// Poll VirtIO RX queue pair 0 and collect frames into a batch buffer.
-pub(crate) fn poll_batch(batch: &mut RxBatch) {
-    poll_batch_qp(0, batch);
-}
-
-/// Poll a specific queue pair's RX queue into a batch buffer.
-pub(crate) fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
-    batch.len = 0;
-    batch.count = 0;
-
-    unsafe {
-        if let Transport::None = (*ndev()).transport {
-            return;
-        }
-    }
-
-    // Drain TX completions. Tier 1 owns qp per core (no lock needed),
-    // Tier 2 has the single shared queue and must serialise.
-    let nqp = unsafe { (*ndev()).num_queue_pairs };
-    if kernel_bare::percpu::num_cores() <= 1 || (nqp as usize) > 1 {
-        tx_drain_qp(qp);
-    } else if let Some(_g) = TX_LOCK.try_lock() {
-        tx_drain_qp(qp);
-    }
-
-    unsafe {
-        while batch.count < BATCH_SIZE {
-            let (used_id, used_len) = match (*rx_q(qp)).used() {
-                Some(v) => v,
-                None => break,
-            };
-            let desc = (*rx_q(qp)).desc(used_id);
-            let buf = phys_to_virt(desc.addr);
-
-            if used_len > VIRTIO_NET_HDR_SIZE as u32 {
-                let frame_len = (used_len - VIRTIO_NET_HDR_SIZE as u32) as usize;
-                if batch.len + 2 + frame_len <= batch.data.len() {
-                    let len_bytes = (frame_len as u16).to_le_bytes();
-                    batch.data[batch.len] = len_bytes[0];
-                    batch.data[batch.len + 1] = len_bytes[1];
-                    let frame_data = buf.add(VIRTIO_NET_HDR_SIZE);
-                    core::ptr::copy_nonoverlapping(
-                        frame_data,
-                        batch.data.as_mut_ptr().add(batch.len + 2),
-                        frame_len,
-                    );
-                    batch.len += 2 + frame_len;
-                    batch.count += 1;
-                }
-            }
-
-            // Re-arm RX buffer
-            let buf_phys = virt_to_phys(buf);
-            (*rx_q(qp)).add_buf(buf_phys, BUFFER_SIZE, 0, 1);
-        }
-
-        if batch.count > 0 {
-            (*rx_q(0)).kick();
-        }
-    }
-}
 
 pub(crate) fn arm_rx_interrupts() {
     unsafe {

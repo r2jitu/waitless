@@ -7,7 +7,6 @@
 // `register_ethernet_driver!`.
 
 #![no_std]
-#![allow(dead_code, unused_imports)]
 
 extern crate alloc;
 
@@ -176,9 +175,15 @@ pub(crate) struct QueuePairState {
 }
 
 impl QueuePairState {
-    // Holds atomics (interior mutability), but it's a one-shot value
-    // initializer: `init_qp_storage` moves it into freshly heap-
-    // allocated storage via `ptr::write`, never read in place.
+    // Zero-initialised queue-pair-state template. Intentionally a
+    // `const` (not a `const fn`): it is `ptr::write`-copied into each
+    // freshly-allocated slot in `init_qp_storage`, and as a `const` it
+    // lives in rodata so the copy is a plain rodata->slot memcpy with
+    // no stack temporary. clippy's `declare_interior_mutable_const`
+    // flags it because the type holds a `Spinlock`/`AtomicBool`; the
+    // per-use copy the lint warns about is exactly what every call
+    // site wants here — one fresh, independent instance per slot — so
+    // the lint is suppressed deliberately.
     #[allow(clippy::declare_interior_mutable_const)]
     pub(crate) const ZEROED: Self = QueuePairState {
         rx_buffers: [ptr::null_mut(); RX_BUFFERS],
@@ -220,9 +225,15 @@ pub(crate) struct WorkerTxPool {
 }
 
 impl WorkerTxPool {
-    // Holds atomics (interior mutability), but it's a one-shot value
-    // initializer: `init_qp_storage` moves it into freshly heap-
-    // allocated storage via `ptr::write`, never read in place.
+    // Zero-initialised worker-TX-pool template. MUST stay a `const`
+    // (not a `const fn`): `WorkerTxPool` is ~97 KiB, and as a `const`
+    // it lives in rodata so `init_qp_storage` copies it rodata->slot.
+    // A `const fn` returning it by value materialises a ~97 KiB stack
+    // temporary that overflows the kernel boot stack on aarch64 and
+    // wedges boot (verified: it breaks webserver_hvf / _qemu_aarch64).
+    // clippy's `declare_interior_mutable_const` flags the interior-
+    // mutable `AtomicBool` arrays; the per-use copy it warns about is
+    // the intended behaviour — one fresh pool per worker.
     #[allow(clippy::declare_interior_mutable_const)]
     pub(crate) const ZEROED: Self = WorkerTxPool {
         small: [const { TxBufSmall::ZERO }; TX_POOL_SMALL_SIZE],
@@ -283,7 +294,6 @@ pub(crate) struct NetDevice {
     /// `has_tso4`: a device can offer CSUM without TSO4. When this
     /// is false, `submit_tx` finishes the L4 checksum in software.
     pub has_csum: bool,
-    pub irq_edge: bool, // SPI is edge-triggered (from FDT)
 }
 
 impl NetDevice {
@@ -303,7 +313,6 @@ impl NetDevice {
         has_mq: false,
         has_tso4: false,
         has_csum: false,
-        irq_edge: false,
     };
 }
 

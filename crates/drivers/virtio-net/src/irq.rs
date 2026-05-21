@@ -6,14 +6,14 @@
 use core::sync::atomic::AtomicBool;
 
 #[cfg(target_arch = "aarch64")]
-use bus::virtio::{MMIO_INTERRUPT_ACK, MMIO_INTERRUPT_STATUS};
+use bus::virtio::{MMIO_INTERRUPT_ACK, MMIO_INTERRUPT_STATUS, vpci_read_isr};
 #[cfg(target_arch = "aarch64")]
 use bus::{virtio_read32, virtio_write32};
-use bus::virtio::{VirtioPciDevice, vpci_device, vpci_read_isr};
+use bus::virtio::vpci_device;
 #[cfg(target_arch = "x86_64")]
 use bus::virtio::{
-    vpci_msix_enable, vpci_msix_write_entry, vpci_select_queue, vpci_set_config_msix_vector,
-    vpci_set_queue_msix_vector,
+    VirtioPciDevice, vpci_msix_enable, vpci_msix_write_entry, vpci_select_queue,
+    vpci_set_config_msix_vector, vpci_set_queue_msix_vector,
 };
 #[cfg(target_arch = "aarch64")]
 use bus::pci::pci_device;
@@ -26,12 +26,10 @@ use crate::{Transport, ndev, rx_q};
 /// The poll path checks this instead of doing an MMIO read every iteration.
 pub(crate) static IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 
-// x86_64: extern "C" fn() wrapper for the IDT stub trampoline
-#[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn irq_handler_x86(_frame: *mut kernel_bare::x86_64::idt::InterruptFrame) {
-    irq_handler(0);
-}
-
+/// Line-based IRQ handler for the aarch64 GIC SPI path. Registered
+/// with `exceptions::register_irq`. The x86_64 MSI-X path uses
+/// `msix_rx_isr_trampoline` instead, so this is aarch64-only.
+#[cfg(target_arch = "aarch64")]
 fn irq_handler(_irq: u32) {
     unsafe {
         // NAPI: disable notifications on entry
@@ -92,9 +90,6 @@ pub(crate) fn enable_irq() {
                             (*rx_q(0)).enable_interrupts();
                             exceptions::register_irq(fdt.virtio_irqs[i], irq_handler);
                             (*ndev()).irq_idle_available = true;
-                            // FDT flags bit 0: 1=edge-triggered, 0=level.
-                            // Edge SPIs don't need ISR read or ACK write.
-                            (*ndev()).irq_edge = (fdt.virtio_irq_flags[i] & 1) != 0;
                             break;
                         }
                     }
@@ -188,10 +183,6 @@ fn init_msix_x86(dev: &VirtioPciDevice, num_pairs: usize) {
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn msix_rx_isr_trampoline(_frame: *mut kernel_bare::x86_64::idt::InterruptFrame) {
     IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
-}
-
-pub(crate) fn irq_idle_supported() -> bool {
-    unsafe { (*ndev()).irq_idle_available }
 }
 
 /// Read the virtio INTERRUPT_STATUS register. This is a no-op from the
