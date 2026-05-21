@@ -11,10 +11,12 @@
 // public APIs are safe where possible.
 
 #![no_std]
-#![allow(dead_code, unused_imports)] // register constants + arch-conditional imports
 
 use core::arch::asm;
 use core::ptr;
+// Barrier primitives for the x86_64 `dsb_*` implementations; the
+// aarch64 path uses `dsb` asm instructions instead.
+#[cfg(target_arch = "x86_64")]
 use core::sync::atomic::{Ordering, compiler_fence};
 
 // ============================================================================
@@ -96,8 +98,7 @@ pub fn dc_civac_range(addr: *const u8, len: usize) {
 
 /// # Safety
 ///
-/// `addr` must be a valid, mapped MMIO address suitably aligned for a
-/// 32-bit access.
+/// `addr` must be a valid, mapped MMIO address.
 #[inline(always)]
 pub unsafe fn mmio_read32(addr: u64) -> u32 {
     unsafe { ptr::read_volatile(addr as *const u32) }
@@ -105,8 +106,7 @@ pub unsafe fn mmio_read32(addr: u64) -> u32 {
 
 /// # Safety
 ///
-/// `addr` must be a valid, mapped MMIO address suitably aligned for a
-/// 32-bit access. The write may have device-visible side effects.
+/// `addr` must be a valid, mapped MMIO address.
 #[inline(always)]
 pub unsafe fn mmio_write32(addr: u64, val: u32) {
     unsafe {
@@ -116,8 +116,7 @@ pub unsafe fn mmio_write32(addr: u64, val: u32) {
 
 /// # Safety
 ///
-/// `addr` must be a valid, mapped MMIO address suitably aligned for a
-/// 16-bit access.
+/// `addr` must be a valid, mapped MMIO address.
 #[inline(always)]
 pub unsafe fn mmio_read16(addr: u64) -> u16 {
     unsafe { ptr::read_volatile(addr as *const u16) }
@@ -125,8 +124,7 @@ pub unsafe fn mmio_read16(addr: u64) -> u16 {
 
 /// # Safety
 ///
-/// `addr` must be a valid, mapped MMIO address suitably aligned for a
-/// 16-bit access. The write may have device-visible side effects.
+/// `addr` must be a valid, mapped MMIO address.
 #[inline(always)]
 pub unsafe fn mmio_write16(addr: u64, val: u16) {
     unsafe {
@@ -144,8 +142,7 @@ pub unsafe fn mmio_read8(addr: u64) -> u8 {
 
 /// # Safety
 ///
-/// `addr` must be a valid, mapped MMIO address. The write may have
-/// device-visible side effects.
+/// `addr` must be a valid, mapped MMIO address.
 #[inline(always)]
 pub unsafe fn mmio_write8(addr: u64, val: u8) {
     unsafe {
@@ -155,12 +152,9 @@ pub unsafe fn mmio_write8(addr: u64, val: u8) {
 
 // ---- x86_64 port I/O -------------------------------------------------------
 
-/// Write a 32-bit value to an x86 I/O port.
-///
 /// # Safety
 ///
-/// `port` must address a valid I/O port; the write may have
-/// device-visible side effects.
+/// `port` must be a valid I/O port for a 32-bit write.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn outl(port: u16, val: u32) {
@@ -169,12 +163,9 @@ pub unsafe fn outl(port: u16, val: u32) {
     }
 }
 
-/// Read a 32-bit value from an x86 I/O port.
-///
 /// # Safety
 ///
-/// `port` must address a valid I/O port; the read may have
-/// device-visible side effects.
+/// `port` must be a valid I/O port for a 32-bit read.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn inl(port: u16) -> u32 {
@@ -185,12 +176,9 @@ pub unsafe fn inl(port: u16) -> u32 {
     }
 }
 
-/// Write a 16-bit value to an x86 I/O port.
-///
 /// # Safety
 ///
-/// `port` must address a valid I/O port; the write may have
-/// device-visible side effects.
+/// `port` must be a valid I/O port for a 16-bit write.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn outw(port: u16, val: u16) {
@@ -199,12 +187,9 @@ pub unsafe fn outw(port: u16, val: u16) {
     }
 }
 
-/// Read a 16-bit value from an x86 I/O port.
-///
 /// # Safety
 ///
-/// `port` must address a valid I/O port; the read may have
-/// device-visible side effects.
+/// `port` must be a valid I/O port for a 16-bit read.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn inw(port: u16) -> u16 {
@@ -215,12 +200,9 @@ pub unsafe fn inw(port: u16) -> u16 {
     }
 }
 
-/// Write an 8-bit value to an x86 I/O port.
-///
 /// # Safety
 ///
-/// `port` must address a valid I/O port; the write may have
-/// device-visible side effects.
+/// `port` must be a valid I/O port for an 8-bit write.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn outb(port: u16, val: u8) {
@@ -229,12 +211,9 @@ pub unsafe fn outb(port: u16, val: u8) {
     }
 }
 
-/// Read an 8-bit value from an x86 I/O port.
-///
 /// # Safety
 ///
-/// `port` must address a valid I/O port; the read may have
-/// device-visible side effects.
+/// `port` must be a valid I/O port for an 8-bit read.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn inb(port: u16) -> u8 {
@@ -251,9 +230,8 @@ pub unsafe fn inb(port: u16) -> u8 {
 ///
 /// # Safety
 ///
-/// `base` must be a valid virtio register location: an I/O port on
-/// x86_64, or a mapped MMIO address (aligned for a 32-bit access) on
-/// aarch64.
+/// `base` must be a valid virtio register address: a mapped MMIO
+/// address on aarch64, or a valid I/O port on x86_64.
 #[inline(always)]
 pub unsafe fn virtio_read32(base: u64) -> u32 {
     unsafe {
@@ -272,9 +250,8 @@ pub unsafe fn virtio_read32(base: u64) -> u32 {
 ///
 /// # Safety
 ///
-/// `base` must be a valid virtio register location: an I/O port on
-/// x86_64, or a mapped MMIO address (aligned for a 32-bit access) on
-/// aarch64.
+/// `base` must be a valid virtio register address: a mapped MMIO
+/// address on aarch64, or a valid I/O port on x86_64.
 #[inline(always)]
 pub unsafe fn virtio_write32(base: u64, val: u32) {
     unsafe {
@@ -293,9 +270,8 @@ pub unsafe fn virtio_write32(base: u64, val: u32) {
 ///
 /// # Safety
 ///
-/// `base` must be a valid virtio register location: an I/O port on
-/// x86_64, or a mapped MMIO address (aligned for a 16-bit access) on
-/// aarch64.
+/// `base` must be a valid virtio register address: a mapped MMIO
+/// address on aarch64, or a valid I/O port on x86_64.
 #[inline(always)]
 pub unsafe fn virtio_read16(base: u64) -> u16 {
     unsafe {
@@ -314,9 +290,8 @@ pub unsafe fn virtio_read16(base: u64) -> u16 {
 ///
 /// # Safety
 ///
-/// `base` must be a valid virtio register location: an I/O port on
-/// x86_64, or a mapped MMIO address (aligned for a 16-bit access) on
-/// aarch64.
+/// `base` must be a valid virtio register address: a mapped MMIO
+/// address on aarch64, or a valid I/O port on x86_64.
 #[inline(always)]
 pub unsafe fn virtio_write16(base: u64, val: u16) {
     unsafe {
@@ -335,8 +310,8 @@ pub unsafe fn virtio_write16(base: u64, val: u16) {
 ///
 /// # Safety
 ///
-/// `base` must be a valid virtio register location: an I/O port on
-/// x86_64, or a mapped MMIO address on aarch64.
+/// `base` must be a valid virtio register address: a mapped MMIO
+/// address on aarch64, or a valid I/O port on x86_64.
 #[inline(always)]
 pub unsafe fn virtio_read8(base: u64) -> u8 {
     unsafe {
@@ -355,8 +330,8 @@ pub unsafe fn virtio_read8(base: u64) -> u8 {
 ///
 /// # Safety
 ///
-/// `base` must be a valid virtio register location: an I/O port on
-/// x86_64, or a mapped MMIO address on aarch64.
+/// `base` must be a valid virtio register address: a mapped MMIO
+/// address on aarch64, or a valid I/O port on x86_64.
 #[inline(always)]
 pub unsafe fn virtio_write8(base: u64, val: u8) {
     unsafe {

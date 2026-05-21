@@ -2,7 +2,9 @@
 
 #[cfg(target_arch = "aarch64")]
 use crate::map_device_range;
-use crate::{log, mmio_read16, mmio_read32, mmio_write16, mmio_write32};
+use crate::{mmio_read32, mmio_write32};
+#[cfg(target_arch = "aarch64")]
+use crate::{mmio_read16, mmio_write16};
 #[cfg(target_arch = "aarch64")]
 use kernel_bare::aarch64::fdt;
 use kernel_bare::sync::Spinlock;
@@ -365,9 +367,9 @@ fn init_inner() {
 
 pub fn find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
     let table = PCI_DEVICES.lock();
-    table.devices[..table.count]
-        .iter()
-        .position(|d| d.vendor_id == vendor_id && d.device_id == device_id)
+    (0..table.count).find(|&i| {
+        table.devices[i].vendor_id == vendor_id && table.devices[i].device_id == device_id
+    })
 }
 
 /// Snapshot of `PCI_DEVICES[idx]` returned by value. PciDevice is Copy

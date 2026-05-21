@@ -8,9 +8,8 @@ use crate::pci::{
     enable_bus_mastering_inner, find_device, pci_device, read_bar64, read_config, write_config,
 };
 use crate::{
-    dsb_ld, dsb_st, dsb_sy, log, mmio_read8, mmio_read16, mmio_read32, mmio_write8, mmio_write16,
-    mmio_write32, virtio_read8, virtio_read16, virtio_read32, virtio_write8, virtio_write16,
-    virtio_write32,
+    dsb_ld, dsb_st, mmio_read8, mmio_read16, mmio_read32, mmio_write8, mmio_write16, mmio_write32,
+    virtio_read16, virtio_read32, virtio_write16, virtio_write32,
 };
 use kernel_bare::mm::{alloc_pages, phys_to_virt};
 
