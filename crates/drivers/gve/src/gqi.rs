@@ -15,7 +15,7 @@
 // Linux's `iowrite32be` doorbell convention; opposite of DQO).
 
 use core::ptr;
-use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
+use core::sync::atomic::{Ordering, compiler_fence};
 
 use bus::mmio_write32;
 use iobuf::{Chain, OwnedIOBuf};
@@ -832,9 +832,3 @@ pub(crate) fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, mut callback
 
     delivered
 }
-
-// Suppress unused warnings for items only used by sibling lib.rs
-// at compile time — the `AtomicBool` import is needed via Drop's
-// release_fn closure but not directly referenced in this module.
-#[allow(dead_code)]
-const _: AtomicBool = AtomicBool::new(false);

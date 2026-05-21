@@ -101,8 +101,6 @@ pub(crate) const REG_MAX_RX_QUEUES: u64 = 0x0C;
 // 0x1C..=0x1F: reserved (3) + driver_version (1)
 // 0x20..=0x2B: modern adminq base_address_hi/lo + length (we don't use these)
 
-const DEVICE_STATUS_RESET: u32 = 1 << 1;
-
 // Admin queue constants, opcodes, command builder, and submission
 // helpers live in `crate::adminq` (q.v.).
 
@@ -608,12 +606,6 @@ pub(crate) fn log_mac(mac: &[u8; 6]) {
     }
     log(&buf);
 }
-
-// `DEVICE_STATUS_RESET` is defined for completeness vs the BAR0
-// register spec but the driver doesn't issue a reset path. Reference
-// it here so `#[deny(dead_code)]` builds don't trip.
-#[allow(dead_code)]
-const _: u32 = DEVICE_STATUS_RESET;
 
 // ============================================================================
 // NicOps registration
