@@ -49,7 +49,7 @@
           }
         },
         // Don't run `cargo check` — bazel is the build system, and the
-        // unikernel kernel/uni crates aren't even cargo-buildable.
+        // unikernel kernel/waitless crates aren't even cargo-buildable.
         "check": {
           "overrideCommand": []
         },

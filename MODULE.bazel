@@ -131,12 +131,12 @@ register_toolchains("@hardfloat_x86_64_none//:toolchain")
 # ── crates.io dependencies ──────────────────────────────────────────────────
 # Cargo.toml is the source of truth: a workspace at the repo root
 # lists the project's external Rust deps (used by tools/hvf-runner +
-# the bare-metal kernel/uni/limine code). crate_universe reads the
+# the bare-metal kernel/waitless/limine code). crate_universe reads the
 # spliced workspace and generates `@crates//:foo` labels that
 # rust_binary / rust_library targets consume. `bazel/crates-bridge`
 # is a placeholder workspace member whose only job is to pull the
 # bare-metal-only crates (bitflags, fdt, limine) into the lockfile,
-# since the `#![no_std]` kernel/uni crates aren't cargo-aware
+# since the `#![no_std]` kernel/waitless crates aren't cargo-aware
 # themselves.
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(

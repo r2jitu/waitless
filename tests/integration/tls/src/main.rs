@@ -319,9 +319,9 @@ fn init() {
         let differ = buf1 != buf2;
 
         if nonzero && differ {
-            pass(b"uni_rng_fill_bytes");
+            pass(b"waitless_rng_fill_bytes");
         } else {
-            fail(b"uni_rng_fill_bytes");
+            fail(b"waitless_rng_fill_bytes");
             failures += 1;
         }
     }

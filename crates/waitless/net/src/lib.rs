@@ -144,7 +144,7 @@ impl Net {
 
     /// Try DHCP first; on failure (typical under minimal tap
     /// networks or stripped HVF configs) fall back to the supplied
-    /// static configuration. Logs which path won via `uni_log!`.
+    /// static configuration. Logs which path won via `waitless::log!`.
     ///
     /// Use this when you want graceful boot on diverse network
     /// environments without writing the match-fallback ladder by

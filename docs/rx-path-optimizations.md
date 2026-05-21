@@ -1535,7 +1535,7 @@ scope.
 `crates/waitless/backend/src/native/tcp.rs`. Item F's gate set — two bare-metal
 `bazel build`s + `test_hvf` — never compiles the native backend
 (it is `select`'d in only for host builds), so the breakage slipped
-through; `tls_test` catches it because `proto/tls → uni →
+through; `tls_test` catches it because `proto/tls → waitless →
 crates/waitless/backend` pulls the native backend into a host-native test
 compile. Fixed by wiring the three hooks as `None` — the documented
 native-POSIX behaviour (`recv()` copies at the syscall boundary, so

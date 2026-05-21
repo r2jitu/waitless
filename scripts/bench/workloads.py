@@ -252,8 +252,8 @@ def _tls_handshake_worker(args):
             # those sends with delayed-ACK and the handshake
             # stalls ~40 ms per round-trip, capping
             # `tls_handshake_max` at ~20 hs/s on GCP. Disabling
-            # it here matches the server-side fix in
-            # `uni/native.rs::tcp_accept`.
+            # it here matches the server-side fix in the native
+            # backend's tcp_accept (`crates/waitless/backend/src/native/`).
             s.setsockopt(sock_mod.IPPROTO_TCP, sock_mod.TCP_NODELAY, 1)
             ssock = ctx.wrap_socket(s, server_hostname="waitless.local")
             ssock.send(request)

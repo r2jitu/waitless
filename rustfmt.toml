@@ -1,6 +1,6 @@
 # rustfmt configuration, applied repo-wide.
 #
-# The bare-metal kernel / uni-* crates are not part of the Cargo
+# The bare-metal kernel and waitless crates are not part of the Cargo
 # workspace (see the comment at the top of Cargo.toml), so `cargo fmt`
 # only reaches the host crates. scripts/format.sh therefore invokes
 # `rustfmt` directly on every *.rs file -- and a bare `rustfmt` reads

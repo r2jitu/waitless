@@ -82,7 +82,7 @@ circular dependencies, then new protocols get their own targets.
 - [x] `//net:dhcp` (deps: types, ethernet, arp, ipv4, drivers, kernel)
 - [x] `//net:net` umbrella — thin dispatch + poll (~30 lines)
 - [x] `arch_udelay` moved to `kernel/time.rs`
-- [ ] Split `//uni` into per-feature targets (deferred — tied to Phase 2 event loop)
+- [ ] Split `//crates/waitless` into per-feature targets (deferred — tied to Phase 2 event loop)
 
 **Tests:**
 - [x] Unit: byte order roundtrips, address types, RFC 1071 checksums (9 tests)
@@ -1158,7 +1158,7 @@ The trade-off is surface area. Scope discipline is critical:
 - [ ] **`//net:quic`** — connection state machine, Initial →
       Handshake → 1-RTT progression, STREAM/ACK frame handling.
       Per-core connection pool indexed by Connection ID.
-- [ ] **`//uni:http3`** — HTTP/3 over QUIC streams
+- [ ] **`//crates/proto/http3`** — HTTP/3 over QUIC streams
       (HEADERS + DATA frames, static QPACK table only).
 - [ ] **External-client interop**: `curl --http3 --cacert
       dev_cert.pem https://waitless.local:8443/health`
@@ -1812,7 +1812,7 @@ rust_test(name = "ethernet_test", crate = ":ethernet")
 Separate test apps that boot QEMU, exercise features, report via serial.
 
 ```python
-rust_library(name = "app", srcs = ["main.rs"], deps = ["//uni", "//kernel"])
+rust_library(name = "app", srcs = ["main.rs"], deps = ["//crates/waitless", "//kernel"])
 waitless_binary(name = "test_smp", app = ":app")
 sh_test(name = "test", srcs = ["test.sh"], data = [":test_smp.elf"])
 ```

@@ -125,8 +125,8 @@ A `git worktree` keeps the baseline checkout (and its `bazel` cache)
 separate from the change:
 
 ```sh
-git worktree add /tmp/uni-base <baseline-commit>
-(cd /tmp/uni-base && python3 scripts/bench.py --env hvf,qemu --cores 1,3 --duration 10)
+git worktree add /tmp/waitless-base <baseline-commit>
+(cd /tmp/waitless-base && python3 scripts/bench.py --env hvf,qemu --cores 1,3 --duration 10)
 python3 scripts/bench.py --env hvf,qemu --cores 1,3 --duration 10   # the change
 ```
 
@@ -267,7 +267,7 @@ gcp-bench.sh ───────► kvm-vm
 
 gcp-deploy-bench.sh ──► waitless-webserver  +  kvm-vm
    └─ deploy-gcloud.sh deploy   (the target)      (the loadgen client)
-   └─ bench.py --env remote --target <uni ip>    over the GCE network → Tier 1
+   └─ bench.py --env remote --target <waitless ip>    over the GCE network → Tier 1
 
 gcp.sh {run,serve,test} ► kvm-vm   (interactive dev: build → push → nested QEMU)
 deploy-gcloud.sh ───────► waitless-webserver   (build a GCE custom image)
