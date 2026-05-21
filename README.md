@@ -148,6 +148,11 @@ unikernel_binary(
 )
 ```
 
+The `apps/` here are in-tree examples. To build a unikernel app in its
+own repository — depending on this one as a Bazel module — see
+[docs/consuming-as-a-library.md](docs/consuming-as-a-library.md) for the
+`MODULE.bazel` boilerplate an external app must supply.
+
 ## Project Layout
 
 ```
