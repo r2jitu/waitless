@@ -962,7 +962,7 @@ pub fn run(config: RunConfig) -> i32 {
     } else {
         "posix"
     };
-    log(b"UniKernel v0.1.0 (native)\n");
+    log(b"Waitless v0.1.0 (native)\n");
     log(format!("platform: {} ({})\n", os, arch).as_bytes());
     log(format!("cpu: {} \u{00d7} host\n", host_cpus).as_bytes());
     log(format!("mem: {} MB (host)\n", ram_mb).as_bytes());

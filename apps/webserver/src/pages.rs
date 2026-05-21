@@ -83,17 +83,17 @@ hr{border:0;border-top:1px solid var(--border);margin:28px 0;}\
 pub(crate) const SHELL_HEAD_BEFORE_TITLE: &[u8] =
     b"<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>";
 /// Between the page title and STYLES.
-pub(crate) const SHELL_HEAD_AFTER_TITLE: &[u8] = b" \xE2\x80\x94 UniKernel</title>";
+pub(crate) const SHELL_HEAD_AFTER_TITLE: &[u8] = b" \xE2\x80\x94 Waitless</title>";
 /// Between STYLES and the nav block (which the active-link
 /// loop builds dynamically because of the `class="active"`
 /// flip).
 pub(crate) const SHELL_AFTER_STYLES: &[u8] =
-    b"</head><body><nav><a class=\"brand\" href=\"/\">\xE2\xAC\xA2 UniKernel</a>";
+    b"</head><body><nav><a class=\"brand\" href=\"/\">\xE2\xAC\xA2 Waitless</a>";
 /// Static between nav and main.
 pub(crate) const SHELL_NAV_MAIN: &[u8] = b"</nav><main>";
 /// Static suffix from the close of `<main>` through `</html>`.
 pub(crate) const SHELL_FOOTER: &[u8] =
-    b"</main><footer><span>UniKernel v0.1.0 \xC2\xB7 bare-metal Rust \xC2\xB7 no OS, no syscalls</span><span><a href=\"/diagnostics\">Live stats \xE2\x86\x92</a></span></footer></body></html>";
+    b"</main><footer><span>Waitless v0.1.0 \xC2\xB7 bare-metal Rust \xC2\xB7 no OS, no syscalls</span><span><a href=\"/diagnostics\">Live stats \xE2\x86\x92</a></span></footer></body></html>";
 
 /// Build an `IOBufChain` for the page shell, taking the page
 /// title and the inner-page body. The shell's static chrome is
@@ -165,7 +165,7 @@ pub(crate) fn html_response(active: &str, title: &str, body: impl Into<http::IOB
 
 pub(crate) fn page_home() -> Response {
     let body = "\
-<h1>UniKernel</h1>\
+<h1>Waitless</h1>\
 <p class=\"lead\">A bare-metal Rust web server. The whole stack — \
 from interrupt vectors to HTTP/3 — runs as one binary at ring 0, \
 in a single address space, with no OS kernel underneath.</p>\

@@ -131,9 +131,9 @@ aws iam put-role-policy \
 # --- Import as AMI ---
 echo "==> Importing disk image as AMI (this may take several minutes)..."
 IMPORT_TASK=$(aws ec2 import-image \
-    --description "UniKernel ${IMAGE_NAME}" \
+    --description "Waitless ${IMAGE_NAME}" \
     --disk-containers "[{
-        \"Description\": \"UniKernel root disk\",
+        \"Description\": \"Waitless root disk\",
         \"Format\": \"raw\",
         \"UserBucket\": {
             \"S3Bucket\": \"${BUCKET}\",

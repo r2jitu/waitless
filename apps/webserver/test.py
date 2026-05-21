@@ -155,7 +155,7 @@ class WebserverServiceTest(unittest.TestCase):
             f"body doesn't end with </html>: ...{body[-60:]!r}",
         )
         self.assertIn(
-            f"<title>{title} — UniKernel</title>".encode(),
+            f"<title>{title} — Waitless</title>".encode(),
             body,
             f"title missing for {title!r}",
         )

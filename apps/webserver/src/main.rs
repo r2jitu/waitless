@@ -1,4 +1,4 @@
-// UniKernel Example: HTTP Web Server
+// Waitless Example: HTTP Web Server
 //
 // Multi-page demo site running on the bare-metal unikernel.
 // Each section lives at its own URL (`/`, `/architecture`,

@@ -397,9 +397,9 @@ unsafe fn kernel_boot(info: &BootInfo) {
         // keeps every timestamp truthful and lets us shorten the PIT window.
         let _ = kernel_bare::time::cycles_per_us();
         #[cfg(target_arch = "aarch64")]
-        klog!("UniKernel v0.1.0 (aarch64)\n");
+        klog!("Waitless v0.1.0 (aarch64)\n");
         #[cfg(target_arch = "x86_64")]
-        klog!("UniKernel v0.1.0 (x86_64)\n");
+        klog!("Waitless v0.1.0 (x86_64)\n");
 
         #[cfg(target_arch = "x86_64")]
         {

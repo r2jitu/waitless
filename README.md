@@ -1,10 +1,10 @@
-# UniKernel
+# Waitless
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Author**: Jitu Das
 
-A bare-metal unikernel written in Rust that boots directly into an application with no OS, no syscalls, and no context switches. All I/O is handled via direct in-process function calls.
+Waitless is a bare-metal unikernel written in Rust that boots directly into an application with no OS, no syscalls, and no context switches. All I/O is handled via direct in-process function calls.
 
 Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework (HVF), Limine ISO (BIOS/UEFI), and Google Compute Engine.
 
@@ -13,12 +13,12 @@ Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework 
 ```
 ┌──────────────────────────────────────┐
 │           Application                │  apps/webserver/
-│         #[uni::init]                 │
+│         #[waitless::init]            │
 ├──────────────────────────────────────┤
 │   Userspace protos (above facade)    │  crates/proto/{tls, http,
 │                                      │                    quic, http3}
 ├──────────────────────────────────────┤
-│    Facade (uni — kernel↔userspace)   │  crates/uni/ + nested
+│ Facade (waitless — kernel↔userspace) │  crates/waitless/ + nested
 │                                      │  macros, net, backend
 ├──────────────────────────────────────┤
 │       Network Stack (below facade)   │  crates/net/ (TCP, UDP, IPv4/6,
@@ -100,18 +100,18 @@ plain text (see [apps/hello](apps/hello) for the full source):
 ```rust
 #![no_std]
 extern crate alloc;
-extern crate uni;
-use uni::http::{Request, Response, Server};
+extern crate waitless;
+use waitless::http::{Request, Response, Server};
 
 struct HelloApp { _server: alloc::boxed::Box<Server> }
 
-impl uni::App for HelloApp {}
+impl waitless::App for HelloApp {}
 
 impl HelloApp {
     fn new() -> Self {
         let mut server = Server::new_boxed();
         server.default_handler(hello);
-        server.listen(uni::config_port(80));
+        server.listen(waitless::config_port(80));
         HelloApp { _server: server }
     }
 }
@@ -120,9 +120,9 @@ fn hello(_: &Request) -> Response {
     Response::ok(b"text/plain", b"Hello from bare metal!\n")
 }
 
-#[uni::init]
+#[waitless::init]
 fn init() {
-    uni::run(HelloApp::new());
+    waitless::run(HelloApp::new());
 }
 ```
 
@@ -138,7 +138,7 @@ load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 rust_library(
     name = "app",
     srcs = ["main.rs"],
-    deps = ["//uni"],
+    deps = ["//crates/waitless"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
@@ -156,15 +156,15 @@ own repository — depending on this one as a Bazel module — see
 ## Project Layout
 
 ```
-unikernel/
+waitless/
 ├── apps/hello/             Minimal HTTP hello-world example (~30 LOC)
 ├── apps/webserver/         Full demo: HTTP + HTTPS + diagnostics
-├── uni/                    Platform abstraction crate
+├── waitless/               Platform abstraction crate
 │   ├── lib.rs              TcpListener, TcpStream, log, config
 │   ├── http.rs             HTTP/1.1 server (+ TLS wrapper)
 │   ├── unikernel.rs        Unikernel backend (serial, idle)
 │   ├── native.rs           Native POSIX backend (sockets)
-│   └── macros/             #[uni::init] proc macro
+│   └── macros/             #[waitless::init] proc macro
 ├── net/                    Network stack crate
 │   ├── ethernet.rs, arp.rs, ipv4.rs, udp.rs, dhcp.rs
 │   ├── tcp.rs              TCP + per-core 4-tuple hash table

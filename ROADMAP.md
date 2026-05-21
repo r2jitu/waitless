@@ -1,6 +1,6 @@
-# Unikernel Next-Gen Roadmap
+# Waitless Next-Gen Roadmap
 
-A cutting-edge, lean unikernel: modern protocols only (QUIC/HTTP3, IPv6),
+Waitless is a cutting-edge, lean unikernel: modern protocols only (QUIC/HTTP3, IPv6),
 cooperative multi-core, zero legacy overhead. Each feature is compile-time
 optional via Bazel deps — you pick exactly what you need.
 

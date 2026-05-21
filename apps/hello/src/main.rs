@@ -1,4 +1,4 @@
-// UniKernel Example: Minimal HTTP Hello World
+// Waitless Example: Minimal HTTP Hello World
 //
 // The smallest useful unikernel app: bring up the network, listen
 // on :80, return one plain-text response per request. For a richer
