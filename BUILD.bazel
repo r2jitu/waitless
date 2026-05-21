@@ -1,15 +1,15 @@
 package(default_visibility = ["//visibility:public"])
 
-# Mark the workspace Cargo.toml plus the bazel-side lockfiles as
+# Mark the workspace Cargo.toml plus the bazel-side lockfile as
 # labels so the crate_universe extension in MODULE.bazel can read
 # them. Cargo.Bazel.lock is the bazel-managed cargo-format lockfile;
-# cargo-bazel-lock.json is the bazel-side JSON lockfile that lets
-# cargo-bazel resolve crates offline. Both are separate from the
-# cargo-managed Cargo.lock that the standalone `cargo build` reads.
+# it is separate from the cargo-managed Cargo.lock that the standalone
+# `cargo build` reads. crate_universe's own JSON lockfile is not
+# committed — its checksum is context-dependent and breaks external
+# consumption; see the `crate.from_cargo` comment in MODULE.bazel.
 exports_files([
     "Cargo.toml",
     "Cargo.Bazel.lock",
-    "cargo-bazel-lock.json",
     ".cargo/config.toml",
 ])
 
