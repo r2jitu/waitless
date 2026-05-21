@@ -8,7 +8,6 @@
 // which spawns the app's `#[uni::init]` body as a task on core 0's arena.
 
 #![no_std]
-#![allow(unused_imports)]
 
 extern crate alloc;
 
@@ -37,7 +36,11 @@ core::arch::global_asm!(include_str!("aarch64/boot.S"));
 #[cfg(target_arch = "aarch64")]
 use kernel_bare::aarch64::{exceptions, fdt, mmu, smp};
 use kernel_bare::{mm, serial, types};
-use types::{BootInfo, MAX_MEMORY_REGIONS, MEM_AVAILABLE, MEM_RESERVED, MemoryRegion, Protocol};
+use types::{BootInfo, MEM_AVAILABLE, MemoryRegion, Protocol};
+// `MAX_MEMORY_REGIONS` / `MEM_RESERVED` are used only by the
+// multiboot/PVH memory-map scan in `boot_shim_x86`.
+#[cfg(target_arch = "x86_64")]
+use types::{MAX_MEMORY_REGIONS, MEM_RESERVED};
 
 // ============================================================================
 // Panic handler (required for rust_static_library)
