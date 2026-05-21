@@ -1,12 +1,119 @@
 # Waitless
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-**Author**: Jitu Das
+**Waitless is a bare-metal unikernel** — a Rust application that boots on real
+(or virtual) hardware as the *entire* software stack. There is no Linux
+underneath, no kernel/user split, and no syscalls. The network stack, TLS,
+HTTP, and your request handlers all run in a single address space, at one
+privilege level, driven by one cooperative `async` runtime.
 
-Waitless is a bare-metal unikernel written in Rust that boots directly into an application with no OS, no syscalls, and no context switches. All I/O is handled via direct in-process function calls.
+The payoff is measurable: on identical Google Compute Engine hardware with the
+same NIC, the demo web server serves **up to 2× the requests per second of
+native Linux** — see [Performance](#performance). Not because the drivers are
+better (Linux's are vastly more mature) but because the architecture deletes
+the syscall boundary, the user/kernel copies, and the context switches
+outright.
 
-Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework (HVF), Limine ISO (BIOS/UEFI), and Google Compute Engine.
+Waitless targets **x86_64** and **ARM64**, and runs under QEMU, Apple
+Hypervisor.framework (HVF), a Limine ISO (BIOS/UEFI), and Google Compute
+Engine.
+
+## Highlights
+
+- **No OS underneath.** Boots straight into your app. I/O is direct function
+  calls, not syscalls — no ring transitions, no context switches, no copies
+  across a kernel boundary.
+- **Async *is* the scheduler.** `async fn` is the only execution model; a
+  per-core cooperative executor polls connection handlers directly. No
+  preemption, no locks, no second scheduling layer.
+- **Networking, hand-rolled in `#![no_std]` Rust.** Ethernet, ARP/NDP,
+  IPv4/IPv6, UDP, a conformance-tracked TCP, and a from-scratch TLS 1.3 server
+  with HTTP/1.1 — with HTTP/3 over QUIC underway.
+- **Two architectures, four ways to run.** x86_64 and aarch64, on QEMU,
+  Apple's hypervisor, a bootable ISO, and GCE — the same app, no source
+  changes.
+- **Composable by Bazel deps.** An app pulls in only the protocols and drivers
+  it uses; unused code never compiles into the image.
+- **Faster than Linux on the same hardware.** [Up to +102 % requests/sec](#performance)
+  against native Linux on an identical GCE VM and NIC.
+
+## Quick Start
+
+```bash
+# Prerequisites: Bazel and QEMU.
+#   macOS:  brew install bazel qemu
+#   Linux:  your distro's bazel (or bazelisk) + qemu-system packages
+
+# Boot the demo web server as a unikernel:
+bazel run //apps/webserver:webserver_hvf          # macOS — Apple Hypervisor
+bazel run //apps/webserver:webserver_qemu_x86_64  # elsewhere — QEMU
+
+# Then, from another terminal:
+curl http://localhost:8080/health
+```
+
+## Performance
+
+Both targets run on GCE `n2-highcpu-4` VMs with **gVNIC** (4 queue pairs), in
+the same `us-west1-a` zone, benched from a separate VM over the VPC
+(`wrk -t4 -d15s`). Same NIC, same queue count, same client — Waitless gets no
+loopback shortcut and no lighter network stack underneath. And **Linux runs
+its mature in-tree `gve` driver** (thousands of lines, years of tuning);
+**Waitless runs the from-scratch gVNIC driver in
+[`crates/drivers/gve/`](crates/drivers/gve/)**. Linux should win on driver
+maturity alone. It doesn't.
+
+| Workload            | Native Linux | **Waitless** | Δ |
+|---------------------|-------------:|-------------:|:-:|
+| `/health`      c128 |    278,000   |  **499,000** | **+79 %**  |
+| `/health`      c256 |    255,000   |  **514,000** | **+102 %** |
+| `/compute`     c100 |     28,700   |   **32,900** | **+15 %**  |
+| `health_tls_max`    |    183,700   |  **294,500** | **+60 %**  |
+| `udp_peak` (pkt/s)  |    566,500   |  **787,000** | **+39 %**  |
+
+Waitless wins every workload because the architecture pays off more than
+driver polish does. No POSIX syscalls, no user/kernel boundary copies, no
+context switches — the HTTP handler, the TCP state machine, and the NIC queue
+all run in the same address space on the same core. gVNIC's Toeplitz RSS gives
+per-core RX queues with zero software distribution, and TCP 4-tuple lookups
+are O(1) via a per-core open-addressed hash table. `/health` doubles at `c256`
+because the per-packet overhead gap widens as the connection count grows.
+
+Reproduce with `scripts/bench.py`; see [docs/benchmarking.md](docs/benchmarking.md)
+for the full methodology.
+
+## Build Configurations
+
+`unikernel_binary(name, app)` generates one runnable target per runner — pick
+the variant by name, no `--config=` flags needed (see
+[`bazel/rules/variants.bzl`](bazel/rules/variants.bzl)):
+
+```bash
+bazel run //apps/webserver:webserver_hvf            # aarch64 · Apple Hypervisor (macOS)
+bazel run //apps/webserver:webserver_qemu_aarch64   # aarch64 · QEMU
+bazel run //apps/webserver:webserver_qemu_x86_64    # x86_64  · QEMU
+bazel run //apps/webserver:webserver_iso_x86_64     # x86_64  · Limine ISO (BIOS/UEFI) via QEMU
+bazel run //apps/webserver:webserver_native         # POSIX sockets · no VM
+```
+
+The `*_native` variant builds the same app against host POSIX sockets — handy
+for fast iteration and debugging without a hypervisor.
+
+## Testing
+
+```bash
+# Full matrix — every applicable variant of every app. HVF tests auto-skip on Linux.
+bazel test //...
+
+# Filter by runner.
+bazel test --test_tag_filters=hvf    //...
+bazel test --test_tag_filters=qemu   //...
+bazel test --test_tag_filters=native //...
+
+# A single variant.
+bazel test //apps/webserver:test_hvf
+```
 
 ## Architecture
 
@@ -38,234 +145,179 @@ Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework 
      (Multiboot2/PVH)  (Linux Image/DTB)
 ```
 
-See [docs/crates.md](docs/crates.md) for the full crate taxonomy,
-naming rules, and the kernel↔userspace facade boundary.
-
-SMP via Limine's MP request on x86_64; one TX + RX queue pair per
-vCPU under Tier 1 polling, with Toeplitz-hashed RSS on gVNIC so
-each core's flows stay on that core. TCP 4-tuple lookups are
-O(1) via a per-core open-addressed hash table.
-
-## Quick Start
-
-```bash
-# Prerequisites (macOS)
-brew install bazel qemu
-
-# Build and run (auto-detects host architecture)
-bazel run //apps/webserver:webserver
-
-# Test
-curl http://localhost:8080/health
-```
-
-## Build Configurations
-
-Every `unikernel_binary(name, app)` generates one runnable target per
-runner (see `bazel/rules/variants.bzl`); pick the one you want by
-target name — no `--config=` flags required.
-
-```bash
-# Unikernel (bare-metal) — each variant is a self-contained launcher.
-bazel run //apps/webserver:webserver_hvf            # aarch64 HVF runner (macOS)
-bazel run //apps/webserver:webserver_qemu_aarch64   # aarch64 QEMU TCG
-bazel run //apps/webserver:webserver_qemu_x86_64   # x86_64 QEMU TCG
-bazel run //apps/webserver:webserver_iso            # x86_64 Limine ISO via QEMU
-
-# Native (POSIX sockets, no VM) — built under the outer host platform.
-bazel run //apps/webserver:webserver_native
-```
-
-## Testing
-
-```bash
-# Full matrix: runs every applicable variant per app. HVF auto-skips on Linux.
-bazel test //...
-
-# Filter by runner — all HVF tests, all qemu tests (both arches), etc.
-bazel test --test_tag_filters=hvf          //...
-bazel test --test_tag_filters=qemu         //...
-bazel test --test_tag_filters=qemu_x86_64  //...
-bazel test --test_tag_filters=native       //...
-
-# Single variant of one app.
-bazel test //apps/webserver:test_hvf
-```
+SMP comes up via Limine's MP request on x86_64; under Tier 1 polling there is
+one TX + RX queue pair per vCPU, with Toeplitz-hashed RSS on gVNIC so each
+core's flows stay on that core. See [docs/crates.md](docs/crates.md) for the
+full crate taxonomy and the kernel↔userspace facade boundary.
 
 ## Writing an Application
 
-The minimal example — a single-route HTTP server that responds with
-plain text (see [apps/hello](apps/hello) for the full source):
+A Waitless app is a `#![no_std]` Rust crate with an `async` entry point. Here
+is [`apps/hello`](apps/hello) in full — bring up the network, serve one route:
 
 ```rust
 #![no_std]
 extern crate alloc;
-extern crate waitless;
-use waitless::http::{Request, Response, Server};
 
-struct HelloApp { _server: alloc::boxed::Box<Server> }
+use http::{Request, Response};
+use waitless::net::Net;
 
-impl waitless::App for HelloApp {}
-
-impl HelloApp {
-    fn new() -> Self {
-        let mut server = Server::new_boxed();
-        server.default_handler(hello);
-        server.listen(waitless::config_port(80));
-        HelloApp { _server: server }
-    }
-}
-
-fn hello(_: &Request) -> Response {
+async fn hello(_: &Request, _: &mut http::BodyReader<'_, waitless::runtime::TcpStream>) -> Response {
     Response::ok(b"text/plain", b"Hello from bare metal!\n")
 }
 
 #[waitless::init]
-fn init() {
-    waitless::run(HelloApp::new());
+async fn init() {
+    Net::up().await.expect("Net::up failed");
+    http::listen(80, hello).expect("http bind");
 }
 ```
 
-For a richer example with HTTPS, multiple routes, and diagnostic
-endpoints, see [apps/webserver](apps/webserver).
+`#[waitless::init]` marks the async entry point the runtime polls once the
+kernel, drivers, and network are up. The crate's `BUILD.bazel` wires it to the
+`unikernel_binary` rule:
 
 ```python
-# apps/myapp/BUILD.bazel
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:unikernel.bzl", "unikernel_binary")
-load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
+load("//bazel/rules:unikernel.bzl", "port_fwd", "unikernel_binary")
 
 rust_library(
     name = "app",
-    srcs = ["main.rs"],
-    deps = ["//crates/waitless"],
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    srcs = ["src/main.rs"],
+    crate_root = "src/main.rs",
+    deps = [
+        "//crates/proto/http",
+        "//crates/waitless",
+    ],
 )
 
 unikernel_binary(
-    name = "myapp",
+    name = "hello",
     app = ":app",
+    drivers = ["//crates/drivers/virtio-net"],
+    port_forwards = [port_fwd("tcp", guest = 80, host = 8080)],
 )
 ```
 
-The `apps/` here are in-tree examples. To build a unikernel app in its
-own repository — depending on this one as a Bazel module — see
-[docs/consuming-as-a-library.md](docs/consuming-as-a-library.md) for the
-`MODULE.bazel` boilerplate an external app must supply.
+For a fuller example — HTTPS, multiple routes, HTTP/3, live diagnostics — see
+[`apps/webserver`](apps/webserver).
+
+## Using Waitless in another project
+
+The `apps/` in this repo are examples; a real application lives in its own
+repository and depends on Waitless as a **Bazel module**. Point your app's
+`MODULE.bazel` at a Waitless checkout — `local_path_override` is simplest for
+a sibling checkout:
+
+```python
+module(name = "website", version = "0.0.0")
+
+bazel_dep(name = "waitless", version = "0.1.0")
+local_path_override(
+    module_name = "waitless",
+    path = "../waitless",
+)
+```
+
+The app's `BUILD.bazel` then loads the rule from `@waitless` and builds
+exactly like an in-tree app — the only difference is the `@waitless` prefix on
+labels that resolve into the dependency:
+
+```python
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@waitless//bazel/rules:unikernel.bzl", "port_fwd", "unikernel_binary")
+
+rust_library(
+    name = "app",
+    srcs = ["src/main.rs"],
+    crate_root = "src/main.rs",
+    deps = [
+        "@waitless//crates/proto/http",
+        "@waitless//crates/waitless",
+    ],
+)
+
+unikernel_binary(
+    name = "website",
+    app = ":app",
+    drivers = ["@waitless//crates/drivers/virtio-net"],
+    port_forwards = [port_fwd("tcp", guest = 80, host = 8080)],
+)
+```
+
+A consuming module must also re-declare a few **root-module-only** Bazel
+settings that don't propagate through the module graph — the `rules_rust`
+version and patches, and the Rust toolchain tags.
+[**docs/consuming-as-a-library.md**](docs/consuming-as-a-library.md) is the
+complete, copy-pasteable checklist.
 
 ## Project Layout
 
 ```
 waitless/
-├── apps/hello/             Minimal HTTP hello-world example (~30 LOC)
-├── apps/webserver/         Full demo: HTTP + HTTPS + diagnostics
-├── waitless/               Platform abstraction crate
-│   ├── lib.rs              TcpListener, TcpStream, log, config
-│   ├── http.rs             HTTP/1.1 server (+ TLS wrapper)
-│   ├── unikernel.rs        Unikernel backend (serial, idle)
-│   ├── native.rs           Native POSIX backend (sockets)
-│   └── macros/             #[waitless::init] proc macro
-├── net/                    Network stack crate
-│   ├── ethernet.rs, arp.rs, ipv4.rs, udp.rs, dhcp.rs
-│   ├── tcp.rs              TCP + per-core 4-tuple hash table
-│   ├── tls_server.rs       TLS 1.3 state machine (hand-rolled)
-│   └── tls_handshake.rs    ECDSA P-256 + X25519 + ChaCha20-Poly1305
-├── drivers/                Device driver crate
-│   ├── pci.rs              PCI bus scan, BAR assignment
-│   ├── virtio.rs           VirtIO transport (modern PCI + MMIO)
-│   ├── virtio_net.rs       VirtIO-net driver (TX/RX, legacy MQ)
-│   ├── virtio_console.rs   VirtIO console (HVF)
-│   ├── gvnic.rs            Google Virtual NIC driver (GQI_QPL + RSS)
-│   └── net.rs              Runtime NIC dispatch (gVNIC → virtio fallback)
-├── kernel/                 Kernel library crate (clean Rust)
-│   ├── serial.rs, mm.rs, percpu.rs, eventloop.rs, sync.rs
-│   ├── exceptions.rs       GIC interrupt controller (aarch64)
-│   └── x86_64/             GDT, IDT, APIC, SMP bring-up (Limine MP)
-├── boot/
-│   ├── entry.rs            Kernel init sequence
-│   ├── limine_entry.rs     Limine boot protocol + AP trampoline
-│   ├── x86_64/boot.S       Multiboot2/PVH entry, page tables, long mode
-│   └── aarch64/boot.S      ARM64 Image header, relocations, MMU
-├── tools/hvf-runner/       Native HVF runner (macOS arm64 dev loop)
-├── bazel/                  Toolchain + platform configs
-└── scripts/                bench.py, gcp-bench.sh, deploy-gcloud.sh, ...
+├── apps/
+│   ├── hello/         Minimal HTTP hello-world (~25 LOC)
+│   └── webserver/     Full demo — HTTP, HTTPS, HTTP/3, live diagnostics
+├── crates/
+│   ├── waitless/      Facade — the API apps program against (+ macros, net, backend)
+│   ├── proto/         Userspace protocols — http, http3, quic, tls
+│   ├── net/           Network stack — Ethernet, ARP, NDP, IPv4/6, TCP, UDP, DHCP
+│   ├── drivers/       NIC + bus drivers — virtio-net, gve (gVNIC)
+│   ├── runtime/       Async substrate — executor, worker, platform
+│   ├── kernel/        Kernel library — serial, memory, SMP, per-core state
+│   ├── crypto/        AEAD helpers
+│   ├── util/          Zero-copy buffers and lock-free primitives
+│   └── boot/          Arch entry, page tables, the Limine boot protocol
+├── bazel/             Toolchains, platforms, and the unikernel_binary rule
+├── docs/              Architecture and subsystem deep-dives
+├── scripts/           Benchmark, deploy, and dev tooling
+└── tools/hvf-runner/  Native macOS/arm64 HVF runner used by the dev loop
 ```
 
-## Performance
+## Documentation
 
-### Apples-to-apples vs native Linux, same network path
-
-Both targets on GCE `n2-highcpu-4` VMs with **gVNIC** (4 queue
-pairs), same `us-west1-a` zone, benched from a separate VM over
-the VPC (`wrk -t4 -d15s` from `kvm-vm`). Same NIC, same queue
-count, same wrk client — the unikernel isn't getting a loopback
-shortcut or a lighter network stack underneath.
-
-Crucially, **Linux is running its mature in-tree `gve` driver**
-(`drivers/net/ethernet/google/gve/`, thousands of lines, years
-of tuning); **the unikernel is running the from-scratch gVNIC
-driver in [`crates/drivers/gve/`](crates/drivers/gve/)**. Linux
-should win on driver maturity alone. It doesn't.
-
-| Workload            | Native Linux | **Unikernel** | Δ |
-|---------------------|-------------:|--------------:|:-:|
-| `/health`      c128 |    278,000   |  **499,000**  | **+79 %** |
-| `/health`      c256 |    255,000   |  **514,000**  | **+102 %** |
-| `/compute`     c100 |     28,700   |   **32,900**  | **+15 %** |
-| `health_tls_max`    |    183,700   |  **294,500**  | **+60 %** |
-| `udp_peak` (pkt/s)  |    566,500   |  **787,000**  | **+39 %** |
-
-The unikernel wins every workload because the architecture pays
-off more than driver polish does. No POSIX syscalls, no
-user/kernel boundary copies, no context switches — the HTTP
-handler, TCP state machine, and NIC queue all run in the same
-address space on the same core. gVNIC's Toeplitz RSS gives us
-per-core RX queues with zero software distribution, and the
-TCP 4-tuple lookup is O(1) via a per-core open-addressed hash.
-`/health` doubles at `c256` because the per-packet overhead
-gap widens as the connection count grows.
-
-Earlier numbers that showed native at ~497 k rps were measured
-on `kvm-vm` localhost (kernel-to-kernel socket, no NIC, no
-Ethernet framing). That's not a fair comparison; over a real
-network path, native pays its full POSIX + general-purpose-TCP
-overhead and the unikernel pulls ahead.
-
-### Alternate NICs on GCE
-
-Same `n2-highcpu-4` host, `/health 4t/c128`:
-
-| NIC                       | rps | notes |
-|---------------------------|----:|-------|
-| virtio-net                | — (bench fails) | GCE's legacy virtio backend stalls under `wrk -c128` bursts |
-| gVNIC, `queue-count=2`    | 411,000 | one physical core effectively — HT pair shares L1 |
-| **gVNIC, `queue-count=4`**| **499,000** | one queue per vCPU; Toeplitz RSS; TCP hash table |
-
-### Running the benchmark
-
-From a VM in the same region as the deployed unikernel:
-
-```bash
-python3 scripts/bench.py --env remote --target 10.138.x.y \
-    --cores 4 --duration 15
-```
-
-`scripts/gcp-bench.sh` wraps this for the kvm-vm path and
-also runs the nested-KVM / native reference targets.
+- [docs/crates.md](docs/crates.md) — crate taxonomy and the kernel↔userspace facade boundary
+- [docs/networking.md](docs/networking.md) — the network stack, end to end
+- [docs/consuming-as-a-library.md](docs/consuming-as-a-library.md) — building an app against Waitless
+- [docs/benchmarking.md](docs/benchmarking.md) — how the performance numbers are measured
+- [docs/gvnic.md](docs/gvnic.md) — the from-scratch Google Virtual NIC driver
+- [docs/iobuf-type-model.md](docs/iobuf-type-model.md) · [rx-path](docs/rx-path-optimizations.md) · [tx-path](docs/tx-path-optimizations.md) — zero-copy datapath internals
+- [ROADMAP.md](ROADMAP.md) — where Waitless is headed: QUIC/HTTP3, IPv6, the async runtime
 
 ## Deploying to GCE
 
 ```bash
-# From your workstation — builds image + creates instance
+# Builds the image and creates the instance.
 ./scripts/deploy-gcloud.sh deploy
 
 # Defaults: n2-highcpu-4 + gVNIC + queue-count=4. Override via env:
-UNIKERNEL_GCE_MACHINE=n2-standard-2 QUEUE_COUNT=2 \
-    ./scripts/deploy-gcloud.sh deploy
+UNIKERNEL_GCE_MACHINE=n2-standard-2 QUEUE_COUNT=2 ./scripts/deploy-gcloud.sh deploy
 
-# Tail the serial console (boot log ends with `Entering event loop.`)
+# Tail the serial console; stop / delete the instance.
 ./scripts/deploy-gcloud.sh logs
-
-# Stop / delete
 ./scripts/deploy-gcloud.sh purge
 ```
+
+## Status
+
+Waitless is a research project, not production software. It implements enough
+of TCP/IP, TLS 1.3, and HTTP to run — and benchmark — a real web server, but
+the API is unstable, it is the work of a single author, and the checked-in dev
+certificate and several defaults are explicitly development-only. Issues,
+questions, and contributions are welcome; the build is plain `bazel test //...`.
+
+## License
+
+Waitless is dual-licensed under either of
+
+- Apache License, Version 2.0 — [LICENSE-APACHE](LICENSE-APACHE)
+- MIT license — [LICENSE-MIT](LICENSE-MIT)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in Waitless by you, as defined in the Apache-2.0
+license, shall be dual-licensed as above, without any additional terms or
+conditions.
