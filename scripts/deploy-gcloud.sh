@@ -36,6 +36,9 @@
 # Env overrides:
 #   WAITLESS_GCE_PROJECT, WAITLESS_GCE_ZONE, WAITLESS_GCE_MACHINE,
 #   WAITLESS_GCS_BUCKET, WAITLESS_GCE_NAME
+#   WAITLESS_BAZEL_DEFINES — extra flags appended to the ISO build,
+#     e.g. `--define tls_cert=prod` to bake in the production TLS
+#     cert. `scripts/renew-and-deploy.sh` sets this.
 
 set -euo pipefail
 
@@ -86,7 +89,11 @@ build_disk() {
     # regardless of the host default, so arm64 dev hosts still
     # produce an x86 ISO that GCE's x86 machine types can boot.
     # For ARM GCE / Graviton deployment, swap to `:webserver_iso_aarch64`.
-    bazel build //apps/webserver:webserver_iso_x86_64
+    #
+    # WAITLESS_BAZEL_DEFINES carries optional extra flags (e.g.
+    # `--define tls_cert=prod`); unquoted so multi-word values split.
+    # shellcheck disable=SC2086
+    bazel build //apps/webserver:webserver_iso_x86_64 ${WAITLESS_BAZEL_DEFINES:-}
     local iso="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver_iso_x86_64.iso"
     [ -f "$iso" ] || {
         echo "ERROR: ISO not produced: $iso" >&2
