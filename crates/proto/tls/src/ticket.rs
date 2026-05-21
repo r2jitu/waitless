@@ -22,14 +22,9 @@
 // state==1 spin window covers two `getrandom` calls — microseconds —
 // so contention on the very first handshake is bounded.
 //
-// `seal_under_key` / `open_under_key` are exercised only by the
-// in-module test suite (the production paths use the global-key
-// wrappers). `current_ticket_key` likewise has no production reader
-// outside this module — the wrappers obtain the key directly via
-// `GLOBAL_TICKET_KEY`. Both are kept `pub(super)` / `pub` so future
-// callers (key-rotation rollover, debug dumps) don't need to add
-// them. `#![deny(warnings)]` would otherwise reject these.
-#![allow(dead_code)]
+// `seal_under_key` / `open_under_key` are the key-injectable inner
+// forms of the seal/open primitives, exercised by the in-module test
+// suite; production paths use the global-key wrappers.
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;

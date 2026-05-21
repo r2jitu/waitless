@@ -184,13 +184,11 @@ fn extract_p256_d_from_pkcs8(blob: &[u8]) -> Option<[u8; 32]> {
 // Error type
 // ============================================================================
 
-// `AeadFailed` and the `Failed` state are reachable via `trace.rs`'s
-// debug formatter but no current code path constructs them — the
+// `AeadFailed` is reserved: no current code path constructs it — the
 // underlying record-layer error is returned wrapped in
-// `RecordError(...)` rather than translated. Keep the variants so
-// the trace remains exhaustive and future error-translation paths
-// have the names they need; silence the dead-code lint locally.
-#[allow(dead_code)]
+// `RecordError(...)` rather than translated. Kept so the trace
+// formatter stays exhaustive and future error-translation paths have
+// the name they need.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeError {
     ParseError(ParseError),
@@ -228,7 +226,6 @@ impl From<RecordError> for HandshakeError {
 // State
 // ============================================================================
 
-#[allow(dead_code)] // `Failed` reachable via trace formatter only — see HandshakeError comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     /// Before any bytes have arrived.
@@ -274,7 +271,6 @@ pub struct TlsServer {
     /// error directly via `Result`); preserved as scaffolding for
     /// the eventual `state()`/`error()` accessor pair when a
     /// caller actually wants to inspect post-mortem.
-    #[allow(dead_code)]
     pub(crate) error: Option<HandshakeError>,
 
     // Raw TLS bytes received from peer (may contain partial or

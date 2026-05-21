@@ -12,8 +12,6 @@
 // is negligible given the parser only runs once per connection, so
 // it's not worth the conditional-compilation complexity to gate them.
 
-#![allow(unused_variables, dead_code)]
-
 use crate::handshake;
 use crate::server::{HandshakeError, State};
 
