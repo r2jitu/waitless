@@ -1,0 +1,19 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# VirtIO console device driver (virtio DeviceID 3) — a device driver,
+# peer of `virtio-net` / `gve`. Exposes `extern "C"` `virtio_console_*`
+# symbols that `crates/kernel/bare`'s serial layer calls; that FFI
+# seam (not a Rust dep) is what keeps `kernel_bare` off a dependency
+# cycle (console -> bus -> kernel_bare). Linked into the image via
+# `//crates/boot`.
+rust_library(
+    name = "virtio-console",
+    srcs = ["src/lib.rs"],
+    crate_name = "virtio_console",
+    target_compatible_with = ["@platforms//os:none"],
+    deps = [
+        "//crates/drivers/bus",
+    ],
+)

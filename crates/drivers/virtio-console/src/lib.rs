@@ -1,11 +1,20 @@
-// drivers/virtio_console.rs — VirtIO console device for modern PCI platforms.
+// drivers/virtio-console/src/lib.rs — the `virtio_console` crate:
+// the VirtIO console device driver (virtio DeviceID 3).
+//
+// A virtio device driver — peer of `virtio-net` / `gve` — split out
+// of the `bus` crate so `bus` stays purely the shared bus/transport
+// layer. `kernel_bare::serial` drives this through the `extern "C"`
+// `virtio_console_*` symbols at the bottom of this file; a normal
+// Rust dependency would cycle (console -> bus -> kernel_bare).
+
+#![no_std]
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::ptr;
 use core::sync::atomic::{AtomicU16, Ordering};
 
-use crate::virtio::{
+use bus::virtio::{
     MMIO_DEVICE_ID, MMIO_DRIVER_FEATURES_SEL, MMIO_GUEST_FEATURES, MMIO_GUEST_PAGE_SIZE,
     MMIO_MAGIC, MMIO_MAGIC_VALUE, MMIO_QUEUE_ALIGN, MMIO_QUEUE_DESC_HIGH, MMIO_QUEUE_DESC_LOW,
     MMIO_QUEUE_DEVICE_HIGH, MMIO_QUEUE_DEVICE_LOW, MMIO_QUEUE_DRIVER_HIGH, MMIO_QUEUE_DRIVER_LOW,
@@ -16,7 +25,7 @@ use crate::virtio::{
     vpci_queue_notify_addr, vpci_reset, vpci_select_queue, vpci_set_queue_addrs, vpci_set_status,
     vpci_write_features,
 };
-use crate::{dsb_st, dsb_sy, mmio_read32, mmio_write32};
+use bus::{dsb_st, dsb_sy, mmio_read32, mmio_write32};
 
 // ============================================================================
 // VirtIO console driver (DeviceID=3)

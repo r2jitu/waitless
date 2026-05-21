@@ -1,11 +1,11 @@
-// drivers/lib.rs — the `bus` crate: shared hardware-access
-// layer for the NIC driver crates.
+// drivers/lib.rs — the `bus` crate: shared bus/transport layer
+// for the driver crates.
 //
 // PCI bus enumeration, VirtIO transport (legacy + modern PCI + MMIO),
-// virtio-console driver, and the MMIO / barrier / port-I/O helpers
-// each driver crate needs. The NIC driver crates
-// (`//crates/drivers/virtio-net`, `//crates/drivers/gve`) depend on this
-// crate; the NIC-dispatch layer is the sibling `//crates/drivers/nic`.
+// and the MMIO / barrier / port-I/O helpers each driver crate needs.
+// The driver crates (`virtio-net`, `gve`, `virtio-console`) depend on
+// this crate; the NIC-dispatch layer is the sibling
+// `//crates/drivers/nic`.
 //
 // All unsafe hardware access is confined to small helper functions;
 // public APIs are safe where possible.
@@ -290,4 +290,3 @@ pub unsafe fn virtio_write8(base: u64, val: u8) {
 
 pub mod pci;
 pub mod virtio;
-pub mod virtio_console;

@@ -236,7 +236,13 @@ def unikernel_binary(
     # Common deps for both .elf paths. multiboot (x86_64 multiboot/PVH stub)
     # is added per-target below since it's incompatible with higher-half
     # linking and only needed for the QEMU direct-boot ELF.
-    _common_deps = [app, "//crates/boot:entry", "//crates/boot:limine", "//crates/boot:mem_stubs"] + drivers
+    _common_deps = [
+        app,
+        "//crates/boot:entry",
+        "//crates/boot:limine",
+        "//crates/boot:mem_stubs",
+        "//crates/drivers/virtio-console",
+    ] + drivers
     _unikernel_flags = _LINK_FLAGS + _LINK_FLAGS_ARCH
 
     # Per-binary crate root. Every boot/driver crate is an rlib; rustc
@@ -251,14 +257,17 @@ def unikernel_binary(
         "#![no_std]",
         "#![no_main]",
         "",
-        "// Boot crates pulled in as rlibs: `entry` carries the kernel entry",
+        "// Force-linked rlibs: `entry` carries the kernel entry",
         "// points and the unikernel's sole `#[panic_handler]` +",
         "// `rust_eh_personality`; `limine` carries the Limine entry and its",
-        "// `.limine_requests` statics; `mem_stubs` carries the `mem*` intrinsics.",
+        "// `.limine_requests` statics; `mem_stubs` carries the `mem*`",
+        "// intrinsics; `virtio_console` carries the `virtio_console_*` C-ABI",
+        "// symbols the kernel's serial layer calls.",
         "extern crate app;",
         "extern crate entry;",
         "extern crate limine;",
         "extern crate mem_stubs;",
+        "extern crate virtio_console;",
     ]
     for d in drivers:
         main_base.append("extern crate " + _label_crate_name(d) + ";")

@@ -2,8 +2,8 @@ load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
-# Shared hardware-access layer: MMIO helpers, PCI enumeration, VirtIO
-# transport, virtio-console. NIC driver crates (`virtio-net`, `gve`)
+# Shared bus/transport layer: MMIO helpers, PCI enumeration, VirtIO
+# transport. The driver crates (`virtio-net`, `gve`, `virtio-console`)
 # depend here for MMIO + bus enumeration; the NIC-dispatch shim lives
 # in the sibling `//crates/drivers/nic` package.
 rust_library(
@@ -12,7 +12,6 @@ rust_library(
         "src/lib.rs",
         "src/pci.rs",
         "src/virtio.rs",
-        "src/virtio_console.rs",
     ],
     crate_name = "bus",
     crate_root = "src/lib.rs",
