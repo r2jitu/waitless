@@ -11,14 +11,14 @@ pub use uni_macros::init;
 pub use uni_net as net;
 
 /// Native entry from `native_main.rs`. Plugs boot_info and shutdown
-/// callbacks into `backend::run` so the backend doesn't need a
+/// callbacks into `uni_backend::run` so the backend doesn't need a
 /// dep back on `uni`.
 #[cfg(not(target_os = "none"))]
 pub fn native_run() -> i32 {
     use crate::boot_info::BootInfoParams;
     use alloc::vec::Vec;
 
-    backend::run(backend::RunConfig {
+    uni_backend::run(uni_backend::RunConfig {
         boot_info_fn: |num_cpus, ram_bytes| {
             crate::boot_info::init_boot_info(BootInfoParams {
                 ram_bytes,
@@ -120,7 +120,7 @@ pub fn shutdown_and_drop() {
     // zeros (libstd's allocator exposes no counters), so the line
     // is informational only; on unikernel it's the actual talc
     // counters and a leaked allocation shows up as `LEAK +Nbytes`.
-    let s = backend::heap_stats();
+    let s = uni_backend::heap_stats();
     let bsl_b = HEAP_BASELINE_BYTES.load(core::sync::atomic::Ordering::Acquire);
     let bsl_a = HEAP_BASELINE_ALLOCS.load(core::sync::atomic::Ordering::Acquire);
     if s.allocated_bytes > bsl_b || s.allocation_count > bsl_a {
@@ -158,10 +158,10 @@ static HEAP_BASELINE_ALLOCS: core::sync::atomic::AtomicUsize =
 /// `shutdown_and_drop` can detect a leak. Called from the `#[uni::init]`
 /// macro after the user's `init()` body returns.
 pub fn set_ready() {
-    let s = backend::heap_stats();
+    let s = uni_backend::heap_stats();
     HEAP_BASELINE_BYTES.store(s.allocated_bytes, core::sync::atomic::Ordering::Release);
     HEAP_BASELINE_ALLOCS.store(s.allocation_count, core::sync::atomic::Ordering::Release);
-    backend::set_ready();
+    uni_backend::set_ready();
 }
 
 /// Route `shutdown_and_drop` into the platform-specific event-loop
@@ -185,8 +185,8 @@ pub fn _install_shutdown_hook() {}
 // directly from `crates/boot/src/entry.rs` via the kernel callback
 // (no app-facing surface), and `HeapStats` is only the return type
 // of `uni::diagnostics::heap_stats()` and named there as
-// `backend::HeapStats`.
-pub use backend::{log, num_workers, request_shutdown, wait_for_events};
+// `uni_backend::HeapStats`.
+pub use uni_backend::{log, num_workers, request_shutdown, wait_for_events};
 
 /// Format-and-log helper for `uni::log!("…", args)`. Allocates a
 /// scratch `String` because `core::fmt::write` doesn't have a
@@ -298,39 +298,39 @@ pub mod diagnostics {
     /// is the queue-pair number; `[0..num_queue_pairs()]` are
     /// meaningful, the rest are zero.
     pub fn net_rx_counts() -> [u64; 8] {
-        backend::net_rx_counts()
+        uni_backend::net_rx_counts()
     }
 
     /// Negotiated RX/TX queue-pair count. Tier 2 (single-queue)
     /// reports 1; Tier 1 reports the per-vCPU count.
     pub fn net_num_queue_pairs() -> u16 {
-        backend::net_num_queue_pairs()
+        uni_backend::net_num_queue_pairs()
     }
 
     /// Per-queue used-ring cursors `(device, driver)`. Useful for
     /// spotting "device produced but driver didn't consume" gaps
     /// (cursors apart) vs "host not delivering" (both stuck).
     pub fn net_rx_used_cursors() -> [(u16, u16); 8] {
-        backend::net_rx_used_cursors()
+        uni_backend::net_rx_used_cursors()
     }
 
     /// gve NIC-driver diagnostic counters (RX-path items B/H —
     /// surfaced on the `/stats` endpoint). Real values on a
     /// bare-metal gve NIC; all-zero on native and under virtio-net.
-    /// Routed through `backend` so application crates need no
+    /// Routed through `uni_backend` so application crates need no
     /// direct — and native-build-breaking — dependency on the
     /// `os:none`-only gve driver crate.
-    pub fn gve_diag() -> backend::GveDiag {
-        backend::gve_diag()
+    pub fn gve_diag() -> uni_backend::GveDiag {
+        uni_backend::gve_diag()
     }
 
     /// TCP/IP-stack diagnostic counters (`/stats`): SYN ingress vs
     /// SYN-ACK egress, and the RX item-H `recv_chunk` zero-copy
     /// stash-vs-ring-drain split. Real on bare-metal; all-zero on
-    /// native. Routed through `backend` for the same reason as
+    /// native. Routed through `uni_backend` for the same reason as
     /// [`gve_diag`] — app crates stay off a direct `net`-crate dep.
-    pub fn tcp_diag() -> backend::TcpDiag {
-        backend::tcp_diag()
+    pub fn tcp_diag() -> uni_backend::TcpDiag {
+        uni_backend::tcp_diag()
     }
 
     /// TX-side hot-path counters: per-qp packet counts + small/big
@@ -349,8 +349,8 @@ pub mod diagnostics {
     /// `small_pool_full_spins` and `big_pool_full_returns` flag
     /// pool sizing — a steady non-zero rate means the pool is
     /// undersized for the load.
-    pub fn net_tx_diag() -> Option<backend::NetTxDiag> {
-        backend::net_tx_diag()
+    pub fn net_tx_diag() -> Option<uni_backend::NetTxDiag> {
+        uni_backend::net_tx_diag()
     }
 
     /// Snapshot the active driver's TX descriptor capture log into
@@ -358,8 +358,8 @@ pub mod diagnostics {
     /// written. Returns 0 on native and on drivers without per-
     /// descriptor instrumentation (currently only gve has it,
     /// for TSO-on-GCE debug). Surfaced via `/diag-gve`.
-    pub fn net_tx_desc_log_snapshot(out: &mut [backend::NetTxDescLogEntry]) -> usize {
-        backend::net_tx_desc_log_snapshot(out)
+    pub fn net_tx_desc_log_snapshot(out: &mut [uni_backend::NetTxDescLogEntry]) -> usize {
+        uni_backend::net_tx_desc_log_snapshot(out)
     }
 
     /// Per-core event-loop stats: `(loops, poll_work, drain_work,
@@ -371,43 +371,43 @@ pub mod diagnostics {
     /// going to net poll / inbox drain / app service. All zeros
     /// on native (the OS owns scheduling).
     pub fn core_stats(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
-        backend::core_stats(core_id)
+        uni_backend::core_stats(core_id)
     }
 
     /// Cycles-per-microsecond multiplier — divide cycle deltas by
     /// this to get microseconds. 0 on native.
     pub fn cycles_per_us() -> u64 {
-        backend::cycles_per_us()
+        uni_backend::cycles_per_us()
     }
 
-    pub use backend::NET_DIAG_QP_CAP;
-    pub use backend::NetTxDescLogEntry;
-    pub use backend::NetTxDiag;
+    pub use uni_backend::NET_DIAG_QP_CAP;
+    pub use uni_backend::NetTxDescLogEntry;
+    pub use uni_backend::NetTxDiag;
 
     /// Snapshot the heap. Cheap on bare-metal (O(1) + spinlock);
     /// best-effort zero on native.
-    pub fn heap_stats() -> backend::HeapStats {
-        backend::heap_stats()
+    pub fn heap_stats() -> uni_backend::HeapStats {
+        uni_backend::heap_stats()
     }
 
     /// Append a byte slice to the in-band diag buffer. For boot-time
     /// KATs and one-shot probes that want their results to land in
     /// `/diag-panic` alongside any later panic traces.
     pub fn diag_append(bytes: &[u8]) {
-        backend::diag_append(bytes)
+        uni_backend::diag_append(bytes)
     }
 
     /// Append a 16-char hex-encoded u64 (no `0x` prefix). Pairs with
     /// `diag_append` for format-free logging from boot-critical code
     /// paths.
     pub fn diag_append_hex(value: u64) {
-        backend::diag_append_hex(value)
+        uni_backend::diag_append_hex(value)
     }
 
     /// Append a 2-char hex-encoded u8. For dumps of byte windows
     /// where the u64 form would print 14 leading zeros per byte.
     pub fn diag_append_hex_u8(value: u8) {
-        backend::diag_append_hex_u8(value)
+        uni_backend::diag_append_hex_u8(value)
     }
 
     /// Snapshot the in-band diag-capture buffer (kernel panics +
@@ -420,18 +420,18 @@ pub mod diagnostics {
     /// (or the same core after recovery, if it didn't actually
     /// halt). See `kernel::diag` for the format.
     pub fn diag_snapshot(out: &mut [u8]) -> usize {
-        backend::diag_snapshot(out)
+        uni_backend::diag_snapshot(out)
     }
 
     /// Bytes captured so far. Cheap "is there anything to show?"
     /// check for the `/diag-panic` endpoint.
     pub fn diag_captured_len() -> usize {
-        backend::diag_captured_len()
+        uni_backend::diag_captured_len()
     }
 
     /// Reset the diag buffer to empty. Used by debugger workflows
     /// that want a fresh capture per repro iteration.
     pub fn diag_reset() {
-        backend::diag_reset()
+        uni_backend::diag_reset()
     }
 }

@@ -3,11 +3,11 @@
 // Single crate with two cfg-gated impls: `unikernel` (bare-metal)
 // and `native` (POSIX). Selected by `target_os`. The exported symbol
 // surface is the same on both sides so `uni/lib.rs` can unconditionally
-// `pub use backend::*;`.
+// `pub use uni_backend::*;`.
 
 #![cfg_attr(target_os = "none", no_std)]
 
-/// Heap-allocator counters surfaced via `backend::heap_stats()`.
+/// Heap-allocator counters surfaced via `uni_backend::heap_stats()`.
 /// Cheap on bare-metal (O(1) read under the talc spinlock); zero on
 /// native (libstd's allocator doesn't expose equivalent accounting).
 #[derive(Debug, Clone, Copy, Default)]
@@ -21,7 +21,7 @@ pub struct HeapStats {
 }
 
 /// gve (Google Virtual NIC) driver diagnostic counters, surfaced via
-/// `backend::gve_diag()` (and `uni::diagnostics::gve_diag`).
+/// `uni_backend::gve_diag()` (and `uni::diagnostics::gve_diag`).
 ///
 /// Real values on bare-metal when the gve driver is linked; all-zero
 /// on native (no gve driver) and on bare-metal under virtio-net.
@@ -48,7 +48,7 @@ pub struct GveDiag {
 }
 
 /// TCP/IP-stack diagnostic counters, surfaced via
-/// `backend::tcp_diag()` (and `uni::diagnostics::tcp_diag`).
+/// `uni_backend::tcp_diag()` (and `uni::diagnostics::tcp_diag`).
 ///
 /// Real values on bare-metal; all-zero on native (the bare-metal
 /// `net` stack — an `os:none` crate — isn't linked there). Same

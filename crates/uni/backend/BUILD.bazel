@@ -11,7 +11,7 @@ package(default_visibility = ["//visibility:public"])
 # `uni/lib.rs` unconditionally `pub use`s from here; the symbol
 # surface is identical on both sides.
 rust_library(
-    name = "backend",
+    name = "uni_backend",
     srcs = [
         "src/lib.rs",
         "src/native/ffi.rs",
@@ -20,7 +20,7 @@ rust_library(
         "src/native/udp.rs",
         "src/unikernel.rs",
     ],
-    crate_name = "backend",
+    crate_name = "uni_backend",
     deps = [
         "//crates/util/iobuf",
         "//crates/runtime/worker",
