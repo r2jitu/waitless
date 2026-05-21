@@ -9,4 +9,9 @@ exports_files([
     "dev_key.der",
     "dev_cert.pem",
     "dev_key.pem",
+    # Empty placeholder — the dev cert is self-signed, so its chain
+    # has no intermediate. The `app` rule's `tls_intermediate` alias
+    # points here for the dev build; `main.rs` reads an empty slice
+    # and emits a one-element (leaf-only) certificate chain.
+    "no_intermediate.der",
 ])

@@ -1,0 +1,29 @@
+package(default_visibility = ["//apps/webserver:__subpackages__"])
+
+# Production TLS certificate material — the leaf cert, its issuing
+# intermediate, and the private key, all DER-encoded.
+#
+# These files are NOT checked in (see .gitignore): `scripts/issue-cert.sh`
+# obtains them from Let's Encrypt and drops them here, and a
+# `--define tls_cert=prod` build bakes them into the image. Renewal
+# therefore never edits tracked source — it only rewrites this
+# gitignored directory and rebuilds.
+#
+# Globbed with `allow_empty = True` so a fresh checkout (with this
+# directory empty) still loads and the default dev build is
+# unaffected. A `--define tls_cert=prod` build selects these
+# filegroups and fails cleanly if the files are absent.
+filegroup(
+    name = "leaf",
+    srcs = glob(["leaf.der"], allow_empty = True),
+)
+
+filegroup(
+    name = "intermediate",
+    srcs = glob(["intermediate.der"], allow_empty = True),
+)
+
+filegroup(
+    name = "key",
+    srcs = glob(["key.der"], allow_empty = True),
+)

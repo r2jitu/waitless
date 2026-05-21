@@ -6,6 +6,44 @@ load("//bazel/rules:variants.bzl", "waitless_app_test")
 
 package(default_visibility = ["//visibility:public"])
 
+# ── Production TLS certificate selection ─────────────────────────────────
+#
+# By default the app bakes in the checked-in self-signed dev cert
+# (`dev_certs/`), so `bazel build` / `bazel test` need no flags. A
+# `--define tls_cert=prod` build swaps in the real Let's Encrypt cert
+# from `prod_certs/` (gitignored — populated by `scripts/issue-cert.sh`).
+# The renewal pipeline rebuilds with that define; it never edits
+# tracked source. `main.rs` reads the three files via `include_bytes!`
+# of the `WAITLESS_TLS_*` paths the `app` rule's `rustc_env` sets.
+config_setting(
+    name = "prod_tls_cert",
+    values = {"define": "tls_cert=prod"},
+)
+
+alias(
+    name = "tls_leaf",
+    actual = select({
+        ":prod_tls_cert": "//apps/webserver/prod_certs:leaf",
+        "//conditions:default": "//apps/webserver/dev_certs:dev_cert.der",
+    }),
+)
+
+alias(
+    name = "tls_intermediate",
+    actual = select({
+        ":prod_tls_cert": "//apps/webserver/prod_certs:intermediate",
+        "//conditions:default": "//apps/webserver/dev_certs:no_intermediate.der",
+    }),
+)
+
+alias(
+    name = "tls_key",
+    actual = select({
+        ":prod_tls_cert": "//apps/webserver/prod_certs:key",
+        "//conditions:default": "//apps/webserver/dev_certs:dev_key.der",
+    }),
+)
+
 # Application library — pure business logic, no platform boilerplate.
 #
 # Deliberately depends on NO driver crate. `app` is compiled into
@@ -23,10 +61,20 @@ rust_library(
         "src/pages.rs",
     ],
     compile_data = [
-        "//apps/webserver/dev_certs:dev_cert.der",
-        "//apps/webserver/dev_certs:dev_key.der",
+        ":tls_intermediate",
+        ":tls_key",
+        ":tls_leaf",
     ],
     crate_root = "src/main.rs",
+    # `main.rs` `include_bytes!`s the TLS cert material from these
+    # paths. `$(execpath ...)` resolves the selected `dev_certs/` or
+    # `prod_certs/` file to an exec-root-relative path, which rustc
+    # reads at compile time.
+    rustc_env = {
+        "WAITLESS_TLS_INTERMEDIATE": "$(execpath :tls_intermediate)",
+        "WAITLESS_TLS_KEY": "$(execpath :tls_key)",
+        "WAITLESS_TLS_LEAF": "$(execpath :tls_leaf)",
+    },
     deps = [
         "//crates/proto/http",
         "//crates/proto/http3",

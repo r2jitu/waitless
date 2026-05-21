@@ -46,10 +46,27 @@ const GATEWAY_PORT: u16 = 9000;
 const GATEWAY_BACKEND_PORT: u16 = 7777;
 const GATEWAY_MSG_SIZE: usize = 32;
 
-// Self-signed dev cert + key (ECDSA P-256 + SHA-256). Regen via
-// `apps/webserver/dev_certs/regen.sh`. NOT FOR PRODUCTION.
-const DEV_CERT_DER: &[u8] = include_bytes!("../dev_certs/dev_cert.der");
-const DEV_KEY_PKCS8_DER: &[u8] = include_bytes!("../dev_certs/dev_key.der");
+// TLS certificate material, baked in at build time. The default
+// build uses the checked-in self-signed dev cert (ECDSA P-256 +
+// SHA-256, `apps/webserver/dev_certs/`, regenerated via `regen.sh`);
+// a `--define tls_cert=prod` build substitutes the real Let's Encrypt
+// cert from `prod_certs/`. The `app` rule's `rustc_env` sets the
+// `WAITLESS_TLS_*` paths — see `apps/webserver/BUILD.bazel`.
+const TLS_LEAF_DER: &[u8] = include_bytes!(env!("WAITLESS_TLS_LEAF"));
+const TLS_INTERMEDIATE_DER: &[u8] = include_bytes!(env!("WAITLESS_TLS_INTERMEDIATE"));
+const TLS_KEY_PKCS8_DER: &[u8] = include_bytes!(env!("WAITLESS_TLS_KEY"));
+
+/// DER certificate chain handed to the TLS / HTTP/3 listeners: the
+/// leaf first, then the issuing intermediate when there is one. The
+/// self-signed dev cert has no intermediate (an empty placeholder
+/// file), so its chain is leaf-only; a real Let's Encrypt chain is
+/// leaf + intermediate. Resolved at compile time — `is_empty` is
+/// `const`.
+const TLS_CERT_CHAIN: &[&[u8]] = if TLS_INTERMEDIATE_DER.is_empty() {
+    &[TLS_LEAF_DER]
+} else {
+    &[TLS_LEAF_DER, TLS_INTERMEDIATE_DER]
+};
 
 // ---- Boot -------------------------------------------------------------------
 
@@ -157,8 +174,8 @@ async fn init() {
     let h3_up = match http3::listen(
         HTTPS_PORT,
         handle_request_h3,
-        &[DEV_CERT_DER],
-        DEV_KEY_PKCS8_DER,
+        TLS_CERT_CHAIN,
+        TLS_KEY_PKCS8_DER,
     ) {
         Ok(()) => {
             waitless::println!("listen udp://:{} (h3, TLS_AES_128_GCM_SHA256)", HTTPS_PORT);
@@ -182,8 +199,8 @@ async fn init() {
     match tls::listen(
         HTTPS_PORT,
         handle_request_https,
-        &[DEV_CERT_DER],
-        DEV_KEY_PKCS8_DER,
+        TLS_CERT_CHAIN,
+        TLS_KEY_PKCS8_DER,
     ) {
         Ok(()) => waitless::println!(
             "listen tcp://:{} (https, TLS_AES_128_GCM_SHA256)",

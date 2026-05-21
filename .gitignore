@@ -32,3 +32,8 @@ __pycache__/
 # Cargo standalone build artefacts (under tools/hvf-runner). The
 # bazel build goes through crate_universe and writes elsewhere.
 target/
+
+# Production TLS cert material — obtained by scripts/issue-cert.sh,
+# baked in by a `--define tls_cert=prod` build. Never committed; the
+# checked-in apps/webserver/prod_certs/BUILD.bazel globs them.
+apps/webserver/prod_certs/*.der
