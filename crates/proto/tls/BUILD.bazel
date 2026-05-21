@@ -101,7 +101,7 @@ rust_library(
 # parsing, key schedule, AEAD round-trip, record-layer framing,
 # ticket envelope, finished-key + ct_eq, etc.).
 rust_test(
-    name = "uni_tls_test",
+    name = "tls_test",
     size = "small",
     crate = ":tls",
 )

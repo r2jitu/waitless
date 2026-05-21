@@ -29,7 +29,7 @@ rust_library(
 )
 
 rust_test(
-    name = "uni_http3_test",
+    name = "http3_test",
     size = "small",
     crate = ":http3",
 )

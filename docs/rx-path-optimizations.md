@@ -1343,7 +1343,7 @@ refresh) — item E is only the smuggling guard.
 
 **Test target.** `proto/http` had a `#[cfg(test)]` module but no
 `rust_test` target, so its tests had never run. A separate
-commit (`b98b499`) added `//crates/proto/http:uni_http_test` and flipped
+commit (`b98b499`) added `//crates/proto/http:http_test` and flipped
 the crate to the `#![cfg_attr(all(not(test), not(feature =
 "std")), no_std)]` form (mirroring `//crates/proto/http3`). Item E adds
 eight tests there — the `transfer_encoding_is_chunked` helper
@@ -1356,7 +1356,7 @@ flagged).
 Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
 `bazel build //apps/webserver:webserver.elf
 --platforms=//bazel/platforms:aarch64_unikernel`;
-`bazel test //crates/proto/http:uni_http_test` (13 tests — 8 new + the 5
+`bazel test //crates/proto/http:http_test` (13 tests — 8 new + the 5
 now-running `host_port_tests`); `bazel test
 //apps/webserver:test_hvf` (TCP + TLS round-trips, 30-conn
 burst — confirms the `serve_conn` restructure left the
@@ -1448,10 +1448,10 @@ Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
 `bazel build //apps/webserver:webserver.elf
 --platforms=//bazel/platforms:aarch64_unikernel`; `bazel test
 //apps/webserver:test_hvf` (TCP + TLS round-trips, 30-conn burst);
-`bazel test //crates/runtime/executor:uni_runtime_test` (2 tests —
+`bazel test //crates/runtime/executor:executor_test` (2 tests —
 `RecvChunkGuard::into_owned` round-trips an owned `Heap` source
 and a `Borrowed` source, bytes preserved either way); `bazel test
-//crates/runtime/executor:uni_runtime_doc_test` (the `compile_fail` guard test
+//crates/runtime/executor:executor_doc_test` (the `compile_fail` guard test
 + its sequential-use companion). Each of the two implementation
 commits was gate-checked on its own tree.
 
@@ -1528,14 +1528,14 @@ guard is the stable façade — and is explicitly out of item G's
 scope.
 
 **A pre-existing item-F miss, fixed in passing (commit `4d3dda2`).**
-`uni_tls_test` would not build: item F added three fields to the
+`tls_test` would not build: item F added three fields to the
 `TcpBackend` vtable (`do_recv_chunk` / `set_chunk_buf_slot` /
 `clear_chunk_buf_slot`) and updated the bare-metal initializer in
 `net/src/tcp.rs`, but missed the native one in
 `uni/backend/src/native/tcp.rs`. Item F's gate set — two bare-metal
 `bazel build`s + `test_hvf` — never compiles the native backend
 (it is `select`'d in only for host builds), so the breakage slipped
-through; `uni_tls_test` catches it because `proto/tls → uni →
+through; `tls_test` catches it because `proto/tls → uni →
 uni/backend` pulls the native backend into a host-native test
 compile. Fixed by wiring the three hooks as `None` — the documented
 native-POSIX behaviour (`recv()` copies at the syscall boundary, so
@@ -1545,7 +1545,7 @@ and callers fall back to `recv`).
 No new unit test. The guard revision is a `pub` on an existing
 constructor — already covered by item F's
 `RecvChunkGuard::into_owned` *Borrowed-source* round-trip in
-`uni_runtime_test`, which **is** the TLS-plaintext shape. A
+`executor_test`, which **is** the TLS-plaintext shape. A
 TLS-side `compile_fail` doc-test of the two-guards borrow error
 would need a full `TlsStream` to construct (a `TcpStream` +
 `PooledTlsConn` + a live runtime); the borrow mechanism is anyway
@@ -1557,8 +1557,8 @@ the functional gate the plan designates for G.
 Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
 `bazel build //apps/webserver:webserver.elf
 --platforms=//bazel/platforms:aarch64_unikernel`; `bazel test
-//apps/webserver:test_hvf`; `bazel test //crates/runtime/executor:uni_runtime_test
-//crates/runtime/executor:uni_runtime_doc_test //crates/proto/tls:uni_tls_test` (the last
+//apps/webserver:test_hvf`; `bazel test //crates/runtime/executor:executor_test
+//crates/runtime/executor:executor_doc_test //crates/proto/tls:tls_test` (the last
 unblocked by the native-backend fix). The `4d3dda2` + `a0c9acf`
 intermediate tree was gate-checked on its own before `74357c6`
 landed on top.
@@ -1670,7 +1670,7 @@ bench exercises it, so this is a documented limitation, not a
 regression of a supported path. The proper fix lives with the
 Phase-4 streaming parser (already an "Out of scope" bullet).
 
-**Tests.** Four `body_reader_tests` added to `uni_http_test`
+**Tests.** Four `body_reader_tests` added to `http_test`
 (now 17 tests): prebuf `data()` zero-copy view, prebuf
 `into_owned()` heap copy, the prebuf trim to `Content-Length`, and
 the `NullStream` past-prebuf EOF case. They drive `chunk` through a
@@ -1684,8 +1684,8 @@ Verified per commit: `bazel build
 //apps/webserver:webserver_qemu_x86_64`; `bazel build
 //apps/webserver:webserver.elf
 --platforms=//bazel/platforms:aarch64_unikernel`; `bazel test
-//crates/proto/http:uni_http_test //apps/webserver:test_hvf` (TCP + TLS
-round-trips, 30-conn burst); plus `uni_tls_test` on the proto/tls
+//crates/proto/http:http_test //apps/webserver:test_hvf` (TCP + TLS
+round-trips, 30-conn burst); plus `tls_test` on the proto/tls
 commit.
 
 **Perf — same-session A/B, `main` vs item H, HVF 1c/3c** (the
@@ -1894,8 +1894,8 @@ backpressure buffer (the math forbids IOBufs in it). Full `recv`
 removal is a Phase-4 endgame.
 
 Verified: `webserver_qemu_x86_64` + `webserver.elf` aarch64 builds;
-`test_hvf`; `uni_http_test`; native backend compile via
-`uni_tls_test`. GCE VMs stopped after the run.
+`test_hvf`; `http_test`; native backend compile via
+`tls_test`. GCE VMs stopped after the run.
 
 ### 2026-05-18 — Follow-up: shared `TaggedTreiberStack` ([x] **landed**)
 

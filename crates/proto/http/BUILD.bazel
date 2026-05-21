@@ -26,9 +26,9 @@ rust_library(
 
 # Inline #[cfg(test)] unit tests — request parser (chunked-TE
 # rejection, Host-header port parsing). Run via:
-#   bazel test //crates/proto/http:uni_http_test
+#   bazel test //crates/proto/http:http_test
 rust_test(
-    name = "uni_http_test",
+    name = "http_test",
     size = "small",
     crate = ":http",
 )

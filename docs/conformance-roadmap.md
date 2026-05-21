@@ -42,7 +42,7 @@ Landed:
 - TCP RFC 6298 retransmission: a per-conn retransmit ring, the RTO
   timer wired into the poll loop, exponential backoff, and the
   SRTT/RTTVAR estimator. A lost outbound segment is now resent.
-- `quic` already host-builds; `//crates/proto/quic:uni_quic_test`
+- `quic` already host-builds; `//crates/proto/quic:quic_test`
   includes `end_to_end_self_handshake`, which drives a synthetic
   Initial through the receive path.
 - `net_classify` (RX parse) is host-tested via
@@ -229,12 +229,12 @@ host-tested, and the RFC 9002 *data model* is present.
 
 - **Have**: long/short header parsing, connection IDs, the connection
   state machine, frame encode/decode, streams, the UDP endpoint
-  routing datagrams to connection tasks. `uni_quic_test` covers wire
+  routing datagrams to connection tasks. `quic_test` covers wire
   formats, frame round-trips, and packet-number decode.
 - **Missing**: audit needed for flow control (MAX_DATA /
   MAX_STREAM_DATA), connection migration, and the full transport-
   parameter set.
-- **Conformance test**: extend `uni_quic_test` with scripted-packet
+- **Conformance test**: extend `quic_test` with scripted-packet
   cases — the harness already exists; this is additive.
 
 ### RFC 9001 — using TLS with QUIC
@@ -245,7 +245,7 @@ host-tested, and the RFC 9002 *data model* is present.
 - **Missing**: audit retry-token handling and key-update (RFC 9001
   §6).
 - **Conformance test**: scripted Initial / Retry / key-update cases in
-  `uni_quic_test`.
+  `quic_test`.
 
 ### RFC 9002 — loss detection + congestion control
 
@@ -256,7 +256,7 @@ host-tested, and the RFC 9002 *data model* is present.
   (`conn.rs` notes it relies on client retransmits today), and there
   is no congestion controller.
 - **Conformance test**: this is "wire the timer + a controller onto
-  existing scaffolding" — host-testable directly in `uni_quic_test`
+  existing scaffolding" — host-testable directly in `quic_test`
   once the clock seam exists. Smaller than the TCP equivalent because
   the bookkeeping is already there.
 

@@ -80,7 +80,7 @@ rust_library(
 # parsing, frame round-trips, AEAD seal/open, packet-number decode,
 # slot-table allocator, end-to-end self handshake).
 rust_test(
-    name = "uni_quic_test",
+    name = "quic_test",
     size = "small",
     crate = ":quic",
 )
