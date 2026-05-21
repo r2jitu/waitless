@@ -758,7 +758,10 @@ def waitless_app_test(name, app_base, test_rule, extra_data = None, variants = N
     src_file = srcs[0]
     caller_tags = list(kwargs.pop("tags", []))
 
-    selected = variants if variants != None else _DEFAULT_TEST_VARIANT_SUFFIXES
+    # Both arms coerced to `list` so `selected` has one concrete type:
+    # the Starlark LSP rejects a `for` over a mixed-type union, even
+    # when every member is itself iterable.
+    selected = list(variants) if variants != None else list(_DEFAULT_TEST_VARIANT_SUFFIXES)
     for suffix in selected:
         if suffix not in _SUFFIX_TO_SPEC:
             fail("waitless_app_test: unknown variant '{}' (known: {})".format(
