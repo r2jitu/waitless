@@ -436,12 +436,13 @@ unsafe fn return_slab(base: NonNull<u8>, _capacity: u32, ctx: *mut ()) {
     // last reference, `PoolInner::drop` now frees the slab region.
 }
 
-/// Best-effort report of a leaked slab. In `cfg(test)` / debug
-/// builds it writes to stderr; in release `#![no_std]` builds —
-/// where this dep-less crate has no logging facility — it is a
+/// Best-effort report of a leaked slab. On a hosted target in `test`
+/// / debug builds it writes to stderr; on the bare-metal `#![no_std]`
+/// unikernel target (`target_os = "none"`) — and in release builds —
+/// where this dep-less crate has no `std` / logging facility, it is a
 /// no-op, and the leak stays observable through
 /// [`IOBufPool::leaked_count`].
-#[cfg(any(test, debug_assertions))]
+#[cfg(all(any(test, debug_assertions), not(target_os = "none")))]
 fn report_leak(base_addr: usize) {
     extern crate std;
     std::eprintln!(
@@ -452,7 +453,7 @@ fn report_leak(base_addr: usize) {
     );
 }
 
-#[cfg(not(any(test, debug_assertions)))]
+#[cfg(not(all(any(test, debug_assertions), not(target_os = "none"))))]
 #[inline(always)]
 fn report_leak(_base_addr: usize) {}
 

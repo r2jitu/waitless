@@ -39,11 +39,15 @@ use crate::{IOBufError, IOBufRead};
 // allocator's cursor going wrong) at the point of construction rather
 // than as silent UAF later.
 //
-// Active only under `cfg(any(test, debug_assertions))`. In bazel
-// release builds (the unikernel target ships with `-Copt-level=2`),
-// `debug_assertions` is off and the tracker compiles to a no-op,
-// so production pays nothing. In `cargo test`, the iobuf_test bazel
-// target, and any debug build of a consumer, the tracker is on.
+// Active only where borrow-tracking is both wanted and possible:
+// `any(test, debug_assertions)` AND a hosted target. The real tracker
+// needs `std` (`thread_local!`), so on the bare-metal unikernel target
+// (`target_os = "none"`) it is always the no-op variant — including
+// under the clippy aspect, which compiles `debug_assertions` code even
+// for `os:none`. In bazel release builds (`-Copt-level=2` →
+// `debug_assertions` off) it is likewise a no-op, so production pays
+// nothing. In `cargo test`, the iobuf_test bazel target, and any
+// hosted debug build of a consumer, the tracker is on.
 //
 // The tracker lives on a per-thread `Vec` (via `std::thread_local!`)
 // because `BorrowedView`s are `!Send` — a borrowed view is bound to
@@ -53,7 +57,7 @@ use crate::{IOBufError, IOBufRead};
 // typical depths are < 4 (one for body scratch, one for TLS scratch,
 // occasional inner sub-views).
 // ============================================================================
-#[cfg(any(test, debug_assertions))]
+#[cfg(all(any(test, debug_assertions), not(target_os = "none")))]
 mod borrow_tracker {
     extern crate std;
 
@@ -127,7 +131,7 @@ mod borrow_tracker {
     }
 }
 
-#[cfg(not(any(test, debug_assertions)))]
+#[cfg(not(all(any(test, debug_assertions), not(target_os = "none"))))]
 mod borrow_tracker {
     use core::ptr::NonNull;
     #[inline(always)]
