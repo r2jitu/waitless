@@ -1,9 +1,7 @@
-# Bazel
-bazel-bin
-bazel-out
-bazel-testlogs
-bazel-unikernel
-bazel-agent-*
+# Bazel — convenience symlinks at the repo root (bazel-bin, bazel-out,
+# bazel-testlogs, bazel-<module-name>, and per-worktree/agent variants).
+# The leading `/` anchors to the root so it can't catch nested paths.
+/bazel-*
 .bazel/
 .bazelrc.local
 
@@ -34,4 +32,3 @@ __pycache__/
 # Cargo standalone build artefacts (under tools/hvf-runner). The
 # bazel build goes through crate_universe and writes elsewhere.
 target/
-bazel-nice-hypatia-ec12ac
