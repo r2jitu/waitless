@@ -33,6 +33,21 @@ Variants produced (names & platform compat defined in _VARIANT_SPECS):
   * `:<name>_qemu_x86_64`  — x86_64 unikernel + QEMU TCG.
 """
 
+# ── Hygienic label constants ─────────────────────────────────────────────
+#
+# Labels that flow into a rule-attribute value or a `select()` key from
+# inside a macro body must be `Label()` objects, not bare `//…` strings:
+# a bare string resolves against the BUILD file calling the macro, so an
+# external app would look for these targets in its own repo and fail.
+# `Label()` evaluated here binds to `@unikernel`. (Pseudo-labels and
+# `attr` / `transition` definition-time defaults are left as strings —
+# they already resolve in unikernel's context.)
+_OS_MACOS = Label("@platforms//os:macos")
+_PLATFORM_NATIVE = Label("//bazel/platforms:native")
+_HVF_RUNNER = Label("//tools/hvf-runner:run_hvf")
+_OS_NONE_SETTING = Label("//bazel/platforms:os_none")
+_INCOMPATIBLE = Label("@platforms//:incompatible")
+
 # ── Transitions ────────────────────────────────────────────────────────────
 #
 # Each transition flips the same five keys:
@@ -548,9 +563,9 @@ _VARIANT_SPECS = [
         suffix = "hvf",
         rule_fn = _hvf_variant,
         src_attrs = {"img": ".img"},
-        host_attrs = {"hvf_runner": "//tools/hvf-runner:run_hvf"},
+        host_attrs = {"hvf_runner": _HVF_RUNNER},
         port_forward_kwargs = _hvf_port_forward_kwargs,
-        host_compat = ["@platforms//os:macos"],  # Hypervisor.framework.
+        host_compat = [_OS_MACOS],  # Hypervisor.framework.
         extra_test_tags = [],
         in_default_test_set = True,
     ),
@@ -616,7 +631,7 @@ _VARIANT_SPECS = [
         src_attrs = {"bin": "_bin"},
         host_attrs = {},
         port_forward_kwargs = _native_port_forward_kwargs,
-        host_compat = ["//bazel/platforms:native"],
+        host_compat = [_PLATFORM_NATIVE],
         extra_test_tags = [],
         in_default_test_set = True,
     ),
@@ -795,7 +810,7 @@ def unikernel_app_test(name, app_base, test_rule, extra_data = None, variants = 
             data = [":" + launcher_name] + (extra_data or []),
             env = {"LAUNCHER_NAME": launcher_name},
             target_compatible_with = spec.host_compat + select({
-                "//bazel/platforms:os_none": ["@platforms//:incompatible"],
+                _OS_NONE_SETTING: [_INCOMPATIBLE],
                 "//conditions:default": [],
             }),
             tags = variant_tags,

@@ -13,6 +13,16 @@ load(
     _rust_test = "rust_test",
 )
 
+# Labels used as `select()` keys / `target_compatible_with` values from
+# inside these wrapper macros must be `Label()` objects, not bare `//…`
+# strings: a bare string resolves against the BUILD file calling the
+# wrapper (an external app's repo), not `@unikernel`. `Label()` evaluated
+# here binds to this `.bzl` file's repo and stays fixed regardless of
+# caller. (`//conditions:default` is a pseudo-label — left as a string.)
+_TESTS_NEED_STD_ON = Label("//bazel/rules:tests_need_std_on")
+_OS_NONE = Label("//bazel/platforms:os_none")
+_INCOMPATIBLE = Label("@platforms//:incompatible")
+
 # `bazel build ...` would otherwise try to compile every rust_test
 # under the global `-Cpanic=abort`, which rustc rejects for test
 # binaries ("building tests with panic=abort is not supported without
@@ -24,8 +34,8 @@ def rust_test(**kwargs):
     if "target_compatible_with" in kwargs:
         fail("rust_test: unikernel wrapper owns target_compatible_with")
     kwargs["target_compatible_with"] = select({
-        "//bazel/rules:tests_need_std_on": [],
-        "//conditions:default": ["@platforms//:incompatible"],
+        _TESTS_NEED_STD_ON: [],
+        "//conditions:default": [_INCOMPATIBLE],
     })
     _rust_test(**kwargs)
 
@@ -38,8 +48,8 @@ def rust_doc_test(**kwargs):
     if "target_compatible_with" in kwargs:
         fail("rust_doc_test: unikernel wrapper owns target_compatible_with")
     kwargs["target_compatible_with"] = select({
-        "//bazel/rules:tests_need_std_on": [],
-        "//conditions:default": ["@platforms//:incompatible"],
+        _TESTS_NEED_STD_ON: [],
+        "//conditions:default": [_INCOMPATIBLE],
     })
     _rust_doc_test(**kwargs)
 
@@ -65,7 +75,7 @@ def rust_proc_macro(rustc_flags = [], target_compatible_with = [], **kwargs):
     _rust_proc_macro(
         rustc_flags = rustc_flags + ["-Cpanic=unwind"],
         target_compatible_with = target_compatible_with + select({
-            "//bazel/platforms:os_none": ["@platforms//:incompatible"],
+            _OS_NONE: [_INCOMPATIBLE],
             "//conditions:default": [],
         }),
         **kwargs

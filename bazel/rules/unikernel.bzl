@@ -55,6 +55,41 @@ def port_fwd(proto, guest, host):
         fail("port_fwd: guest must be a TCP/UDP port (1–65535), got '{}'".format(guest))
     return struct(proto = proto, guest = guest, host = host)
 
+# ── Hygienic label constants ─────────────────────────────────────────────
+#
+# Every label that flows into a rule-attribute value or a `select()` key
+# from inside a macro body must be a `Label()` object, not a bare `//…`
+# string. A bare string is resolved against the *calling* BUILD file's
+# repository, so an external app calling `unikernel_binary` would look
+# for `@theapp//crates/boot:entry` (and fail) instead of unikernel's own
+# `//crates/boot:entry`. A `Label()` evaluated here binds to this `.bzl`
+# file's repo (`@unikernel`) and stays fixed regardless of caller.
+#
+# Pseudo-labels (`//conditions:default`, `//command_line_option:*`,
+# `//visibility:*`) and `attr` / `transition` definition-time defaults are
+# intentionally NOT wrapped — those already resolve in unikernel's
+# context, at definition time.
+_AARCH64 = Label("//bazel/platforms:aarch64")
+_X86_64 = Label("//bazel/platforms:x86_64")
+_PLATFORM_NATIVE = Label("//bazel/platforms:native")
+_OS_NONE = Label("@platforms//os:none")
+_OS_MACOS = Label("@platforms//os:macos")
+
+_BOOT_ENTRY = Label("//crates/boot:entry")
+_BOOT_LIMINE = Label("//crates/boot:limine")
+_BOOT_MEM_STUBS = Label("//crates/boot:mem_stubs")
+_BOOT_MULTIBOOT = Label("//crates/boot:multiboot")
+_LIMINE_CONF = Label("//crates/boot:limine.conf")
+_VIRTIO_CONSOLE = Label("//crates/drivers/virtio-console")
+
+_LD_ARM64 = Label("//bazel/toolchain:unikernel_arm64.ld")
+_LD_X86_64 = Label("//bazel/toolchain:unikernel.ld")
+_LD_LIMINE = Label("//bazel/toolchain:unikernel_limine.ld")
+
+_MAKE_LIMINE_ISO = Label("//scripts:make_limine_iso")
+_NATIVE_MAIN_RS = Label("//bazel/rules:native_main.rs")
+_UNI = Label("//crates/uni")
+
 # Bare-metal linker flags (passed to rust-lld via -C link-arg).
 #
 # No `--allow-multiple-definition`: it used to be needed because the
@@ -81,7 +116,7 @@ _LINK_FLAGS = [
 ]
 
 _LINK_FLAGS_ARCH = select({
-    "//bazel/platforms:aarch64": ["-C", "link-arg=-pie", "-C", "link-arg=-znotext"],
+    _AARCH64: ["-C", "link-arg=-pie", "-C", "link-arg=-znotext"],
     "//conditions:default": ["-C", "link-arg=-static", "-C", "link-arg=--no-pie"],
 })
 
@@ -231,17 +266,17 @@ def unikernel_binary(
     # (//bazel/rules:variants.bzl) flip the platform to aarch64 /
     # x86_64 `_unikernel` (both `os:none`), so the variant dep-chain
     # (`:<name>_hvf` → `:<name>.img` → `:<name>.elf`) builds fine.
-    _unikernel_only = ["@platforms//os:none"]
+    _unikernel_only = [_OS_NONE]
 
     # Common deps for both .elf paths. multiboot (x86_64 multiboot/PVH stub)
     # is added per-target below since it's incompatible with higher-half
     # linking and only needed for the QEMU direct-boot ELF.
     _common_deps = [
         app,
-        "//crates/boot:entry",
-        "//crates/boot:limine",
-        "//crates/boot:mem_stubs",
-        "//crates/drivers/virtio-console",
+        _BOOT_ENTRY,
+        _BOOT_LIMINE,
+        _BOOT_MEM_STUBS,
+        _VIRTIO_CONSOLE,
     ] + drivers
     _unikernel_flags = _LINK_FLAGS + _LINK_FLAGS_ARCH
 
@@ -309,12 +344,12 @@ def unikernel_binary(
         srcs = [":" + elf_main_rule],
         crate_root = elf_main_rs,
         deps = _common_deps + select({
-            "//bazel/platforms:x86_64": ["//crates/boot:multiboot"],
+            _X86_64: [_BOOT_MULTIBOOT],
             "//conditions:default": [],
         }),
         linker_script = select({
-            "//bazel/platforms:aarch64": "//bazel/toolchain:unikernel_arm64.ld",
-            "//conditions:default": "//bazel/toolchain:unikernel.ld",
+            _AARCH64: _LD_ARM64,
+            "//conditions:default": _LD_X86_64,
         }),
         rustc_flags = _unikernel_flags,
         target_compatible_with = _unikernel_only,
@@ -370,7 +405,7 @@ def unikernel_binary(
         srcs = [":" + limine_main_rule],
         crate_root = limine_main_rs,
         deps = _common_deps,
-        linker_script = "//bazel/toolchain:unikernel_limine.ld",
+        linker_script = _LD_LIMINE,
         rustc_flags = _unikernel_flags,
         target_compatible_with = _unikernel_only,
         visibility = ["//visibility:private"],
@@ -386,32 +421,47 @@ def unikernel_binary(
     # Rule name is `<name>_iso_gen` (not `<name>.iso`) so Bazel doesn't
     # warn that the rule name collides with its single output file.
     # External references use the file label `:<name>.iso`.
+    #
+    # `cmd` can't hold `Label` objects (it's a shell string), and the
+    # `$(location …)` make-var resolves its label against the genrule's
+    # package — the *caller's* package. Formatting `str(Label("//…"))`
+    # in yields the canonical `@@unikernel+//…` label, which `$(location)`
+    # resolves unambiguously and which matches the `srcs` / `tools`
+    # `Label` entries below.
     native.genrule(
         name = name + "_iso_gen",
         srcs = select({
-            "//bazel/platforms:aarch64": [
+            _AARCH64: [
                 ":" + name + ".elf",
-                "//crates/boot:limine.conf",
+                _LIMINE_CONF,
             ],
             "//conditions:default": [
                 ":" + name + ".limine.elf",
-                "//crates/boot:limine.conf",
+                _LIMINE_CONF,
             ],
         }),
         outs = [name + ".iso"],
         cmd = select({
-            "//bazel/platforms:aarch64": """
-                $(location //scripts:make_limine_iso) \
+            _AARCH64: """
+                $(location {make_iso}) \
                     $(location :{name_elf}) $@ \
-                    --arch aarch64 --conf $(location //crates/boot:limine.conf)
-            """.format(name_elf = name + ".elf"),
+                    --arch aarch64 --conf $(location {limine_conf})
+            """.format(
+                make_iso = str(_MAKE_LIMINE_ISO),
+                limine_conf = str(_LIMINE_CONF),
+                name_elf = name + ".elf",
+            ),
             "//conditions:default": """
-                $(location //scripts:make_limine_iso) \
+                $(location {make_iso}) \
                     $(location :{name_limine_elf}) $@ \
-                    --arch x86_64 --conf $(location //crates/boot:limine.conf)
-            """.format(name_limine_elf = name + ".limine.elf"),
+                    --arch x86_64 --conf $(location {limine_conf})
+            """.format(
+                make_iso = str(_MAKE_LIMINE_ISO),
+                limine_conf = str(_LIMINE_CONF),
+                name_limine_elf = name + ".limine.elf",
+            ),
         }),
-        tools = ["//scripts:make_limine_iso"],
+        tools = [_MAKE_LIMINE_ISO],
         local = True,
         target_compatible_with = _unikernel_only,
         visibility = visibility,
@@ -438,10 +488,10 @@ def unikernel_binary(
     if build_native:
         rust_binary(
             name = name + "_bin",
-            srcs = ["//bazel/rules:native_main.rs"],
-            deps = [app, "//crates/uni"],
+            srcs = [_NATIVE_MAIN_RS],
+            deps = [app, _UNI],
             rustc_flags = select({
-                "@platforms//os:macos": ["-C", "link-arg=-lSystem"],
+                _OS_MACOS: ["-C", "link-arg=-lSystem"],
                 # Linux musl: static binary, no external sysroot needed.
                 # Rust ships a self-contained musl libc + crt.
                 "//conditions:default": [
@@ -453,7 +503,7 @@ def unikernel_binary(
                     "link-arg=-lc",
                 ],
             }),
-            target_compatible_with = ["//bazel/platforms:native"],
+            target_compatible_with = [_PLATFORM_NATIVE],
             visibility = visibility,
         )
 
