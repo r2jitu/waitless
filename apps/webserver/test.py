@@ -587,6 +587,7 @@ class WebserverShutdownTest(unittest.TestCase):
                                 create_protocol=P,
                                 wait_connected=True,
                             ) as c:
+                                assert isinstance(c, P)
                                 while not stop_hammer[0]:
                                     sid = c._quic.get_next_available_stream_id()
                                     c.h3.send_headers(
@@ -639,10 +640,8 @@ class WebserverShutdownTest(unittest.TestCase):
             (line for line in buf.splitlines() if b"HEAP_LEAK_CHECK" in line),
             None,
         )
-        self.assertIsNotNone(
-            leak_line,
-            "no HEAP_LEAK_CHECK line in serial log",
-        )
+        if leak_line is None:
+            self.fail("no HEAP_LEAK_CHECK line in serial log")
         print(f"    {leak_line.decode(errors='replace')}", flush=True)
         self.assertNotIn(
             b"HEAP_LEAK_CHECK LEAK",
@@ -688,10 +687,8 @@ class WebserverShutdownTest(unittest.TestCase):
             (line for line in buf.splitlines() if b"HEAP_LEAK_CHECK" in line),
             None,
         )
-        self.assertIsNotNone(
-            leak_line,
-            "no HEAP_LEAK_CHECK line in serial log",
-        )
+        if leak_line is None:
+            self.fail("no HEAP_LEAK_CHECK line in serial log")
         print(f"    {leak_line.decode(errors='replace')}", flush=True)
         self.assertNotIn(
             b"HEAP_LEAK_CHECK LEAK",
@@ -742,10 +739,8 @@ class WebserverShutdownTest(unittest.TestCase):
             (line for line in buf.splitlines() if b"HEAP_LEAK_CHECK" in line),
             None,
         )
-        self.assertIsNotNone(
-            leak_line,
-            "no HEAP_LEAK_CHECK line in serial log",
-        )
+        if leak_line is None:
+            self.fail("no HEAP_LEAK_CHECK line in serial log")
         print(f"    {leak_line.decode(errors='replace')}", flush=True)
         self.assertNotIn(
             b"HEAP_LEAK_CHECK LEAK",
@@ -766,10 +761,10 @@ class WebserverShutdownTest(unittest.TestCase):
             (line for line in buf.splitlines() if b"HEAP_LEAK_CHECK" in line),
             None,
         )
-        self.assertIsNotNone(
-            leak_line,
-            "no HEAP_LEAK_CHECK line in serial log — shutdown_and_drop didn't run?",
-        )
+        if leak_line is None:
+            self.fail(
+                "no HEAP_LEAK_CHECK line in serial log — shutdown_and_drop didn't run?"
+            )
         print(f"    {leak_line.decode(errors='replace')}", flush=True)
         self.assertNotIn(
             b"HEAP_LEAK_CHECK LEAK",
