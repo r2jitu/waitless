@@ -50,6 +50,12 @@ test --//bazel/rules:tests_need_std=True
 # runner; that's the variant target's job. `bazel build :webserver_hvf`
 # runs fine under any host-platform default because the variant's
 # transition pins the guest platform internally.
+#
+# These are also the workaround for a *git worktree*: a worktree has
+# no `.bazelrc.local` (it's gitignored + per-host — `git worktree add`
+# checks out tracked files only), so it falls back to the x86_64
+# unikernel default below. Pass `--config=aarch64-macos` (or
+# `--config=x86_64-linux`) to build/test HVF or native targets there.
 build:aarch64-macos --platforms=//bazel/platforms:aarch64_macos
 build:x86_64-linux  --platforms=//bazel/platforms:x86_64_linux
 
