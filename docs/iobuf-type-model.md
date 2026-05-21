@@ -1,4 +1,4 @@
-# uni-iobuf type model — split borrowed (`!Send`) from owned (`Send`)
+# util/iobuf type model — split borrowed (`!Send`) from owned (`Send`)
 
 **Status:** **Landed 2026-05-16.** Three commits: `fb755a3` (prep —
 deleted the dead `Shared` variant + `split_at` / `split_off`),
@@ -32,11 +32,11 @@ because a bench anomaly got chased into a packet capture).
 
 - **`Borrowed` is minted at exactly 3 sites** — all TX-path, all
   single-core synchronous, each pushes the borrowed buffer into a
-  chain built → sent → dropped within one function: `uni-tls`
-  (TLS record scratch), `uni-http` (response header array),
-  `uni-runtime` (`send_bytes` borrowing a `&[u8]`). None cross a
+  chain built → sent → dropped within one function: `proto/tls`
+  (TLS record scratch), `proto/http` (response header array),
+  `runtime/executor` (`send_bytes` borrowing a `&[u8]`). None cross a
   core.
-- **Chains genuinely mix** borrowed and owned parts — `uni-http`'s
+- **Chains genuinely mix** borrowed and owned parts — `proto/http`'s
   response chain holds a `Borrowed` header + `Static`/`Heap` body.
 - **`Shared` is dead code** — `IOBuf::split_at` /
   `IOBufChain::split_off`, its only producers, have zero callers.
@@ -47,7 +47,7 @@ because a bench anomaly got chased into a packet capture).
   distributor → `RxInbox`).
 - **Churn is RX-path-bounded.** Owned-side consumers are the
   item-B file set (drivers + net dispatch) + item C's kernel file.
-  The TX-heavy crates (uni-http, uni-http3, uni-tls, uni-quic) keep
+  The TX-heavy crates (proto/http, proto/http3, proto/tls, proto/quic) keep
   `IOBuf`.
 
 ## Why keep `Borrowed` at all
@@ -154,7 +154,7 @@ written twice — thin, mechanical, macro-able — but only dispatch).
   proxy's forwarded buffer and turns every path refactor into a
   rename.
 - **Delete `Shared` / `split_at` / `split_off`** — dead code;
-  removes the `Rc` from uni-iobuf.
+  removes the `Rc` from util/iobuf.
 
 The cross-core guarantee is the RX path being *typed* `OwnedIOBuf`.
 Promoting the variants to structs enables the clean factoring; it
@@ -219,7 +219,7 @@ Note `Borrowed` parts must copy at the crossing — re-opening the
 - **Sequence:** precede item C, so its inbox is born
   `Send`-by-derivation. (If C ships first it carries the documented
   `unsafe impl`, which this work deletes — acceptable, wasteful.)
-- **Two code commits, not one.** The uni-iobuf *internal* refactor
+- **Two code commits, not one.** The util/iobuf *internal* refactor
   — extract the variant structs, add `OwnedIOBuf` / `IOBufRead` /
   generic `Chain<B>`, keep `IOBuf`'s API and `IOBufChain =
   Chain<IOBuf>` — is **additive**: `wrap_owned` still returns

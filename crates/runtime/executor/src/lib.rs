@@ -6,9 +6,10 @@
 //     schedules into it. `task::tick` calls into this to advance
 //     timers each iteration.
 //   * `event`, `launcher`, `select` — small free-standing
-//     primitives consumed by the net reactors and apps.
-//   * `net` — UDP / TCP per-worker reactors (the runtime's "meat";
-//     submodule because it's two reactors plus shared helpers).
+//     primitives consumed by the reactors and apps.
+//   * `reactor` — UDP / TCP per-worker reactors (the runtime's
+//     "meat"; submodule because it's two reactors plus shared
+//     helpers).
 //
 // Rule of thumb for new files here: subdir when >1 file's worth of
 // implementation, top-level `.rs` when it's one file's worth.

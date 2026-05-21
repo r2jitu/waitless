@@ -199,8 +199,8 @@ shortcut or a lighter network stack underneath.
 Crucially, **Linux is running its mature in-tree `gve` driver**
 (`drivers/net/ethernet/google/gve/`, thousands of lines, years
 of tuning); **the unikernel is running the from-scratch gVNIC
-driver in [`drivers/gvnic.rs`](drivers/gvnic.rs)**. Linux should
-win on driver maturity alone. It doesn't.
+driver in [`crates/drivers/gve/`](crates/drivers/gve/)**. Linux
+should win on driver maturity alone. It doesn't.
 
 | Workload            | Native Linux | **Unikernel** | Δ |
 |---------------------|-------------:|--------------:|:-:|

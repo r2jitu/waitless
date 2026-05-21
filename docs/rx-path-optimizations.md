@@ -1,7 +1,7 @@
 # RX path optimizations — tracker
 
 > **Note on Bazel labels.** Items below reference labels by their path
-> at the time the work landed (e.g. `//uni-iobuf:iobuf_test`,
+> at the time the work landed (e.g. `//crates/util/iobuf:iobuf_test`,
 > `//net:tcp`). After the May 2026 crate reorganization those moved
 > under `//crates/`; see [crates.md](crates.md) for the current map.
 > Updates here are deliberately not retro-rewritten so the historical
@@ -51,12 +51,12 @@ bufs past the callback).
 | # | Step | Site | Cost per byte | Notes |
 |---|------|------|---|---|
 | 1 | Device DMA → driver buf | gVNIC DQO / virtio-net / gVNIC GQI | 0 | DMA into per-driver pool buffer |
-| 2 | Driver callback | [`uni-net/src/driver.rs`](uni-net/src/driver.rs), `NicOps::poll_qp` | 0 | Slice into device buf for callback duration |
+| 2 | Driver callback | [`uni/net/src/driver.rs`](uni/net/src/driver.rs), `NicOps::poll_qp` | 0 | Slice into device buf for callback duration |
 | 3 | Cross-core inbox push | [`kernel/src/percpu.rs:115`](kernel/src/percpu.rs#L115) | **1× memcpy** (only multi-core path) | Copies frame into `RxPacket.data: [u8; 1514]` |
 | 4 | TCP fast path (parked recv) | [`net/src/tcp.rs:331`](net/src/tcp.rs#L331) | **1× memcpy** | `ptr::copy_nonoverlapping` directly into user buf |
 | 4'| TCP slow path (no parked recv) | [`net/src/tcp.rs:303`](net/src/tcp.rs#L303) | **1× memcpy** (into ring) + **1× memcpy** (out at recv) | Per-conn 16 KiB byte ring |
-| 5 | HTTP parse-buf refill | [`uni-http/src/lib.rs`](uni-http/src/lib.rs) `serve_conn` | 0 (Phase 1: bytes flow through stream.recv into parse buf — same memcpy as step 4) | Headers + body prebuf land here |
-| 6 | BodyReader::chunk past prebuf | [`uni-http/src/lib.rs:332`](uni-http/src/lib.rs#L332) | **0** (item H) | `recv_chunk` surfaces the transport buffer behind a `BodyChunkGuard`; the 4 KiB `refill` scratch is gone |
+| 5 | HTTP parse-buf refill | [`proto/http/src/lib.rs`](proto/http/src/lib.rs) `serve_conn` | 0 (Phase 1: bytes flow through stream.recv into parse buf — same memcpy as step 4) | Headers + body prebuf land here |
+| 6 | BodyReader::chunk past prebuf | [`proto/http/src/lib.rs:332`](proto/http/src/lib.rs#L332) | **0** (item H) | `recv_chunk` surfaces the transport buffer behind a `BodyChunkGuard`; the 4 KiB `refill` scratch is gone |
 | 7 | Handler reads body | app handler | 0 | `BodyChunkGuard::data()` — in-place view (item H) |
 
 Active per-byte memcpys on **TCP RX** guest side for body bytes
@@ -71,10 +71,10 @@ buffer moves straight through `recv_chunk` to the handler) and
 | # | Step | Site | Cost per byte | Notes |
 |---|------|------|---|---|
 | 1–4 | Same as TCP HTTP | (above) | 1–2 | Ciphertext bytes flow through |
-| 5 | TLS pump_rx into cipher_buf | [`uni-tls/src/lib.rs:513`](uni-tls/src/lib.rs#L513) | 0 (in-place pump from TcpStream::recv) | 8 KiB inline cipher_buf |
+| 5 | TLS pump_rx into cipher_buf | [`proto/tls/src/lib.rs:513`](proto/tls/src/lib.rs#L513) | 0 (in-place pump from TcpStream::recv) | 8 KiB inline cipher_buf |
 | 6 | AEAD decrypt | TLS state machine | **1× R/W** (ChaCha20) + **1× R** (Poly1305 verify) | Plaintext lands in `pt_buf` (17 KiB after Phase 1's bump) |
-| 7 | TlsStream::recv pops plaintext | [`uni-tls/src/lib.rs:685`](uni-tls/src/lib.rs#L685) | **1× memcpy** | pt_buf → user buf (item G's `recv_chunk` is the zero-copy sibling) |
-| 8 | HTTP / BodyReader past prebuf | [`uni-http/src/lib.rs:332`](uni-http/src/lib.rs#L332) | **0** (items G + H) | `recv_chunk` hands a `Borrowed` view into `pt_buf`; the `refill` scratch is gone |
+| 7 | TlsStream::recv pops plaintext | [`proto/tls/src/lib.rs:685`](proto/tls/src/lib.rs#L685) | **1× memcpy** | pt_buf → user buf (item G's `recv_chunk` is the zero-copy sibling) |
+| 8 | HTTP / BodyReader past prebuf | [`proto/http/src/lib.rs:332`](proto/http/src/lib.rs#L332) | **0** (items G + H) | `recv_chunk` hands a `Borrowed` view into `pt_buf`; the `refill` scratch is gone |
 
 Active per-byte memcpys on **TLS RX** guest side: the fundamental
 AEAD R/W only — items G and H removed both structural memcpys
@@ -88,9 +88,9 @@ see item H's progress-log bench note.
 | # | Step | Site | Cost per byte | Notes |
 |---|------|------|---|---|
 | 1 | UDP datagram delivered | virtio/gVNIC | 0–1 | Same driver path as TCP |
-| 2 | QUIC AEAD open | uni-quic | 1× R/W | Plaintext into datagram-local scratch |
-| 3 | H3 DATA frame accumulate | [`uni-http3/src/server.rs:528`](uni-http3/src/server.rs#L528) | **1× memcpy per frame** into `data: Vec<u8>` | Whole body buffered before handler invoked |
-| 4 | BodyReader from buffered slice | uni-http (Phase 1) | 0 | Borrowed view of the accumulated Vec |
+| 2 | QUIC AEAD open | proto/quic | 1× R/W | Plaintext into datagram-local scratch |
+| 3 | H3 DATA frame accumulate | [`proto/http3/src/server.rs:528`](proto/http3/src/server.rs#L528) | **1× memcpy per frame** into `data: Vec<u8>` | Whole body buffered before handler invoked |
+| 4 | BodyReader from buffered slice | proto/http (Phase 1) | 0 | Borrowed view of the accumulated Vec |
 
 QUIC's body-buffering is out of scope for this plan (would OOM on
 a 100 MB POST) — the H3 `DATA` reassembly is a separate HTTP/3-layer
@@ -103,8 +103,8 @@ AEAD.
 
 ### A. `IOBuf::into_owned()` + `IOBufPool` infrastructure
 - **Status**: [x] landed 2026-05-15 — commit `180e29c`
-- **Where**: [`uni-iobuf/src/lib.rs`](uni-iobuf/src/lib.rs);
-  possibly new [`uni-iobuf/src/pool.rs`](uni-iobuf/src/pool.rs).
+- **Where**: [`util/iobuf/src/lib.rs`](util/iobuf/src/lib.rs);
+  possibly new [`util/iobuf/src/pool.rs`](util/iobuf/src/pool.rs).
 - **What**:
   * `IOBuf::into_owned(self) -> IOBuf`: no-op for Heap / Shared /
     Static / ExternalOwned; copies-to-Heap for Borrowed. The
@@ -130,23 +130,23 @@ AEAD.
 ### B. NicOps RX callback delivers `IOBufChain`
 - **Status**: [x] landed 2026-05-16 — commit `103202d`
 - **Where**:
-  * [`uni-net/src/driver.rs`](uni-net/src/driver.rs) — `NicOps`
+  * [`uni/net/src/driver.rs`](uni/net/src/driver.rs) — `NicOps`
     struct (change `poll_qp: fn(usize, fn(&[u8])) -> usize` to
     `fn(usize, fn(IOBufChain)) -> usize`; same for `poll_rx`).
-  * [`uni-driver-gve/src/dqo.rs`](uni-driver-gve/src/dqo.rs) —
+  * [`crates/drivers/gve/src/dqo.rs`](crates/drivers/gve/src/dqo.rs) —
     wrap device buf as `ExternalOwned(buf_id)` via
-    [`IOBuf::wrap_owned`](uni-iobuf/src/lib.rs#L483); drop_fn
+    [`IOBuf::wrap_owned`](util/iobuf/src/lib.rs#L483); drop_fn
     reposts buf_id to the data ring (atomic `fill_cnt.Release` +
     BAR2 doorbell). Remove the current explicit repost code path
     (now in drop_fn).
-  * [`uni-driver-gve/src/gqi.rs`](uni-driver-gve/src/gqi.rs) —
+  * [`crates/drivers/gve/src/gqi.rs`](crates/drivers/gve/src/gqi.rs) —
     maintain per-qp `IOBufPool`; per frame: alloc slab → memcpy
     device bytes → wrap as ExternalOwned → repost device slot →
     deliver 1-part chain.
-  * [`uni-driver-virtio-net/src/lib.rs`](uni-driver-virtio-net/src/lib.rs)
+  * [`crates/drivers/virtio-crates/net/stack/src/lib.rs`](crates/drivers/virtio-crates/net/stack/src/lib.rs)
     — wrap descriptor buf as `ExternalOwned(desc_idx)`; drop_fn
     returns descriptor to avail ring.
-  * [`net/src/lib.rs:411`](net/src/lib.rs#L411) — `distribute_frame`
+  * [`crates/net/stack/src/lib.rs:411`](crates/net/stack/src/lib.rs#L411) — `distribute_frame`
     takes `IOBufChain`. Walk chain; parse each.
 - **What**: change the driver↔net trait signature atomic across
   all three drivers + net dispatch. Drivers wrap their device
@@ -174,8 +174,8 @@ AEAD.
   [`kernel/src/percpu.rs`](kernel/src/percpu.rs) pins the payload
   (`RxChain = Chain<OwnedIOBuf>`) and the `static` node pool;
   `distribute_frame` / `net_drain_cb` in
-  [`net/src/lib.rs`](net/src/lib.rs);
-  [`uni-driver-virtio-net/src/lib.rs`](uni-driver-virtio-net/src/lib.rs)
+  [`crates/net/stack/src/lib.rs`](crates/net/stack/src/lib.rs);
+  [`crates/drivers/virtio-crates/net/stack/src/lib.rs`](crates/drivers/virtio-crates/net/stack/src/lib.rs)
   `rx_used_locked` (fix #1 below).
 - **What**: the Tier 2 cross-core inbox stops copying frame bytes.
   `distribute_frame` *moves* the received `Chain<OwnedIOBuf>` into a
@@ -202,7 +202,7 @@ AEAD.
 - **Effort**: low–medium. ~330 LOC (`rx_inbox.rs` + wiring + the
   virtio race fix).
 - **Risk**: low. The chain moves cross-core, not copies. The
-  uni-iobuf type-model split landed first, so the inbox is typed
+  util/iobuf type-model split landed first, so the inbox is typed
   `Chain<OwnedIOBuf>` — `Send` by derivation, no `unsafe impl Send`,
   no human-maintained "no `Borrowed` parts" invariant.
 - **Node ownership** — kept in a kernel-side pool, *not* 1:1
@@ -218,15 +218,15 @@ AEAD.
   no node/payload leak.
 
 ### D. `tcp_receive` takes a `Chain<OwnedIOBuf>`
-- **Status**: [x] landed 2026-05-17 — commits `bdd15ce` (uni-iobuf
+- **Status**: [x] landed 2026-05-17 — commits `bdd15ce` (util/iobuf
   `OwnedIOBuf::narrow`/`consume`/`trim_end`), `e940a10` (net
   plumbing). See the progress-log entry below for the design
   decisions.
 - **Where**: [`net/src/tcp.rs`](net/src/tcp.rs) `tcp_receive`
   (signature + chain-walking payload delivery);
-  [`net/src/lib.rs`](net/src/lib.rs) `net_receive` /
+  [`crates/net/stack/src/lib.rs`](crates/net/stack/src/lib.rs) `net_receive` /
   `tcp_receive_segment` / `ipv6_receive_frame` (chain-as-unit
-  dispatch + narrow-to-segment); [`uni-iobuf/src/lib.rs`](uni-iobuf/src/lib.rs)
+  dispatch + narrow-to-segment); [`util/iobuf/src/lib.rs`](util/iobuf/src/lib.rs)
   `OwnedIOBuf::narrow`.
 - **What**: per-conn `rx_ring` stays `Box<[u8; 16384]>` — the
   1500-conn × 11-bufs/conn math forbids holding IOBufs in the
@@ -246,7 +246,7 @@ AEAD.
 - **Status**: [x] landed 2026-05-17 — commit `8c2cb69` (the guard
   + unit tests), `b98b499` (the `rust_test` target it needed).
   See the progress-log entry below.
-- **Where**: [`uni-http/src/lib.rs`](uni-http/src/lib.rs) —
+- **Where**: [`proto/http/src/lib.rs`](proto/http/src/lib.rs) —
   `parse_request_with_state` sets the new `Request.reject` flag
   via the `transfer_encoding_is_chunked` helper; `serve_conn`
   short-circuits a flagged request to `Response::bad_request()` +
@@ -266,10 +266,10 @@ AEAD.
 
 ### F. `TcpStream::recv_chunk` API (guard-pattern)
 - **Status**: [x] landed 2026-05-17 — commits `ae9e850` (net-tcp
-  backend hooks), `570e40a` (uni-runtime API). See the progress-log
+  backend hooks), `570e40a` (runtime/executor API). See the progress-log
   entry below.
 - **Where**:
-  * [`uni-runtime/src/net/tcp.rs:161`](uni-runtime/src/net/tcp.rs#L161)
+  * [`runtime/executor/src/net/tcp.rs:161`](runtime/executor/src/net/tcp.rs#L161)
     — new `TcpStream::recv_chunk(&mut self) -> RecvChunk<'_>`
     (`Future<Output = Option<RecvChunkGuard<'_>>>`); `RecvChunkGuard`
     / `RecvChunk` types and the three `TcpBackend` vtable fields.
@@ -291,7 +291,7 @@ AEAD.
   Stated invariant: at most 1 outstanding IOBuf per TcpStream.
 - **Win**: enables item H (BodyReader::chunk returns guard) →
   -1 memcpy on body bytes past the prebuf on the fast path.
-- **Effort**: medium. ~200 LOC across uni-runtime + net.
+- **Effort**: medium. ~200 LOC across runtime/executor + net.
 - **Risk**: medium. Guard-pattern lifetimes interact with the
   async-fn-in-trait machinery; expect HRTB pain similar to
   Phase 1.
@@ -300,15 +300,15 @@ AEAD.
   preserves bytes.
 
 ### G. `TlsStream::recv_chunk`
-- **Status**: [x] landed 2026-05-17 — commits `a0c9acf` (uni-runtime
-  guard constructor), `74357c6` (uni-tls `recv_chunk`). See the
+- **Status**: [x] landed 2026-05-17 — commits `a0c9acf` (runtime/executor
+  guard constructor), `74357c6` (proto/tls `recv_chunk`). See the
   progress-log entry below.
-- **Where**: [`uni-tls/src/lib.rs:573`](uni-tls/src/lib.rs#L573) —
+- **Where**: [`proto/tls/src/lib.rs:573`](proto/tls/src/lib.rs#L573) —
   `TlsStream::recv_chunk`, an inherent method alongside the existing
   fill-buf `recv` (the `HttpStream` trait impl, now at
-  [`:685`](uni-tls/src/lib.rs#L685)); the `TlsServer` plaintext-window
+  [`:685`](proto/tls/src/lib.rs#L685)); the `TlsServer` plaintext-window
   accessors it drives are at
-  [`uni-tls/src/server.rs:502`](uni-tls/src/server.rs#L502).
+  [`proto/tls/src/server.rs:502`](proto/tls/src/server.rs#L502).
 - **What**: returns a `RecvChunkGuard<'_>` wrapping a Borrowed
   IOBuf into `pt_buf` (already-decrypted plaintext from
   AEAD-open). Caller reads in place; advances `pt_pos` on guard
@@ -323,19 +323,19 @@ AEAD.
 
 ### H. `BodyReader::chunk` returns guard
 - **Status**: [x] landed 2026-05-17 — commits `1e97350` (HttpStream
-  trait `recv_chunk`), `ad85de4` (uni-tls fold), `91aa952`
+  trait `recv_chunk`), `ad85de4` (proto/tls fold), `91aa952`
   (`BodyReader::chunk` returns the guard). See the progress-log
   entry below.
 - **Where**:
-  * [`uni-http/src/lib.rs:254`](../uni-http/src/lib.rs#L254) —
+  * [`proto/http/src/lib.rs:254`](../proto/http/src/lib.rs#L254) —
     `BodyReader` struct (4 KiB `refill` scratch field dropped);
-    [`:332`](../uni-http/src/lib.rs#L332) — `BodyReader::chunk`;
-    [`:423`](../uni-http/src/lib.rs#L423) — new `BodyChunkGuard`
-    type; [`:804`](../uni-http/src/lib.rs#L804) — `HttpStream`
+    [`:332`](../proto/http/src/lib.rs#L332) — `BodyReader::chunk`;
+    [`:423`](../proto/http/src/lib.rs#L423) — new `BodyChunkGuard`
+    type; [`:804`](../proto/http/src/lib.rs#L804) — `HttpStream`
     trait `recv_chunk` (default `-> None`);
-    [`:892`](../uni-http/src/lib.rs#L892) — `HttpStream for
+    [`:892`](../proto/http/src/lib.rs#L892) — `HttpStream for
     TcpStream` `recv_chunk` (forwards to the inherent method).
-  * [`uni-tls/src/lib.rs:804`](../uni-tls/src/lib.rs#L804) —
+  * [`proto/tls/src/lib.rs:804`](../proto/tls/src/lib.rs#L804) —
     `HttpStream for TlsStream` `recv_chunk` (item G's inherent
     method folded into the trait impl).
   * [`apps/webserver/src/main.rs:341`](../apps/webserver/src/main.rs#L341)
@@ -363,7 +363,7 @@ AEAD.
 
 ### I. Multi-buf RX chain accumulation in DQO
 - **Status**: [ ]
-- **Where**: [`uni-driver-gve/src/dqo.rs:479`](uni-driver-gve/src/dqo.rs#L479)
+- **Where**: [`crates/drivers/gve/src/dqo.rs:479`](crates/drivers/gve/src/dqo.rs#L479)
   `poll_qp_inner`.
 - **What**: build IOBufChain across non-EOP completions; emit
   chain on EOP. Stops dropping non-EOP fragments (the Phase-3
@@ -385,7 +385,7 @@ AEAD.
 
 ### J. Enable HW GRO (RSC) on DQO_RDA queues
 - **Status**: [ ]
-- **Where**: [`uni-driver-gve/src/lib.rs:1401`](uni-driver-gve/src/lib.rs#L1401)
+- **Where**: [`crates/drivers/gve/src/lib.rs:1401`](crates/drivers/gve/src/lib.rs#L1401)
   `build_create_rx_queue_cmd`: `cmd.set_byte(58, 1)` for DqoRda.
 - **What**: the one-line flip that turns RSC on. Lives in this
   plan because items A–I make it safe (multi-buf delivery
@@ -405,7 +405,7 @@ AEAD.
 ### K. Driver-delivered RX frame (fold the inbox node into the driver)
 - **Status**: [ ]
 - **Where**: the `NicOps` RX-callback surface
-  ([`uni-net/src/driver.rs`](uni-net/src/driver.rs)); all three
+  ([`uni/net/src/driver.rs`](uni/net/src/driver.rs)); all three
   drivers; [`kernel/src/rx_inbox.rs`](kernel/src/rx_inbox.rs) — the
   `RxNodePool` free-list is deleted.
 - **What**: item C's cross-core inbox node lives in a kernel-side
@@ -444,7 +444,7 @@ the equivalent move-not-copy step for the per-bind datagram inbox.
     `&[u8]` → `Chain<OwnedIOBuf>` (the UDP-datagram-narrowed chain),
     mirroring item D's `tcp_receive`. `net::net_receive` grows a
     `udp_receive_segment` helper alongside `tcp_receive_segment`.
-  * [`uni-runtime/src/net/udp.rs`](uni-runtime/src/net/udp.rs) —
+  * [`runtime/executor/src/net/udp.rs`](runtime/executor/src/net/udp.rs) —
     `deliver_udp` takes an owned `OwnedIOBuf` (datagram body), not
     `&[u8]`; the `Datagram` inbox slot's inline `[u8; 1500]` becomes
     an `Option<OwnedIOBuf>`; `WorkerInbox::try_push` *moves* the buf
@@ -483,7 +483,7 @@ the equivalent move-not-copy step for the per-bind datagram inbox.
   (≤ 1500 B each). Benefits `echo_udp`, gateway / DNS / NTP flows,
   and QUIC datagram delivery.
 - **Effort**: medium. ~150 LOC across `net/src/udp.rs` +
-  `uni-runtime/src/net/udp.rs`; the `udp_receive` / `deliver_udp` /
+  `runtime/executor/src/net/udp.rs`; the `udp_receive` / `deliver_udp` /
   `try_push` / slot-type changes land as one atomic signature chain.
 - **Risk**: low–medium. The SPSC inbox ring shape is unchanged; only
   the slot payload type changes. `test_hvf` exercises UDP echo; the
@@ -514,7 +514,7 @@ stall.
   and the host-test blocker.
 - **Where**: [`net/src/ipv4.rs`](net/src/ipv4.rs) `ipv4_receive`,
   [`net/src/ipv6.rs`](net/src/ipv6.rs) `ipv6_receive`,
-  [`net/src/lib.rs`](net/src/lib.rs) `net_receive` /
+  [`crates/net/stack/src/lib.rs`](crates/net/stack/src/lib.rs) `net_receive` /
   `tcp_receive_segment`, [`net/src/tcp.rs`](net/src/tcp.rs)
   `tcp_receive`.
 - **What**: a HW-GRO / RSC / LRO frame arrives as a *single*
@@ -541,7 +541,7 @@ stall.
 
 ### N. virtio-net multi-buf RX chain accumulation
 - **Status**: [ ]
-- **Where**: [`uni-driver-virtio-net/src/lib.rs`](uni-driver-virtio-net/src/lib.rs)
+- **Where**: [`crates/drivers/virtio-crates/net/stack/src/lib.rs`](crates/drivers/virtio-crates/net/stack/src/lib.rs)
   `poll_qp` / `poll_batch_qp`.
 - **What**: the virtio twin of item I. Today `poll_qp` reads one
   used-ring descriptor, treats `used_len - 12` bytes as a whole
@@ -572,7 +572,7 @@ stall.
 - **Status**: [ ]
 - **Where**: [`drivers/src/virtio.rs`](drivers/src/virtio.rs)
   `VIRTIO_NET_RX_OFFLOAD_MASK`; the PCI feature negotiation in
-  [`uni-driver-virtio-net/src/lib.rs`](uni-driver-virtio-net/src/lib.rs).
+  [`crates/drivers/virtio-crates/net/stack/src/lib.rs`](crates/drivers/virtio-crates/net/stack/src/lib.rs).
 - **What**: the virtio twin of item J — the enable. With item N's
   reassembly in place, drop `MRG_RXBUF` + `GUEST_TSO4` / `TSO6`
   (and, once N honours `hdr.flags`, `GUEST_CSUM`) from the mask so
@@ -703,7 +703,7 @@ backpressure. CPU-bound at ChaCha20-Poly1305 decrypt rate
 
 ## Out of scope / known limitations (Phase 4+)
 
-- **Large HTTP/3 (QUIC) payloads**: uni-http3 reassembles all
+- **Large HTTP/3 (QUIC) payloads**: proto/http3 reassembles all
   DATA frames before invoking the handler — OOMs on 100 MB
   QUIC POSTs. Fix is progressive DATA-frame delivery, mirroring
   the TCP/TLS path. Separate plan (see Follow-ups).
@@ -733,7 +733,7 @@ backpressure. CPU-bound at ChaCha20-Poly1305 decrypt rate
   layer must reassemble first. Today reassembly copies into
   `cipher_buf`; the zero-copy form is chain-threaded reassembly +
   in-place AEAD across a discontiguous chain + per-fragment
-  `narrow` + content-type/padding strip — a `uni-tls` record-layer
+  `narrow` + content-type/padding strip — a `proto/tls` record-layer
   rearchitecture, well past item G's scope. A single-device-buffer
   fast path (a record that fits in one MTU buffer → decrypt in
   place there) is the tractable partial win. Needs **no API
@@ -805,7 +805,7 @@ the middle is frayed. "Tier 1 — each core polls its own queue" is
 total **only on the diagonal `nqp == num_cores`**. Off it:
 
 - `nqp < num_cores` — cores `>= nqp` poll nothing
-  ([`net/src/lib.rs`](../net/src/lib.rs), `poll_tier1`'s
+  ([`crates/net/stack/src/lib.rs`](../crates/net/stack/src/lib.rs), `poll_tier1`'s
   `core >= nqp → return false`). That is a *degradation* (those
   cores fall back to compute-stealing), not a real handling.
 - `nqp > num_cores` — queues `num_cores..nqp` are polled by
@@ -880,7 +880,7 @@ deployments whose `nqp` polling cores bottleneck on `tcp_receive`.
 
 ### Mid-term — HTTP/3 streaming body
 
-- uni-http3 progressive DATA-frame delivery (unblocks 100 MB
+- proto/http3 progressive DATA-frame delivery (unblocks 100 MB
   QUIC POST).
 
 ### TLS
@@ -902,7 +902,7 @@ as a validation probe for item J (ideal RSC shape).
 Surfaced during item B's validation; deferred so they didn't
 sprawl that session.
 
-- **TCP conformance test harness.** `net_tcp` has no conformance
+- **TCP conformance test harness.** `tcp` has no conformance
   suite — the receiver-side window-update bug (commit `171c68e`,
   found mid-item-B only because a QEMU upload anomaly got chased
   into a packet capture) is exhibit A for why that's a gap. Build
@@ -911,8 +911,8 @@ sprawl that session.
   `tcp_receive(src, dst, &[u8])` is already a `pub` RX entry point
   that takes crafted segments — so a test drives scripted packets
   in and asserts on captured output (packetdrill-in-a-unit-test).
-  *Blocker:* `net_tcp`'s `os:none` dep chain (`kernel` /
-  `uni-runtime`) must be made host-buildable — extend the
+  *Blocker:* `tcp`'s `os:none` dep chain (`kernel` /
+  `runtime/executor`) must be made host-buildable — extend the
   `tests_need_std` mechanism in
   [`bazel/rules/rust.bzl`](bazel/rules/rust.bzl) (today only
   `util/atomic_fn` uses it) and `#[cfg]`-gate the genuinely
@@ -932,7 +932,7 @@ sprawl that session.
   output readable. Port the existing registry as a
   no-behavior-change refactor first, then fill gaps.
 
-### uni-iobuf type model — [x] landed 2026-05-16
+### util/iobuf type model — [x] landed 2026-05-16
 
 `IOBuf` used to conflate borrowed (`!Send`) and owned (`Send`)
 buffers in one `!Send` type, so every cross-core use needed a
@@ -962,15 +962,15 @@ tool, not the cross-core gate). Full write-up:
 ## Reuse rather than rebuild
 
 Concrete utilities to lean on:
-- [`IOBuf::wrap_owned`](uni-iobuf/src/lib.rs#L483) — exactly the
+- [`IOBuf::wrap_owned`](util/iobuf/src/lib.rs#L483) — exactly the
   constructor for ExternalOwned with drop_fn (NIC zero-copy RX
   is its documented canonical use case at
-  [uni-iobuf/src/lib.rs:245-247](uni-iobuf/src/lib.rs#L245-L247)).
-- [`IOBuf::borrow`](uni-iobuf/src/lib.rs#L538) for prebuf IOBufs +
+  [util/iobuf/src/lib.rs:245-247](util/iobuf/src/lib.rs#L245-L247)).
+- [`IOBuf::borrow`](util/iobuf/src/lib.rs#L538) for prebuf IOBufs +
   TLS pt_buf IOBufs; debug-mode `BorrowGuard` catches aliasing.
-- [`IOBufChain`](uni-iobuf/src/lib.rs#L1295) — already
+- [`IOBufChain`](util/iobuf/src/lib.rs#L1295) — already
   smallvec-style (8 inline parts + lazy `VecDeque` overflow).
-- [`ExternalOwned` is Send](uni-iobuf/src/lib.rs#L338) —
+- [`ExternalOwned` is Send](util/iobuf/src/lib.rs#L338) —
   cross-core inbox can move chains across workers.
 
 ## Progress log
@@ -996,7 +996,7 @@ Bench (Phase 1 baseline; subsequent items measure against this):
 `upload_32k_tcp` 1c went +9%; the others stayed within run-to-run
 noise (~2%). 4c numbers client-bound at `cli ≈ 5.5/8` cores.
 
-Also discovered + fixed two latent uni-tls bugs that surfaced
+Also discovered + fixed two latent proto/tls bugs that surfaced
 when bench started doing TLS POSTs > 4 KiB: `RX_BUF_LEN` was 4 KiB
 (too small for a 16 KiB TLS record), `PT_BUF_LEN` similarly.
 Both bumped to 17 KiB (commits `5e6d59f`, `c357337`). `upload_32k_tls`
@@ -1004,14 +1004,14 @@ unblocked.
 
 ### 2026-05-15 — Phase 2/3, item A: `IOBuf::into_owned` + `IOBufPool` ([x] **landed** — commit `180e29c`)
 
-Pure-additions infrastructure step. Two additions to `uni-iobuf`:
+Pure-additions infrastructure step. Two additions to `util/iobuf`:
 
 - `IOBuf::into_owned(self) -> IOBuf` — zero-copy no-op for the four
   owning variants (`Heap` / `Shared` / `Static` / `ExternalOwned`);
   copies-to-`Heap` for `Borrowed`, the one non-owning variant. The
   ownership-transfer escape hatch the item-F / item-H guards'
   `into_owned()` will delegate to.
-- `IOBufPool` — fixed-size MTU-slab pool ([`uni-iobuf/src/pool.rs`](uni-iobuf/src/pool.rs))
+- `IOBufPool` — fixed-size MTU-slab pool ([`util/iobuf/src/pool.rs`](util/iobuf/src/pool.rs))
   with a lock-free tagged-pointer Treiber free list (`AtomicU64`
   head packing `(slot_index, version_tag)`; version bumps on push
   to defeat ABA; links in a dedicated `AtomicU32` array so they
@@ -1022,7 +1022,7 @@ Pure-additions infrastructure step. Two additions to `uni-iobuf`:
 
 No perf delta expected or measured — no GCE bench for this item
 per the plan (first checkpoint is after item B). Verified:
-`bazel test //uni-iobuf:iobuf_test` (50 tests, +12 new, including
+`bazel test //crates/util/iobuf:iobuf_test` (50 tests, +12 new, including
 an 8-thread Treiber-stack ABA stress test), x86_64 + aarch64
 unikernel builds, and `test_hvf`.
 
@@ -1241,7 +1241,7 @@ desync `rcv_nxt`. Today `pkt.payload` is IP-total-length-trimmed;
 `narrow(l4_off, l4_len)` reproduces that trim exactly. New
 `OwnedIOBuf::narrow` / `consume` / `trim_end` (forwarders to the
 existing `ExternalOwned` / `HeapStorage` offset arithmetic; landed
-in the uni-iobuf commit) — narrowing shifts only `offset`/`len`, so
+in the util/iobuf commit) — narrowing shifts only `offset`/`len`, so
 `ExternalOwned`'s `base`/`capacity` are untouched and the drop
 callback still reposts the *whole* device buffer.
 
@@ -1264,7 +1264,7 @@ part-0 narrow (`Chain::shrink_total_len`) — a `Single`-repr chain
 computes `total_len` live, so item D needs nothing there.
 
 **Design decision 3 — the RX path stays `OwnedIOBuf`-typed; no
-widening to `IOBuf` at the target core.** Per the uni-iobuf
+widening to `IOBuf` at the target core.** Per the util/iobuf
 type-model doc, `From<OwnedIOBuf> for IOBuf` is applied **per-chunk
 at the app RX API boundary** (`BodyReader`, items F/H), not eagerly
 to a `Chain` — an eager widen is an O(parts) re-tag + `VecDeque`
@@ -1284,7 +1284,7 @@ this session); it picks up the `udp_receive` signature change there.
 Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
 `bazel build //apps/webserver:webserver.elf
 --platforms=//bazel/platforms:aarch64_unikernel`;
-`bazel test //uni-iobuf:iobuf_test` (+1 test —
+`bazel test //crates/util/iobuf:iobuf_test` (+1 test —
 `owned_iobuf_narrow_clamps_window_keeps_backing`, asserting a
 narrowed buffer still reposts its original `(base, capacity)`);
 `bazel test //apps/webserver:test_hvf` (TCP + TLS round-trips under
@@ -1341,11 +1341,11 @@ framing, so `reject` stays `false` there by construction.
 Proper chunked decoding is still deferred to Phase 4 (HTTP parser
 refresh) — item E is only the smuggling guard.
 
-**Test target.** `uni-http` had a `#[cfg(test)]` module but no
+**Test target.** `proto/http` had a `#[cfg(test)]` module but no
 `rust_test` target, so its tests had never run. A separate
-commit (`b98b499`) added `//uni-http:uni_http_test` and flipped
+commit (`b98b499`) added `//crates/proto/http:uni_http_test` and flipped
 the crate to the `#![cfg_attr(all(not(test), not(feature =
-"std")), no_std)]` form (mirroring `//uni-http3`). Item E adds
+"std")), no_std)]` form (mirroring `//crates/proto/http3`). Item E adds
 eight tests there — the `transfer_encoding_is_chunked` helper
 (case-insensitivity, coding-list membership, non-chunked
 codings) and the parser flag end-to-end (chunked request flagged,
@@ -1356,7 +1356,7 @@ flagged).
 Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
 `bazel build //apps/webserver:webserver.elf
 --platforms=//bazel/platforms:aarch64_unikernel`;
-`bazel test //uni-http:uni_http_test` (13 tests — 8 new + the 5
+`bazel test //crates/proto/http:uni_http_test` (13 tests — 8 new + the 5
 now-running `host_port_tests`); `bazel test
 //apps/webserver:test_hvf` (TCP + TLS round-trips, 30-conn
 burst — confirms the `serve_conn` restructure left the
@@ -1432,9 +1432,9 @@ new hooks are `set_chunk_buf_slot` / `clear_chunk_buf_slot` (the
 one-bit "deliver-as-IOBuf" request, cancel-safe via
 `RecvChunk::Drop`) and `do_recv_chunk`.
 
-**Test infrastructure.** `uni-runtime` had no `rust_test` target;
+**Test infrastructure.** `runtime/executor` had no `rust_test` target;
 it flips to the workspace-standard `#![cfg_attr(not(test),
-no_std)]` so `rust_test(crate = ":uni-runtime")` runs host-native.
+no_std)]` so `rust_test(crate = ":runtime/executor")` runs host-native.
 The `compile_fail` test — "two guards must not compile" — cannot
 be a `#[cfg(test)]` unit test (a crate with non-compiling code
 does not compile at all); it is a `compile_fail` doc-test, run by
@@ -1448,10 +1448,10 @@ Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
 `bazel build //apps/webserver:webserver.elf
 --platforms=//bazel/platforms:aarch64_unikernel`; `bazel test
 //apps/webserver:test_hvf` (TCP + TLS round-trips, 30-conn burst);
-`bazel test //uni-runtime:uni_runtime_test` (2 tests —
+`bazel test //crates/runtime/executor:uni_runtime_test` (2 tests —
 `RecvChunkGuard::into_owned` round-trips an owned `Heap` source
 and a `Borrowed` source, bytes preserved either way); `bazel test
-//uni-runtime:uni_runtime_doc_test` (the `compile_fail` guard test
+//crates/runtime/executor:uni_runtime_doc_test` (the `compile_fail` guard test
 + its sequential-use companion). Each of the two implementation
 commits was gate-checked on its own tree.
 
@@ -1491,8 +1491,8 @@ by construction, exactly as item F was.
 **The guard knot — "advance `pt_pos` on guard drop" without a
 cross-crate `Drop`.** Item G's sketch said the TLS guard "advances
 `pt_pos` on guard drop." A typed mutate-the-`TlsStream`-on-drop is
-*impossible*: `RecvChunkGuard` lives in `uni-runtime` and cannot
-name `TlsStream` (the dependency runs `uni-tls → uni-runtime`), and
+*impossible*: `RecvChunkGuard` lives in `runtime/executor` and cannot
+name `TlsStream` (the dependency runs `proto/tls → runtime/executor`), and
 item F deliberately gave the guard no `Drop`. Two clean options
 were on the table: (a) advance `pt_pos` **eagerly** when
 `recv_chunk` hands out the guard; (b) give the guard a type-erased
@@ -1532,11 +1532,11 @@ scope.
 `TcpBackend` vtable (`do_recv_chunk` / `set_chunk_buf_slot` /
 `clear_chunk_buf_slot`) and updated the bare-metal initializer in
 `net/src/tcp.rs`, but missed the native one in
-`uni-backend/src/native/tcp.rs`. Item F's gate set — two bare-metal
+`uni/backend/src/native/tcp.rs`. Item F's gate set — two bare-metal
 `bazel build`s + `test_hvf` — never compiles the native backend
 (it is `select`'d in only for host builds), so the breakage slipped
-through; `uni_tls_test` catches it because `uni-tls → uni →
-uni-backend` pulls the native backend into a host-native test
+through; `uni_tls_test` catches it because `proto/tls → uni →
+uni/backend` pulls the native backend into a host-native test
 compile. Fixed by wiring the three hooks as `None` — the documented
 native-POSIX behaviour (`recv()` copies at the syscall boundary, so
 there is no device buffer to lend; `recv_chunk` resolves to `None`
@@ -1557,8 +1557,8 @@ the functional gate the plan designates for G.
 Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
 `bazel build //apps/webserver:webserver.elf
 --platforms=//bazel/platforms:aarch64_unikernel`; `bazel test
-//apps/webserver:test_hvf`; `bazel test //uni-runtime:uni_runtime_test
-//uni-runtime:uni_runtime_doc_test //uni-tls:uni_tls_test` (the last
+//apps/webserver:test_hvf`; `bazel test //crates/runtime/executor:uni_runtime_test
+//crates/runtime/executor:uni_runtime_doc_test //crates/proto/tls:uni_tls_test` (the last
 unblocked by the native-backend fix). The `4d3dda2` + `a0c9acf`
 intermediate tree was gate-checked on its own before `74357c6`
 landed on top.
@@ -1612,12 +1612,12 @@ streaming chunk path and inherits it, so a `BodyReader` over
 `TlsStream` override it. The two impls resolve the name collision
 differently, each cleanly:
 
-- **`TlsStream` folds in.** `uni-tls` owns both `TlsStream` and its
+- **`TlsStream` folds in.** `proto/tls` owns both `TlsStream` and its
   `impl HttpStream for TlsStream`, so the inherent `recv_chunk`
   (item G) just *becomes* the trait-impl override — body moved
   verbatim, inherent method deleted, no collision left to footgun.
 - **`TcpStream` forwards.** `uni::runtime::TcpStream` can't impl an
-  uni-http trait (the dependency runs the other way) and item-F
+  proto/http trait (the dependency runs the other way) and item-F
   doc-tests call its inherent `recv_chunk`, so that method stays;
   the trait impl forwards to it. The forward is written as a plain
   `fn` returning the *concrete* `RecvChunk` future — not an
@@ -1631,7 +1631,7 @@ differently, each cleanly:
   the targeted `#[allow(refining_impl_trait_reachable)]` is
   intentional — the refinement *is* the footgun guard.
 
-**`BodyChunkGuard`.** A new guard type in uni-http wrapping the body
+**`BodyChunkGuard`.** A new guard type in proto/http wrapping the body
 chunk from either source behind one `data() -> &[u8]` (zero-copy in
 place) / `into_owned() -> IOBuf` façade:
 
@@ -1684,8 +1684,8 @@ Verified per commit: `bazel build
 //apps/webserver:webserver_qemu_x86_64`; `bazel build
 //apps/webserver:webserver.elf
 --platforms=//bazel/platforms:aarch64_unikernel`; `bazel test
-//uni-http:uni_http_test //apps/webserver:test_hvf` (TCP + TLS
-round-trips, 30-conn burst); plus `uni_tls_test` on the uni-tls
+//crates/proto/http:uni_http_test //apps/webserver:test_hvf` (TCP + TLS
+round-trips, 30-conn burst); plus `uni_tls_test` on the proto/tls
 commit.
 
 **Perf — same-session A/B, `main` vs item H, HVF 1c/3c** (the
@@ -1900,7 +1900,7 @@ Verified: `webserver_qemu_x86_64` + `webserver.elf` aarch64 builds;
 ### 2026-05-18 — Follow-up: shared `TaggedTreiberStack` ([x] **landed**)
 
 The "Extract a shared `TaggedTreiberStack`" near-term follow-up.
-`IOBufPool` ([`uni-iobuf/src/pool.rs`](../uni-iobuf/src/pool.rs)) and
+`IOBufPool` ([`util/iobuf/src/pool.rs`](../util/iobuf/src/pool.rs)) and
 `RxNodePool` ([`kernel/src/rx_inbox.rs`](../kernel/src/rx_inbox.rs))
 each carried a byte-identical ~40-line copy of the tagged-pointer
 Treiber free-list. Both now delegate to one audited copy — two
@@ -1941,7 +1941,7 @@ suites — each with its own 8-thread Treiber test — still pass
 unchanged against the shared implementation.
 
 Verified: `bazel test //util/tagged_treiber:tagged_treiber_test
-//uni-iobuf:iobuf_test //kernel:rx_inbox_test`; `webserver_qemu_x86_64`
+//crates/util/iobuf:iobuf_test //kernel:rx_inbox_test`; `webserver_qemu_x86_64`
 + `webserver.elf` aarch64 builds; `test_hvf`.
 
 ### 2026-05-18 — Follow-up: fuse the Tier-2 classify parse ([x] **landed**)
@@ -2062,14 +2062,14 @@ that the clamp still relies on.
 
 **Not landed — the `tcp_receive` super-segment unit test (host-test
 blocker).** Feeding `tcp_receive` a synthetic multi-part chain needs
-`net_tcp` host-buildable, and `net_tcp` → `//kernel`, which is
+`tcp` host-buildable, and `tcp` → `//kernel`, which is
 hard-marked `target_compatible_with = ["@platforms//os:none"]`
 (mach-o-hostile `#[link_section(".boot_bss")]`, MMU / APIC / IDT
 code). That is exactly the blocker the "Test & bench infrastructure"
 follow-up records — making `//kernel` host-buildable by `#[cfg]`-
 gating its bare-metal bits is a substantial, separate effort, not an
 M-sized tightening, so per the "report structural findings rather
-than force them" guidance it stays with that follow-up. `uni-runtime`
+than force them" guidance it stays with that follow-up. `runtime/executor`
 is already host-buildable; `//kernel` is the remaining gate. Until
 then the M change is covered by the two L3-parse tests above plus
 the `tcp_receive` audit; the chain-walk itself is item D's code and
@@ -2083,7 +2083,7 @@ Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
 
 ### 2026-05-18 — Follow-up: `net` RX-pipeline refactor + IPv6 Tier-2 distribution fix ([x] **landed** — commits `c22e84d`, `a0a2f92`)
 
-`net/src/lib.rs` had grown to 1028 lines holding four unrelated
+`crates/net/stack/src/lib.rs` had grown to 1028 lines holding four unrelated
 concerns (backend wiring, the Tier 1/2 poll scheduler, the receive
 pipeline, the IPv6 control plane), and the receive path itself was
 *two* entangled pipelines: the Tier-2 distributor (`distribute_frame

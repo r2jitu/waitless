@@ -40,9 +40,9 @@ Transitive deps pull in exactly what's needed; `--gc-sections` strips the rest.
 //crates/net:ipv4             <- tcp, udp-over-ipv4
 //crates/net:ipv6             <- quic, udp-over-ipv6
 //crates/net:ndp              <- ipv6 needs this (replaces ARP)
-//crates/net/tcp              <- transport/http needs this
+//crates/net/tcp              <- proto/http needs this
 //crates/net:udp              <- quic needs this
-//crates/proto/quic       <- transport/http3 needs this (+ tls)
+//crates/proto/quic       <- proto/http3 needs this (+ tls)
 //crates/proto/http       <- HTTP/1.1 server (deps: tcp)
 //crates/proto/http3      <- HTTP/3 server (deps: quic)
 ```
@@ -738,7 +738,7 @@ primitives QUIC needs; more reactor primitives land as QUIC demands.
       (`UdpSocket::run(|sock| async ...)` is the typical entry
       point; bind+spawn-per-worker happen together).
 - [x] Reactor: `TcpListener::accept().await` /
-      `TcpStream::{recv,send}.await`. `uni_http::listen` migrated
+      `TcpStream::{recv,send}.await`. `http::listen` migrated
       to async handlers (`AsyncFn(&Request) -> Response`).
 - [x] Event loop shim: tick drains the wheel, scans ready slots, calls
       `future.as_mut().poll(&mut cx)`. No change to poll/drain/idle.
@@ -1175,7 +1175,7 @@ bazel+nightly migration.
 
 ### 4a. QPACK header compression — done
 
-Static-only QPACK in `//uni-http3/src/qpack.rs`, with the 99-entry
+Static-only QPACK in `//crates/proto/http3/src/qpack.rs`, with the 99-entry
 static table from RFC 9204 Appendix A in `static_table.rs`. Encoder
 picks the smallest legal representation per field
 (indexed → name-ref → literal-name); decoder handles all three plus
@@ -1188,7 +1188,7 @@ code).
 
 ### 4b. HTTP/3 frame parsing — done
 
-`//uni-http3/src/frame.rs`. DATA / HEADERS / SETTINGS / GOAWAY
+`//crates/proto/http3/src/frame.rs`. DATA / HEADERS / SETTINGS / GOAWAY
 parsed; reserved frame types parse to `Skipped { ty }` and consume
 their announced length so callers don't choke on grease frames.
 
@@ -1196,14 +1196,14 @@ their announced length so callers don't choke on grease frames.
 - [x] H3 frame builder (`write_frame` + `write_empty_settings`)
 - [x] Unit: H3 frame parse/build round-trip
 
-### 4c. //uni-http3 module — done
+### 4c. //crates/proto/http3 module — done
 
-Mirrors `//uni-http`'s `listen(port, handler)` shape, not the
+Mirrors `//crates/proto/http`'s `listen(port, handler)` shape, not the
 `route + run` shape originally sketched: the app keeps **one**
 `AsyncFn(&Request) -> Response` closure that serves HTTP/1.1,
 HTTPS/1.1 and HTTP/3 simultaneously — see `apps/webserver/src/main.rs`.
 
-- [x] `//uni-http3` Bazel target (deps: //uni-http, //uni-quic)
+- [x] `//crates/proto/http3` Bazel target (deps: //crates/proto/http, //crates/proto/quic)
 - [x] H3Server: control stream + per-request stream dispatch
 - [x] Request/response over QUIC bidi streams; QPACK encode + decode
 - [x] `apps/webserver` serves HTTP/3 alongside HTTP/1.1 + HTTPS
@@ -1309,7 +1309,7 @@ v6 sockets without any further code changes.
       `send_to_addr(IpAddr, ...)`. The `UdpBackend` vtable's
       `send` now takes `IpAddr` so the bare-metal and native
       backends share one signature.
-- [x] `uni-runtime::ip` re-export of `net_types::{IpAddr,
+- [x] `runtime/executor::ip` re-export of `net_types::{IpAddr,
       Ipv4Addr, Ipv6Addr}`. `UdpSocket::send_to(IpAddr, ...)`,
       `recv_from() -> (IpAddr, u16, usize)`,
       `UdpClient::connect(IpAddr, ...)`,
@@ -1319,7 +1319,7 @@ v6 sockets without any further code changes.
       ∈ {TCP, UDP}` into the L4 entry points with `IpAddr::V6`.
       ARP-snoop-on-receive's IPv6 counterpart `ndp_learn` runs
       on every inbound v6 frame.
-- [x] `apps/webserver` (UDP echo, gateway), `uni-quic`
+- [x] `apps/webserver` (UDP echo, gateway), `proto/quic`
       (`Datagram.src_ip`, `peer_ip` Cell), DHCP (`BROADCAST_IP`
       + `handle_reply`), and native backend (`udp_send`,
       `deliver_udp`) all updated to `IpAddr`. v6 destinations
@@ -1643,43 +1643,43 @@ don't want to truncate (current workloads — HTTP/1.1 ~ms-scale —
 don't stress this). QUIC streams will benefit since clean
 CONNECTION_CLOSE is preferred over UDP-level forget.
 
-### Lift `net_tcp` / `net_udp` above `uni_runtime` (app-space L4)
+### Lift `tcp` / `udp` above `executor` (app-space L4)
 
-Today TCP and UDP implementations live *below* `uni_runtime` in the
-crate DAG: `net_tcp` / `net_udp` register a `TcpBackend` /
+Today TCP and UDP implementations live *below* `executor` in the
+crate DAG: `tcp` / `udp` register a `TcpBackend` /
 `UdpBackend` vtable
-([uni-runtime/src/net/tcp.rs](uni-runtime/src/net/tcp.rs),
-[udp.rs](uni-runtime/src/net/udp.rs)) at boot from
-[net/src/lib.rs](net/src/lib.rs)'s `init_stack`. Apps see only
-`uni_runtime::net::TcpListener` / `UdpSocket`. Lifting the
-implementations *above* `uni_runtime` — alongside `uni-tls` /
-`uni-http` — would complete the "everything above the NIC is a
+([runtime/executor/src/net/tcp.rs](runtime/executor/src/net/tcp.rs),
+[udp.rs](runtime/executor/src/net/udp.rs)) at boot from
+[crates/net/stack/src/lib.rs](crates/net/stack/src/lib.rs)'s `init_stack`. Apps see only
+`executor::reactor::TcpListener` / `UdpSocket`. Lifting the
+implementations *above* `executor` — alongside `proto/tls` /
+`proto/http` — would complete the "everything above the NIC is a
 library" story and let apps swap in alternative L4 stacks
 (smoltcp, custom congestion control, research stacks).
 
 **What's already done:** the vtable seam exists. App code is
-already decoupled from `net_tcp` internals — moving the
+already decoupled from `tcp` internals — moving the
 implementation up the DAG is symbolic from the API perspective,
 load-bearing only for *who controls the implementation*.
 
 **What the move would actually require:**
 
-- [ ] Promote `net_tcp` → `uni-tcp` and `net_udp` → `uni-udp`
-      above `uni_runtime`. Both crates are already `#![no_std]`
-      with no `uni_drivers` dep; the `kernel_bare::cpu_id` /
+- [ ] Promote `tcp` → `uni-tcp` and `udp` → `uni-udp`
+      above `executor`. Both crates are already `#![no_std]`
+      with no `nic_api` dep; the `kernel_bare::cpu_id` /
       `rng::fill_bytes` / `percpu::PerCpu` calls have
-      `uni_worker` equivalents in use across `uni_runtime::net`.
+      `worker` equivalents in use across `executor::reactor`.
 - [ ] Move the bare-metal `BARE_TCP_BACKEND` /
-      `BARE_UDP_BACKEND` registration out of `net/src/lib.rs`
+      `BARE_UDP_BACKEND` registration out of `crates/net/stack/src/lib.rs`
       into `uni_tcp::install()` / `uni_udp::install()` (mirrors
-      `uni_tls::install()` style). App calls `install()` from
+      `tls::install()` style). App calls `install()` from
       its boot sequence.
 - [ ] Define one new `Ipv4Send` vtable that the platform
       registers and `uni-tcp` / `uni-udp` call instead of
       `ipv4_send` directly. Keeps IPv4/ARP/Ethernet below the
       line as the "platform's wire glue"; only L4 lifts.
 - [ ] Move the `tcp_dispatch` / `udp_dispatch` registry hooks
-      ([net/src/lib.rs:25-38](net/src/lib.rs#L25-L38)) into the
+      ([crates/net/stack/src/lib.rs:25-38](crates/net/stack/src/lib.rs#L25-L38)) into the
       lifted crates so they self-register against
       `protocol::Registry`.
 - [ ] Re-validate the full bench matrix (1c/2c/3c × HVF/KVM/
@@ -1696,7 +1696,7 @@ re-run).
 
 **Trigger**: either of —
 
-- (a) `uni-quic` design wants to share `net_tcp`'s per-core
+- (a) `proto/quic` design wants to share `tcp`'s per-core
   conn pool / generation-handle / waker scaffolding with QUIC.
   At that point lifting both becomes structural rather than
   aesthetic, and the right time to do it is as part of QUIC's
@@ -1706,7 +1706,7 @@ re-run).
   Then the seam has a real user pulling on it.
 
 Until one of those fires, the existing vtable boundary at
-[uni-runtime/src/net/tcp.rs:205](uni-runtime/src/net/tcp.rs#L205)
+[runtime/executor/src/net/tcp.rs:205](runtime/executor/src/net/tcp.rs#L205)
 is paying the dividend that matters most (app-side decoupling),
 and the unmet 20 % is speculative.
 
@@ -1853,12 +1853,12 @@ reactors) shipped including the `UdpRecv::recv_from` and
 to "alongside QUIC" — they're already done. Highlights since the
 April 2026 status:
 
-- `//uni-runtime` async executor with chunked launcher table,
+- `//crates/runtime/executor` async executor with chunked launcher table,
   per-worker arenas, generation-aware handles.
 - `UdpSocket::run` / `TcpListener::run` reactors on bare-metal
   AND native, both backends sharing a single `TcpBackend` /
   `UdpBackend` vtable.
-- `uni_http::listen` and `listen_https` now take any
+- `http::listen` and `listen_https` now take any
   `AsyncFn(&Request) -> Response` — handlers can `.await`.
 - Native gateway workload at 89 k req/s 1c, HVF at 73 k 1c
   (post `gateway_max conns_per_core: 1500` bump).

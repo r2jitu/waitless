@@ -49,10 +49,10 @@ QUIC TX path's per-byte cost.
 | # | Step | Site | Cost per byte | Cost per packet | Notes |
 |---|------|------|---|---|---|
 | 1 | Handler renders body | `body_iobuf` writer | 1× memcpy (dynamic content only) | — | Same as TCP path |
-| 2 | H3 frame encode | `uni-http3/src/*` | — | small `Vec::with_capacity` per frame | HEADERS / DATA / etc. |
-| 3 | **QUIC packet encode** | `encode_one_rtt_packet` etc. (`uni-quic/src/conn.rs:2018+`) | **1× memcpy** | `Vec::with_capacity(1024)` for frames + `take_datagram_buf` (~1500 B, pooled with 62 B L2/L3/L4 headroom prefix after item Q) | Frame headers + STREAM data written into the datagram Vec; for 1-RTT packets writes directly (no temp staging Vec); Initial/Handshake still stage via temp `frames` Vec |
+| 2 | H3 frame encode | `proto/http3/src/*` | — | small `Vec::with_capacity` per frame | HEADERS / DATA / etc. |
+| 3 | **QUIC packet encode** | `encode_one_rtt_packet` etc. (`proto/quic/src/conn.rs:2018+`) | **1× memcpy** | `Vec::with_capacity(1024)` for frames + `take_datagram_buf` (~1500 B, pooled with 62 B L2/L3/L4 headroom prefix after item Q) | Frame headers + STREAM data written into the datagram Vec; for 1-RTT packets writes directly (no temp staging Vec); Initial/Handshake still stage via temp `frames` Vec |
 | 4 | QUIC AEAD seal | within `seal_packet` | 1× R/W (ChaCha20) + 1× R (Poly1305) | — | In place over the assembled packet bytes |
-| 5 | `pop_packet_owned` | `uni-quic/src/endpoint.rs` | — (move) | — | `DatagramBuf` ownership transferred to the reactor; `TxSlot` variant carries a `TxBufHandle` (zero-copy ship), `Heap` variant carries a `Vec<u8>` (recycled via the conn's pool) |
+| 5 | `pop_packet_owned` | `proto/quic/src/endpoint.rs` | — (move) | — | `DatagramBuf` ownership transferred to the reactor; `TxSlot` variant carries a `TxBufHandle` (zero-copy ship), `Heap` variant carries a `Vec<u8>` (recycled via the conn's pool) |
 | 6 | ~~UDP wrap~~ | — (item Q ✓) | — | — | Folded into step 3 — encoder writes packet bytes directly into the framing buffer's UDP-payload region; bare-metal `send_with_l2_headroom` fills UDP/IP/Eth headers in the pre-reserved headroom |
 | 7 | ~~IPv4 wrap~~ | — | — | — | Folded into step 6 (item P ✓ and Q ✓) |
 | 8 | ~~Ethernet wrap~~ | — | — | — | Folded into step 6 (item P ✓ and Q ✓) |
@@ -98,7 +98,7 @@ AEAD to the NIC.
   + `submit_tx`; caller (TCP and QUIC) writes straight into a
   slot of the existing 64-slot `tx_pool`, no intermediate stack
   buffer + memcpy.
-  * Implementation: new `TxBufHandle` struct in `uni-net::driver`
+  * Implementation: new `TxBufHandle` struct in `uni/net::driver`
     with `Drop` returning the slot to the pool unused; `submit_tx`
     `mem::forget`s the handle to skip release.
   * virtio-net: per-qp scan, Tier-1 only (Tier-2 shared qp returns
@@ -144,8 +144,8 @@ AEAD to the NIC.
   through `send_app_data_iobuf` (which calls `seal_in_place`).
   Record header / type byte / tag all written into the scratch's
   reserved headroom + tailroom — no Heap IOBufs allocated.
-- **Where**: `uni-tls/src/record.rs::seal_chain_in_place`,
-  `uni-http/src/lib.rs::flush_record`.
+- **Where**: `proto/tls/src/record.rs::seal_chain_in_place`,
+  `proto/http/src/lib.rs::flush_record`.
 - **What**: `seal_chain_in_place` allocates 2 small Heap IOBufs
   (5 B header, 17 B trailer) per record. Make the scratch
   `[u8; 5 + 16384 + 17]` — 16406 B — with reserved headroom and
@@ -169,7 +169,7 @@ AEAD to the NIC.
   drives the same SIMD backends as in-place `apply_keystream`.
   Implementation:
   * New `chacha20poly1305_seal_chain_to` primitive in
-    `uni-tls/aead.rs` — reads plaintext from an iterator,
+    `proto/tls/aead.rs` — reads plaintext from an iterator,
     XORs while writing ciphertext to dst, accumulates Poly1305
     over the resulting ciphertext bytes.
   * `TrafficKey::seal_chain_to` + `record::seal_chain_to_in_place`
@@ -187,8 +187,8 @@ AEAD to the NIC.
 
 ### E. Skip `drain_tx()` no-op at top of the hot path
 - **Status**: [ ] not started
-- **Where**: `uni-http/src/lib.rs::TlsStream::send`,
-  `uni-tls/src/lib.rs::TlsConnImpl`.
+- **Where**: `proto/http/src/lib.rs::TlsStream::send`,
+  `proto/tls/src/lib.rs::TlsConnImpl`.
 - **What**: Defensive `drain_tx().await?` at the top of `send` is
   a no-op when the TLS layer has no pending bytes. Track a
   `tx_pending` flag in `TlsConnImpl` and skip the call when
@@ -230,7 +230,7 @@ AEAD to the NIC.
   filled in place via the existing `ethernet::fill_header` /
   `ipv4::fill_header` / `ipv6::fill_header` helpers (added by
   item A). Hand the contiguous frame straight to
-  `uni_drivers::net::send`.
+  `nic_api::net::send`.
 - **Win**: -2 memcpys per byte on the **QUIC TX hot path** (UDP
   wrap + IP wrap + Eth wrap collapse to one frame build).
   Drops QUIC guest-side memcpys 5 → 3, matching the post-A TCP
@@ -252,10 +252,10 @@ AEAD to the NIC.
   `udp::send_to_addr → ipv4_send → ethernet_send`.
   QUIC TX guest-side memcpys now match TCP at 2 per byte
   (encode + driver-pool); item B drops both to 1.
-- **Where**: `uni-quic/src/conn.rs::encode_*_packet` family,
+- **Where**: `proto/quic/src/conn.rs::encode_*_packet` family,
   the boundary between `pop_packet_owned` and
   `UdpSocket::send_to`, and the QUIC reactor's send loop in
-  `uni-quic/src/endpoint.rs`.
+  `proto/quic/src/endpoint.rs`.
 - **What**: Today QUIC encodes each packet into a freshly-taken
   `Vec<u8>` from `outbound_pool`, plus a separate
   `Vec::with_capacity(1024)` for staging frames. The Vec then
@@ -304,20 +304,20 @@ AEAD to the NIC.
   UDP-GSO landing.
 - **Where**:
   * Dispatcher (currently early-returns on DQO):
-    [`uni-driver-gve/src/lib.rs:1619-1630`](uni-driver-gve/src/lib.rs#L1619-L1630)
+    [`crates/drivers/gve/src/lib.rs:1619-1630`](crates/drivers/gve/src/lib.rs#L1619-L1630)
     `submit_tx_udp_gso` — `if QUEUE_FORMAT_DQO { return; }` at
     line 1626.
   * Buf-acquire (currently shares GQI big-pool path, returns None
     on DQO):
-    [`uni-driver-gve/src/lib.rs:1610-1617`](uni-driver-gve/src/lib.rs#L1610-L1617)
+    [`crates/drivers/gve/src/lib.rs:1610-1617`](crates/drivers/gve/src/lib.rs#L1610-L1617)
     `acquire_tx_udp_gso_buf` → `acquire_tx_tso_buf()` → None on
-    DQO ([lib.rs:1641-1644](uni-driver-gve/src/lib.rs#L1641-L1644)).
+    DQO ([lib.rs:1641-1644](crates/drivers/gve/src/lib.rs#L1641-L1644)).
   * GQI implementation to mirror:
-    [`uni-driver-gve/src/gqi.rs:571`](uni-driver-gve/src/gqi.rs#L571)
+    [`crates/drivers/gve/src/gqi.rs:571`](crates/drivers/gve/src/gqi.rs#L571)
     `submit_tx_udp_gso_inner`. Same arg shape: `handle`,
     `frame_len`, `hdr_len`, `csum_start`, `gso_size`.
   * DQO TX descriptor format reference:
-    [`uni-driver-gve/src/dqo.rs:21-65`](uni-driver-gve/src/dqo.rs#L21-L65)
+    [`crates/drivers/gve/src/dqo.rs:21-65`](crates/drivers/gve/src/dqo.rs#L21-L65)
     documents the general-context + pkt-desc pair; lines 130-138
     cover the pkt-desc flags layout.
 - **What**:
@@ -333,7 +333,7 @@ AEAD to the NIC.
      fields populated, emit the pkt descriptor with the GSO
      flag set, ring the doorbell.
   3. Swap the dispatcher at
-     [`lib.rs:1626-1628`](uni-driver-gve/src/lib.rs#L1626-L1628)
+     [`lib.rs:1626-1628`](crates/drivers/gve/src/lib.rs#L1626-L1628)
      to call `dqo::submit_tx_udp_gso_inner` on DQO instead of
      `return;`.
   4. Extend `acquire_tx_udp_gso_buf` to allocate from the DQO TX
@@ -412,7 +412,7 @@ AEAD to the NIC.
   vhost-net or a real NIC. Not yet bench-verified on those targets
   — when GCE bench cycle returns we expect the same TX win plus
   whatever NIC-hardware offload latency reduction the underlying
-  device adds. GVE driver (in uni-driver-gve) reports
+  device adds. GVE driver (in crates/drivers/gve) reports
   `tso_available: || false` so it falls back to per-MSS sends
   until we wire the descriptor-side support there too.
 - **Risk**: low for HVF (the userspace proxy just forwards bytes,
@@ -475,9 +475,9 @@ Measured: **/diagnostics over HTTPS/1.1 = 11 allocs**, **over H3 =
 
 | # | Alloc | Site | Per-… |
 |---|-------|------|------|
-| 1 | `Box::pin(async move {...})` (conn future) | `uni-runtime/src/net/tcp.rs:475` | conn-accept |
+| 1 | `Box::pin(async move {...})` (conn future) | `runtime/executor/src/net/tcp.rs:475` | conn-accept |
 | 2 | spawn task struct | `crate::spawn_boxed` | conn-accept |
-| 3 | `Box<TlsConnImpl>` | `uni-tls/src/lib.rs:163` | conn-accept |
+| 3 | `Box<TlsConnImpl>` | `proto/tls/src/lib.rs:163` | conn-accept |
 | 4 | `rx_buf` `Box<[u8; 4096]>` | `TlsServer::new` | conn-accept |
 | 5 | `tx_buf` `Box<[u8; 4096]>` | `TlsServer::new` | conn-accept |
 | 6 | `pt_buf` `Box<[u8; 4096]>` | `TlsServer::new` | conn-accept |
@@ -485,7 +485,7 @@ Measured: **/diagnostics over HTTPS/1.1 = 11 allocs**, **over H3 =
 | 8 | VecDeque overflow | first chain `push_back` past INLINE_PARTS | first request per conn |
 | 9 | seal trailer Heap IOBuf (17 B) | `seal_chain_in_place` | per-record (also in TX memcpy table item C) |
 | 10 | seal header Heap IOBuf (5 B) | `seal_chain_in_place` | per-record (also in TX memcpy table item C) |
-| H3 +1..+8 | per-packet/frame `Vec::with_capacity` | `uni-quic/src/conn.rs` (frame & datagram encode) | per H3 packet |
+| H3 +1..+8 | per-packet/frame `Vec::with_capacity` | `proto/quic/src/conn.rs` (frame & datagram encode) | per H3 packet |
 
 Item **C** in the memcpy plan removes #9 and #10 by baking the
 record envelope into the TLS scratch.
@@ -500,10 +500,10 @@ the work below.
 
 ### M. Conn-state pool
 - **Status**: [ ] not started
-- **Where**: `uni-runtime/src/net/tcp.rs` (accept site),
-  `uni-tls/src/lib.rs::new_connection`,
-  `uni-tls/src/server.rs::TlsServer::new`,
-  `uni-http/src/lib.rs::handle_conn` (`body_scratch`).
+- **Where**: `runtime/executor/src/net/tcp.rs` (accept site),
+  `proto/tls/src/lib.rs::new_connection`,
+  `proto/tls/src/server.rs::TlsServer::new`,
+  `proto/http/src/lib.rs::handle_conn` (`body_scratch`).
 - **What**: Recycle the chunky per-conn allocations across
   accept/close cycles instead of allocating fresh per accept.
   Pool the things that have stable shape and size:
@@ -531,7 +531,7 @@ the work below.
 
 ### N. Conn future + spawn-task pool (follow-up to M)
 - **Status**: [ ] not started, after M
-- **Where**: `uni-runtime/src/net/tcp.rs:475` Box::pin site,
+- **Where**: `runtime/executor/src/net/tcp.rs:475` Box::pin site,
   `crate::spawn_boxed` task allocation.
 - **What**: Once M lands the conn-state pool, the remaining two
   per-accept allocs are the boxed accept-body future and the
@@ -682,7 +682,7 @@ E and F are low-effort cleanups that can land any time.
   * Collapsed `udp::send_to_addr` to delegate to
     `send_with_l2_headroom` (one site for header-fill logic;
     -120 LOC of duplicated code).
-  * Updated stale comments in `uni-quic` referencing the
+  * Updated stale comments in `proto/quic` referencing the
     pre-Q `sock.send_to(&vec)` flow.
 - **2026-05-08** — Item **B landed for TCP** (`936f03f`,
   `84777e2`): SG TX API + TCP wiring. Driver exposes
@@ -708,7 +708,7 @@ E and F are low-effort cleanups that can land any time.
   `DatagramBuf` enum with `Heap(Vec<u8>)` and
   `TxSlot { handle: TxBufHandle, vec: ManuallyDrop<Vec<u8>> }`
   variants. `Connection::take_datagram_buf` tries
-  `uni_runtime::net::acquire_tx_buf` first and wraps the slot's
+  `executor::reactor::acquire_tx_buf` first and wraps the slot's
   data region as a `Vec` via `from_raw_parts` (capacity = 1514,
   len pre-set to 62 B headroom for L2/L3/L4). Encoder writes
   packet bytes via the existing `&mut Vec<u8>` surface (audited:
@@ -730,7 +730,7 @@ E and F are low-effort cleanups that can land any time.
 - **2026-05-09** — Multi-driver TX-path overhaul
   (`78bfc60`...`a301ef0`):
 
-  * **`uni-http`**: per-worker TLS record scratch (cfg-gated
+  * **`proto/http`**: per-worker TLS record scratch (cfg-gated
     bare-metal) — caps the 16 KiB per-conn future state at one
     worker-static buffer regardless of conn count. Removes the
     broken `TlsConn` trait defaults that made
@@ -744,7 +744,7 @@ E and F are low-effort cleanups that can land any time.
     one direct-fill path; slice-shaped fallback retained for
     drivers that don't expose direct-fill.
 
-  * **`uni-driver-virtio-net`**: TX pool is now per-worker
+  * **`crates/drivers/virtio-net`**: TX pool is now per-worker
     (`WorkerTxPool` indexed by worker id) regardless of
     `num_queue_pairs`. On Tier 2 (single shared qp + multi-core)
     slot allocation stays lock-free; only the virtq submit step
@@ -760,7 +760,7 @@ E and F are low-effort cleanups that can land any time.
     encoded:
     `PseudoHeaderPartial` (virtio) and `Zero` (gve).
 
-  * **`uni-driver-gve`**: direct-fill TX path for GQI_QPL
+  * **`crates/drivers/gve`**: direct-fill TX path for GQI_QPL
     (validated on n2-highcpu-4 / GVNIC). DQO_RDA implementation
     exists with the spec-correct fixes from Linux's
     `gve_tx_dqo` (RE spaced ≥ 32 descs per
@@ -931,7 +931,7 @@ E and F are low-effort cleanups that can land any time.
   Bug exposed by the path that *didn't* work: HTTPS /health
   (post-handshake response under MSS) timed out, while HTTPS
   /diagnostics (record over MSS) succeeded. Root cause: the
-  TLS-direct `try_send_tso` path (uni-http `TlsStream::send`)
+  TLS-direct `try_send_tso` path (proto/http `TlsStream::send`)
   gated only on `src.total_len() <= PLAINTEXT_CHUNK` — i.e. it
   used TSO for ANY chain fitting one record, including
   single-segment responses. **gve hardware silently drops

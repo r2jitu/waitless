@@ -1,7 +1,7 @@
 # gVNIC (Google Virtual NIC)
 
 The NIC GCE attaches to modern instances. Driver lives in
-[uni-driver-gve](../uni-driver-gve/src/lib.rs); virtio-net is the
+[crates/drivers/gve](../crates/drivers/gve/src/lib.rs); virtio-net is the
 fallback on older shapes (see [crates.md](crates.md)).
 
 PCI id `0x1ae0:0x0042`. BAR0 is the 32-bit-per-register config
@@ -93,9 +93,9 @@ Per-queue doorbell registers live in the BAR2 window at byte offset
 `db_index * 4`. Endianness differs by format:
 
 - **GQI** writes the doorbell big-endian (`iowrite32be`) —
-  [gqi.rs `doorbell_write`](../uni-driver-gve/src/gqi.rs).
+  [gqi.rs `doorbell_write`](../crates/drivers/gve/src/gqi.rs).
 - **DQO** writes it little-endian (`writel`) —
-  [dqo.rs `doorbell_write_le`](../uni-driver-gve/src/dqo.rs).
+  [dqo.rs `doorbell_write_le`](../crates/drivers/gve/src/dqo.rs).
 
 Both wrappers issue an `sfence` (`host_dma_fence()`) before the MMIO
 store — see the WB→UC hazard below.
