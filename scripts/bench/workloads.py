@@ -740,7 +740,7 @@ def _udp_bench_bin():
     if not os.path.isfile(src):
         return None
 
-    cache = os.path.join(tempfile.gettempdir(), f"unikernel_bench_{os.getuid()}")
+    cache = os.path.join(tempfile.gettempdir(), f"waitless_bench_{os.getuid()}")
     os.makedirs(cache, exist_ok=True)
     udp_bin = os.path.join(cache, "udp_bench")
 

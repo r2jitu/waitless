@@ -150,7 +150,7 @@ Two GCE VMs, both `c3-highcpu-8`, SPOT, zone `us-west1-c`:
 
 - **`kvm-vm`** — the loadgen host. Also runs the unikernel under
   *nested* QEMU/KVM for `gcp-bench.sh`.
-- **`unikernel-webserver`** — the unikernel running as a *real* GCE VM
+- **`waitless-webserver`** — the unikernel running as a *real* GCE VM
   (gVNIC). The target for `gcp-deploy-bench.sh`.
 
 Both scripts start the VM(s) they need and **stop them on exit** unless
@@ -181,7 +181,7 @@ the harness + binaries, and runs `bench.py` over SSH. Env vars:
 
 ### `gcp-deploy-bench.sh` — production-shape bench
 
-Deploys the unikernel as the real `unikernel-webserver` GCE VM and
+Deploys the unikernel as the real `waitless-webserver` GCE VM and
 drives `loadgen` against it from `kvm-vm` over the GCE network — the
 gVNIC datapath, **Tier 1**.
 
@@ -202,7 +202,7 @@ It calls `deploy-gcloud.sh deploy` (unless `--no-redeploy`), syncs the
 harness to `kvm-vm`, builds `loadgen` there, tunes the loadgen VM's
 sysctls (`tcp_tw_reuse`, widened `ip_local_port_range` — fresh-conn
 workloads exhaust ephemeral ports otherwise), then runs `bench.py --env
-remote --target <unikernel-webserver IP>`. Env vars: `WAITLESS_GCE_*`
+remote --target <waitless-webserver IP>`. Env vars: `WAITLESS_GCE_*`
 (see below) plus `GCP_KVM_VM_NAME` / `GCP_KVM_VM_ZONE`.
 
 ---
@@ -247,7 +247,7 @@ launch with serial logging.
 
 Env vars: `WAITLESS_GCE_PROJECT`, `WAITLESS_GCE_ZONE` (`us-west1-c`),
 `WAITLESS_GCE_MACHINE` (`c3-highcpu-8`), `WAITLESS_GCE_NAME`
-(`unikernel-webserver`), `WAITLESS_GCS_BUCKET`, `QUEUE_COUNT` (`8` —
+(`waitless-webserver`), `WAITLESS_GCS_BUCKET`, `QUEUE_COUNT` (`8` —
 match vCPUs), `WAITLESS_GCE_PREEMPTIBLE` (`1` = SPOT),
 `LEGACY_VIRTIO_NIC` (`1` = legacy virtio instead of gVNIC, for A/B
 comparison).
@@ -265,12 +265,12 @@ gcp-bench.sh ───────► kvm-vm
    └─ gcp.sh start          (auto-start)         nested QEMU+KVM + loadgen,
    └─ rsync harness                              both on loopback  → Tier 2
 
-gcp-deploy-bench.sh ──► unikernel-webserver  +  kvm-vm
+gcp-deploy-bench.sh ──► waitless-webserver  +  kvm-vm
    └─ deploy-gcloud.sh deploy   (the target)      (the loadgen client)
    └─ bench.py --env remote --target <uni ip>    over the GCE network → Tier 1
 
 gcp.sh {run,serve,test} ► kvm-vm   (interactive dev: build → push → nested QEMU)
-deploy-gcloud.sh ───────► unikernel-webserver   (build a GCE custom image)
+deploy-gcloud.sh ───────► waitless-webserver   (build a GCE custom image)
 ```
 
 ## Gotchas
@@ -305,7 +305,7 @@ deploy-gcloud.sh ───────► unikernel-webserver   (build a GCE cus
   harness then polled `http://10.20.30.10/health` for 20 s, got nothing,
   and after 3 strikes printed `SKIP (not ready)`. (The two paths that
   *do* work use no nested KVM: local `--env qemu` is TCG, and the real
-  `unikernel-webserver` GCE VM is itself the non-nested guest.)
+  `waitless-webserver` GCE VM is itself the non-nested guest.)
 
   Nested virtualization is now **enabled** on `kvm-vm` and `--env kvm`
   produces real, core-scaling numbers again (`c3-highcpu-8` supports

@@ -70,7 +70,7 @@ def rust_doc_test(**kwargs):
 # incompat marker only suppresses wildcard expansion (`bazel build
 # //...`) from trying to compile the proc-macro in the top-level
 # unikernel config — which is what the rust-analyzer discover aspect
-# does under `--platforms=*_unikernel`.
+# does under `--platforms=*_waitless`.
 def rust_proc_macro(rustc_flags = [], target_compatible_with = [], **kwargs):
     _rust_proc_macro(
         rustc_flags = rustc_flags + ["-Cpanic=unwind"],

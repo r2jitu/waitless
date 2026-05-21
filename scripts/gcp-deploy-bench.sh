@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # gcp-deploy-bench.sh — Production-shape GCE bench: deploy the
-# unikernel as a real GCE VM (`unikernel-webserver`, n2-highcpu-4
+# unikernel as a real GCE VM (`waitless-webserver`, n2-highcpu-4
 # w/ gVNIC) and drive the loadgen against it from a separate
 # bench client (`kvm-vm`, n2-highcpu-8). Both VMs sit on the
 # default VPC, so traffic crosses the GCE network on internal
@@ -40,7 +40,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-UNI_NAME="${WAITLESS_GCE_NAME:-unikernel-webserver}"
+UNI_NAME="${WAITLESS_GCE_NAME:-waitless-webserver}"
 # us-west1-c: c3 family availability + matches deploy-gcloud.sh's
 # zone default. Both VMs must co-locate (cross-zone same-region
 # RTT is ~5 ms — enough to RTT-bound `get_tcp_fresh` to single-

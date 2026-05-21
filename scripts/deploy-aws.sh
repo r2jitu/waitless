@@ -22,7 +22,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-NAME="${1:-unikernel-webserver}"
+NAME="${1:-waitless-webserver}"
 ELF="${2:-}"
 REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 INSTANCE_TYPE="${WAITLESS_EC2_TYPE:-t3.micro}"
@@ -190,14 +190,14 @@ echo "    AMI: $AMI_ID"
 # --- Create security group for HTTP ---
 echo "==> Ensuring security group..."
 SG_ID=$(aws ec2 describe-security-groups \
-    --group-names "unikernel-http" \
+    --group-names "waitless-http" \
     --region "$REGION" \
     --query 'SecurityGroups[0].GroupId' \
     --output text 2>/dev/null || echo "")
 
 if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
     SG_ID=$(aws ec2 create-security-group \
-        --group-name "unikernel-http" \
+        --group-name "waitless-http" \
         --description "Allow HTTP for unikernel instances" \
         --region "$REGION" \
         --query 'GroupId' \

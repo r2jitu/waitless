@@ -508,7 +508,7 @@ class RemoteEnv:
     """Bench target that's already running somewhere else. No build, no
     start, no stop — just a reachable `ip:port` the workload hits.
     Intended for benching a dedicated unikernel VM (e.g. the
-    `unikernel-webserver` GCE instance) rather than a VM we spawn
+    `waitless-webserver` GCE instance) rather than a VM we spawn
     locally. Set `--target 10.0.0.1` on the CLI; leave `--cores` as
     whatever the remote VM actually has so the `*_per_core` workloads
     scale pressure correctly.

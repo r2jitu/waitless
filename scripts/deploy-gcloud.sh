@@ -44,7 +44,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 MODE="${1:-deploy}"
 
-NAME="${WAITLESS_GCE_NAME:-unikernel-webserver}"
+NAME="${WAITLESS_GCE_NAME:-waitless-webserver}"
 # Default zone us-west1-c: only us-west1 zone with c3-highcpu-8.
 ZONE="${WAITLESS_GCE_ZONE:-us-west1-c}"
 # c3-highcpu-8 by default: 8 vCPU room for multi-core bench scaling.
@@ -295,7 +295,7 @@ deploy() {
         --project="$PROJECT" \
         --quiet
 
-    gcloud compute firewall-rules create allow-http-unikernel \
+    gcloud compute firewall-rules create allow-http-waitless \
         --allow=tcp:80,tcp:443 \
         --target-tags=http-server \
         --project="$PROJECT" \
@@ -468,7 +468,7 @@ purge() {
         echo "    bucket:   (not present)"
     fi
 
-    gcloud compute firewall-rules delete allow-http-unikernel \
+    gcloud compute firewall-rules delete allow-http-waitless \
         --project="$PROJECT" --quiet 2>/dev/null &&
         echo "    firewall: deleted" ||
         echo "    firewall: (not present)"

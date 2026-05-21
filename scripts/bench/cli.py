@@ -580,7 +580,7 @@ def main():
         "--target",
         default=None,
         help="Target IP for --env remote (e.g. the GCE "
-        "unikernel-webserver internal IP). Required when "
+        "waitless-webserver internal IP). Required when "
         "--env remote is used.",
     )
     args = parser.parse_args()

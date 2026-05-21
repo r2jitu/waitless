@@ -796,7 +796,7 @@ backpressure. CPU-bound at ChaCha20-Poly1305 decrypt rate
 - **Observability**: surface the new counters in
   `/stats`-style dashboards.
 - **GCE IPv6 subnet enablement** so `get_tcp_v6` runs against
-  the remote unikernel-webserver VM (currently HVF-only).
+  the remote waitless-webserver VM (currently HVF-only).
 
 ### RX scheduler — unify the tier model
 
@@ -1751,7 +1751,7 @@ Reading the numbers honestly:
 nested-KVM `gcp-bench.sh --env kvm` path hit the documented
 `SKIP (not ready)` failure (see `docs/benchmarking.md`), so the
 checkpoint ran via `gcp-deploy-bench.sh` — the unikernel as the
-real `unikernel-webserver` GCE VM over gVNIC (**Tier 1**), loadgen
+real `waitless-webserver` GCE VM over gVNIC (**Tier 1**), loadgen
 on `kvm-vm`. Same-session A/B, baseline `4327a15` vs `main`, 2 runs
 per side (means):
 
@@ -1864,7 +1864,7 @@ counters `RX_CHUNK_STASH_HITS` / `RX_CHUNK_RING_DRAIN` (`fd41463`),
 surfaced at `/stats` as `rx_chunk_stash_hits` / `rx_chunk_ring_drain`,
 count the two `do_recv_chunk` paths: the zero-copy device-buffer
 *stash* vs the copying *ring-drain* fallback. Deployed to the real
-`unikernel-webserver` gVNIC VM, ran `upload_32k_tcp`, read `/stats`:
+`waitless-webserver` gVNIC VM, ran `upload_32k_tcp`, read `/stats`:
 
 ```
 rx_chunk_stash_hits  = 3_891_009   (52.0 %)

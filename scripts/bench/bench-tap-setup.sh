@@ -14,7 +14,7 @@
 # so calling it before every KVM test is cheap and resets any stale
 # tap state left by a prior run.
 #
-# Requires: ip (iproute2), dnsmasq, and a /etc/dnsmasq.d/unikernel-bench.conf
+# Requires: ip (iproute2), dnsmasq, and a /etc/dnsmasq.d/waitless-bench.conf
 # with at minimum:
 #     interface=tap0
 #     bind-interfaces
@@ -33,7 +33,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # Create dnsmasq config if missing.
-DNSMASQ_CONF=/etc/dnsmasq.d/unikernel-bench.conf
+DNSMASQ_CONF=/etc/dnsmasq.d/waitless-bench.conf
 if [ ! -f "$DNSMASQ_CONF" ]; then
     cat >"$DNSMASQ_CONF" <<'EOF'
 # Unikernel benchmark: minimal DHCP for tap0

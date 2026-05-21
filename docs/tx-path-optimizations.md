@@ -778,7 +778,7 @@ E and F are low-effort cleanups that can land any time.
     debugged.
 
   GCE deploy/bench validation via `deploy-gcloud.sh`
-  (`unikernel-webserver-image` on n2 + c3) and
+  (`waitless-webserver-image` on n2 + c3) and
   `gcp-deploy-bench.sh`. n2 `health_max` 469K req/s the first
   bench session, ~322K subsequently — variance attributed to
   GCE network. Both VMs stopped between iterations to keep

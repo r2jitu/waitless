@@ -85,7 +85,7 @@ def spawn_backgrounded(
     launcher_path: Path,
     *,
     env: Optional[dict[str, str]] = None,
-    log_prefix: str = "unikernel_test",
+    log_prefix: str = "waitless_test",
 ) -> Launcher:
     """Run an executable in the background, stdout+stderr to a temp log."""
     fd, log_path_str = tempfile.mkstemp(prefix=f"{log_prefix}_", suffix=".log")
