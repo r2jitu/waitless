@@ -326,6 +326,18 @@ pub struct TcpConnection {
     /// counter. Meaningful only while `lifecycle_deadline_ms` is armed
     /// in `FinWait1` / `LastAck`.
     pub(crate) fin_retx_count: u8,
+    /// RFC 5681 congestion window, bytes — the controller's estimate
+    /// of how much unacknowledged data the path will accept. Grows on
+    /// ACKs (slow start, then congestion avoidance) and collapses to
+    /// one segment on an RTO. 0 until `congestion_init` runs at the
+    /// SYN. Maintained as bookkeeping today; the send path does not
+    /// yet pace against it.
+    pub(crate) cwnd: u32,
+    /// RFC 5681 slow-start threshold, bytes. While `cwnd < ssthresh`
+    /// the controller is in slow start (exponential growth); at or
+    /// above it, congestion avoidance (linear). Starts effectively
+    /// infinite and drops to half the flight size on loss.
+    pub(crate) ssthresh: u32,
     /// Free-list link. When this slot is on the free list (state ==
     /// Closed AND the slot has been returned to the pool), this
     /// holds the index of the next free slot, or `NULL_SLOT` for
@@ -373,6 +385,8 @@ impl TcpConnection {
             rtt_anchor_active: false,
             lifecycle_deadline_ms: 0,
             fin_retx_count: 0,
+            cwnd: 0,
+            ssthresh: 0,
             next_free: NULL_SLOT,
         }
     }
@@ -699,6 +713,9 @@ impl TcpConnection {
         if acked == 0 {
             return; // not new data — leave the timer untouched
         }
+        // RFC 5681 §3.1: an ACK of new data opens the congestion
+        // window — slow start or congestion avoidance.
+        self.cwnd_on_ack(acked as u32);
         // RFC 6298 §3 (Karn): if this ACK covers the anchored byte and
         // no retransmission has invalidated the sample, fold the
         // round-trip time into the estimator.
@@ -735,6 +752,11 @@ impl TcpConnection {
             self.rtx_deadline_ms = 0; // nothing to retransmit
             return;
         }
+        // RFC 5681 §3.1: the timeout is a congestion signal — halve
+        // ssthresh (first RTO of the episode) and collapse cwnd back
+        // to one segment. Done before the `rtx_backoff` bump below so
+        // `rtx_backoff == 0` still marks that first timeout.
+        self.congestion_on_rto();
         // Copy the (≤ MSS) bytes out of the ring into a contiguous
         // scratch buffer — the ring segment may wrap, and `send_segment`
         // takes a flat slice. Off the steady-state path (only fires on
@@ -817,6 +839,52 @@ impl TcpConnection {
     /// deadline rather than a FIN-retransmit deadline.
     pub(crate) fn arm_time_wait(&mut self, now: u64) {
         self.lifecycle_deadline_ms = now + TIME_WAIT_MS;
+    }
+
+    // ─── RFC 5681 congestion control ─────────────────────────────────────
+
+    /// Initialise the congestion window at connection start. RFC 5681
+    /// §3.1: for our SMSS (1440/1460 B, in the 1095 < SMSS ≤ 2190
+    /// band) the initial window is 3·SMSS. `ssthresh` starts
+    /// effectively infinite so the connection opens in slow start.
+    pub(crate) fn congestion_init(&mut self) {
+        self.cwnd = 3 * mss_for(self.local_ip) as u32;
+        self.ssthresh = u32::MAX;
+    }
+
+    /// Fold an ACK of `acked` new bytes into the congestion window
+    /// (RFC 5681 §3.1). Slow start (`cwnd < ssthresh`) opens the
+    /// window by one SMSS per ACK — exponential per RTT. Congestion
+    /// avoidance adds `SMSS·SMSS/cwnd` per ACK, the standard
+    /// approximation of one SMSS per RTT — linear.
+    pub(crate) fn cwnd_on_ack(&mut self, acked: u32) {
+        let smss = mss_for(self.local_ip) as u32;
+        if self.cwnd < self.ssthresh {
+            // Slow start: one SMSS per ACK, capped at the bytes the
+            // ACK actually covers (RFC 5681's `min(N, SMSS)`).
+            self.cwnd = self.cwnd.saturating_add(acked.min(smss));
+        } else {
+            // Congestion avoidance: ~one SMSS per RTT. `max(1)` keeps
+            // the window opening when integer division would floor
+            // the increment to zero.
+            let inc = ((smss as u64 * smss as u64) / self.cwnd.max(1) as u64) as u32;
+            self.cwnd = self.cwnd.saturating_add(inc.max(1));
+        }
+    }
+
+    /// Fold an RTO expiry into the congestion window (RFC 5681 §3.1):
+    /// the first timeout of a loss episode drops `ssthresh` to half
+    /// the flight size, and every timeout collapses `cwnd` to one
+    /// segment — the connection re-enters slow start. Called by
+    /// `retransmit_oldest` before it bumps `rtx_backoff`, so
+    /// `rtx_backoff == 0` marks that first timeout.
+    pub(crate) fn congestion_on_rto(&mut self) {
+        let smss = mss_for(self.local_ip) as u32;
+        if self.rtx_backoff == 0 {
+            let flight = self.snd_nxt.wrapping_sub(self.snd_una);
+            self.ssthresh = (flight / 2).max(2 * smss);
+        }
+        self.cwnd = smss;
     }
 }
 

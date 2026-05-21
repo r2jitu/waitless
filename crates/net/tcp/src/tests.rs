@@ -817,6 +817,113 @@ fn rtt_estimator_tracks_rfc6298() {
     );
 }
 
+// ---- RFC 5681 congestion control — pure controller arithmetic ---------
+
+/// RFC 5681 §3.1 slow start: the initial window is 3·SMSS for our
+/// segment size, and each ACK opens `cwnd` by one SMSS — so the
+/// window doubles over each RTT's worth of ACKs (exponential).
+#[test]
+fn slow_start_grows_cwnd_one_segment_per_ack() {
+    // The controller arithmetic is pure — exercise it on a bare TCB.
+    let mut c = TcpConnection::new();
+    c.congestion_init();
+    let smss = 1460u32; // MSS_V4 — `new()` leaves `local_ip` IPv4.
+
+    assert_eq!(c.cwnd, 3 * smss, "the initial window is 3·SMSS");
+    assert!(c.cwnd < c.ssthresh, "a fresh connection opens in slow start");
+
+    let before = c.cwnd;
+    c.cwnd_on_ack(smss);
+    assert_eq!(c.cwnd, before + smss, "slow start adds one SMSS per ACK");
+
+    // A partial ACK opens the window by only the bytes it covers.
+    let before = c.cwnd;
+    c.cwnd_on_ack(500);
+    assert_eq!(c.cwnd, before + 500, "the increment is capped at bytes acked");
+}
+
+/// RFC 5681 §3.1: at `cwnd == ssthresh` the controller switches from
+/// slow start to congestion avoidance — growth drops from one SMSS
+/// per ACK to roughly one SMSS per RTT.
+#[test]
+fn cwnd_switches_to_congestion_avoidance_at_ssthresh() {
+    let mut c = TcpConnection::new();
+    c.congestion_init();
+    let smss = 1460u32;
+    c.ssthresh = 8 * smss;
+    c.cwnd = 7 * smss;
+
+    // Still below ssthresh — slow start, one SMSS per ACK.
+    c.cwnd_on_ack(smss);
+    assert_eq!(c.cwnd, 8 * smss, "slow start runs up to ssthresh");
+
+    // At ssthresh — congestion avoidance, sub-SMSS per ACK.
+    let before = c.cwnd;
+    c.cwnd_on_ack(smss);
+    let inc = c.cwnd - before;
+    assert!(inc >= 1 && inc < smss, "congestion avoidance is sub-SMSS per ACK");
+    // SMSS·SMSS/cwnd, with cwnd == 8·SMSS, is SMSS/8.
+    assert_eq!(inc, smss * smss / (8 * smss));
+}
+
+/// RFC 5681 §3.1: an RTO collapses `cwnd` to one segment and drops
+/// `ssthresh` to half the flight size; a second RTO with no
+/// intervening progress collapses `cwnd` again but does not re-halve
+/// `ssthresh`.
+#[test]
+fn rto_collapses_cwnd_and_halves_ssthresh() {
+    let mut c = TcpConnection::new();
+    c.congestion_init();
+    let smss = 1460u32;
+
+    // A wide-open window with 20·SMSS in flight.
+    c.cwnd = 20 * smss;
+    c.ssthresh = 16 * smss;
+    c.snd_una = 1000;
+    c.snd_nxt = 1000u32.wrapping_add(20 * smss);
+    c.rtx_backoff = 0; // the first RTO of this loss episode
+
+    c.congestion_on_rto();
+    assert_eq!(c.cwnd, smss, "an RTO collapses cwnd to one segment");
+    assert_eq!(
+        c.ssthresh,
+        (20 * smss) / 2,
+        "ssthresh drops to half the flight size",
+    );
+
+    // A second RTO before any data is acknowledged.
+    c.cwnd = 5 * smss;
+    c.rtx_backoff = 1;
+    let ssthresh_after_first = c.ssthresh;
+    c.congestion_on_rto();
+    assert_eq!(c.cwnd, smss, "every RTO re-collapses cwnd");
+    assert_eq!(
+        c.ssthresh, ssthresh_after_first,
+        "ssthresh is not re-halved by a back-to-back RTO",
+    );
+}
+
+/// RFC 5681 §3.1: `ssthresh` has a 2·SMSS floor — a tiny flight size
+/// at RTO time cannot drive it below two segments.
+#[test]
+fn rto_ssthresh_has_a_two_segment_floor() {
+    let mut c = TcpConnection::new();
+    c.congestion_init();
+    let smss = 1460u32;
+
+    // Only one segment in flight when the RTO fires.
+    c.snd_una = 1000;
+    c.snd_nxt = 1000 + smss;
+    c.rtx_backoff = 0;
+
+    c.congestion_on_rto();
+    assert_eq!(
+        c.ssthresh,
+        2 * smss,
+        "ssthresh is floored at 2·SMSS, not flight/2 = SMSS/2",
+    );
+}
+
 /// The lossy-network egress fixture itself: a dropped first
 /// transmission is invisible to the stack — the bytes stay in the
 /// RFC 6298 retransmit ring — and the RTO timer recovers it. Validates

@@ -168,6 +168,10 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             c.rcv_nxt = seq + 1;
             c.listener_port = dst_port;
             c.accepted = false;
+            // RFC 5681 §3.1: open the congestion window at the
+            // initial window (3·SMSS) now that `local_ip` — and thus
+            // the segment size — is known.
+            c.congestion_init();
 
             // Ring cursors — reset on every SYN so a slot reused from
             // the free list starts empty.
