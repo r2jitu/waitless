@@ -20,6 +20,7 @@ use core::ptr::NonNull;
 use from_bytes::FromBytes;
 use iobuf::{Chain, IOBufDropFn, OwnedIOBuf};
 use nic_api::{CsumOffload, NicOps, set_active_ops};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, Once};
 use types::{IpAddr, Ipv4Addr, ntohl, ntohs};
 
@@ -31,8 +32,63 @@ const SERVER_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x01];
 
 static TX: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
+// ---- lossy-network egress fixture -------------------------------------
+//
+// `mock_send` consults a deterministic drop policy before recording a
+// frame. A dropped egress frame is *not* pushed to `TX` — it models a
+// frame the client never received — so a scenario that drops a
+// transmission and then asserts on the eventual retransmit captures the
+// recovered frame, not the lost one. Deterministic (drop-the-next-N or
+// drop-where-predicate), never random: conformance scenarios must be
+// reproducible. `harness()` clears the policy so a drop armed by one
+// scenario can't leak into the next.
+//
+// This is the test seam the timer- and loss-driven scenarios (FIN
+// retransmit, fast retransmit) need — the corners that are invisible on
+// a loss-free LAN/VM path.
+type EgressPred = Box<dyn FnMut(&[u8]) -> bool + Send>;
+static EGRESS_DROP: Mutex<Option<EgressPred>> = Mutex::new(None);
+static EGRESS_DROPPED: AtomicU32 = AtomicU32::new(0);
+
 fn mock_send(frame: &[u8], _csum: CsumOffload) {
+    {
+        let mut policy = EGRESS_DROP.lock().unwrap();
+        if let Some(pred) = policy.as_mut()
+            && pred(frame)
+        {
+            // Lost on the wire — the client never sees it, so it
+            // does not enter the `TX` capture.
+            EGRESS_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
     TX.lock().unwrap().push(frame.to_vec());
+}
+
+/// Drop every egress frame for which `pred` returns true. The building
+/// block for the loss scenarios; `drop_next_egress` wraps it for the
+/// common count-based case.
+fn drop_egress_where(pred: impl FnMut(&[u8]) -> bool + Send + 'static) {
+    *EGRESS_DROP.lock().unwrap() = Some(Box::new(pred));
+}
+
+/// Drop the next `n` egress frames, then deliver normally.
+fn drop_next_egress(n: u32) {
+    let mut remaining = n;
+    drop_egress_where(move |_| {
+        if remaining > 0 {
+            remaining -= 1;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// Count of egress frames the fixture has dropped since the last
+/// `harness()` reset.
+fn egress_drops() -> u32 {
+    EGRESS_DROPPED.load(Ordering::Relaxed)
 }
 fn mock_get_mac(out: *mut u8) {
     // SAFETY: the NIC-dispatch contract guarantees `out` addresses
@@ -105,6 +161,13 @@ fn harness() -> std::sync::MutexGuard<'static, ()> {
         set_active_ops(&MOCK_OPS);
     });
     TX.lock().unwrap().clear();
+    // Hand every scenario a pristine connection pool — `on_rtx_tick`
+    // walks the whole pool, so a leftover armed conn would pollute it.
+    reset_pool();
+    // Clear any egress drop policy so a loss armed by an earlier
+    // scenario cannot leak into this one.
+    *EGRESS_DROP.lock().unwrap() = None;
+    EGRESS_DROPPED.store(0, Ordering::Relaxed);
     // Start every scenario at t=0 so a timer-driven test never
     // inherits clock advanced by an earlier one.
     kernel_core::clock::mock::reset();
@@ -120,6 +183,24 @@ fn tx() -> Vec<Vec<u8>> {
 /// window mid-scenario (e.g. after the handshake).
 fn clear_tx() {
     TX.lock().unwrap().clear();
+}
+
+/// Free every connection slot on core 0 so each scenario starts with a
+/// pristine pool. The retransmission tick (`on_rtx_tick`) and the
+/// lifecycle tick walk the whole per-core pool, so a connection left
+/// armed by an earlier scenario would otherwise fire a timer into this
+/// scenario's `TX` capture — distinct 4-tuples isolate hash lookups
+/// but not pool-global timer ticks.
+fn reset_pool() {
+    let core = 0u32;
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        // SAFETY: single worker, test-serialised by `TEST_LOCK`.
+        let c = unsafe { &*conn_ptr(core, i) };
+        if c.state != TcpState::Closed {
+            super::free_connection(core, i);
+        }
+    }
 }
 
 // ---- scripted segment construction / parsing --------------------------
@@ -733,6 +814,49 @@ fn rtt_estimator_tracks_rfc6298() {
         c.estimated_rto(),
         RTO_INITIAL_MS,
         "a low, steady RTT clamps the RTO at the 1 s floor",
+    );
+}
+
+/// The lossy-network egress fixture itself: a dropped first
+/// transmission is invisible to the stack — the bytes stay in the
+/// RFC 6298 retransmit ring — and the RTO timer recovers it. Validates
+/// the drop seam against the known-good retransmit path before the
+/// timer- and loss-driven scenarios for the lifecycle corners and
+/// fast retransmit rely on it.
+#[test]
+fn egress_drop_fixture_loses_a_segment_then_rto_recovers_it() {
+    let _g = harness();
+    const SP: u16 = 9111;
+    const CP: u16 = 50111;
+    const CLIENT_ISN: u32 = 0xB000;
+    super::listen_on_core(0, SP);
+    handshake(SP, CP, CLIENT_ISN);
+
+    let (handle, generation) = conn_handle(CP, SP);
+    clear_tx();
+    // The wire loses the next egress frame — the server's response.
+    drop_next_egress(1);
+    let body = b"lost-on-the-wire";
+    let mut chain = iobuf::IOBufChain::from(body.to_vec());
+    super::async_try_send_chain(handle, generation, &mut chain)
+        .expect("an established connection accepts the send");
+    assert!(
+        tx().is_empty(),
+        "the first transmission was dropped by the fixture",
+    );
+    assert_eq!(egress_drops(), 1, "exactly one egress frame was dropped");
+
+    // The stack does not know the frame was lost — the bytes are in
+    // the retransmit ring. Crossing the RTO retransmits them, and the
+    // fixture (next-1 exhausted) now lets the frame through.
+    kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 + 1);
+    super::on_rtx_tick();
+    let rtx = tx();
+    assert_eq!(rtx.len(), 1, "the RTO retransmit recovers the lost segment");
+    assert_eq!(
+        &rtx[0][34 + TCP_HDR_LEN..],
+        body,
+        "the recovered segment carries the original payload",
     );
 }
 
