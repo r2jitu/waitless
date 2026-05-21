@@ -1,6 +1,6 @@
 # TCP / QUIC conformance + RFC-compliance roadmap
 
-Status: in progress (steps 1-3 complete). Last updated 2026-05-19.
+Status: in progress (steps 1-4 complete). Last updated 2026-05-21.
 
 ## Purpose
 
@@ -18,38 +18,46 @@ conformance-test behaviour that does not exist — so the harness's job
 for those items is **test-first feature development**, not checking an
 existing implementation.
 
-## Status today (2026-05-19)
+## Status today (2026-05-21)
 
-Steps 1-3 of the sequencing below are **complete** (`main`, through
-the RFC 6298 estimator commit). The in-process harness, a
-test-controllable clock, and TCP retransmission all now exist.
+Steps 1-4 of the sequencing below are **complete**. The in-process
+harness, a test-controllable clock, TCP retransmission, the
+connection-lifecycle corners, and RFC 5681 congestion control all
+now exist.
 
 Landed:
 
 - `tcp` is host-buildable. `//crates/net/tcp:tcp_test` is a
   packetdrill-style harness: it drives scripted TCP segments into the
   real `tcp_receive` against a mock `NicOps` that captures every
-  transmitted frame, then asserts on the captured output. Eleven
-  scenarios — the handshake trio (SYN→SYN-ACK, in-order data→ACK,
-  FIN→ACK), the receiver-side set (retransmitted SYN, duplicate data,
-  out-of-order, RST at/off `rcv_nxt`), and the RFC 6298 set (RTO
-  retransmit + backoff, ACK stops the timer, the SRTT/RTTVAR
-  estimator). Harness lives in `crates/net/tcp/src/lib.rs`'s
-  `#[cfg(test)] mod tests`.
+  transmitted frame, then asserts on the captured output. It covers
+  the handshake trio, the receiver-side set, the RFC 6298 set, the
+  connection-lifecycle corners (LastAck, FIN retransmit, TimeWait),
+  and the RFC 5681 controller. The harness lives in
+  `crates/net/tcp/src/tests.rs`, and includes a deterministic
+  egress-drop fixture for the loss-driven scenarios.
 - A `now_ms()` compile-time clock seam (`kernel_core::clock`) with a
   test-controllable host mock — the prerequisite for every
   timer-driven test.
 - TCP RFC 6298 retransmission: a per-conn retransmit ring, the RTO
   timer wired into the poll loop, exponential backoff, and the
   SRTT/RTTVAR estimator. A lost outbound segment is now resent.
+- TCP connection-lifecycle corners: `CloseWait → LastAck` with a
+  bounded FIN-retransmit timer, `FinWait* → TimeWait` with a 2×MSL
+  drop. They ride the same per-core poll-scan as the RTO timer
+  (`on_tcp_tick`).
+- TCP RFC 5681 congestion control: `cwnd`/`ssthresh`, slow start,
+  AIMD congestion avoidance, and three-dup-ACK fast retransmit /
+  fast recovery. (The controller is maintained as bookkeeping; a
+  cwnd-paced send window is a deferred follow-up.)
 - `quic` already host-builds; `//crates/proto/quic:quic_test`
   includes `end_to_end_self_handshake`, which drives a synthetic
   Initial through the receive path.
 - `net_classify` (RX parse) is host-tested via
   `//crates/net:classify_test`.
 
-What remains: RFC 5681 congestion control, QUIC loss recovery, and
-the feature-breadth items (window scaling, SACK) — steps 4 onward.
+What remains: QUIC loss recovery + congestion (step 5) and the
+feature-breadth items (window scaling, SACK) — steps 6 onward.
 
 ## Part 1 — Conformance-test strategy
 
@@ -139,16 +147,35 @@ optional feature.
 - **Have**: full state set (`Closed`…`TimeWait`), three-way handshake,
   in-order data transfer, FIN/close, RST generation + RFC 5961 RST
   acceptance check, per-core connection pool.
-- **Missing**: TIME-WAIT and FIN-WAIT timeouts (no timer — orphaned
-  connections leak, though the RFC 6298 retransmission timer is now a
-  model for wiring them); the MSS option is never *sent*
-  (`send_segment` hard-codes a 20-byte header); zero-window persist
-  relies on the peer's persist timer; no delayed-ACK coalescing (we
-  ACK immediately — correct, just not optimal).
+- **Missing**: the MSS option is never *sent* (`send_segment`
+  hard-codes a 20-byte header); zero-window persist relies on the
+  peer's persist timer; no delayed-ACK coalescing (we ACK
+  immediately — correct, just not optimal). The TIME-WAIT and
+  FIN-WAIT timeouts that used to be listed here are now closed —
+  see the lifecycle-corners note below.
 - **Conformance test**: done — the receiver-side scenarios
   (retransmitted SYN / stale-twin cleanup, duplicate/old data →
   immediate dup-ACK, out-of-order segment, RST at/off `rcv_nxt`)
-  landed in the harness as step 1.
+  landed in the harness as step 1, and the connection-lifecycle
+  scenarios (LastAck, FIN retransmit, TimeWait) followed.
+
+### RFC 9293 — connection-lifecycle corners (LastAck / TimeWait)
+
+- **Have**: `close()` on a peer-closed connection enters `LastAck`
+  and waits for the ACK; active close reaches `TimeWait` on the
+  peer FIN and holds for 2×MSL; an unacknowledged FIN is
+  retransmitted with exponential backoff and the connection is
+  forced shut after a bounded retry count. The timers ride the
+  per-core poll-scan (`on_tcp_tick`).
+- **Missing**: nothing material — simultaneous close shortcuts
+  `FinWait1 → TimeWait` rather than passing through a distinct
+  `Closing` state, which is a benign simplification for a
+  server-role stack.
+- **Conformance test**: done — `CloseWait → LastAck`, the LastAck
+  ACK completion, FIN retransmit on loss (both close directions)
+  and bounded give-up, `FinWait* → TimeWait`, the 2×MSL drop, and
+  the retransmitted-FIN re-ACK. The loss scenarios use the
+  harness's deterministic egress-drop fixture.
 
 ### RFC 6298 — retransmission timeout
 
@@ -159,11 +186,10 @@ optional feature.
   exponentially (§5.5); the SRTT/RTTVAR estimator (§2.2/§2.3) makes
   the RTO adaptive, with Karn's algorithm on the RTT samples. The
   former MUST violation is closed.
-- **Missing**: SYN-ACK and FIN retransmission (data segments only
-  today — a retransmitted client SYN already re-drives the SYN-ACK);
-  and an unacked window larger than the retransmit ring suspends
-  coverage until it drains (gone once RFC 5681 `cwnd` bounds the
-  in-flight window).
+- **Missing**: SYN-ACK retransmission (a retransmitted client SYN
+  already re-drives the SYN-ACK, so this is cosmetic); the FIN is
+  now covered by the lifecycle timer. An unacked window larger than
+  the retransmit ring still suspends coverage until it drains.
 - **Conformance test**: done — `tcp_test` scripts a send, drops the
   ACK, advances the mock clock past the RTO, and asserts the
   retransmit fires and the RTO doubles; a second case asserts an ACK
@@ -171,16 +197,21 @@ optional feature.
 
 ### RFC 5681 — congestion control
 
-- **Have**: nothing. No `cwnd`, no slow-start, no congestion
-  avoidance, no fast retransmit / fast recovery. The server sends what
-  fits the peer's advertised window.
-- **Missing**: the full controller — `cwnd`/`ssthresh`, slow-start,
-  AIMD congestion avoidance, the three-dup-ACK fast-retransmit trigger
-  and fast recovery (RFC 5681 §3.2).
-- **Conformance test**: depends on RFC 6298 landing first (fast
-  retransmit is a retransmission path). On the harness: script a loss,
-  feed three duplicate ACKs, assert fast retransmit fires and
-  `cwnd`/`ssthresh` move per spec.
+- **Have**: the controller. `cwnd`/`ssthresh` on the TCB, opened at
+  the 3·SMSS initial window; slow start grows `cwnd` one SMSS per
+  ACK, congestion avoidance adds the `SMSS·SMSS/cwnd` linear
+  approximation; an RTO collapses `cwnd` to one segment and halves
+  `ssthresh`; three duplicate ACKs trigger fast retransmit with the
+  §3.2 fast-recovery inflate/deflate. The controller is maintained
+  as bookkeeping today — a cwnd-paced send window (and the send
+  queue it needs) is a deferred follow-up.
+- **Missing**: the send path does not yet pace transmission against
+  `cwnd`; that, plus peer-rwnd flow control, is the windowed
+  send-path follow-up.
+- **Conformance test**: done — pure controller-arithmetic scenarios
+  (slow-start growth, the slow-start→CA switch, RTO collapse, the
+  2·SMSS ssthresh floor) plus harness scenarios for three-dup-ACK
+  fast retransmit and the fast-recovery inflate/deflate cycle.
 
 ### RFC 2018 — selective acknowledgement (SACK)
 
@@ -272,8 +303,10 @@ Dependency-ordered. Each step is test-first on the harness.
    timer-driven test.
 3. ✅ **TCP RFC 6298 (RTO)** — RTT estimator, RTO + backoff, the
    per-conn retransmit ring, the retransmission timer.
-4. **TCP RFC 5681 (congestion)** — `cwnd`/`ssthresh`, slow-start,
-   congestion avoidance, fast retransmit / fast recovery.
+4. ✅ **TCP RFC 5681 (congestion)** — `cwnd`/`ssthresh`, slow-start,
+   congestion avoidance, fast retransmit / fast recovery. (Plus the
+   connection-lifecycle corners — LastAck, TimeWait, FIN retransmit
+   — which slotted in alongside.)
 5. **QUIC RFC 9002 loss recovery + congestion** — wire the PTO timer
    and a controller onto the existing data model.
 6. **TCP RFC 7323 (window scaling + timestamps)** — widen `rcv_wnd`,
@@ -285,9 +318,9 @@ Dependency-ordered. Each step is test-first on the harness.
 10. **QUIC Interop Runner** — cross-implementation validation, after
     step 5.
 
-Steps 1–3 are complete. Steps 4–5 are the remaining headline
-correctness work (congestion control, both stacks); 6–8 are feature
-breadth; 9–10 are tooling.
+Steps 1–4 are complete. Step 5 (QUIC loss recovery + congestion) is
+the remaining headline correctness work; 6–8 are feature breadth;
+9–10 are tooling.
 
 ## Non-goals
 

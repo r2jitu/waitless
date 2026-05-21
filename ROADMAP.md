@@ -1001,13 +1001,12 @@ python3 scripts/bench.py --env hvf,native --cores 1,2,3 \
 
 #### Still to do (deferred TLS work)
 
-- [ ] **Session resumption** (PSK + session tickets, RFC 8446
-      §2.2). Skips the entire ECDSA sign + Certificate flight on
-      resumed connections; ~7× handshake-rate win on resumed
-      vs fresh. Roughly a day of state-machine work — the
-      profiler already pinpoints `cv_sign` at ~70 % of handshake
-      time, so this is the next big lever before QUIC. Tracked
-      separately in "Deferred work" below.
+- [x] **Session resumption** (PSK + session tickets, RFC 8446
+      §2.2) — shipped. `NewSessionTicket`, `pre_shared_key`
+      parsing, the `do_client_hello` PSK branch, and 0-RTT replay
+      protection all landed; a resumed handshake skips the ECDSA
+      sign + Certificate flight. See the closed-out "Deferred
+      work" entry below — only ticket-key rotation remains.
 - [ ] **Faster ECDSA P-256** — pure-Rust `p256` is the bottleneck
       after the SigningKey cache fix. Options: switch to
       `fiat-p256` (formally verified, ~2× faster, no C deps),
@@ -1413,24 +1412,36 @@ correctness; **not** a CSPRNG suitable for production. To upgrade:
 **Trigger**: before any production deployment that handles real
 cert generation, real session tickets, or real client auth.
 
-### Production certificate path
+### Production certificate path — shipped
 
-Today we ship a checked-in dev cert (`apps/webserver/dev_certs/`).
-Production needs:
+The dev build ships the checked-in self-signed cert
+(`apps/webserver/dev_certs/`); a production build bakes in a real
+Let's Encrypt certificate. Decision taken (vs boot-time ephemeral
+self-signed): a bundled CA chain — production-realistic, and it
+doesn't break certificate pinning.
 
-- [ ] Boot-time generation of an ephemeral Ed25519 keypair from
-      `kernel::rng` and a self-signed cert built with a minimal
-      X.509 DER builder (or a vendored trim of `rcgen`'s no_std
-      surface).
-- [ ] Optionally: bundle a real cert chain via `include_bytes!`
-      from a build-time fetch (e.g. an ACME issuance pipeline that
-      stamps the binary), with the private key encrypted at rest
-      and decrypted at boot via a kernel-supplied passphrase.
-- [ ] Decision: ephemeral self-signed (simplest, breaks pinning) vs
-      bundled chain (production-realistic, requires build-time
-      cert management).
+What landed:
 
-**Trigger**: when we want a public-facing TLS endpoint.
+- [x] ACME issuance externalised — `scripts/issue-cert.sh` runs
+      `lego` with the DNS-01 challenge, so the unikernel ships no
+      ACME client and needs no HTTP-01 handler. ACME-on-boot was
+      rejected: it would burn Let's Encrypt's 5-duplicate-certs/week
+      rate limit on reboots.
+- [x] The prod cert is decoupled from the Rust source — a
+      `--define tls_cert=prod` build `select()`s it from a
+      gitignored `apps/webserver/prod_certs/`, so renewal never
+      edits tracked source.
+- [x] `build_certificate` / `TlsServerConfig` send a full cert
+      chain (leaf + intermediate) — required for a real CA cert.
+- [x] Renewal automation — `scripts/renew-and-deploy.sh` (issue →
+      build with the prod define → deploy). A host cron or CI
+      schedule can drive it unattended.
+
+Remaining (not blocking a deploy):
+
+- [ ] Boot-time ephemeral self-signed cert from `kernel::rng` — an
+      alternative for endpoints that don't need CA trust.
+- [ ] Encrypt the bundled private key at rest, decrypt at boot.
 
 ### x86_64 SSE / AVX baseline via custom target JSON
 
@@ -1453,37 +1464,31 @@ sets `features: "+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+aes,
 crates, or when adding a crate requires a third "look up which
 intrinsic is failing" debugging session.
 
-### Session resumption (TLS 1.3 PSK + session tickets)
+### Session resumption (TLS 1.3 PSK + session tickets) — shipped
 
-Profiler shows `cv_sign` (ECDSA P-256 sign) at ~70 % of
-handshake wall time on every platform. Session resumption
-(RFC 8446 §2.2) skips the entire signature path on resumed
-connections — the server just HMACs a PSK binder and
-re-derives the key schedule. Resumed handshakes drop from
-~226 µs → ~30 µs (~7×).
+Profiler showed `cv_sign` (ECDSA P-256 sign) at ~70 % of handshake
+wall time. Session resumption (RFC 8446 §2.2) skips the entire
+signature path on resumed connections — the server HMACs a PSK
+binder and re-derives the key schedule.
 
-Implementation cost: moderate. Roughly one focused day:
+What landed (`tls/src/{ticket,replay,handlers}.rs`):
 
-- [ ] `NewSessionTicket` post-handshake message: encrypt
-      `(resumption_master_secret, ticket_age_add, max_early_data,
-      issued_at)` under a server-held ticket key, ship to client.
-- [ ] `pre_shared_key` extension parsing in `ClientHello`:
-      decrypt the ticket, validate freshness, validate the PSK
-      binder HMAC.
-- [ ] State-machine branch in `do_client_hello`: if PSK accepted,
-      skip Certificate + CertificateVerify in the server flight
-      and derive the application traffic secrets from the PSK
-      instead of from a fresh ECDHE.
-- [ ] Ticket key rotation. For dev cert / test purposes a static
-      key is fine; production needs a rotating keyring with
+- [x] `NewSessionTicket` post-handshake message — the resumption
+      secret + `ticket_age_add` + `issued_at` sealed under a
+      server-held ticket key.
+- [x] `pre_shared_key` extension parsing in `ClientHello` —
+      decrypt the ticket, validate freshness and the binder HMAC.
+- [x] `do_client_hello` PSK branch — an accepted PSK skips
+      Certificate + CertificateVerify and derives the traffic
+      secrets from the PSK.
+- [x] 0-RTT replay protection (`replay.rs`, RFC 9001 §5.5).
+- [x] Bench: `tls_resume` workload (`run_loadgen_tls_resume`).
+
+Remaining:
+
+- [ ] Ticket key rotation. `ticket.rs` uses a single static key —
+      fine for now; production wants a rotating keyring with an
       old-key acceptance window so tickets survive key rolls.
-- [ ] Bench: extend `tls_handshake_max` to optionally reuse
-      a session, or add `tls_resume_max` as a separate workload.
-
-**Trigger**: before QUIC if we want resumed-connection latency
-on the TLS-over-TCP path. After QUIC if we want it on the QUIC
-path too (QUIC reuses TLS 1.3 tickets with QUIC-specific
-extensions, RFC 9001 §4.6).
 
 ### Faster ECDSA P-256
 
@@ -1710,33 +1715,27 @@ Until one of those fires, the existing vtable boundary at
 is paying the dividend that matters most (app-side decoupling),
 and the unmet 20 % is speculative.
 
-### Bare-metal TCP corners (LastAck wait, TIME_WAIT, FIN retransmit)
+### Bare-metal TCP corners (LastAck wait, TIME_WAIT, FIN retransmit) — shipped
 
-`net/src/tcp.rs::close()`'s `CloseWait` branch sends FIN+ACK and
-frees immediately — no `LastAck` wait. Active close in
-`FinWait1`/`FinWait2` transitions straight to `Closed` on peer FIN
-— no `TIME_WAIT`. There is no FIN retransmit timer.
+`close()` used to free a connection the instant it sent its FIN —
+no `LastAck` wait, no `TIME_WAIT`, no FIN retransmit. Invisible on
+a loss-free LAN; on a lossy WAN a dropped FIN stranded the conn and
+a delayed segment from a reused 4-tuple could land in a fresh
+connection.
 
-On a local LAN / VM-NAT (loss-free) this is invisible. On a lossy
-WAN: a single dropped FIN strands the conn until the peer's
-keepalive fires; a delayed segment from a just-closed 4-tuple
-could be misinterpreted by a fresh connection that reuses the
-same ports.
+What landed:
 
-Implementation requires integrating the kernel timer wheel into
-TCP's sync packet handlers (callback fires → state-machine tick
-on the owning core), with generation-aware cancel on slot reuse:
+- [x] `CloseWait → LastAck` + a bounded FIN-retransmit timer
+      (exponential backoff, give up after `FIN_RETX_MAX`).
+- [x] `FinWait*` peer-FIN → `TimeWait` with a 2×MSL drop timer;
+      a retransmitted peer FIN in `TimeWait` is re-ACK'd.
+- [x] Lossy-network test fixture — a deterministic egress-drop
+      seam in the `tcp` conformance harness.
 
-- [ ] `CloseWait → LastAck` transition + retransmit timer.
-- [ ] `FinWait*` peer-FIN → `TimeWait` with 2×MSL drop timer.
-- [ ] Bounded FIN retransmit (e.g., 5 retries with exponential
-      backoff) before forcing close.
-- [ ] Lossy-network test fixture (drop N% of egress packets in
-      the bare-metal driver test seam).
-
-**Trigger**: WAN deployments, OR when QUIC lands and we want
-parity-class TCP behavior so apples-to-apples bench comparisons
-are honest. Probably ~1-2 days plus the test infrastructure.
+The timers ride the existing per-core poll-scan (`on_tcp_tick`,
+the RFC 6298 RTO tick generalised) rather than a separate timer
+wheel; generation-aware cancel falls out of `free_connection`
+zeroing the deadline. Conformance scenarios cover every transition.
 
 ### Optional macOS delayed-ACK regression check
 
