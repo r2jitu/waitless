@@ -53,7 +53,7 @@ use limine::request::{ExecutableCmdlineRequest, MpRequest, RsdpRequest};
 //
 // Also switches to our own 256 KiB stack before calling the Rust
 // entry. Limine's default stack is only 64 KiB, which
-// Server::new_boxed (+ TlsServerConfig::from_dev_cert + the
+// Server::new_boxed (+ TlsServerConfig::from_chain + the
 // RustCrypto scalar-mult temporaries) overruns, triple-faulting
 // the guest the moment main() starts. Matches boot/x86_64/boot.S
 // where the multiboot path uses a 256 KiB stack_top.

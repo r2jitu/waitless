@@ -84,10 +84,12 @@ pub const PT_BUF_LEN: usize = 17 * 1024;
 /// Static server configuration shared across all TLS connections.
 /// Must outlive every `TlsServer` that references it.
 pub struct TlsServerConfig {
-    /// DER-encoded X.509 certificate. We include it opaque — we don't
-    /// parse it, because the client's job is to verify it (or not,
-    /// in the `curl -k` case).
-    pub cert_der: &'static [u8],
+    /// DER-encoded X.509 certificate chain — the leaf first, then any
+    /// intermediate CA certificates. Opaque to us; the client's job
+    /// is to verify it (or not, in the `curl -k` case). A self-signed
+    /// dev cert is a one-element chain; a real CA leaf needs its
+    /// issuing intermediate appended or clients reject it.
+    pub cert_chain: &'static [&'static [u8]],
     /// Pre-constructed ECDSA P-256 signing key. Built once at config
     /// creation so the handshake hot path doesn't re-derive it on
     /// every connection.
@@ -105,18 +107,27 @@ pub struct TlsServerConfig {
 }
 
 impl TlsServerConfig {
-    /// Load from our checked-in dev cert. The dev key DER from
-    /// `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256`
-    /// is a PKCS#8 `PrivateKeyInfo` wrapping an RFC 5915 `ECPrivateKey`
-    /// SEQUENCE, which contains the 32-byte private scalar.
+    /// Build from a DER certificate chain (leaf first, then any
+    /// intermediates) and a PKCS#8 ECDSA P-256 private key. The dev
+    /// cert is a one-element chain; a Let's Encrypt leaf passes its
+    /// issuing intermediate as the second element.
     ///
-    /// Returns `None` if the PKCS#8 blob isn't the expected shape or
-    /// the extracted scalar isn't a valid P-256 private key.
-    pub fn from_dev_cert(cert_der: &'static [u8], pkcs8_key: &[u8]) -> Option<Self> {
+    /// The key DER from `openssl genpkey -algorithm EC -pkeyopt
+    /// ec_paramgen_curve:P-256` is a PKCS#8 `PrivateKeyInfo` wrapping
+    /// an RFC 5915 `ECPrivateKey` SEQUENCE, which holds the 32-byte
+    /// private scalar.
+    ///
+    /// Returns `None` if the chain is empty, the PKCS#8 blob isn't
+    /// the expected shape, or the extracted scalar isn't a valid
+    /// P-256 private key.
+    pub fn from_chain(cert_chain: &'static [&'static [u8]], pkcs8_key: &[u8]) -> Option<Self> {
+        if cert_chain.is_empty() {
+            return None;
+        }
         let seed = extract_p256_d_from_pkcs8(pkcs8_key)?;
         let signing_key = SigningKey::from_slice(&seed).ok()?;
         Some(TlsServerConfig {
-            cert_der,
+            cert_chain,
             signing_key,
         })
     }

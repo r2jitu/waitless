@@ -157,7 +157,7 @@ async fn init() {
     let h3_up = match http3::listen(
         HTTPS_PORT,
         handle_request_h3,
-        DEV_CERT_DER,
+        &[DEV_CERT_DER],
         DEV_KEY_PKCS8_DER,
     ) {
         Ok(()) => {
@@ -182,7 +182,7 @@ async fn init() {
     match tls::listen(
         HTTPS_PORT,
         handle_request_https,
-        DEV_CERT_DER,
+        &[DEV_CERT_DER],
         DEV_KEY_PKCS8_DER,
     ) {
         Ok(()) => waitless::println!(

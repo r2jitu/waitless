@@ -161,9 +161,10 @@ pub enum ListenError {
     Bind(waitless::runtime::TcpBindError),
 }
 
-/// One-call HTTPS listener. Parses `cert_der` + `key_der`, binds
-/// TCP on `port`, accepts each connection, wraps it in a
-/// `TlsStream`, and drives `http::serve_conn` on top.
+/// One-call HTTPS listener. Parses the DER `cert_chain` (leaf first,
+/// then intermediates) + `key_der`, binds TCP on `port`, accepts each
+/// connection, wraps it in a `TlsStream`, and drives
+/// `http::serve_conn` on top.
 ///
 /// Apps that want to advertise an HTTP/3 endpoint via `Alt-Svc`
 /// emit it themselves per-response — read `req.host_port()` and
@@ -174,7 +175,7 @@ pub enum ListenError {
 pub fn listen<H>(
     port: u16,
     handler: H,
-    cert_der: &'static [u8],
+    cert_chain: &'static [&'static [u8]],
     key_der: &'static [u8],
 ) -> Result<(), ListenError>
 where
@@ -186,7 +187,7 @@ where
         + Sync
         + 'static,
 {
-    let cfg = TlsServerConfig::from_dev_cert(cert_der, key_der).ok_or(ListenError::Cert)?;
+    let cfg = TlsServerConfig::from_chain(cert_chain, key_der).ok_or(ListenError::Cert)?;
     let cfg = Arc::new(cfg);
     let pool = TlsConnPool::new();
 

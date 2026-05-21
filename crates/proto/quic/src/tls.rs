@@ -556,10 +556,13 @@ impl QuicTls {
         // ~1 KB of handshake bytes and the ECDSA signing cost
         // (the slowest server-side step in our profile).
         if !resumed {
-            let mut cert_body = alloc::vec![0u8; 2048];
-            let cert_body_len =
-                build_certificate(config.cert_der, &mut cert_body).ok_or(QuicTlsError::Internal)?;
-            let mut cert_msg = alloc::vec![0u8; 2100];
+            // 4 KiB covers a self-signed dev cert and a real CA chain
+            // (leaf + one ECDSA intermediate); `build_certificate`
+            // fails the handshake cleanly if a larger chain overflows.
+            let mut cert_body = alloc::vec![0u8; 4096];
+            let cert_body_len = build_certificate(config.cert_chain, &mut cert_body)
+                .ok_or(QuicTlsError::Internal)?;
+            let mut cert_msg = alloc::vec![0u8; 4128];
             let cert_msg_len = encode_handshake(
                 msg_type::CERTIFICATE,
                 &cert_body[..cert_body_len],
@@ -925,7 +928,7 @@ mod tests {
         // Bundled dev cert + key. Same files the webserver uses.
         const CERT: &[u8] = include_bytes!("../../../../apps/webserver/dev_certs/dev_cert.der");
         const KEY: &[u8] = include_bytes!("../../../../apps/webserver/dev_certs/dev_key.der");
-        TlsServerConfig::from_dev_cert(CERT, KEY).expect("dev cert load")
+        TlsServerConfig::from_chain(&[CERT], KEY).expect("dev cert load")
     }
 
     #[test]

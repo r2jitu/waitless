@@ -51,7 +51,8 @@ pub fn build_encrypted_extensions(extras: &[(u16, &[u8])], out: &mut [u8]) -> Op
 // Certificate builder (RFC 8446 §4.4.2)
 // ============================================================================
 
-/// Build a TLS 1.3 `Certificate` message body with a single cert entry.
+/// Build a TLS 1.3 `Certificate` message body from a certificate
+/// chain — leaf first, then any intermediate CA certificates.
 ///
 /// Wire format:
 /// ```text
@@ -61,22 +62,34 @@ pub fn build_encrypted_extensions(extras: &[(u16, &[u8])], out: &mut [u8]) -> Op
 /// } Certificate;
 ///
 /// struct {
-///     opaque cert_data<1..2^24-1>;   /* X.509 DER */
+///     opaque cert_data<1..2^24-1>;     /* X.509 DER */
 ///     Extension extensions<0..2^16-1>; /* empty for us */
 /// } CertificateEntry;
 /// ```
 ///
-/// `cert_der` is the single X.509 DER cert we're sending. We don't support
-/// cert chains in this first cut — if the client needs intermediates they
-/// must already trust the leaf directly (self-signed dev cert case).
+/// `chain[0]` is the end-entity (leaf) certificate; `chain[1..]` are
+/// the intermediates a client needs to build a path to a trusted
+/// root. A self-signed dev cert is a one-element chain. A real CA
+/// (Let's Encrypt) leaf needs its issuing intermediate appended, or
+/// clients reject the connection with `unknown_ca`.
 ///
-/// Returns the number of bytes written. The layout is deterministic so
-/// the caller can predict the total size as:
-///   1 (ctx len=0) + 3 (list len) + 3 (cert len) + cert_der.len() + 2 (ext len=0)
-pub fn build_certificate(cert_der: &[u8], out: &mut [u8]) -> Option<usize> {
-    let entry_len = 3 + cert_der.len() + 2; // cert_len(3) + cert_der + ext_len(2)
-    let total = 1 + 3 + entry_len; // ctx_len(1) + list_len(3) + entry
-    if out.len() < total || cert_der.len() > 0xff_ffff {
+/// Returns the number of bytes written, or `None` if `out` is too
+/// small, the chain is empty, or the encoding overflows a 2^24 cap.
+pub fn build_certificate(chain: &[&[u8]], out: &mut [u8]) -> Option<usize> {
+    if chain.is_empty() {
+        return None;
+    }
+    // certificate_list is the concatenation of one CertificateEntry
+    // per cert: cert_len(3) + cert_data + ext_len(2).
+    let mut list_len = 0usize;
+    for cert in chain {
+        if cert.len() > 0xff_ffff {
+            return None;
+        }
+        list_len += 3 + cert.len() + 2;
+    }
+    let total = 1 + 3 + list_len; // ctx_len(1) + list_len(3) + entries
+    if out.len() < total || list_len > 0xff_ffff {
         return None;
     }
 
@@ -85,22 +98,24 @@ pub fn build_certificate(cert_der: &[u8], out: &mut [u8]) -> Option<usize> {
     out[p] = 0;
     p += 1;
     // certificate_list length (uint24, big-endian)
-    out[p] = ((entry_len >> 16) & 0xff) as u8;
-    out[p + 1] = ((entry_len >> 8) & 0xff) as u8;
-    out[p + 2] = (entry_len & 0xff) as u8;
+    out[p] = ((list_len >> 16) & 0xff) as u8;
+    out[p + 1] = ((list_len >> 8) & 0xff) as u8;
+    out[p + 2] = (list_len & 0xff) as u8;
     p += 3;
-    // CertificateEntry: cert_data length (uint24)
-    out[p] = ((cert_der.len() >> 16) & 0xff) as u8;
-    out[p + 1] = ((cert_der.len() >> 8) & 0xff) as u8;
-    out[p + 2] = (cert_der.len() & 0xff) as u8;
-    p += 3;
-    // cert_data
-    out[p..p + cert_der.len()].copy_from_slice(cert_der);
-    p += cert_der.len();
-    // extensions (u16 length = 0)
-    out[p] = 0;
-    out[p + 1] = 0;
-    p += 2;
+    for cert in chain {
+        // CertificateEntry: cert_data length (uint24)
+        out[p] = ((cert.len() >> 16) & 0xff) as u8;
+        out[p + 1] = ((cert.len() >> 8) & 0xff) as u8;
+        out[p + 2] = (cert.len() & 0xff) as u8;
+        p += 3;
+        // cert_data
+        out[p..p + cert.len()].copy_from_slice(cert);
+        p += cert.len();
+        // extensions (u16 length = 0)
+        out[p] = 0;
+        out[p + 1] = 0;
+        p += 2;
+    }
 
     debug_assert_eq!(p, total);
     Some(p)
@@ -311,10 +326,10 @@ mod tests {
 
     #[test]
     fn certificate_single_entry_layout() {
-        // 10-byte fake cert DER.
-        let cert_der = [0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce, 0x00, 0x01];
+        // 10-byte fake cert DER — a one-element chain (the dev cert).
+        let cert_der: [u8; 10] = [0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce, 0x00, 0x01];
         let mut out = [0u8; 64];
-        let n = build_certificate(&cert_der, &mut out).unwrap();
+        let n = build_certificate(&[&cert_der], &mut out).unwrap();
 
         // Expected: ctx_len(1) + list_len(3) + cert_len(3) + cert(10) + ext_len(2) = 19
         assert_eq!(n, 19);
@@ -328,6 +343,39 @@ mod tests {
         assert_eq!(&out[7..17], &cert_der[..]);
         // extensions length = 0
         assert_eq!(&out[17..19], &[0, 0]);
+    }
+
+    #[test]
+    fn certificate_two_entry_chain_layout() {
+        // A leaf + one intermediate — the shape of a real CA chain.
+        let leaf: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+        let intermediate: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let mut out = [0u8; 64];
+        let n = build_certificate(&[&leaf, &intermediate], &mut out).unwrap();
+
+        // ctx(1) + list_len(3) + [cert_len(3)+leaf(4)+ext(2)]
+        //                      + [cert_len(3)+intermediate(6)+ext(2)] = 24
+        assert_eq!(n, 24);
+        assert_eq!(out[0], 0, "request context is empty");
+        // certificate_list length = 9 + 11 = 20
+        assert_eq!(&out[1..4], &[0, 0, 20]);
+        // first entry: the leaf, leaf-first ordering
+        assert_eq!(&out[4..7], &[0, 0, 4], "first entry length = leaf");
+        assert_eq!(&out[7..11], &leaf[..]);
+        assert_eq!(&out[11..13], &[0, 0], "first entry extensions empty");
+        // second entry: the intermediate
+        assert_eq!(&out[13..16], &[0, 0, 6], "second entry length = intermediate");
+        assert_eq!(&out[16..22], &intermediate[..]);
+        assert_eq!(&out[22..24], &[0, 0], "second entry extensions empty");
+    }
+
+    #[test]
+    fn certificate_rejects_an_empty_chain() {
+        let mut out = [0u8; 64];
+        assert!(
+            build_certificate(&[], &mut out).is_none(),
+            "an empty chain has no leaf to send",
+        );
     }
 
     #[test]

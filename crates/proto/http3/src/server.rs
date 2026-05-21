@@ -50,15 +50,15 @@ impl From<QuicListenError> for ListenError {
 /// `handler` returns a `Response`; the framework sends it back as
 /// HEADERS + DATA + FIN on the request stream.
 ///
-/// `cert_der` and `key_pkcs8_der` are the same blobs `tls::
-/// acceptor` accepts.
+/// `cert_chain` (DER, leaf first then intermediates) and
+/// `key_pkcs8_der` are the same blobs `tls::listen` accepts.
 ///
 /// Returns once the server is bound; the listener stays alive for
 /// the duration of the program (waitless's task system retains it).
 pub fn listen<H>(
     port: u16,
     handler: H,
-    cert_der: &'static [u8],
+    cert_chain: &'static [&'static [u8]],
     key_pkcs8_der: &'static [u8],
 ) -> Result<(), ListenError>
 where
@@ -88,7 +88,7 @@ where
     quic::preinit();
 
     let handler = Arc::new(handler);
-    let listener = quic_listen(port, cert_der, key_pkcs8_der, move |conn: QuicConn| {
+    let listener = quic_listen(port, cert_chain, key_pkcs8_der, move |conn: QuicConn| {
         let handler = Arc::clone(&handler);
         async move {
             handle_conn(conn, handler).await;

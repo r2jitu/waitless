@@ -317,10 +317,11 @@ impl QuicConn {
     }
 }
 
-/// Start a per-worker QUIC server bound to `port`. `cert_der` and
-/// `key_pkcs8_der` are the same blobs `tls::acceptor` accepts
-/// — typically `include_bytes!`'d at compile time. `handler` runs
-/// once per accepted connection as `async fn(QuicConn) -> ()`.
+/// Start a per-worker QUIC server bound to `port`. `cert_chain`
+/// (DER, leaf first then intermediates) and `key_pkcs8_der` are the
+/// same blobs `tls::listen` accepts — typically `include_bytes!`'d
+/// at compile time. `handler` runs once per accepted connection as
+/// `async fn(QuicConn) -> ()`.
 ///
 /// Returns a `QuicListener` whose `Drop` tears down the listener
 /// and aborts in-flight conn tasks. Store on a long-lived owner
@@ -333,7 +334,7 @@ impl QuicConn {
 /// worker that received their first Initial.
 pub fn quic_listen<H, F>(
     port: u16,
-    cert_der: &'static [u8],
+    cert_chain: &'static [&'static [u8]],
     key_pkcs8_der: &'static [u8],
     handler: H,
 ) -> Result<QuicListener, QuicListenError>
@@ -341,10 +342,10 @@ where
     H: Fn(QuicConn) -> F + Send + Sync + 'static,
     F: Future<Output = ()> + 'static,
 {
-    let cfg = TlsServerConfig::from_dev_cert(cert_der, key_pkcs8_der)
+    let cfg = TlsServerConfig::from_chain(cert_chain, key_pkcs8_der)
         .ok_or(QuicListenError::CertOrKey)?;
     // Cross-worker captures must be Send + Sync. `TlsServerConfig`
-    // already is (cert is &'static [u8], SigningKey is Sync per p256).
+    // already is (the chain is &'static, SigningKey is Sync per p256).
     // Each per-worker future converts to Rc inside the task so the
     // hot path stays single-threaded.
     let cfg_arc: Arc<TlsServerConfig> = Arc::new(cfg);

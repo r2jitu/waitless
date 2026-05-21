@@ -453,11 +453,15 @@ impl TlsServer {
         // point of resumption.
         let t = if !resumed {
             // Certificate
-            // Build into a stack buffer; 2 KB handles our 500-ish-byte dev cert.
-            let mut cert_body = [0u8; 2048];
-            let cert_body_len = build_certificate(config.cert_der, &mut cert_body)
+            // Build into a stack buffer. 4 KiB covers a self-signed
+            // dev cert and a real CA chain (leaf + one ECDSA
+            // intermediate ≈ 1.6 KiB body); `build_certificate`
+            // returns `None` — failing the handshake cleanly — if a
+            // larger chain ever overflows it.
+            let mut cert_body = [0u8; 4096];
+            let cert_body_len = build_certificate(config.cert_chain, &mut cert_body)
                 .ok_or(HandshakeError::Internal)?;
-            let mut cert_msg = [0u8; 2100];
+            let mut cert_msg = [0u8; 4128];
             let cert_msg_len = encode_handshake(
                 msg_type::CERTIFICATE,
                 &cert_body[..cert_body_len],
