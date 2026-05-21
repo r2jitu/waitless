@@ -38,7 +38,7 @@ echo "    Instance type: $INSTANCE_TYPE"
 if [ -z "$ELF" ]; then
     echo "==> Building webserver..."
     cd "$PROJECT_ROOT"
-    bazel build //apps/webserver:webserver.elf 2>&1
+    bazel build --config=x86_64-waitless //apps/webserver:webserver.elf 2>&1
     ELF="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
 fi
 

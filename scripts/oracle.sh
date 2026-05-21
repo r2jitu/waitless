@@ -53,7 +53,7 @@ _require_oci() {
 _build() {
     echo "==> Building webserver.img..."
     cd "$PROJECT_ROOT"
-    bazel build //apps/webserver:webserver.img
+    bazel build --config=aarch64-waitless //apps/webserver:webserver.img
 }
 
 _push() {
