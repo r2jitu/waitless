@@ -151,7 +151,14 @@ impl TxFrame {
 enum ConnState {
     SynSent = 0,
     Established = 1,
-    Closed = 2,
+    /// The proxy has sent its FIN to the guest (the host socket hit
+    /// EOF) and is waiting for the guest's own FIN to finish the
+    /// four-way close. Distinct from `Closed` so the conn is kept
+    /// around long enough to acknowledge that FIN — without the ACK
+    /// the guest strands the connection in LastAck. Ordered below
+    /// `Closed` so the `state < Closed` reap guard keeps it alive.
+    FinWait = 2,
+    Closed = 3,
 }
 
 struct ProxyConn {
@@ -1522,10 +1529,15 @@ fn drain_conn_rx(
                             &[],
                         );
                         c.my_seq = c.my_seq.wrapping_add(1);
-                        c.state = ConnState::Closed;
-                        // Mirror the guest-initiated FIN path in handle_tcp:
-                        // drop the host fd now so the kernel socket leaves
-                        // CLOSE_WAIT instead of leaking until process exit.
+                        // Half-closed: we have sent our FIN, but the
+                        // guest still owes us its FIN. Stay in FinWait
+                        // (not Closed) so `handle_tcp` acknowledges
+                        // that FIN when it arrives and the guest's
+                        // LastAck completes instead of stranding.
+                        c.state = ConnState::FinWait;
+                        // Drop the host fd now so the kernel socket
+                        // leaves CLOSE_WAIT instead of leaking until
+                        // process exit.
                         unsafe {
                             libc::close(c.host_fd);
                         }

@@ -490,6 +490,19 @@ pub(super) fn handle_tcp(family: IpFamily, tcp: &[u8]) {
                     c.host_fd = -1;
                 }
             }
+            ConnState::FinWait => {
+                // The proxy already sent its FIN (host EOF). The
+                // guest's own FIN completes the four-way close — the
+                // reply path (below) acknowledges it; move to Closed
+                // so the conn is reaped. A bare ACK of our FIN (no
+                // FIN bit) needs no state change.
+                if flags & 0x01 != 0 {
+                    c.peer_ack = seq
+                        .wrapping_add(payload.len() as u32)
+                        .wrapping_add(1);
+                    c.state = ConnState::Closed;
+                }
+            }
             _ => {}
         }
         s
@@ -533,6 +546,18 @@ pub(super) fn handle_tcp(family: IpFamily, tcp: &[u8]) {
             if flags & 0x01 != 0 {
                 let ack = snap.ack.wrapping_add(1);
                 let f = build_tcp_reply(family, snap.port, src_port, snap.seq, ack, 0x11, &[]);
+                replies.push_back(f);
+            }
+        }
+        ConnState::FinWait => {
+            // The proxy has already sent its FIN (host EOF); reply to
+            // the guest's FIN with a bare ACK so its LastAck close
+            // completes. Without this the guest strands the
+            // connection waiting for an acknowledgement that never
+            // arrives.
+            if flags & 0x01 != 0 {
+                let ack = seq.wrapping_add(payload.len() as u32).wrapping_add(1);
+                let f = build_tcp_reply(family, snap.port, src_port, snap.seq, ack, 0x10, &[]);
                 replies.push_back(f);
             }
         }
