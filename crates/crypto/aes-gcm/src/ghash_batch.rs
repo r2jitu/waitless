@@ -399,15 +399,15 @@ unsafe fn absorb_8_x86(
     let h = xmm::load_h_powers(h_powers);
     let mut acc = xmm::acc_zero();
 
-    for i in 0..BATCH_BLOCKS {
-        let x_raw = _mm_loadu_si128(chunk.as_ptr().add(i * BLOCK_LEN) as *const __m128i);
+    for (i, (block, &hi)) in chunk.chunks_exact(BLOCK_LEN).zip(h.iter()).enumerate() {
+        let x_raw = _mm_loadu_si128(block.as_ptr() as *const __m128i);
         let x_rev = _mm_shuffle_epi8(x_raw, bswap);
         let yi = if i == 0 {
             _mm_xor_si128(state, x_rev)
         } else {
             x_rev
         };
-        xmm::karatsuba_accumulate(&mut acc, yi, h[i]);
+        xmm::karatsuba_accumulate(&mut acc, yi, hi);
     }
     let result = xmm::acc_reduce(acc);
     _mm_storeu_si128(y.as_mut_ptr() as *mut __m128i, result);

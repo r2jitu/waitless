@@ -91,6 +91,16 @@ fn psci_cpu_on(target_cpu: u64, entry_point: u64, context_id: u64) -> i64 {
 /// Code that needs all cores up before proceeding waits on its own
 /// signal: `eventloop::run` on each AP spins on `READY` until user
 /// init's `set_ready()` fires; tests use `kernel::wait_for_cores_online`.
+///
+/// # Safety
+///
+/// Must be called exactly once, by the BSP only, after the MMU,
+/// per-core areas, GIC, and page allocator are fully initialized.
+/// `cpu_count` must be the core count reported by the FDT — the
+/// loop issues PSCI `CPU_ON` for logical CPUs `1..cpu_count`, so a
+/// value larger than the platform's core count starts non-existent
+/// cores. Each AP runs the assembly trampoline and `ap_entry`,
+/// which assumes those facilities are already live.
 pub unsafe fn start_secondary_cores(cpu_count: u32) {
     if cpu_count <= 1 {
         return;
@@ -111,9 +121,11 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
         unsafe extern "C" {
             fn ap_trampoline();
         }
-        // Cast through a function pointer first; rust 1.93+ rejects
-        // casting a function item directly to an integer.
-        let entry = ap_trampoline as unsafe extern "C" fn() as u64;
+        // Cast through a function pointer, then `usize`, before
+        // widening to `u64`: rust 1.93+ rejects casting a function
+        // item directly to an integer, and clippy rejects casting a
+        // function pointer straight to `u64`.
+        let entry = ap_trampoline as unsafe extern "C" fn() as usize as u64;
         // PSCI return doesn't survive the HVF X0 writeback (see
         // `psci_cpu_on` docs), so we don't gate the loop on it. The
         // AP-incremented online counter is the source of truth, and
@@ -224,7 +236,8 @@ pub fn send_sgi_to(target_core: u32) {
             // Bits [23:16] = target CPU mask
             // Bits [3:0] = SGI INTID (0)
             let sgir = fdt.gic_dist_base + 0xF00;
-            let val: u32 = (1 << (16 + target_core)) | 0; // target core, SGI 0
+            // [23:16] = target CPU mask; [3:0] = SGI INTID 0 (zero).
+            let val: u32 = 1 << (16 + target_core);
             core::ptr::write_volatile(sgir as *mut u32, val);
         }
     }
@@ -264,7 +277,8 @@ pub fn request_shutdown() {
         } else {
             // GICv2: GICD_SGIR, broadcast to all other CPUs
             let sgir = fdt.gic_dist_base + 0xF00;
-            let val: u32 = (1 << 24) | 0; // target filter = all other, SGI 0
+            // [25:24] = 0b01 (target filter: all other PEs); [3:0] = SGI INTID 0 (zero).
+            let val: u32 = 1 << 24;
             core::ptr::write_volatile(sgir as *mut u32, val);
         }
     }

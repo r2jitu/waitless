@@ -257,7 +257,7 @@ mod boot_shim_x86 {
 
             // Try Multiboot2
             let mb2_total_size = ptr::read_volatile(boot_info_addr as *const u32);
-            if mb2_total_size >= 8 && mb2_total_size < 65536 {
+            if (8..65536).contains(&mb2_total_size) {
                 // Scan tags for memory map
                 let mut tag_addr = boot_info_addr + 8;
                 let mut mmap_addr: u64 = 0;
@@ -591,7 +591,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
         // serial port and is NIC-independent — always wire it. The
         // NIC-specific hooks (poll/drain/flush/rearm/idle) only make
         // sense when a NIC probed.
-        kernel_bare::eventloop::set_check_shutdown(|| serial::check_shutdown());
+        kernel_bare::eventloop::set_check_shutdown(serial::check_shutdown);
         if net_ok {
             net::init_eventloop();
             kernel_bare::eventloop::set_idle(idle_cb);
@@ -734,6 +734,17 @@ unsafe extern "C" fn serial_rx_isr_trampoline(
 // ============================================================================
 
 /// Legacy entry point called from boot.S.
+///
+/// # Safety
+///
+/// Must be called exactly once, by the boot assembly, on the BSP before
+/// any AP starts and with no other code running. The processor must be
+/// in 64-bit mode (x86_64) / EL1 (aarch64) with a valid stack. BSS is
+/// not yet zeroed — this function zeroes it. `boot_info_addr` is the
+/// raw boot-protocol pointer (x86_64: multiboot2/PVH info physical
+/// address, or 0 for none; aarch64: DTB physical address) and must
+/// either be 0 or point to a valid structure for the active protocol.
+/// Never returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kernel_main(boot_info_addr: u64) {
     unsafe {
@@ -771,6 +782,13 @@ pub unsafe extern "C" fn kernel_main(boot_info_addr: u64) {
 }
 
 /// Entry from Limine bootloader (BSS already zeroed, FDT/ECAM handled by limine_entry.rs).
+///
+/// # Safety
+///
+/// Must be called exactly once, by `limine_entry`, on the BSP before
+/// any AP starts. `info` must point to a fully populated, valid
+/// `BootInfo` that stays live for the rest of the kernel's lifetime.
+/// Never returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kernel_boot_from_bootinfo(info: *const BootInfo) {
     unsafe {

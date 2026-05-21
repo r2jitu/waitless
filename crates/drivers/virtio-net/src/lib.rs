@@ -176,6 +176,10 @@ pub(crate) struct QueuePairState {
 }
 
 impl QueuePairState {
+    // Holds atomics (interior mutability), but it's a one-shot value
+    // initializer: `init_qp_storage` moves it into freshly heap-
+    // allocated storage via `ptr::write`, never read in place.
+    #[allow(clippy::declare_interior_mutable_const)]
     pub(crate) const ZEROED: Self = QueuePairState {
         rx_buffers: [ptr::null_mut(); RX_BUFFERS],
         rx_lock: kernel_bare::sync::Spinlock::new(()),
@@ -216,6 +220,10 @@ pub(crate) struct WorkerTxPool {
 }
 
 impl WorkerTxPool {
+    // Holds atomics (interior mutability), but it's a one-shot value
+    // initializer: `init_qp_storage` moves it into freshly heap-
+    // allocated storage via `ptr::write`, never read in place.
+    #[allow(clippy::declare_interior_mutable_const)]
     pub(crate) const ZEROED: Self = WorkerTxPool {
         small: [const { TxBufSmall::ZERO }; TX_POOL_SMALL_SIZE],
         small_used: [const { core::sync::atomic::AtomicBool::new(false) }; TX_POOL_SMALL_SIZE],

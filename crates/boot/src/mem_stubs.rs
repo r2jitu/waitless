@@ -6,6 +6,13 @@
 // No `#[panic_handler]` here: this crate is a plain rlib linked into
 // the unikernel binary, whose sole handler lives in `entry`.
 
+/// Copy `n` bytes from `src` to `dest`.
+///
+/// # Safety
+///
+/// `dest` and `src` must each point to at least `n` valid bytes, with
+/// `dest` writable. The two regions must not overlap — use `memmove`
+/// when they might.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     unsafe {
@@ -18,6 +25,11 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut
     }
 }
 
+/// Fill `n` bytes at `dest` with the low byte of `val`.
+///
+/// # Safety
+///
+/// `dest` must point to at least `n` bytes that are valid and writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memset(dest: *mut u8, val: i32, n: usize) -> *mut u8 {
     unsafe {
@@ -31,6 +43,12 @@ pub unsafe extern "C" fn memset(dest: *mut u8, val: i32, n: usize) -> *mut u8 {
     }
 }
 
+/// Copy `n` bytes from `src` to `dest`, tolerating overlapping regions.
+///
+/// # Safety
+///
+/// `dest` and `src` must each point to at least `n` valid bytes, with
+/// `dest` writable. Unlike `memcpy`, the regions are allowed to overlap.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     unsafe {
@@ -51,6 +69,11 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mu
     }
 }
 
+/// Compare the first `n` bytes of `s1` and `s2`.
+///
+/// # Safety
+///
+/// Both `s1` and `s2` must point to at least `n` valid bytes to read.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
     unsafe {

@@ -118,6 +118,14 @@ pub fn eoi() {
 }
 
 /// Initialize the Local APIC on the current core (BSP or AP).
+///
+/// # Safety
+///
+/// Must be called exactly once on the BSP, before any AP starts, and
+/// before any other function in this module: it publishes `APIC_BASE`
+/// (read by every later `lapic()` call) and programs the LAPIC MMIO
+/// registers. The HHDM mapping (`mm::phys_to_virt`) must already be
+/// live, and CPUID must report a Local APIC.
 pub unsafe fn init() {
     unsafe {
         // Read APIC base from MSR
@@ -152,6 +160,13 @@ pub unsafe fn init() {
 
 /// Initialize the Local APIC on a secondary core (AP).
 /// The BSP has already disabled PIC and mapped the APIC base.
+///
+/// # Safety
+///
+/// Must be called on an AP after the BSP has already run `init()`,
+/// which publishes `APIC_BASE` (read here via `lapic()`). Writes the
+/// IA32_APIC_BASE MSR and the LAPIC MMIO registers for the current
+/// core.
 pub unsafe fn init_ap() {
     unsafe {
         // Read APIC base from MSR (same physical address as BSP)
@@ -167,6 +182,13 @@ pub unsafe fn init_ap() {
 }
 
 /// Send an IPI (Inter-Processor Interrupt) to a specific APIC ID.
+///
+/// # Safety
+///
+/// `init()` (or `init_ap()`) must have run on the calling core so the
+/// LAPIC MMIO is mapped. Delivering an IPI to `vector` runs that
+/// vector's handler on the target core; the caller must ensure that
+/// vector is a valid, installed entry.
 pub unsafe fn send_ipi(target_apic_id: u32, vector: u8) {
     let l = lapic();
     // Set destination in ICR high
@@ -188,6 +210,12 @@ fn wait_ipi_idle(l: &ApicRegs) {
 }
 
 /// Send INIT IPI to a target core.
+///
+/// # Safety
+///
+/// `init()` must have run on the calling core so the LAPIC MMIO is
+/// mapped. Resets the target core into wait-for-SIPI state; the
+/// caller must be driving the INIT-SIPI-SIPI startup sequence.
 pub unsafe fn send_init(target_apic_id: u32) {
     let l = lapic();
     l.icr_hi.write(target_apic_id << 24);
@@ -203,6 +231,13 @@ pub unsafe fn send_init(target_apic_id: u32) {
 /// Send Startup IPI (SIPI) to a target core.
 /// `vector` is the page number (4KB-aligned) where the AP trampoline lives.
 /// e.g., if trampoline is at 0x8000, vector = 0x08.
+///
+/// # Safety
+///
+/// `init()` must have run on the calling core so the LAPIC MMIO is
+/// mapped, and the target must already have received an INIT IPI. The
+/// caller must guarantee a valid AP trampoline is present at
+/// `vector << 12` physical, since the target begins executing there.
 pub unsafe fn send_sipi(target_apic_id: u32, vector: u8) {
     let l = lapic();
     l.icr_hi.write(target_apic_id << 24);
@@ -212,6 +247,12 @@ pub unsafe fn send_sipi(target_apic_id: u32, vector: u8) {
 }
 
 /// Broadcast INIT to all cores except self.
+///
+/// # Safety
+///
+/// `init()` must have run on the calling core so the LAPIC MMIO is
+/// mapped. Resets every other core into wait-for-SIPI state; the
+/// caller must be driving the INIT-SIPI-SIPI startup sequence.
 pub unsafe fn send_init_broadcast() {
     let l = lapic();
     l.icr_hi.write(0);
@@ -221,6 +262,13 @@ pub unsafe fn send_init_broadcast() {
 }
 
 /// Broadcast SIPI to all cores except self.
+///
+/// # Safety
+///
+/// `init()` must have run on the calling core so the LAPIC MMIO is
+/// mapped, and every other core must already have received an INIT
+/// IPI. The caller must guarantee a valid AP trampoline is present at
+/// `vector << 12` physical, since each target begins executing there.
 pub unsafe fn send_sipi_broadcast(vector: u8) {
     let l = lapic();
     l.icr_hi.write(0);

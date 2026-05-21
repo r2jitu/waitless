@@ -272,27 +272,27 @@ pub fn run(core_id: u32) -> ! {
         let mut did_work = false;
 
         // 1. Network poll: try to distribute RX + flush TX (rotating distributor)
-        if let Some(f) = NET_POLL.load() {
-            if f(core_id) {
-                did_work = true;
-                poll_work += 1;
-            }
+        if let Some(f) = NET_POLL.load()
+            && f(core_id)
+        {
+            did_work = true;
+            poll_work += 1;
         }
 
         // 2. Drain this core's inbox
-        if let Some(f) = NET_DRAIN.load() {
-            if f(core_id) {
-                did_work = true;
-                drain_work += 1;
-            }
+        if let Some(f) = NET_DRAIN.load()
+            && f(core_id)
+        {
+            did_work = true;
+            drain_work += 1;
         }
 
         // 3. App service (connections, handlers)
-        if let Some(f) = SERVICE.load() {
-            if f(core_id) {
-                did_work = true;
-                service_work += 1;
-            }
+        if let Some(f) = SERVICE.load()
+            && f(core_id)
+        {
+            did_work = true;
+            service_work += 1;
         }
 
         // 3a. Async runtime: advance timers (drain pending MPSC + fire
@@ -305,19 +305,19 @@ pub fn run(core_id: u32) -> ! {
 
         // 3b. Flush TX after service — responses must be sent immediately
         // so keep-alive follow-up requests arrive promptly.
-        if did_work {
-            if let Some(f) = NET_FLUSH.load() {
-                f();
-            }
+        if did_work
+            && let Some(f) = NET_FLUSH.load()
+        {
+            f();
         }
 
         // 4. Check for shutdown (every 64 iterations to avoid MMIO overhead).
         if loops & 63 == 0 {
-            if let Some(f) = CHECK_SHUTDOWN.load() {
-                if f() {
-                    request_shutdown();
-                    break;
-                }
+            if let Some(f) = CHECK_SHUTDOWN.load()
+                && f()
+            {
+                request_shutdown();
+                break;
             }
 
             // Periodic scheduling window for the host. With PL011 the
@@ -382,11 +382,11 @@ pub fn run(core_id: u32) -> ! {
             // next RX. The callback returns true if a packet already
             // landed between the last poll and now, in which case we
             // skip HLT and loop so we don't miss it.
-            if let Some(arm) = NET_REARM_RX.load() {
-                if arm(core_id) {
-                    idle_streak = 0;
-                    continue;
-                }
+            if let Some(arm) = NET_REARM_RX.load()
+                && arm(core_id)
+            {
+                idle_streak = 0;
+                continue;
             }
 
             // Sleep until interrupt. WFI/HLT yields the CPU to the
@@ -481,10 +481,10 @@ pub fn run(core_id: u32) -> ! {
     // App teardown — only the BSP runs this, and it runs before the
     // architectural power-off (which never returns). APs fall through
     // to their own CPU_OFF below without touching app state.
-    if core_id == 0 {
-        if let Some(f) = ON_SHUTDOWN.load() {
-            f();
-        }
+    if core_id == 0
+        && let Some(f) = ON_SHUTDOWN.load()
+    {
+        f();
     }
 
     // Shutdown — allow APs to print before exiting

@@ -246,6 +246,14 @@ unsafe fn set_idt_entry(vector: usize, handler_addr: u64, selector: u16, ist: u8
 /// Called from the assembly common stub after all GP registers are saved.
 /// Dispatches to registered Rust handlers, sends PIC EOI for hardware IRQs,
 /// and halts on unhandled CPU exceptions.
+///
+/// # Safety
+///
+/// Only the assembly `isr_common` stub may call this. `frame` must
+/// point at a fully-populated `InterruptFrame` on the interrupt
+/// stack, and `init()` must have run so the IDT and handler table are
+/// live. Each registered handler is itself trusted to be a valid
+/// `InterruptHandler`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
     unsafe {
@@ -255,7 +263,7 @@ pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
         if let Some(handler) = (*IDT.0.get()).handlers[vector] {
             handler(frame);
             // Send EOI for hardware IRQs (vectors 32-47) via PIC
-            if vector >= 32 && vector < 48 {
+            if (32..48).contains(&vector) {
                 if vector >= 40 {
                     outb(PIC2_CMD, 0x20); // Slave PIC EOI
                 }
@@ -270,7 +278,7 @@ pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
         // No handler registered — handle defaults
 
         // For hardware IRQs without handlers, just send EOI (spurious/unhandled)
-        if vector >= 32 && vector < 48 {
+        if (32..48).contains(&vector) {
             if vector >= 40 {
                 outb(PIC2_CMD, 0x20);
             }
@@ -364,9 +372,8 @@ pub fn init() {
         // Install all 256 ISR stubs into the IDT.
         // Type/attr = 0x8E: Present=1, DPL=0, Type=0xE (64-bit interrupt gate)
         // An interrupt gate automatically clears IF on entry (unlike a trap gate).
-        for i in 0..256 {
-            let stub_addr = isr_stub_table[i] as u64;
-            set_idt_entry(i, stub_addr, KERNEL_CODE_SELECTOR, 0, 0x8E);
+        for (i, &stub) in isr_stub_table.iter().enumerate() {
+            set_idt_entry(i, stub as u64, KERNEL_CODE_SELECTOR, 0, 0x8E);
         }
 
         // Load the IDTR

@@ -159,7 +159,7 @@ fn kvmclock_tsc_per_us() -> Option<u64> {
                 // Inverting: TSC_HZ = (1 << (32 - shift)) * 1e9 / mul,
                 // so cycles_per_us = TSC_HZ / 1e6.
                 let total_shift = 32i32 - shift as i32;
-                if total_shift < 0 || total_shift > 63 {
+                if !(0..=63).contains(&total_shift) {
                     return None;
                 }
                 let scale: u64 = 1u64 << total_shift;

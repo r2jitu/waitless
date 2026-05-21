@@ -566,7 +566,7 @@ fn build_register_page_list_cmd(
     // each) in a separate DMA-coherent buffer. 8 bytes per page,
     // rounded up. A 1024-page RX QPL needs 2 pages here.
     let list_bytes = (num_pages as usize) * 8;
-    let list_pages = (list_bytes + (PAGE_SIZE as usize) - 1) / (PAGE_SIZE as usize);
+    let list_pages = list_bytes.div_ceil(PAGE_SIZE as usize);
     let page_addrs_phys = alloc_pages(list_pages);
     if page_addrs_phys == 0 {
         log(b"[gvnic] failed to alloc page-address list\n");
@@ -583,7 +583,7 @@ fn build_register_page_list_cmd(
         let page_addr = base_phys + (i as u64) * (PAGE_SIZE as u64);
         let buf = page_addr.to_be_bytes();
         unsafe {
-            ptr::copy_nonoverlapping(buf.as_ptr(), (page_addrs_va as *mut u8).add(i * 8), 8);
+            ptr::copy_nonoverlapping(buf.as_ptr(), page_addrs_va.add(i * 8), 8);
         }
     }
 
@@ -780,8 +780,8 @@ fn alloc_tx_resources(fmt: QueueFormat) -> Option<TxAlloc> {
             // TX bounce-buffer pool: one packet buffer per ring slot.
             // send() copies the packet here so the descriptor can
             // hand the device a stable DMA address.
-            let bytes = (dqo::DQO_TX_POOL_BUFS as u32) * (RX_BUFFER_SIZE as u32);
-            let pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+            let bytes = dqo::DQO_TX_POOL_BUFS * (RX_BUFFER_SIZE as u32);
+            let pages = bytes.div_ceil(PAGE_SIZE);
             alloc_contig(pages as usize)
         }
     };
@@ -795,7 +795,7 @@ fn alloc_tx_resources(fmt: QueueFormat) -> Option<TxAlloc> {
             // TX completion ring — 8 bytes per entry, sized to
             // tx_compl_ring_size (use ring_entries for symmetry).
             let bytes = (TX_RING_ENTRIES as u32) * (dqo::DQO_TX_COMPL_SIZE as u32);
-            let pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+            let pages = bytes.div_ceil(PAGE_SIZE);
             let (p, v) = alloc_contig(pages as usize);
             if p == 0 {
                 log(b"[gvnic] failed to alloc TX compl ring\n");
@@ -824,7 +824,7 @@ fn alloc_rx_resources(fmt: QueueFormat) -> Option<RxAlloc> {
         QueueFormat::GqiQpl => 64,
         QueueFormat::DqoRda => dqo::DQO_RX_COMPL_SIZE as u32,
     };
-    let compl_pages = ((RX_RING_ENTRIES as u32) * compl_desc_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    let compl_pages = ((RX_RING_ENTRIES as u32) * compl_desc_size).div_ceil(PAGE_SIZE);
     let (compl_phys, compl_va) = alloc_contig(compl_pages as usize);
     if compl_phys == 0 {
         log(b"[gvnic] failed to alloc RX completion ring\n");
@@ -838,7 +838,7 @@ fn alloc_rx_resources(fmt: QueueFormat) -> Option<RxAlloc> {
         QueueFormat::GqiQpl => 8,
         QueueFormat::DqoRda => dqo::DQO_RX_DESC_SIZE as u32,
     };
-    let data_pages = ((RX_RING_ENTRIES as u32) * data_desc_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    let data_pages = ((RX_RING_ENTRIES as u32) * data_desc_size).div_ceil(PAGE_SIZE);
     let (data_phys, data_va) = alloc_contig(data_pages as usize);
     if data_phys == 0 {
         log(b"[gvnic] failed to alloc RX data ring\n");
@@ -857,8 +857,8 @@ fn alloc_rx_resources(fmt: QueueFormat) -> Option<RxAlloc> {
             // RX buffer pool: one 2 KiB packet buffer per pool slot.
             // The device DMA-writes received frames into these and
             // returns the matching buf_id in the completion.
-            let bytes = (dqo::DQO_RX_POOL_BUFS as u32) * (RX_BUFFER_SIZE as u32);
-            let pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+            let bytes = dqo::DQO_RX_POOL_BUFS * (RX_BUFFER_SIZE as u32);
+            let pages = bytes.div_ceil(PAGE_SIZE);
             alloc_contig(pages as usize)
         }
     };
@@ -913,13 +913,13 @@ fn build_create_tx_queue_cmd(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) -> Admi
     // refusing to bring up older devices that didn't advertise it.
     {
         let st = STATE.lock();
-        if let Some(s) = st.as_ref() {
-            if s.max_tx_ring != 0 {
-                assert!(
-                    TX_RING_ENTRIES >= s.min_tx_ring && TX_RING_ENTRIES <= s.max_tx_ring,
-                    "TX_RING_ENTRIES out of MODIFY_RING bounds"
-                );
-            }
+        if let Some(s) = st.as_ref()
+            && s.max_tx_ring != 0
+        {
+            assert!(
+                TX_RING_ENTRIES >= s.min_tx_ring && TX_RING_ENTRIES <= s.max_tx_ring,
+                "TX_RING_ENTRIES out of MODIFY_RING bounds"
+            );
         }
     }
     let mut cmd = AdminqCommand::new(OP_CREATE_TX_QUEUE);
@@ -966,13 +966,13 @@ fn build_create_rx_queue_cmd(
 ) -> AdminqCommand {
     {
         let st = STATE.lock();
-        if let Some(s) = st.as_ref() {
-            if s.max_rx_ring != 0 {
-                assert!(
-                    RX_RING_ENTRIES >= s.min_rx_ring && RX_RING_ENTRIES <= s.max_rx_ring,
-                    "RX_RING_ENTRIES out of MODIFY_RING bounds"
-                );
-            }
+        if let Some(s) = st.as_ref()
+            && s.max_rx_ring != 0
+        {
+            assert!(
+                RX_RING_ENTRIES >= s.min_rx_ring && RX_RING_ENTRIES <= s.max_rx_ring,
+                "RX_RING_ENTRIES out of MODIFY_RING bounds"
+            );
         }
     }
     let mut cmd = AdminqCommand::new(OP_CREATE_RX_QUEUE);
@@ -1117,15 +1117,15 @@ fn create_all_queues_batched(num_qp: u32, fmt: QueueFormat) -> bool {
     // commands). Order doesn't matter; do TX then RX.
     let mut tx_allocs: [Option<TxAlloc>; MAX_QUEUE_PAIRS] = [None; MAX_QUEUE_PAIRS];
     let mut rx_allocs: [Option<RxAlloc>; MAX_QUEUE_PAIRS] = [None; MAX_QUEUE_PAIRS];
-    for qp in 0..n {
-        tx_allocs[qp] = alloc_tx_resources(fmt);
-        if tx_allocs[qp].is_none() {
+    for slot in tx_allocs.iter_mut().take(n) {
+        *slot = alloc_tx_resources(fmt);
+        if slot.is_none() {
             return false;
         }
     }
-    for qp in 0..n {
-        rx_allocs[qp] = alloc_rx_resources(fmt);
-        if rx_allocs[qp].is_none() {
+    for slot in rx_allocs.iter_mut().take(n) {
+        *slot = alloc_rx_resources(fmt);
+        if slot.is_none() {
             return false;
         }
     }
@@ -1265,8 +1265,8 @@ fn post_initial_rx() {
     // descriptors carrying buf_id+buf_addr, then doorbell.
     let is_dqo = QUEUE_FORMAT_DQO.load(Ordering::Acquire);
     let bar2_va = BAR2_VA.load(Ordering::Acquire);
-    for qp in 0..MAX_QUEUE_PAIRS {
-        let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
+    for rx_slot in RX_QUEUES.iter() {
+        let rx_ptr = rx_slot.load(Ordering::Acquire);
         if rx_ptr.is_null() {
             continue;
         }

@@ -229,7 +229,7 @@ pub(crate) fn init_pci_modern() -> bool {
     // dropped. Leaving ctrl uninitialised in the single-queue case
     // avoids the wedge.
     if has_mq && num_pairs > 1 {
-        let ctrl_qi = (2 * max_pairs) as u16;
+        let ctrl_qi = 2 * max_pairs;
         vpci_select_queue(dev, ctrl_qi);
         let ctrl_qsize = vpci_get_queue_size(dev);
         if ctrl_qsize > 0 {
@@ -612,7 +612,7 @@ pub(crate) fn init_mmio() -> bool {
 
     // Init ctrl VQ if MQ negotiated and num_pairs > 1
     if has_mq && num_pairs > 1 {
-        let ctrl_qi = (2 * max_pairs) as u16;
+        let ctrl_qi = 2 * max_pairs;
         unsafe {
             if !(*ndev())
                 .ctrl_queue

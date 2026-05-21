@@ -264,7 +264,6 @@ mod aarch64 {
                 pci_init();
                 if virtio_console_init_pci() {
                     BACKEND.init(SerialBackend::Virtio);
-                    return;
                 }
             }
 
@@ -561,7 +560,7 @@ pub fn upgrade_after_pci() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         x86::upgrade_to_virtio_console();
-        return x86::is_virtio_console_active();
+        x86::is_virtio_console_active()
     }
     #[cfg(not(target_arch = "x86_64"))]
     false

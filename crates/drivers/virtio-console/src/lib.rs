@@ -537,12 +537,14 @@ pub extern "C" fn virtio_console_putc(c: u8) {
 
 /// Write `len` bytes from `ptr` to the console as a single batched
 /// TX submission per `CON_TX_BUF_LEN`-byte chunk — one MMIO notify
-/// + one used-ring poll per chunk. Used by `serial::aarch64::puts_raw`
-/// for the Virtio backend.
+/// plus one used-ring poll per chunk. Used by
+/// `serial::aarch64::puts_raw` for the Virtio backend.
 ///
-/// SAFETY: `ptr` must point at `len` valid bytes for the duration
-/// of the call. Caller holds SERIAL_TX_LOCK so no other thread is
-/// touching the static console state.
+/// # Safety
+///
+/// `ptr` must point at `len` valid bytes for the duration of the
+/// call. Caller holds SERIAL_TX_LOCK so no other thread is touching
+/// the static console state.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn virtio_console_puts(ptr: *const u8, len: usize) {
     if ptr.is_null() || len == 0 {

@@ -141,11 +141,10 @@ pub async fn bringup_dhcp() -> bool {
 
 /// `dns` is left at 0.0.0.0 — the stack doesn't resolve names.
 pub fn bringup_static(ip: types::Ipv4Addr, gateway: types::Ipv4Addr, netmask: types::Ipv4Addr) {
-    let ip_o = ip.octets();
-    let mask_o = netmask.octets();
-    let gw_o = gateway.octets();
-    dhcp::set_fallback_config(
-        ip_o[0], ip_o[1], ip_o[2], ip_o[3], mask_o[0], mask_o[1], mask_o[2], mask_o[3], gw_o[0],
-        gw_o[1], gw_o[2], gw_o[3], 0, 0, 0, 0, // DNS — unused
-    );
+    dhcp::set_fallback_config(&dhcp::FallbackConfig {
+        ip: ip.octets(),
+        subnet_mask: netmask.octets(),
+        gateway: gateway.octets(),
+        dns: [0, 0, 0, 0], // DNS — unused
+    });
 }

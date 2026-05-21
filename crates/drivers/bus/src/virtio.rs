@@ -584,7 +584,7 @@ impl Virtqueue {
         let first_region = (desc_size + avail_size + 4095) & !4095;
         let second_region = (used_size + 4095) & !4095;
         let total_size = first_region + second_region;
-        let num_frames = (total_size + 4095) / 4096;
+        let num_frames = total_size.div_ceil(4096);
 
         // Single contiguous allocation. The pre-talc frame
         // allocator scanned its bitmap and effectively handed out

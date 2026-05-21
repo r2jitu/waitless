@@ -72,7 +72,7 @@ pub use kernel_bare::percpu::num_cores as num_workers;
 ///   * `drain_work`    — iterations where the net-drain callback returned true
 ///   * `service_work`  — iterations where the app-service callback returned true
 ///   * `runtime_work`  — iterations where `executor::tick` polled a ready task
-///                       (the webserver's TCP/TLS/QUIC accept loops live here)
+///     (the webserver's TCP/TLS/QUIC accept loops live here)
 ///   * `idle_enters`   — number of times the core actually slept (HLT/WFI)
 ///   * `busy_cycles`   — cumulative cycles spent in the loop body (non-idle)
 ///   * `idle_cycles`   — cumulative cycles spent inside HLT/WFI

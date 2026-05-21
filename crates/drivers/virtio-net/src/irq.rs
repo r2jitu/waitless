@@ -105,22 +105,19 @@ pub(crate) fn enable_irq() {
 
         #[cfg(target_arch = "x86_64")]
         {
-            match (*ndev()).transport {
-                Transport::ModernPci { vpci_idx } => {
-                    let dev = vpci_device(vpci_idx);
-                    if dev.msix_cap_off != 0 && dev.msix_table != 0 {
-                        init_msix_x86(&dev, (*ndev()).num_queue_pairs as usize);
-                        // Enable notifications on each RX queue pair so the
-                        // first incoming packet triggers an MSI-X entry we
-                        // unmasked in init_msix_x86.
-                        let nqp = (*ndev()).num_queue_pairs as usize;
-                        for qp in 0..nqp {
-                            (*rx_q(qp)).enable_interrupts();
-                        }
-                        (*ndev()).irq_idle_available = true;
+            if let Transport::ModernPci { vpci_idx } = (*ndev()).transport {
+                let dev = vpci_device(vpci_idx);
+                if dev.msix_cap_off != 0 && dev.msix_table != 0 {
+                    init_msix_x86(&dev, (*ndev()).num_queue_pairs as usize);
+                    // Enable notifications on each RX queue pair so the
+                    // first incoming packet triggers an MSI-X entry we
+                    // unmasked in init_msix_x86.
+                    let nqp = (*ndev()).num_queue_pairs as usize;
+                    for qp in 0..nqp {
+                        (*rx_q(qp)).enable_interrupts();
                     }
+                    (*ndev()).irq_idle_available = true;
                 }
-                _ => {}
             }
         }
     }

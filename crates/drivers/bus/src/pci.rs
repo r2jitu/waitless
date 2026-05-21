@@ -365,12 +365,9 @@ fn init_inner() {
 
 pub fn find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
     let table = PCI_DEVICES.lock();
-    for i in 0..table.count {
-        if table.devices[i].vendor_id == vendor_id && table.devices[i].device_id == device_id {
-            return Some(i);
-        }
-    }
-    None
+    table.devices[..table.count]
+        .iter()
+        .position(|d| d.vendor_id == vendor_id && d.device_id == device_id)
 }
 
 /// Snapshot of `PCI_DEVICES[idx]` returned by value. PciDevice is Copy

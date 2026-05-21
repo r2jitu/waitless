@@ -239,6 +239,9 @@ fn claim_phys(heap: &mut Talc<ErrOnOom>, hhdm: u64, phys: u64, size: u64) -> u64
     }
 }
 
+// `info` is caller-validated (boot path passes a live BootInfo); marking
+// the fn `unsafe` would ripple into the `crates/boot` caller.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn init(info: *const BootInfo) {
     // SAFETY: caller passes a valid BootInfo pointer that lives for the
     // duration of init. Init runs single-threaded on the BSP before any
@@ -399,7 +402,15 @@ pub fn kmalloc(size: usize) -> *mut u8 {
     }
 }
 
-pub fn kfree(ptr: *mut u8) {
+/// Free a pointer previously returned by `kmalloc`.
+///
+/// # Safety
+///
+/// `ptr` must be null, or a pointer returned by an earlier `kmalloc`
+/// call that has not already been freed. `kfree` reads the 16-byte
+/// size prefix `kmalloc` stashed just before `ptr` to reconstruct the
+/// `talc` layout.
+pub unsafe fn kfree(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }

@@ -71,11 +71,11 @@ pub(crate) fn tx_diag() -> nic_api::TxDiag {
     // queue. Pool slot count instead would conflate small and big
     // pools — the descriptor-side count is the device's view.
     let nqp = unsafe { (*ndev()).negotiated_queue_pairs as usize };
-    for i in 0..nqp.min(DIAG_QP_CAP) {
+    for (i, slot) in inflight.iter_mut().enumerate().take(nqp.min(DIAG_QP_CAP)) {
         unsafe {
             let q = &*tx_q(i);
             // Outstanding descriptors = avail.idx - used.idx.
-            inflight[i] = (q.avail_idx().wrapping_sub(q.used_idx())) as u32;
+            *slot = (q.avail_idx().wrapping_sub(q.used_idx())) as u32;
         }
     }
     nic_api::TxDiag {
@@ -123,8 +123,8 @@ pub(crate) fn rx_used_cursors() -> [(u16, u16); DIAG_QP_CAP] {
     // up; the diag-array bound is what fits in the public API tuple.
     let n = unsafe { (*ndev()).negotiated_queue_pairs as usize }.min(DIAG_QP_CAP);
     unsafe {
-        for i in 0..n {
-            out[i] = (
+        for (i, slot) in out.iter_mut().enumerate().take(n) {
+            *slot = (
                 (*crate::rx_q(i)).used_idx(),
                 (*crate::rx_q(i)).last_used_cursor(),
             );

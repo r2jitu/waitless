@@ -211,10 +211,10 @@ fn extract_info(fdt: &fdt::Fdt) -> FdtInfo {
         info.ram_size = region.size.unwrap_or(0) as u64;
     }
 
-    if let Some(uart) = fdt.find_compatible(&["arm,pl011"]) {
-        if let Some(reg) = uart.reg().and_then(|mut r| r.next()) {
-            info.uart_base = reg.starting_address as u64;
-        }
+    if let Some(uart) = fdt.find_compatible(&["arm,pl011"])
+        && let Some(reg) = uart.reg().and_then(|mut r| r.next())
+    {
+        info.uart_base = reg.starting_address as u64;
     }
 
     // GIC: try v3 first, fall back to v2 names.
@@ -231,10 +231,10 @@ fn extract_info(fdt: &fdt::Fdt) -> FdtInfo {
         if let Some(r) = regs.next() {
             info.gic_dist_base = r.starting_address as u64;
         }
-        if version == 3 {
-            if let Some(r) = regs.next() {
-                info.gic_redist_base = r.starting_address as u64;
-            }
+        if version == 3
+            && let Some(r) = regs.next()
+        {
+            info.gic_redist_base = r.starting_address as u64;
         }
     }
 
@@ -257,11 +257,11 @@ fn extract_info(fdt: &fdt::Fdt) -> FdtInfo {
             info.pcie_ecam_base = reg.starting_address as u64;
             info.pcie_ecam_size = reg.size.unwrap_or(0) as u64;
         }
-        if let Some(ranges) = pci.property("ranges") {
-            if let Some((base, size)) = parse_pci_mmio32(ranges.value) {
-                info.pci_mmio32_base = base;
-                info.pci_mmio32_size = size;
-            }
+        if let Some(ranges) = pci.property("ranges")
+            && let Some((base, size)) = parse_pci_mmio32(ranges.value)
+        {
+            info.pci_mmio32_base = base;
+            info.pci_mmio32_size = size;
         }
         if let Some(imap) = pci.property("interrupt-map") {
             parse_pci_interrupt_map(imap.value, &mut info.pci_irqs);
@@ -269,10 +269,10 @@ fn extract_info(fdt: &fdt::Fdt) -> FdtInfo {
     }
 
     // HVF cooperative yield register.
-    if let Some(node) = fdt.find_compatible(&["hvf,yield"]) {
-        if let Some(reg) = node.reg().and_then(|mut r| r.next()) {
-            info.yield_mmio_base = reg.starting_address as u64;
-        }
+    if let Some(node) = fdt.find_compatible(&["hvf,yield"])
+        && let Some(reg) = node.reg().and_then(|mut r| r.next())
+    {
+        info.yield_mmio_base = reg.starting_address as u64;
     }
 
     // /chosen/bootargs — kernel command line. Some firmwares
@@ -283,18 +283,18 @@ fn extract_info(fdt: &fdt::Fdt) -> FdtInfo {
     // Copy into the inline buffer; truncate (don't fail) if the
     // string overflows BOOT_ARGS_MAX so a too-long arg degrades
     // gracefully.
-    if let Some(chosen) = fdt.find_node("/chosen") {
-        if let Some(prop) = chosen.property("bootargs") {
-            let mut bytes = prop.value;
-            if let Some((&last, head)) = bytes.split_last() {
-                if last == 0 {
-                    bytes = head;
-                }
-            }
-            let n = bytes.len().min(BOOT_ARGS_MAX);
-            info.boot_args_buf[..n].copy_from_slice(&bytes[..n]);
-            info.boot_args_len = n;
+    if let Some(chosen) = fdt.find_node("/chosen")
+        && let Some(prop) = chosen.property("bootargs")
+    {
+        let mut bytes = prop.value;
+        if let Some((&last, head)) = bytes.split_last()
+            && last == 0
+        {
+            bytes = head;
         }
+        let n = bytes.len().min(BOOT_ARGS_MAX);
+        info.boot_args_buf[..n].copy_from_slice(&bytes[..n]);
+        info.boot_args_len = n;
     }
 
     info

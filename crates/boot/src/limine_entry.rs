@@ -201,6 +201,18 @@ static LIMINE_BOOT_INFO: LimineBootInfoCell =
         rsdp_paddr: 0,
     }));
 
+/// Rust entry point for the Limine boot path, tail-called from
+/// `limine_entry_stub` after it has switched to the kernel stack and
+/// enabled the SSE/AVX OS-level bits.
+///
+/// # Safety
+///
+/// Must be called exactly once, by `limine_entry_stub`, on the BSP
+/// before any AP starts. It relies on Limine having satisfied the
+/// `.limine_requests` statics in this file. Reads device MMIO
+/// (aarch64 FDT/ECAM) and writes the `LIMINE_BOOT_INFO` static, so it
+/// must run single-threaded with no concurrent access to that static.
+/// Never returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn limine_entry() {
     // Build the BootInfo in a local first; commit to LIMINE_BOOT_INFO once
@@ -340,6 +352,14 @@ unsafe extern "C" fn limine_ap_stub(cpu: &limine::mp::Cpu) -> ! {
 ///
 /// no_mangle + extern "C" so boot/entry.rs can call this by linker
 /// name without pulling the limine crate into its dep list.
+///
+/// # Safety
+///
+/// Must be called once, on the BSP, after the kernel is far enough
+/// along to handle APs joining the event loop (APIC and per-CPU state
+/// initialised). It writes each AP's `goto_address`, releasing it into
+/// `limine_ap_stub`, so it relies on Limine having satisfied
+/// `MP_REQUEST` and on the parked APs still being valid.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn start_aps_via_limine_mp() -> u32 {

@@ -128,11 +128,14 @@ mod aarch64 {
 
     const MAX_IRQS: usize = 256;
 
+    /// Fixed-size table of optional per-INTID handler function pointers.
+    type IrqHandlerTable = [Option<fn(u32)>; MAX_IRQS];
+
     // IRQ handler table. Registered on the BSP during boot via
     // `register_irq_handler`; read from the exception handler on any
     // core. Per-slot writes + reads are single-word and tearing-safe
     // on aarch64. Wrapped in `UnsafeCell` + `unsafe impl Sync`.
-    struct IrqHandlersCell(core::cell::UnsafeCell<[Option<fn(u32)>; MAX_IRQS]>);
+    struct IrqHandlersCell(core::cell::UnsafeCell<IrqHandlerTable>);
     // SAFETY: single-writer (BSP) with single-word slot stores; readers
     // only observe fully-published handler pointers.
     unsafe impl Sync for IrqHandlersCell {}
@@ -170,10 +173,10 @@ mod aarch64 {
                     asm!("mrs {}, ICC_IAR1_EL1", out(reg) iar);
                     let intid = (iar & 0xFF_FFFF) as u32;
                     if intid < 1020 {
-                        if (intid as usize) < MAX_IRQS {
-                            if let Some(handler) = (*IRQ_HANDLERS.0.get())[intid as usize] {
-                                handler(intid);
-                            }
+                        if (intid as usize) < MAX_IRQS
+                            && let Some(handler) = (*IRQ_HANDLERS.0.get())[intid as usize]
+                        {
+                            handler(intid);
                         }
                         asm!("msr ICC_EOIR1_EL1, {}", in(reg) iar);
                     }
@@ -181,10 +184,10 @@ mod aarch64 {
                     let iar = gicc().iar.read();
                     let irq = iar & 0x3FF;
                     if irq < 1020 {
-                        if (irq as usize) < MAX_IRQS {
-                            if let Some(handler) = (*IRQ_HANDLERS.0.get())[irq as usize] {
-                                handler(irq);
-                            }
+                        if (irq as usize) < MAX_IRQS
+                            && let Some(handler) = (*IRQ_HANDLERS.0.get())[irq as usize]
+                        {
+                            handler(irq);
                         }
                         gicc().eoir.write(iar);
                     }

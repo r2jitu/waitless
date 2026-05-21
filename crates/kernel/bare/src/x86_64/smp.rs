@@ -68,6 +68,15 @@ pub fn num_cores_online() -> u32 {
 /// pool, and the wrapper extracts the LAPIC ID from the `Cpu` struct
 /// before calling us. Keeping the `Cpu` type confined to the boot
 /// crate lets `kernel` avoid a build-time dep on the limine crate.
+///
+/// # Safety
+///
+/// Only the Limine MP boot path may call this, once per AP. Limine
+/// must have already placed this core in 64-bit long mode on its own
+/// page tables with a valid stack, and the BSP must have completed
+/// `mm::init` / `apic::init` / `idt::init` / `acpi::detect_cpus`
+/// before any AP starts. `apic_id` must be this core's true LAPIC ID.
+/// Does not return.
 pub unsafe extern "C" fn ap_entry_via_limine(apic_id: u32) -> ! {
     // Enable SSE + AVX on this AP. Limine puts us in long mode but
     // doesn't touch CR4 / XCR0 — those are per-CPU register bits the
@@ -157,6 +166,15 @@ pub unsafe extern "C" fn ap_entry_via_limine(apic_id: u32) -> ! {
 }
 
 /// Boot secondary cores via INIT-SIPI-SIPI (Multiboot2 / PVH path).
+///
+/// # Safety
+///
+/// BSP-only, called once. Used only on the Multiboot2 / PVH boot
+/// path, where low physical memory (including the trampoline page at
+/// `AP_TRAMPOLINE_ADDR`) is identity-mapped — never under Limine.
+/// `mm::init`, `apic::init`, `idt::init`, and `acpi::detect_cpus`
+/// must have run, and `cpu_count` must match the ACPI topology. This
+/// overwrites the page at `AP_TRAMPOLINE_ADDR` with the AP trampoline.
 pub unsafe fn start_secondary_cores(cpu_count: u32) {
     if cpu_count <= 1 {
         return;

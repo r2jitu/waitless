@@ -151,8 +151,8 @@ pub(crate) fn send(data: &[u8], csum: nic_api::CsumOffload) {
 // `None` from `acquire_tx_buf` — the caller falls back to the
 // legacy `send(&[u8])` + per-core staging path.
 
-/// Pool ID embedded in `TxBufHandle::driver_token` so `release_fn`
-/// + `submit_tx*` know which pool's `_used` array to update and
+/// Pool ID embedded in `TxBufHandle::driver_token` so `release_fn` +
+/// `submit_tx*` know which pool's `_used` array to update and
 /// which slot array to index. Only two pools today (small + big),
 /// one bit of the token is sufficient.
 const POOL_ID_SMALL: u8 = 0;

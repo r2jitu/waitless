@@ -96,7 +96,7 @@ unsafe fn find_rsdp_bios_scan() -> u64 {
 unsafe fn find_table(sdt_phys: u64, entry_size: u64, sig: [u8; 4]) -> u64 {
     let sdt_len: u32 = read_phys(sdt_phys + 4);
     let sdt_len = sdt_len as usize;
-    if sdt_len < SDT_HEADER_LEN || sdt_len > MAX_TABLE_LEN {
+    if !(SDT_HEADER_LEN..=MAX_TABLE_LEN).contains(&sdt_len) {
         return 0;
     }
     let entry_count = (sdt_len - SDT_HEADER_LEN) as u64 / entry_size;
@@ -211,6 +211,16 @@ unsafe fn locate_root_sdt() -> (u64, u64) {
 /// re-parsing (and rather than panicking on InitOnce double-init). The
 /// virtio_net driver and boot/entry both call this; the first wins,
 /// the rest read the cached value.
+///
+/// # Safety
+///
+/// The HHDM mapping (`mm::phys_to_virt`) must be live, since this
+/// dereferences boot-protocol or BIOS-scan-derived physical addresses
+/// while walking the ACPI tables. The boot loader's RSDP hint
+/// (`set_rsdp`) must have been seeded under UEFI where the legacy
+/// BIOS-area scan fails. Behaviour relies on the firmware-provided
+/// ACPI structures being well-formed; only the length fields are
+/// range-checked.
 pub unsafe fn detect_cpus() -> u32 {
     if let Some(t) = TOPOLOGY.try_get() {
         return t.cpu_count;
@@ -265,6 +275,13 @@ pub fn topology() -> &'static CpuTopology {
 ///
 /// We pick the first entry covering segment 0, bus 0 — on QEMU q35
 /// and GCE there is exactly one.
+///
+/// # Safety
+///
+/// The HHDM mapping (`mm::phys_to_virt`) must be live, since this
+/// dereferences boot-protocol or BIOS-scan-derived physical addresses
+/// while walking the ACPI RSDT/XSDT and MCFG tables. The boot
+/// loader's RSDP hint (`set_rsdp`) must have been seeded under UEFI.
 pub unsafe fn mcfg_ecam_base() -> Option<u64> {
     let (sdt_phys, entry_size) = locate_root_sdt();
     if sdt_phys == 0 {
@@ -279,7 +296,7 @@ pub unsafe fn mcfg_ecam_base() -> Option<u64> {
     let total_len: u32 = read_phys(mcfg + 4);
     let total_len = total_len as usize;
     // Header (36) + reserved (8) + at least one 16-byte allocation.
-    if total_len < 60 || total_len > MAX_TABLE_LEN {
+    if !(60..=MAX_TABLE_LEN).contains(&total_len) {
         return None;
     }
 

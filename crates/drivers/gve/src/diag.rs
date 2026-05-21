@@ -153,8 +153,8 @@ pub fn tx_desc_log_snapshot(out: &mut [TxDescLogEntry]) -> usize {
     } else {
         0
     };
-    for i in 0..n {
-        out[i] = log.entries[(start + i) % TX_DESC_LOG_DEPTH];
+    for (i, dst) in out.iter_mut().take(n).enumerate() {
+        *dst = log.entries[(start + i) % TX_DESC_LOG_DEPTH];
     }
     n
 }

@@ -241,7 +241,7 @@ pub(crate) fn handle_icmpv6(
             };
             // Respond if the target is one of our addresses
             // (link-local OR the SLAAC global).
-            let is_ours = ns.target == ipv6_ll() || ipv6_global().map_or(false, |g| g == ns.target);
+            let is_ours = ns.target == ipv6_ll() || ipv6_global().is_some_and(|g| g == ns.target);
             if !is_ours {
                 return;
             }

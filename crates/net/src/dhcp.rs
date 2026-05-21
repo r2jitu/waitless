@@ -341,30 +341,27 @@ pub async fn discover() -> bool {
     true
 }
 
+/// Fallback network config in octet form — the four IPv4 addresses
+/// `set_fallback_config` needs, each as a `[u8; 4]`.
+pub struct FallbackConfig {
+    pub ip: [u8; 4],
+    pub subnet_mask: [u8; 4],
+    pub gateway: [u8; 4],
+    pub dns: [u8; 4],
+}
+
 /// Set fallback network config (called from `bringup_static` when
 /// the app opts out of DHCP, or from a failure-retry path).
-pub fn set_fallback_config(
-    ip_a: u8,
-    ip_b: u8,
-    ip_c: u8,
-    ip_d: u8,
-    mask_a: u8,
-    mask_b: u8,
-    mask_c: u8,
-    mask_d: u8,
-    gw_a: u8,
-    gw_b: u8,
-    gw_c: u8,
-    gw_d: u8,
-    dns_a: u8,
-    dns_b: u8,
-    dns_c: u8,
-    dns_d: u8,
-) {
+pub fn set_fallback_config(cfg: &FallbackConfig) {
     CONFIG.store(types::NetConfig {
-        ip: Ipv4Addr::from(ip_a, ip_b, ip_c, ip_d),
-        subnet_mask: Ipv4Addr::from(mask_a, mask_b, mask_c, mask_d),
-        gateway: Ipv4Addr::from(gw_a, gw_b, gw_c, gw_d),
-        dns: Ipv4Addr::from(dns_a, dns_b, dns_c, dns_d),
+        ip: Ipv4Addr::from(cfg.ip[0], cfg.ip[1], cfg.ip[2], cfg.ip[3]),
+        subnet_mask: Ipv4Addr::from(
+            cfg.subnet_mask[0],
+            cfg.subnet_mask[1],
+            cfg.subnet_mask[2],
+            cfg.subnet_mask[3],
+        ),
+        gateway: Ipv4Addr::from(cfg.gateway[0], cfg.gateway[1], cfg.gateway[2], cfg.gateway[3]),
+        dns: Ipv4Addr::from(cfg.dns[0], cfg.dns[1], cfg.dns[2], cfg.dns[3]),
     });
 }
