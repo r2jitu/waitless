@@ -29,13 +29,6 @@
 //     X25519 share; HRR is for negotiating a different group)
 //   * Key update (1-RTT key rotation; RFC 9001 §6)
 
-// The connection state machine is the consumer of this module.
-// Until that crate lands, the public API surface here looks
-// dead-code from the workspace's perspective — silence the
-// `#![deny(warnings)]` on the items the connection state machine
-// will wire into.
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 
 use p256::ecdsa::{Signature as EcdsaSignature, signature::Signer};
@@ -792,12 +785,6 @@ impl RxBuf {
     /// Total contiguous bytes available right now.
     pub(crate) fn len(&self) -> usize {
         self.contiguous.len()
-    }
-
-    /// Stream-offset of the END of `contiguous` (i.e. next byte the
-    /// peer can send to extend our window).
-    pub(crate) fn next_offset(&self) -> u64 {
-        self.consumed
     }
 
     /// Discard a prefix of `n` bytes from the contiguous buffer

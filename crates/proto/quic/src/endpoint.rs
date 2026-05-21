@@ -38,8 +38,6 @@
 // routes them to, so a single connection always lands on the
 // same worker — no cross-worker state migration.
 
-#![allow(dead_code)]
-
 use alloc::rc::Rc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;

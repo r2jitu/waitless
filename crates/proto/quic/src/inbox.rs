@@ -29,8 +29,6 @@
 // zero and the slot's `Weak::upgrade()` returns `None` — no
 // manual deregistration needed.
 
-#![allow(dead_code)]
-
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::rc::{Rc, Weak};

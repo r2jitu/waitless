@@ -24,8 +24,6 @@
 //   * `max_udp_payload_size`, `ack_delay_exponent`, `max_ack_delay`
 //   * `active_connection_id_limit`, `retry_source_connection_id`
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 
 use crate::wire::{WireError, read_varint, write_varint};

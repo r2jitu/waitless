@@ -61,8 +61,6 @@
 //               `process_ack`, `detect_loss`, `update_rtt`,
 //               `record_sent_packet`, PTO timer + probe.
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 
 use crate::tls::{QuicTls, QuicTlsError};
@@ -196,10 +194,12 @@ pub(super) struct SentPacket {
     /// for the simple cases — both flags currently coincide for our
     /// stack (we don't pad-only) but keep them split for clarity and
     /// to ease future congestion-control work.
+    #[allow(dead_code)] // reserved for the eventual congestion controller
     pub(super) in_flight: bool,
     /// On-the-wire byte count of the sealed packet. Drives bytes-
     /// in-flight; not used yet but recorded for the eventual
     /// congestion controller.
+    #[allow(dead_code)] // reserved for the eventual congestion controller
     pub(super) byte_count: u32,
 }
 

@@ -33,8 +33,6 @@
 //     advertised initial limits in transport_params are sized so
 //     a small request/response fits without ever blocking.
 
-#![allow(dead_code)]
-
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
