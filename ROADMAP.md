@@ -1443,6 +1443,28 @@ Remaining (not blocking a deploy):
       alternative for endpoints that don't need CA trust.
 - [ ] Encrypt the bundled private key at rest, decrypt at boot.
 
+### HTTP/3 over the GCE gve NIC crashes the unikernel
+
+h3 works on the HVF runner (virtio-net) and passes the `test_hvf` h3
+scenarios, but on a real GCE instance with the `gve` NIC the first
+inbound QUIC packet halts the kernel: an unhandled page fault inside
+`talc::Talc::free` with `cr2 = -8` — `free()` handed a null/garbage
+pointer, i.e. heap corruption (a bad free) on the QUIC RX path.
+
+TCP over `gve` is unaffected — the bench workloads exercise it
+heavily — so only the UDP/QUIC consumption path is implicated, and it
+has never run on `gve` before (h3 was only ever exercised on the HVF
+virtio-net path).
+
+- [ ] Reproduce under a debug allocator / heap canaries to catch the
+      corrupting write rather than the downstream `free` fault.
+- [ ] Audit the QUIC datagram RX path's handling of `gve` RX IOBufs
+      (`External` device buffers vs `Heap`) — prime suspect is an
+      IOBuf ownership / drop-callback mismatch specific to `gve`.
+
+**Trigger**: when h3 is wanted on a GCE deployment. Until then the
+deploy keeps `udp:443` firewall-closed (`scripts/deploy-gcloud.sh`).
+
 ### x86_64 SSE / AVX baseline via custom target JSON
 
 The cpufeatures fix is currently a **per-crate** rustc_flags

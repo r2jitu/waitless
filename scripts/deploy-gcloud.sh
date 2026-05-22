@@ -324,12 +324,14 @@ deploy() {
         --project="$PROJECT" \
         --quiet
 
-    # udp:443 is load-bearing: HTTP/3 is QUIC over UDP. Without it the
-    # h3 listener is unreachable and Chrome silently falls back to TCP
-    # (`firewall-rules create` is a no-op if the rule already exists —
-    # an existing rule must be `update`d to add the port).
+    # Only tcp:80 / tcp:443. HTTP/3 (QUIC, udp:443) is deliberately NOT
+    # opened: QUIC RX over the GCE gve NIC currently halts the unikernel
+    # (a bad free in the talc allocator — see the deferred-work note in
+    # ROADMAP.md). Until that is fixed, opening udp:443 lets any QUIC
+    # packet crash the server. The h3 listener still binds inside the
+    # guest; it is simply unreachable, and Chrome falls back to TCP.
     gcloud compute firewall-rules create allow-http-waitless \
-        --allow=tcp:80,tcp:443,udp:443 \
+        --allow=tcp:80,tcp:443 \
         --target-tags=http-server \
         --project="$PROJECT" \
         --quiet 2>/dev/null || true
