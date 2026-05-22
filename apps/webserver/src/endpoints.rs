@@ -466,6 +466,8 @@ pub(crate) fn obs_response() -> Response {
         waitless::diagnostics::udp_obs_json(&mut w);
         let _ = w.write_str(",\"nic\":");
         waitless::diagnostics::nic_obs_json(&mut w);
+        let _ = w.write_str(",\"tls\":");
+        let _ = tls::diag::write_obs_json(&mut w);
         let _ = w.write_str("}");
     }
     Response::ok(&b"application/json"[..], body)

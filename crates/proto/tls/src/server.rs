@@ -582,6 +582,7 @@ impl TlsServer {
             &mut self.tx_buf[self.tx_len..],
         )?;
         self.tx_len += n;
+        crate::diag::COUNTERS.close_notify_sent.bump();
         self.state = State::Closed;
         Ok(())
     }
@@ -621,6 +622,10 @@ impl TlsServer {
     /// data record stranded in `rx_buf` until the next caller push —
     /// which for a short HTTPS request never comes, wedging the conn.
     pub fn advance(&mut self, config: &TlsServerConfig) -> Result<State, HandshakeError> {
+        // State on entry — so a fresh transition to `Established`
+        // can be counted exactly once (the doctrine handshake-
+        // completed counter), regardless of how many inner steps run.
+        let entry_state = self.state;
         loop {
             let before_state = self.state;
             let before_rx = self.rx_len;
@@ -634,6 +639,7 @@ impl TlsServer {
             };
             if let Err(e) = step_result {
                 crate::trace::error(before_state, &e);
+                crate::diag::record_handshake_failure(before_state, &e);
                 return Err(e);
             }
             let progressed = self.state != before_state
@@ -641,6 +647,9 @@ impl TlsServer {
                 || self.pt_len != before_pt
                 || self.tx_len != before_tx;
             if !progressed {
+                if entry_state != State::Established && self.state == State::Established {
+                    crate::diag::COUNTERS.handshakes_completed.bump();
+                }
                 return Ok(self.state);
             }
         }

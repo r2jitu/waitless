@@ -227,7 +227,7 @@ their invariant inputs, and a `write_obs_json` is wired into `/obs`.
 | UDP              | `crates/net`                | ✅ Done   | `udp::diag` — 6 counters + `LAST_UNDELIVERABLE`; `waitless_backend` seam. |
 | NIC / gve driver | `crates/drivers/gve`        | ✅ Done   | `gve::diag` — anomaly counters + `LAST_RX_SKIP`; `waitless_backend` seam. virtio-net driver still bare. |
 | IP / ARP / NDP   | `crates/net/stack`          | ⬜ Pending | lower-layer RX/TX. |
-| TLS              | `crates/proto/tls`          | ⬜ Pending | `tls::record` encrypt/decrypt stats; `tls_profile`. |
+| TLS              | `crates/proto/tls`          | ✅ Done   | `tls::diag` — handshake-lifecycle counters + `LAST_HANDSHAKE_FAILURE`; app-reachable, no seam. |
 | Async runtime    | `crates/runtime/executor`   | ⬜ Pending | per-core loop stats (`core_stats`). |
 | Kernel           | `crates/kernel`             | ⬜ Pending | heap stats; the `diag` ring stays panic-only. |
 

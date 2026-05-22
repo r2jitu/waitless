@@ -23,6 +23,7 @@ rust_library(
     name = "tls",
     srcs = [
         "src/lib.rs",
+        "src/diag.rs",
         # Sans-io TLS primitives (formerly //crates/net:tls{,_crypto,_handshake,_record})
         "src/aead.rs",
         "src/handshake/mod.rs",
@@ -79,6 +80,8 @@ rust_library(
     }),
     deps = [
         "//crates/crypto/aes-gcm",
+        # `kernel_core::obs` — observability primitives (`docs/observability.md`).
+        "//crates/kernel/core",
         "//crates/proto/http",
         "//crates/runtime/worker",
         "//crates/util/iobuf",

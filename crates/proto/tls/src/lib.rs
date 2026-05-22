@@ -63,6 +63,7 @@ use http::{IOBuf, IOBufChain};
 // pub for symmetry; it's TCP-only but the wider audience doesn't
 // pay any cost — LTO drops it from QUIC binaries.
 pub mod aead;
+pub mod diag;
 pub mod handshake;
 pub mod record;
 pub mod schedule;
