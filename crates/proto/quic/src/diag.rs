@@ -10,13 +10,16 @@
 //      packet/conn and move on". They bump the counter and (gated
 //      by log level) emit a single line, replacing the silent
 //      `Err(_) -> drop` and `match _ => {}` patterns.
-//   3. `LastEvent` snapshot slots — `LAST_DROP`, `LAST_CONN_CLOSE`,
-//      `LAST_CONN_EXIT`. A counter says *how many*; a snapshot
-//      retains *what the most recent one looked like*, including
-//      the invariant inputs you would otherwise have to redeploy
-//      to capture. The h3-over-gve bug needed exactly this — the
-//      stack counted idle timeouts but discarded the 81 ms
-//      `last_recv_age` that proved the timeout spurious.
+//   3. `quic_bug!` — for a genuinely unexpected condition (an
+//      invariant not holding). Logs to serial UNCONDITIONALLY: a
+//      broken assumption is loud, regardless of log level.
+//   4. `LastEvent` snapshot slots — `LAST_DROP`, `LAST_BUG`,
+//      `LAST_CONN_CLOSE`, `LAST_CONN_EXIT`. A counter says *how
+//      many*; a snapshot retains *what the most recent one looked
+//      like*, including the invariant inputs you would otherwise
+//      have to redeploy to capture. The h3-over-gve bug needed
+//      exactly this — the stack counted idle timeouts but discarded
+//      the 81 ms `last_recv_age` that proved the timeout spurious.
 //
 // Cost: a counter bump is one atomic increment. A snapshot
 // `record` takes a `Spinlock`, so it is COLD PATH ONLY — connection
@@ -263,6 +266,14 @@ pub struct Counters {
     /// CONNECTION_CLOSE (see `conn_closes_received` + the
     /// `LAST_CONN_CLOSE` detail) or an app-initiated close.
     pub conn_task_exit_conn_failed: Counter,
+    /// `QuicConn::recv`'s watchdog fired: a request handler's `recv`
+    /// await ran past the 5 s stuck threshold without the stream
+    /// making progress. A handler should get data or observe
+    /// `Failed` long before that — so each fire is a genuine wedge
+    /// (a handler bug, or a stream stuck half-open). Raised via
+    /// `quic_bug!`: logged to serial unconditionally, with the sid
+    /// and recv-stream state in `LAST_BUG`.
+    pub handler_stuck: Counter,
 
     // ── Flush / datagram throughput ──────────────────────────────
     /// One call to `flush_outbound`. Bumps from both
@@ -346,6 +357,7 @@ impl Counters {
             conn_task_exit_inbox_closed: Counter::new(),
             conn_task_exit_process_error: Counter::new(),
             conn_task_exit_conn_failed: Counter::new(),
+            handler_stuck: Counter::new(),
             flush_calls: Counter::new(),
             datagrams_sent: Counter::new(),
             datagrams_processed: Counter::new(),
@@ -373,6 +385,13 @@ pub static COUNTERS: Counters = Counters::new();
 /// Most recent failure drop (any `quic_drop!` site). Tells you which
 /// drop fired last and when even when serial logging is off.
 pub static LAST_DROP: LastEvent<DropRecord> = LastEvent::new();
+
+/// Most recent invariant violation (any `quic_bug!` site). Distinct
+/// from `LAST_DROP`: a drop is an *expected* failure, a bug is a
+/// *broken assumption*. Check this slot first — a non-zero `count`
+/// means a "can't happen" did. The full context is on serial
+/// (`quic_bug!` logs unconditionally).
+pub static LAST_BUG: LastEvent<DropRecord> = LastEvent::new();
 
 /// Most recent CONNECTION_CLOSE frame *received* from a peer. Holds
 /// the error_code / frame_type / reason the frame dispatcher used to
@@ -517,6 +536,15 @@ fn write_json_ascii(w: &mut dyn fmt::Write, bytes: &[u8]) -> fmt::Result {
 /// not meant for direct use.
 pub fn record_drop(reason: &'static str) {
     LAST_DROP.record(DropRecord {
+        reason,
+        at_us: tls::ticket::now_us(),
+    });
+}
+
+/// Record a `quic_bug!` site into `LAST_BUG`. Called by the macro;
+/// not meant for direct use.
+pub fn record_bug(reason: &'static str) {
+    LAST_BUG.record(DropRecord {
         reason,
         at_us: tls::ticket::now_us(),
     });
@@ -676,7 +704,7 @@ pub fn should_log_event() -> bool {
 /// dumps. Returns `(name, value)` pairs in declaration order. The
 /// four AEAD throughput counters are intentionally excluded — they
 /// are surfaced separately under `/stats`.
-pub fn snapshot() -> [(&'static str, u64); 45] {
+pub fn snapshot() -> [(&'static str, u64); 46] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.get()),
@@ -729,6 +757,7 @@ pub fn snapshot() -> [(&'static str, u64); 45] {
             "conn_task_exit_conn_failed",
             c.conn_task_exit_conn_failed.get(),
         ),
+        ("handler_stuck", c.handler_stuck.get()),
         ("flush_calls", c.flush_calls.get()),
         ("datagrams_sent", c.datagrams_sent.get()),
         ("datagrams_processed", c.datagrams_processed.get()),
@@ -747,6 +776,8 @@ pub fn write_obs_json(w: &mut dyn fmt::Write) -> fmt::Result {
         write!(w, "\"{name}\":{value},")?;
     }
     LAST_DROP.write_json(w, "last_drop")?;
+    w.write_str(",")?;
+    LAST_BUG.write_json(w, "last_bug")?;
     w.write_str(",")?;
     LAST_CONN_CLOSE.write_json(w, "last_conn_close")?;
     w.write_str(",")?;
@@ -816,6 +847,39 @@ macro_rules! quic_event {
     }};
 }
 
+/// Invariant-violation macro — for a genuinely unexpected condition,
+/// an assumption the code relies on that did not hold (doctrine
+/// principle 6: *a broken assumption is loud*).
+///
+/// Unlike `quic_drop!` (gated, for routine/expected failures) this
+/// logs to serial **unconditionally** — regardless of the `quic.log`
+/// level, including `silent` benchmark builds — because a counter
+/// ticking 0→1 on an unwatched dashboard is not a signal. It also
+/// bumps the named counter and records `LAST_BUG`. Such sites are
+/// cold by definition (a "can't happen" that happens often was
+/// never an invariant), so the unconditional println costs nothing
+/// in practice.
+///
+/// Example:
+///   `quic_bug!(rng_failed, "getrandom failed minting CID nonce");`
+#[macro_export]
+macro_rules! quic_bug {
+    ($reason:ident, $($detail:tt)*) => {{
+        $crate::diag::COUNTERS.$reason.bump();
+        $crate::diag::record_bug(::core::stringify!($reason));
+        ::waitless::println!(
+            "[quic-bug {}] {}",
+            ::core::stringify!($reason),
+            ::core::format_args!($($detail)*),
+        );
+    }};
+    ($reason:ident) => {{
+        $crate::diag::COUNTERS.$reason.bump();
+        $crate::diag::record_bug(::core::stringify!($reason));
+        ::waitless::println!("[quic-bug {}]", ::core::stringify!($reason));
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,6 +945,15 @@ mod tests {
     }
 
     #[test]
+    fn record_bug_populates_last_bug_snapshot() {
+        let (before, _) = LAST_BUG.snapshot();
+        record_bug("handler_stuck");
+        let (count, last) = LAST_BUG.snapshot();
+        assert_eq!(count, before + 1);
+        assert_eq!(last.expect("recorded").reason, "handler_stuck");
+    }
+
+    #[test]
     fn write_obs_json_is_one_object() {
         let mut s = String::new();
         write_obs_json(&mut s).unwrap();
@@ -888,6 +961,9 @@ mod tests {
         assert!(s.ends_with('}'));
         // Counters present as flat members; snapshots nested.
         assert!(s.contains("\"idle_timeouts\":"));
+        assert!(s.contains("\"handler_stuck\":"));
         assert!(s.contains("\"last_conn_exit\":{\"count\":"));
+        // The invariant-violation slot is distinct from `last_drop`.
+        assert!(s.contains("\"last_bug\":{\"count\":"));
     }
 }

@@ -690,7 +690,7 @@ pub struct Connection {
     /// recv_stream on the very next flush (because the matching
     /// `send_stream` was still satisfying the reap conditions),
     /// leaving the H3 server blocked forever on `recv(sid)` —
-    /// surfaces as `[quic-drop other_wire] stuck recv await
+    /// surfaces as `[quic-bug handler_stuck] recv await
     /// state=None`. Linux quinn drives this case routinely via
     /// loss-recovery retransmits; macOS quinn rarely hits it.
     /// Tracking a small ring of "already-handled" sids and

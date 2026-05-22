@@ -216,9 +216,12 @@ impl QuicConn {
                 let elapsed = tls::ticket::now_us().saturating_sub(entered_us);
                 if elapsed > STUCK_THRESHOLD_US {
                     let state = self.conn.borrow().recv_stream_state(sid);
-                    crate::quic_drop!(
-                        other_wire,
-                        "stuck recv await sid={} elapsed_ms={} state={:?} local_cid={}",
+                    // A handler that hasn't made progress in 5 s is
+                    // a wedge, not a routine drop — log it loudly
+                    // and unconditionally (doctrine principle 6).
+                    crate::quic_bug!(
+                        handler_stuck,
+                        "recv await sid={} elapsed_ms={} state={:?} local_cid={}",
                         sid,
                         elapsed / 1_000,
                         state,
@@ -556,7 +559,7 @@ async fn listener_loop<H, F>(
         slots.register_initial_dcid(&dcid, slot_idx, generation);
         let mut nonce = [0u8; 4];
         if getrandom::getrandom(&mut nonce).is_err() {
-            crate::quic_drop!(rng_failed, "minting CID nonce");
+            crate::quic_bug!(rng_failed, "getrandom failed minting CID nonce");
             recycle_buf(&recycle_pool, buf);
             continue;
         }
@@ -585,7 +588,7 @@ async fn listener_loop<H, F>(
 
         let mut seed = [0u8; 32];
         if getrandom::getrandom(&mut seed).is_err() {
-            crate::quic_drop!(rng_failed, "minting per-conn TLS seed");
+            crate::quic_bug!(rng_failed, "getrandom failed minting per-conn TLS seed");
             continue;
         }
         let _ = spawn(conn_task::<H, F>(ConnTaskArgs {
