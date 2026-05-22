@@ -70,7 +70,7 @@ pub(crate) const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
 /// Public diagnostic API (`net_rx_counts` / `net_rx_used_cursors`)
 /// returns fixed-size arrays of this length. The actual queue-pair
 /// storage is heap-allocated and uncapped — this only bounds what
-/// /stats can show in a single response.
+/// the `/obs` `nic` block can show in a single response.
 pub(crate) const DIAG_QP_CAP: usize = 8;
 
 /// NAPI-style IP-header alignment shift. Layout of each RX buffer:

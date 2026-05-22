@@ -773,8 +773,8 @@ pub fn num_workers() -> u32 {
 /// Native lacks the bare-metal event-loop cycle accounting — there's
 /// no per-loop iter `now_cycles()` hook in the std/tokio-based
 /// runner and the OS owns scheduling decisions anyway. Return zeros;
-/// /stats consumers should treat zeros as "not available on this
-/// backend" rather than "core is idle".
+/// `/obs` `event_loop` consumers should treat zeros as "not
+/// available on this backend" rather than "core is idle".
 pub fn core_stats(_core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
     (0, 0, 0, 0, 0, 0, 0, 0)
 }

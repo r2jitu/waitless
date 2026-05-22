@@ -234,7 +234,7 @@ pub fn rearm_rx_napi(core_id: u32) -> bool {
         .unwrap_or(false)
 }
 
-// ---- Diagnostics (/stats) ------------------------------------------------
+// ---- Diagnostics (/obs `nic` block) ---------------------------------------
 
 pub fn rx_counts() -> [u64; 8] {
     active_ops().diag.map(|d| (d.rx_counts)()).unwrap_or([0; 8])

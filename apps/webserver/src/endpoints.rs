@@ -1,5 +1,5 @@
 // apps/webserver/src/endpoints.rs — machine-facing data +
-// diagnostic endpoints (health, stats, heap, quic-stats, diag
+// diagnostic endpoints (health, /obs aggregate, quic-stats, diag
 // dumps, TLS profile).
 //
 // Split out of `main.rs`; see the crate-root doc comment there for
@@ -131,27 +131,34 @@ pub(crate) fn max_min_ratio_x100(observed: &[u64]) -> u64 {
     max.saturating_mul(100) / min.max(1)
 }
 
-/// Per-queue RX frame counts + used-ring cursors + TX-side
-/// saturation/scan-depth/per-qp counters. Lets a monitoring agent
-/// or `/diagnostics` page see whether:
+/// Render the `nic` block of `/obs`: the per-queue *distribution*
+/// view — RX frame counts, used-ring cursors, TX packet / byte
+/// counts, in-flight depth — plus the RSS-balance metrics derived
+/// from it and the TX direct-fill pool saturation counters, then
+/// the gve driver's own failure/throughput counters nested under
+/// `"gve"`. Lets a monitoring agent see whether:
 ///   * RSS / per-core dispatch is spreading load evenly
-///     (rx_frames / tx_packets even across qps)
-///   * The TX pool is undersized for the offered load
-///     (tx_small_full_spins climbing)
-///   * The linear-scan acquire path is wasting cycles
-///     (tx_small_avg_scan_depth high relative to pool size)
+///     (`rx_chi_squared_x100` / `rx_max_min_ratio_x100`, the `tx_`
+///     pair — and the raw `rx_frames` / `tx_packets` arrays)
+///   * the TX pool is undersized for the offered load
+///     (`tx_small_full_spins` climbing)
+///   * the linear-scan acquire path is wasting cycles
+///     (`tx_small_avg_scan_x100` high relative to the pool size)
 ///   * TSO super-segments are saturating their pool
-///     (tx_big_full_returns climbing)
-pub(crate) fn stats_response() -> Response {
+///     (`tx_big_full_returns` climbing)
+///
+/// The distribution arrays are driver-agnostic (gve or virtio-net,
+/// whichever is active); the nested `"gve"` block is gve-specific
+/// and reads all-zero under virtio-net.
+fn write_nic_obs<W: core::fmt::Write>(w: &mut W) {
     let counts = waitless::diagnostics::net_rx_counts();
     let cursors = waitless::diagnostics::net_rx_used_cursors();
     let nqp = waitless::diagnostics::net_num_queue_pairs() as usize;
     let tx = waitless::diagnostics::net_tx_diag();
 
     // Project the (device_idx, driver_cursor) tuple into separate
-    // u16 slices so `emit_json_array` can render them — needed
-    // because the helper emits `T: Display` and there's no
-    // sensible Display impl for `(u16, u16)`.
+    // u16 slices so `emit_json_array` can render them — the helper
+    // emits `T: Display` and there's no Display impl for `(u16, u16)`.
     let n = nqp.min(cursors.len());
     let mut used_dev = [0u16; 8];
     let mut used_drv = [0u16; 8];
@@ -172,144 +179,134 @@ pub(crate) fn stats_response() -> Response {
     let rx_chi = rss_chi_squared_x100(rx_slice);
     let rx_ratio = max_min_ratio_x100(rx_slice);
 
-    // 4 KiB body region — covers nqp ≤ 8 plus per-qp TX/RX byte
-    // arrays, per-core CPU stats, and TLS/QUIC AEAD counters.
-    // /stats is on the slow path so the extra reservation is free.
-    let mut body = http::body_iobuf(4096);
-    {
-        let mut w = body.writer();
-        let _ = w.write_str("{");
-        emit_json_array(&mut w, "rx_frames", &counts[..nqp.min(counts.len())]);
+    let _ = w.write_str("{");
+    emit_json_array(w, "rx_frames", rx_slice);
+    let _ = w.write_str(",");
+    emit_json_array(w, "rx_used_dev", &used_dev[..n]);
+    let _ = w.write_str(",");
+    emit_json_array(w, "rx_used_drv", &used_drv[..n]);
+    let _ = write!(
+        w,
+        ",\"num_queue_pairs\":{nqp},\
+          \"rx_chi_squared_x100\":{rx_chi},\
+          \"rx_max_min_ratio_x100\":{rx_ratio}",
+    );
+
+    if let Some(t) = tx {
+        // Average scan depth: high values vs `small_pool_size`
+        // motivate replacing the linear scan with a freelist.
+        // Compute on the read side; emit as a fixed-point ratio
+        // (×100) since we don't pull in float formatting.
+        let avg_scan_x100 = if t.small_pool_acquires > 0 {
+            (t.small_pool_scan_iters * 100) / t.small_pool_acquires
+        } else {
+            0
+        };
+        let tx_slice = &t.packets_per_qp[..nqp.min(t.packets_per_qp.len())];
+        let inflight_slice = &t.inflight_per_qp[..nqp.min(t.inflight_per_qp.len())];
+        let tx_chi = rss_chi_squared_x100(tx_slice);
+        let tx_ratio = max_min_ratio_x100(tx_slice);
         let _ = w.write_str(",");
-        emit_json_array(&mut w, "rx_used_dev", &used_dev[..n]);
+        emit_json_array(w, "tx_packets", tx_slice);
         let _ = w.write_str(",");
-        emit_json_array(&mut w, "rx_used_drv", &used_drv[..n]);
+        emit_json_array(w, "tx_inflight", inflight_slice);
         let _ = write!(
             w,
-            ",\"num_queue_pairs\":{},\
-              \"rx_chi_squared_x100\":{},\
-              \"rx_max_min_ratio_x100\":{}",
-            nqp, rx_chi, rx_ratio,
+            ",\"tx_chi_squared_x100\":{},\
+              \"tx_max_min_ratio_x100\":{},\
+              \"tx_small_pool_size\":{},\
+              \"tx_big_pool_size\":{},\
+              \"tx_small_acquires\":{},\
+              \"tx_small_scan_iters\":{},\
+              \"tx_small_avg_scan_x100\":{},\
+              \"tx_small_full_spins\":{},\
+              \"tx_big_acquires\":{},\
+              \"tx_big_full_returns\":{}",
+            tx_chi,
+            tx_ratio,
+            t.small_pool_size,
+            t.big_pool_size,
+            t.small_pool_acquires,
+            t.small_pool_scan_iters,
+            avg_scan_x100,
+            t.small_pool_full_spins,
+            t.big_pool_acquires,
+            t.big_pool_full_returns,
         );
-
-        if let Some(t) = tx {
-            // Average scan depth: high values vs `small_pool_size`
-            // motivate replacing the linear scan with a freelist.
-            // Compute on the read side; emit as a fixed-point
-            // ratio (×100) since we don't pull in float formatting.
-            let avg_scan_x100 = if t.small_pool_acquires > 0 {
-                (t.small_pool_scan_iters * 100) / t.small_pool_acquires
-            } else {
-                0
-            };
-            let tx_slice = &t.packets_per_qp[..nqp.min(t.packets_per_qp.len())];
-            let inflight_slice = &t.inflight_per_qp[..nqp.min(t.inflight_per_qp.len())];
-            let tx_chi = rss_chi_squared_x100(tx_slice);
-            let tx_ratio = max_min_ratio_x100(tx_slice);
-            let _ = w.write_str(",");
-            emit_json_array(&mut w, "tx_packets", tx_slice);
-            let _ = w.write_str(",");
-            emit_json_array(&mut w, "tx_inflight", inflight_slice);
-            let _ = write!(
-                w,
-                ",\"tx_chi_squared_x100\":{},\
-                  \"tx_max_min_ratio_x100\":{},\
-                  \"tx_small_pool_size\":{},\
-                  \"tx_big_pool_size\":{},\
-                  \"tx_small_acquires\":{},\
-                  \"tx_small_scan_iters\":{},\
-                  \"tx_small_avg_scan_x100\":{},\
-                  \"tx_small_full_spins\":{},\
-                  \"tx_big_acquires\":{},\
-                  \"tx_big_full_returns\":{}",
-                tx_chi,
-                tx_ratio,
-                t.small_pool_size,
-                t.big_pool_size,
-                t.small_pool_acquires,
-                t.small_pool_scan_iters,
-                avg_scan_x100,
-                t.small_pool_full_spins,
-                t.big_pool_acquires,
-                t.big_pool_full_returns,
-            );
-            let tx_bytes = &t.tx_bytes_per_qp[..nqp.min(t.tx_bytes_per_qp.len())];
-            let rx_bytes = &t.rx_bytes_per_qp[..nqp.min(t.rx_bytes_per_qp.len())];
-            let _ = w.write_str(",");
-            emit_json_array(&mut w, "tx_bytes", tx_bytes);
-            let _ = w.write_str(",");
-            emit_json_array(&mut w, "rx_bytes", rx_bytes);
-        }
-
-        // ---- Per-core event-loop stats ----
-        //
-        // Captures the four numbers most directly relevant to "are
-        // we CPU- or network-bound?":
-        //   * `idle_cycles / (busy + idle)` → idle fraction; high =
-        //     plenty of CPU headroom, low = CPU-bound.
-        //   * `service_work` rate vs `loops` rate → fraction of
-        //     iterations that did real app work (vs poll-only spins
-        //     ticking the spin-before-HLT window).
-        //   * `idle_enters` → how many HLT/WFI bracketings happened;
-        //     each costs ~1µs IRQ round-trip on KVM/HVF. A low rate
-        //     means we're in steady-state poll mode.
-        //
-        // Per-core arrays so RSS imbalance (one core hot, others
-        // idle) is visible. cycles_per_us is emitted once so /stats
-        // consumers can convert cycle deltas to µs.
-        let nc = (waitless::num_workers() as usize).min(8);
-        let mut loops = [0u64; 8];
-        let mut poll_work = [0u64; 8];
-        let mut drain_work = [0u64; 8];
-        let mut svc_work = [0u64; 8];
-        let mut rt_work = [0u64; 8];
-        let mut idle_enters = [0u64; 8];
-        let mut busy_cyc = [0u64; 8];
-        let mut idle_cyc = [0u64; 8];
-        for i in 0..nc {
-            let s = waitless::diagnostics::core_stats(i as u32);
-            loops[i] = s.0;
-            poll_work[i] = s.1;
-            drain_work[i] = s.2;
-            svc_work[i] = s.3;
-            rt_work[i] = s.4;
-            idle_enters[i] = s.5;
-            busy_cyc[i] = s.6;
-            idle_cyc[i] = s.7;
-        }
+        let tx_bytes = &t.tx_bytes_per_qp[..nqp.min(t.tx_bytes_per_qp.len())];
+        let rx_bytes = &t.rx_bytes_per_qp[..nqp.min(t.rx_bytes_per_qp.len())];
         let _ = w.write_str(",");
-        emit_json_array(&mut w, "core_loops", &loops[..nc]);
+        emit_json_array(w, "tx_bytes", tx_bytes);
         let _ = w.write_str(",");
-        emit_json_array(&mut w, "core_poll_work", &poll_work[..nc]);
-        let _ = w.write_str(",");
-        emit_json_array(&mut w, "core_drain_work", &drain_work[..nc]);
-        let _ = w.write_str(",");
-        emit_json_array(&mut w, "core_service_work", &svc_work[..nc]);
-        let _ = w.write_str(",");
-        emit_json_array(&mut w, "core_runtime_work", &rt_work[..nc]);
-        let _ = w.write_str(",");
-        emit_json_array(&mut w, "core_idle_enters", &idle_enters[..nc]);
-        let _ = w.write_str(",");
-        emit_json_array(&mut w, "core_busy_cycles", &busy_cyc[..nc]);
-        let _ = w.write_str(",");
-        emit_json_array(&mut w, "core_idle_cycles", &idle_cyc[..nc]);
-        let _ = write!(
-            w,
-            ",\"cycles_per_us\":{}",
-            waitless::diagnostics::cycles_per_us()
-        );
-
-        // The per-subsystem counter blocks that used to live here —
-        // gve NIC counters, TCP SYN/chunk counters, TLS + QUIC AEAD
-        // throughput — moved to `/obs` (the `nic` / `tcp` / `tls` /
-        // `quic` blocks). `/stats` is now purely the per-qp / per-core
-        // *distribution* view (RSS balance, TX-pool saturation,
-        // event-loop occupancy) — complementary to `/obs`'s
-        // per-subsystem counters + snapshots. See `docs/observability.md`.
-
-        let _ = w.write_str("}");
+        emit_json_array(w, "rx_bytes", rx_bytes);
     }
-    Response::ok(&b"application/json"[..], body)
+
+    // The gve driver's own failure / throughput counters + the
+    // `LAST_RX_SKIP` snapshot, nested as `"gve"`.
+    let _ = w.write_str(",\"gve\":");
+    waitless::diagnostics::nic_obs_json(&mut *w);
+    let _ = w.write_str("}");
+}
+
+/// Render the `event_loop` block of `/obs`: per-core event-loop
+/// occupancy. Captures the numbers most directly relevant to "are
+/// we CPU- or network-bound?":
+///   * `core_idle_cycles / (busy + idle)` → idle fraction; high =
+///     plenty of CPU headroom, low = CPU-bound.
+///   * `core_service_work` rate vs `core_loops` rate → fraction of
+///     iterations that did real app work (vs poll-only spins
+///     ticking the spin-before-HLT window).
+///   * `core_idle_enters` → how many HLT/WFI bracketings happened;
+///     each costs ~1 µs IRQ round-trip on KVM/HVF. A low rate
+///     means we're in steady-state poll mode.
+///
+/// Per-core arrays so RSS imbalance (one core hot, others idle) is
+/// visible. `cycles_per_us` is emitted once so a consumer can
+/// convert cycle deltas to µs. All zeros on native (the OS owns
+/// scheduling).
+fn write_event_loop_obs<W: core::fmt::Write>(w: &mut W) {
+    let nc = (waitless::num_workers() as usize).min(8);
+    let mut loops = [0u64; 8];
+    let mut poll_work = [0u64; 8];
+    let mut drain_work = [0u64; 8];
+    let mut svc_work = [0u64; 8];
+    let mut rt_work = [0u64; 8];
+    let mut idle_enters = [0u64; 8];
+    let mut busy_cyc = [0u64; 8];
+    let mut idle_cyc = [0u64; 8];
+    for i in 0..nc {
+        let s = waitless::diagnostics::core_stats(i as u32);
+        loops[i] = s.0;
+        poll_work[i] = s.1;
+        drain_work[i] = s.2;
+        svc_work[i] = s.3;
+        rt_work[i] = s.4;
+        idle_enters[i] = s.5;
+        busy_cyc[i] = s.6;
+        idle_cyc[i] = s.7;
+    }
+    let _ = w.write_str("{");
+    emit_json_array(w, "core_loops", &loops[..nc]);
+    let _ = w.write_str(",");
+    emit_json_array(w, "core_poll_work", &poll_work[..nc]);
+    let _ = w.write_str(",");
+    emit_json_array(w, "core_drain_work", &drain_work[..nc]);
+    let _ = w.write_str(",");
+    emit_json_array(w, "core_service_work", &svc_work[..nc]);
+    let _ = w.write_str(",");
+    emit_json_array(w, "core_runtime_work", &rt_work[..nc]);
+    let _ = w.write_str(",");
+    emit_json_array(w, "core_idle_enters", &idle_enters[..nc]);
+    let _ = w.write_str(",");
+    emit_json_array(w, "core_busy_cycles", &busy_cyc[..nc]);
+    let _ = w.write_str(",");
+    emit_json_array(w, "core_idle_cycles", &idle_cyc[..nc]);
+    let _ = write!(
+        w,
+        ",\"cycles_per_us\":{}",
+        waitless::diagnostics::cycles_per_us()
+    );
+    let _ = w.write_str("}");
 }
 
 // `/heap` retired — the heap statistics moved into `/obs`'s
@@ -339,16 +336,18 @@ pub(crate) fn quic_stats_response() -> Response {
 /// Aggregate observability surface — one JSON object per subsystem
 /// that has adopted the doctrine, keyed by subsystem name:
 /// `{"quic":{…}}`. This is the single clean home for observability
-/// data; NIC, TCP, runtime, and kernel each become one more line
-/// here as they adopt the mechanism (see the rollout checklist in
+/// data — the per-subsystem failure / performance counters, the NIC
+/// per-qp distribution view, and the per-core event-loop occupancy
+/// all surface here (see the rollout checklist in
 /// `docs/observability.md`). `/quic_stats` is the QUIC-only view of
 /// the same `write_obs_json` output.
 pub(crate) fn obs_response() -> Response {
-    // 12 KiB covers all subsystem blocks (QUIC counters + snapshots
+    // 16 KiB covers all subsystem blocks (QUIC counters + snapshots
     // + latency histograms, plus tcp / udp / nic / tls / http /
-    // http3 / runtime / kernel / net) with margin. Slow path, so
-    // the reservation is free.
-    let mut body = http::body_iobuf(12288);
+    // http3 / runtime / kernel / net), the NIC per-qp distribution
+    // arrays, and the per-core event-loop block, with margin. Slow
+    // path, so the reservation is free.
+    let mut body = http::body_iobuf(16384);
     {
         let mut w = body.writer();
         let _ = w.write_str("{\"quic\":");
@@ -358,7 +357,7 @@ pub(crate) fn obs_response() -> Response {
         let _ = w.write_str(",\"udp\":");
         waitless::diagnostics::udp_obs_json(&mut w);
         let _ = w.write_str(",\"nic\":");
-        waitless::diagnostics::nic_obs_json(&mut w);
+        write_nic_obs(&mut w);
         let _ = w.write_str(",\"tls\":");
         let _ = tls::diag::write_obs_json(&mut w);
         let _ = w.write_str(",\"http\":");
@@ -367,6 +366,8 @@ pub(crate) fn obs_response() -> Response {
         let _ = http3::diag::write_obs_json(&mut w);
         let _ = w.write_str(",\"runtime\":");
         waitless::diagnostics::runtime_obs_json(&mut w);
+        let _ = w.write_str(",\"event_loop\":");
+        write_event_loop_obs(&mut w);
         let _ = w.write_str(",\"kernel\":");
         waitless::diagnostics::kernel_obs_json(&mut w);
         let _ = w.write_str(",\"net\":");

@@ -3,9 +3,9 @@
 // The observability doctrine (`docs/observability.md`) applied to
 // the task executor. The per-core event-loop telemetry (loop /
 // idle-cycle stats) already lives in `kernel_bare::eventloop` and is
-// surfaced via `/stats`; the gap the doctrine closes here is the
-// per-worker task arena — task lifecycle, and in particular the
-// silent `spawn` failure.
+// surfaced as the `/obs` `event_loop` block; the gap the doctrine
+// closes here is the per-worker task arena — task lifecycle, and in
+// particular the silent `spawn` failure.
 //
 // `obs` is a leaf crate, so the executor — which sits *below*
 // `kernel_core` in the crate graph — can depend on it directly.

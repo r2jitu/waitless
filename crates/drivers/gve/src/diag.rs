@@ -1,8 +1,8 @@
 // Driver diagnostics — counters, descriptor capture ring, and the
-// `NicDiagOps`-style accessors the runtime registers under
-// /stats / /diag-gve. None of this is on the critical send/recv
-// path's correctness chain; everything here is read-mostly and the
-// per-packet hot path touches only relaxed atomic increments.
+// `NicDiagOps`-style accessors the runtime registers under the
+// `/obs` `nic` block / `/diag-gve`. None of this is on the critical
+// send/recv path's correctness chain; everything here is read-mostly
+// and the per-packet hot path touches only relaxed atomic increments.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -36,14 +36,15 @@ pub(crate) static RX_BYTES_PER_QP: [AtomicU64; 8] = [const { AtomicU64::new(0) }
 /// drained completion at the batch-end repost. The cross-core
 /// drop-callback sanity check: this should track the per-qp RX
 /// frame count — a persistent shortfall means a drop callback
-/// isn't firing (a leaked device buffer). Surfaced via /stats.
+/// isn't firing (a leaked device buffer). Surfaced via the `/obs`
+/// `nic` block.
 pub static RX_BUF_REPOST_COUNT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// Per-qp count of GQI frames dropped because the recycle pool was
 /// exhausted — no slab free to copy the frame into (item B).
 /// Always 0 on a healthy GQI queue; a non-zero value means the
 /// consumer isn't draining pooled slabs fast enough (see
-/// `gqi::GQI_RX_POOL_SLABS`). Surfaced via /stats.
+/// `gqi::GQI_RX_POOL_SLABS`). Surfaced via the `/obs` `nic` block.
 pub static GQI_RECYCLE_POOL_EXHAUSTED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 // ---- TX direct-fill pool saturation counters -------------------------------
@@ -242,7 +243,8 @@ pub(crate) fn rx_counts() -> [u64; 8] {
 /// virtio-style "used ring" — the closest analogs are the
 /// completion ring's fill count (posted to device) and cons count
 /// (consumed by driver). Return `(fill_cnt, cons_cnt)` which maps
-/// naturally onto virtio's `(device_idx, driver_cursor)` in /stats.
+/// naturally onto virtio's `(device_idx, driver_cursor)` in the
+/// `/obs` `nic` block.
 pub(crate) fn rx_used_cursors() -> [(u16, u16); 8] {
     let mut out = [(0u16, 0u16); 8];
     for qp in 0..MAX_QUEUE_PAIRS.min(out.len()) {

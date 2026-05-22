@@ -105,10 +105,10 @@ def _alloc_tag(allocs_before, allocs_after, iterations):
 
 
 def _cycles_per_byte_tag(stats_before, stats_after):
-    """Format the TLS-encrypt cycles-per-byte derived from `/stats`
-    `tls_encrypt_bytes` + `tls_encrypt_cycles` snapshots. Returns
-    an empty string when sampling failed or the delta is too small
-    for a stable ratio.
+    """Format the TLS-encrypt cycles-per-byte derived from the `/obs`
+    `tls` block's `encrypt_bytes` + `encrypt_cycles` snapshots.
+    Returns an empty string when sampling failed or the delta is too
+    small for a stable ratio.
 
     Independent of wrk-side throughput: this is server-side TSC
     cycles spent in the seal hot path divided by record-layer
@@ -940,10 +940,11 @@ def main():
                         # wrk over https://. Self-signed dev cert is fine
                         # because wrk doesn't verify by default.
                         #
-                        # Two server-side snapshots flank the run:
-                        #   * `/heap` → talc total_allocation_count for
-                        #     the per-request alloc-per-iter readout.
-                        #   * `/stats` → TLS-encrypt byte+cycle counters
+                        # Two server-side snapshots flank the run,
+                        # both read from the aggregate `/obs` surface:
+                        #   * `kernel` block → talc total_allocation_count
+                        #     for the per-request alloc-per-iter readout.
+                        #   * `tls` block → TLS-encrypt byte+cycle counters
                         #     so we can compute cycles-per-byte of the
                         #     server-side AEAD hot path directly (vs
                         #     inferring it from wrk req/s × body size,

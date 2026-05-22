@@ -152,7 +152,7 @@ pub(crate) fn init() -> bool {
     // Decide how many queue pairs to bring up. `default_num_queues`
     // is what GCE advertises for this machine type (2 on
     // n2-standard-2); `max_tx/rx_queues` is the hardware ceiling.
-    // We cap at MAX_QUEUE_PAIRS because the /stats + net layer
+    // We cap at MAX_QUEUE_PAIRS because the diagnostic + net layer
     // APIs are sized to that constant.
     let (default_nq, max_tx, max_rx) = {
         let st = STATE.lock();

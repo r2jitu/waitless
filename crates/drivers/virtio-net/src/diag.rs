@@ -11,8 +11,8 @@ use crate::{DIAG_QP_CAP, TX_POOL_BIG_SIZE, TX_POOL_SMALL_SIZE, ndev, tx_q};
 // ---- Per-qp byte / packet counters -----------------------------------------
 
 /// Per-queue RX counters. Incremented once per consumed frame.
-/// Read via `rx_counts()` from app code (e.g. the /stats handler)
-/// to see which queues are actually getting traffic — useful for
+/// Read via `rx_counts()` from app code (e.g. the `/obs` `nic`
+/// block) to see which queues are actually getting traffic — useful for
 /// diagnosing RSS / flow-hash distribution under Tier 1 MQ. Cap at
 /// `DIAG_QP_CAP` because the public `net_rx_counts` API returns a
 /// fixed-size array; queues beyond that are not tracked here.

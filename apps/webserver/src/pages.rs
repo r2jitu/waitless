@@ -286,10 +286,11 @@ without a DHCP server still come up.</li>\
 NS on cache miss for outbound v6 packets, mirroring v4's ARP-on-miss.</li>\
 </ul>\
 <h2>Live counters</h2>\
-<p>Per-queue RX frame counts and used-ring cursors live at \
-<a href=\"/stats\"><code>/stats</code></a>; raw heap utilisation at \
-<a href=\"/heap\"><code>/heap</code></a>. The <a href=\"/diagnostics\">Diagnostics</a> \
-page renders these in a more readable shape.</p>\
+<p>Per-queue RX frame counts and used-ring cursors — and every \
+subsystem's failure / performance counters — live in the aggregate \
+<a href=\"/obs\"><code>/obs</code></a> surface. The \
+<a href=\"/diagnostics\">Diagnostics</a> page renders these in a \
+more readable shape.</p>\
 <h2>Async at the socket layer</h2>\
 <p>Listeners are plain async fns:</p>\
 <pre><code>waitless::tcp_listen(80, |stream| async move {\n    let mut buf = [0u8; 4096];\n    loop {\n        let n = stream.recv(&mut buf).await?;\n        if n == 0 { return; }\n        // ... handle bytes ...\n    }\n});</code></pre>\
@@ -497,7 +498,7 @@ auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
             );
         }
         let _ = w.write_str("</table>");
-        let _ = w.write_str("<p><a href=\"/stats\"><code>/stats</code></a> · raw JSON</p>");
+        let _ = w.write_str("<p><a href=\"/obs\"><code>/obs</code></a> · raw JSON</p>");
 
         // ── QUIC counters ─────────────────────────────────────────────
         let _ = w.write_str("<h2>QUIC events &amp; drops</h2>");

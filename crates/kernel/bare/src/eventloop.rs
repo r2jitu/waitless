@@ -14,8 +14,8 @@ use sync::AtomicFn;
 
 /// Per-core event-loop counters exposed for live diagnostics. Each
 /// core writes its own slot; readers may snapshot from any core. The
-/// `busy_cycles` / `idle_cycles` pair lets `/stats` compute a
-/// per-core idle percentage without taking any lock.
+/// `busy_cycles` / `idle_cycles` pair lets the `/obs` `event_loop`
+/// block compute a per-core idle percentage without taking any lock.
 ///
 /// `busy_cycles` is accumulated across loop iterations that did
 /// work (`did_work == true`) using `now_cycles()` deltas. `idle_cycles`
@@ -211,9 +211,9 @@ pub fn run(core_id: u32) -> ! {
     // Per-core counters for diagnostics. These shadow the
     // `CORE_STATS[core_id]` atomics — local registers stay hot in
     // the inner loop; we publish to the atomics in bulk via
-    // `fetch_add` at the bottom of each iteration so /stats can
-    // observe them at run time. Sample-and-difference reads from
-    // `/stats` give a per-core utilisation breakdown.
+    // `fetch_add` at the bottom of each iteration so the `/obs`
+    // `event_loop` block can observe them at run time. Sample-and-
+    // difference reads give a per-core utilisation breakdown.
     let mut loops: u64 = 0;
     let mut poll_work: u64 = 0;
     let mut drain_work: u64 = 0;
@@ -428,7 +428,7 @@ pub fn run(core_id: u32) -> ! {
 
         // Publish accumulated counters. Plain stores — the atomic
         // is cache-line resident in the publishing core's L1 (we're
-        // the only writer); /stats readers pay a cache-miss to
+        // the only writer); `/obs` readers pay a cache-miss to
         // pull a fresh snapshot but readers are not on the hot path.
         // Doing this every iter keeps the per-counter staleness at
         // exactly one iter and avoids the gating bug where idle

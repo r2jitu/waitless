@@ -64,7 +64,7 @@ mod tx;
 // without knowing the diag module exists, and so the public
 // `tx_desc_log_snapshot` keeps its `gve::tx_desc_log_snapshot`
 // path. `RX_BUF_REPOST_COUNT` / `GQI_RECYCLE_POOL_EXHAUSTED` are
-// `pub` (not `pub(crate)`) so the app's /stats endpoint can read
+// `pub` (not `pub(crate)`) so the `/obs` `nic` block can read
 // them as `gve::…`.
 pub use diag::{
     GQI_RECYCLE_POOL_EXHAUSTED, RX_BUF_REPOST_COUNT, TxDescLogEntry, tx_desc_log_snapshot,
@@ -223,7 +223,7 @@ pub(crate) struct TxQueue {
     /// Monotonically-increasing packet producer counter. Written to
     /// the TX doorbell after submitting. Atomic so one core can
     /// publish (send path) while any other core reads it (e.g. for
-    /// a deferred-kick check or a `/stats` snapshot).
+    /// a deferred-kick check or an `/obs` `nic`-block snapshot).
     pub(crate) fill_cnt: AtomicU32,
     /// Last-seen value of `counter_array[counter_index]`. Drives
     /// TX slot recycling (a slot is reusable once done_cnt passes
@@ -301,8 +301,8 @@ pub(crate) struct RxQueue {
     /// the value last written to the RX doorbell).
     pub(crate) fill_cnt: AtomicU32,
     /// How many completions we've consumed. Only written by the
-    /// core that polls this queue in Tier 1 mode; atomic so
-    /// `/stats` can snapshot from any other core without a lock.
+    /// core that polls this queue in Tier 1 mode; atomic so `/obs`
+    /// can snapshot from any other core without a lock.
     pub(crate) cons_cnt: AtomicU32,
     /// Expected `flags_seq` sequence byte in GQI_QPL mode (low 3 bits,
     /// cycles 1..7; 0 is reserved); doubles as the expected

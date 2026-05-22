@@ -98,8 +98,9 @@ pub enum RecordError {
 // ============================================================================
 //
 // Bumped on every successful seal / open call with the plaintext
-// byte count. Surfaced via `tls_encrypt_stats()` so /stats can
-// report wire-bytes-per-second through the AEAD primitive (the
+// byte count. Surfaced via `encrypt_stats()` in the `/obs` `tls`
+// block so a reader can derive wire-bytes-per-second and
+// cycles-per-byte through the AEAD primitive (the
 // guest-side cost of TLS, modulo header / framing memcpys which
 // are already amortised by item A + B + D + the TLS-direct
 // fast path).

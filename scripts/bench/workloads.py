@@ -44,11 +44,11 @@ def wait_http(port, timeout=20, host="localhost"):
 
 
 def fetch_total_allocs(port, host="localhost", https=False):
-    """GET `/heap` and return `total_allocation_count` (cumulative
-    talc allocations since boot). Returns `None` on any failure
-    (server not exposing /heap, network blip, parse error) so
-    callers can fall back to "no alloc-stats" reporting without
-    aborting the bench.
+    """GET `/obs` and return `total_allocation_count` (cumulative
+    talc allocations since boot) from the `kernel` block. Returns
+    `None` on any failure (server not exposing /obs, network blip,
+    parse error) so callers can fall back to "no alloc-stats"
+    reporting without aborting the bench.
 
     On a unikernel target this number is the kernel heap's monotonic
     `Talc::counters().total_allocation_count`; on native/POSIX it's
@@ -59,7 +59,7 @@ def fetch_total_allocs(port, host="localhost", https=False):
     import json
 
     scheme = "https" if https else "http"
-    url = f"{scheme}://{host}:{port}/heap"
+    url = f"{scheme}://{host}:{port}/obs"
     try:
         # `-k` for HTTPS so the self-signed dev cert doesn't trip
         # curl's verifier; the alternative is `subprocess.run` with
@@ -71,16 +71,17 @@ def fetch_total_allocs(port, host="localhost", https=False):
         r = subprocess.run(["curl", *flags, url], capture_output=True, timeout=5)
         if r.returncode != 0:
             return None
-        data = json.loads(r.stdout)
-        return int(data.get("total_allocation_count", 0))
+        kernel = json.loads(r.stdout).get("kernel", {})
+        return int(kernel.get("total_allocation_count", 0))
     except Exception:
         return None
 
 
 def fetch_tls_encrypt_stats(port, host="localhost", https=False):
-    """GET `/stats` and return `(tls_encrypt_bytes, tls_encrypt_cycles)`
+    """GET `/obs` and return `(tls_encrypt_bytes, tls_encrypt_cycles)`
     — the TSC-cycle and byte totals the server has accumulated in the
-    TLS record-layer seal path since boot. Returns `None` on any
+    TLS record-layer seal path since boot, read from the `tls` block
+    of the aggregate observability surface. Returns `None` on any
     failure or when both values are zero (counter not wired in this
     build).
 
@@ -92,7 +93,7 @@ def fetch_tls_encrypt_stats(port, host="localhost", https=False):
     import json
 
     scheme = "https" if https else "http"
-    url = f"{scheme}://{host}:{port}/stats"
+    url = f"{scheme}://{host}:{port}/obs"
     try:
         flags = ["-sf", "--max-time", "3"]
         if https:
@@ -100,9 +101,9 @@ def fetch_tls_encrypt_stats(port, host="localhost", https=False):
         r = subprocess.run(["curl", *flags, url], capture_output=True, timeout=5)
         if r.returncode != 0:
             return None
-        data = json.loads(r.stdout)
-        b = int(data.get("tls_encrypt_bytes", 0))
-        c = int(data.get("tls_encrypt_cycles", 0))
+        tls = json.loads(r.stdout).get("tls", {})
+        b = int(tls.get("encrypt_bytes", 0))
+        c = int(tls.get("encrypt_cycles", 0))
         if b == 0 and c == 0:
             return None
         return (b, c)
