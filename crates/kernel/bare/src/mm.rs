@@ -388,6 +388,7 @@ pub fn kmalloc(size: usize) -> *mut u8 {
         Ok(nn) => nn.as_ptr(),
         Err(()) => {
             drop(heap);
+            record_oom(layout.size(), layout.align());
             klog!("mm::kmalloc: OOM ({} bytes)\n", size);
             return ptr::null_mut();
         }
@@ -482,14 +483,16 @@ pub fn total_memory() -> usize {
 // already captures panics + unhandled CPU exceptions (the kernel's
 // "last fatal fault"); the gap the doctrine closes is the one
 // *non-fatal* kernel anomaly worth counting — an allocation that
-// failed. `GlobalAlloc::alloc` returning null is a counted-nowhere
-// event today; the caller handles the null and carries on, so it
-// can recur. `write_obs_json` is the kernel's `/obs` block.
+// failed. An allocator returning null is a counted-nowhere event
+// otherwise; the caller handles the null and carries on, so it can
+// recur. `write_obs_json` is the kernel's `/obs` block.
 
-/// Heap allocations that failed — `GlobalAlloc::alloc` returned null
-/// because `talc` had no block to satisfy the request. Genuinely
-/// unexpected on a healthy system; sustained growth means the heap
-/// is undersized or something is leaking.
+/// Heap allocations that failed — `talc` had no block to satisfy
+/// the request, so the allocator returned null. Bumped by both the
+/// `GlobalAlloc::alloc` path (`Box` / `Vec` / …) and the legacy
+/// `kmalloc` path (virtio-net DMA buffers). Genuinely unexpected on
+/// a healthy system; sustained growth means the heap is undersized
+/// or something is leaking.
 pub static HEAP_OOM: Counter = Counter::new();
 
 /// Most recent failed allocation — the size / alignment `talc`
