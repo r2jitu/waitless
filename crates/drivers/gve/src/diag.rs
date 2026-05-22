@@ -6,6 +6,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use kernel_bare::obs::{LastEvent, ObsRecord};
 use kernel_bare::sync::Spinlock;
 
 use crate::{MAX_QUEUE_PAIRS, RX_QUEUES, TX_BIG_POOL_SLOTS, TX_QUEUES, TX_SMALL_POOL_SLOTS};
@@ -255,4 +256,77 @@ pub(crate) fn rx_used_cursors() -> [(u16, u16); 8] {
         }
     }
     out
+}
+
+// ---- Observability doctrine: RX-skip snapshot + /obs block -----------------
+//
+// The observability doctrine (`docs/observability.md`) applied to the
+// NIC. The driver's counters already exist (above + `dqo`); the gap
+// the doctrine closes is *context*: the DQO RX path kept only a bare
+// `DQO_RX_LAST_SKIP_STATUS` byte for skipped completions. `LAST_RX_SKIP`
+// retains the qp and a timestamp alongside it. `write_obs_json` is the
+// NIC's `/obs` block.
+
+/// Most recent RX completion the DQO drain skipped (`buf_id` out of
+/// range, EOP clear, or `pkt_len == 0` — see `dqo::DQO_RX_COMPL_SKIPPED`).
+pub static LAST_RX_SKIP: LastEvent<RxSkipRecord> = LastEvent::new();
+
+/// Snapshot payload for `LAST_RX_SKIP`.
+#[derive(Clone, Copy)]
+pub struct RxSkipRecord {
+    /// Status byte (offset 8) of the skipped completion descriptor.
+    pub status: u8,
+    /// Queue pair the skip occurred on.
+    pub qp: u8,
+    /// `kernel_core::clock::now_ms()` at the skip.
+    pub at_ms: u64,
+}
+
+impl ObsRecord for RxSkipRecord {
+    fn write_fields(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        write!(
+            w,
+            "\"status\":{},\"qp\":{},\"at_ms\":{}",
+            self.status, self.qp, self.at_ms,
+        )
+    }
+}
+
+/// Record a skipped RX completion into `LAST_RX_SKIP`. Called from
+/// the DQO RX drain; `DQO_RX_COMPL_SKIPPED` is bumped at the site.
+pub fn record_rx_skip(qp: u8, status: u8) {
+    LAST_RX_SKIP.record(RxSkipRecord {
+        status,
+        qp,
+        at_ms: kernel_bare::clock::now_ms(),
+    });
+}
+
+/// Render the NIC observability block as JSON — the gve driver's
+/// anomaly counters (TX miss/reinject, RX skip, recycle-pool
+/// exhaustion, repost shortfall) and throughput totals, then the
+/// `LAST_RX_SKIP` snapshot. Under virtio-net the gve counters are
+/// all 0 (gve is not the active driver). This is the NIC's `/obs`
+/// contribution; `waitless_backend::nic_obs_json` forwards it.
+pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+    let sum = |a: &[AtomicU64]| -> u64 { a.iter().map(|c| c.load(Ordering::Relaxed)).sum() };
+    write!(
+        w,
+        "{{\"tx_miss_compl\":{},\"tx_reinject_compl\":{},\"rx_compl_skipped\":{},\
+         \"rx_buf_reposts\":{},\"gqi_recycle_exhausted\":{},\"tx_packets\":{},\
+         \"tx_bytes\":{},\"rx_bytes\":{},\"tx_small_full_spins\":{},\
+         \"tx_big_full_returns\":{},",
+        crate::dqo::DQO_TX_MISS_COMPL.load(Ordering::Relaxed),
+        crate::dqo::DQO_TX_REINJECT_COMPL.load(Ordering::Relaxed),
+        crate::dqo::DQO_RX_COMPL_SKIPPED.load(Ordering::Relaxed),
+        sum(&RX_BUF_REPOST_COUNT),
+        sum(&GQI_RECYCLE_POOL_EXHAUSTED),
+        sum(&TX_PACKETS_PER_QP),
+        sum(&TX_BYTES_PER_QP),
+        sum(&RX_BYTES_PER_QP),
+        TX_SMALL_FULL_SPINS.load(Ordering::Relaxed),
+        TX_BIG_FULL_RETURNS.load(Ordering::Relaxed),
+    )?;
+    LAST_RX_SKIP.write_json(w, "last_rx_skip")?;
+    w.write_str("}")
 }

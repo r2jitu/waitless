@@ -68,6 +68,7 @@ mod tx;
 // them as `gve::…`.
 pub use diag::{
     GQI_RECYCLE_POOL_EXHAUSTED, RX_BUF_REPOST_COUNT, TxDescLogEntry, tx_desc_log_snapshot,
+    write_obs_json,
 };
 pub(crate) use diag::{
     RX_BYTES_PER_QP, TX_BIG_ACQUIRES, TX_BIG_FULL_RETURNS, TX_BYTES_PER_QP, TX_PACKETS_PER_QP,

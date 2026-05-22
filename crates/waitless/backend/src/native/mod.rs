@@ -1068,6 +1068,12 @@ pub fn udp_obs_json(w: &mut dyn core::fmt::Write) {
     let _ = w.write_str("{}");
 }
 
+/// Native stub for the NIC observability block. Mirrors
+/// `bare::nic_obs_json`.
+pub fn nic_obs_json(w: &mut dyn core::fmt::Write) {
+    let _ = w.write_str("{}");
+}
+
 // ---- Diag-capture stubs (native has no kernel panic to capture) ----
 
 pub fn diag_append(_bytes: &[u8]) {}

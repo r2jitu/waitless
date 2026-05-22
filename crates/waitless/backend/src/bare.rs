@@ -75,6 +75,14 @@ pub fn udp_obs_json(w: &mut dyn core::fmt::Write) {
     let _ = udp::diag::write_obs_json(w);
 }
 
+/// Render the NIC observability block (`gve::diag`) as JSON into `w`
+/// — the `os:none` half of the `/obs` `"nic"` block. The gve
+/// counters read all-zero under virtio-net (gve is not the active
+/// driver). The native backend stubs this `{}`.
+pub fn nic_obs_json(w: &mut dyn core::fmt::Write) {
+    let _ = gve::write_obs_json(w);
+}
+
 // ---- Event loop re-exports ------------------------------------------------
 
 pub use kernel_bare::eventloop::{request_shutdown, set_ready};

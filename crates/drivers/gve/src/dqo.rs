@@ -669,6 +669,9 @@ pub(crate) fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, mut callback
         } else {
             DQO_RX_COMPL_SKIPPED.fetch_add(1, Ordering::Relaxed);
             DQO_RX_LAST_SKIP_STATUS.store(status, Ordering::Relaxed);
+            // Observability doctrine: retain the qp + a timestamp
+            // alongside the status byte (`docs/observability.md`).
+            crate::diag::record_rx_skip(qp as u8, status);
         }
 
         cons = cons.wrapping_add(1);

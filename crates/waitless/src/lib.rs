@@ -350,6 +350,14 @@ pub mod diagnostics {
         waitless_backend::udp_obs_json(w)
     }
 
+    /// Render the NIC driver's observability block (`gve::diag`) as
+    /// JSON into `w` — the NIC half of the `/obs` aggregate surface.
+    /// gve counters on bare-metal (all-zero under virtio-net); `{}`
+    /// on native.
+    pub fn nic_obs_json(w: &mut dyn core::fmt::Write) {
+        waitless_backend::nic_obs_json(w)
+    }
+
     /// TX-side hot-path counters: per-qp packet counts + small/big
     /// pool saturation + scan-depth aggregates. `None` when no
     /// driver is bound or the active driver hasn't wired the
