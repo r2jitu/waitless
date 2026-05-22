@@ -1,8 +1,5 @@
 # Observability doctrine
 
-Status: doctrine + mechanism landed; QUIC is the reference
-implementation. Last updated 2026-05-22.
-
 ## Why this exists
 
 A unikernel has no `dmesg`, no `/proc`, no `strace`, no debugger
@@ -81,9 +78,10 @@ what to retain **before** the incident, because after it you cannot.
 
 ## The mechanism
 
-Three primitives live in [`kernel_core::obs`](../crates/kernel/core/src/obs.rs)
-(re-exported as `kernel_bare::obs`). They are deliberately tiny —
-the doctrine is a discipline, not a framework. `Counter` and
+Three primitives live in the `obs` leaf crate
+([`crates/util/obs`](../crates/util/obs/src/lib.rs)). They are
+deliberately tiny — the doctrine is a discipline, not a framework.
+`Counter` and
 `LastEvent` serve the failure pillar; `LatencyHist` serves the
 performance pillar (see *Performance observability* below).
 
@@ -194,7 +192,7 @@ A subsystem may also keep a focused per-subsystem endpoint that
 reuses the *same* `write_obs_json` writer — QUIC keeps `/quic_stats`
 for that reason. There is no second rendering path.
 
-**The endpoint map** (after the consolidation):
+**The endpoint map:**
 
 - `/obs` — *the* always-on structured surface: every subsystem's
   counters, `LastEvent` snapshots, and latency histograms; the NIC
@@ -206,15 +204,13 @@ for that reason. There is no second rendering path.
   debug). `/tls-profile` — the per-stage handshake profiler.
   Both are special-purpose capture tools, deliberately separate.
 
-`/stats` was retired — its per-qp / per-core distribution view (a
-different *shape*: arrays, not per-event counters) folded into
-`/obs` as the `nic` block's distribution fields and the
-`event_loop` block, so there is one observability surface, not two.
-`/heap` was retired earlier — its heap statistics are the `kernel`
-block of `/obs`. The legacy `GveDiag` / `TcpDiag` seam structs went
-with `/stats`: counters now render straight to JSON in the
-subsystem, crossing the seam as `write_obs_json` output, never as a
-per-subsystem struct.
+There is exactly one observability surface — `/obs` — not a family
+of them. The NIC per-qp distribution view (arrays, not per-event
+counters) is the `nic` block's distribution fields; per-core
+event-loop occupancy is the `event_loop` block; heap statistics are
+the `kernel` block. Counters render straight to JSON inside their
+subsystem, crossing the `os:none` seam as `write_obs_json` output —
+there is no per-subsystem carrier struct.
 
 **The `os:none` seam.** App-reachable crates that build on the host
 (`quic`, `tls`, the runtime) plug into `/obs` directly. The
@@ -236,30 +232,30 @@ Panics answer "did we crash, and why"; `LastEvent` snapshots answer
 (A future enhancement could have the panic handler append a compact
 counter summary to the ring; that is out of scope here.)
 
-## Rollout checklist
+## Subsystem coverage
 
-One row per subsystem. Sessions adopting the doctrine update the
-status here. "Adopted" means: cold-path counters use `Counter`,
-anomaly/exit counters are paired with `LastEvent` snapshots carrying
-their invariant inputs, and a `write_obs_json` is wired into `/obs`.
+Every subsystem below carries the doctrine: cold-path counters use
+`Counter`, anomaly/exit counters are paired with `LastEvent`
+snapshots carrying their invariant inputs, and a `write_obs_json`
+is wired into `/obs`.
 
-| Subsystem        | Crate                       | Status   | Notes |
-|------------------|-----------------------------|----------|-------|
-| QUIC             | `crates/proto/quic`         | ✅ Done   | Reference implementation — see below. |
-| TCP              | `crates/net/tcp`            | ✅ Done   | `tcp::diag` — 19 counters, `LAST_RST` / `LAST_TEARDOWN` / `LAST_ACK_UNSENT`; surfaced via the `waitless_backend` seam. |
-| UDP              | `crates/net`                | ✅ Done   | `udp::diag` — 6 counters + `LAST_UNDELIVERABLE`; `waitless_backend` seam. |
-| NIC drivers      | `crates/drivers/{gve,virtio-net}` | ✅ Done | Both drivers: `gve::diag` — anomaly counters + `LAST_RX_SKIP`; `virtio_net::diag` — 5 failure counters + `LAST_TX_DROP`. `NicDiagOps::obs_json` vtable entry; `nic::obs_json` dispatches to the active driver; `waitless_backend` seam. Each block self-identifies via a `"driver"` field. |
-| IP / ARP / NDP   | `crates/net/stack`          | ✅ Done   | `net_stack::diag` — L2/L3 RX-dispatch drops (`classified_drops` / `unknown_l4`) + `LAST_CLASSIFIED_DROP`; `waitless_backend` seam. |
-| TLS              | `crates/proto/tls`          | ✅ Done   | `tls::diag` — handshake-lifecycle counters + `LAST_HANDSHAKE_FAILURE`; app-reachable, no seam. |
-| HTTP/1.1         | `crates/proto/http`         | ✅ Done   | `http::diag` — 9 connection/request lifecycle counters + `LAST_REJECT` (smuggling-shaped request → `400`); app-reachable, no seam. |
-| HTTP/3           | `crates/proto/http3`        | ✅ Done   | `http3::diag` — 15 request/drop/lifecycle counters + `LAST_DROP`; `h3_drop!` / `h3_event!` gated by the `h3.log=` boot-arg; app-reachable, no seam. |
-| Async runtime    | `crates/runtime/executor`   | ✅ Done   | `executor::diag` — task-lifecycle counters + `LAST_SPAWN_FAILURE`; app-reachable via `executor::diag`, no seam. |
-| Kernel           | `crates/kernel`             | ✅ Done   | `kernel_bare::mm` — heap stats + `HEAP_OOM` / `LAST_OOM`; `waitless_backend` seam. Panics / exceptions stay in the `diag` ring (`/diag-panic`). |
+| Subsystem        | Crate                       | Notes |
+|------------------|-----------------------------|-------|
+| QUIC             | `crates/proto/quic`         | Reference implementation — see below. |
+| TCP              | `crates/net/tcp`            | `tcp::diag` — 19 counters, `LAST_RST` / `LAST_TEARDOWN` / `LAST_ACK_UNSENT`; surfaced via the `waitless_backend` seam. |
+| UDP              | `crates/net`                | `udp::diag` — 6 counters + `LAST_UNDELIVERABLE`; `waitless_backend` seam. |
+| NIC drivers      | `crates/drivers/{gve,virtio-net}` | Both drivers: `gve::diag` — anomaly counters + `LAST_RX_SKIP`; `virtio_net::diag` — 5 failure counters + `LAST_TX_DROP`. `NicDiagOps::obs_json` vtable entry; `nic::obs_json` dispatches to the active driver; `waitless_backend` seam. Each block self-identifies via a `"driver"` field. |
+| IP / ARP / NDP   | `crates/net/stack`          | `net_stack::diag` — L2/L3 RX-dispatch drops (`classified_drops` / `unknown_l4`) + `LAST_CLASSIFIED_DROP`; `waitless_backend` seam. |
+| TLS              | `crates/proto/tls`          | `tls::diag` — handshake-lifecycle counters + `LAST_HANDSHAKE_FAILURE`; app-reachable, no seam. |
+| HTTP/1.1         | `crates/proto/http`         | `http::diag` — 9 connection/request lifecycle counters + `LAST_REJECT` (smuggling-shaped request → `400`); app-reachable, no seam. |
+| HTTP/3           | `crates/proto/http3`        | `http3::diag` — 15 request/drop/lifecycle counters + `LAST_DROP`; `h3_drop!` / `h3_event!` gated by the `h3.log=` boot-arg; app-reachable, no seam. |
+| Async runtime    | `crates/runtime/executor`   | `executor::diag` — task-lifecycle counters + `LAST_SPAWN_FAILURE`; app-reachable via `executor::diag`, no seam. |
+| Kernel           | `crates/kernel`             | `kernel_bare::mm` — heap stats + `HEAP_OOM` / `LAST_OOM`; `waitless_backend` seam. Panics / exceptions stay in the `diag` ring (`/diag-panic`). |
 
 ## Reference implementation: QUIC
 
-`crates/proto/quic` is the worked example. A session adopting the
-doctrine for another subsystem should read these and mirror them:
+`crates/proto/quic` is the worked example. To apply the doctrine to
+a new subsystem, read these and mirror them:
 
 - **`src/diag.rs`** — the `Counters` struct (every field a
   `Counter`), the `LastEvent` snapshot slots, the `LatencyHist`s,
