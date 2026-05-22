@@ -1488,12 +1488,23 @@ overrun corrupts virtio-net's slot too.
       every datagram stays within `MAX_QUIC_DATAGRAM` — catches a
       regression without needing GCE.
 
+**Follow-on bug found during live verification — also fixed.** With
+the crash gone, real browser sessions exposed a pre-existing
+connection-lifecycle bug: the conn task armed one timer at
+`min(PTO, idle)` and mis-identified an early-waking PTO timer as an
+idle timeout, silently reaping live h3 connections ~80 ms after
+their last packet. The client kept using the connection, got no
+reply, and fell back to HTTP/1.1. Fixed by gating the idle break on
+the genuine idle condition (`now - last_recv >= idle_us`) instead of
+guessing which deadline fired.
+
 `scripts/deploy-gcloud.sh` opens `udp:443`. **Verified on the live
 `waitless-dev` GCE instance** (n2-highcpu-2, gVNIC, `GQI_QPL`,
-production leaf+intermediate cert chain): 71 HTTP/3 requests — a
-single first request, then 40 sequential and 30 concurrent full
-QUIC handshakes — all served `200`, serial console clean, no
-`talc::free` fault.
+production leaf+intermediate cert chain): the handshake fix over 71
+requests (no `talc::free` fault), and the connection-reuse fix over
+sustained reused-connection load — PTO fired 100+ times with zero
+spurious reaps (`idle_timeouts=0`, `unknown_short_header=0`), while
+a genuinely idle connection still reaps correctly at ~30 s.
 
 ### x86_64 SSE / AVX baseline via custom target JSON
 

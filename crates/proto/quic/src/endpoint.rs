@@ -691,24 +691,49 @@ where
             waitless::runtime::Either::Left(Some(d)) => d,
             waitless::runtime::Either::Left(None) => break, // inbox closed
             waitless::runtime::Either::Right(()) => {
-                // Timer fired. Distinguish PTO vs idle by which
-                // deadline was earlier and is now in the past.
+                // The timer fired. It was armed at
+                // `min(PTO deadline, idle deadline)`, so a wakeup
+                // means one of those is due — but the wakeup is
+                // NOT self-identifying, and timer granularity can
+                // wake us a hair early. Re-derive from the clock
+                // rather than trusting which deadline it "was".
                 let after = tls::ticket::now_us();
-                if let Some(p) = pto_deadline
-                    && after >= p
-                    && p < idle_deadline
-                {
-                    // PTO fired first — emit a probe and loop
-                    // back. Don't break; PTO is recovery, not
-                    // teardown.
+                // Genuine idle timeout: no inbound datagram for the
+                // full idle window. This MUST mirror the
+                // top-of-loop `elapsed >= idle_us` check exactly.
+                // A PTO wakeup — the timer firing for the *earlier*
+                // PTO deadline, even a microsecond early — must
+                // never be mistaken for an idle timeout. The
+                // previous test ("PTO iff `after >= p && p <
+                // idle_deadline`", else idle) failed exactly that
+                // way: a PTO timer that woke a hair before `p`
+                // fell through to the idle break and reaped a live
+                // connection ~80 ms after its last packet — the h3
+                // connection-reuse bug.
+                if after.saturating_sub(last_recv_us) >= idle_us {
+                    crate::quic_event!(
+                        idle_timeouts,
+                        "elapsed_us={} idle_us={} local_cid={}",
+                        after.saturating_sub(last_recv_us),
+                        idle_us,
+                        hex8(&local_cid_bytes)
+                    );
+                    break;
+                }
+                // Not idle — the PTO deadline is what woke us.
+                // Emit a probe if it has actually arrived (a
+                // too-early wakeup just loops and re-arms the
+                // timer); then loop back. PTO is recovery, not
+                // teardown.
+                if pto_deadline.is_some_and(|p| after >= p) {
                     let probed = conn.borrow_mut().send_pto_probe();
                     if probed {
                         crate::diag::COUNTERS
                             .pto_probes_sent
                             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                        // Drain the probe to the wire
-                        // immediately via the ownership-
-                        // transfer pop + recycle pattern.
+                        // Drain the probe to the wire immediately
+                        // via the ownership-transfer pop + recycle
+                        // pattern.
                         loop {
                             let pkt = match conn.borrow_mut().pop_packet_owned() {
                                 Some(p) => p,
@@ -717,17 +742,8 @@ where
                             ship_datagram(&sock, &conn, peer_ip.get(), peer_port.get(), pkt);
                         }
                     }
-                    continue;
                 }
-                // Idle path.
-                crate::quic_event!(
-                    idle_timeouts,
-                    "elapsed_us={} idle_us={} local_cid={}",
-                    after.saturating_sub(last_recv_us),
-                    idle_us,
-                    hex8(&local_cid_bytes)
-                );
-                break;
+                continue;
             }
         };
         // Process the awaited datagram, then opportunistically
