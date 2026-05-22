@@ -727,6 +727,8 @@ impl TcpConnection {
             // The retransmit ring could not be allocated. Suspend
             // retransmit coverage until `snd_una` catches `snd_nxt`;
             // `rtx_on_ack` clears the flag once the window drains.
+            // Heap exhaustion — genuinely unexpected, so trace it.
+            crate::diag::COUNTERS.rtx_buf_oom.bump();
             self.rtx_overflow = true;
             self.rtx_head = 0;
             self.rtx_len = 0;
@@ -986,6 +988,7 @@ impl TcpConnection {
     /// mechanism: a non-data segment, so it needs no access to the
     /// queued send data.
     pub(crate) fn send_window_probe(&mut self, now: u64) {
+        crate::diag::COUNTERS.persist_probes.bump();
         send_segment(
             &SegmentMeta {
                 local_ip: self.local_ip,

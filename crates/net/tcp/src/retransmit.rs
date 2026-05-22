@@ -51,6 +51,10 @@ pub fn on_tcp_tick() {
         if c.persist_deadline_ms != 0 && now >= c.persist_deadline_ms {
             if c.state == TcpState::Established {
                 if c.persist_backoff >= PERSIST_MAX_PROBES {
+                    crate::diag::record_teardown(
+                        crate::diag::TeardownReason::PersistGiveup,
+                        c.state,
+                    );
                     free_connection(core, i);
                     continue;
                 }

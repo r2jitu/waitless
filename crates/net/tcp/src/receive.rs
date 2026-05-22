@@ -281,6 +281,10 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
         // resynchronizes to our real window, then drop the segment —
         // a forged or badly confused ACK must not be processed.
         if seq_lt(c.snd_nxt, ack) {
+            // Trace the rejection — `LAST_ACK_UNSENT` retains the
+            // RFC 9293 §3.10.7.4 acceptability inputs (`SEG.ACK` vs
+            // `SND.NXT`) that tell a confused peer from an injection.
+            crate::diag::record_ack_unsent(src_port, dst_port, ack, c.snd_una, c.snd_nxt, c.state);
             send_segment(
                 &SegmentMeta {
                     local_ip: dst_ip,

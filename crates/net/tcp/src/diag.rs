@@ -6,16 +6,17 @@
 //   * `Counters` — one `obs::Counter` per event. Wraps the four
 //     pre-existing diagnostic atomics (`syn_rx`, `synack_tx`, the
 //     `rx_chunk_*` pair) and adds the connection-lifecycle, reset,
-//     and retransmit events the stack used to leave untraced.
-//   * `LastEvent` snapshots — `LAST_RST` and `LAST_TEARDOWN` retain
-//     the decisive context of the most recent reset / connection
-//     teardown. A counter says a connection died; the snapshot says
-//     in which state and why.
+//     congestion-window, and retransmit events the stack used to
+//     leave untraced.
+//   * `LastEvent` snapshots — `LAST_RST`, `LAST_TEARDOWN`, and
+//     `LAST_ACK_UNSENT` retain the decisive context of the most
+//     recent reset, connection teardown, and rejected ACK. A counter
+//     says an anomaly fired; the snapshot says what it looked like.
 //
 // Cold path only — every site here fires at most once per
-// connection (accept, reset, teardown) or per RTO, never per
-// segment. Surfaced as the `"tcp"` block of `/obs` via
-// `write_obs_json`, which crosses the `os:none` → app boundary
+// connection (accept, reset, teardown), per RTO, or per persist
+// probe, never per segment. Surfaced as the `"tcp"` block of `/obs`
+// via `write_obs_json`, which crosses the `os:none` → app boundary
 // through `waitless_backend::tcp_obs_json`.
 
 use core::fmt;
@@ -37,6 +38,13 @@ pub struct Counters {
     /// Three-way handshake completed — a connection reached
     /// `Established`. Pair with `conns_freed` to watch live count.
     pub conns_established: Counter,
+    /// Inbound segments whose ACK field was above `SND.NXT` —
+    /// acknowledging data we never sent (RFC 9293 §3.10.7.4). Each
+    /// was answered with a bare ACK and dropped. A real peer never
+    /// does this; a non-zero count is a confused peer or a blind
+    /// off-path injection. `LAST_ACK_UNSENT` has the rejected
+    /// `SEG.ACK` and the `SND.NXT` it failed against.
+    pub ack_unsent: Counter,
 
     // ── Teardown ─────────────────────────────────────────────────
     /// Connections freed, all reasons. Equals the sum of the
@@ -58,6 +66,10 @@ pub struct Counters {
     /// A half-closed connection torn down because our FIN went
     /// unacknowledged `FIN_RETX_MAX` times. Anomalous.
     pub fin_giveups: Counter,
+    /// A connection aborted because `PERSIST_MAX_PROBES` zero-window
+    /// probes went unanswered — the peer kept its receive window
+    /// shut. Anomalous; `LAST_TEARDOWN` has the state.
+    pub persist_giveups: Counter,
 
     // ── Resource pressure (genuinely unexpected) ─────────────────
     /// `alloc_connection` found no free slot AND no half-closed
@@ -73,6 +85,10 @@ pub struct Counters {
     /// A SYN was refused because the per-conn RX ring could not be
     /// heap-allocated. Heap exhaustion — genuinely unexpected.
     pub rx_ring_oom: Counter,
+    /// A send could not grow the per-conn retransmit ring — heap
+    /// exhaustion. Retransmit coverage is suspended (`rtx_overflow`)
+    /// until the unacked window drains. Genuinely unexpected.
+    pub rtx_buf_oom: Counter,
 
     // ── Retransmission ───────────────────────────────────────────
     /// RFC 6298 data retransmissions — the oldest unacked segment
@@ -81,6 +97,9 @@ pub struct Counters {
     /// FIN retransmissions — a `FinWait1` / `LastAck` FIN resent
     /// because the peer hadn't acknowledged it.
     pub fin_retransmits: Counter,
+    /// RFC 9293 §3.8.6.1 zero-window probes — one bare ACK emitted
+    /// per persist-timer expiry while a peer keeps its window shut.
+    pub persist_probes: Counter,
 
     // ── recv_chunk zero-copy accounting ──────────────────────────
     /// `recv_chunk` resolved via the zero-copy device-buffer stash.
@@ -96,16 +115,20 @@ impl Counters {
             syn_rx: Counter::new(),
             synack_tx: Counter::new(),
             conns_established: Counter::new(),
+            ack_unsent: Counter::new(),
             conns_freed: Counter::new(),
             rst_received: Counter::new(),
             rst_sent: Counter::new(),
             rtx_giveups: Counter::new(),
             fin_giveups: Counter::new(),
+            persist_giveups: Counter::new(),
             pool_exhausted: Counter::new(),
             pool_reclaimed: Counter::new(),
             rx_ring_oom: Counter::new(),
+            rtx_buf_oom: Counter::new(),
             data_retransmits: Counter::new(),
             fin_retransmits: Counter::new(),
+            persist_probes: Counter::new(),
             rx_chunk_stash_hits: Counter::new(),
             rx_chunk_ring_drain: Counter::new(),
         }
@@ -121,6 +144,11 @@ pub static LAST_RST: LastEvent<RstRecord> = LastEvent::new();
 
 /// Most recent connection teardown — the state it died in and why.
 pub static LAST_TEARDOWN: LastEvent<TeardownRecord> = LastEvent::new();
+
+/// Most recent inbound ACK rejected as acknowledging unsent data —
+/// the RFC 9293 §3.10.7.4 acceptability inputs the bare `ack_unsent`
+/// count discards.
+pub static LAST_ACK_UNSENT: LastEvent<AckUnsentRecord> = LastEvent::new();
 
 /// Snapshot payload for `LAST_RST`.
 #[derive(Clone, Copy)]
@@ -159,6 +187,42 @@ impl ObsRecord for RstRecord {
     }
 }
 
+/// Snapshot payload for `LAST_ACK_UNSENT` — an inbound segment whose
+/// ACK acknowledged data past `SND.NXT`.
+#[derive(Clone, Copy)]
+pub struct AckUnsentRecord {
+    pub peer_port: u16,
+    pub local_port: u16,
+    /// The rejected `SEG.ACK` — acknowledged data we never sent.
+    pub seg_ack: u32,
+    /// `SND.UNA` at receipt — the oldest unacknowledged byte.
+    pub snd_una: u32,
+    /// `SND.NXT` at receipt — the acceptability bound `SEG.ACK`
+    /// exceeded (the test is `SEG.ACK > SND.NXT`).
+    pub snd_nxt: u32,
+    /// Connection state when the segment arrived.
+    pub conn_state: TcpState,
+    /// `kernel_core::clock::now_ms()` at receipt.
+    pub at_ms: u64,
+}
+
+impl ObsRecord for AckUnsentRecord {
+    fn write_fields(&self, w: &mut dyn fmt::Write) -> fmt::Result {
+        write!(
+            w,
+            "\"peer_port\":{},\"local_port\":{},\"seg_ack\":{},\"snd_una\":{},\
+             \"snd_nxt\":{},\"conn_state\":\"{}\",\"at_ms\":{}",
+            self.peer_port,
+            self.local_port,
+            self.seg_ack,
+            self.snd_una,
+            self.snd_nxt,
+            state_name(self.conn_state),
+            self.at_ms,
+        )
+    }
+}
+
 /// Why a connection was torn down.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TeardownReason {
@@ -173,6 +237,8 @@ pub enum TeardownReason {
     RtxGiveup,
     /// FIN retransmission gave up (`FIN_RETX_MAX`).
     FinGiveup,
+    /// Zero-window persist gave up (`PERSIST_MAX_PROBES`).
+    PersistGiveup,
     /// The connection was force-reclaimed to free a pool slot.
     PoolReclaim,
     /// A SYN's RX-ring allocation failed; the just-allocated slot
@@ -189,6 +255,7 @@ impl TeardownReason {
             TeardownReason::TimeWaitExpiry => "time_wait_expiry",
             TeardownReason::RtxGiveup => "rtx_giveup",
             TeardownReason::FinGiveup => "fin_giveup",
+            TeardownReason::PersistGiveup => "persist_giveup",
             TeardownReason::PoolReclaim => "pool_reclaim",
             TeardownReason::RxRingOom => "rx_ring_oom",
         }
@@ -254,6 +321,29 @@ pub fn record_rst(
     });
 }
 
+/// Record an inbound ACK rejected as acknowledging unsent data
+/// (`SEG.ACK > SND.NXT`): bump `ack_unsent` and snapshot the
+/// RFC 9293 §3.10.7.4 acceptability inputs into `LAST_ACK_UNSENT`.
+pub fn record_ack_unsent(
+    peer_port: u16,
+    local_port: u16,
+    seg_ack: u32,
+    snd_una: u32,
+    snd_nxt: u32,
+    conn_state: TcpState,
+) {
+    COUNTERS.ack_unsent.bump();
+    LAST_ACK_UNSENT.record(AckUnsentRecord {
+        peer_port,
+        local_port,
+        seg_ack,
+        snd_una,
+        snd_nxt,
+        conn_state,
+        at_ms: kernel_core::clock::now_ms(),
+    });
+}
+
 /// Record a connection teardown: bump `conns_freed` (+ the
 /// per-reason counter for an anomalous reason) and snapshot the
 /// state + reason into `LAST_TEARDOWN`. Call with the connection's
@@ -263,6 +353,7 @@ pub fn record_teardown(reason: TeardownReason, state: TcpState) {
     match reason {
         TeardownReason::RtxGiveup => COUNTERS.rtx_giveups.bump(),
         TeardownReason::FinGiveup => COUNTERS.fin_giveups.bump(),
+        TeardownReason::PersistGiveup => COUNTERS.persist_giveups.bump(),
         TeardownReason::PoolReclaim => COUNTERS.pool_reclaimed.bump(),
         TeardownReason::RxRingOom => COUNTERS.rx_ring_oom.bump(),
         TeardownReason::PeerReset
@@ -278,22 +369,26 @@ pub fn record_teardown(reason: TeardownReason, state: TcpState) {
 
 /// Counter `(name, value)` pairs in declaration order — the flat
 /// half of the `/obs` `"tcp"` block.
-pub fn snapshot() -> [(&'static str, u64); 15] {
+pub fn snapshot() -> [(&'static str, u64); 19] {
     let c = &COUNTERS;
     [
         ("syn_rx", c.syn_rx.get()),
         ("synack_tx", c.synack_tx.get()),
         ("conns_established", c.conns_established.get()),
+        ("ack_unsent", c.ack_unsent.get()),
         ("conns_freed", c.conns_freed.get()),
         ("rst_received", c.rst_received.get()),
         ("rst_sent", c.rst_sent.get()),
         ("rtx_giveups", c.rtx_giveups.get()),
         ("fin_giveups", c.fin_giveups.get()),
+        ("persist_giveups", c.persist_giveups.get()),
         ("pool_exhausted", c.pool_exhausted.get()),
         ("pool_reclaimed", c.pool_reclaimed.get()),
         ("rx_ring_oom", c.rx_ring_oom.get()),
+        ("rtx_buf_oom", c.rtx_buf_oom.get()),
         ("data_retransmits", c.data_retransmits.get()),
         ("fin_retransmits", c.fin_retransmits.get()),
+        ("persist_probes", c.persist_probes.get()),
         ("rx_chunk_stash_hits", c.rx_chunk_stash_hits.get()),
         ("rx_chunk_ring_drain", c.rx_chunk_ring_drain.get()),
     ]
@@ -311,6 +406,8 @@ pub fn write_obs_json(w: &mut dyn fmt::Write) -> fmt::Result {
     LAST_RST.write_json(w, "last_rst")?;
     w.write_str(",")?;
     LAST_TEARDOWN.write_json(w, "last_teardown")?;
+    w.write_str(",")?;
+    LAST_ACK_UNSENT.write_json(w, "last_ack_unsent")?;
     w.write_str("}")
 }
 
@@ -342,6 +439,28 @@ mod tests {
     }
 
     #[test]
+    fn ack_unsent_record_renders() {
+        let mut s = String::new();
+        AckUnsentRecord {
+            peer_port: 51000,
+            local_port: 443,
+            seg_ack: 5000,
+            snd_una: 1000,
+            snd_nxt: 1500,
+            conn_state: TcpState::Established,
+            at_ms: 42,
+        }
+        .write_fields(&mut s)
+        .unwrap();
+        assert_eq!(
+            s,
+            "\"peer_port\":51000,\"local_port\":443,\"seg_ack\":5000,\
+             \"snd_una\":1000,\"snd_nxt\":1500,\
+             \"conn_state\":\"established\",\"at_ms\":42"
+        );
+    }
+
+    #[test]
     fn record_teardown_bumps_total_and_reason() {
         let total = COUNTERS.conns_freed.get();
         let giveups = COUNTERS.rtx_giveups.get();
@@ -358,6 +477,9 @@ mod tests {
         write_obs_json(&mut s).unwrap();
         assert!(s.starts_with('{') && s.ends_with('}'));
         assert!(s.contains("\"syn_rx\":"));
+        assert!(s.contains("\"ack_unsent\":"));
+        assert!(s.contains("\"persist_probes\":"));
         assert!(s.contains("\"last_teardown\":{\"count\":"));
+        assert!(s.contains("\"last_ack_unsent\":{\"count\":"));
     }
 }

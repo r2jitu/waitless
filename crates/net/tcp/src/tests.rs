@@ -2148,6 +2148,7 @@ fn zero_window_arms_persist_and_probes() {
     assert_eq!(blocked, 0, "a zero advertised window blocks the send");
 
     // No probe before the persist interval elapses.
+    let probes_before = super::diag::COUNTERS.persist_probes.get();
     clear_tx();
     kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 - 1);
     super::on_tcp_tick();
@@ -2168,6 +2169,11 @@ fn zero_window_arms_persist_and_probes() {
         frames[0].len(),
         34 + TCP_HDR_LEN,
         "the probe carries no payload",
+    );
+    assert_eq!(
+        super::diag::COUNTERS.persist_probes.get(),
+        probes_before + 1,
+        "the probe bumped the persist_probes counter",
     );
 }
 
@@ -2296,6 +2302,7 @@ fn zero_window_persist_gives_up() {
 
     // The peer's window stays shut forever — every probe goes
     // unanswered. Tick past each backed-off deadline.
+    let giveups_before = super::diag::COUNTERS.persist_giveups.get();
     for _ in 0..=PERSIST_MAX_PROBES {
         kernel_core::clock::mock::advance(RTO_MAX_MS as u64 + 1);
         super::on_tcp_tick();
@@ -2304,6 +2311,17 @@ fn zero_window_persist_gives_up() {
         conn_state(CP, SP),
         None,
         "a permanently shut window aborts the connection",
+    );
+    assert_eq!(
+        super::diag::COUNTERS.persist_giveups.get(),
+        giveups_before + 1,
+        "the abort bumped the persist_giveups counter",
+    );
+    let (_, last) = super::diag::LAST_TEARDOWN.snapshot();
+    assert_eq!(
+        last.expect("the abort recorded a teardown").reason,
+        super::diag::TeardownReason::PersistGiveup,
+        "LAST_TEARDOWN attributes the abort to the persist give-up",
     );
 }
 
@@ -2484,6 +2502,7 @@ fn future_ack_is_dropped_with_a_bare_ack() {
 
     // A segment acking 5000 bytes past snd_nxt, carrying injected data.
     clear_tx();
+    let ack_unsent_before = super::diag::COUNTERS.ack_unsent.get();
     deliver(&Seg {
         src_port: CP,
         dst_port: SP,
@@ -2512,6 +2531,25 @@ fn future_ack_is_dropped_with_a_bare_ack() {
         conn_snd_una(CP, SP),
         server_isn.wrapping_add(1),
         "the bogus ACK left snd_una untouched",
+    );
+    // The rejection is traced — `ack_unsent` counts it and
+    // `LAST_ACK_UNSENT` retains the RFC 9293 acceptability inputs.
+    assert_eq!(
+        super::diag::COUNTERS.ack_unsent.get(),
+        ack_unsent_before + 1,
+        "the rejection bumped the ack_unsent counter",
+    );
+    let (_, last) = super::diag::LAST_ACK_UNSENT.snapshot();
+    let last = last.expect("the rejection recorded a snapshot");
+    assert_eq!(
+        last.seg_ack,
+        server_isn.wrapping_add(1 + 5000),
+        "LAST_ACK_UNSENT retained the rejected SEG.ACK",
+    );
+    assert_eq!(
+        last.snd_nxt,
+        server_isn.wrapping_add(1 + 500),
+        "LAST_ACK_UNSENT retained the SND.NXT it failed against",
     );
 }
 

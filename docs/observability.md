@@ -223,7 +223,7 @@ their invariant inputs, and a `write_obs_json` is wired into `/obs`.
 | Subsystem        | Crate                       | Status   | Notes |
 |------------------|-----------------------------|----------|-------|
 | QUIC             | `crates/proto/quic`         | ✅ Done   | Reference implementation — see below. |
-| TCP              | `crates/net/tcp`            | ✅ Done   | `tcp::diag` — 15 counters, `LAST_RST` / `LAST_TEARDOWN`; surfaced via the `waitless_backend` seam. |
+| TCP              | `crates/net/tcp`            | ✅ Done   | `tcp::diag` — 19 counters, `LAST_RST` / `LAST_TEARDOWN` / `LAST_ACK_UNSENT`; surfaced via the `waitless_backend` seam. |
 | UDP              | `crates/net`                | ✅ Done   | `udp::diag` — 6 counters + `LAST_UNDELIVERABLE`; `waitless_backend` seam. |
 | NIC / gve driver | `crates/drivers/gve`        | ✅ Done   | `gve::diag` — anomaly counters + `LAST_RX_SKIP`; `waitless_backend` seam. virtio-net driver still bare. |
 | IP / ARP / NDP   | `crates/net/stack`          | ⬜ Pending | lower-layer RX/TX. |
