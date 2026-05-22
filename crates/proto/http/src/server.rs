@@ -90,6 +90,7 @@ where
     // into a single alloc per conn-accept. Sized to BODY_CAP +
     // header headroom so a full bulk-upload request fits in one
     // parse pass.
+    crate::diag::COUNTERS.connections_served.bump();
     let mut buf = [0u8; BUF_SIZE];
     let mut buf_len = 0usize;
     // Per-connection scratch reused across every request on this
@@ -128,14 +129,19 @@ where
         if buf_len == BUF_SIZE {
             // Parse buffer full and no complete request in it —
             // client sent something larger than we handle.
+            crate::diag::COUNTERS.header_buffer_overflow.bump();
             return;
         }
         let recv_fut = stream.recv(&mut buf[buf_len..]);
         let got = match waitless::runtime::timeout_us(IDLE_TIMEOUT_US, recv_fut).await {
             Some(n) => n,
-            None => return, // idle timeout
+            None => {
+                crate::diag::COUNTERS.idle_timeout.bump();
+                return; // idle timeout
+            }
         };
         if got == 0 {
+            crate::diag::COUNTERS.peer_eof.bump();
             return; // EOF / fatal recv
         }
         buf_len += got;
@@ -146,6 +152,7 @@ where
             if body_start == 0 {
                 break; // need more bytes
             }
+            crate::diag::COUNTERS.requests_parsed.bump();
             let content_length = req.content_length;
 
             // A request the HTTP/1.1 parser flagged as malformed —
@@ -165,6 +172,7 @@ where
             let want_close;
             let resp;
             if req.reject {
+                crate::diag::record_reject(&req);
                 resp = Response::bad_request();
                 want_close = true;
             } else {
@@ -197,6 +205,7 @@ where
                     body_drained_ok = want_close || body.is_empty() || body.discard().await.is_ok();
                 }
                 if !body_drained_ok {
+                    crate::diag::COUNTERS.body_drain_failed.bump();
                     return;
                 }
             }
@@ -253,8 +262,10 @@ where
             out_chain.push_front(header);
 
             if stream.send(&mut out_chain).await.is_err() {
+                crate::diag::COUNTERS.send_failed.bump();
                 return;
             }
+            crate::diag::COUNTERS.responses_sent.bump();
 
             if want_close {
                 // Send TLS close_notify (no-op for plain TCP) before

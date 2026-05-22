@@ -18,6 +18,7 @@ extern crate alloc;
 pub use iobuf::{Cursor as IOBufCursor, IOBuf, IOBufChain, IOBufError, IOBufWriter, OwnedIOBuf};
 
 mod body;
+pub mod diag;
 mod request;
 mod response;
 mod server;

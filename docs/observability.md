@@ -246,6 +246,7 @@ their invariant inputs, and a `write_obs_json` is wired into `/obs`.
 | NIC / gve driver | `crates/drivers/gve`        | ✅ Done   | `gve::diag` — anomaly counters + `LAST_RX_SKIP`; `waitless_backend` seam. virtio-net driver still bare. |
 | IP / ARP / NDP   | `crates/net/stack`          | ✅ Done   | `net_stack::diag` — L2/L3 RX-dispatch drops (`classified_drops` / `unknown_l4`) + `LAST_CLASSIFIED_DROP`; `waitless_backend` seam. |
 | TLS              | `crates/proto/tls`          | ✅ Done   | `tls::diag` — handshake-lifecycle counters + `LAST_HANDSHAKE_FAILURE`; app-reachable, no seam. |
+| HTTP/1.1         | `crates/proto/http`         | ✅ Done   | `http::diag` — 9 connection/request lifecycle counters + `LAST_REJECT` (smuggling-shaped request → `400`); app-reachable, no seam. |
 | HTTP/3           | `crates/proto/http3`        | ✅ Done   | `http3::diag` — 15 request/drop/lifecycle counters + `LAST_DROP`; `h3_drop!` / `h3_event!` gated by the `h3.log=` boot-arg; app-reachable, no seam. |
 | Async runtime    | `crates/runtime/executor`   | ✅ Done   | `executor::diag` — task-lifecycle counters + `LAST_SPAWN_FAILURE`; app-reachable via `executor::diag`, no seam. |
 | Kernel           | `crates/kernel`             | ✅ Done   | `kernel_bare::mm` — heap stats + `HEAP_OOM` / `LAST_OOM`; `waitless_backend` seam. Panics / exceptions stay in the `diag` ring (`/diag-panic`). |

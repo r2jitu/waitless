@@ -10,6 +10,7 @@ rust_library(
     name = "http",
     srcs = [
         "src/body.rs",
+        "src/diag.rs",
         "src/lib.rs",
         "src/request.rs",
         "src/response.rs",
@@ -18,6 +19,8 @@ rust_library(
     ],
     crate_name = "http",
     deps = [
+        # obs::{Counter, LastEvent} — observability primitives.
+        "//crates/util/obs",
         "//crates/runtime/worker",
         "//crates/waitless",
         "//crates/util/iobuf",
