@@ -1744,6 +1744,27 @@ fn usable_window_arithmetic() {
     assert_eq!(c.usable_window(), 0, "an over-shrunk window saturates at 0");
 }
 
+/// RFC 5681 §3.1: a fresh `Established` connection opens at the
+/// initial window of 3·SMSS — and exactly that. The 3-way handshake
+/// ACK acknowledges the SYN's sequence number, but the SYN is not
+/// data (RFC 5681 §2), so it must not inflate `cwnd`.
+#[test]
+fn congestion_window_opens_at_the_initial_window() {
+    let _g = harness();
+    const SP: u16 = 9152;
+    const CP: u16 = 50152;
+    const CLIENT_ISN: u32 = 0xF000;
+    super::listen_on_core(0, SP);
+    handshake(SP, CP, CLIENT_ISN);
+    let (cwnd, _) = conn_cwnd_ssthresh(CP, SP);
+    assert_eq!(
+        cwnd,
+        3 * 1460,
+        "cwnd opens at exactly 3·SMSS — the handshake ACK of the SYN \
+         must not count as a data ACK",
+    );
+}
+
 /// A send larger than the congestion window puts exactly `cwnd`
 /// bytes on the wire (the connection has nothing else in flight) and
 /// leaves the rest queued in the chain.

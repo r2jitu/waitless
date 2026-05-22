@@ -811,9 +811,19 @@ impl TcpConnection {
         if acked == 0 {
             return; // not new data — leave the timer untouched
         }
-        // RFC 5681 §3.1: an ACK of new data opens the congestion
-        // window — slow start or congestion avoidance.
-        self.cwnd_on_ack(acked as u32);
+        // Data bytes this ACK retires from the retransmit ring.
+        // `acked` is the raw sequence advance, which also counts the
+        // SYN / FIN phantom bytes — neither is held in `rtx_buf`, so
+        // clamping to `rtx_len` strips them.
+        let drop = acked.min(self.rtx_len as usize);
+        // RFC 5681 §2 / §3.1: the congestion window opens only for an
+        // ACK that "cumulatively acknowledges new data" — the SYN and
+        // FIN flag bytes do not count. Skipping the update when no
+        // data was acked keeps the 3-way handshake ACK (which acks
+        // only the SYN) from inflating the initial window.
+        if drop > 0 {
+            self.cwnd_on_ack(drop as u32);
+        }
         // RFC 6298 §3 (Karn): if this ACK covers the anchored byte and
         // no retransmission has invalidated the sample, fold the
         // round-trip time into the estimator.
@@ -822,7 +832,6 @@ impl TcpConnection {
             self.sample_rtt(elapsed.min(u32::MAX as u64) as u32);
             self.rtt_anchor_active = false;
         }
-        let drop = acked.min(self.rtx_len as usize);
         self.rtx_head = ((self.rtx_head as usize + drop) % RTX_BUF_BYTES) as u16;
         self.rtx_len -= drop as u16;
         // New data acknowledged: the peer is making progress, so clear
