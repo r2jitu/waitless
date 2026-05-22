@@ -24,7 +24,7 @@ implements and host-tests:
 - RFC 5961 §3.2 — strict-sequence RST acceptance.
 - RFC 1122 §4.2.2.16 — receiver silly-window-syndrome avoidance.
 
-Validation: `//crates/net/tcp:tcp_test` is a 46-scenario in-process
+Validation: `//crates/net/tcp:tcp_test` is a 48-scenario in-process
 packetdrill-style harness (scripted segments → real `tcp_receive` →
 assertions on captured TX), plus production interop (`dev.r2jitu.com`
 serves real browsers / curl / openssl).
@@ -51,10 +51,14 @@ Effort: **S** ≈ hours, **M** ≈ a few days, **L** ≈ a week+.
 
 ## P0 — correctness bugs reachable in normal operation
 
-### T1 — The ACK field is not validated against the send window
+### T1 — The ACK field is not validated against the send window — ✅ done
 
-**What.** `tcp_receive`'s generic ACK branch does `c.snd_una = ack`
-unconditionally. There is no `SND.UNA < SEG.ACK <= SND.NXT` check.
+**Status.** Done on branch `tcp-cwnd-send-window` — `tcp_receive` now
+applies the RFC 9293 §3.10.7.4 acceptability rule. Kept here for the
+record; the rest of the entry describes the gap that was closed.
+
+**What.** `tcp_receive`'s generic ACK branch did `c.snd_una = ack`
+unconditionally. There was no `SND.UNA < SEG.ACK <= SND.NXT` check.
 
 **RFC.** RFC 9293 §3.10.7.4: an ACK above `SND.NXT` MUST be answered
 with an ACK and the segment dropped; an ACK at or below `SND.UNA` is
@@ -269,7 +273,7 @@ Not pending — explicitly out of scope:
 
 Dependency-ordered, test-first per item:
 
-1. **T1** (ACK validation) — small, high correctness payoff.
+1. ✅ **T1** (ACK validation) — done.
 2. **T2** (MSS option + clamp) — removes the sub-1500-MTU blackhole.
 3. **T4 + T5** (SYN-on-sync + RFC 5961 challenge ACKs) — one coherent
    hardening change.

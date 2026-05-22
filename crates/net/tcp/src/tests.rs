@@ -2414,6 +2414,107 @@ fn tso_then_chain_rtx_stays_consistent() {
     );
 }
 
+// ---- RFC 9293 §3.10.7.4 ACK acceptability ------------------------------
+
+/// A stale, reordered ACK — `SEG.ACK` below `SND.UNA` — must not drag
+/// `SND.UNA` backwards. Reordered ACKs are routine on real paths; an
+/// unconditional `snd_una = ack` would desync the send side and
+/// corrupt the retransmit ring.
+#[test]
+fn stale_ack_does_not_rewind_snd_una() {
+    let _g = harness();
+    const SP: u16 = 9160;
+    const CP: u16 = 50160;
+    const CLIENT_ISN: u32 = 0xF100;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    // 2000 bytes in flight; the peer acknowledges the first 1000.
+    let mut chain = iobuf::IOBufChain::from(vec![0u8; 2000]);
+    super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1 + 1000),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert_eq!(
+        conn_snd_una(CP, SP),
+        server_isn.wrapping_add(1 + 1000),
+        "the in-order ACK advanced snd_una",
+    );
+
+    // A reordered copy of the original ACK arrives late.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert_eq!(
+        conn_snd_una(CP, SP),
+        server_isn.wrapping_add(1 + 1000),
+        "a stale old ACK must not drag snd_una backwards",
+    );
+}
+
+/// An ACK above `SND.NXT` acknowledges data we never sent. RFC 9293
+/// §3.10.7.4: answer with a bare ACK and drop the segment — including
+/// any payload it carries — leaving `SND.UNA` untouched.
+#[test]
+fn future_ack_is_dropped_with_a_bare_ack() {
+    let _g = harness();
+    const SP: u16 = 9161;
+    const CP: u16 = 50161;
+    const CLIENT_ISN: u32 = 0xF200;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    // 500 bytes in flight.
+    let mut chain = iobuf::IOBufChain::from(vec![0u8; 500]);
+    super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+
+    // A segment acking 5000 bytes past snd_nxt, carrying injected data.
+    clear_tx();
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1 + 5000),
+        flags: TCP_ACK | TCP_PSH,
+        window: 65535,
+        payload: b"injected".to_vec(),
+    });
+
+    let frames = tx();
+    assert_eq!(frames.len(), 1, "an unacceptable ACK elicits exactly one bare ACK");
+    let h = tcp_hdr(&frames[0]);
+    assert_eq!(h.flags, TCP_ACK, "the reply is a bare ACK");
+    assert_eq!(
+        h.seq,
+        server_isn.wrapping_add(1 + 500),
+        "the reply carries our real snd_nxt",
+    );
+    assert_eq!(
+        h.ack,
+        CLIENT_ISN.wrapping_add(1),
+        "the reply carries our real rcv_nxt — the injected payload was dropped",
+    );
+    assert_eq!(
+        conn_snd_una(CP, SP),
+        server_isn.wrapping_add(1),
+        "the bogus ACK left snd_una untouched",
+    );
+}
+
 /// Locate the live (non-listener) connection for a client/server
 /// port pair and return its `(handle, generation)` so a scenario
 /// can drive the real send path (`async_try_send_chain`).
@@ -2489,6 +2590,25 @@ fn conn_rtx_overflow(client_port: u16, server_port: u16) -> bool {
             && c.remote_port == client_port
         {
             return c.rtx_overflow;
+        }
+    }
+    panic!("no live connection for ports {client_port} -> {server_port}");
+}
+
+/// `snd_una` of the live connection for a client/server port pair —
+/// lets a scenario assert on send-sequence bookkeeping.
+fn conn_snd_una(client_port: u16, server_port: u16) -> u32 {
+    let core = 0u32;
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        // SAFETY: single worker, test-serialised by `TEST_LOCK`.
+        let c = unsafe { &*conn_ptr(core, i) };
+        if c.state != TcpState::Closed
+            && c.state != TcpState::Listen
+            && c.local_port == server_port
+            && c.remote_port == client_port
+        {
+            return c.snd_una;
         }
     }
     panic!("no live connection for ports {client_port} -> {server_port}");

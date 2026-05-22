@@ -276,10 +276,36 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
 
     // Process ACK
     if flags & TCP_ACK != 0 {
+        // RFC 9293 §3.10.7.4: an ACK above `SND.NXT` acknowledges data
+        // we never sent. Answer with a bare ACK so the peer
+        // resynchronizes to our real window, then drop the segment —
+        // a forged or badly confused ACK must not be processed.
+        if seq_lt(c.snd_nxt, ack) {
+            send_segment(
+                &SegmentMeta {
+                    local_ip: dst_ip,
+                    dst_ip: src_ip,
+                    src_port: dst_port,
+                    dst_port: src_port,
+                    seq: c.snd_nxt,
+                    ack: c.rcv_nxt,
+                    flags: TCP_ACK,
+                    window: c.rx_free() as u16,
+                },
+                &[],
+            );
+            return;
+        }
         // `snd_una` before this ACK advances it — `rtx_on_ack` needs
         // the delta to drop acknowledged bytes from the retransmit
         // ring (RFC 6298 §5.2 / §5.3).
         let old_una = c.snd_una;
+        // RFC 9293 §3.10.7.4: an ACK may advance `SND.UNA` only when
+        // `SND.UNA < SEG.ACK` (it is already `<= SND.NXT`, guarded
+        // above). An ACK at or below `SND.UNA` is old or duplicate —
+        // it must not drag `SND.UNA` backwards, though the segment is
+        // still processed below for data and the dup-ACK signal.
+        let ack_advances = seq_lt(c.snd_una, ack);
         // RFC 5681 §2: a duplicate ACK — a pure ACK that does not
         // advance `snd_una`, carries no data, has no SYN/FIN, and
         // arrives while data is in flight. Classified before the
@@ -298,7 +324,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             c.snd_wl1 = seq;
             c.snd_wl2 = ack;
         }
-        if c.state == TcpState::SynReceived {
+        if c.state == TcpState::SynReceived && ack_advances {
             c.state = TcpState::Established;
             crate::diag::COUNTERS.conns_established.bump();
             c.snd_una = ack;
@@ -332,9 +358,10 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             c.snd_una = ack;
             c.lifecycle_deadline_ms = 0;
             c.fin_retx_count = 0;
-        } else {
+        } else if ack_advances {
             c.snd_una = ack;
         }
+        // else: an old / duplicate ACK — `SND.UNA` stays put.
         // RFC 6298 §5.2 / §5.3: drop acknowledged bytes from the
         // retransmit ring and re-arm or stop the RTO timer. (The
         // `LastAck` branch above already `return`ed — the connection
