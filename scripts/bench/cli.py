@@ -83,7 +83,7 @@ def _throughput_tag(rps, nbytes, label):
 def _alloc_tag(allocs_before, allocs_after, iterations):
     """Format the allocs-per-iteration delta for the per-run output
     line. Returns an empty string (no extra tag) when sampling
-    failed (`/heap` not exposed on this env, or HTTPS fetch failed)
+    failed (`/obs` not exposed on this env, or HTTPS fetch failed)
     or when iterations is too small to give a stable ratio (<10).
 
     Used by tls_handshake / tls_resume / diagnostics workloads to

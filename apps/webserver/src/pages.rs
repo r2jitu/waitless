@@ -471,7 +471,7 @@ auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
             heap.total_allocation_count
         );
         let _ = w.write_str("</table>");
-        let _ = w.write_str("<p><a href=\"/heap\"><code>/heap</code></a> · raw JSON</p>");
+        let _ = w.write_str("<p><a href=\"/obs\"><code>/obs</code></a> · raw JSON</p>");
 
         // ── NIC RX queues ─────────────────────────────────────────────
         let counts = waitless::diagnostics::net_rx_counts();

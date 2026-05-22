@@ -397,7 +397,7 @@ AEAD.
 - **Effort**: trivial. 1 line of code.
 - **Risk**: low if I lands first; high if shipped standalone
   (the prior session's experience).
-- **Tests**: GCE bench, before/after. `/stats` check:
+- **Tests**: GCE bench, before/after. `/obs` check:
   `dqo_rx_compl_skipped` may grow (chains now delivered, not
   skipped); pair with `RX_BUF_REPOST_COUNT` to verify every
   received frame's bufs repost.
@@ -662,7 +662,7 @@ triggers "halt and investigate."
   materialise; the win was HVF-path-specific. See the item-H
   progress-log entry.
 - **After I** (multi-buf chain handling, RSC still off): full
-  bench. Expected ±0%. `/stats`: `dqo_rx_compl_skipped` stays
+  bench. Expected ±0%. `/obs`: `dqo_rx_compl_skipped` stays
   at 0; `dqo_rx_pending_chain_timeouts` stays at 0.
 - **After J** (RSC enabled): full bench. `upload_32k_*` should
   rise. Controls unchanged. `dqo_rx_compl_skipped` may grow
@@ -671,7 +671,7 @@ triggers "halt and investigate."
 
 ### Observability counters introduced
 
-Exposed via `/stats`:
+Exposed via `/obs`:
 - `DQO_RX_PENDING_CHAIN_TIMEOUTS` (per qp; item I)
 - ~~`RX_INBOX_OVERFLOW_DROPS`~~ — item C as landed has **no**
   overflow: the intrusive-node inbox is provably bounded by the RX
@@ -794,7 +794,7 @@ backpressure. CPU-bound at ChaCha20-Poly1305 decrypt rate
   bounds-assert added in `daad48b` is the guardrail so the runtime
   value can't drift out of range silently.
 - **Observability**: surface the new counters in
-  `/stats`-style dashboards.
+  `/obs`-style dashboards.
 - **GCE IPv6 subnet enablement** so `get_tcp_v6` runs against
   the remote waitless-webserver VM (currently HVF-only).
 
