@@ -23,6 +23,7 @@
 extern crate alloc;
 pub use net_types as ip;
 
+pub mod diag;
 pub mod event;
 pub mod launcher;
 pub mod reactor;

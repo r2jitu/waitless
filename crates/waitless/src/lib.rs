@@ -358,6 +358,14 @@ pub mod diagnostics {
         waitless_backend::nic_obs_json(w)
     }
 
+    /// Render the async runtime's observability block (`executor::diag`
+    /// — task-lifecycle counters) as JSON into `w`. The executor is
+    /// cross-platform, so this calls it directly — no `waitless_backend`
+    /// seam, unlike the `os:none`-only `net` / NIC blocks.
+    pub fn runtime_obs_json(w: &mut dyn core::fmt::Write) {
+        let _ = executor::diag::write_obs_json(w);
+    }
+
     /// TX-side hot-path counters: per-qp packet counts + small/big
     /// pool saturation + scan-depth aggregates. `None` when no
     /// driver is bound or the active driver hasn't wired the

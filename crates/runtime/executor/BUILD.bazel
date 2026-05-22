@@ -12,6 +12,7 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "executor",
     srcs = [
+        "src/diag.rs",
         "src/event.rs",
         "src/launcher.rs",
         "src/lib.rs",
@@ -29,6 +30,10 @@ rust_library(
         "//crates/runtime/platform",
         "//crates/runtime/worker",
         "//crates/util/iobuf",
+        # `obs::{Counter, LastEvent}` — observability primitives.
+        # `obs` is a leaf crate, so this introduces no cycle even
+        # though the executor sits below `kernel_core`.
+        "//crates/util/obs",
     ],
 )
 

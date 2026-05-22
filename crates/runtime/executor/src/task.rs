@@ -186,6 +186,7 @@ pub fn spawn_boxed(fut: BoxedFuture) -> Result<TaskHandle, SpawnError> {
             slot.abort.store(false, Ordering::Release);
             let epoch = slot.epoch.load(Ordering::Acquire);
             arena.ready_bits.fetch_or(1u64 << idx, Ordering::Release);
+            crate::diag::COUNTERS.tasks_spawned.bump();
             return Ok(TaskHandle {
                 worker_id,
                 slot_idx: idx as u32,
@@ -193,6 +194,8 @@ pub fn spawn_boxed(fut: BoxedFuture) -> Result<TaskHandle, SpawnError> {
             });
         }
     }
+    // Arena full — the future is dropped. Trace the silent loss.
+    crate::diag::record_spawn_failure(worker_id);
     Err(SpawnError)
 }
 
@@ -304,6 +307,7 @@ pub fn tick(worker_id: u32) -> bool {
             }
             slot.epoch.fetch_add(1, Ordering::AcqRel);
             slot.used.store(false, Ordering::Release);
+            crate::diag::COUNTERS.tasks_aborted.bump();
             did_work = true;
             continue;
         }
@@ -382,6 +386,7 @@ fn poll_slot(slot: &TaskSlot, worker_id: u32, slot_idx: usize) {
             // a no-op rather than aborting the next task in this slot.
             slot.epoch.fetch_add(1, Ordering::AcqRel);
             slot.used.store(false, Ordering::Release);
+            crate::diag::COUNTERS.tasks_completed.bump();
         }
     }
 }
