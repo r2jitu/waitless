@@ -110,6 +110,14 @@ echo "    DNS:     Google Cloud DNS (project $GCE_PROJECT)"
 export GCE_PROJECT
 export GCE_PROPAGATION_TIMEOUT="${GCE_PROPAGATION_TIMEOUT:-300}"
 
+# `lego run` skips issuance if a certificate for the domain already
+# exists under --path, so clear any prior run's certificate files —
+# every invocation must obtain a fresh cert. The ACME account in
+# `accounts/` is kept and reused (account registration is itself
+# rate-limited). Without this, a staging run leaves files that make a
+# later `prod` run silently skip, redeploying the stale staging cert.
+rm -f "$CERT_DIR/$DOMAIN".*
+
 lego run \
     --accept-tos \
     --email "$WAITLESS_CERT_EMAIL" \
