@@ -299,133 +299,24 @@ pub(crate) fn stats_response() -> Response {
             waitless::diagnostics::cycles_per_us()
         );
 
-        // gve NIC-driver counters, via `waitless::diagnostics::gve_diag`
-        // — NOT a direct `waitless_driver_gve` reference: the gve driver
-        // is `os:none`-only, so reaching into it from this app crate
-        // makes `app` (hence the native `webserver_bin` and the
-        // `--env native` / `--env docker` benches) unbuildable. The
-        // accessor returns zeros on native and under virtio-net.
-        //   * dqo_tx_miss/reinject: device-side TX drop/recover —
-        //     > 0 means hardware backpressure (0 on healthy flows).
-        //     (PKT/DESC completion counts are deliberately omitted:
-        //     per-packet atomic increments cost ~30% TX throughput;
-        //     the same info is in TX_PACKETS_PER_QP.)
-        //   * dqo_rx_compl_skipped / last_skip_status: RX-completion
-        //     skips (RX-path item I observability).
-        //   * rx_buf_repost_count: per-qp RX frame count summed —
-        //     the item-B cross-core drop-callback sanity check; a
-        //     shortfall means a chain's IOBuf isn't dropping.
-        //   * gqi_recycle_pool_exhausted: 0 unless GQI's recycle
-        //     pool can't keep up with a slow consumer.
-        let gve = waitless::diagnostics::gve_diag();
-        let _ = write!(
-            w,
-            ",\"dqo_tx_miss_compl\":{},\"dqo_tx_reinject_compl\":{}\
-              ,\"dqo_rx_compl_skipped\":{},\"dqo_rx_last_skip_status\":{}\
-              ,\"rx_buf_repost_count\":{},\"gqi_recycle_pool_exhausted\":{}",
-            gve.dqo_tx_miss_compl,
-            gve.dqo_tx_reinject_compl,
-            gve.dqo_rx_compl_skipped,
-            gve.dqo_rx_last_skip_status,
-            gve.rx_buf_repost_count,
-            gve.gqi_recycle_pool_exhausted,
-        );
-
-        // SYN-ingress vs SYN-ACK-egress counters. Compared against
-        // a client-side pcap (or nstat TcpActiveOpens/SynRetrans)
-        // these localize ingress drops below the TCP stack:
-        //   client SYNs > tcp_syn_rx  → RX driver / NIC dropping
-        //   tcp_syn_rx == tcp_synack_tx ≠ client SYN-ACK received
-        //                             → egress drop after our TX.
-        // TCP/IP-stack counters, via `waitless::diagnostics::tcp_diag`
-        // — NOT a direct `waitless::net::tcp` reference: `net` is the
-        // `os:none` bare-metal stack, and reaching into it from
-        // this app crate breaks the native build (same trap as the
-        // gve block above). Zeros on native.
-        //   * tcp_syn_rx vs tcp_synack_tx: SYN-ingress vs
-        //     SYN-ACK-egress — compared against a client-side pcap
-        //     (or nstat TcpActiveOpens/SynRetrans) these localize
-        //     ingress drops below the TCP stack:
-        //       client SYNs > tcp_syn_rx  → RX driver / NIC dropping
-        //       tcp_syn_rx == tcp_synack_tx ≠ client SYN-ACK got
-        //                                  → egress drop after TX.
-        //   * rx_chunk_stash_hits / ring_drain: the RX item-H
-        //     `recv_chunk` zero-copy device-buffer stash vs the
-        //     copying ring-drain fallback; stash / (stash +
-        //     ring_drain) is the live zero-copy hit ratio.
-        let tcp = waitless::diagnostics::tcp_diag();
-        let _ = write!(
-            w,
-            ",\"tcp_syn_rx\":{},\"tcp_synack_tx\":{}\
-              ,\"rx_chunk_stash_hits\":{},\"rx_chunk_ring_drain\":{}",
-            tcp.syn_rx, tcp.synack_tx, tcp.rx_chunk_stash_hits, tcp.rx_chunk_ring_drain,
-        );
-
-        // ---- AEAD throughput (TLS + QUIC) ----
-        //
-        // TLS counters cover the record layer (every full-record
-        // seal / open). QUIC counters cover per-packet AEAD on the
-        // 1-RTT path (the only level where ~all bytes flow post-
-        // handshake). Divide bytes by wall-clock from two
-        // snapshots and compare to cycles_per_us × idle fraction
-        // to spot crypto-bound regimes (encrypt_bytes/sec capped
-        // well below the per-core AEAD ceiling means non-crypto
-        // overhead dominates).
-        let (tls_enc_b, tls_enc_r, tls_enc_cyc, tls_dec_b, tls_dec_r, tls_dec_cyc) =
-            tls::record::encrypt_stats();
-        let qenc_b = quic::diag::COUNTERS.aead_seal_bytes.get();
-        let qenc_p = quic::diag::COUNTERS.aead_seal_packets.get();
-        let qdec_b = quic::diag::COUNTERS.aead_open_bytes.get();
-        let qdec_p = quic::diag::COUNTERS.aead_open_packets.get();
-        let _ = write!(
-            w,
-            ",\"tls_encrypt_bytes\":{},\
-              \"tls_encrypt_records\":{},\
-              \"tls_encrypt_cycles\":{},\
-              \"tls_decrypt_bytes\":{},\
-              \"tls_decrypt_records\":{},\
-              \"tls_decrypt_cycles\":{},\
-              \"quic_aead_seal_bytes\":{},\
-              \"quic_aead_seal_packets\":{},\
-              \"quic_aead_open_bytes\":{},\
-              \"quic_aead_open_packets\":{}",
-            tls_enc_b,
-            tls_enc_r,
-            tls_enc_cyc,
-            tls_dec_b,
-            tls_dec_r,
-            tls_dec_cyc,
-            qenc_b,
-            qenc_p,
-            qdec_b,
-            qdec_p,
-        );
+        // The per-subsystem counter blocks that used to live here —
+        // gve NIC counters, TCP SYN/chunk counters, TLS + QUIC AEAD
+        // throughput — moved to `/obs` (the `nic` / `tcp` / `tls` /
+        // `quic` blocks). `/stats` is now purely the per-qp / per-core
+        // *distribution* view (RSS balance, TX-pool saturation,
+        // event-loop occupancy) — complementary to `/obs`'s
+        // per-subsystem counters + snapshots. See `docs/observability.md`.
 
         let _ = w.write_str("}");
     }
     Response::ok(&b"application/json"[..], body)
 }
 
-pub(crate) fn heap_response() -> Response {
-    // ~200 B JSON renders directly into the per-conn body
-    // scratch via `body_iobuf`; transport-framing reserves are
-    // handled inside the IOBuf out of view, so the encrypt-in-
-    // place path in `TlsStream::send` applies for HTTPS.
-    let s = waitless::diagnostics::heap_stats();
-    let mut body = http::body_iobuf(256);
-    let _ = write!(
-        body.writer(),
-        "{{\"allocated_bytes\":{},\"available_bytes\":{},\"claimed_bytes\":{},\
-         \"allocation_count\":{},\"fragment_count\":{},\"total_allocation_count\":{}}}",
-        s.allocated_bytes,
-        s.available_bytes,
-        s.claimed_bytes,
-        s.allocation_count,
-        s.fragment_count,
-        s.total_allocation_count,
-    );
-    Response::ok(&b"application/json"[..], body)
-}
+// `/heap` retired — the heap statistics moved into `/obs`'s
+// `"kernel"` block (`kernel_bare::mm::write_obs_json`), alongside the
+// new `heap_oom` counter. `waitless::diagnostics::heap_stats()`
+// stays — the shutdown `HEAP_LEAK_CHECK` and the `/diagnostics`
+// page still read it directly.
 
 /// The QUIC stack's observability block as JSON — every drop /
 /// event counter plus the `LastEvent` snapshots (`last_drop`,

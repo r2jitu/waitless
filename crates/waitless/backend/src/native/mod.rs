@@ -1042,19 +1042,7 @@ pub fn net_tx_desc_log_snapshot(_out: &mut [NetTxDescLogEntry]) -> usize {
     0
 }
 
-/// Native stub for the gve NIC-driver counters — gve is a
-/// bare-metal-only driver, so there is nothing to report. Mirrors
-/// the unikernel side's `gve_diag()` so cross-platform callers
-/// (`waitless::diagnostics::gve_diag`) see one type on both backends.
-pub fn gve_diag() -> crate::GveDiag {
-    crate::GveDiag::default()
-}
-
-/// Native stub for the TCP/IP-stack counters — the bare-metal
-/// `net` stack isn't linked on native. Mirrors `bare::tcp_diag`.
-pub fn tcp_diag() -> crate::TcpDiag {
-    crate::TcpDiag::default()
-}
+// `gve_diag()` / `tcp_diag()` retired — see `bare.rs`.
 
 /// Native stub for the TCP observability block — no `net` stack, so
 /// the `/obs` `"tcp"` object is empty. Mirrors `bare::tcp_obs_json`.

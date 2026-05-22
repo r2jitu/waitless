@@ -314,24 +314,9 @@ pub mod diagnostics {
         waitless_backend::net_rx_used_cursors()
     }
 
-    /// gve NIC-driver diagnostic counters (RX-path items B/H —
-    /// surfaced on the `/stats` endpoint). Real values on a
-    /// bare-metal gve NIC; all-zero on native and under virtio-net.
-    /// Routed through `waitless_backend` so application crates need no
-    /// direct — and native-build-breaking — dependency on the
-    /// `os:none`-only gve driver crate.
-    pub fn gve_diag() -> waitless_backend::GveDiag {
-        waitless_backend::gve_diag()
-    }
-
-    /// TCP/IP-stack diagnostic counters (`/stats`): SYN ingress vs
-    /// SYN-ACK egress, and the RX item-H `recv_chunk` zero-copy
-    /// stash-vs-ring-drain split. Real on bare-metal; all-zero on
-    /// native. Routed through `waitless_backend` for the same reason as
-    /// [`gve_diag`] — app crates stay off a direct `net`-crate dep.
-    pub fn tcp_diag() -> waitless_backend::TcpDiag {
-        waitless_backend::tcp_diag()
-    }
+    // `gve_diag()` / `tcp_diag()` retired — the gve and TCP counters
+    // they exposed for `/stats` are now in `/obs` (the `nic` / `tcp`
+    // blocks) via the `*_obs_json` accessors below.
 
     /// Render the TCP stack's observability block (`tcp::diag` —
     /// counters + last-event snapshots) as JSON into `w`. This is

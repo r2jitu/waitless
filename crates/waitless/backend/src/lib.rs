@@ -20,54 +20,12 @@ pub struct HeapStats {
     pub total_allocation_count: u64,
 }
 
-/// gve (Google Virtual NIC) driver diagnostic counters, surfaced via
-/// `waitless_backend::gve_diag()` (and `waitless::diagnostics::gve_diag`).
-///
-/// Real values on bare-metal when the gve driver is linked; all-zero
-/// on native (no gve driver) and on bare-metal under virtio-net.
-/// This type — and `gve_diag()`'s cfg-split — is what lets an
-/// application crate read the gve `/stats` counters *without*
-/// depending on the (`os:none`-only) gve driver directly. A direct
-/// app→`gve` dep makes the app unbuildable for native;
-/// undoing exactly that regression is why this struct exists.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct GveDiag {
-    /// DQO TX completions the device reported as missed.
-    pub dqo_tx_miss_compl: u64,
-    /// DQO TX completions the device reinjected after a miss.
-    pub dqo_tx_reinject_compl: u64,
-    /// DQO RX completions skipped (RX-path item I observability).
-    pub dqo_rx_compl_skipped: u64,
-    /// Status byte of the most recent skipped RX completion.
-    pub dqo_rx_last_skip_status: u8,
-    /// RX buffers reposted, summed across queue pairs — the
-    /// item-B cross-core drop-callback sanity check.
-    pub rx_buf_repost_count: u64,
-    /// GQI recycle-pool exhaustion events, summed across qps.
-    pub gqi_recycle_pool_exhausted: u64,
-}
-
-/// TCP/IP-stack diagnostic counters, surfaced via
-/// `waitless_backend::tcp_diag()` (and `waitless::diagnostics::tcp_diag`).
-///
-/// Real values on bare-metal; all-zero on native (the bare-metal
-/// `net` stack — an `os:none` crate — isn't linked there). Same
-/// rationale as [`GveDiag`]: an application crate reads these
-/// `/stats` counters through this struct instead of reaching into
-/// `net::tcp` directly, which would coupling-break its native build.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TcpDiag {
-    /// SYN segments observed by `tcp_receive`.
-    pub syn_rx: u64,
-    /// SYN-ACK segments emitted in response to a SYN.
-    pub synack_tx: u64,
-    /// `recv_chunk` calls served zero-copy from the device-buffer
-    /// stash (RX-path item H).
-    pub rx_chunk_stash_hits: u64,
-    /// `recv_chunk` calls served via the copying ring-drain
-    /// fallback (RX-path item H).
-    pub rx_chunk_ring_drain: u64,
-}
+// `GveDiag` / `TcpDiag` retired. They were plain-struct carriers for
+// the gve / TCP counters across the backend seam, consumed by
+// `/stats`. The counters now render straight to JSON inside the
+// subsystem (`gve::diag` / `tcp::diag`) and cross the seam via the
+// `*_obs_json(&mut dyn Write)` accessors — one mechanism, no
+// per-subsystem struct. See `docs/observability.md`.
 
 #[cfg(not(target_os = "none"))]
 mod native;

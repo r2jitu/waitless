@@ -725,10 +725,9 @@ pub fn should_log_event() -> bool {
 }
 
 /// Snapshot of every drop / event counter, for `/quic_stats`-style
-/// dumps. Returns `(name, value)` pairs in declaration order. The
-/// four AEAD throughput counters are intentionally excluded — they
-/// are surfaced separately under `/stats`.
-pub fn snapshot() -> [(&'static str, u64); 46] {
+/// dumps. Returns `(name, value)` pairs in declaration order,
+/// including the four AEAD throughput counters.
+pub fn snapshot() -> [(&'static str, u64); 50] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.get()),
@@ -786,6 +785,10 @@ pub fn snapshot() -> [(&'static str, u64); 46] {
         ("datagrams_sent", c.datagrams_sent.get()),
         ("datagrams_processed", c.datagrams_processed.get()),
         ("anti_amp_throttled", c.anti_amp_throttled.get()),
+        ("aead_seal_bytes", c.aead_seal_bytes.get()),
+        ("aead_seal_packets", c.aead_seal_packets.get()),
+        ("aead_open_bytes", c.aead_open_bytes.get()),
+        ("aead_open_packets", c.aead_open_packets.get()),
     ]
 }
 

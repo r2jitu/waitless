@@ -21,43 +21,9 @@ pub use nic::{
     tx_diag as net_tx_diag,
 };
 
-/// gve NIC driver diagnostic counters (RX-path items B/H — see
-/// `/stats`). Reads the bare-metal gve driver's atomics directly;
-/// every field stays 0 unless the gve NIC is the active driver
-/// (so all-zero under virtio-net). The native backend has no gve
-/// driver and stubs this all-zero (`native::gve_diag`), so an
-/// application can surface these counters through
-/// `waitless::diagnostics` *without* itself depending on the
-/// `os:none`-only gve driver crate — the dependency that, placed
-/// in app code, breaks the native build.
-pub fn gve_diag() -> crate::GveDiag {
-    use core::sync::atomic::Ordering::Relaxed;
-    let sum =
-        |a: &[core::sync::atomic::AtomicU64]| -> u64 { a.iter().map(|c| c.load(Relaxed)).sum() };
-    crate::GveDiag {
-        dqo_tx_miss_compl: gve::dqo::DQO_TX_MISS_COMPL.load(Relaxed),
-        dqo_tx_reinject_compl: gve::dqo::DQO_TX_REINJECT_COMPL.load(Relaxed),
-        dqo_rx_compl_skipped: gve::dqo::DQO_RX_COMPL_SKIPPED.load(Relaxed),
-        dqo_rx_last_skip_status: gve::dqo::DQO_RX_LAST_SKIP_STATUS.load(Relaxed),
-        rx_buf_repost_count: sum(&gve::RX_BUF_REPOST_COUNT),
-        gqi_recycle_pool_exhausted: sum(&gve::GQI_RECYCLE_POOL_EXHAUSTED),
-    }
-}
-
-/// TCP/IP-stack diagnostic counters (`/stats`). Reads the
-/// bare-metal `net` stack's atomics; the native backend has no
-/// `net` stack and stubs this all-zero (`native::tcp_diag`), so an
-/// application reads them through `waitless::diagnostics` without a
-/// direct dependency on the `os:none` `net` crate.
-pub fn tcp_diag() -> crate::TcpDiag {
-    let c = &tcp::diag::COUNTERS;
-    crate::TcpDiag {
-        syn_rx: c.syn_rx.get(),
-        synack_tx: c.synack_tx.get(),
-        rx_chunk_stash_hits: c.rx_chunk_stash_hits.get(),
-        rx_chunk_ring_drain: c.rx_chunk_ring_drain.get(),
-    }
-}
+// `gve_diag()` / `tcp_diag()` retired — their counters are rendered
+// straight to JSON by `gve::diag` / `tcp::diag` and surfaced via the
+// `*_obs_json` accessors below (the `/obs` `nic` / `tcp` blocks).
 
 /// Render the TCP stack's full observability block (`tcp::diag`) as
 /// JSON into `w` — the `os:none` half of the `/obs` `"tcp"` block.

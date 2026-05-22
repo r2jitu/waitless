@@ -182,16 +182,34 @@ profiler, no sampling agent, live in `/obs`.
 
 ## Exposure
 
-All observability data is surfaced through **one aggregate
-endpoint**, `/obs`, whose body is `{"<subsystem>":{…}, …}` — each
-subsystem's `write_obs_json` output under its name. Adding a
-subsystem to `/obs` is one line. This is the clean home the
-scattered ad-hoc endpoints (`/stats`, `/heap`, `/tls-profile`)
-migrate into; until they do, they keep working unchanged.
+All per-subsystem counters and snapshots are surfaced through **one
+aggregate endpoint**, `/obs`, whose body is `{"<subsystem>":{…}, …}`
+— each subsystem's `write_obs_json` output under its name (eight
+blocks: `quic`, `tcp`, `udp`, `nic`, `tls`, `runtime`, `kernel`,
+`net`). Adding a subsystem is one line.
 
 A subsystem may also keep a focused per-subsystem endpoint that
 reuses the *same* `write_obs_json` writer — QUIC keeps `/quic_stats`
 for that reason. There is no second rendering path.
+
+**The endpoint map** (after the consolidation):
+
+- `/obs` — *the* always-on structured surface: every subsystem's
+  counters, `LastEvent` snapshots, and latency histograms.
+- `/stats` — the per-qp / per-core **distribution** view (RSS
+  balance, TX-pool saturation, event-loop occupancy). A different
+  *shape* — arrays, not per-event counters — so it is complementary
+  to `/obs`, not redundant. Its old per-subsystem counter blocks
+  (gve / TCP / TLS / QUIC-AEAD) moved into `/obs` and were removed.
+- `/diag-panic` — the panic / unhandled-exception ring (below).
+- `/diag-gve` — the raw gve TX-descriptor capture ring (driver
+  debug). `/tls-profile` — the per-stage handshake profiler.
+  Both are special-purpose capture tools, deliberately separate.
+
+`/heap` was retired — its heap statistics are the `kernel` block of
+`/obs`. The legacy `GveDiag` / `TcpDiag` seam structs went with it:
+counters now render straight to JSON in the subsystem, crossing the
+seam as `write_obs_json` output, never as a per-subsystem struct.
 
 **The `os:none` seam.** App-reachable crates that build on the host
 (`quic`, `tls`, the runtime) plug into `/obs` directly. The

@@ -395,7 +395,6 @@ async fn handle_request<S: http::HttpStream>(
         b"/static-1m" => Response::ok(b"application/octet-stream", STATIC_1M_BYTES.get()),
 
         b"/stats" => stats_response(),
-        b"/heap" => heap_response(),
         b"/quic_stats" => quic_stats_response(),
         b"/obs" => obs_response(),
         b"/compute" => {
