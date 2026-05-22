@@ -226,7 +226,7 @@ static CORES: PerWorker<PerCore> = PerWorker::new();
 /// their event loop. Returns true if work was done. Stored as a typed
 /// `AtomicFn` so cross-core publish/subscribe is a real release/acquire
 /// pair without per-call-site fn-pointer transmutes.
-static AP_POLL_FN: crate::sync::AtomicFn<fn(u32) -> bool> = crate::sync::AtomicFn::null();
+static AP_POLL_FN: sync::AtomicFn<fn(u32) -> bool> = sync::AtomicFn::null();
 
 /// Initialise per-core state for `count` cores. Publishes `count`
 /// via `set_num_workers` so every `PerWorker<T>` (here, in

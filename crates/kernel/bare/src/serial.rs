@@ -320,7 +320,7 @@ static SHUTDOWN_REQUESTED: core::sync::atomic::AtomicBool =
 /// Wraps `()` because we don't need to protect any inner data — the
 /// underlying serial state is owned by the device-specific putc/puts
 /// implementations. The lock just provides mutual exclusion.
-static SERIAL_TX_LOCK: crate::sync::Spinlock<()> = crate::sync::Spinlock::new(());
+static SERIAL_TX_LOCK: sync::Spinlock<()> = sync::Spinlock::new(());
 
 /// `true` when the next emitted byte is the first byte of a new
 /// line. Used to drive the "[N.NNN] " timestamp prefix that every
@@ -455,7 +455,7 @@ struct EarlyBuf {
     active: bool,
 }
 
-static EARLY_BUF: crate::sync::Spinlock<EarlyBuf> = crate::sync::Spinlock::new(EarlyBuf {
+static EARLY_BUF: sync::Spinlock<EarlyBuf> = sync::Spinlock::new(EarlyBuf {
     data: [0; EARLY_BUF_CAP],
     len: 0,
     active: true,

@@ -30,7 +30,7 @@ pub(crate) fn qp_needs_lock() -> bool {
 /// flush or send. Wraps `()` because the underlying state lives in
 /// `(*tx_q(0))` and is mutable through the existing
 /// raw-pointer accessors; this lock just provides mutual exclusion.
-pub(crate) static TX_LOCK: kernel_bare::sync::Spinlock<()> = kernel_bare::sync::Spinlock::new(());
+pub(crate) static TX_LOCK: sync::Spinlock<()> = sync::Spinlock::new(());
 
 // ---- TX drain ---------------------------------------------------------------
 

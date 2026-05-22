@@ -109,6 +109,7 @@ rust_library(
         "//crates/drivers/nic",
         "//crates/kernel/core",
         "//crates/util/iobuf",
+        "//crates/util/sync",
     ],
 )
 
@@ -188,6 +189,7 @@ rust_library(
     deps = [
         ":types",
         "//crates/kernel/core",
+        "//crates/util/sync",
     ],
 )
 
@@ -255,10 +257,12 @@ rust_library(
         ":types",
         "//crates/drivers/nic",
         "//crates/drivers/nic:api",
-        # `kernel_core::obs` — observability primitives (`docs/observability.md`).
+        # `kernel_core::clock` — the `record_undeliverable` timestamp.
         "//crates/kernel/core",
         "//crates/runtime/executor",
         "//crates/util/iobuf",
+        # `obs::{Counter, LastEvent}` — observability (`docs/observability.md`).
+        "//crates/util/obs",
     ],
 )
 
@@ -285,6 +289,7 @@ rust_library(
         ":types",
         "//crates/kernel/bare",
         "//crates/runtime/executor",
+        "//crates/util/sync",
     ],
 )
 

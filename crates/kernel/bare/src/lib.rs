@@ -16,12 +16,14 @@ pub mod serial;
 pub mod time;
 
 // The pure-logic kernel modules — lock-free data structures, per-core
-// state, sync primitives — live in the host-buildable `kernel_core`
-// crate (split out so they are unit-testable off the bare-metal
-// target). Re-export every one so consumers' `kernel_bare::{percpu,
-// sync, rx_inbox, ...}` paths are unchanged.
+// state — live in the host-buildable `kernel_core` crate (split out
+// so they are unit-testable off the bare-metal target). Re-export
+// every one so consumers' `kernel_bare::{percpu, rx_inbox, ...}`
+// paths are unchanged. (`Spinlock` and the observability primitives
+// are *not* here — they live in the leaf crates `//crates/util/sync`
+// and `//crates/util/obs`; consumers `use sync::…` / `use obs::…`.)
 pub use kernel_core::{
-    clock, cpu_id, deque, diag, mmio, obs, once, percpu, rx_inbox, spsc, sync, timer, types,
+    clock, cpu_id, deque, diag, mmio, once, percpu, rx_inbox, spsc, timer, types,
 };
 
 #[cfg(target_arch = "x86_64")]

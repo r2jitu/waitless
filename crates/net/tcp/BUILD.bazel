@@ -38,6 +38,7 @@ rust_library(
         "//crates/runtime/executor",
         "//crates/runtime/worker",
         "//crates/util/iobuf",
+        "//crates/util/obs",
         "@crates//:bitflags",
     ],
 )

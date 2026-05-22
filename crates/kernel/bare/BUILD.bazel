@@ -52,6 +52,9 @@ rust_library(
         "//crates/runtime/executor",
         "//crates/runtime/worker",
         "//crates/runtime/platform",
+        # `Spinlock` — the leaf `sync` crate (hoisted out of
+        # `kernel_core`; see `docs/observability.md`).
+        "//crates/util/sync",
         "@crates//:getrandom",
         "@crates//:sha2",
         "@crates//:talc",

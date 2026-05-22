@@ -21,5 +21,6 @@ rust_library(
         "//crates/kernel/bare",
         "//crates/net:checksum",
         "//crates/util/iobuf",
+        "//crates/util/sync",
     ],
 )

@@ -23,5 +23,7 @@ rust_library(
         "//crates/drivers/nic:api",
         "//crates/kernel/bare",
         "//crates/util/iobuf",
+        "//crates/util/obs",
+        "//crates/util/sync",
     ],
 )

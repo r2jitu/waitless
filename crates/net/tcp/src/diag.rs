@@ -21,7 +21,7 @@
 
 use core::fmt;
 
-use kernel_core::obs::{Counter, LastEvent, ObsRecord};
+use obs::{Counter, LastEvent, ObsRecord};
 
 use crate::state::TcpState;
 

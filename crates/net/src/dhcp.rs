@@ -26,7 +26,7 @@ use executor::event::AsyncEvent;
 use executor::reactor::UdpSocket;
 use executor::select::timeout_us;
 use from_bytes::FromBytes;
-use kernel_bare::sync::Spinlock;
+use sync::Spinlock;
 use types::{CONFIG, Ipv4Addr, htonl, htons};
 
 /// Fixed DHCP/BOOTP header. 236 bytes + 4-byte magic cookie = 240

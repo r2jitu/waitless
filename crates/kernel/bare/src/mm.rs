@@ -40,7 +40,7 @@ use talc::{ErrOnOom, Span, Talc};
 
 use crate::once::InitOnce;
 use crate::serial;
-use crate::sync::Spinlock;
+use sync::Spinlock;
 use crate::types::{BootInfo, MEM_AVAILABLE};
 
 unsafe extern "C" {

@@ -1,0 +1,22 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Shared observability primitives — `Counter`, `LastEvent`,
+# `LatencyHist`, `ObsRecord`. A leaf crate (only `//crates/util/sync`)
+# so every subsystem, including the async runtime below `kernel_core`,
+# depends on it directly. See `docs/observability.md`.
+rust_library(
+    name = "obs",
+    srcs = ["src/lib.rs"],
+    crate_name = "obs",
+    crate_root = "src/lib.rs",
+    deps = ["//crates/util/sync"],
+)
+
+rust_test(
+    name = "obs_test",
+    size = "small",
+    crate = ":obs",
+)

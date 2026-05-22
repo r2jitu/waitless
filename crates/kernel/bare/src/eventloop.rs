@@ -10,7 +10,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::sync::AtomicFn;
+use sync::AtomicFn;
 
 /// Per-core event-loop counters exposed for live diagnostics. Each
 /// core writes its own slot; readers may snapshot from any core. The

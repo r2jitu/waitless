@@ -80,11 +80,12 @@ rust_library(
     }),
     deps = [
         "//crates/crypto/aes-gcm",
-        # `kernel_core::obs` — observability primitives (`docs/observability.md`).
-        "//crates/kernel/core",
         "//crates/proto/http",
         "//crates/runtime/worker",
         "//crates/util/iobuf",
+        # `obs::{Counter, LastEvent}` — the shared observability
+        # primitives (`docs/observability.md`).
+        "//crates/util/obs",
         "//crates/waitless",
         "@crates//:aes",
         "@crates//:aes-gcm",

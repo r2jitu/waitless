@@ -23,7 +23,7 @@
 //     captures (e.g. one core panics, then another) accumulate up to
 //     the cap; further writes are silently dropped.
 
-use crate::sync::Spinlock;
+use sync::Spinlock;
 
 /// Total bytes of capture. 4 KiB is plenty for a few panic records
 /// (a single panic record is ~200-400 B with all the context).

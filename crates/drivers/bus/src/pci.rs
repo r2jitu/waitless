@@ -7,7 +7,7 @@ use crate::{mmio_read32, mmio_write32};
 use crate::{mmio_read16, mmio_write16};
 #[cfg(target_arch = "aarch64")]
 use kernel_bare::aarch64::fdt;
-use kernel_bare::sync::Spinlock;
+use sync::Spinlock;
 
 #[cfg(target_arch = "x86_64")]
 use crate::{inl, outl};

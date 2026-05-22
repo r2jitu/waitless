@@ -97,8 +97,8 @@ impl VpciTable {
     }
 }
 
-pub static VPCI_DEVICES: kernel_bare::sync::Spinlock<VpciTable> =
-    kernel_bare::sync::Spinlock::new(VpciTable::new());
+pub static VPCI_DEVICES: sync::Spinlock<VpciTable> =
+    sync::Spinlock::new(VpciTable::new());
 
 /// Snapshot of `VPCI_DEVICES[idx]` returned by value.
 pub fn vpci_device(idx: usize) -> VirtioPciDevice {

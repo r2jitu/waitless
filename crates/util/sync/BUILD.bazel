@@ -1,0 +1,22 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# `Spinlock<T>` + the `AtomicFn` re-export. A near-leaf crate (only
+# the zero-dep `atomic-fn`), kept in `util/` rather than `kernel_core`
+# so crates *below* `kernel_core` in the graph — the async runtime,
+# and `//crates/util/obs` — can share one `Spinlock` without a cycle.
+rust_library(
+    name = "sync",
+    srcs = ["src/lib.rs"],
+    crate_name = "sync",
+    crate_root = "src/lib.rs",
+    deps = ["//crates/util/atomic-fn"],
+)
+
+rust_test(
+    name = "sync_test",
+    size = "small",
+    crate = ":sync",
+)

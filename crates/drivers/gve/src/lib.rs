@@ -79,7 +79,7 @@ use bus::{log, mmio_read32, mmio_write32};
 use core::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
 };
-use kernel_bare::sync::Spinlock;
+use sync::Spinlock;
 
 // ---- PCI identity ----------------------------------------------------------
 

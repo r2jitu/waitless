@@ -45,7 +45,7 @@
 use core::cell::UnsafeCell;
 use sha2::{Digest, Sha256};
 
-use crate::sync::Spinlock;
+use sync::Spinlock;
 
 // ============================================================================
 // Entropy collection

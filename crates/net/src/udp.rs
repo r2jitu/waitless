@@ -21,7 +21,7 @@ use types::{CONFIG, IpAddr, MacAddr, htons, ntohs};
 /// of `/obs` via `waitless_backend::udp_obs_json`.
 pub mod diag {
     use core::fmt;
-    use kernel_core::obs::{Counter, LastEvent, ObsRecord};
+    use obs::{Counter, LastEvent, ObsRecord};
 
     /// One counter per UDP event.
     pub struct Counters {

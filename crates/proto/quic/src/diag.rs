@@ -41,7 +41,7 @@
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use kernel_core::obs::{Counter, LastEvent, LatencyHist, ObsRecord};
+use obs::{Counter, LastEvent, LatencyHist, ObsRecord};
 
 /// One counter per drop / event reason. Cheap to read in bulk for a
 /// stats dump, cheap to increment on the hot path.

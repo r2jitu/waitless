@@ -9,7 +9,7 @@ use ethernet::{ETHERTYPE_ARP, ethernet_our_mac, ethernet_parse};
 use ethernet_send::ethernet_send;
 use from_bytes::FromBytes;
 use iobuf::{Chain, OwnedIOBuf};
-use kernel_core::sync::Spinlock;
+use sync::Spinlock;
 use types::{CONFIG, Ipv4Addr, MacAddr, htons, ntohs};
 
 const ARP_CACHE_SIZE: usize = 64;

@@ -26,7 +26,7 @@
 
 extern crate net_types as types;
 
-use kernel_core::sync::Spinlock;
+use sync::Spinlock;
 use types::{Ipv6Addr, MacAddr};
 
 const NDP_CACHE_SIZE: usize = 32;

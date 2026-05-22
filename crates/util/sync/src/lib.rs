@@ -1,4 +1,9 @@
-// kernel/sync.rs — `Spinlock<T>`: typed RAII spinlock for shared mutable state.
+// crates/util/sync — `Spinlock<T>`: typed RAII spinlock for shared mutable state.
+//
+// A zero-cost leaf crate (only `//crates/util/atomic-fn`). Lives in
+// `util/` rather than `kernel_core` so crates *below* `kernel_core`
+// in the graph — the async runtime, and `//crates/util/obs` — can
+// depend on a single shared `Spinlock` without a dependency cycle.
 //
 // `Spinlock<T>` owns the protected data and hands out access only through a
 // guard:
@@ -14,6 +19,8 @@
 // `lock()` inlines to a CAS loop, `Drop` inlines to one
 // `store(false, Release)`, and field access through the guard compiles
 // to the same code as a raw `*mut T` dereference.
+
+#![cfg_attr(not(test), no_std)]
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};

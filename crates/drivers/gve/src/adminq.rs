@@ -11,7 +11,7 @@ use core::mem::size_of;
 use core::ptr;
 
 use bus::log;
-use kernel_bare::sync::Spinlock;
+use sync::Spinlock;
 
 use crate::{host_dma_fence, log_hex32, put_be32, read_be32, reg_read32, reg_write32};
 

@@ -17,15 +17,18 @@ pub mod clock;
 pub mod deque;
 pub mod diag;
 pub mod mmio;
-pub mod obs;
 pub mod once;
 pub mod percpu;
 pub mod rng;
 pub mod rx_inbox;
 pub mod spsc;
-pub mod sync;
 pub mod timer;
 pub mod types;
+
+// `Spinlock` / `AtomicFn` and the observability primitives moved to
+// the leaf crates `//crates/util/sync` and `//crates/util/obs` — see
+// their crate docs. Consumers `use sync::…` / `use obs::…` directly;
+// `kernel_core` no longer re-exports them.
 
 /// Current CPU id.
 ///

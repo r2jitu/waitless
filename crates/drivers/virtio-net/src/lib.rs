@@ -165,7 +165,7 @@ pub(crate) struct QueuePairState {
     /// drain. The lock is kept for forward-compat (e.g. an IRQ
     /// handler that also re-arms) and as a single-writer
     /// invariant inside `add_buf`.
-    pub rx_lock: kernel_bare::sync::Spinlock<()>,
+    pub rx_lock: sync::Spinlock<()>,
     /// Set by inline re-arm after a successful `add_buf`.
     /// Read + cleared by the end-of-batch kick in `poll_qp`,
     /// which kicks the device if set so it sees the freshly-
@@ -187,7 +187,7 @@ impl QueuePairState {
     #[allow(clippy::declare_interior_mutable_const)]
     pub(crate) const ZEROED: Self = QueuePairState {
         rx_buffers: [ptr::null_mut(); RX_BUFFERS],
-        rx_lock: kernel_bare::sync::Spinlock::new(()),
+        rx_lock: sync::Spinlock::new(()),
         rx_dirty: core::sync::atomic::AtomicBool::new(false),
     };
 }

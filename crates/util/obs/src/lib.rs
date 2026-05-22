@@ -1,4 +1,4 @@
-// kernel_core/obs.rs — shared observability primitives.
+// crates/util/obs — shared observability primitives.
 //
 // Two cold-path types every subsystem (QUIC, NIC, TCP, runtime,
 // kernel) uses to make failures diagnosable WITHOUT a redeploy:
@@ -23,10 +23,16 @@
 // single line (see the per-core note on `Counter`). `LastEvent`
 // takes a `Spinlock`, so it is COLD PATH ONLY: record connection
 // teardowns, protocol errors, anomalies — never per-packet events.
+//
+// A leaf crate: depends only on `//crates/util/sync`. That is what
+// lets crates below `kernel_core` (the async runtime) use it.
 
-use crate::sync::Spinlock;
+#![cfg_attr(not(test), no_std)]
+
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
+
+use sync::Spinlock;
 
 /// A process-wide monotonic event counter.
 ///
@@ -323,7 +329,7 @@ fn percentile_lo(buckets: &[u64; HIST_BUCKETS], total: u64, pct: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::string::String;
+    use std::string::String;
 
     #[test]
     fn counter_bump_add_get() {
