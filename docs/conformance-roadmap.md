@@ -1,6 +1,10 @@
 # TCP / QUIC conformance + RFC-compliance roadmap
 
-Status: in progress (steps 1-4 complete). Last updated 2026-05-21.
+Status: in progress (steps 1-4 complete). Last updated 2026-05-22.
+
+The prioritized TCP gap backlog now lives in
+[`tcp-conformance-backlog.md`](tcp-conformance-backlog.md); this doc
+keeps the conformance-testing strategy and the QUIC roadmap.
 
 ## Purpose
 
@@ -48,8 +52,9 @@ Landed:
   (`on_tcp_tick`).
 - TCP RFC 5681 congestion control: `cwnd`/`ssthresh`, slow start,
   AIMD congestion avoidance, and three-dup-ACK fast retransmit /
-  fast recovery. (The controller is maintained as bookkeeping; a
-  cwnd-paced send window is a deferred follow-up.)
+  fast recovery — and a send path that paces transmission against
+  `min(cwnd, rwnd)`, with a zero-window persist timer and the
+  SND.WL1/WL2 window-update rule (branch `tcp-cwnd-send-window`).
 - `quic` already host-builds; `//crates/proto/quic:quic_test`
   includes `end_to_end_self_handshake`, which drives a synthetic
   Initial through the receive path.
@@ -147,12 +152,12 @@ optional feature.
 - **Have**: full state set (`Closed`…`TimeWait`), three-way handshake,
   in-order data transfer, FIN/close, RST generation + RFC 5961 RST
   acceptance check, per-core connection pool.
-- **Missing**: the MSS option is never *sent* (`send_segment`
-  hard-codes a 20-byte header); zero-window persist relies on the
-  peer's persist timer; no delayed-ACK coalescing (we ACK
-  immediately — correct, just not optimal). The TIME-WAIT and
-  FIN-WAIT timeouts that used to be listed here are now closed —
-  see the lifecycle-corners note below.
+- **Missing**: the MSS option is never sent or parsed, the ACK field
+  is not range-checked, and a SYN on a synchronized connection is
+  mishandled — see `tcp-conformance-backlog.md` (T1, T2, T4). No
+  delayed-ACK coalescing (we ACK immediately — correct, just not
+  optimal). Zero-window persist is now implemented; the TIME-WAIT /
+  FIN-WAIT timeouts are closed too — see the lifecycle-corners note.
 - **Conformance test**: done — the receiver-side scenarios
   (retransmitted SYN / stale-twin cleanup, duplicate/old data →
   immediate dup-ACK, out-of-order segment, RST at/off `rcv_nxt`)
@@ -188,8 +193,9 @@ optional feature.
   former MUST violation is closed.
 - **Missing**: SYN-ACK retransmission (a retransmitted client SYN
   already re-drives the SYN-ACK, so this is cosmetic); the FIN is
-  now covered by the lifecycle timer. An unacked window larger than
-  the retransmit ring still suspends coverage until it drains.
+  covered by the lifecycle timer. The retransmit ring is now sized
+  to a full 64 KiB receive window, so an unacked window can no
+  longer outgrow it.
 - **Conformance test**: done — `tcp_test` scripts a send, drops the
   ACK, advances the mock clock past the RTO, and asserts the
   retransmit fires and the RTO doubles; a second case asserts an ACK
@@ -197,21 +203,21 @@ optional feature.
 
 ### RFC 5681 — congestion control
 
-- **Have**: the controller. `cwnd`/`ssthresh` on the TCB, opened at
-  the 3·SMSS initial window; slow start grows `cwnd` one SMSS per
-  ACK, congestion avoidance adds the `SMSS·SMSS/cwnd` linear
-  approximation; an RTO collapses `cwnd` to one segment and halves
-  `ssthresh`; three duplicate ACKs trigger fast retransmit with the
-  §3.2 fast-recovery inflate/deflate. The controller is maintained
-  as bookkeeping today — a cwnd-paced send window (and the send
-  queue it needs) is a deferred follow-up.
-- **Missing**: the send path does not yet pace transmission against
-  `cwnd`; that, plus peer-rwnd flow control, is the windowed
-  send-path follow-up.
+- **Have**: the full mechanism. `cwnd`/`ssthresh` on the TCB, opened
+  at the 3·SMSS initial window; slow start, congestion avoidance,
+  RTO collapse, three-dup-ACK fast retransmit / fast recovery — and
+  the send path now paces transmission against `min(cwnd, rwnd)`:
+  `async_try_send_chain` (and the TSO fast path) cap in-flight bytes
+  at the usable window, queue the remainder, and resume on the ACK
+  that reopens it. The peer's receive window is tracked under the
+  RFC 9293 SND.WL1/WL2 rule; a zero-window stall is recovered by the
+  §3.8.6.1 persist timer. The former "controller computed but
+  ignored" gap is closed.
+- **Missing**: nothing material for the server role.
 - **Conformance test**: done — pure controller-arithmetic scenarios
-  (slow-start growth, the slow-start→CA switch, RTO collapse, the
-  2·SMSS ssthresh floor) plus harness scenarios for three-dup-ACK
-  fast retransmit and the fast-recovery inflate/deflate cycle.
+  plus harness scenarios for the windowed send path (cwnd cap,
+  closed-window stall + ACK-driven resume, rwnd cap, slow-start
+  ramp), zero-window persist, and TSO retransmit coverage.
 
 ### RFC 2018 — selective acknowledgement (SACK)
 
@@ -245,11 +251,11 @@ optional feature.
 
 ### Smaller core items
 
-MSS-option emission, a TIME-WAIT 2 MSL timer, the zero-window persist
-timer, ECN (RFC 3168), and Nagle (RFC 9293 §3.7.4) — each small,
-each gated on the clock seam where a timer is involved. Track them as
-a checklist once the big three (6298 / 5681 / core 9293 receiver
-tests) are moving.
+The TIME-WAIT timer and the zero-window persist timer are done. The
+remaining smaller items — MSS-option handling, ACK-field validation,
+ECN (RFC 3168), Nagle (RFC 9293 §3.7.4), a delayed-ACK coalescer —
+are tracked, prioritized, in
+[`tcp-conformance-backlog.md`](tcp-conformance-backlog.md).
 
 ## Part 3 — QUIC RFC roadmap
 
@@ -306,7 +312,9 @@ Dependency-ordered. Each step is test-first on the harness.
 4. ✅ **TCP RFC 5681 (congestion)** — `cwnd`/`ssthresh`, slow-start,
    congestion avoidance, fast retransmit / fast recovery. (Plus the
    connection-lifecycle corners — LastAck, TimeWait, FIN retransmit
-   — which slotted in alongside.)
+   — which slotted in alongside.) The cwnd-paced send window —
+   windowed `async_try_send_chain` + zero-window persist + TSO
+   retransmit coverage — followed on branch `tcp-cwnd-send-window`.
 5. **QUIC RFC 9002 loss recovery + congestion** — wire the PTO timer
    and a controller onto the existing data model.
 6. **TCP RFC 7323 (window scaling + timestamps)** — widen `rcv_wnd`,
