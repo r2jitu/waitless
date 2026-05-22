@@ -135,8 +135,8 @@ pub(crate) fn max_min_ratio_x100(observed: &[u64]) -> u64 {
 /// view — RX frame counts, used-ring cursors, TX packet / byte
 /// counts, in-flight depth — plus the RSS-balance metrics derived
 /// from it and the TX direct-fill pool saturation counters, then
-/// the gve driver's own failure/throughput counters nested under
-/// `"gve"`. Lets a monitoring agent see whether:
+/// the active driver's own failure counters nested under
+/// `"counters"`. Lets a monitoring agent see whether:
 ///   * RSS / per-core dispatch is spreading load evenly
 ///     (`rx_chi_squared_x100` / `rx_max_min_ratio_x100`, the `tx_`
 ///     pair — and the raw `rx_frames` / `tx_packets` arrays)
@@ -147,9 +147,9 @@ pub(crate) fn max_min_ratio_x100(observed: &[u64]) -> u64 {
 ///   * TSO super-segments are saturating their pool
 ///     (`tx_big_full_returns` climbing)
 ///
-/// The distribution arrays are driver-agnostic (gve or virtio-net,
-/// whichever is active); the nested `"gve"` block is gve-specific
-/// and reads all-zero under virtio-net.
+/// The distribution arrays and the nested `"counters"` block both
+/// reflect whichever NIC driver is active — gve or virtio-net; the
+/// `"counters"` block's `"driver"` field names it.
 fn write_nic_obs<W: core::fmt::Write>(w: &mut W) {
     let counts = waitless::diagnostics::net_rx_counts();
     let cursors = waitless::diagnostics::net_rx_used_cursors();
@@ -241,9 +241,10 @@ fn write_nic_obs<W: core::fmt::Write>(w: &mut W) {
         emit_json_array(w, "rx_bytes", rx_bytes);
     }
 
-    // The gve driver's own failure / throughput counters + the
-    // `LAST_RX_SKIP` snapshot, nested as `"gve"`.
-    let _ = w.write_str(",\"gve\":");
+    // The active driver's own failure counters + its `last_*`
+    // snapshot, nested as `"counters"` — gve or virtio-net,
+    // self-identified by the block's `"driver"` field.
+    let _ = w.write_str(",\"counters\":");
     waitless::diagnostics::nic_obs_json(&mut *w);
     let _ = w.write_str("}");
 }

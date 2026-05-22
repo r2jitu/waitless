@@ -409,6 +409,15 @@ pub struct NicDiagOps {
     /// serial output is gated). The log is bounded; older entries
     /// roll off as new ones land.
     pub tx_desc_log_snapshot: Option<fn(&mut [TxDescLogEntry]) -> usize>,
+    /// Render the driver's observability block as a JSON object —
+    /// its failure / anomaly counters, throughput totals, and a
+    /// `last_*` snapshot, per the observability doctrine
+    /// (`docs/observability.md`). The first field is `"driver"`, so
+    /// the rendered object self-identifies which NIC produced it.
+    /// Required (not `Option`): the doctrine mandates every
+    /// subsystem expose a `write_obs_json`. `nic::obs_json`
+    /// dispatches here for the `/obs` `nic` block's `counters`.
+    pub obs_json: fn(&mut dyn core::fmt::Write) -> core::fmt::Result,
 }
 
 /// Driver-emitted TX descriptor record. The `kind` field tells the

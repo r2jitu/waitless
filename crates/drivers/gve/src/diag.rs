@@ -304,19 +304,20 @@ pub fn record_rx_skip(qp: u8, status: u8) {
     });
 }
 
-/// Render the NIC observability block as JSON — the gve driver's
+/// Render the gve driver's observability block as JSON — the
 /// anomaly counters (TX miss/reinject, RX skip, recycle-pool
 /// exhaustion, repost shortfall) and throughput totals, then the
-/// `LAST_RX_SKIP` snapshot. Under virtio-net the gve counters are
-/// all 0 (gve is not the active driver). This is the NIC's `/obs`
-/// contribution; `waitless_backend::nic_obs_json` forwards it.
+/// `LAST_RX_SKIP` snapshot. The leading `"driver"` field self-
+/// identifies the block. This is gve's `counters` contribution to
+/// the `/obs` `nic` block; `nic::obs_json` dispatches here when gve
+/// is the active driver (virtio-net renders its own block).
 pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
     let sum = |a: &[AtomicU64]| -> u64 { a.iter().map(|c| c.load(Ordering::Relaxed)).sum() };
     write!(
         w,
-        "{{\"tx_miss_compl\":{},\"tx_reinject_compl\":{},\"rx_compl_skipped\":{},\
-         \"rx_buf_reposts\":{},\"gqi_recycle_exhausted\":{},\"tx_packets\":{},\
-         \"tx_bytes\":{},\"rx_bytes\":{},\"tx_small_full_spins\":{},\
+        "{{\"driver\":\"gve\",\"tx_miss_compl\":{},\"tx_reinject_compl\":{},\
+         \"rx_compl_skipped\":{},\"rx_buf_reposts\":{},\"gqi_recycle_exhausted\":{},\
+         \"tx_packets\":{},\"tx_bytes\":{},\"rx_bytes\":{},\"tx_small_full_spins\":{},\
          \"tx_big_full_returns\":{},",
         crate::dqo::DQO_TX_MISS_COMPL.load(Ordering::Relaxed),
         crate::dqo::DQO_TX_REINJECT_COMPL.load(Ordering::Relaxed),

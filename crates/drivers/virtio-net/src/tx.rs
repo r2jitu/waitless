@@ -305,12 +305,24 @@ pub(crate) fn submit_tx(handle: nic_api::TxBufHandle, frame_len: usize, csum: ni
     // `TxTsoBufHandle` + `submit_tx_tso`). Defensive bound checks
     // for slot/worker index only.
     if slot >= TX_POOL_SMALL_SIZE || worker >= unsafe { (*ndev()).num_workers } {
+        crate::diag::record_tx_drop(
+            &crate::diag::COUNTERS.tx_bad_token,
+            "bad_token",
+            worker as u32,
+            frame_len as u32,
+        );
         return;
     }
     if frame_len == 0 || frame_len > MAX_ETH_FRAME_SMALL {
         unsafe {
             (*wpool(worker)).small_used[slot].store(false, Ordering::Release);
         }
+        crate::diag::record_tx_drop(
+            &crate::diag::COUNTERS.tx_bad_frame_len,
+            "bad_frame_len",
+            worker_qp(worker) as u32,
+            frame_len as u32,
+        );
         return;
     }
 
@@ -361,6 +373,12 @@ pub(crate) fn submit_tx(handle: nic_api::TxBufHandle, frame_len: usize, csum: ni
             let head = head_check();
             if head < 0 {
                 (*wpool(worker)).small_used[slot].store(false, Ordering::Release);
+                crate::diag::record_tx_drop(
+                    &crate::diag::COUNTERS.tx_submit_failed,
+                    "submit_failed",
+                    qp as u32,
+                    frame_len as u32,
+                );
                 return false;
             }
             (*tx_q(qp)).kick();
@@ -400,12 +418,24 @@ pub(crate) fn submit_tx_tso(
     core::mem::forget(handle); // see `submit_tx` for rationale
 
     if slot >= TX_POOL_BIG_SIZE || worker >= unsafe { (*ndev()).num_workers } {
+        crate::diag::record_tx_drop(
+            &crate::diag::COUNTERS.tx_bad_token,
+            "bad_token",
+            worker as u32,
+            frame_len as u32,
+        );
         return;
     }
     if frame_len == 0 || frame_len > MAX_ETH_FRAME_BIG {
         unsafe {
             (*wpool(worker)).big_used[slot].store(false, Ordering::Release);
         }
+        crate::diag::record_tx_drop(
+            &crate::diag::COUNTERS.tx_bad_frame_len,
+            "bad_frame_len",
+            worker_qp(worker) as u32,
+            frame_len as u32,
+        );
         return;
     }
 
@@ -416,6 +446,12 @@ pub(crate) fn submit_tx_tso(
         unsafe {
             (*wpool(worker)).big_used[slot].store(false, Ordering::Release);
         }
+        crate::diag::record_tx_drop(
+            &crate::diag::COUNTERS.tx_bad_token,
+            "big_pool_null",
+            worker_qp(worker) as u32,
+            frame_len as u32,
+        );
         return;
     }
 
@@ -453,6 +489,12 @@ pub(crate) fn submit_tx_tso(
             let head = (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0);
             if head < 0 {
                 (*wpool(worker)).big_used[slot].store(false, Ordering::Release);
+                crate::diag::record_tx_drop(
+                    &crate::diag::COUNTERS.tx_submit_failed,
+                    "submit_failed",
+                    qp as u32,
+                    frame_len as u32,
+                );
                 return false;
             }
             (*tx_q(qp)).kick();

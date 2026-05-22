@@ -450,6 +450,7 @@ static VIRTIO_NET_DIAG_OPS: NicDiagOps = NicDiagOps {
     // stays uniform across drivers without forcing every backend
     // to add the ring.
     tx_desc_log_snapshot: None,
+    obs_json: diag::write_obs_json,
 };
 
 static VIRTIO_NET_OPS: NicOps = NicOps {

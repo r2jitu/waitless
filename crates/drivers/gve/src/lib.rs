@@ -66,10 +66,7 @@ mod tx;
 // path. `RX_BUF_REPOST_COUNT` / `GQI_RECYCLE_POOL_EXHAUSTED` are
 // `pub` (not `pub(crate)`) so the `/obs` `nic` block can read
 // them as `gve::…`.
-pub use diag::{
-    GQI_RECYCLE_POOL_EXHAUSTED, RX_BUF_REPOST_COUNT, TxDescLogEntry, tx_desc_log_snapshot,
-    write_obs_json,
-};
+pub use diag::{GQI_RECYCLE_POOL_EXHAUSTED, RX_BUF_REPOST_COUNT, TxDescLogEntry, tx_desc_log_snapshot};
 pub(crate) use diag::{
     RX_BYTES_PER_QP, TX_BIG_ACQUIRES, TX_BIG_FULL_RETURNS, TX_BYTES_PER_QP, TX_PACKETS_PER_QP,
     TX_SMALL_ACQUIRES, TX_SMALL_FULL_SPINS, TX_SMALL_SCAN_ITERS, record_tx_desc, tx_desc_kind,
@@ -631,6 +628,7 @@ static GVE_DIAG_OPS: NicDiagOps = NicDiagOps {
     rx_used_cursors: diag::rx_used_cursors,
     tx_diag: Some(diag::tx_diag),
     tx_desc_log_snapshot: Some(diag::tx_desc_log_snapshot_export),
+    obs_json: diag::write_obs_json,
 };
 
 static GVE_OPS: NicOps = NicOps {

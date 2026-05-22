@@ -41,12 +41,13 @@ pub fn udp_obs_json(w: &mut dyn core::fmt::Write) {
     let _ = udp::diag::write_obs_json(w);
 }
 
-/// Render the NIC observability block (`gve::diag`) as JSON into `w`
-/// — the `os:none` half of the `/obs` `"nic"` block. The gve
-/// counters read all-zero under virtio-net (gve is not the active
-/// driver). The native backend stubs this `{}`.
+/// Render the active NIC driver's observability block as JSON into
+/// `w` — the `os:none` half of the `/obs` `"nic"` block's
+/// `counters`. `nic::obs_json` dispatches to whichever driver bound
+/// hardware (gve or virtio-net); each renders its own failure
+/// counters + `last_*` snapshot. The native backend stubs this `{}`.
 pub fn nic_obs_json(w: &mut dyn core::fmt::Write) {
-    let _ = gve::write_obs_json(w);
+    let _ = nic::obs_json(w);
 }
 
 /// Render the kernel observability block (`kernel_bare::mm` — heap

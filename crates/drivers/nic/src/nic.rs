@@ -267,6 +267,17 @@ pub fn tx_desc_log_snapshot(out: &mut [nic_api::TxDescLogEntry]) -> usize {
         .unwrap_or(0)
 }
 
+/// Render the active driver's observability block as a JSON object
+/// — the `nic` block's `counters` for `/obs` (see
+/// `docs/observability.md`). Dispatches to the driver's `obs_json`;
+/// writes `{}` when no driver is bound (native, or pre-probe).
+pub fn obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+    match active_ops().diag {
+        Some(d) => (d.obs_json)(w),
+        None => w.write_str("{}"),
+    }
+}
+
 pub use nic_api::{DIAG_QP_CAP, TxDescLogEntry, TxDiag};
 
 /// Cold-path: used by `waitless::Net::enable` to tell "no driver linked"

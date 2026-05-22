@@ -102,7 +102,11 @@ unsafe fn virtio_rx_repost(base: NonNull<u8>, _capacity: u32, ctx: *mut ()) {
     let qp = ctx as usize;
     let nqp = unsafe { (*ndev()).negotiated_queue_pairs as usize };
     if qp >= nqp {
-        return; // impossible under correct use — leak, never panic
+        // Corrupt `ctx` — impossible under correct use. Leak the
+        // buffer rather than panic (a `#![no_std]` Drop panic is
+        // poison), but count it: a nonzero value is a real bug.
+        crate::diag::COUNTERS.rx_repost_bad_qp.bump();
+        return;
     }
     let buf = base.as_ptr();
     // SAFETY: `buf` is the RX buffer start; the virtio-net header
@@ -221,6 +225,7 @@ pub(crate) fn poll_qp(qp: usize, callback: fn(Chain<OwnedIOBuf>)) -> usize {
                 // header, so there's no IOBuf to deliver. Re-arm
                 // the descriptor inline, mirroring the wrapped
                 // path's `virtio_rx_repost`.
+                crate::diag::COUNTERS.rx_runt_frames.bump();
                 ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
                 rx_repost(qp, virt_to_phys(buf));
             }

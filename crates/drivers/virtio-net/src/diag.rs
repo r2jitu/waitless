@@ -6,6 +6,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use obs::{Counter, LastEvent, ObsRecord};
+
 use crate::{DIAG_QP_CAP, TX_POOL_BIG_SIZE, TX_POOL_SMALL_SIZE, ndev, tx_q};
 
 // ---- Per-qp byte / packet counters -----------------------------------------
@@ -131,4 +133,131 @@ pub(crate) fn rx_used_cursors() -> [(u16, u16); DIAG_QP_CAP] {
         }
     }
     out
+}
+
+// ---- Observability doctrine: anomaly counters + /obs block -----------------
+//
+// The observability doctrine (`docs/observability.md`) applied to the
+// virtio-net driver. The per-qp byte / packet counters above feed the
+// driver-agnostic distribution view; the gap the doctrine closes is
+// the *failure* pillar — an RX runt frame, a corrupted drop-callback
+// `ctx`, a rejected TX descriptor previously vanished without a trace.
+// `Counters` + `LAST_TX_DROP` close that. `write_obs_json` is the
+// virtio-net half of the `/obs` `nic` block's `counters`; `gve::diag`
+// is the gve half — `nic::obs_json` dispatches to whichever driver is
+// active.
+
+/// One counter per virtio-net failure / anomaly. Field names are the
+/// stable tokens used in `LAST_TX_DROP` reasons and the `/obs` block.
+pub struct Counters {
+    /// RX completion whose `used_len` was no larger than the 12-byte
+    /// virtio-net header — a frame with no payload. The descriptor
+    /// is re-armed and nothing is delivered to the net stack.
+    pub rx_runt_frames: Counter,
+    /// `virtio_rx_repost` (a delivered RX `IOBuf`'s drop callback)
+    /// was handed an out-of-range queue-pair index — its `ctx` is
+    /// corrupt. The device buffer is leaked rather than reposted.
+    /// Impossible under correct use; any nonzero value is a bug.
+    pub rx_repost_bad_qp: Counter,
+    /// A TX submit's virtq `add_buf` returned `< 0` — the TX
+    /// descriptor ring was full. The frame is dropped and its
+    /// pool slot released. Read `LAST_TX_DROP` for the qp.
+    pub tx_submit_failed: Counter,
+    /// A TX submit was handed a zero-length or oversized frame and
+    /// dropped it (slot released). A caller bug — `submit_tx` /
+    /// `submit_tx_tso` expect `0 < frame_len <= MAX_ETH_FRAME_*`.
+    pub tx_bad_frame_len: Counter,
+    /// A TX submit decoded an out-of-range worker / slot from the
+    /// handle token, or the TSO big pool was null mid-flight — the
+    /// submit was abandoned. Impossible under correct use (the
+    /// type-distinct handles guarantee a valid pool); any nonzero
+    /// value means a corrupted `TxBufHandle`.
+    pub tx_bad_token: Counter,
+}
+
+impl Counters {
+    const fn new() -> Self {
+        Counters {
+            rx_runt_frames: Counter::new(),
+            rx_repost_bad_qp: Counter::new(),
+            tx_submit_failed: Counter::new(),
+            tx_bad_frame_len: Counter::new(),
+            tx_bad_token: Counter::new(),
+        }
+    }
+}
+
+/// Process-wide virtio-net failure counters.
+pub static COUNTERS: Counters = Counters::new();
+
+/// Most recent dropped TX frame — which submit failure fired, on
+/// which qp, and the frame length involved.
+pub static LAST_TX_DROP: LastEvent<TxDropRecord> = LastEvent::new();
+
+/// Snapshot payload for `LAST_TX_DROP`.
+#[derive(Clone, Copy)]
+pub struct TxDropRecord {
+    /// Failure token — a `Counters` field name.
+    pub reason: &'static str,
+    /// Queue pair the drop occurred on. For `tx_bad_token` this is
+    /// the (corrupt) decoded worker index, retained as-is.
+    pub qp: u32,
+    /// Frame length the submit was called with.
+    pub frame_len: u32,
+    /// `kernel_bare::clock::now_ms()` at the drop.
+    pub at_ms: u64,
+}
+
+impl ObsRecord for TxDropRecord {
+    fn write_fields(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        write!(
+            w,
+            "\"reason\":\"{}\",\"qp\":{},\"frame_len\":{},\"at_ms\":{}",
+            self.reason, self.qp, self.frame_len, self.at_ms,
+        )
+    }
+}
+
+/// Record a dropped TX frame: bump `counter` and snapshot the
+/// reason / qp / frame length into `LAST_TX_DROP`. Called from the
+/// `submit_tx` / `submit_tx_tso` failure arms.
+pub fn record_tx_drop(counter: &Counter, reason: &'static str, qp: u32, frame_len: u32) {
+    counter.bump();
+    LAST_TX_DROP.record(TxDropRecord {
+        reason,
+        qp,
+        frame_len,
+        at_ms: kernel_bare::clock::now_ms(),
+    });
+}
+
+/// Render the virtio-net observability block as a JSON object — the
+/// failure counters, the RX-repost / per-qp throughput totals, then
+/// the `LAST_TX_DROP` snapshot. The leading `"driver"` field lets a
+/// reader tell which NIC produced the block. This is virtio-net's
+/// contribution to the `/obs` `nic` block; `nic::obs_json` forwards
+/// it when virtio-net is the active driver.
+pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+    let sum = |a: &[AtomicU64]| -> u64 { a.iter().map(|c| c.load(Ordering::Relaxed)).sum() };
+    let c = &COUNTERS;
+    write!(
+        w,
+        "{{\"driver\":\"virtio-net\",\"rx_runt_frames\":{},\"rx_repost_bad_qp\":{},\
+         \"tx_submit_failed\":{},\"tx_bad_frame_len\":{},\"tx_bad_token\":{},\
+         \"rx_buf_reposts\":{},\"tx_packets\":{},\"tx_bytes\":{},\"rx_bytes\":{},\
+         \"tx_small_full_spins\":{},\"tx_big_full_returns\":{},",
+        c.rx_runt_frames.get(),
+        c.rx_repost_bad_qp.get(),
+        c.tx_submit_failed.get(),
+        c.tx_bad_frame_len.get(),
+        c.tx_bad_token.get(),
+        sum(&RX_BUF_REPOST_COUNT),
+        sum(&TX_PACKETS_PER_QP),
+        sum(&TX_BYTES_PER_QP),
+        sum(&RX_BYTES_PER_QP),
+        TX_SMALL_FULL_SPINS.load(Ordering::Relaxed),
+        TX_BIG_FULL_RETURNS.load(Ordering::Relaxed),
+    )?;
+    LAST_TX_DROP.write_json(w, "last_tx_drop")?;
+    w.write_str("}")
 }

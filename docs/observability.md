@@ -248,7 +248,7 @@ their invariant inputs, and a `write_obs_json` is wired into `/obs`.
 | QUIC             | `crates/proto/quic`         | ✅ Done   | Reference implementation — see below. |
 | TCP              | `crates/net/tcp`            | ✅ Done   | `tcp::diag` — 19 counters, `LAST_RST` / `LAST_TEARDOWN` / `LAST_ACK_UNSENT`; surfaced via the `waitless_backend` seam. |
 | UDP              | `crates/net`                | ✅ Done   | `udp::diag` — 6 counters + `LAST_UNDELIVERABLE`; `waitless_backend` seam. |
-| NIC / gve driver | `crates/drivers/gve`        | ✅ Done   | `gve::diag` — anomaly counters + `LAST_RX_SKIP`; `waitless_backend` seam. virtio-net driver still bare. |
+| NIC drivers      | `crates/drivers/{gve,virtio-net}` | ✅ Done | Both drivers: `gve::diag` — anomaly counters + `LAST_RX_SKIP`; `virtio_net::diag` — 5 failure counters + `LAST_TX_DROP`. `NicDiagOps::obs_json` vtable entry; `nic::obs_json` dispatches to the active driver; `waitless_backend` seam. Each block self-identifies via a `"driver"` field. |
 | IP / ARP / NDP   | `crates/net/stack`          | ✅ Done   | `net_stack::diag` — L2/L3 RX-dispatch drops (`classified_drops` / `unknown_l4`) + `LAST_CLASSIFIED_DROP`; `waitless_backend` seam. |
 | TLS              | `crates/proto/tls`          | ✅ Done   | `tls::diag` — handshake-lifecycle counters + `LAST_HANDSHAKE_FAILURE`; app-reachable, no seam. |
 | HTTP/1.1         | `crates/proto/http`         | ✅ Done   | `http::diag` — 9 connection/request lifecycle counters + `LAST_REJECT` (smuggling-shaped request → `400`); app-reachable, no seam. |
