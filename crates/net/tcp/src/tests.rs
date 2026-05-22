@@ -2553,6 +2553,198 @@ fn future_ack_is_dropped_with_a_bare_ack() {
     );
 }
 
+// ---- lossy-transfer recovery -------------------------------------------
+//
+// The conformance harness is deterministic and loss-free by default;
+// the egress-drop fixture is the only loss seam. These two scenarios
+// drive a *windowed* multi-segment transfer, drop real segments with
+// the fixture, and assert the whole composition — windowed
+// `async_try_send_chain`, the RFC 5681 congestion response, and the
+// RFC 6298 / fast-retransmit recovery — delivers every byte. They
+// exercise the loss behaviour that the loss-free HVF and GCE-loopback
+// benches cannot reach.
+
+/// A whole window lost on the wire is recovered by the RTO timer one
+/// segment at a time (the stack has no SACK), the loss collapses
+/// `cwnd` to one segment, and the transfer still delivers every byte.
+#[test]
+fn lossy_windowed_transfer_completes() {
+    let _g = harness();
+    const SP: u16 = 9170;
+    const CP: u16 = 50170;
+    const CLIENT_ISN: u32 = 0xF300;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    let total: usize = 20_000;
+    let mut chain = iobuf::IOBufChain::from(vec![0x5Au8; total]);
+
+    // Window 1 — delivered cleanly, acknowledged in full.
+    let w1 = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert!(w1 > 0 && w1 < total, "the body spans more than one window");
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1).wrapping_add(w1 as u32),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+
+    // Window 2 — every segment dropped on the wire.
+    let w2_frames = (total - w1).div_ceil(1460);
+    clear_tx();
+    drop_next_egress(w2_frames as u32);
+    let w2 = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(w1 + w2, total, "the whole body has left the send path");
+    assert!(chain.is_empty(), "nothing is left queued in the chain");
+    assert!(tx().is_empty(), "window 2's segments were all dropped on the wire");
+    assert_eq!(egress_drops(), w2_frames as u32);
+
+    // The RTO recovers window 2 one segment per timeout (no SACK).
+    let final_nxt = server_isn.wrapping_add(1).wrapping_add(total as u32);
+    let mut cycles = 0u32;
+    let mut at_loss: Option<(u32, u32)> = None;
+    while conn_snd_una(CP, SP) != final_nxt {
+        cycles += 1;
+        assert!(cycles <= 32, "RTO recovery must converge");
+        clear_tx();
+        kernel_core::clock::mock::advance(RTO_MAX_MS as u64 + 1);
+        super::on_tcp_tick();
+        if at_loss.is_none() {
+            at_loss = Some(conn_cwnd_ssthresh(CP, SP));
+        }
+        let rtx = tx();
+        assert_eq!(rtx.len(), 1, "the RTO retransmits exactly one segment per tick");
+        let seg_len = (rtx[0].len() - 34 - TCP_HDR_LEN) as u32;
+        let acked = conn_snd_una(CP, SP).wrapping_add(seg_len);
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN.wrapping_add(1),
+            ack: acked,
+            flags: TCP_ACK,
+            window: 65535,
+            payload: Vec::new(),
+        });
+    }
+
+    let (cwnd_at_loss, ssthresh_at_loss) = at_loss.expect("recovery ran at least one RTO");
+    assert_eq!(cwnd_at_loss, 1460, "the RTO collapsed cwnd to one SMSS");
+    assert_eq!(
+        ssthresh_at_loss,
+        (w2 as u32 / 2).max(2 * 1460),
+        "ssthresh dropped to half the lost flight (2·SMSS floor)",
+    );
+    assert_eq!(cycles as usize, w2_frames, "one RTO cycle per lost segment");
+    assert_eq!(
+        conn_snd_una(CP, SP),
+        final_nxt,
+        "every byte of the lossy transfer was ultimately delivered",
+    );
+    assert!(
+        !conn_rtx_overflow(CP, SP),
+        "the retransmit ring stayed consistent through the loss",
+    );
+    let (cwnd_after, _) = conn_cwnd_ssthresh(CP, SP);
+    assert!(
+        cwnd_after < 14_600,
+        "the loss persistently shrank the window — cwnd did not snap back",
+    );
+}
+
+/// A single segment dropped mid-window is recovered by fast
+/// retransmit — no RTO wait — and the windowed transfer flows on to
+/// completion. The egress-drop fixture really removes the segment,
+/// so the recovered frame is unambiguous; the `data_retransmits`
+/// counter staying 0 confirms recovery was fast retransmit, not RTO.
+#[test]
+fn fast_retransmit_keeps_a_windowed_transfer_flowing() {
+    let _g = harness();
+    const SP: u16 = 9171;
+    const CP: u16 = 50171;
+    const CLIENT_ISN: u32 = 0xF400;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    let total: usize = 20_000;
+    let body = vec![0xC7u8; total];
+    let mut chain = iobuf::IOBufChain::from(body.clone());
+    let rto_retransmits_before = super::diag::COUNTERS.data_retransmits.get();
+
+    // Window 1 — the first segment is dropped on the wire.
+    clear_tx();
+    drop_next_egress(1);
+    let w1 = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert!(w1 > 3 * 1460, "window 1 is several segments");
+    assert_eq!(egress_drops(), 1, "the first segment was dropped");
+
+    // The peer sees the gap and dup-ACKs; the third triggers fast
+    // retransmit of the missing segment — with the clock untouched.
+    let dup = Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    };
+    clear_tx();
+    deliver(&dup);
+    deliver(&dup);
+    assert!(tx().is_empty(), "two dup-ACKs do not retransmit");
+    deliver(&dup);
+    let rtx = tx();
+    assert_eq!(rtx.len(), 1, "the third dup-ACK fast-retransmits");
+    assert_eq!(
+        tcp_hdr(&rtx[0]).seq,
+        server_isn.wrapping_add(1),
+        "the fast retransmit re-sends the dropped segment from snd_una",
+    );
+    assert_eq!(
+        &rtx[0][34 + TCP_HDR_LEN..],
+        &body[..1460],
+        "the recovered segment carries the dropped segment's bytes",
+    );
+    assert_eq!(
+        super::diag::COUNTERS.data_retransmits.get(),
+        rto_retransmits_before,
+        "recovery was fast retransmit — no RTO timer fired",
+    );
+
+    // The peer now has the whole first window — ACK it; the windowed
+    // transfer resumes and the remaining bytes go out.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1).wrapping_add(w1 as u32),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    let w2 = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(w1 + w2, total, "the transfer flowed on past the recovered loss");
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1).wrapping_add(total as u32),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert_eq!(
+        conn_snd_una(CP, SP),
+        server_isn.wrapping_add(1).wrapping_add(total as u32),
+        "every byte was delivered after the fast-retransmit recovery",
+    );
+}
+
 /// Locate the live (non-listener) connection for a client/server
 /// port pair and return its `(handle, generation)` so a scenario
 /// can drive the real send path (`async_try_send_chain`).
