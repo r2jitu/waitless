@@ -52,13 +52,20 @@ what to retain **before** the incident, because after it you cannot.
    allocation, formatting, or locking. `#[cfg]`-gate anything that
    is not free.
 
-6. **Serial is a slow human channel, not the triage surface.** The
-   GCE serial console is readable in production, but writing to it
-   is slow and what comes out is unstructured text. Durable
-   diagnostics live in memory — counters and snapshot slots — and
-   are surfaced as structured JSON via an HTTP endpoint. Serial
-   carries only gated, human-paced lines for interactive debugging
-   (`quic.log=events` and friends).
+6. **A broken assumption is loud.** Most failures are *expected* —
+   junk packets, a decrypt that failed against stale keys, a peer
+   that closed. Those are counted and snapshotted, queryable at
+   leisure via `/obs`; routing them to serial would just be noise.
+   But a *genuinely unexpected* condition — an invariant the code
+   relies on not holding — is not a statistic. It logs to serial
+   immediately and unconditionally, with its context, because a
+   counter ticking 0→1 on a dashboard nobody is watching is not a
+   signal. Such paths are cold by definition: a "can't happen" that
+   happens often was never an invariant, so the serial cost never
+   matters. Serial is not the bulk triage surface — `/obs` is — but
+   it is exactly right for the rare, loud, this-should-never-happen
+   line. (QUIC spells this as the `quic_bug!` macro: ungated serial
+   + counter + a `LAST_BUG` snapshot.)
 
 7. **One mechanism, every subsystem.** The counter type, the
    snapshot slot, and the render convention are shared and generic.
@@ -74,9 +81,11 @@ what to retain **before** the incident, because after it you cannot.
 
 ## The mechanism
 
-Two cold-path primitives live in [`kernel_core::obs`](../crates/kernel/core/src/obs.rs)
+Three primitives live in [`kernel_core::obs`](../crates/kernel/core/src/obs.rs)
 (re-exported as `kernel_bare::obs`). They are deliberately tiny —
-the doctrine is a discipline, not a framework.
+the doctrine is a discipline, not a framework. `Counter` and
+`LastEvent` serve the failure pillar; `LatencyHist` serves the
+performance pillar (see *Performance observability* below).
 
 ### `Counter`
 
@@ -104,6 +113,20 @@ It takes a lock, so it is **cold path only**: connection teardowns,
 protocol errors, anomalies — never per packet. `count == 0` ⇔ the
 slot never fired, so an empty slot is unambiguous.
 
+### `LatencyHist`
+
+A fixed-bucket log2 latency histogram: 20 buckets (bucket `b` =
+`[2^b, 2^(b+1))`), plus `count`, `sum`, `min`, `max`. `record` is
+one `leading_zeros` and ~5 relaxed atomics — the cost class of a
+`Counter`, not of a `LastEvent`. That is what licenses it on a warm
+path. Unit-agnostic: the caller records whatever it likes (the QUIC
+histograms record microseconds; the unit lives in the field name).
+
+`write_json` renders `count` / `min` / `max` / `mean` / `p50` /
+`p99` plus the raw bucket array. The percentiles are the *lower
+bound* of the bucket they fall in — a log2 histogram resolves only
+to a power of two, so a `p99` is "at least this".
+
 ### The snapshot/render convention
 
 A snapshot payload implements `ObsRecord`, whose `write_fields`
@@ -120,8 +143,42 @@ shape is uniform, so consumers never special-case "absent".
 
 Each subsystem exposes one `write_obs_json(&mut dyn Write)` that
 emits a JSON object: its `Counter`s as flat `"name":value` members,
-its `LastEvent`s via `write_json`. That function is the subsystem's
-entire contribution to the exposure surface.
+its `LastEvent`s and `LatencyHist`s via their `write_json`. That
+function is the subsystem's entire contribution to the exposure
+surface.
+
+## Performance observability
+
+The failure pillar above answers *did it break, and why*. The
+performance pillar answers *how long did it take*. Same philosophy —
+retain it in advance, one mechanism, surfaced via `/obs` — but a
+different cost rule.
+
+Principle 5 keeps the failure pillar cold-path-only: `LastEvent`
+snapshots and detail logging fire only on rare events. The
+performance pillar deliberately samples *warm* paths — per request,
+and where it earns its keep, per datagram. That is sound because a
+`LatencyHist::record` is a bounded O(1) op (one `leading_zeros`, a
+few relaxed atomics) — the cost class of a `Counter`, not of a
+`LastEvent`. What stays forbidden everywhere is per-packet
+allocation, formatting, or locking, and any unbounded work.
+
+A latency measurement needs two timestamps and a way to *correlate*
+them. The trick is to measure where the correlation is structural,
+not bolted on. In QUIC a request and its response are the same
+bidirectional stream, keyed by `sid` — so a timestamp stamped on
+the inbound datagram, carried to the request's `RecvStream` and
+then its `SendStream`, closes the loop at no plumbing cost beyond a
+`u64` field. QUIC measures two spans:
+
+- **`inbox_wait_us`** — listener `recv_from` → conn-task dequeue.
+  The one genuinely per-datagram sample; isolates scheduling /
+  queueing delay.
+- **`request_latency_us`** — inbound datagram → response FIN
+  encoded. The end-to-end RX→TX path as experienced by a request.
+
+`p50` / `p99` come straight off the histogram on the read side — no
+profiler, no sampling agent, live in `/obs`.
 
 ## Exposure
 

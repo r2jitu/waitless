@@ -163,6 +163,163 @@ impl<T: Copy + ObsRecord> LastEvent<T> {
     }
 }
 
+/// Number of log2 buckets in a [`LatencyHist`]. Bucket `b` holds
+/// samples in `[2^b, 2^(b+1))` of whatever unit the caller records;
+/// bucket 0 also catches a sample of `0`. Twenty buckets span 1 ..
+/// ~1.05M units — 1 µs .. ~1 s for the QUIC microsecond histograms —
+/// and anything larger saturates into the top bucket.
+pub const HIST_BUCKETS: usize = 20;
+
+/// A fixed-bucket log2 latency histogram — the performance-pillar
+/// counterpart of [`Counter`]. Unit-agnostic: the caller records
+/// whatever monotonic quantity it likes (the QUIC stack records
+/// microseconds; the unit goes in the field name).
+///
+/// `record` is one `leading_zeros` plus ~5 relaxed atomics — the
+/// cost class of a `Counter`, not of a `LastEvent`. That is what
+/// makes it sound on a warm path: per-request, and (deliberately)
+/// per-datagram, sampling is fine. What stays forbidden is
+/// per-packet allocation, formatting, or locking. See the
+/// performance-observability section of `docs/observability.md`.
+pub struct LatencyHist {
+    buckets: [AtomicU64; HIST_BUCKETS],
+    count: AtomicU64,
+    /// Sum of all samples, for the mean. Saturates rather than wraps
+    /// — at µs scale that is centuries of traffic, but a wrapped mean
+    /// would be a silently wrong number, which the doctrine forbids.
+    sum: AtomicU64,
+    min: AtomicU64,
+    max: AtomicU64,
+}
+
+/// Plain-data snapshot of a [`LatencyHist`], for tests and rendering.
+#[derive(Clone, Copy)]
+pub struct HistSnapshot {
+    pub count: u64,
+    pub sum: u64,
+    /// `0` when `count == 0` (the live `min` slot sits at `u64::MAX`).
+    pub min: u64,
+    pub max: u64,
+    pub buckets: [u64; HIST_BUCKETS],
+}
+
+impl LatencyHist {
+    /// An empty histogram. `const` so it can live in a `static`.
+    pub const fn new() -> Self {
+        LatencyHist {
+            buckets: [const { AtomicU64::new(0) }; HIST_BUCKETS],
+            count: AtomicU64::new(0),
+            sum: AtomicU64::new(0),
+            // Empty `min` sits at the top so the first real sample
+            // always wins the `fetch_min`.
+            min: AtomicU64::new(u64::MAX),
+            max: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one `sample` (in the caller's unit).
+    #[inline]
+    pub fn record(&self, sample: u64) {
+        // floor(log2(sample)); sample 0 and 1 both land in bucket 0.
+        let idx = if sample < 2 {
+            0
+        } else {
+            (63 - sample.leading_zeros() as usize).min(HIST_BUCKETS - 1)
+        };
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let mut s = self.sum.load(Ordering::Relaxed);
+        loop {
+            let n = s.saturating_add(sample);
+            match self
+                .sum
+                .compare_exchange_weak(s, n, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(cur) => s = cur,
+            }
+        }
+        self.min.fetch_min(sample, Ordering::Relaxed);
+        self.max.fetch_max(sample, Ordering::Relaxed);
+    }
+
+    /// Read the histogram out as plain data.
+    pub fn snapshot(&self) -> HistSnapshot {
+        let mut buckets = [0u64; HIST_BUCKETS];
+        for (i, b) in self.buckets.iter().enumerate() {
+            buckets[i] = b.load(Ordering::Relaxed);
+        }
+        let count = self.count.load(Ordering::Relaxed);
+        HistSnapshot {
+            count,
+            sum: self.sum.load(Ordering::Relaxed),
+            min: if count == 0 {
+                0
+            } else {
+                self.min.load(Ordering::Relaxed)
+            },
+            max: self.max.load(Ordering::Relaxed),
+            buckets,
+        }
+    }
+
+    /// Render as one JSON object member:
+    /// `"<name>":{"count":N,"min":..,"max":..,"mean":..,"p50":..,"p99":..,"buckets":[..]}`.
+    /// An empty histogram renders `"<name>":{"count":0}` — the same
+    /// uniform shape `LastEvent` uses. `p50`/`p99` are the *lower
+    /// bound* of the bucket the percentile falls in: a log2
+    /// histogram only resolves to a power of two, so the true value
+    /// is "at least this". The raw `buckets` array is emitted too
+    /// for consumers that want to compute their own.
+    pub fn write_json(&self, w: &mut dyn fmt::Write, name: &str) -> fmt::Result {
+        let s = self.snapshot();
+        write!(w, "\"{name}\":{{\"count\":{}", s.count)?;
+        if s.count > 0 {
+            write!(
+                w,
+                ",\"min\":{},\"max\":{},\"mean\":{},\"p50\":{},\"p99\":{},\"buckets\":[",
+                s.min,
+                s.max,
+                s.sum / s.count,
+                percentile_lo(&s.buckets, s.count, 50),
+                percentile_lo(&s.buckets, s.count, 99),
+            )?;
+            for (i, b) in s.buckets.iter().enumerate() {
+                if i > 0 {
+                    w.write_str(",")?;
+                }
+                write!(w, "{b}")?;
+            }
+            w.write_str("]")?;
+        }
+        w.write_str("}")
+    }
+}
+
+impl Default for LatencyHist {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Lower bound of the bucket at which the cumulative count first
+/// reaches `pct`% of `total`. Approximate by construction — a log2
+/// histogram resolves only to a power of two.
+fn percentile_lo(buckets: &[u64; HIST_BUCKETS], total: u64, pct: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    let target = total.saturating_mul(pct) / 100;
+    let mut cum = 0u64;
+    for (b, &n) in buckets.iter().enumerate() {
+        cum += n;
+        if cum >= target {
+            return if b == 0 { 0 } else { 1u64 << b };
+        }
+    }
+    1u64 << (HIST_BUCKETS - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +396,60 @@ mod tests {
             s,
             "\"last_thing\":{\"count\":1,\"code\":7,\"age_us\":81000}"
         );
+    }
+
+    #[test]
+    fn hist_buckets_are_floor_log2() {
+        let h = LatencyHist::new();
+        h.record(0); // bucket 0
+        h.record(1); // bucket 0  ([1,2))
+        h.record(2); // bucket 1  ([2,4))
+        h.record(3); // bucket 1
+        h.record(1000); // bucket 9  (2^9=512 ≤ 1000 < 1024)
+        let s = h.snapshot();
+        assert_eq!(s.count, 5);
+        assert_eq!(s.buckets[0], 2);
+        assert_eq!(s.buckets[1], 2);
+        assert_eq!(s.buckets[9], 1);
+        assert_eq!(s.min, 0);
+        assert_eq!(s.max, 1000);
+        assert_eq!(s.sum, 1006);
+    }
+
+    #[test]
+    fn hist_oversized_sample_saturates_into_top_bucket() {
+        let h = LatencyHist::new();
+        h.record(u64::MAX);
+        let s = h.snapshot();
+        assert_eq!(s.buckets[HIST_BUCKETS - 1], 1);
+    }
+
+    #[test]
+    fn hist_empty_renders_uniform_shape() {
+        let h = LatencyHist::new();
+        let mut s = String::new();
+        h.write_json(&mut s, "request_latency_us").unwrap();
+        assert_eq!(s, "\"request_latency_us\":{\"count\":0}");
+    }
+
+    #[test]
+    fn hist_percentiles_track_the_distribution() {
+        let h = LatencyHist::new();
+        // 99 fast samples (~100 µs) + 1 slow one (~9 ms).
+        for _ in 0..99 {
+            h.record(100);
+        }
+        h.record(9_000);
+        let s = h.snapshot();
+        assert_eq!(s.count, 100);
+        // p50 sits in the 100 µs bucket (2^6=64 ≤ 100 < 128).
+        assert_eq!(percentile_lo(&s.buckets, s.count, 50), 64);
+        // p99 still in the fast bucket; the lone slow sample is p100.
+        assert_eq!(percentile_lo(&s.buckets, s.count, 99), 64);
+        let mut out = String::new();
+        h.write_json(&mut out, "request_latency_us").unwrap();
+        assert!(out.contains("\"count\":100"));
+        assert!(out.contains("\"max\":9000"));
+        assert!(out.contains("\"p50\":64"));
     }
 }
