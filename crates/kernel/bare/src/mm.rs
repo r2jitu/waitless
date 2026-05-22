@@ -40,6 +40,7 @@ use talc::{ErrOnOom, Span, Talc};
 
 use crate::once::InitOnce;
 use crate::serial;
+use obs::{Counter, LastEvent, ObsRecord};
 use sync::Spinlock;
 use crate::types::{BootInfo, MEM_AVAILABLE};
 
@@ -330,6 +331,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
             Ok(nn) => nn.as_ptr(),
             Err(()) => {
                 drop(heap);
+                record_oom(layout.size(), layout.align());
                 klog!(
                     "mm::alloc: OOM ({} bytes, align {})\n",
                     layout.size(),
@@ -472,6 +474,71 @@ pub fn heap_stats() -> HeapStats {
 
 pub fn total_memory() -> usize {
     TOTAL_RAM.load(Ordering::Acquire) as usize
+}
+
+// ── Observability: heap OOM (the observability doctrine) ────────────
+//
+// `docs/observability.md` applied to the kernel. The `diag` ring
+// already captures panics + unhandled CPU exceptions (the kernel's
+// "last fatal fault"); the gap the doctrine closes is the one
+// *non-fatal* kernel anomaly worth counting — an allocation that
+// failed. `GlobalAlloc::alloc` returning null is a counted-nowhere
+// event today; the caller handles the null and carries on, so it
+// can recur. `write_obs_json` is the kernel's `/obs` block.
+
+/// Heap allocations that failed — `GlobalAlloc::alloc` returned null
+/// because `talc` had no block to satisfy the request. Genuinely
+/// unexpected on a healthy system; sustained growth means the heap
+/// is undersized or something is leaking.
+pub static HEAP_OOM: Counter = Counter::new();
+
+/// Most recent failed allocation — the size / alignment `talc`
+/// could not satisfy.
+pub static LAST_OOM: LastEvent<OomRecord> = LastEvent::new();
+
+/// Snapshot payload for `LAST_OOM`.
+#[derive(Clone, Copy)]
+pub struct OomRecord {
+    pub size: usize,
+    pub align: usize,
+}
+
+impl ObsRecord for OomRecord {
+    fn write_fields(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        write!(w, "\"size\":{},\"align\":{}", self.size, self.align)
+    }
+}
+
+/// Record a failed allocation: bump `HEAP_OOM` and snapshot the
+/// request into `LAST_OOM`.
+fn record_oom(size: usize, align: usize) {
+    HEAP_OOM.bump();
+    LAST_OOM.record(OomRecord { size, align });
+}
+
+/// Render the kernel observability block as JSON — heap statistics
+/// plus the OOM counter and `LAST_OOM` snapshot. This is the
+/// kernel's `/obs` block; `waitless_backend::kernel_obs_json`
+/// forwards it (the native backend has no kernel heap and stubs
+/// `{}`).
+pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+    let s = heap_stats();
+    write!(
+        w,
+        "{{\"heap_allocated_bytes\":{},\"heap_available_bytes\":{},\
+         \"heap_claimed_bytes\":{},\"heap_allocation_count\":{},\
+         \"heap_fragment_count\":{},\"heap_total_allocation_count\":{},\
+         \"heap_oom\":{},",
+        s.allocated_bytes,
+        s.available_bytes,
+        s.claimed_bytes,
+        s.allocation_count,
+        s.fragment_count,
+        s.total_allocation_count,
+        HEAP_OOM.get(),
+    )?;
+    LAST_OOM.write_json(w, "last_oom")?;
+    w.write_str("}")
 }
 
 pub fn free_memory() -> usize {

@@ -83,6 +83,13 @@ pub fn nic_obs_json(w: &mut dyn core::fmt::Write) {
     let _ = gve::write_obs_json(w);
 }
 
+/// Render the kernel observability block (`kernel_bare::mm` — heap
+/// stats + OOM) as JSON into `w`. The native backend has no kernel
+/// heap and stubs this `{}` (`native::kernel_obs_json`).
+pub fn kernel_obs_json(w: &mut dyn core::fmt::Write) {
+    let _ = kernel_bare::mm::write_obs_json(w);
+}
+
 // ---- Event loop re-exports ------------------------------------------------
 
 pub use kernel_bare::eventloop::{request_shutdown, set_ready};

@@ -366,6 +366,13 @@ pub mod diagnostics {
         let _ = executor::diag::write_obs_json(w);
     }
 
+    /// Render the kernel observability block (`kernel_bare::mm` —
+    /// heap stats + OOM) as JSON into `w`. Real on bare-metal, `{}`
+    /// on native.
+    pub fn kernel_obs_json(w: &mut dyn core::fmt::Write) {
+        waitless_backend::kernel_obs_json(w)
+    }
+
     /// TX-side hot-path counters: per-qp packet counts + small/big
     /// pool saturation + scan-depth aggregates. `None` when no
     /// driver is bound or the active driver hasn't wired the

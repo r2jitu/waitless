@@ -1074,6 +1074,12 @@ pub fn nic_obs_json(w: &mut dyn core::fmt::Write) {
     let _ = w.write_str("{}");
 }
 
+/// Native stub for the kernel observability block — no kernel heap
+/// on native. Mirrors `bare::kernel_obs_json`.
+pub fn kernel_obs_json(w: &mut dyn core::fmt::Write) {
+    let _ = w.write_str("{}");
+}
+
 // ---- Diag-capture stubs (native has no kernel panic to capture) ----
 
 pub fn diag_append(_bytes: &[u8]) {}
