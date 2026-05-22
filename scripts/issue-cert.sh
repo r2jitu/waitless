@@ -98,24 +98,26 @@ echo "    DNS:     Google Cloud DNS (project $GCE_PROJECT)"
 
 # --- Run the ACME DNS-01 flow ---------------------------------------------
 #
-# `--key-type ec256` matches the server: the TLS stack signs
+# `--key-type EC256` matches the server: the TLS stack signs
 # CertificateVerify with ECDSA P-256, and `TlsServerConfig` expects a
 # P-256 PKCS#8 key. An RSA cert would not load.
 #
 # `GCE_PROPAGATION_TIMEOUT` is generous — Cloud DNS TXT propagation
 # is usually quick but the ACME server's own resolver caching can lag.
+#
+# lego ≥ 5 takes the certificate flags on the `run` subcommand — only
+# `--log.*` / `--config` are global — so `run` comes first.
 export GCE_PROJECT
 export GCE_PROPAGATION_TIMEOUT="${GCE_PROPAGATION_TIMEOUT:-300}"
 
-lego \
+lego run \
     --accept-tos \
     --email "$WAITLESS_CERT_EMAIL" \
     --domains "$DOMAIN" \
     --dns gcloud \
-    --key-type ec256 \
+    --key-type EC256 \
     --path "$LEGO_DIR" \
-    --server "$ACME_SERVER" \
-    run
+    --server "$ACME_SERVER"
 
 # --- Convert PEM → DER and stage into prod_certs/ -------------------------
 #
