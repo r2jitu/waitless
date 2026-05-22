@@ -58,6 +58,10 @@
 #     replaces the instance in place (a multi-minute outage).
 #   WAITLESS_HEALTH_TIMEOUT — seconds to wait for a new instance to
 #     answer GET /health with 200 before aborting (default 150).
+#   WAITLESS_HEALTH_INSECURE — set to 1 so the HTTPS health probe
+#     skips certificate verification (curl -k). Needed for a Let's
+#     Encrypt *staging* cert, which chains to an untrusted root;
+#     renew-and-deploy.sh sets it for the `staging` mode.
 
 set -euo pipefail
 
@@ -177,6 +181,9 @@ resolve_instance() {
 # set (WAITLESS_CERT_DOMAINS / WAITLESS_CERT_DOMAIN) the probe is
 # HTTPS with --resolve, so it also confirms the new image serves a
 # valid cert for the domain; without it, a plain-HTTP probe.
+# WAITLESS_HEALTH_INSECURE=1 adds `curl -k`: the HTTPS probe still
+# confirms the server is up and serving /health, but tolerates an
+# untrusted chain — a Let's Encrypt staging cert chains to one.
 # Args: <ip> <label>
 health_check() {
     local ip="$1" label="$2"
@@ -187,6 +194,7 @@ health_check() {
         probe=(curl -fsS --max-time 5
             --resolve "${CERT_DOMAIN}:443:${ip}"
             "https://${CERT_DOMAIN}/health")
+        [ "${WAITLESS_HEALTH_INSECURE:-0}" = "1" ] && probe+=(-k)
     else
         probe=(curl -fsS --max-time 5 "http://${ip}/health")
     fi

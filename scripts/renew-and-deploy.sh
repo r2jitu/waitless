@@ -71,8 +71,16 @@ echo "=========================================="
 # DOWNTIME=1 selects the blue/green path — health-check the new image
 # on a second instance, then flip the static IP — so the cutover is
 # seconds and a bad build never reaches production.
+#
+# A staging cert chains to an untrusted root, so the blue/green HTTPS
+# health check must skip verification (WAITLESS_HEALTH_INSECURE=1) — it
+# still confirms the server is up. A prod cert verifies clean, so the
+# check stays strict and catches a broken prod cert before cutover.
+health_insecure=0
+[ "$MODE" = "staging" ] && health_insecure=1
 WAITLESS_BAZEL_DEFINES="--define tls_cert=prod" \
     WAITLESS_ZERO_DOWNTIME=1 \
+    WAITLESS_HEALTH_INSECURE="$health_insecure" \
     "$SCRIPT_DIR/deploy-gcloud.sh" deploy
 
 echo ""
