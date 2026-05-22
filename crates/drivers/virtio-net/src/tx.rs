@@ -233,8 +233,8 @@ pub(crate) fn acquire_tx_buf() -> Option<nic_api::TxBufHandle> {
                     // — `local_iters / acquires` (read-side) is the
                     // average scan depth. Relaxed ordering: counters
                     // never gate any other read.
-                    TX_SMALL_SCAN_ITERS.fetch_add(local_iters, Ordering::Relaxed);
-                    TX_SMALL_ACQUIRES.fetch_add(1, Ordering::Relaxed);
+                    TX_SMALL_SCAN_ITERS.add(local_iters);
+                    TX_SMALL_ACQUIRES.bump();
                     let buf = &mut (*wpool(worker)).small[slot];
                     return Some(nic_api::TxBufHandle {
                         data_ptr: buf.data.as_mut_ptr(),
@@ -249,7 +249,7 @@ pub(crate) fn acquire_tx_buf() -> Option<nic_api::TxBufHandle> {
         // process the pending TX batch and produce completions,
         // then drain and re-scan. Each full sweep counts as one
         // saturation event for `tx_diag`.
-        TX_SMALL_FULL_SPINS.fetch_add(1, Ordering::Relaxed);
+        TX_SMALL_FULL_SPINS.bump();
         unsafe {
             (*tx_q(qp)).flush_kick();
         }
@@ -274,7 +274,7 @@ pub(crate) fn acquire_tx_tso_buf() -> Option<nic_api::TxTsoBufHandle> {
         unsafe {
             if !(*wpool(worker)).big_used[slot].load(Ordering::Acquire) {
                 (*wpool(worker)).big_used[slot].store(true, Ordering::Relaxed);
-                TX_BIG_ACQUIRES.fetch_add(1, Ordering::Relaxed);
+                TX_BIG_ACQUIRES.bump();
                 let buf = &mut *big_ptr.add(slot);
                 return Some(nic_api::TxTsoBufHandle(nic_api::TxBufHandle {
                     data_ptr: buf.data.as_mut_ptr(),
@@ -289,7 +289,7 @@ pub(crate) fn acquire_tx_tso_buf() -> Option<nic_api::TxTsoBufHandle> {
     // High counts here mean TSO is being undersized (or the TCP
     // layer is shipping super-segments faster than the device
     // drains them).
-    TX_BIG_FULL_RETURNS.fetch_add(1, Ordering::Relaxed);
+    TX_BIG_FULL_RETURNS.bump();
     None
 }
 

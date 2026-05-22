@@ -294,8 +294,8 @@ pub(crate) fn acquire_tx_buf_for_qp(qp: usize) -> Option<nic_api::TxBufHandle> {
                     // count so the reader can compute the average
                     // scan depth. Single relaxed atomic each — off
                     // the per-packet hot path's critical chain.
-                    TX_SMALL_SCAN_ITERS.fetch_add(local_iters, Ordering::Relaxed);
-                    TX_SMALL_ACQUIRES.fetch_add(1, Ordering::Relaxed);
+                    TX_SMALL_SCAN_ITERS.add(local_iters);
+                    TX_SMALL_ACQUIRES.bump();
                     let qpl_offset = (slot as u32) * PAGE_SIZE;
                     let data_ptr = (tx.qpl_base_va + qpl_offset as u64) as *mut u8;
                     return Some(nic_api::TxBufHandle {
@@ -310,7 +310,7 @@ pub(crate) fn acquire_tx_buf_for_qp(qp: usize) -> Option<nic_api::TxBufHandle> {
         // No capacity. Force any deferred kick so the host sees
         // pending descriptors and can produce completions. Each
         // wrap-around counts as one saturation event.
-        TX_SMALL_FULL_SPINS.fetch_add(1, Ordering::Relaxed);
+        TX_SMALL_FULL_SPINS.bump();
         let bar2_va = BAR2_VA.load(Ordering::Acquire);
         if bar2_va != 0 {
             let last = tx.last_kicked.load(Ordering::Relaxed);
@@ -346,13 +346,13 @@ pub(crate) fn acquire_tx_tso_buf_for_qp(qp: usize) -> Option<nic_api::TxTsoBufHa
     let fill = tx.fill_cnt.load(Ordering::Relaxed);
     let done = tx.done_cnt.load(Ordering::Relaxed);
     if fill.wrapping_sub(done) >= tx.ring_entries as u32 - 1 {
-        TX_BIG_FULL_RETURNS.fetch_add(1, Ordering::Relaxed);
+        TX_BIG_FULL_RETURNS.bump();
         return None;
     }
     for slot in 0..(TX_BIG_POOL_SLOTS as usize) {
         if !tx.big_slot_used[slot].load(Ordering::Acquire) {
             tx.big_slot_used[slot].store(true, Ordering::Relaxed);
-            TX_BIG_ACQUIRES.fetch_add(1, Ordering::Relaxed);
+            TX_BIG_ACQUIRES.bump();
             let qpl_offset = TX_BIG_POOL_QPL_OFFSET + (slot as u32) * TX_BIG_SLOT_SIZE;
             let data_ptr = (tx.qpl_base_va + qpl_offset as u64) as *mut u8;
             return Some(nic_api::TxTsoBufHandle(nic_api::TxBufHandle {
@@ -363,7 +363,7 @@ pub(crate) fn acquire_tx_tso_buf_for_qp(qp: usize) -> Option<nic_api::TxTsoBufHa
             }));
         }
     }
-    TX_BIG_FULL_RETURNS.fetch_add(1, Ordering::Relaxed);
+    TX_BIG_FULL_RETURNS.bump();
     None
 }
 

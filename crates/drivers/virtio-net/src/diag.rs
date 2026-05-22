@@ -52,11 +52,11 @@ pub(crate) static TX_BYTES_PER_QP: [AtomicU64; DIAG_QP_CAP] =
 /// lengths the callback receives.
 pub(crate) static RX_BYTES_PER_QP: [AtomicU64; DIAG_QP_CAP] =
     [const { AtomicU64::new(0) }; DIAG_QP_CAP];
-pub(crate) static TX_SMALL_FULL_SPINS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TX_SMALL_SCAN_ITERS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TX_SMALL_ACQUIRES: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TX_BIG_FULL_RETURNS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TX_BIG_ACQUIRES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TX_SMALL_FULL_SPINS: Counter = Counter::new();
+pub(crate) static TX_SMALL_SCAN_ITERS: Counter = Counter::new();
+pub(crate) static TX_SMALL_ACQUIRES: Counter = Counter::new();
+pub(crate) static TX_BIG_FULL_RETURNS: Counter = Counter::new();
+pub(crate) static TX_BIG_ACQUIRES: Counter = Counter::new();
 
 pub(crate) fn tx_diag() -> nic_api::TxDiag {
     use Ordering::Relaxed;
@@ -85,11 +85,11 @@ pub(crate) fn tx_diag() -> nic_api::TxDiag {
         inflight_per_qp: inflight,
         tx_bytes_per_qp: tx_bytes,
         rx_bytes_per_qp: rx_bytes,
-        small_pool_full_spins: TX_SMALL_FULL_SPINS.load(Relaxed),
-        small_pool_scan_iters: TX_SMALL_SCAN_ITERS.load(Relaxed),
-        small_pool_acquires: TX_SMALL_ACQUIRES.load(Relaxed),
-        big_pool_full_returns: TX_BIG_FULL_RETURNS.load(Relaxed),
-        big_pool_acquires: TX_BIG_ACQUIRES.load(Relaxed),
+        small_pool_full_spins: TX_SMALL_FULL_SPINS.get(),
+        small_pool_scan_iters: TX_SMALL_SCAN_ITERS.get(),
+        small_pool_acquires: TX_SMALL_ACQUIRES.get(),
+        big_pool_full_returns: TX_BIG_FULL_RETURNS.get(),
+        big_pool_acquires: TX_BIG_ACQUIRES.get(),
         small_pool_size: TX_POOL_SMALL_SIZE as u32,
         big_pool_size: TX_POOL_BIG_SIZE as u32,
     }
@@ -255,8 +255,8 @@ pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
         sum(&TX_PACKETS_PER_QP),
         sum(&TX_BYTES_PER_QP),
         sum(&RX_BYTES_PER_QP),
-        TX_SMALL_FULL_SPINS.load(Ordering::Relaxed),
-        TX_BIG_FULL_RETURNS.load(Ordering::Relaxed),
+        TX_SMALL_FULL_SPINS.get(),
+        TX_BIG_FULL_RETURNS.get(),
     )?;
     LAST_TX_DROP.write_json(w, "last_tx_drop")?;
     w.write_str("}")

@@ -6,7 +6,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use obs::{LastEvent, ObsRecord};
+use obs::{Counter, LastEvent, ObsRecord};
 use sync::Spinlock;
 
 use crate::{MAX_QUEUE_PAIRS, RX_QUEUES, TX_BIG_POOL_SLOTS, TX_QUEUES, TX_SMALL_POOL_SLOTS};
@@ -49,11 +49,11 @@ pub static GQI_RECYCLE_POOL_EXHAUSTED: [AtomicU64; 8] = [const { AtomicU64::new(
 
 // ---- TX direct-fill pool saturation counters -------------------------------
 
-pub(crate) static TX_SMALL_FULL_SPINS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TX_SMALL_SCAN_ITERS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TX_SMALL_ACQUIRES: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TX_BIG_FULL_RETURNS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TX_BIG_ACQUIRES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TX_SMALL_FULL_SPINS: Counter = Counter::new();
+pub(crate) static TX_SMALL_SCAN_ITERS: Counter = Counter::new();
+pub(crate) static TX_SMALL_ACQUIRES: Counter = Counter::new();
+pub(crate) static TX_BIG_FULL_RETURNS: Counter = Counter::new();
+pub(crate) static TX_BIG_ACQUIRES: Counter = Counter::new();
 
 // ---- TX descriptor capture ring -------------------------------------------
 //
@@ -216,11 +216,11 @@ pub(crate) fn tx_diag() -> nic_api::TxDiag {
         inflight_per_qp: inflight,
         tx_bytes_per_qp: tx_bytes,
         rx_bytes_per_qp: rx_bytes,
-        small_pool_full_spins: TX_SMALL_FULL_SPINS.load(Ordering::Relaxed),
-        small_pool_scan_iters: TX_SMALL_SCAN_ITERS.load(Ordering::Relaxed),
-        small_pool_acquires: TX_SMALL_ACQUIRES.load(Ordering::Relaxed),
-        big_pool_full_returns: TX_BIG_FULL_RETURNS.load(Ordering::Relaxed),
-        big_pool_acquires: TX_BIG_ACQUIRES.load(Ordering::Relaxed),
+        small_pool_full_spins: TX_SMALL_FULL_SPINS.get(),
+        small_pool_scan_iters: TX_SMALL_SCAN_ITERS.get(),
+        small_pool_acquires: TX_SMALL_ACQUIRES.get(),
+        big_pool_full_returns: TX_BIG_FULL_RETURNS.get(),
+        big_pool_acquires: TX_BIG_ACQUIRES.get(),
         small_pool_size: TX_SMALL_POOL_SLOTS,
         big_pool_size: TX_BIG_POOL_SLOTS,
     }
@@ -327,8 +327,8 @@ pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
         sum(&TX_PACKETS_PER_QP),
         sum(&TX_BYTES_PER_QP),
         sum(&RX_BYTES_PER_QP),
-        TX_SMALL_FULL_SPINS.load(Ordering::Relaxed),
-        TX_BIG_FULL_RETURNS.load(Ordering::Relaxed),
+        TX_SMALL_FULL_SPINS.get(),
+        TX_BIG_FULL_RETURNS.get(),
     )?;
     LAST_RX_SKIP.write_json(w, "last_rx_skip")?;
     w.write_str("}")
