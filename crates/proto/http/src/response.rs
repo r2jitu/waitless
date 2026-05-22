@@ -98,6 +98,22 @@ impl Response {
         }
     }
 
+    /// Build a `301 Moved Permanently` with an empty body and the
+    /// supplied `Location` header. The HTTP redirect every browser,
+    /// crawler, and proxy treats as "always use this URL instead" —
+    /// the right tool for HTTP→HTTPS upgrades and permanent renames.
+    /// Pair this with a plain `http::listen` so the TLS server never
+    /// has to handle un-encrypted traffic at all.
+    pub fn moved_permanently(location: impl Into<Bytes>) -> Self {
+        Response {
+            status: 301,
+            content_type: IOBuf::from_static(b"text/plain"),
+            body: IOBuf::from_static(b"").into(),
+            extra_headers: [const { None }; MAX_EXTRA_HEADERS],
+        }
+        .with_header(b"Location", location)
+    }
+
     /// Add an extra response header. Use for `Alt-Svc`,
     /// `Cache-Control`, `Set-Cookie`, etc. Both `name` and
     /// `value` are `Bytes` (Cow<'static, [u8]>) so static
