@@ -462,6 +462,8 @@ pub(crate) fn obs_response() -> Response {
         let _ = quic::diag::write_obs_json(&mut w);
         let _ = w.write_str(",\"tcp\":");
         waitless::diagnostics::tcp_obs_json(&mut w);
+        let _ = w.write_str(",\"udp\":");
+        waitless::diagnostics::udp_obs_json(&mut w);
         let _ = w.write_str("}");
     }
     Response::ok(&b"application/json"[..], body)

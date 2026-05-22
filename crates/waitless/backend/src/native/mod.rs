@@ -1062,6 +1062,12 @@ pub fn tcp_obs_json(w: &mut dyn core::fmt::Write) {
     let _ = w.write_str("{}");
 }
 
+/// Native stub for the UDP observability block. Mirrors
+/// `bare::udp_obs_json`.
+pub fn udp_obs_json(w: &mut dyn core::fmt::Write) {
+    let _ = w.write_str("{}");
+}
+
 // ---- Diag-capture stubs (native has no kernel panic to capture) ----
 
 pub fn diag_append(_bytes: &[u8]) {}

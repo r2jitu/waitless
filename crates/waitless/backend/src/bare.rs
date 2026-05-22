@@ -68,6 +68,13 @@ pub fn tcp_obs_json(w: &mut dyn core::fmt::Write) {
     let _ = tcp::diag::write_obs_json(w);
 }
 
+/// Render the UDP path's observability block (`udp::diag`) as JSON
+/// into `w` — the `os:none` half of the `/obs` `"udp"` block. The
+/// native backend stubs this `{}` (`native::udp_obs_json`).
+pub fn udp_obs_json(w: &mut dyn core::fmt::Write) {
+    let _ = udp::diag::write_obs_json(w);
+}
+
 // ---- Event loop re-exports ------------------------------------------------
 
 pub use kernel_bare::eventloop::{request_shutdown, set_ready};

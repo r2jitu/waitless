@@ -224,8 +224,8 @@ their invariant inputs, and a `write_obs_json` is wired into `/obs`.
 |------------------|-----------------------------|----------|-------|
 | QUIC             | `crates/proto/quic`         | ✅ Done   | Reference implementation — see below. |
 | TCP              | `crates/net/tcp`            | ✅ Done   | `tcp::diag` — 15 counters, `LAST_RST` / `LAST_TEARDOWN`; surfaced via the `waitless_backend` seam. |
+| UDP              | `crates/net`                | ✅ Done   | `udp::diag` — 6 counters + `LAST_UNDELIVERABLE`; `waitless_backend` seam. |
 | NIC / gve driver | `crates/drivers/nic`        | ⬜ Pending | `gve_diag` counters exist; fold into the mechanism + `/obs`. |
-| UDP              | `crates/net`                | ⬜ Pending | the UDP reactor path. |
 | IP / ARP / NDP   | `crates/net/stack`          | ⬜ Pending | lower-layer RX/TX. |
 | TLS              | `crates/proto/tls`          | ⬜ Pending | `tls::record` encrypt/decrypt stats; `tls_profile`. |
 | Async runtime    | `crates/runtime/executor`   | ⬜ Pending | per-core loop stats (`core_stats`). |

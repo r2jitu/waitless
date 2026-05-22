@@ -343,6 +343,13 @@ pub mod diagnostics {
         waitless_backend::tcp_obs_json(w)
     }
 
+    /// Render the UDP path's observability block (`udp::diag`) as
+    /// JSON into `w` — the UDP half of the `/obs` aggregate surface.
+    /// Real on bare-metal, `{}` on native.
+    pub fn udp_obs_json(w: &mut dyn core::fmt::Write) {
+        waitless_backend::udp_obs_json(w)
+    }
+
     /// TX-side hot-path counters: per-qp packet counts + small/big
     /// pool saturation + scan-depth aggregates. `None` when no
     /// driver is bound or the active driver hasn't wired the

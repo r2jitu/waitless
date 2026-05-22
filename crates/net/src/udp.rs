@@ -14,6 +14,111 @@ extern crate net_types as types;
 use from_bytes::FromBytes;
 use types::{CONFIG, IpAddr, MacAddr, htons, ntohs};
 
+/// Observability for the UDP path — the observability doctrine
+/// (`docs/observability.md`) applied to a stateless protocol. No
+/// state machine, so this is event counters plus one "last
+/// undeliverable datagram" snapshot. Surfaced as the `"udp"` block
+/// of `/obs` via `waitless_backend::udp_obs_json`.
+pub mod diag {
+    use core::fmt;
+    use kernel_core::obs::{Counter, LastEvent, ObsRecord};
+
+    /// One counter per UDP event.
+    pub struct Counters {
+        /// Datagrams that parsed and were delivered to a bound socket.
+        pub rx_datagrams: Counter,
+        /// Datagrams dropped at parse — short/garbage header or a
+        /// `length` field inconsistent with the segment.
+        pub rx_malformed: Counter,
+        /// Well-formed datagrams dropped because no socket was bound
+        /// to the destination port (`deliver_udp` returned false).
+        /// `LAST_UNDELIVERABLE` has the port.
+        pub rx_undeliverable: Counter,
+        /// Datagrams shipped to the wire.
+        pub tx_datagrams: Counter,
+        /// Sends dropped because the destination MAC was unresolved
+        /// (ARP / NDP miss). UDP is fire-and-forget — the app layer
+        /// retransmits.
+        pub tx_mac_unresolved: Counter,
+        /// Sends dropped for an invalid payload size (empty, or
+        /// past the single-frame MTU).
+        pub tx_invalid: Counter,
+    }
+
+    impl Counters {
+        const fn new() -> Self {
+            Counters {
+                rx_datagrams: Counter::new(),
+                rx_malformed: Counter::new(),
+                rx_undeliverable: Counter::new(),
+                tx_datagrams: Counter::new(),
+                tx_mac_unresolved: Counter::new(),
+                tx_invalid: Counter::new(),
+            }
+        }
+    }
+
+    /// Process-wide UDP counters.
+    pub static COUNTERS: Counters = Counters::new();
+
+    /// Most recent datagram dropped for want of a bound socket.
+    pub static LAST_UNDELIVERABLE: LastEvent<UndeliverableRecord> = LastEvent::new();
+
+    /// Snapshot payload for `LAST_UNDELIVERABLE`.
+    #[derive(Clone, Copy)]
+    pub struct UndeliverableRecord {
+        pub dst_port: u16,
+        pub src_port: u16,
+        pub len: u16,
+        pub at_ms: u64,
+    }
+
+    impl ObsRecord for UndeliverableRecord {
+        fn write_fields(&self, w: &mut dyn fmt::Write) -> fmt::Result {
+            write!(
+                w,
+                "\"dst_port\":{},\"src_port\":{},\"len\":{},\"at_ms\":{}",
+                self.dst_port, self.src_port, self.len, self.at_ms,
+            )
+        }
+    }
+
+    /// Record an undeliverable datagram: bump the counter and
+    /// snapshot the destination port into `LAST_UNDELIVERABLE`.
+    pub fn record_undeliverable(dst_port: u16, src_port: u16, len: usize) {
+        COUNTERS.rx_undeliverable.bump();
+        LAST_UNDELIVERABLE.record(UndeliverableRecord {
+            dst_port,
+            src_port,
+            len: len.min(u16::MAX as usize) as u16,
+            at_ms: kernel_core::clock::now_ms(),
+        });
+    }
+
+    /// Counter `(name, value)` pairs in declaration order.
+    pub fn snapshot() -> [(&'static str, u64); 6] {
+        let c = &COUNTERS;
+        [
+            ("rx_datagrams", c.rx_datagrams.get()),
+            ("rx_malformed", c.rx_malformed.get()),
+            ("rx_undeliverable", c.rx_undeliverable.get()),
+            ("tx_datagrams", c.tx_datagrams.get()),
+            ("tx_mac_unresolved", c.tx_mac_unresolved.get()),
+            ("tx_invalid", c.tx_invalid.get()),
+        ]
+    }
+
+    /// Render the UDP observability block as a JSON object.
+    pub fn write_obs_json(w: &mut dyn fmt::Write) -> fmt::Result {
+        w.write_str("{")?;
+        for (name, value) in snapshot() {
+            write!(w, "\"{name}\":{value},")?;
+        }
+        LAST_UNDELIVERABLE.write_json(w, "last_undeliverable")?;
+        w.write_str("}")
+    }
+}
+
 #[repr(C, packed)]
 struct UdpHeader {
     src_port: u16,
@@ -160,13 +265,17 @@ pub fn send_with_l2_headroom(dst: IpAddr, src_port: u16, dst_port: u16, frame: &
 
     let payload_len = frame.len() - MAX_L2_HEADROOM;
     if payload_len == 0 || payload_len > 1500 - IPV4_HDR_LEN - UDP_HDR_LEN {
+        diag::COUNTERS.tx_invalid.bump();
         return;
     }
     let udp_len = UDP_HDR_LEN + payload_len;
 
     let dst_mac = match mac_resolve::resolve(dst) {
         Some(m) => m,
-        None => return,
+        None => {
+            diag::COUNTERS.tx_mac_unresolved.bump();
+            return;
+        }
     };
 
     // The buffer reserves MAX_L2_HEADROOM (= 62, the v6 header size)
@@ -204,6 +313,7 @@ pub fn send_with_l2_headroom(dst: IpAddr, src_port: u16, dst_port: u16, frame: &
         };
         nic::send(frame_slice, csum);
     }
+    diag::COUNTERS.tx_datagrams.bump();
 }
 
 /// Submit a `TxBufHandle` (acquired via
@@ -245,13 +355,18 @@ pub fn send_via_tx_handle(
     if payload_len == 0 || payload_len > 1500 - IPV4_HDR_LEN - UDP_HDR_LEN {
         // Invalid input — drop. Handle's `Drop` returns the slot
         // to the pool unused.
+        diag::COUNTERS.tx_invalid.bump();
         return;
     }
     let udp_len = UDP_HDR_LEN + payload_len;
 
     let dst_mac = match mac_resolve::resolve(dst) {
         Some(m) => m,
-        None => return, // ARP/NDP miss; fire-and-forget UDP drop.
+        None => {
+            // ARP/NDP miss; fire-and-forget UDP drop.
+            diag::COUNTERS.tx_mac_unresolved.bump();
+            return;
+        }
     };
 
     let ip_hdr_len = match dst {
@@ -290,6 +405,7 @@ pub fn send_via_tx_handle(
         offset: 6,
     };
     nic::submit_tx(handle, on_wire_actual, csum);
+    diag::COUNTERS.tx_datagrams.bump();
 }
 
 /// Slice-shaped UDP send. Copies `data` into a stack-local
@@ -306,6 +422,7 @@ pub fn send_via_tx_handle(
 pub fn send_to_addr(dst: IpAddr, src_port: u16, dst_port: u16, data: &[u8]) {
     use executor::reactor::MAX_L2_HEADROOM;
     if data.len() > 1500 - IPV4_HDR_LEN - UDP_HDR_LEN {
+        diag::COUNTERS.tx_invalid.bump();
         return;
     }
     let mut buf = core::mem::MaybeUninit::<[u8; FRAME_BUF_LEN]>::uninit();
@@ -333,14 +450,23 @@ pub fn send_to_addr(dst: IpAddr, src_port: u16, dst_port: u16, data: &[u8]) {
 /// released before we return.
 pub fn udp_receive(src_ip: IpAddr, _dst_ip: IpAddr, segment: &[u8]) {
     let Some(hdr) = UdpHeader::try_ref_from(segment) else {
+        diag::COUNTERS.rx_malformed.bump();
         return;
     };
     let dst_port = ntohs(hdr.dst_port);
     let src_port = ntohs(hdr.src_port);
     let udp_len = ntohs(hdr.length) as usize;
     if udp_len < 8 || udp_len > segment.len() {
+        diag::COUNTERS.rx_malformed.bump();
         return;
     }
     let body = &segment[8..udp_len];
-    let _ = executor::reactor::deliver_udp(dst_port, src_ip, src_port, body);
+    // `deliver_udp` returns false when no socket is bound to the
+    // destination port — a dropped datagram the old `let _ =`
+    // discarded. Trace it, with the port, into `LAST_UNDELIVERABLE`.
+    if executor::reactor::deliver_udp(dst_port, src_ip, src_port, body) {
+        diag::COUNTERS.rx_datagrams.bump();
+    } else {
+        diag::record_undeliverable(dst_port, src_port, body.len());
+    }
 }

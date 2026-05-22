@@ -37,13 +37,15 @@ rust_library(
             "//crates/drivers/nic",
             "//crates/kernel/bare",
             "//crates/net/stack",
-            # `tcp` crate, for `tcp_diag()`'s TCP-stack counters.
-            # `gve` driver crate, for `gve_diag()`'s NIC counters.
-            # Both are bare-metal-only; `waitless-backend` is the right
-            # home for these deps (it is the platform-split crate),
-            # and reading the atomics here keeps application crates
-            # off direct, native-build-breaking `os:none` deps.
+            # `tcp` / `udp` crates, for the `tcp_diag()` / `*_obs_json()`
+            # observability blocks; `gve` driver crate, for `gve_diag()`'s
+            # NIC counters. All are bare-metal-only; `waitless-backend`
+            # is the right home for these deps (it is the platform-split
+            # crate), and reading the atomics / rendering the JSON here
+            # keeps application crates off direct, native-build-breaking
+            # `os:none` deps.
             "//crates/net/tcp",
+            "//crates/net:udp",
             "//crates/drivers/gve",
         ],
         "//conditions:default": ["//crates/util/atomic-fn"],

@@ -255,6 +255,8 @@ rust_library(
         ":types",
         "//crates/drivers/nic",
         "//crates/drivers/nic:api",
+        # `kernel_core::obs` — observability primitives (`docs/observability.md`).
+        "//crates/kernel/core",
         "//crates/runtime/executor",
         "//crates/util/iobuf",
     ],
