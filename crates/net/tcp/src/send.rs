@@ -430,9 +430,21 @@ pub fn try_send_tso(
 
     let hdr_len = payload_off as u16;
     let csum_start = tcp_off as u16;
-    nic::submit_tx_tso(handle, frame_len, hdr_len, csum_start, mss as u16);
 
+    // Advance `snd_nxt` and retain the sealed bytes for retransmit
+    // BEFORE `submit_tx_tso` consumes the slot. The TX-pool slot is
+    // the only place this ciphertext exists in addressable memory, so
+    // RFC 6298 coverage means copying its payload into the retransmit
+    // ring now — without this, a lost TSO segment would never be
+    // retransmitted and a mixed TSO/chain response would desync the
+    // ring. `snd_nxt` is advanced first so the retain's RTT anchor
+    // records the post-send sequence number, matching the chain path.
     c.snd_nxt = c.snd_nxt.wrapping_add(payload_len as u32);
+    {
+        let payload = &handle.data_mut()[payload_off..payload_off + payload_len];
+        c.rtx_on_data_sent_slice(payload);
+    }
+    nic::submit_tx_tso(handle, frame_len, hdr_len, csum_start, mss as u16);
     Some(Ok(payload_len))
 }
 

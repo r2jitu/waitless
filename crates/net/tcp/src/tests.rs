@@ -19,9 +19,9 @@ use alloc::boxed::Box;
 use core::ptr::NonNull;
 use from_bytes::FromBytes;
 use iobuf::{Chain, IOBufDropFn, OwnedIOBuf};
-use nic_api::{CsumOffload, NicOps, set_active_ops};
+use nic_api::{CsumOffload, NicOps, TxBufHandle, TxTsoBufHandle, set_active_ops};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, Once};
+use std::sync::{Mutex, Once, OnceLock};
 use types::{IpAddr, Ipv4Addr, ntohl, ntohs};
 
 const SERVER_IP: [u8; 4] = [10, 0, 0, 1];
@@ -50,7 +50,10 @@ type EgressPred = Box<dyn FnMut(&[u8]) -> bool + Send>;
 static EGRESS_DROP: Mutex<Option<EgressPred>> = Mutex::new(None);
 static EGRESS_DROPPED: AtomicU32 = AtomicU32::new(0);
 
-fn mock_send(frame: &[u8], _csum: CsumOffload) {
+/// Record a transmitted frame into the `TX` capture — unless the
+/// lossy-network egress fixture's drop policy swallows it. Shared by
+/// the plain `send` mock and the TSO `submit_tx_tso` mock.
+fn record_egress(frame: &[u8]) {
     {
         let mut policy = EGRESS_DROP.lock().unwrap();
         if let Some(pred) = policy.as_mut()
@@ -63,6 +66,55 @@ fn mock_send(frame: &[u8], _csum: CsumOffload) {
         }
     }
     TX.lock().unwrap().push(frame.to_vec());
+}
+
+fn mock_send(frame: &[u8], _csum: CsumOffload) {
+    record_egress(frame);
+}
+
+// ---- mock TSO big-slot ------------------------------------------------
+//
+// `MOCK_OPS_TSO` is a second NIC mock that advertises TSO so the
+// `try_send_tso` fast path is exercisable. A scenario opts in with
+// `set_active_ops(&MOCK_OPS_TSO)` after `harness()`; the next
+// `harness()` resets to the plain `MOCK_OPS`.
+
+/// Capacity of the mock TSO big-slot — comfortably larger than any
+/// super-segment the conformance scenarios seal into it.
+const TSO_SLOT_CAP: usize = 24_000;
+
+/// Stable pointer to one shared mock TSO slot. Scenarios are
+/// `TEST_LOCK`-serialised and submit a single super-segment at a
+/// time, so one buffer suffices; leaked deliberately — it lives for
+/// the test process.
+fn tso_slot_ptr() -> *mut u8 {
+    static SLOT: OnceLock<usize> = OnceLock::new();
+    *SLOT.get_or_init(|| {
+        let boxed = vec![0u8; TSO_SLOT_CAP].into_boxed_slice();
+        Box::into_raw(boxed) as *mut u8 as usize
+    }) as *mut u8
+}
+
+fn mock_acquire_tx_tso_buf() -> Option<TxTsoBufHandle> {
+    Some(TxTsoBufHandle(TxBufHandle {
+        data_ptr: tso_slot_ptr(),
+        data_cap: TSO_SLOT_CAP as u32,
+        driver_token: 0,
+        release_fn: |_| {},
+    }))
+}
+
+fn mock_submit_tx_tso(
+    mut handle: TxTsoBufHandle,
+    frame_len: usize,
+    _hdr_len: u16,
+    _csum_start: u16,
+    _gso_size: u16,
+) {
+    // Capture the assembled super-segment, subject to the egress-drop
+    // fixture — same path as the plain `send` mock.
+    let frame = handle.data_mut()[..frame_len].to_vec();
+    record_egress(&frame);
 }
 
 /// Drop every egress frame for which `pred` returns true. The building
@@ -143,6 +195,34 @@ static MOCK_OPS: NicOps = NicOps {
     diag: None,
 };
 
+// TSO-capable NIC mock — identical to `MOCK_OPS` but advertises
+// TSOv4 and supplies the big-slot acquire / submit hooks, so the
+// `try_send_tso` fast path can be driven by the conformance harness.
+static MOCK_OPS_TSO: NicOps = NicOps {
+    name: "mock-tso",
+    probe: yes,
+    send: mock_send,
+    acquire_tx_buf: None,
+    submit_tx: None,
+    tso_available: yes,
+    acquire_tx_tso_buf: Some(mock_acquire_tx_tso_buf),
+    submit_tx_tso: Some(mock_submit_tx_tso),
+    udp_gso_available: no,
+    acquire_tx_udp_gso_buf: None,
+    submit_tx_udp_gso: None,
+    poll_rx: no_poll,
+    poll_qp: no_poll_qp,
+    get_mac: mock_get_mac,
+    num_queue_pairs: one_qp,
+    enable_irq: unit,
+    enable_deferred_tx_kick: unit,
+    flush_tx_staging: unit,
+    flush_tx_kick_if_dirty: no,
+    poke_interrupt_status: unit,
+    idle: None,
+    diag: None,
+};
+
 // ---- one-time bring-up + per-test serialisation -----------------------
 
 static SETUP: Once = Once::new();
@@ -158,8 +238,11 @@ fn harness() -> std::sync::MutexGuard<'static, ()> {
         super::init(); // TCP per-core pools
         ipv4::init(); // per-core IP-ID counter (the TX path stamps it)
         ethernet::set_our_mac(SERVER_MAC);
-        set_active_ops(&MOCK_OPS);
     });
+    // Reset to the non-TSO NIC mock every scenario — a TSO scenario
+    // opts into `MOCK_OPS_TSO` after `harness()`, and this restores
+    // the default for the next one.
+    set_active_ops(&MOCK_OPS);
     TX.lock().unwrap().clear();
     // Hand every scenario a pristine connection pool — `on_tcp_tick`
     // walks the whole pool, so a leftover armed conn would pollute it.
@@ -2200,6 +2283,113 @@ fn zero_window_persist_gives_up() {
         conn_state(CP, SP),
         None,
         "a permanently shut window aborts the connection",
+    );
+}
+
+// ---- RFC 6298 retransmit coverage for the TSO fast path ----------------
+
+/// A TSO super-segment is retransmittable: `try_send_tso` retains its
+/// sealed bytes in the RFC 6298 ring, so a TSO send whose ACK never
+/// arrives is recovered by the RTO timer — exactly like a chain send.
+#[test]
+fn tso_send_is_retransmittable_on_rto() {
+    let _g = harness();
+    const SP: u16 = 9150;
+    const CP: u16 = 50150;
+    const CLIENT_ISN: u32 = 0xEE00;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    set_active_ops(&MOCK_OPS_TSO);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    // A TSO super-segment: payload > MSS, so `try_send_tso` engages.
+    clear_tx();
+    let body = vec![0x5Au8; 3000];
+    let r = super::try_send_tso(handle, generation, body.len(), &mut |slot: &mut [u8]| {
+        slot[..body.len()].copy_from_slice(&body);
+        Ok(body.len())
+    });
+    assert_eq!(r, Some(Ok(3000)), "the TSO fast path ships the whole payload");
+    assert_eq!(tx().len(), 1, "one TSO super-segment goes on the wire");
+
+    // Withhold the ACK; cross the RTO. The TSO bytes must be
+    // retransmitted — without retain coverage they would be lost.
+    clear_tx();
+    kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 + 1);
+    super::on_tcp_tick();
+    let rtx = tx();
+    assert_eq!(rtx.len(), 1, "the RTO retransmits the unacked TSO segment");
+    assert_eq!(
+        tcp_hdr(&rtx[0]).seq,
+        server_isn.wrapping_add(1),
+        "the retransmit re-sends from snd_una",
+    );
+    assert_eq!(
+        &rtx[0][34 + TCP_HDR_LEN..],
+        &body[..1460],
+        "the retransmit carries the original TSO payload (one MSS)",
+    );
+}
+
+/// A response that mixes a TSO send and a chain send keeps the
+/// retransmit ring consistent. An ACK covering only the TSO bytes
+/// advances `snd_una` past them; the RTO retransmit then resumes at
+/// the still-unacked chain bytes. Before TSO retain coverage the ring
+/// desynced — TSO bytes advanced `snd_nxt` without entering it, so
+/// `rtx_on_ack`'s `min(acked, rtx_len)` dropped live chain bytes.
+#[test]
+fn tso_then_chain_rtx_stays_consistent() {
+    let _g = harness();
+    const SP: u16 = 9151;
+    const CP: u16 = 50151;
+    const CLIENT_ISN: u32 = 0xEF00;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    set_active_ops(&MOCK_OPS_TSO);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    // A TSO super-segment (2000 B) followed by a chain send (1000 B).
+    let tso_body = vec![0xA1u8; 2000];
+    assert_eq!(
+        super::try_send_tso(handle, generation, tso_body.len(), &mut |slot: &mut [u8]| {
+            slot[..tso_body.len()].copy_from_slice(&tso_body);
+            Ok(tso_body.len())
+        }),
+        Some(Ok(2000)),
+        "the TSO send is accepted",
+    );
+    let chain_body = vec![0xB2u8; 1000];
+    let mut chain = iobuf::IOBufChain::from(chain_body.clone());
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(sent, 1000, "the chain send follows the TSO send");
+
+    // The peer acknowledges only the 2000 TSO bytes.
+    clear_tx();
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1 + 2000),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+
+    // The RTO retransmit must resume at the chain bytes — `snd_una`
+    // has advanced past the acked TSO bytes.
+    kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 + 1);
+    super::on_tcp_tick();
+    let rtx = tx();
+    assert_eq!(rtx.len(), 1, "the RTO retransmits the still-unacked chain bytes");
+    assert_eq!(
+        tcp_hdr(&rtx[0]).seq,
+        server_isn.wrapping_add(1 + 2000),
+        "the retransmit resumes at snd_una — past the acked TSO bytes",
+    );
+    assert_eq!(
+        &rtx[0][34 + TCP_HDR_LEN..],
+        &chain_body[..],
+        "the retransmit carries the chain bytes, not stale TSO bytes",
     );
 }
 

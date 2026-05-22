@@ -708,11 +708,15 @@ impl TcpConnection {
             .clamp(RTO_INITIAL_MS, RTO_MAX_MS)
     }
 
-    /// Retain the `total` just-sent bytes — read from a fresh cursor
-    /// over the chain `async_try_send_chain` already transmitted — so
-    /// the RTO timer can retransmit them, and start the timer if it
-    /// is not already running (RFC 6298 §5.1).
-    pub(crate) fn rtx_on_data_sent(&mut self, total: usize, cur: &mut iobuf::Cursor<'_>) {
+    /// Shared core of the two retransmit-retain entry points
+    /// (`rtx_on_data_sent` for the chain path, `rtx_on_data_sent_slice`
+    /// for the TSO path). Reserves `total` bytes at the tail of the
+    /// retransmit ring and invokes `write` with each (possibly
+    /// wrapped) destination slice in order — the caller fills them
+    /// from a chain cursor or a contiguous slice. Handles the
+    /// allocation guard, the ring wrap, `rtx_len`, the RFC 6298 §5.1
+    /// RTO timer, and the §3 RTT anchor.
+    fn rtx_retain(&mut self, total: usize, mut write: impl FnMut(&mut [u8])) {
         if total == 0 || self.rtx_overflow {
             return; // nothing to retain, or coverage already suspended
         }
@@ -729,11 +733,11 @@ impl TcpConnection {
         let tail = (self.rtx_head as usize + self.rtx_len as usize) % RTX_BUF_BYTES;
         let buf = self.rtx_buf.as_mut().expect("ensure_rtx_buf succeeded");
         if tail + total <= RTX_BUF_BYTES {
-            cur.read(&mut buf[tail..tail + total]);
+            write(&mut buf[tail..tail + total]);
         } else {
             let first = RTX_BUF_BYTES - tail;
-            cur.read(&mut buf[tail..]);
-            cur.read(&mut buf[..total - first]);
+            write(&mut buf[tail..]);
+            write(&mut buf[..total - first]);
         }
         self.rtx_len += total as u16;
         // §5.1: start the timer if it is not already running.
@@ -748,6 +752,30 @@ impl TcpConnection {
             self.rtt_anchor_seq = self.snd_nxt;
             self.rtt_anchor_ms = kernel_core::clock::now_ms();
         }
+    }
+
+    /// Retain the `total` just-sent bytes — read from a fresh cursor
+    /// over the chain `async_try_send_chain` already transmitted — so
+    /// the RTO timer can retransmit them, and start the timer if it
+    /// is not already running (RFC 6298 §5.1).
+    pub(crate) fn rtx_on_data_sent(&mut self, total: usize, cur: &mut iobuf::Cursor<'_>) {
+        self.rtx_retain(total, |dst| {
+            cur.read(dst);
+        });
+    }
+
+    /// Retain just-sent bytes handed in as a contiguous slice — the
+    /// TSO fast path's entry point. `try_send_tso` seals ciphertext
+    /// directly into a driver TX-pool slot; this copies that slot's
+    /// payload into the retransmit ring before the slot recycles, so
+    /// a TSO segment is covered by the RTO timer exactly like a
+    /// chain-sent one.
+    pub(crate) fn rtx_on_data_sent_slice(&mut self, bytes: &[u8]) {
+        let mut off = 0usize;
+        self.rtx_retain(bytes.len(), |dst| {
+            dst.copy_from_slice(&bytes[off..off + dst.len()]);
+            off += dst.len();
+        });
     }
 
     /// Fold an ACK into the retransmission state: drop acknowledged
