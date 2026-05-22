@@ -22,6 +22,8 @@ rust_library(
     ],
     crate_name = "http3",
     deps = [
+        # obs::{Counter, LastEvent} — observability primitives.
+        "//crates/util/obs",
         "//crates/proto/http",
         "//crates/proto/quic",
         "//crates/waitless",

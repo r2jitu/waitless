@@ -296,7 +296,7 @@ async fn handle_request_https<S: http::HttpStream>(
 /// polled, which would be a runtime/scheduler bug rather than
 /// handler-internal work.
 async fn handle_request_h3(req: Request, body: &mut http::BufferedBody<'_>) -> Response {
-    http3::diag::bump(&http3::diag::COUNTERS.user_handler_polled);
+    http3::diag::COUNTERS.user_handler_polled.bump();
     handle_request(&req, body).await
 }
 

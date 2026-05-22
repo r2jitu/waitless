@@ -463,7 +463,7 @@ where
             break;
         }
     }
-    crate::diag::bump(&crate::diag::COUNTERS.read_loop_completed);
+    crate::diag::COUNTERS.read_loop_completed.bump();
     if !headers_seen {
         crate::h3_drop!(no_headers_seen, "sid={}", sid);
         conn.close_stream(sid);
@@ -548,20 +548,20 @@ where
     // needs a stop point that matches the prebuf length.
     req.set_content_length(data.len());
 
-    crate::diag::bump(&crate::diag::COUNTERS.user_handler_invoked);
+    crate::diag::COUNTERS.user_handler_invoked.bump();
     // Build a `BodyReader` whose `prebuf` is the fully-buffered
     // body. The `NullStream` is unused — `total == prebuf.len()`
     // means the reader never reaches its stream-refill path.
     let mut null = NullStream;
     let mut body = BodyReader::new(&mut null, &data[..], data.len());
     let response = handler(req, &mut body).await;
-    crate::diag::bump(&crate::diag::COUNTERS.user_handler_returned);
+    crate::diag::COUNTERS.user_handler_returned.bump();
     let status = response.status;
     // Encode response: HEADERS + DATA + FIN.
     write_response(conn, sid, response, &scratch.framing_pool);
-    crate::diag::bump(&crate::diag::COUNTERS.write_response_completed);
+    crate::diag::COUNTERS.write_response_completed.bump();
     crate::h3_event!(requests_handled, "sid={} status={}", sid, status);
-    crate::diag::bump(&crate::diag::COUNTERS.responses_sent);
+    crate::diag::COUNTERS.responses_sent.bump();
 }
 
 /// Maximum bytes an H3 frame header (type varint + length

@@ -345,8 +345,9 @@ pub(crate) fn quic_stats_response() -> Response {
 /// the same `write_obs_json` output.
 pub(crate) fn obs_response() -> Response {
     // 12 KiB covers all subsystem blocks (QUIC counters + snapshots
-    // + latency histograms, plus tcp / udp / nic / tls / runtime /
-    // kernel) with margin. Slow path, so the reservation is free.
+    // + latency histograms, plus tcp / udp / nic / tls / http3 /
+    // runtime / kernel / net) with margin. Slow path, so the
+    // reservation is free.
     let mut body = http::body_iobuf(12288);
     {
         let mut w = body.writer();
@@ -360,6 +361,8 @@ pub(crate) fn obs_response() -> Response {
         waitless::diagnostics::nic_obs_json(&mut w);
         let _ = w.write_str(",\"tls\":");
         let _ = tls::diag::write_obs_json(&mut w);
+        let _ = w.write_str(",\"http3\":");
+        let _ = http3::diag::write_obs_json(&mut w);
         let _ = w.write_str(",\"runtime\":");
         waitless::diagnostics::runtime_obs_json(&mut w);
         let _ = w.write_str(",\"kernel\":");
