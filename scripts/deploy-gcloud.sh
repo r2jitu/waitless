@@ -36,6 +36,10 @@
 # Env overrides:
 #   WAITLESS_GCE_PROJECT, WAITLESS_GCE_ZONE, WAITLESS_GCE_MACHINE,
 #   WAITLESS_GCS_BUCKET, WAITLESS_GCE_NAME
+#   WAITLESS_GCE_ADDRESS — name of a reserved regional static IP to
+#     attach to the instance (`gcloud compute addresses create`).
+#     Unset → an ephemeral IP. A public site wants a reserved one so
+#     the DNS A-record survives restarts / preemption.
 #   WAITLESS_BAZEL_DEFINES — extra flags appended to the ISO build,
 #     e.g. `--define tls_cert=prod` to bake in the production TLS
 #     cert. `scripts/renew-and-deploy.sh` sets this.
@@ -290,12 +294,30 @@ deploy() {
             --maintenance-policy=TERMINATE
         )
     fi
+    # Optional reserved static external IP. WAITLESS_GCE_ADDRESS names
+    # a regional address reserved with `gcloud compute addresses
+    # create`; resolve it to its IP and pin it on the NIC. Unset → an
+    # ephemeral IP.
+    local net_iface="network=default,${nic_args}"
+    if [ -n "${WAITLESS_GCE_ADDRESS:-}" ]; then
+        local static_ip
+        static_ip="$(gcloud compute addresses describe "$WAITLESS_GCE_ADDRESS" \
+            --region="${ZONE%-*}" --project="$PROJECT" \
+            --format='value(address)' 2>/dev/null || true)"
+        if [ -z "$static_ip" ]; then
+            echo "Error: reserved address '$WAITLESS_GCE_ADDRESS' not found in" \
+                "region ${ZONE%-*}" >&2
+            exit 1
+        fi
+        echo "    (static IP: $WAITLESS_GCE_ADDRESS = $static_ip)"
+        net_iface="${net_iface},address=${static_ip}"
+    fi
     gcloud compute instances create "$NAME" \
         --zone="$ZONE" \
         --machine-type="$MACHINE_TYPE" \
         --image="$IMAGE_NAME" \
         --image-project="$PROJECT" \
-        --network-interface="network=default,${nic_args}" \
+        --network-interface="$net_iface" \
         --tags=http-server \
         --metadata=serial-port-enable=TRUE \
         ${preempt_args[@]+"${preempt_args[@]}"} \
