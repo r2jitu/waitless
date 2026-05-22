@@ -349,6 +349,12 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
         } else if c.snd_una != old_una {
             c.on_new_data_ack();
         }
+        // A reopened (non-zero) advertised window retires the
+        // RFC 9293 §3.8.6.1 zero-window persist timer.
+        if c.snd_wnd > 0 {
+            c.persist_deadline_ms = 0;
+            c.persist_backoff = 0;
+        }
         // RFC 5681 §4: an ACK may have reopened the send window —
         // `snd_una` advanced (in-flight shrank), `cwnd` grew, or the
         // peer advertised more space. Wake a `TcpSendChain` parked on

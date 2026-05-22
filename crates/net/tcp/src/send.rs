@@ -587,6 +587,14 @@ pub fn async_try_send_chain(
     // re-wakes it when an ACK reopens the window.
     let sendable = total.min(c.usable_window() as usize);
     if sendable == 0 {
+        // RFC 9293 §3.8.6.1: a zero advertised window blocks the send
+        // and the window-update ACK that lifts it is not itself
+        // retransmitted — so arm the persist timer to probe the shut
+        // window. A window closed only by `cwnd` / in-flight bytes
+        // needs no probe: that data carries its own RFC 6298 RTO.
+        if c.snd_wnd == 0 && c.persist_deadline_ms == 0 {
+            c.arm_persist(kernel_core::clock::now_ms());
+        }
         return Ok(0);
     }
 

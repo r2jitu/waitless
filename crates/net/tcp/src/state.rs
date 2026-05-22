@@ -171,6 +171,11 @@ pub(crate) const RTX_MAX_RETRIES: u8 = 8;
 /// with exponential backoff off the RTO estimate (~63 s total at the
 /// 1 s initial RTO) before teardown.
 pub(crate) const FIN_RETX_MAX: u8 = 5;
+/// Zero-window probes (RFC 9293 §3.8.6.1) before a connection whose
+/// peer keeps its receive window shut is aborted — a peer that never
+/// reopens its window across this many exponentially-backed-off
+/// probes is treated as dead. Matches `RTX_MAX_RETRIES`.
+pub(crate) const PERSIST_MAX_PROBES: u8 = 8;
 /// `TimeWait` hold time: 2×MSL (RFC 9293 §3.10.7.4) with MSL taken as
 /// 30 s. After an active close completes the TCB lingers here so a
 /// delayed duplicate from the old 4-tuple cannot be delivered into a
@@ -349,6 +354,16 @@ pub struct TcpConnection {
     /// counter. Meaningful only while `lifecycle_deadline_ms` is armed
     /// in `FinWait1` / `LastAck`.
     pub(crate) fin_retx_count: u8,
+    /// Absolute deadline (`kernel_core::clock::now_ms`) for the next
+    /// RFC 9293 §3.8.6.1 zero-window probe. Armed by
+    /// `async_try_send_chain` when a send is blocked by a zero
+    /// advertised window; disarmed when an ACK reopens the window.
+    /// 0 = disarmed.
+    pub(crate) persist_deadline_ms: u64,
+    /// Consecutive zero-window probes with no window reopening — the
+    /// exponential-backoff exponent and the `PERSIST_MAX_PROBES`
+    /// give-up counter.
+    pub(crate) persist_backoff: u8,
     /// RFC 5681 congestion window, bytes — the controller's estimate
     /// of how much unacknowledged data the path will accept. Grows on
     /// ACKs (slow start, then congestion avoidance) and collapses to
@@ -421,6 +436,8 @@ impl TcpConnection {
             rtt_anchor_active: false,
             lifecycle_deadline_ms: 0,
             fin_retx_count: 0,
+            persist_deadline_ms: 0,
+            persist_backoff: 0,
             cwnd: 0,
             ssthresh: 0,
             dup_acks: 0,
@@ -887,6 +904,51 @@ impl TcpConnection {
     /// deadline rather than a FIN-retransmit deadline.
     pub(crate) fn arm_time_wait(&mut self, now: u64) {
         self.lifecycle_deadline_ms = now + TIME_WAIT_MS;
+    }
+
+    // ─── RFC 9293 §3.8.6.1 zero-window probing ───────────────────────────
+    //
+    // A peer that advertises a zero receive window stalls the send
+    // path. The peer reopens the window with a bare window-update ACK
+    // — but that ACK carries no data, so it is not itself
+    // retransmitted, and a single lost window-update would otherwise
+    // deadlock the connection. The persist timer breaks the deadlock:
+    // it periodically probes the shut window until the peer answers.
+
+    /// Arm (or re-arm) the zero-window persist timer. The interval
+    /// backs off exponentially with `persist_backoff` off the RTO
+    /// estimate, capped at `RTO_MAX_MS` — the same shape as
+    /// `arm_fin_timer`.
+    pub(crate) fn arm_persist(&mut self, now: u64) {
+        let interval = ((self.estimated_rto() as u64) << self.persist_backoff.min(16))
+            .min(RTO_MAX_MS as u64);
+        self.persist_deadline_ms = now + interval;
+    }
+
+    /// Send a zero-window probe and re-arm the persist timer with one
+    /// more step of backoff. The probe is a bare ACK at `snd_una - 1`
+    /// — one sequence number below the peer's `rcv_nxt`, so the
+    /// segment is "unacceptable" and the peer is obliged to answer
+    /// with an ACK (RFC 9293 §3.10.7.4), which re-advertises its
+    /// receive window. The probe is the Linux `tcp_xmit_probe_skb`
+    /// mechanism: a non-data segment, so it needs no access to the
+    /// queued send data.
+    pub(crate) fn send_window_probe(&mut self, now: u64) {
+        send_segment(
+            &SegmentMeta {
+                local_ip: self.local_ip,
+                dst_ip: self.remote_ip,
+                src_port: self.local_port,
+                dst_port: self.remote_port,
+                seq: self.snd_una.wrapping_sub(1),
+                ack: self.rcv_nxt,
+                flags: TCP_ACK,
+                window: self.rx_free() as u16,
+            },
+            &[],
+        );
+        self.persist_backoff = self.persist_backoff.saturating_add(1);
+        self.arm_persist(now);
     }
 
     // ─── RFC 5681 congestion control ─────────────────────────────────────

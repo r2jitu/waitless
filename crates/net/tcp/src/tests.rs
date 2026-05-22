@@ -2006,6 +2006,203 @@ fn large_send_never_triggers_rtx_overflow() {
     assert!(chain.is_empty(), "the whole 400 KB body reached the wire");
 }
 
+// ---- RFC 9293 §3.8.6.1 zero-window persist -----------------------------
+//
+// A peer that advertises a zero receive window stalls the send path.
+// The window-update ACK that lifts it carries no data and is not
+// itself retransmitted, so a lost update would deadlock the send.
+// The persist timer probes the shut window until the peer answers.
+
+/// A zero advertised window blocks the send and arms the persist
+/// timer, which then probes the shut window — a bare ACK one
+/// sequence number below `snd_una` (the Linux `tcp_xmit_probe_skb`
+/// shape).
+#[test]
+fn zero_window_arms_persist_and_probes() {
+    let _g = harness();
+    const SP: u16 = 9140;
+    const CP: u16 = 50140;
+    const CLIENT_ISN: u32 = 0xEA00;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    // The peer advertises a zero receive window.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 0,
+        payload: Vec::new(),
+    });
+
+    // The send is blocked — and arms the persist timer.
+    let mut chain = iobuf::IOBufChain::from(vec![0u8; 2000]);
+    let blocked = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(blocked, 0, "a zero advertised window blocks the send");
+
+    // No probe before the persist interval elapses.
+    clear_tx();
+    kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 - 1);
+    super::on_tcp_tick();
+    assert!(tx().is_empty(), "no probe before the persist interval elapses");
+
+    // Crossing it fires exactly one probe.
+    kernel_core::clock::mock::advance(2);
+    super::on_tcp_tick();
+    let frames = tx();
+    assert_eq!(frames.len(), 1, "the persist timer fires one probe");
+    let h = tcp_hdr(&frames[0]);
+    assert_eq!(h.flags, TCP_ACK, "the probe is a bare ACK");
+    assert_eq!(
+        h.seq, server_isn, // snd_una (server_isn + 1) − 1
+        "the probe sits one sequence number below snd_una",
+    );
+    assert_eq!(
+        frames[0].len(),
+        34 + TCP_HDR_LEN,
+        "the probe carries no payload",
+    );
+}
+
+/// The persist probe recovers a connection whose window-update ACK
+/// was lost on the wire: the probe re-elicits the peer's window, the
+/// parked sender wakes, and the queued data drains.
+#[test]
+fn zero_window_persist_recovers_lost_update() {
+    let _g = harness();
+    const SP: u16 = 9141;
+    const CP: u16 = 50141;
+    const CLIENT_ISN: u32 = 0xEB00;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 0,
+        payload: Vec::new(),
+    });
+    let mut chain = iobuf::IOBufChain::from(vec![0u8; 2000]);
+    let blocked = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(blocked, 0, "the zero window blocks the send");
+
+    // The reactor parks the send waker on the closed window.
+    let (waker, count) = counting_waker();
+    super::register_send_waker(handle, generation, &waker);
+
+    // The peer's window-update is lost — only the persist probe gets
+    // the connection moving again.
+    clear_tx();
+    kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 + 1);
+    super::on_tcp_tick();
+    assert_eq!(tx().len(), 1, "the persist timer probes the shut window");
+
+    // The probe elicits the peer's re-advertised window.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert!(
+        count.0.load(Ordering::Relaxed) >= 1,
+        "the probe-elicited window update wakes the parked sender",
+    );
+
+    // The reopened window now drains the queued data.
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(sent, 2000, "the recovered window drains the queued data");
+}
+
+/// Successive persist probes back off exponentially off the RTO
+/// estimate.
+#[test]
+fn zero_window_persist_backs_off() {
+    let _g = harness();
+    const SP: u16 = 9142;
+    const CP: u16 = 50142;
+    const CLIENT_ISN: u32 = 0xEC00;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 0,
+        payload: Vec::new(),
+    });
+    let mut chain = iobuf::IOBufChain::from(vec![0u8; 2000]);
+    super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+
+    // Probe 1 fires at the initial RTO.
+    clear_tx();
+    kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 + 1);
+    super::on_tcp_tick();
+    assert_eq!(tx().len(), 1, "probe 1 fires at the initial interval");
+
+    // The interval has doubled — one more RTO of wait is not enough.
+    clear_tx();
+    kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64);
+    super::on_tcp_tick();
+    assert!(tx().is_empty(), "the backed-off (2x) interval has not elapsed");
+
+    kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64);
+    super::on_tcp_tick();
+    assert_eq!(tx().len(), 1, "probe 2 fires only after the doubled interval");
+}
+
+/// A peer that keeps its window shut across `PERSIST_MAX_PROBES`
+/// unanswered probes is treated as dead — the connection is aborted.
+#[test]
+fn zero_window_persist_gives_up() {
+    let _g = harness();
+    const SP: u16 = 9143;
+    const CP: u16 = 50143;
+    const CLIENT_ISN: u32 = 0xED00;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 0,
+        payload: Vec::new(),
+    });
+    let mut chain = iobuf::IOBufChain::from(vec![0u8; 2000]);
+    super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(conn_state(CP, SP), Some(TcpState::Established));
+
+    // The peer's window stays shut forever — every probe goes
+    // unanswered. Tick past each backed-off deadline.
+    for _ in 0..=PERSIST_MAX_PROBES {
+        kernel_core::clock::mock::advance(RTO_MAX_MS as u64 + 1);
+        super::on_tcp_tick();
+    }
+    assert_eq!(
+        conn_state(CP, SP),
+        None,
+        "a permanently shut window aborts the connection",
+    );
+}
+
 /// Locate the live (non-listener) connection for a client/server
 /// port pair and return its `(handle, generation)` so a scenario
 /// can drive the real send path (`async_try_send_chain`).
