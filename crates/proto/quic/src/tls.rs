@@ -297,6 +297,16 @@ impl QuicTls {
         n
     }
 
+    /// Whether any Handshake-level CRYPTO bytes are still buffered
+    /// for transmission. `flush_outbound` uses this to decide
+    /// whether the server flight needs another fragment packet:
+    /// the flight (EncryptedExtensions + Certificate +
+    /// CertificateVerify + Finished) routinely exceeds one packet
+    /// for a real leaf+intermediate cert chain.
+    pub fn has_pending_handshake(&self) -> bool {
+        !self.tx_handshake.is_empty()
+    }
+
     /// Advance the state machine over the bytes currently buffered.
     /// Returns the (possibly unchanged) state. Idempotent on
     /// truncated input — re-call after the next `push_handshake`.

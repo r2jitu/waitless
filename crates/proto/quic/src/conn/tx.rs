@@ -12,7 +12,10 @@
 // the CONNECTION_CLOSE path; `encode_ping_probe` backs the PTO
 // timer in `loss.rs`.
 
-use super::{ConnError, ConnState, Connection, SpaceState, append_max_streams_into};
+use super::{
+    ConnError, ConnState, Connection, HS_CRYPTO_BUDGET, MAX_QUIC_DATAGRAM, SpaceState,
+    append_max_streams_into,
+};
 use crate::crypto::{HP_SAMPLE_LEN, TAG_LEN, apply_hp_mask, packet_nonce};
 use crate::frame::{write_ack, write_crypto};
 use crate::tls::CryptoLevel;
@@ -139,38 +142,65 @@ impl Connection {
             self.initial_space.ack_pending = false;
         }
 
-        // Handshake packet (after Initial has at least an ACK).
-        // Stack-allocate the drain buffer — the server flight is
-        // bounded (cert + EE + CV + Finished, well under 8 KiB),
-        // and the previous Vec::with_capacity(8192) was hitting
-        // the heap on every flush.
-        // Skip if we've discarded our Handshake keys per RFC 9001
-        // §4.9.2 (peer sent a 1-RTT packet → both sides have moved
-        // on); same shape as the Initial guard above. The pending
-        // ACK state is dropped on the floor — peer doesn't expect
-        // a Handshake-level ACK once they've started 1-RTT.
-        let mut hs_crypto = [0u8; 8192];
-        let hs_n = self
-            .tls
-            .pop_handshake(CryptoLevel::Handshake, &mut hs_crypto);
+        // Handshake packet — first fragment, coalesced into this
+        // datagram behind the Initial.
+        //
+        // The server flight (EncryptedExtensions + Certificate +
+        // CertificateVerify + Finished) exceeds one packet for any
+        // real leaf+intermediate cert chain. RFC 9001 §4.1.3: the
+        // Handshake CRYPTO stream may span any number of packets.
+        // We drain it `HS_CRYPTO_BUDGET` bytes at a time — this
+        // first fragment here, the remainder as their own
+        // datagrams in the handshake-tail loop below — so no
+        // datagram exceeds `MAX_QUIC_DATAGRAM`. A small fixed-size
+        // drain buffer makes an oversized handshake packet
+        // structurally unrepresentable: you cannot pop more bytes
+        // than the array holds. (A single oversized datagram is
+        // both a path-MTU violation AND, on the zero-copy `TxSlot`
+        // send path, a `Vec` realloc off driver-owned memory =>
+        // heap corruption — the gve h3 crash this fixes.)
+        //
+        // Skip entirely once Handshake keys are discarded (RFC 9001
+        // §4.9.2); the pending ACK is dropped — the peer has moved
+        // to 1-RTT and won't expect a Handshake-level ACK.
         if self.handshake_keys_discarded {
             self.handshake_space.ack_pending = false;
-        } else if hs_n > 0 || self.handshake_space.ack_pending {
-            self.encode_handshake_packet(
-                datagram.vec_mut(),
-                &hs_crypto[..hs_n],
-                self.handshake_space.ack_pending,
-            )?;
-            self.handshake_space.ack_pending = false;
+        } else {
+            let mut hs_crypto = [0u8; HS_CRYPTO_BUDGET];
+            let hs_n = self
+                .tls
+                .pop_handshake(CryptoLevel::Handshake, &mut hs_crypto);
+            if hs_n > 0 || self.handshake_space.ack_pending {
+                self.encode_handshake_packet(
+                    datagram.vec_mut(),
+                    &hs_crypto[..hs_n],
+                    self.handshake_space.ack_pending,
+                )?;
+                self.handshake_space.ack_pending = false;
+            }
         }
 
         // 1-RTT packet — bundles ACK + HANDSHAKE_DONE + STREAM
         // frames + STREAM data drained from per-stream send queues.
-        // Encode the FIRST 1-RTT packet inline with any
-        // Initial/Handshake packets above to maximise coalescing.
+        // Encode the FIRST 1-RTT packet inline with any Initial /
+        // Handshake packets above to maximise coalescing. 1-RTT is
+        // only reached once Established — strictly after the whole
+        // Handshake flight has been sent — so it never shares a
+        // datagram with the large multi-fragment flight.
         if matches!(self.state, ConnState::Established) {
             self.encode_one_rtt_packet(datagram.vec_mut())?;
         }
+        // Invariant: every datagram stays within MAX_QUIC_DATAGRAM
+        // (see the const's docs — protocol MTU *and* TX-slot
+        // capacity). Caught here in debug builds; on the `TxSlot`
+        // send path an overrun also trips the always-on guard in
+        // `DatagramBuf::into_tx_handle`.
+        debug_assert!(
+            datagram.len() <= MAX_QUIC_DATAGRAM,
+            "QUIC datagram {} B exceeds MAX_QUIC_DATAGRAM {} B",
+            datagram.len(),
+            MAX_QUIC_DATAGRAM,
+        );
         if datagram.len() > MAX_L2_HEADROOM {
             // Anti-amplification gate (RFC 9000 §8.1.2). Pre-
             // validation we drop packets whose cumulative bytes
@@ -186,6 +216,52 @@ impl Connection {
                 self.outbound.push_back(datagram);
             } else {
                 crate::diag::bump(&crate::diag::COUNTERS.anti_amp_throttled);
+            }
+        }
+
+        // Handshake CRYPTO that did not fit the first fragment →
+        // additional Handshake packets, each its own datagram.
+        // This is what keeps the server flight within the path MTU
+        // for a real (leaf + intermediate) cert chain. Mirrors the
+        // 1-RTT multi-packet tail below; RFC 9000 §12.2 permits
+        // coalescing Handshake packets, but one packet per datagram
+        // is simplest and keeps every datagram comfortably small.
+        if !self.handshake_keys_discarded {
+            const MAX_HS_PACKETS: usize = 16;
+            for _ in 0..MAX_HS_PACKETS {
+                if !self.tls.has_pending_handshake() {
+                    break;
+                }
+                // Same anti-amplification gate as the first
+                // datagram (RFC 9000 §8.1.2).
+                if self.anti_amp_remaining() == 0 {
+                    break;
+                }
+                let mut hs_crypto = [0u8; HS_CRYPTO_BUDGET];
+                let hs_n = self
+                    .tls
+                    .pop_handshake(CryptoLevel::Handshake, &mut hs_crypto);
+                if hs_n == 0 {
+                    break;
+                }
+                let mut more = self.take_datagram_buf(1500);
+                self.encode_handshake_packet(more.vec_mut(), &hs_crypto[..hs_n], false)?;
+                debug_assert!(
+                    more.len() <= MAX_QUIC_DATAGRAM,
+                    "QUIC Handshake datagram {} B exceeds MAX_QUIC_DATAGRAM {} B",
+                    more.len(),
+                    MAX_QUIC_DATAGRAM,
+                );
+                if more.len() <= MAX_L2_HEADROOM {
+                    break;
+                }
+                let n = (more.len() - MAX_L2_HEADROOM) as u64;
+                if n > self.anti_amp_remaining() {
+                    crate::diag::bump(&crate::diag::COUNTERS.anti_amp_throttled);
+                    break;
+                }
+                self.record_bytes_sent(n);
+                self.outbound.push_back(more);
             }
         }
 
@@ -353,9 +429,18 @@ impl Connection {
             self.append_ack_frame(&mut frames, &self.handshake_space);
         }
         if !crypto_bytes.is_empty() {
-            let mut tmp = vec![0u8; crypto_bytes.len() + 16];
-            let n = write_crypto(0, crypto_bytes, &mut tmp).map_err(|_| ConnError::Wire)?;
+            // The server flight is fragmented across Handshake
+            // packets (see `flush_outbound`), so each CRYPTO frame
+            // carries this fragment's offset in the Handshake
+            // CRYPTO stream — the peer reassembles by offset
+            // (RFC 9001 §4.1.3). `+ 24` covers the CRYPTO frame
+            // header (type byte + offset varint + length varint)
+            // for any offset/length we emit.
+            let mut tmp = vec![0u8; crypto_bytes.len() + 24];
+            let n = write_crypto(self.handshake_crypto_offset, crypto_bytes, &mut tmp)
+                .map_err(|_| ConnError::Wire)?;
             frames.extend_from_slice(&tmp[..n]);
+            self.handshake_crypto_offset += crypto_bytes.len() as u64;
         }
 
         let pn_length: usize = 4;

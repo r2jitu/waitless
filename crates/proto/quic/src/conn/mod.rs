@@ -381,6 +381,41 @@ impl DatagramBuf {
     }
 }
 
+/// The largest QUIC datagram — L2/L3/L4 headroom prefix **plus**
+/// wire bytes — the encoder is permitted to produce. It does two
+/// jobs:
+///
+///   * **Protocol.** Keeps every datagram within the conservative
+///     1200-byte QUIC path-MTU floor (RFC 9000 §14.1) plus the
+///     62-byte headroom, so the server's handshake flight is never
+///     IP-fragmented.
+///   * **Memory safety.** A [`DatagramBuf::TxSlot`] wraps a
+///     driver-owned TX-pool slot in a `Vec` that MUST NOT
+///     reallocate — a realloc frees the slot pointer (NIC DMA
+///     memory, not a heap allocation) through the global allocator
+///     and corrupts the heap. [`Connection::take_datagram_buf`]
+///     only takes the zero-copy `TxSlot` path when the slot's
+///     capacity is at least this value, so a bounded encode can
+///     never grow the `Vec` past the slot.
+///
+/// Sized above the encoder's true worst case (~1200 B for a 1-RTT
+/// packet; ~1100 B for an Initial + first-Handshake-fragment
+/// datagram) with margin. Both shipping drivers' TX slots clear it
+/// comfortably — gve 2048 B, virtio-net 1514 B.
+pub(super) const MAX_QUIC_DATAGRAM: usize = 1400;
+
+/// Maximum Handshake-level CRYPTO bytes packed into a single
+/// Handshake packet. The server flight (EncryptedExtensions +
+/// Certificate + CertificateVerify + Finished) exceeds one packet
+/// for any real leaf+intermediate cert chain, so `flush_outbound`
+/// fragments the Handshake CRYPTO stream across several packets,
+/// each carrying at most this many bytes. Chosen so a Handshake
+/// packet — even coalesced behind an Initial in the first datagram
+/// — stays under [`MAX_QUIC_DATAGRAM`]. A small fixed-size drain
+/// buffer (`[0u8; HS_CRYPTO_BUDGET]`) makes an oversized handshake
+/// packet structurally unrepresentable.
+pub(super) const HS_CRYPTO_BUDGET: usize = 768;
+
 pub struct Connection {
     pub(super) state: ConnState,
 
@@ -571,6 +606,16 @@ pub struct Connection {
     /// so the offset accumulates rather than resetting per-frame.
     pub(super) one_rtt_crypto_offset: u64,
 
+    /// Next-byte offset into the **Handshake** CRYPTO stream for
+    /// the outbound server flight. That flight (EncryptedExtensions,
+    /// Certificate, CertificateVerify, Finished) exceeds one packet
+    /// for any real leaf+intermediate cert chain, so `flush_outbound`
+    /// fragments it across several Handshake packets; each CRYPTO
+    /// frame carries its slice's offset in this stream so the peer
+    /// reassembles it (RFC 9001 §4.1.3). Mirrors
+    /// [`one_rtt_crypto_offset`](Self::one_rtt_crypto_offset).
+    pub(super) handshake_crypto_offset: u64,
+
     /// Outbound packet queue: complete UDP datagrams (including
     /// any header-protected, AEAD-sealed packets) ready to ship.
     /// `pop_packet_owned` drains the front entry; the reactor's
@@ -734,6 +779,7 @@ impl Connection {
             last_recv_us: 0,
             close_pending: None,
             one_rtt_crypto_offset: 0,
+            handshake_crypto_offset: 0,
             outbound: alloc::collections::VecDeque::new(),
             outbound_pool: Vec::new(),
             recv_streams: alloc::collections::BTreeMap::new(),
