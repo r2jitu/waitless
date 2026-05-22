@@ -22,7 +22,7 @@ conformance-test behaviour that does not exist — so the harness's job
 for those items is **test-first feature development**, not checking an
 existing implementation.
 
-## Status today (2026-05-21)
+## Status today (2026-05-22)
 
 Steps 1-4 of the sequencing below are **complete**. The in-process
 harness, a test-controllable clock, TCP retransmission, the
@@ -54,7 +54,7 @@ Landed:
   AIMD congestion avoidance, and three-dup-ACK fast retransmit /
   fast recovery — and a send path that paces transmission against
   `min(cwnd, rwnd)`, with a zero-window persist timer and the
-  SND.WL1/WL2 window-update rule (branch `tcp-cwnd-send-window`).
+  SND.WL1/WL2 window-update rule.
 - `quic` already host-builds; `//crates/proto/quic:quic_test`
   includes `end_to_end_self_handshake`, which drives a synthetic
   Initial through the receive path.
@@ -287,15 +287,20 @@ host-tested, and the RFC 9002 *data model* is present.
 ### RFC 9002 — loss detection + congestion control
 
 - **Have**: the data model — `sent_packets`, `SentPacket`
-  (`ack_eliciting` / `in_flight`), the RFC 9002 §5 RTT estimator, and
-  the per-space PTO anchors. This is real scaffolding.
-- **Missing**: the PTO/loss-detection *timers* are not wired
-  (`conn.rs` notes it relies on client retransmits today), and there
-  is no congestion controller.
-- **Conformance test**: this is "wire the timer + a controller onto
-  existing scaffolding" — host-testable directly in `quic_test`
-  once the clock seam exists. Smaller than the TCP equivalent because
-  the bookkeeping is already there.
+  (`ack_eliciting` / `in_flight`), the RFC 9002 §5 RTT estimator —
+  plus, as of `conn/loss.rs`, packet- and time-threshold loss
+  detection and the PTO timer (`pto_deadline_us`, raced against a
+  sleep in `endpoint.rs`'s conn task; `send_pto_probe` emits a PING).
+- **Missing**: frame retransmission — `detect_loss` declares packets
+  lost and drops them, but the lost CRYPTO/STREAM frames are never
+  re-queued (`send_pto_probe` sends a bare PING, not the lost data),
+  so recovery still leans on client retransmits. There is no
+  congestion controller, and the PTO period has no exponential
+  backoff (`PTO * 2^pto_count`).
+- **Conformance test**: host-testable directly in `quic_test`; the
+  loss-detection + RTT half already rides the clock seam. What
+  remains is "wire frame retx + a controller onto the existing
+  detection".
 
 ## Part 4 — Sequencing
 
@@ -314,9 +319,10 @@ Dependency-ordered. Each step is test-first on the harness.
    connection-lifecycle corners — LastAck, TimeWait, FIN retransmit
    — which slotted in alongside.) The cwnd-paced send window —
    windowed `async_try_send_chain` + zero-window persist + TSO
-   retransmit coverage — followed on branch `tcp-cwnd-send-window`.
-5. **QUIC RFC 9002 loss recovery + congestion** — wire the PTO timer
-   and a controller onto the existing data model.
+   retransmit coverage — followed and is merged to main.
+5. **QUIC RFC 9002 loss recovery + congestion** — the PTO timer, RTT
+   estimator, and loss detection have landed; what remains is frame
+   retransmission and a congestion controller.
 6. **TCP RFC 7323 (window scaling + timestamps)** — widen `rcv_wnd`,
    negotiate and apply the options, PAWS.
 7. **TCP RFC 2018 (SACK)** — reassembly queue, SACK blocks, RFC 6675

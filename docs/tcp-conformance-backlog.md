@@ -18,8 +18,7 @@ implements and host-tests:
 - RFC 6298 — RTO retransmission, the SRTT/RTTVAR estimator,
   exponential backoff, Karn's algorithm.
 - RFC 5681 — slow start, AIMD, fast retransmit / fast recovery, and
-  (as of branch `tcp-cwnd-send-window`) a send path that paces against
-  `min(cwnd, rwnd)`.
+  a send path that paces against `min(cwnd, rwnd)`.
 - RFC 9293 §3.8.6.1 — zero-window persist probing.
 - RFC 5961 §3.2 — strict-sequence RST acceptance.
 - RFC 1122 §4.2.2.16 — receiver silly-window-syndrome avoidance.
@@ -53,9 +52,9 @@ Effort: **S** ≈ hours, **M** ≈ a few days, **L** ≈ a week+.
 
 ### T1 — The ACK field is not validated against the send window — ✅ done
 
-**Status.** Done on branch `tcp-cwnd-send-window` — `tcp_receive` now
-applies the RFC 9293 §3.10.7.4 acceptability rule. Kept here for the
-record; the rest of the entry describes the gap that was closed.
+**Status.** Done and merged to main — `tcp_receive` now applies the
+RFC 9293 §3.10.7.4 acceptability rule. Kept here for the record; the
+rest of the entry describes the gap that was closed.
 
 **What.** `tcp_receive`'s generic ACK branch did `c.snd_una = ack`
 unconditionally. There was no `SND.UNA < SEG.ACK <= SND.NXT` check.

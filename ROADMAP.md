@@ -1901,46 +1901,46 @@ sh_test(name = "test", srcs = ["test.sh"], data = [":test_smp.elf"])
 | 2g. Async/await (Future + Waker + executor + UDP/TCP reactors) | ✅ done | Medium | The differentiation thesis | 2f |
 | 3a. UDP | ✅ done | Small | Enables QUIC | None |
 | 3b. TLS 1.3 (hand-rolled) | ✅ done | Large | Required for QUIC | 1b |
-| 3c. QUIC (as `async fn`) | next | Large | Modern transport + runtime consumer | 3a, 3b, 2g |
-| 4. HTTP/3 | not started | Medium | Modern HTTP | 3c |
-| 5. IPv6 + NDP | not started | Medium | Drop IPv4 legacy | None |
+| 3c. QUIC (as `async fn`) | ✅ done | Large | Modern transport + runtime consumer | 3a, 3b, 2g |
+| 4. HTTP/3 | ✅ done | Medium | Modern HTTP | 3c |
+| 5. IPv6 + NDP | ✅ done | Medium | Drop IPv4 legacy | None |
 | 2d. Work stealing | parked (post-QUIC) | Medium | CPU-task efficiency | 2a-c |
 | 2e. Timer wheel event-loop wiring | absorbed into 2g | Small | Async timers | 2a |
 | 2h. Perf regression tests | parked (post-QUIC) | Medium | Prevent regressions | 2a-c |
 
-**Where we are now (2026-05-02):** all QUIC prerequisites are in.
-Phase 3b (TLS 1.3) shipped, phases 2f+2g (async runtime + UDP/TCP
-reactors) shipped including the `UdpRecv::recv_from` and
-`TcpListener::accept`/`TcpStream` reactors that 3b's plan deferred
-to "alongside QUIC" — they're already done. Highlights since the
-April 2026 status:
+**Where we are now (2026-05-22):** Phases 3c (QUIC), 4 (HTTP/3),
+and 5 (IPv6 + NDP) have all shipped — see the per-phase sections
+below. The webserver serves HTTP/1.1, HTTP/1.1-over-TLS, and
+HTTP/3 side by side; `dev.r2jitu.com` is live on GCE over gVNIC.
+Highlights:
 
-- `//crates/runtime/executor` async executor with chunked launcher table,
-  per-worker arenas, generation-aware handles.
-- `UdpSocket::run` / `TcpListener::run` reactors on bare-metal
-  AND native, both backends sharing a single `TcpBackend` /
-  `UdpBackend` vtable.
-- `http::listen` and `listen_https` now take any
+- `//crates/runtime/executor` async executor with chunked launcher
+  table, per-worker arenas, generation-aware handles.
+- `UdpSocket::run` / `TcpListener::run` reactors on bare-metal AND
+  native, both backends sharing a single `TcpBackend` / `UdpBackend`
+  vtable.
+- `http::listen` / `listen_https` take any
   `AsyncFn(&Request) -> Response` — handlers can `.await`.
-- Native gateway workload at 89 k req/s 1c, HVF at 73 k 1c
-  (post `gateway_max conns_per_core: 1500` bump).
+- QUIC + HTTP/3 as `async fn` per connection; the TLS 1.3 state
+  machine is reused for the QUIC handshake over CRYPTO frames.
+- IPv6 + NDP + SLAAC + dual-stack TCP/UDP.
 - Graceful shutdown: `drain_all_arenas` reclaims in-flight task
   storage, `shutdown_all_tcp` emits one RST per active conn,
   `HEAP_LEAK_CHECK ok` asserted under traffic.
 
-**Next on deck:** Phase **3c** (QUIC as `async fn`). Every
-prerequisite — async runtime, UDP socket API, TLS 1.3 server
-state machine — is in place; QUIC starts on a clean foundation.
+**What's left.** No headline phase remains; the open work is
+correctness depth and performance:
 
-**Optional pre-QUIC**: TLS session resumption (1 focused day; see
-"Deferred work — Session resumption"). Drops resumed-handshake
-latency ~7×, and resumed handshakes are exactly what QUIC's
-`pre_shared_key` extension reuses, so doing it on the TCP path
-first is free leverage on QUIC later. Skip if eager to start QUIC.
-
-Revised order for what's left:
-`3c (QUIC) → 4 (HTTP/3) → 5 (IPv6/NDP) → 2d/2h (work stealing
-+ perf tests, post-QUIC)`.
+- **QUIC RFC 9002** — loss recovery + congestion control: frame
+  retransmission and a congestion controller (the PTO timer, RTT
+  estimator, and loss detection already landed). See
+  `docs/conformance-roadmap.md` step 5.
+- **TCP conformance backlog** — `docs/tcp-conformance-backlog.md`.
+- **RX / TX path optimizations** — `docs/rx-path-optimizations.md`
+  (RX-offload items I/J/N/O) and `docs/tx-path-optimizations.md`
+  (conn-state / conn-future pools).
+- **2d (work stealing)** and **2h (perf regression tests)** —
+  still parked.
 
 **The thesis we're committing to**: `async fn` is the *only* execution
 model, not a layer. Tokio/smol run above Linux; Embassy is
