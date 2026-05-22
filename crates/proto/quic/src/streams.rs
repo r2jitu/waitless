@@ -102,6 +102,11 @@ pub struct RecvStream {
     /// Cumulative cap on out-of-order bytes — anything past this
     /// is dropped (treated as packet loss).
     pub gap_budget: usize,
+    /// Arrival time (µs) of the datagram that opened this stream —
+    /// copied from `Connection::cur_rx_us` by `dispatch_frames`.
+    /// `ensure_send_stream` carries it onto the matching `SendStream`
+    /// so the request RX→TX latency can be sampled at response FIN.
+    pub rx_us: u64,
 }
 
 impl Default for RecvStream {
@@ -112,6 +117,7 @@ impl Default for RecvStream {
             gap_buffer: BTreeMap::new(),
             state: RecvState::Open,
             gap_budget: 16 * 1024,
+            rx_us: 0,
         }
     }
 }
@@ -131,6 +137,7 @@ impl RecvStream {
         self.gap_buffer.clear();
         self.state = RecvState::Open;
         self.gap_budget = 16 * 1024;
+        self.rx_us = 0;
     }
 
     /// Snapshot of internal state for diagnostics. Used by the
@@ -324,6 +331,13 @@ pub struct SendStream {
     pub send_offset: u64,
     /// Lifecycle — replaces (`close_after_drain`, `fin_sent`).
     pub state: SendState,
+    /// Arrival time (µs) of the request this stream answers, seeded
+    /// by `ensure_send_stream` from the matching `RecvStream`. `0`
+    /// for an untracked stream (server-initiated, or no matching
+    /// request). When non-zero, `enter_fin_sent` records the RX→TX
+    /// request latency; cleared to `0` after recording so the
+    /// sample fires at most once.
+    pub rx_us: u64,
 }
 
 impl Default for SendStream {
@@ -333,6 +347,7 @@ impl Default for SendStream {
             head_consumed: 0,
             send_offset: 0,
             state: SendState::Open,
+            rx_us: 0,
         }
     }
 }
@@ -350,6 +365,7 @@ impl SendStream {
         self.head_consumed = 0;
         self.send_offset = 0;
         self.state = SendState::Open;
+        self.rx_us = 0;
     }
 
     /// Convenience predicate (FIN was emitted) — kept for the
@@ -357,6 +373,21 @@ impl SendStream {
     /// gate.
     pub fn fin_sent(&self) -> bool {
         matches!(self.state, SendState::FinSent)
+    }
+
+    /// Transition to `FinSent` — the response is fully encoded — and,
+    /// when this is a tracked request stream, record the request
+    /// RX→TX latency into `REQUEST_LATENCY`. `rx_us` is seeded by
+    /// `ensure_send_stream` from the matching `RecvStream`'s arrival
+    /// time (non-zero only for a client-bidi request); it is cleared
+    /// after recording so the sample fires at most once.
+    fn enter_fin_sent(&mut self) {
+        self.state = SendState::FinSent;
+        if self.rx_us != 0 {
+            let lat_us = tls::ticket::now_us().saturating_sub(self.rx_us);
+            crate::diag::REQUEST_LATENCY.record(lat_us);
+            self.rx_us = 0;
+        }
     }
 
     /// Canonical append. Takes any pre-built [`IOBuf`] (static
@@ -425,7 +456,7 @@ impl SendStream {
         let offset = self.send_offset;
         if self.outbound.is_empty() {
             // Closing with empty outbound → zero-byte FIN.
-            self.state = SendState::FinSent;
+            self.enter_fin_sent();
             return Some((offset, Vec::new(), true));
         }
         let head_remaining = self.head_remaining_len();
@@ -438,7 +469,7 @@ impl SendStream {
         self.send_offset += n as u64;
         let fin = matches!(self.state, SendState::Closing) && self.outbound.is_empty();
         if fin {
-            self.state = SendState::FinSent;
+            self.enter_fin_sent();
         }
         Some((offset, chunk, fin))
     }
@@ -463,7 +494,7 @@ impl SendStream {
         if self.outbound.is_empty() {
             // Closing with no queued data → zero-byte FIN.
             crate::frame::append_stream_header(stream_id, offset, true, 0, frames_out)?;
-            self.state = SendState::FinSent;
+            self.enter_fin_sent();
             return Ok(true);
         }
 
@@ -483,7 +514,7 @@ impl SendStream {
         self.advance_head(n);
         self.send_offset += n as u64;
         if fin {
-            self.state = SendState::FinSent;
+            self.enter_fin_sent();
         }
         Ok(true)
     }

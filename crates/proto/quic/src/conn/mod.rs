@@ -606,6 +606,15 @@ pub struct Connection {
     /// "creation time + idle".
     pub(super) last_recv_us: u64,
 
+    /// Arrival time (µs, `tls::ticket::now_us`) of the datagram
+    /// currently being processed — the conn task sets it from
+    /// `Datagram.rx_us` before each `process_datagram`.
+    /// `dispatch_frames` copies it onto a freshly-created
+    /// `RecvStream` so the request RX→TX latency histogram can be
+    /// sampled when the matching response stream FINs. `0` outside
+    /// a `process_datagram` call.
+    pub(super) cur_rx_us: u64,
+
     /// Set by `close_with_error` to schedule a CONNECTION_CLOSE
     /// frame on the next `flush_outbound`. `None` means the
     /// connection is in normal operation. RFC 9000 §10.2.1: a close
@@ -794,6 +803,7 @@ impl Connection {
             rttvar_us: 0,
             time_of_last_ack_eliciting_us: [None; 3],
             last_recv_us: 0,
+            cur_rx_us: 0,
             close_pending: None,
             one_rtt_crypto_offset: 0,
             handshake_crypto_offset: 0,
@@ -807,6 +817,13 @@ impl Connection {
             reaped_streams: [REAPED_STREAM_EMPTY; REAPED_STREAMS_CAP],
             reaped_idx: 0,
         }
+    }
+
+    /// Stamp the arrival time of the datagram about to be processed.
+    /// The conn task calls this with `Datagram.rx_us` before each
+    /// `process_datagram`; see the `cur_rx_us` field.
+    pub fn set_cur_rx_us(&mut self, rx_us: u64) {
+        self.cur_rx_us = rx_us;
     }
 
     /// Record `sid` in the reaped-streams ring. Called when
@@ -829,10 +846,16 @@ impl Connection {
     /// handle so the caller can immediately write into it.
     pub(super) fn ensure_send_stream(&mut self, sid: u64) -> &mut crate::streams::SendStream {
         if !self.send_streams.contains_key(&sid) {
-            let new_stream = self
+            let mut new_stream = self
                 .send_pool
                 .pop()
                 .unwrap_or_default();
+            // Seed the request RX→TX latency timestamp: a request
+            // and its response share `sid`, so copy the matching
+            // RecvStream's arrival time onto the SendStream. Only a
+            // client-bidi request has a RecvStream here — server-
+            // initiated streams find none and stay untracked (0).
+            new_stream.rx_us = self.recv_streams.get(&sid).map_or(0, |r| r.rx_us);
             self.send_streams.insert(sid, new_stream);
             crate::diag::COUNTERS.send_streams_created.bump();
         }

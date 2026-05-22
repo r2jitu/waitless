@@ -47,6 +47,10 @@ pub struct Datagram {
     pub src_ip: waitless::runtime::IpAddr,
     pub src_port: u16,
     pub bytes: Vec<u8>,
+    /// Arrival time (µs, `tls::ticket::now_us`), stamped by the
+    /// listener right after `recv_from`. Feeds the `inbox_wait` and
+    /// `request_latency` performance histograms — see `diag.rs`.
+    pub rx_us: u64,
 }
 
 /// Per-connection async queue. The listener (producer) calls
@@ -622,6 +626,7 @@ mod tests {
             }),
             src_port: 5000,
             bytes: alloc::vec![byte; 8],
+            rx_us: 0,
         }
     }
 

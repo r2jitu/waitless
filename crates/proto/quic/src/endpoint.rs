@@ -446,6 +446,10 @@ async fn listener_loop<H, F>(
         if n == 0 {
             continue;
         }
+        // Stamp arrival time once per datagram — carried on the
+        // `Datagram` to the conn task, where it feeds the
+        // `inbox_wait` / `request_latency` performance histograms.
+        let rx_us = tls::ticket::now_us();
         buf.truncate(n);
         let dcid = match extract_dcid(&buf) {
             Some(d) => d,
@@ -474,6 +478,7 @@ async fn listener_loop<H, F>(
                 src_ip,
                 src_port,
                 bytes: buf,
+                rx_us,
             });
             if !pushed {
                 crate::quic_drop!(
@@ -510,6 +515,7 @@ async fn listener_loop<H, F>(
                 src_ip,
                 src_port,
                 bytes: buf,
+                rx_us,
             });
             if !pushed {
                 crate::quic_drop!(inbox_full_drops, "size={} initial-dcid", dgram_size);
@@ -584,6 +590,7 @@ async fn listener_loop<H, F>(
             src_ip,
             src_port,
             bytes: buf,
+            rx_us,
         });
 
         let mut seed = [0u8; 32];
@@ -777,6 +784,12 @@ where
         while let Some(d) = current.take() {
             peer_ip.set(d.src_ip);
             peer_port.set(d.src_port);
+            // Performance pillar: how long this datagram waited in
+            // the inbox (listener `recv_from` → here), and the
+            // arrival time the conn carries forward so a request's
+            // RX→TX latency can be sampled when its response FINs.
+            let rx_us = d.rx_us;
+            crate::diag::INBOX_WAIT.record(tls::ticket::now_us().saturating_sub(rx_us));
             // Pass the datagram as `&mut [u8]` so the per-packet
             // processors can do HP-unprotect + AEAD-decrypt in
             // place rather than allocating a fresh buffer per
@@ -784,7 +797,11 @@ where
             // mutable access is straightforward.
             let dgram_size = d.bytes.len();
             let mut bytes = d.bytes;
-            let result = conn.borrow_mut().process_datagram(&mut bytes, &cfg);
+            let result = {
+                let mut c = conn.borrow_mut();
+                c.set_cur_rx_us(rx_us);
+                c.process_datagram(&mut bytes, &cfg)
+            };
             // Hand the buffer back to the listener's recycle pool
             // — kept-alive QUIC conns under refresh-spam pattern see
             // 5-8 inbound datagrams per fetch, each 1500 B; without

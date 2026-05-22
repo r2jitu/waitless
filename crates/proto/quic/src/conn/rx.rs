@@ -776,6 +776,10 @@ impl Connection {
                             continue;
                         }
                         let was_new = !self.recv_streams.contains_key(&stream_id);
+                        // Read before the &mut borrow below — the
+                        // datagram arrival time the conn task stamped
+                        // for this `process_datagram` pass.
+                        let cur_rx_us = self.cur_rx_us;
                         if was_new {
                             // Pull from the per-conn recycle pool so
                             // a recycled stream's `buffer` Vec keeps
@@ -790,6 +794,12 @@ impl Connection {
                             self.recv_streams.insert(stream_id, new_stream);
                         }
                         let s = self.recv_streams.get_mut(&stream_id).unwrap();
+                        if was_new {
+                            // Stamp arrival time so the request RX→TX
+                            // latency can be sampled when the matching
+                            // response stream FINs (see `streams.rs`).
+                            s.rx_us = cur_rx_us;
+                        }
                         s.ingest(offset, data, fin);
                         if was_new {
                             crate::diag::COUNTERS.recv_streams_created.bump();

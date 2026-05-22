@@ -1,7 +1,7 @@
 // crates/proto/quic/src/diag.rs — observability for the QUIC stack.
 //
 // QUIC is the reference implementation of the observability doctrine
-// (`docs/observability.md`). Three things live here:
+// (`docs/observability.md`). Five things live here:
 //
 //   1. `Counters` — one `obs::Counter` per drop / event reason.
 //      Cheap (relaxed atomic), always live.
@@ -20,11 +20,16 @@
 //      have to redeploy to capture. The h3-over-gve bug needed
 //      exactly this — the stack counted idle timeouts but discarded
 //      the 81 ms `last_recv_age` that proved the timeout spurious.
+//   5. `LatencyHist` slots — `REQUEST_LATENCY`, `INBOX_WAIT`. The
+//      performance pillar: how long the RX→TX path takes. Sampled
+//      on warm paths (per request / per datagram) — sound because
+//      a histogram `record` is the cost class of a counter.
 //
-// Cost: a counter bump is one atomic increment. A snapshot
-// `record` takes a `Spinlock`, so it is COLD PATH ONLY — connection
-// close, conn-task teardown, drop sites. Never per packet on a
-// healthy flow. The `quic_drop!` println is gated by the runtime
+// Cost: a counter / histogram `record` is a handful of relaxed
+// atomics. A `LastEvent` snapshot `record` takes a `Spinlock`, so
+// it is COLD PATH ONLY — connection close, conn-task teardown, drop
+// sites. Never per packet on a healthy flow. The `quic_drop!`
+// println is gated by the runtime
 // log level (`LogLevel` below); benchmark builds pay only the
 // increment. Default is `Drops` — failure events log, normal
 // events don't. Override via the `quic.log=silent|drops|events`
@@ -36,7 +41,7 @@
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use kernel_core::obs::{Counter, LastEvent, ObsRecord};
+use kernel_core::obs::{Counter, LastEvent, LatencyHist, ObsRecord};
 
 /// One counter per drop / event reason. Cheap to read in bulk for a
 /// stats dump, cheap to increment on the hot path.
@@ -403,6 +408,25 @@ pub static LAST_CONN_CLOSE: LastEvent<ConnCloseRecord> = LastEvent::new();
 /// whether an idle-timeout exit was legitimate.
 pub static LAST_CONN_EXIT: LastEvent<ConnExitRecord> = LastEvent::new();
 
+// ── Performance histograms (microseconds) ───────────────────────────
+//
+// The performance pillar (see `docs/observability.md`). `record` is
+// the cost class of a `Counter`, so these sample warm paths — per
+// request and per datagram — which the failure-pillar `LastEvent`
+// slots above never may.
+
+/// RX→TX request service latency: inbound datagram arrival →
+/// response FIN encoded. Sampled once per request — a request and
+/// its response share a `sid`, so the arrival timestamp threads
+/// `Datagram` → `RecvStream` → `SendStream` and the sample fires
+/// when the response stream reaches `FinSent`.
+pub static REQUEST_LATENCY: LatencyHist = LatencyHist::new();
+
+/// Inbox queue wait: listener `recv_from` → conn-task dequeue.
+/// Sampled per datagram; isolates scheduling / queueing delay out
+/// of `REQUEST_LATENCY`.
+pub static INBOX_WAIT: LatencyHist = LatencyHist::new();
+
 /// Snapshot payload for `LAST_DROP`.
 #[derive(Clone, Copy)]
 pub struct DropRecord {
@@ -767,8 +791,9 @@ pub fn snapshot() -> [(&'static str, u64); 46] {
 
 /// Render the full QUIC observability block as a JSON object —
 /// every drop / event counter as a flat `"name":value` member, then
-/// the `LastEvent` snapshots as nested objects. This is QUIC's
-/// contribution to the `/obs` surface and the body of `/quic_stats`;
+/// the `LastEvent` snapshots and `LatencyHist`s as nested objects.
+/// This is QUIC's contribution to the `/obs` surface and the body
+/// of `/quic_stats`;
 /// see `docs/observability.md` for the convention.
 pub fn write_obs_json(w: &mut dyn fmt::Write) -> fmt::Result {
     w.write_str("{")?;
@@ -782,6 +807,10 @@ pub fn write_obs_json(w: &mut dyn fmt::Write) -> fmt::Result {
     LAST_CONN_CLOSE.write_json(w, "last_conn_close")?;
     w.write_str(",")?;
     LAST_CONN_EXIT.write_json(w, "last_conn_exit")?;
+    w.write_str(",")?;
+    REQUEST_LATENCY.write_json(w, "request_latency_us")?;
+    w.write_str(",")?;
+    INBOX_WAIT.write_json(w, "inbox_wait_us")?;
     w.write_str("}")
 }
 
@@ -965,5 +994,8 @@ mod tests {
         assert!(s.contains("\"last_conn_exit\":{\"count\":"));
         // The invariant-violation slot is distinct from `last_drop`.
         assert!(s.contains("\"last_bug\":{\"count\":"));
+        // Performance pillar: the RX→TX latency histograms.
+        assert!(s.contains("\"request_latency_us\":{\"count\":"));
+        assert!(s.contains("\"inbox_wait_us\":{\"count\":"));
     }
 }
