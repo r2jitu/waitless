@@ -347,6 +347,23 @@ impl DatagramBuf {
         match self {
             DatagramBuf::TxSlot { handle, vec } => {
                 let len = vec.len();
+                // Tripwire. If the encoder ever overran the slot,
+                // the `Vec` reallocated and `as_ptr()` no longer
+                // points at the driver slot — which means the slot
+                // pointer was already freed through the heap
+                // allocator (heap corruption). Fail-stop loudly
+                // here, naming the cause, rather than let a later
+                // unrelated `talc::free` fault on the damage. The
+                // `data_cap` gate in `take_datagram_buf` plus the
+                // encoder's `MAX_QUIC_DATAGRAM` budget make this
+                // unreachable in correct code — it is a guard
+                // against a future regression, not a live path.
+                assert!(
+                    core::ptr::eq(vec.as_ptr(), handle.data_ptr as *const u8),
+                    "QUIC TX datagram reallocated off its {}-byte driver \
+                     slot — the encoder overran the TX-pool buffer",
+                    handle.data_cap,
+                );
                 // `vec` is `ManuallyDrop<Vec<u8>>` wrapping the
                 // driver-owned slot. Dropping the wrapper is a
                 // no-op (it doesn't dealloc the slot), so the
@@ -982,46 +999,54 @@ impl Connection {
     pub(super) fn take_datagram_buf(&mut self, fallback_capacity: usize) -> DatagramBuf {
         use executor::reactor::MAX_L2_HEADROOM;
 
-        // Hot path: acquire a slot from the driver's TX pool.
+        // Hot path: acquire a slot from the driver's TX pool and
+        // write packet bytes straight into it (no driver-side
+        // memcpy at submit time).
         if let Some(handle) = executor::reactor::acquire_tx_buf() {
-            // Wrap the slot's data region as a Vec via raw
-            // construction. Capacity == handle.data_cap (1514 B);
-            // the encoder won't push beyond that for any single
-            // QUIC datagram (PACKET_BODY_BUDGET keeps 1-RTT
-            // packets ~1100 B; handshake-coalesced datagrams stay
-            // well under 1300 B).
-            //
-            // SAFETY:
-            //   * `handle.data_ptr` is a valid `*mut u8` to a
-            //     writable region of `data_cap` bytes for the
-            //     handle's lifetime (driver's TX-pool slot).
-            //   * len = MAX_L2_HEADROOM ≤ data_cap; the trailing
-            //     bytes are zero-padded (slot was zeroed at boot
-            //     and never written past `len` by anyone before).
-            //     Wait — the slot's `data` field is reused across
-            //     conn lifetimes, so the trailing bytes may hold
-            //     stale ciphertext from a previous TX. We
-            //     explicitly zero the headroom prefix below so
-            //     bytes [..MAX_L2_HEADROOM] are clean before the
-            //     encoder writes; the bytes past `len` are not
-            //     read until the encoder writes them via push /
-            //     extend_from_slice (which initialises before
-            //     read).
-            //   * The Vec's allocation (`handle.data_ptr`) is NOT
-            //     allocator-managed; ManuallyDrop suppresses
-            //     Vec::Drop's dealloc.
-            let mut vec: Vec<u8> =
-                unsafe { Vec::from_raw_parts(handle.data_ptr, 0, handle.data_cap as usize) };
-            // Zero-fill the headroom; the encoder doesn't read it
-            // (writes start at vec.len()), but the backend fills
-            // headers there at submit time and may read for
-            // checksumming. Use resize to grow `len`.
-            vec.resize(MAX_L2_HEADROOM, 0);
-            let _ = fallback_capacity; // matched signature; unused on this path
-            return DatagramBuf::TxSlot {
-                handle,
-                vec: ManuallyDrop::new(vec),
-            };
+            // The `TxSlot` datagram wraps the driver slot in a
+            // `Vec` that MUST NOT reallocate: a realloc would free
+            // `handle.data_ptr` — a NIC TX-pool / DMA address, not
+            // a heap allocation — through the global allocator,
+            // corrupting the heap. The `Vec`'s capacity is fixed
+            // at `data_cap`, so "never reallocate" reduces to
+            // "never write past `data_cap`". Only take this path
+            // when the slot provably fits the encoder's worst-case
+            // datagram (`MAX_QUIC_DATAGRAM`); a smaller slot falls
+            // through to the freely-growable heap path. No shipping
+            // driver hits the fallback (gve 2048 B, virtio-net
+            // 1514 B both clear `MAX_QUIC_DATAGRAM`) — it is a
+            // checked guard so a future small-slot driver cannot
+            // silently re-introduce the realloc hazard.
+            if handle.data_cap as usize >= MAX_QUIC_DATAGRAM {
+                // SAFETY:
+                //   * `handle.data_ptr` is a valid `*mut u8` over
+                //     `data_cap` writable bytes for the handle's
+                //     lifetime (the driver's TX-pool slot).
+                //   * len 0 ≤ cap; `resize` below initialises
+                //     bytes [..MAX_L2_HEADROOM].
+                //   * The allocation is NOT heap-managed:
+                //     `ManuallyDrop` suppresses `Vec`'s dealloc,
+                //     and the `data_cap` gate above guarantees the
+                //     encoder never triggers a realloc (which
+                //     would have freed `data_ptr` as if it were a
+                //     heap block).
+                let mut vec: Vec<u8> = unsafe {
+                    Vec::from_raw_parts(handle.data_ptr, 0, handle.data_cap as usize)
+                };
+                // Zero the L2/L3/L4 headroom: the encoder writes
+                // past it, but the backend fills the headers there
+                // at submit time and may read them for checksum.
+                vec.resize(MAX_L2_HEADROOM, 0);
+                let _ = fallback_capacity; // unused on this path
+                return DatagramBuf::TxSlot {
+                    handle,
+                    vec: ManuallyDrop::new(vec),
+                };
+            }
+            // Slot too small for our worst-case datagram — release
+            // it (the handle's `Drop` returns it to the pool) and
+            // fall through to the heap path below.
+            drop(handle);
         }
 
         // Fallback: heap-allocated Vec, recycled through
