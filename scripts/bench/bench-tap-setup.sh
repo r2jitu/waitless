@@ -32,6 +32,17 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# Drop the pre-rename bench config a prior setup may have left behind.
+# `unikernel-bench.conf` (from before the UniKernel→Waitless rename)
+# carries the same `dhcp-host` MAC→IP mapping as the file written
+# below; dnsmasq aborts startup when two configs map one IP
+# ("duplicate dhcp-host IP address"). That failure is otherwise
+# silent — `KvmEnv.build()` ignores this script's exit status, and
+# `dnsmasq --test` does not catch it (the duplicate-IP check runs
+# only at real startup) — so it surfaces as an unexplained
+# `SKIP (not ready)` on every KVM workload.
+rm -f /etc/dnsmasq.d/unikernel-bench.conf
+
 # Create dnsmasq config if missing.
 DNSMASQ_CONF=/etc/dnsmasq.d/waitless-bench.conf
 if [ ! -f "$DNSMASQ_CONF" ]; then
