@@ -308,11 +308,14 @@ pub struct TcpConnection {
     /// Bytes currently buffered. Equals `snd_nxt - snd_una` while
     /// retransmit coverage holds; see `rtx_overflow`.
     pub(crate) rtx_len: u16,
-    /// Set when the unacked window outgrew `rtx_buf` (or the buffer
-    /// failed to allocate): the ring no longer covers `[snd_una,
-    /// snd_nxt)`, so the RTO timer is held off until the peer's ACKs
-    /// drain the window back to empty, at which point coverage
-    /// resumes. Never *worse* than the pre-RFC-6298 behaviour.
+    /// Set when `rtx_buf` failed to allocate: the ring cannot cover
+    /// `[snd_una, snd_nxt)`, so the RTO timer is held off until the
+    /// peer's ACKs drain the window back to empty, at which point
+    /// `rtx_on_ack` clears this and coverage resumes. The unacked
+    /// window outgrowing the ring is no longer a cause — the RFC 5681
+    /// send window bounds in-flight bytes at `min(cwnd, rwnd)`, which
+    /// the 64 KiB ring always holds; an `ensure_rtx_buf` allocation
+    /// failure is the sole residual trigger.
     pub(crate) rtx_overflow: bool,
     /// Current retransmission timeout, milliseconds. Doubles on each
     /// RTO expiry (§5.5); re-initialised when new data is ACK'd.
@@ -720,9 +723,9 @@ impl TcpConnection {
         if total == 0 || self.rtx_overflow {
             return; // nothing to retain, or coverage already suspended
         }
-        if !self.ensure_rtx_buf() || self.rtx_len as usize + total > RTX_BUF_BYTES {
-            // OOM, or the unacked window outgrew the ring. Drop
-            // retransmit coverage until snd_una catches snd_nxt;
+        if !self.ensure_rtx_buf() {
+            // The retransmit ring could not be allocated. Suspend
+            // retransmit coverage until `snd_una` catches `snd_nxt`;
             // `rtx_on_ack` clears the flag once the window drains.
             self.rtx_overflow = true;
             self.rtx_head = 0;
@@ -730,6 +733,16 @@ impl TcpConnection {
             self.rtx_deadline_ms = 0;
             return;
         }
+        // A window outgrowing the ring is structurally impossible: the
+        // RFC 5681 send path caps in-flight bytes at `min(cwnd, rwnd)`,
+        // `rwnd` is a `u16` (no window scaling), and `RTX_BUF_BYTES` is
+        // 64 KiB — so `rtx_len + total` (the post-send flight size)
+        // never exceeds the ring. Assert it rather than branch on it.
+        debug_assert!(
+            self.rtx_len as usize + total <= RTX_BUF_BYTES,
+            "in-flight bytes outgrew the retransmit ring — the send \
+             window should have bounded them at min(cwnd, rwnd)",
+        );
         let tail = (self.rtx_head as usize + self.rtx_len as usize) % RTX_BUF_BYTES;
         let buf = self.rtx_buf.as_mut().expect("ensure_rtx_buf succeeded");
         if tail + total <= RTX_BUF_BYTES {
@@ -783,7 +796,9 @@ impl TcpConnection {
     /// §5.2 / §5.3). `old_una` is `snd_una` from *before* the caller
     /// advanced it for this ACK.
     pub(crate) fn rtx_on_ack(&mut self, old_una: u32) {
-        // Resume coverage once an overflowed window has fully drained.
+        // Resume coverage once the window has fully drained — when
+        // `rtx_overflow` is set the ring (failed to allocate) cannot
+        // be trusted, so wait for an empty window before re-engaging.
         if self.rtx_overflow {
             if self.snd_una == self.snd_nxt {
                 self.rtx_overflow = false;
