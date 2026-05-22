@@ -324,8 +324,12 @@ deploy() {
         --project="$PROJECT" \
         --quiet
 
+    # udp:443 is load-bearing: HTTP/3 is QUIC over UDP. Without it the
+    # h3 listener is unreachable and Chrome silently falls back to TCP
+    # (`firewall-rules create` is a no-op if the rule already exists —
+    # an existing rule must be `update`d to add the port).
     gcloud compute firewall-rules create allow-http-waitless \
-        --allow=tcp:80,tcp:443 \
+        --allow=tcp:80,tcp:443,udp:443 \
         --target-tags=http-server \
         --project="$PROJECT" \
         --quiet 2>/dev/null || true
