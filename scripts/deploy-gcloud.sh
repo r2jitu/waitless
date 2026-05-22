@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # deploy-gcloud.sh — Deploy the unikernel as a GCE custom image.
 #
-# Builds //apps/webserver:webserver.iso (Limine hybrid BIOS+UEFI ISO),
+# Builds the app's ISO target (Limine hybrid BIOS+UEFI ISO),
 # wraps it as a GCE-compatible disk.raw.tar.gz, uploads to GCS, creates
 # a custom image, and launches a VM with serial-port logging enabled.
 #
@@ -36,6 +36,13 @@
 # Env overrides:
 #   WAITLESS_GCE_PROJECT, WAITLESS_GCE_ZONE, WAITLESS_GCE_MACHINE,
 #   WAITLESS_GCS_BUCKET, WAITLESS_GCE_NAME
+#   WAITLESS_DEPLOY_REPO — Bazel workspace root to build the ISO from.
+#     Default: the waitless repo this script lives in. Point it at an
+#     external consumer repo (one that depends on waitless as a Bazel
+#     module) to deploy that repo's app with these same scripts.
+#   WAITLESS_BUILD_TARGET — ISO target label to build inside
+#     WAITLESS_DEPLOY_REPO. Default
+#     //apps/webserver:webserver_iso_x86_64.
 #   WAITLESS_GCE_ADDRESS — name of a reserved regional static IP to
 #     attach to the instance (`gcloud compute addresses create`).
 #     Unset → an ephemeral IP. A public site wants a reserved one so
@@ -86,6 +93,33 @@ DISK_FILE="${WORKDIR}/disk.raw"
 TARBALL="${WORKDIR}/${TARBALL_NAME}"
 
 PROJECT="${WAITLESS_GCE_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
+
+# Repo + target to build. Default: the in-repo demo webserver. An
+# external app repo (a waitless consumer) sets WAITLESS_DEPLOY_REPO to
+# its own root and WAITLESS_BUILD_TARGET to its ISO label, and is then
+# deployed by this exact script.
+DEPLOY_REPO="${WAITLESS_DEPLOY_REPO:-$PROJECT_ROOT}"
+BUILD_TARGET="${WAITLESS_BUILD_TARGET:-//apps/webserver:webserver_iso_x86_64}"
+
+# Primary cert domain — drives the HTTPS health-check probe and the
+# summary URL. Accepts the space-separated WAITLESS_CERT_DOMAINS (first
+# entry wins) or the older single-valued WAITLESS_CERT_DOMAIN.
+CERT_DOMAIN="${WAITLESS_CERT_DOMAINS:-${WAITLESS_CERT_DOMAIN:-}}"
+CERT_DOMAIN="${CERT_DOMAIN%% *}"
+
+# bazel-bin path of the ISO that BUILD_TARGET produces:
+#   //apps/webserver:webserver_iso_x86_64
+#       -> bazel-bin/apps/webserver/webserver_iso_x86_64.iso
+#   //:webserver_iso_x86_64  -> bazel-bin/webserver_iso_x86_64.iso
+_iso_path_for() {
+    local label="${1#//}"
+    local pkg="${label%%:*}" tgt="${label##*:}"
+    if [ -n "$pkg" ] && [ "$pkg" != "$label" ]; then
+        echo "bazel-bin/${pkg}/${tgt}.iso"
+    else
+        echo "bazel-bin/${tgt}.iso"
+    fi
+}
 
 _require_project() {
     if [ -z "$PROJECT" ]; then
@@ -139,19 +173,20 @@ resolve_instance() {
 }
 
 # Poll an instance until GET /health returns 200, or fail after
-# WAITLESS_HEALTH_TIMEOUT seconds (default 150). With
-# WAITLESS_CERT_DOMAIN set the probe is HTTPS with --resolve, so it
-# also confirms the new image serves a valid cert for the domain;
-# without it, a plain-HTTP probe. Args: <ip> <label>
+# WAITLESS_HEALTH_TIMEOUT seconds (default 150). With a cert domain
+# set (WAITLESS_CERT_DOMAINS / WAITLESS_CERT_DOMAIN) the probe is
+# HTTPS with --resolve, so it also confirms the new image serves a
+# valid cert for the domain; without it, a plain-HTTP probe.
+# Args: <ip> <label>
 health_check() {
     local ip="$1" label="$2"
     local timeout="${WAITLESS_HEALTH_TIMEOUT:-150}"
     local deadline=$((SECONDS + timeout))
     local probe
-    if [ -n "${WAITLESS_CERT_DOMAIN:-}" ]; then
+    if [ -n "$CERT_DOMAIN" ]; then
         probe=(curl -fsS --max-time 5
-            --resolve "${WAITLESS_CERT_DOMAIN}:443:${ip}"
-            "https://${WAITLESS_CERT_DOMAIN}/health")
+            --resolve "${CERT_DOMAIN}:443:${ip}"
+            "https://${CERT_DOMAIN}/health")
     else
         probe=(curl -fsS --max-time 5 "http://${ip}/health")
     fi
@@ -171,18 +206,19 @@ health_check() {
 # GCE expects a tarball containing a single file named exactly "disk.raw"
 # at the tar root, sized to a whole number of GB (>= 1 GB).
 build_disk() {
-    echo "==> Building //apps/webserver:webserver_iso_x86_64 ..."
-    cd "$PROJECT_ROOT"
+    echo "==> Building $BUILD_TARGET (in $DEPLOY_REPO) ..."
+    cd "$DEPLOY_REPO"
     # The iso variant's transition pins the target platform
     # regardless of the host default, so arm64 dev hosts still
     # produce an x86 ISO that GCE's x86 machine types can boot.
-    # For ARM GCE / Graviton deployment, swap to `:webserver_iso_aarch64`.
+    # For ARM GCE / Graviton deployment, set WAITLESS_BUILD_TARGET to
+    # the aarch64 ISO label.
     #
     # WAITLESS_BAZEL_DEFINES carries optional extra flags (e.g.
     # `--define tls_cert=prod`); unquoted so multi-word values split.
     # shellcheck disable=SC2086
-    bazel build //apps/webserver:webserver_iso_x86_64 ${WAITLESS_BAZEL_DEFINES:-}
-    local iso="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver_iso_x86_64.iso"
+    bazel build "$BUILD_TARGET" ${WAITLESS_BAZEL_DEFINES:-}
+    local iso="$DEPLOY_REPO/$(_iso_path_for "$BUILD_TARGET")"
     [ -f "$iso" ] || {
         echo "ERROR: ISO not produced: $iso" >&2
         exit 1
@@ -693,7 +729,7 @@ deploy_bluegreen() {
 =========================================
   Live instance: $target   Zone: $ZONE
   Static IP:     $static_ip
-  URL:           https://${WAITLESS_CERT_DOMAIN:-$static_ip}/
+  URL:           https://${CERT_DOMAIN:-$static_ip}/
 
   Serial console:  $0 logs
 =========================================

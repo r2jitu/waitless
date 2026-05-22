@@ -15,9 +15,10 @@
 # deploy.
 #
 # Output: leaf.der, intermediate.der, key.der (PKCS#8) written into
-# apps/webserver/prod_certs/. A `--define tls_cert=prod` build bakes
-# them in (see apps/webserver/BUILD.bazel). The files are gitignored
-# — issuance never edits tracked source.
+# WAITLESS_PROD_CERTS_DIR (default apps/webserver/prod_certs/). A
+# `--define tls_cert=prod` build bakes them in (see the app's
+# BUILD.bazel). The files are gitignored — issuance never edits
+# tracked source.
 #
 # Issuance is skipped when prod_certs/ already holds a certificate
 # that covers the domain, matches the requested ACME environment, and
@@ -43,7 +44,13 @@
 #   hosted there.
 #
 # Required env:
-#   WAITLESS_CERT_DOMAIN   fully-qualified domain for the cert
+#   WAITLESS_CERT_DOMAINS  space-separated FQDN list for the cert; the
+#                          first is the primary (cert CN + the basename
+#                          lego writes files under), the rest become
+#                          extra SAN names on the one cert — e.g.
+#                          "r2jitu.com www.r2jitu.com". The older
+#                          single-valued WAITLESS_CERT_DOMAIN is still
+#                          accepted as a fallback.
 #   WAITLESS_CERT_EMAIL    ACME account email (expiry notices)
 #   GCE_PROJECT            GCP project hosting the Cloud DNS zone
 #
@@ -53,6 +60,11 @@
 #                             lego falls back to application-default
 #                             credentials (`gcloud auth
 #                             application-default login`).
+#   WAITLESS_PROD_CERTS_DIR   directory the leaf/intermediate/key .der
+#                             files are staged into. Default
+#                             apps/webserver/prod_certs/ (the in-repo
+#                             demo app); an external consumer repo
+#                             points it at its own app's prod_certs/.
 #   WAITLESS_RENEW_DAYS       reuse the staged cert until fewer than
 #                             this many days of validity remain
 #                             (default 30).
@@ -87,9 +99,23 @@ _require() {
         exit 1
     fi
 }
-_require WAITLESS_CERT_DOMAIN
 _require WAITLESS_CERT_EMAIL
 _require GCE_PROJECT
+
+# Domain(s) the certificate must cover. WAITLESS_CERT_DOMAINS is a
+# space-separated list — the first entry is the primary (the cert CN
+# and the basename lego writes its files under); any others become
+# additional SAN names on the same cert. WAITLESS_CERT_DOMAIN is the
+# older single-domain form, still honoured as a fallback.
+_domains_raw="${WAITLESS_CERT_DOMAINS:-${WAITLESS_CERT_DOMAIN:-}}"
+if [ -z "$_domains_raw" ]; then
+    echo "Error: set WAITLESS_CERT_DOMAINS (space-separated) or" \
+        "WAITLESS_CERT_DOMAIN (see script header)" >&2
+    exit 1
+fi
+# shellcheck disable=SC2206  # deliberate word-split into the domain list
+DOMAINS=($_domains_raw)
+PRIMARY="${DOMAINS[0]}"
 
 for tool in lego openssl; do
     if ! command -v "$tool" >/dev/null 2>&1; then
@@ -98,10 +124,9 @@ for tool in lego openssl; do
     fi
 done
 
-DOMAIN="$WAITLESS_CERT_DOMAIN"
 LEGO_DIR="/tmp/waitless-lego"
 CERT_DIR="$LEGO_DIR/certificates"
-OUT_DIR="$PROJECT_ROOT/apps/webserver/prod_certs"
+OUT_DIR="${WAITLESS_PROD_CERTS_DIR:-$PROJECT_ROOT/apps/webserver/prod_certs}"
 
 # --- Reuse an already-valid staged certificate ----------------------------
 #
@@ -134,10 +159,15 @@ staged_cert_reusable() {
     openssl x509 -in "$leaf" -inform DER -noout >/dev/null 2>&1 ||
         { echo "    staged leaf.der does not parse"; return 1; }
 
-    # Covers this exact domain? Compare whole SAN entries, not substrings.
-    openssl x509 -in "$leaf" -inform DER -noout -ext subjectAltName 2>/dev/null |
-        tr -d ' ' | tr ',' '\n' | grep -Fqx "DNS:$DOMAIN" ||
-        { echo "    staged cert does not cover $DOMAIN"; return 1; }
+    # Covers every requested domain? Compare whole SAN entries, not
+    # substrings — a multi-name request needs all names on the one cert.
+    local _san _d
+    _san="$(openssl x509 -in "$leaf" -inform DER -noout \
+        -ext subjectAltName 2>/dev/null | tr -d ' ' | tr ',' '\n')"
+    for _d in "${DOMAINS[@]}"; do
+        printf '%s\n' "$_san" | grep -Fqx "DNS:$_d" ||
+            { echo "    staged cert does not cover $_d"; return 1; }
+    done
 
     # Issued by the ACME environment we were asked for?
     local issuer
@@ -172,7 +202,7 @@ staged_cert_reusable() {
     return 0
 }
 
-echo "==> Checking prod_certs/ for a reusable certificate ($MODE / $DOMAIN)"
+echo "==> Checking prod_certs/ for a reusable certificate ($MODE / ${DOMAINS[*]})"
 if [ "${WAITLESS_FORCE_ISSUE:-0}" = "1" ]; then
     echo "    WAITLESS_FORCE_ISSUE=1 set — issuing a fresh certificate"
 elif staged_cert_reusable; then
@@ -181,17 +211,16 @@ elif staged_cert_reusable; then
     openssl x509 -in "$OUT_DIR/leaf.der" -inform DER -noout \
         -subject -issuer -dates 2>&1 | sed 's/^/    /'
     echo ""
-    echo "Done. Build the production image with:"
-    echo "    bazel build //apps/webserver:webserver_iso_x86_64 --define tls_cert=prod"
+    echo "Done. Build with --define tls_cert=prod to bake this cert in,"
     echo "or run scripts/renew-and-deploy.sh to build and deploy in one step."
     echo "(Set WAITLESS_FORCE_ISSUE=1 to issue a fresh certificate instead.)"
     exit 0
 fi
 
 echo "==> Issuing certificate"
-echo "    domain:  $DOMAIN"
-echo "    ACME CA: $MODE ($ACME_SERVER)"
-echo "    DNS:     Google Cloud DNS (project $GCE_PROJECT)"
+echo "    domain(s): ${DOMAINS[*]}"
+echo "    ACME CA:   $MODE ($ACME_SERVER)"
+echo "    DNS:       Google Cloud DNS (project $GCE_PROJECT)"
 
 # --- Run the ACME DNS-01 flow ---------------------------------------------
 #
@@ -213,12 +242,18 @@ export GCE_PROPAGATION_TIMEOUT="${GCE_PROPAGATION_TIMEOUT:-300}"
 # --path, so clear any prior run's files from the lego working dir to
 # force a fresh issuance. The ACME account in `accounts/` is kept and
 # reused (account registration is itself rate-limited).
-rm -f "$CERT_DIR/$DOMAIN".*
+rm -f "$CERT_DIR/$PRIMARY".*
 
+# One --domains flag per name: lego mints a single certificate whose
+# SAN carries them all, and names its output files after the first.
+_domain_args=()
+for _d in "${DOMAINS[@]}"; do
+    _domain_args+=(--domains "$_d")
+done
 lego run \
     --accept-tos \
     --email "$WAITLESS_CERT_EMAIL" \
-    --domains "$DOMAIN" \
+    "${_domain_args[@]}" \
     --dns gcloud \
     --key-type EC256 \
     --path "$LEGO_DIR" \
@@ -241,11 +276,11 @@ lego run \
 mkdir -p "$OUT_DIR"
 
 echo "==> Converting to DER → $OUT_DIR"
-openssl x509 -in "$CERT_DIR/$DOMAIN.crt" \
+openssl x509 -in "$CERT_DIR/$PRIMARY.crt" \
     -outform DER -out "$OUT_DIR/leaf.der"
-openssl x509 -in "$CERT_DIR/$DOMAIN.issuer.crt" \
+openssl x509 -in "$CERT_DIR/$PRIMARY.issuer.crt" \
     -outform DER -out "$OUT_DIR/intermediate.der"
-openssl pkey -in "$CERT_DIR/$DOMAIN.key" \
+openssl pkey -in "$CERT_DIR/$PRIMARY.key" \
     -outform DER -out "$OUT_DIR/key.der"
 
 echo ""
@@ -254,10 +289,9 @@ echo "    intermediate.der $(wc -c <"$OUT_DIR/intermediate.der" | tr -d ' ') byt
 echo "    key.der          $(wc -c <"$OUT_DIR/key.der" | tr -d ' ') bytes"
 echo ""
 echo "Certificate summary:"
-openssl x509 -in "$CERT_DIR/$DOMAIN.crt" -noout \
+openssl x509 -in "$CERT_DIR/$PRIMARY.crt" -noout \
     -subject -issuer -dates 2>&1 | sed 's/^/    /'
 
 echo ""
-echo "Done. Build the production image with:"
-echo "    bazel build //apps/webserver:webserver_iso_x86_64 --define tls_cert=prod"
+echo "Done. Build with --define tls_cert=prod to bake this cert in,"
 echo "or run scripts/renew-and-deploy.sh to build and deploy in one step."

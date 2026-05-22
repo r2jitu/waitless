@@ -13,7 +13,7 @@
 # hand any time or unattended from a host cron / CI schedule, e.g.:
 #
 #   # crontab — renew on the 1st of every other month, 04:17
-#   17 4 1 */2 *  WAITLESS_CERT_DOMAIN=example.com \
+#   17 4 1 */2 *  WAITLESS_CERT_DOMAINS=example.com \
 #                 WAITLESS_CERT_EMAIL=me@example.com \
 #                 GCE_PROJECT=my-proj \
 #                 /path/to/waitless/scripts/renew-and-deploy.sh prod \
@@ -30,8 +30,13 @@
 #   ./scripts/renew-and-deploy.sh staging   # LE staging (default)
 #   ./scripts/renew-and-deploy.sh prod      # LE production
 #
-# Env: see issue-cert.sh (WAITLESS_CERT_DOMAIN, WAITLESS_CERT_EMAIL,
-# GCE_PROJECT) and deploy-gcloud.sh (WAITLESS_GCE_* overrides).
+# Env: see issue-cert.sh (WAITLESS_CERT_DOMAINS, WAITLESS_CERT_EMAIL,
+# GCE_PROJECT, WAITLESS_PROD_CERTS_DIR) and deploy-gcloud.sh
+# (WAITLESS_GCE_* plus WAITLESS_DEPLOY_REPO / WAITLESS_BUILD_TARGET).
+# Deploying an external app — one in its own repo that consumes
+# waitless as a Bazel module — is just a matter of pointing
+# WAITLESS_DEPLOY_REPO / WAITLESS_BUILD_TARGET / WAITLESS_PROD_CERTS_DIR
+# at it; the pipeline is otherwise identical to the in-repo demo.
 
 set -euo pipefail
 
@@ -45,6 +50,11 @@ staging | prod) ;;
     exit 1
     ;;
 esac
+
+# Primary cert domain for the closing "verify" hint — first of the
+# WAITLESS_CERT_DOMAINS list, or the legacy single WAITLESS_CERT_DOMAIN.
+CERT_DOMAIN="${WAITLESS_CERT_DOMAINS:-${WAITLESS_CERT_DOMAIN:-}}"
+CERT_DOMAIN="${CERT_DOMAIN%% *}"
 
 echo "=========================================="
 echo "  Step 1/3 — issue certificate ($MODE)"
@@ -71,5 +81,5 @@ if [ "$MODE" = "staging" ]; then
     echo "    curl -kv https://<external-ip>/health"
     echo "    (staging certs chain to an untrusted root — -k or --cacert)"
 else
-    echo "    curl -v https://${WAITLESS_CERT_DOMAIN:-<domain>}/health"
+    echo "    curl -v https://${CERT_DOMAIN:-<domain>}/health"
 fi
