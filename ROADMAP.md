@@ -1443,27 +1443,57 @@ Remaining (not blocking a deploy):
       alternative for endpoints that don't need CA trust.
 - [ ] Encrypt the bundled private key at rest, decrypt at boot.
 
-### HTTP/3 over the GCE gve NIC crashes the unikernel
+### HTTP/3 over the GCE gve NIC crashed the unikernel — FIXED
 
-h3 works on the HVF runner (virtio-net) and passes the `test_hvf` h3
-scenarios, but on a real GCE instance with the `gve` NIC the first
-inbound QUIC packet halts the kernel: an unhandled page fault inside
-`talc::Talc::free` with `cr2 = -8` — `free()` handed a null/garbage
-pointer, i.e. heap corruption (a bad free) on the QUIC RX path.
+**Status: fixed** — handshake-CRYPTO fragmentation in
+`proto/quic/src/conn/tx.rs`.
 
-TCP over `gve` is unaffected — the bench workloads exercise it
-heavily — so only the UDP/QUIC consumption path is implicated, and it
-has never run on `gve` before (h3 was only ever exercised on the HVF
-virtio-net path).
+**Symptom.** h3 worked on the HVF runner (virtio-net) and passed the
+`test_hvf` h3 scenarios, but on a real GCE instance with the `gve`
+NIC the first inbound QUIC packet halted the kernel: an unhandled
+page fault inside `talc::Talc::free` with `cr2 = -8` — `free()`
+handed a null/garbage pointer, i.e. heap corruption.
 
-- [ ] Reproduce under a debug allocator / heap canaries to catch the
-      corrupting write rather than the downstream `free` fault.
-- [ ] Audit the QUIC datagram RX path's handling of `gve` RX IOBufs
-      (`External` device buffers vs `Heap`) — prime suspect is an
-      IOBuf ownership / drop-callback mismatch specific to `gve`.
+**Root cause — the QUIC encoder, not the RX path.**
+`encode_handshake_packet` packed the *entire* TLS server flight
+(EncryptedExtensions, Certificate, CertificateVerify, Finished) into
+one Handshake packet. With the 548-byte single dev cert the flight is
+~700 B and the datagram ~1 KB; with the production Let's Encrypt
+leaf+intermediate chain it is ~2.7 KB. The encoder writes into a
+`DatagramBuf::TxSlot` — a driver TX-pool slot wrapped in a `Vec` via
+`Vec::from_raw_parts` under a "never reallocate" contract. The
+oversized datagram overran the slot, the `Vec` reallocated, and the
+realloc freed the slot pointer (NIC DMA memory, not a heap block)
+through the allocator => heap corruption, surfacing downstream as the
+`talc::free` fault. It looked "gve-specific" only because the prod
+cert chain had never run anywhere but the gve deploy — the same
+overrun corrupts virtio-net's slot too.
 
-**Trigger**: when h3 is wanted on a GCE deployment. Until then the
-deploy keeps `udp:443` firewall-closed (`scripts/deploy-gcloud.sh`).
+**Fix.**
+
+- [x] `flush_outbound` fragments the Handshake CRYPTO stream across
+      MTU-bounded packets/datagrams (`HS_CRYPTO_BUDGET`), each
+      carrying its offset in the stream (RFC 9001 §4.1.3) — the
+      standard QUIC behaviour `encode_one_rtt_packet` already
+      followed. A small fixed-size drain buffer makes an oversized
+      handshake packet structurally unrepresentable.
+- [x] `take_datagram_buf` only takes the zero-copy `TxSlot` path
+      when the slot capacity clears `MAX_QUIC_DATAGRAM`;
+      `DatagramBuf::into_tx_handle` asserts the `Vec` did not
+      realloc off the driver slot — silent heap corruption becomes a
+      named fail-stop.
+- [x] Host regression test
+      `quic_test::handshake_flight_fragments_across_mtu_datagrams`
+      drives a handshake with a large multi-cert chain and asserts
+      every datagram stays within `MAX_QUIC_DATAGRAM` — catches a
+      regression without needing GCE.
+
+`scripts/deploy-gcloud.sh` opens `udp:443`. **Verified on the live
+`waitless-dev` GCE instance** (n2-highcpu-2, gVNIC, `GQI_QPL`,
+production leaf+intermediate cert chain): 71 HTTP/3 requests — a
+single first request, then 40 sequential and 30 concurrent full
+QUIC handshakes — all served `200`, serial console clean, no
+`talc::free` fault.
 
 ### x86_64 SSE / AVX baseline via custom target JSON
 

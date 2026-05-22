@@ -324,17 +324,28 @@ deploy() {
         --project="$PROJECT" \
         --quiet
 
-    # Only tcp:80 / tcp:443. HTTP/3 (QUIC, udp:443) is deliberately NOT
-    # opened: QUIC RX over the GCE gve NIC currently halts the unikernel
-    # (a bad free in the talc allocator — see the deferred-work note in
-    # ROADMAP.md). Until that is fixed, opening udp:443 lets any QUIC
-    # packet crash the server. The h3 listener still binds inside the
-    # guest; it is simply unreachable, and Chrome falls back to TCP.
+    # tcp:80, tcp:443, and udp:443 (HTTP/3 / QUIC). udp:443 was once
+    # held closed because QUIC over the GCE gve NIC halted the
+    # unikernel — the QUIC encoder packed the whole TLS server flight
+    # into one oversized datagram, which on the zero-copy TX-slot send
+    # path reallocated a Vec off the driver's TX-pool slot and
+    # corrupted the heap (surfaced as a talc::free fault). Fixed: the
+    # Handshake CRYPTO stream is now fragmented across MTU-bounded
+    # packets (proto/quic; see ROADMAP.md and the regression test
+    # quic_test::handshake_flight_fragments_across_mtu_datagrams).
+    #
+    # `create` if the rule is absent, else `update` it — so an
+    # existing instance previously deployed with udp:443 closed picks
+    # up the new port without a purge.
     gcloud compute firewall-rules create allow-http-waitless \
-        --allow=tcp:80,tcp:443 \
+        --allow=tcp:80,tcp:443,udp:443 \
         --target-tags=http-server \
         --project="$PROJECT" \
-        --quiet 2>/dev/null || true
+        --quiet 2>/dev/null \
+    || gcloud compute firewall-rules update allow-http-waitless \
+        --allow=tcp:80,tcp:443,udp:443 \
+        --project="$PROJECT" \
+        --quiet
 
     local ip
     ip="$(gcloud compute instances describe "$NAME" \
