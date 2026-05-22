@@ -225,8 +225,9 @@ their invariant inputs, and a `write_obs_json` is wired into `/obs`.
 doctrine for another subsystem should read these and mirror them:
 
 - **`src/diag.rs`** — the `Counters` struct (every field a
-  `Counter`), the `LastEvent` snapshot slots, the snapshot record
-  types with their `ObsRecord` impls, and `write_obs_json`. This is
+  `Counter`), the `LastEvent` snapshot slots, the `LatencyHist`s,
+  the record types with their `ObsRecord` impls, the `quic_drop!` /
+  `quic_event!` / `quic_bug!` macros, and `write_obs_json`. This is
   the template.
 - **`src/conn/rx.rs`** — capturing received `CONNECTION_CLOSE`
   `error_code` / `frame_type` / `reason` that the frame dispatcher
@@ -235,6 +236,11 @@ doctrine for another subsystem should read these and mirror them:
   loop-exit paths bumps an exit-reason counter and the last one
   records a `ConnExitRecord` carrying `last_recv_age_us` and
   `idle_us` — the invariant inputs the h3 bug needed (principles 2,
-  3).
+  3). Also the `quic_bug!` invariant sites (`rng_failed`) and the
+  per-datagram `inbox_wait` sample.
+- **`src/streams.rs` + `src/conn/mod.rs`** — the structural
+  correlation for `request_latency`: a `rx_us` timestamp threaded
+  `Datagram` → `RecvStream` → `SendStream` (shared `sid`), recorded
+  at `SendStream::enter_fin_sent`.
 - **`apps/webserver/src/endpoints.rs`** — `/quic_stats` and `/obs`,
   both rendering via `quic::diag::write_obs_json`.
