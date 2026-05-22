@@ -7,9 +7,10 @@
 #   2. bazel build     — webserver_iso with `--define tls_cert=prod`
 #   3. deploy-gcloud.sh — upload the image and relaunch the GCE VM
 #
-# Let's Encrypt certificates are valid 90 days; run this around day
-# 60. Designed to be invoked by hand for now; a host cron or a CI
-# schedule can call it unattended later, e.g.:
+# Let's Encrypt certificates are valid 90 days. issue-cert.sh reuses
+# the staged cert and re-issues only once it nears expiry (default:
+# under 30 days left), so this script is idempotent — safe to run by
+# hand any time or unattended from a host cron / CI schedule, e.g.:
 #
 #   # crontab — renew on the 1st of every other month, 04:17
 #   17 4 1 */2 *  WAITLESS_CERT_DOMAIN=example.com \

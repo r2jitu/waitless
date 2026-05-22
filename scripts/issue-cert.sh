@@ -19,6 +19,13 @@
 # them in (see apps/webserver/BUILD.bazel). The files are gitignored
 # — issuance never edits tracked source.
 #
+# Issuance is skipped when prod_certs/ already holds a certificate
+# that covers the domain, matches the requested ACME environment, and
+# is not yet within its renewal window: re-issuing an equivalent cert
+# would only burn a Let's Encrypt rate-limit slot. This makes the
+# script idempotent and safe to run unattended. WAITLESS_FORCE_ISSUE=1
+# overrides it; see "Reuse an already-valid staged certificate" below.
+#
 # Usage:
 #   ./scripts/issue-cert.sh staging   # Let's Encrypt staging (default)
 #   ./scripts/issue-cert.sh prod      # Let's Encrypt production
@@ -46,6 +53,11 @@
 #                             lego falls back to application-default
 #                             credentials (`gcloud auth
 #                             application-default login`).
+#   WAITLESS_RENEW_DAYS       reuse the staged cert until fewer than
+#                             this many days of validity remain
+#                             (default 30).
+#   WAITLESS_FORCE_ISSUE      set to 1 to always issue a fresh cert,
+#                             even when a valid one is already staged.
 
 set -euo pipefail
 
@@ -91,6 +103,91 @@ LEGO_DIR="/tmp/waitless-lego"
 CERT_DIR="$LEGO_DIR/certificates"
 OUT_DIR="$PROJECT_ROOT/apps/webserver/prod_certs"
 
+# --- Reuse an already-valid staged certificate ----------------------------
+#
+# A `--define tls_cert=prod` build bakes whatever DER files sit in
+# prod_certs/ straight into the image. If that directory already holds
+# a certificate that covers this domain, was issued by the requested
+# ACME environment, and is not yet inside its renewal window, issuing
+# again is pure waste — it spends one of Let's Encrypt's five
+# duplicate-certs-per-week slots to mint an equivalent cert. Detect
+# that and reuse what is staged, which also makes this script
+# idempotent and safe to run on a schedule.
+#
+#   WAITLESS_RENEW_DAYS     re-issue once fewer than this many days of
+#                           validity remain (default 30 — LE certs are
+#                           valid 90 days; renewal is due around day 60).
+#   WAITLESS_FORCE_ISSUE=1  always issue, ignoring any staged cert.
+#
+# The ACME-environment check is load-bearing, not cosmetic: staging
+# and production certs share the same prod_certs/ filenames, so
+# without it a prior `staging` run's cert could be silently reused for
+# a `prod` deploy. Staging Let's Encrypt issuers carry "(STAGING)" in
+# their name; production issuers do not.
+RENEW_DAYS="${WAITLESS_RENEW_DAYS:-30}"
+
+staged_cert_reusable() {
+    local leaf="$OUT_DIR/leaf.der"
+    [ -s "$leaf" ] && [ -s "$OUT_DIR/intermediate.der" ] && [ -s "$OUT_DIR/key.der" ] ||
+        { echo "    prod_certs/ has no complete staged cert"; return 1; }
+
+    openssl x509 -in "$leaf" -inform DER -noout >/dev/null 2>&1 ||
+        { echo "    staged leaf.der does not parse"; return 1; }
+
+    # Covers this exact domain? Compare whole SAN entries, not substrings.
+    openssl x509 -in "$leaf" -inform DER -noout -ext subjectAltName 2>/dev/null |
+        tr -d ' ' | tr ',' '\n' | grep -Fqx "DNS:$DOMAIN" ||
+        { echo "    staged cert does not cover $DOMAIN"; return 1; }
+
+    # Issued by the ACME environment we were asked for?
+    local issuer
+    issuer="$(openssl x509 -in "$leaf" -inform DER -noout -issuer 2>/dev/null)"
+    case "$MODE:$issuer" in
+    prod:*'(STAGING)'*)
+        echo "    staged cert is a STAGING cert, but prod was requested"
+        return 1
+        ;;
+    staging:*'(STAGING)'*) ;;
+    staging:*)
+        echo "    staged cert is a production cert, but staging was requested"
+        return 1
+        ;;
+    esac
+
+    # Enough validity left to skip renewal?
+    openssl x509 -in "$leaf" -inform DER -noout \
+        -checkend "$((RENEW_DAYS * 86400))" >/dev/null 2>&1 ||
+        { echo "    staged cert expires within ${RENEW_DAYS} days — renewal is due"; return 1; }
+
+    # Does key.der actually belong to this leaf? A mismatch builds
+    # cleanly and then fails the TLS handshake at boot.
+    local leaf_pub key_pub
+    leaf_pub="$(openssl x509 -in "$leaf" -inform DER -noout -pubkey 2>/dev/null |
+        openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256)"
+    key_pub="$(openssl pkey -in "$OUT_DIR/key.der" -inform DER -pubout -outform DER 2>/dev/null |
+        openssl dgst -sha256)"
+    [ -n "$leaf_pub" ] && [ "$leaf_pub" = "$key_pub" ] ||
+        { echo "    staged key.der does not match leaf.der"; return 1; }
+
+    return 0
+}
+
+echo "==> Checking prod_certs/ for a reusable certificate ($MODE / $DOMAIN)"
+if [ "${WAITLESS_FORCE_ISSUE:-0}" = "1" ]; then
+    echo "    WAITLESS_FORCE_ISSUE=1 set — issuing a fresh certificate"
+elif staged_cert_reusable; then
+    echo ""
+    echo "==> Reusing the staged certificate — no ACME issuance needed."
+    openssl x509 -in "$OUT_DIR/leaf.der" -inform DER -noout \
+        -subject -issuer -dates 2>&1 | sed 's/^/    /'
+    echo ""
+    echo "Done. Build the production image with:"
+    echo "    bazel build //apps/webserver:webserver_iso_x86_64 --define tls_cert=prod"
+    echo "or run scripts/renew-and-deploy.sh to build and deploy in one step."
+    echo "(Set WAITLESS_FORCE_ISSUE=1 to issue a fresh certificate instead.)"
+    exit 0
+fi
+
 echo "==> Issuing certificate"
 echo "    domain:  $DOMAIN"
 echo "    ACME CA: $MODE ($ACME_SERVER)"
@@ -110,12 +207,12 @@ echo "    DNS:     Google Cloud DNS (project $GCE_PROJECT)"
 export GCE_PROJECT
 export GCE_PROPAGATION_TIMEOUT="${GCE_PROPAGATION_TIMEOUT:-300}"
 
-# `lego run` skips issuance if a certificate for the domain already
-# exists under --path, so clear any prior run's certificate files —
-# every invocation must obtain a fresh cert. The ACME account in
-# `accounts/` is kept and reused (account registration is itself
-# rate-limited). Without this, a staging run leaves files that make a
-# later `prod` run silently skip, redeploying the stale staging cert.
+# We only reach here once the reuse check above has determined a
+# fresh certificate is genuinely needed. `lego run` itself skips
+# issuance when a certificate for the domain already exists under
+# --path, so clear any prior run's files from the lego working dir to
+# force a fresh issuance. The ACME account in `accounts/` is kept and
+# reused (account registration is itself rate-limited).
 rm -f "$CERT_DIR/$DOMAIN".*
 
 lego run \
