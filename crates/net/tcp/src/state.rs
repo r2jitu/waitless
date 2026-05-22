@@ -1008,12 +1008,18 @@ impl TcpConnection {
 
     // ─── RFC 5681 congestion control ─────────────────────────────────────
 
-    /// Initialise the congestion window at connection start. RFC 5681
-    /// §3.1: for our SMSS (1440/1460 B, in the 1095 < SMSS ≤ 2190
-    /// band) the initial window is 3·SMSS. `ssthresh` starts
-    /// effectively infinite so the connection opens in slow start.
+    /// Initialise the congestion window at connection start.
+    /// RFC 6928: the initial window is `min(10·SMSS, max(2·SMSS,
+    /// 14600))` — for our SMSS (1440/1460 B) that works out to
+    /// 10·SMSS, the initial window Linux has defaulted to since
+    /// 2013. (RFC 5681 §3.1's older 3·SMSS is the lower bound
+    /// RFC 6928 raised: a larger IW saves a fresh connection several
+    /// slow-start round-trips on the first response.) `ssthresh`
+    /// starts effectively infinite so the connection opens in slow
+    /// start.
     pub(crate) fn congestion_init(&mut self) {
-        self.cwnd = 3 * mss_for(self.local_ip) as u32;
+        let smss = mss_for(self.local_ip) as u32;
+        self.cwnd = (10 * smss).min((2 * smss).max(14600));
         self.ssthresh = u32::MAX;
     }
 

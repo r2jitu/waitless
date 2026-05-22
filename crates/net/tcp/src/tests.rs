@@ -902,9 +902,9 @@ fn rtt_estimator_tracks_rfc6298() {
 
 // ---- RFC 5681 congestion control — pure controller arithmetic ---------
 
-/// RFC 5681 §3.1 slow start: the initial window is 3·SMSS for our
-/// segment size, and each ACK opens `cwnd` by one SMSS — so the
-/// window doubles over each RTT's worth of ACKs (exponential).
+/// RFC 5681 §3.1 slow start: each ACK opens `cwnd` by one SMSS — so
+/// the window doubles over each RTT's worth of ACKs (exponential).
+/// The initial window itself is the RFC 6928 IW10 (`congestion_init`).
 #[test]
 fn slow_start_grows_cwnd_one_segment_per_ack() {
     // The controller arithmetic is pure — exercise it on a bare TCB.
@@ -912,7 +912,7 @@ fn slow_start_grows_cwnd_one_segment_per_ack() {
     c.congestion_init();
     let smss = 1460u32; // MSS_V4 — `new()` leaves `local_ip` IPv4.
 
-    assert_eq!(c.cwnd, 3 * smss, "the initial window is 3·SMSS");
+    assert_eq!(c.cwnd, 14600, "the initial window is the RFC 6928 IW10 (10·SMSS)");
     assert!(c.cwnd < c.ssthresh, "a fresh connection opens in slow start");
 
     let before = c.cwnd;
@@ -1715,21 +1715,21 @@ fn total_tx_payload() -> usize {
 #[test]
 fn usable_window_arithmetic() {
     let mut c = TcpConnection::new();
-    c.congestion_init(); // cwnd = 3·MSS_V4 = 4380 (new() leaves IPv4)
+    c.congestion_init(); // cwnd = RFC 6928 IW10 = 14600 (new() leaves IPv4)
     let smss = 1460u32;
     c.snd_wnd = 65535;
     c.snd_una = 1000;
     c.snd_nxt = 1000;
     assert_eq!(c.flight(), 0);
-    assert_eq!(c.usable_window(), 3 * smss, "an idle conn may send a full cwnd");
+    assert_eq!(c.usable_window(), 14600, "an idle conn may send a full cwnd");
 
     // In-flight bytes are subtracted from the window.
     c.snd_nxt = 1000u32.wrapping_add(2 * smss);
     assert_eq!(c.flight(), 2 * smss);
-    assert_eq!(c.usable_window(), smss, "in-flight bytes consume the window");
+    assert_eq!(c.usable_window(), 14600 - 2 * smss, "in-flight bytes consume the window");
 
     // A full congestion window closes the send window.
-    c.snd_nxt = 1000u32.wrapping_add(3 * smss);
+    c.snd_nxt = 1000u32.wrapping_add(10 * smss); // 10·SMSS == IW10
     assert_eq!(c.usable_window(), 0, "a full cwnd closes the window");
 
     // The advertised receive window caps the send window below cwnd.
@@ -1744,10 +1744,10 @@ fn usable_window_arithmetic() {
     assert_eq!(c.usable_window(), 0, "an over-shrunk window saturates at 0");
 }
 
-/// RFC 5681 §3.1: a fresh `Established` connection opens at the
-/// initial window of 3·SMSS — and exactly that. The 3-way handshake
+/// A fresh `Established` connection opens at the RFC 6928 initial
+/// window (IW10 = 10·SMSS) — and exactly that. The 3-way handshake
 /// ACK acknowledges the SYN's sequence number, but the SYN is not
-/// data (RFC 5681 §2), so it must not inflate `cwnd`.
+/// data (RFC 5681 §2), so it must not inflate `cwnd` past the IW.
 #[test]
 fn congestion_window_opens_at_the_initial_window() {
     let _g = harness();
@@ -1759,9 +1759,9 @@ fn congestion_window_opens_at_the_initial_window() {
     let (cwnd, _) = conn_cwnd_ssthresh(CP, SP);
     assert_eq!(
         cwnd,
-        3 * 1460,
-        "cwnd opens at exactly 3·SMSS — the handshake ACK of the SYN \
-         must not count as a data ACK",
+        14600,
+        "cwnd opens at exactly the RFC 6928 IW10 (10·SMSS) — the \
+         handshake ACK of the SYN must not count as a data ACK",
     );
 }
 
@@ -1847,7 +1847,7 @@ fn ack_reopens_the_send_window() {
     let server_isn = handshake(SP, CP, CLIENT_ISN);
 
     let (handle, generation) = conn_handle(CP, SP);
-    let mut chain = iobuf::IOBufChain::from(vec![0u8; 10_000]);
+    let mut chain = iobuf::IOBufChain::from(vec![0u8; 25_000]);
     let first = super::async_try_send_chain(handle, generation, &mut chain).unwrap() as u32;
     assert!(first > 0, "the first send fills the window");
 
@@ -1868,7 +1868,7 @@ fn ack_reopens_the_send_window() {
     let second = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
     assert_eq!(
         second as u32,
-        10_000 - first,
+        25_000 - first,
         "the ACK-reopened window drains the rest",
     );
     assert!(chain.is_empty(), "the whole body is now on the wire");
@@ -1887,7 +1887,7 @@ fn closed_window_wakes_parked_sender() {
     let server_isn = handshake(SP, CP, CLIENT_ISN);
 
     let (handle, generation) = conn_handle(CP, SP);
-    let mut chain = iobuf::IOBufChain::from(vec![0u8; 10_000]);
+    let mut chain = iobuf::IOBufChain::from(vec![0u8; 25_000]);
     let first = super::async_try_send_chain(handle, generation, &mut chain).unwrap() as u32;
 
     // The window is closed — the reactor would park the send waker.
@@ -1922,8 +1922,8 @@ fn send_respects_advertised_rwnd() {
     super::listen_on_core(0, SP);
     let server_isn = handshake(SP, CP, CLIENT_ISN);
 
-    // The peer advertises a 2000-byte window — below the 4380-byte
-    // initial cwnd.
+    // The peer advertises a 2000-byte window — far below the
+    // 14600-byte initial cwnd.
     deliver(&Seg {
         src_port: CP,
         dst_port: SP,
