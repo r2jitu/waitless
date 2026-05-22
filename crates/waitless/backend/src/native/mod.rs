@@ -1080,6 +1080,12 @@ pub fn kernel_obs_json(w: &mut dyn core::fmt::Write) {
     let _ = w.write_str("{}");
 }
 
+/// Native stub for the network-stack observability block — no
+/// bare-metal stack on native. Mirrors `bare::net_obs_json`.
+pub fn net_obs_json(w: &mut dyn core::fmt::Write) {
+    let _ = w.write_str("{}");
+}
+
 // ---- Diag-capture stubs (native has no kernel panic to capture) ----
 
 pub fn diag_append(_bytes: &[u8]) {}

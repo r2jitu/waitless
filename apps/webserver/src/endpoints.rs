@@ -473,6 +473,8 @@ pub(crate) fn obs_response() -> Response {
         waitless::diagnostics::runtime_obs_json(&mut w);
         let _ = w.write_str(",\"kernel\":");
         waitless::diagnostics::kernel_obs_json(&mut w);
+        let _ = w.write_str(",\"net\":");
+        waitless::diagnostics::net_obs_json(&mut w);
         let _ = w.write_str("}");
     }
     Response::ok(&b"application/json"[..], body)

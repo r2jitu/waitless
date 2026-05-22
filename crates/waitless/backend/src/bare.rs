@@ -90,6 +90,13 @@ pub fn kernel_obs_json(w: &mut dyn core::fmt::Write) {
     let _ = kernel_bare::mm::write_obs_json(w);
 }
 
+/// Render the network-stack observability block (`net_stack::diag` —
+/// L2/L3 RX-dispatch drops) as JSON into `w`. The native backend
+/// has no bare-metal `net` stack and stubs this `{}`.
+pub fn net_obs_json(w: &mut dyn core::fmt::Write) {
+    let _ = net_stack::diag::write_obs_json(w);
+}
+
 // ---- Event loop re-exports ------------------------------------------------
 
 pub use kernel_bare::eventloop::{request_shutdown, set_ready};

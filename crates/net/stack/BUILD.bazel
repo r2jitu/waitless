@@ -9,6 +9,7 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "stack",
     srcs = [
+        "src/diag.rs",
         "src/ipv6_nd.rs",
         "src/lib.rs",
         "src/rx.rs",
@@ -34,5 +35,7 @@ rust_library(
         "//crates/net/tcp",
         "//crates/runtime/executor",
         "//crates/util/iobuf",
+        # `obs::{Counter, LastEvent}` — observability (`docs/observability.md`).
+        "//crates/util/obs",
     ],
 )

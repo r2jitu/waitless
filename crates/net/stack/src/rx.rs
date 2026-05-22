@@ -51,7 +51,7 @@ pub(crate) fn net_receive(chain: Chain<OwnedIOBuf>) {
             }
         }
         Classified::Ip(parsed) => deliver(parsed, chain),
-        Classified::Drop => {}
+        Classified::Drop => crate::diag::record_classified_drop(frame),
     }
 }
 
@@ -112,7 +112,7 @@ pub(crate) fn distribute_frame(chain: Chain<OwnedIOBuf>) {
                 }
             }
         }
-        Classified::Drop => {}
+        Classified::Drop => crate::diag::record_classified_drop(frame),
     }
 }
 
@@ -171,7 +171,7 @@ pub(crate) fn deliver(parsed: types::ParsedL3, chain: Chain<OwnedIOBuf>) {
             }
         }
         // Any other L4 protocol — no handler; `chain` drops, reposting.
-        _ => {}
+        _ => crate::diag::COUNTERS.unknown_l4.bump(),
     }
 }
 

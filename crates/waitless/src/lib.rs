@@ -373,6 +373,13 @@ pub mod diagnostics {
         waitless_backend::kernel_obs_json(w)
     }
 
+    /// Render the network-stack observability block (`net_stack::diag`
+    /// — L2/L3 RX-dispatch drops) as JSON into `w`. Real on
+    /// bare-metal, `{}` on native.
+    pub fn net_obs_json(w: &mut dyn core::fmt::Write) {
+        waitless_backend::net_obs_json(w)
+    }
+
     /// TX-side hot-path counters: per-qp packet counts + small/big
     /// pool saturation + scan-depth aggregates. `None` when no
     /// driver is bound or the active driver hasn't wired the
