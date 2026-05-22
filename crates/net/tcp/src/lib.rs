@@ -39,6 +39,7 @@ extern crate net_checksum as checksum;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 
+pub mod diag;
 mod listener;
 mod pool;
 mod receive;
@@ -57,7 +58,6 @@ pub use listener::{
     clear_send_waker, close, do_recv_chunk, init, is_readable_or_closed, listen_on_core,
     register_recv_waker, register_send_waker, set_chunk_buf_slot, set_recv_buf_slot, shutdown_all,
 };
-pub use pool::{RX_CHUNK_RING_DRAIN, RX_CHUNK_STASH_HITS, TCP_SYN_RX, TCP_SYNACK_TX};
 pub use receive::tcp_receive;
 pub use retransmit::{has_armed_timers, on_tcp_tick};
 pub use send::{async_try_send_chain, try_send_tso};

@@ -1056,6 +1056,12 @@ pub fn tcp_diag() -> crate::TcpDiag {
     crate::TcpDiag::default()
 }
 
+/// Native stub for the TCP observability block — no `net` stack, so
+/// the `/obs` `"tcp"` object is empty. Mirrors `bare::tcp_obs_json`.
+pub fn tcp_obs_json(w: &mut dyn core::fmt::Write) {
+    let _ = w.write_str("{}");
+}
+
 // ---- Diag-capture stubs (native has no kernel panic to capture) ----
 
 pub fn diag_append(_bytes: &[u8]) {}

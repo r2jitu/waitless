@@ -4,7 +4,6 @@
 
 use crate::state::{MAX_SEGMENTS, NULL_SLOT, SEGMENT_SIZE, TcpConnection, TcpState};
 use alloc::boxed::Box;
-use core::sync::atomic::AtomicU64;
 use types::IpAddr;
 
 // Per-core connection pools. Core N owns POOLS[N].
@@ -197,32 +196,9 @@ impl TcpHashCore {
 pub(crate) static TCP_HASH: kernel_core::percpu::PerWorker<TcpHashCore> =
     kernel_core::percpu::PerWorker::new();
 
-/// Count of SYN (no-ACK) packets we see reach `tcp_receive` —
-/// diagnostic: compare against the bench client's SYN-sent count
-/// to detect ingress-side drops below the TCP stack (driver/NIC).
-pub static TCP_SYN_RX: AtomicU64 = AtomicU64::new(0);
-/// Count of SYN-ACK segments we emit via `send_segment` in
-/// response to a SYN. Compare against bench-client SYN-ACK
-/// received to distinguish egress (fabric/strand) drops.
-pub static TCP_SYNACK_TX: AtomicU64 = AtomicU64::new(0);
-
-/// RX item H verification counters. `do_recv_chunk` resolves a
-/// `recv_chunk` call by one of two paths:
-///   * the zero-copy **stash** — a device RX buffer `tcp_receive`
-///     moved straight into `pending_chunk`, surfaced as an
-///     `External` IOBuf with no copy;
-///   * the **ring-drain** fallback — the per-conn `rx_ring` copied
-///     into a fresh `Heap` IOBuf.
-///
-/// `stash / (stash + ring_drain)` is the live measure of how often
-/// the streaming-body `recv_chunk` path is actually zero-copy — the
-/// signal item H's HVF-vs-GCE divergence needs to settle (item H
-/// won +13.6% on HVF but was flat on GCE; the hypothesis is that
-/// GCE segment bursts keep the ring non-empty so the fallback
-/// dominates — these counters confirm or refute it). Surfaced via
-/// `/stats` as `rx_chunk_stash_hits` / `rx_chunk_ring_drain`.
-pub static RX_CHUNK_STASH_HITS: AtomicU64 = AtomicU64::new(0);
-pub static RX_CHUNK_RING_DRAIN: AtomicU64 = AtomicU64::new(0);
+// TCP diagnostic counters moved to `crate::diag` (the observability
+// doctrine — `docs/observability.md`). `syn_rx` / `synack_tx` and the
+// `rx_chunk_*` zero-copy pair now live in `diag::COUNTERS`.
 
 #[inline]
 pub(crate) fn tcp_hash_key(src_ip: IpAddr, src_port: u16, dst_port: u16) -> u64 {
@@ -489,6 +465,8 @@ pub(crate) fn alloc_connection(core: u32) -> Option<usize> {
             if c.state == state {
                 // free_connection bumps generation, resets the slot,
                 // and pushes onto the free list. Re-pop and return.
+                // The reclaim is a forced teardown — trace it.
+                crate::diag::record_teardown(crate::diag::TeardownReason::PoolReclaim, state);
                 free_connection(core, i);
                 return pool.alloc().map(|s| s as usize);
             }

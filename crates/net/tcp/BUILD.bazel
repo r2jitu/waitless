@@ -12,6 +12,7 @@ rust_library(
     name = "tcp",
     srcs = [
         "src/lib.rs",
+        "src/diag.rs",
         "src/listener.rs",
         "src/pool.rs",
         "src/receive.rs",

@@ -453,11 +453,15 @@ pub(crate) fn quic_stats_response() -> Response {
 /// `docs/observability.md`). `/quic_stats` is the QUIC-only view of
 /// the same `write_obs_json` output.
 pub(crate) fn obs_response() -> Response {
-    let mut body = http::body_iobuf(4096);
+    // 8 KiB covers the QUIC block (counters + snapshots + latency
+    // histograms) plus the TCP block, with margin. Slow path.
+    let mut body = http::body_iobuf(8192);
     {
         let mut w = body.writer();
         let _ = w.write_str("{\"quic\":");
         let _ = quic::diag::write_obs_json(&mut w);
+        let _ = w.write_str(",\"tcp\":");
+        waitless::diagnostics::tcp_obs_json(&mut w);
         let _ = w.write_str("}");
     }
     Response::ok(&b"application/json"[..], body)

@@ -4,8 +4,8 @@
 // or hands the device buffer to a parked `recv_chunk` consumer.
 
 use crate::pool::{
-    TCP_SYN_RX, TCP_SYNACK_TX, alloc_connection, conn_ptr, free_connection, next_seq,
-    pool_capacity, tcp_hash_find, tcp_hash_insert, tcp_hash_key, tcp_linear_find,
+    alloc_connection, conn_ptr, free_connection, next_seq, pool_capacity, tcp_hash_find,
+    tcp_hash_insert, tcp_hash_key, tcp_linear_find,
 };
 use crate::send::{SegmentMeta, send_rst, send_segment};
 use crate::state::{
@@ -74,7 +74,17 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
                 && c.local_port == dst_port
                 && c.remote_port == src_port
             {
-                if seq == c.rcv_nxt {
+                // RFC 5961 §3.2: only an in-sequence RST tears the
+                // connection down. Trace it either way — an
+                // out-of-window RST is a blind off-path injection we
+                // (correctly) dropped, and `LAST_RST.in_window`
+                // distinguishes the two.
+                let in_window = seq == c.rcv_nxt;
+                let state = c.state;
+                let rcv_nxt = c.rcv_nxt;
+                crate::diag::record_rst(src_port, dst_port, seq, rcv_nxt, in_window, state);
+                if in_window {
+                    crate::diag::record_teardown(crate::diag::TeardownReason::PeerReset, state);
                     free_connection(core, i);
                 }
                 return;
@@ -85,7 +95,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
 
     // SYN — new connection from client
     if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
-        TCP_SYN_RX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::diag::COUNTERS.syn_rx.bump();
         // Single pool walk: find the `Listen` slot for `dst_port`,
         // and also spot any existing connection already on this
         // exact 4-tuple. A SYN on a live 4-tuple is the peer
@@ -143,7 +153,12 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
         // Allocate new connection on this core
         let slot = match alloc_connection(core) {
             Some(i) => i,
-            None => return,
+            None => {
+                // No free slot and nothing reclaimable — the SYN is
+                // dropped. Genuinely unexpected below the pool ceiling.
+                crate::diag::COUNTERS.pool_exhausted.bump();
+                return;
+            }
         };
 
         {
@@ -153,7 +168,9 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             // the connection rather than proceeding with a missing
             // ring that would silently drop every payload byte.
             if !c.ensure_rx_ring() {
+                let state = c.state;
                 send_rst(dst_ip, src_ip, dst_port, src_port, 0, seq + 1);
+                crate::diag::record_teardown(crate::diag::TeardownReason::RxRingOom, state);
                 free_connection(core, slot);
                 return;
             }
@@ -206,7 +223,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
                 },
                 &[],
             );
-            TCP_SYNACK_TX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            crate::diag::COUNTERS.synack_tx.bump();
         }
         unsafe {
             let cp = conn_ptr(core, slot);
@@ -266,6 +283,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             && seq_lt(c.snd_una, c.snd_nxt);
         if c.state == TcpState::SynReceived {
             c.state = TcpState::Established;
+            crate::diag::COUNTERS.conns_established.bump();
             c.snd_una = ack;
             // Wake any async `TcpListener::accept` awaiting on this
             // port. Runs on the core that received the 3-way-ACK,
@@ -275,6 +293,10 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             executor::reactor::deliver_tcp_ready(port);
         } else if c.state == TcpState::LastAck && ack == c.snd_nxt {
             // The peer acknowledged our FIN — passive close complete.
+            crate::diag::record_teardown(
+                crate::diag::TeardownReason::PassiveClose,
+                TcpState::LastAck,
+            );
             // The `ack == snd_nxt` guard matters: a peer retransmitting
             // its own FIN (because it never saw our ACK of it) carries
             // an `ack` below `snd_nxt`, and must not free the slot

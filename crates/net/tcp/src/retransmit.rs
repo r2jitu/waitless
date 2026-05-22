@@ -33,9 +33,11 @@ pub fn on_tcp_tick() {
         // RFC 6298 data retransmission.
         if c.rtx_deadline_ms != 0 && now >= c.rtx_deadline_ms {
             if c.rtx_backoff >= RTX_MAX_RETRIES {
+                crate::diag::record_teardown(crate::diag::TeardownReason::RtxGiveup, c.state);
                 free_connection(core, i);
                 continue;
             }
+            crate::diag::COUNTERS.data_retransmits.bump();
             c.retransmit_oldest(now);
         }
 
@@ -47,14 +49,23 @@ pub fn on_tcp_tick() {
                     if c.fin_retx_count >= FIN_RETX_MAX {
                         // The peer never acknowledged our FIN — give
                         // up rather than leak the half-closed slot.
+                        crate::diag::record_teardown(
+                            crate::diag::TeardownReason::FinGiveup,
+                            c.state,
+                        );
                         free_connection(core, i);
                     } else {
+                        crate::diag::COUNTERS.fin_retransmits.bump();
                         c.retransmit_fin(now);
                     }
                 }
                 TcpState::TimeWait => {
                     // 2×MSL elapsed — the window for a delayed
                     // duplicate or a retransmitted peer FIN is over.
+                    crate::diag::record_teardown(
+                        crate::diag::TeardownReason::TimeWaitExpiry,
+                        TcpState::TimeWait,
+                    );
                     free_connection(core, i);
                 }
                 // A lifecycle deadline armed on a state that no longer

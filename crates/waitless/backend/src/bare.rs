@@ -50,13 +50,22 @@ pub fn gve_diag() -> crate::GveDiag {
 /// application reads them through `waitless::diagnostics` without a
 /// direct dependency on the `os:none` `net` crate.
 pub fn tcp_diag() -> crate::TcpDiag {
-    use core::sync::atomic::Ordering::Relaxed;
+    let c = &tcp::diag::COUNTERS;
     crate::TcpDiag {
-        syn_rx: tcp::TCP_SYN_RX.load(Relaxed),
-        synack_tx: tcp::TCP_SYNACK_TX.load(Relaxed),
-        rx_chunk_stash_hits: tcp::RX_CHUNK_STASH_HITS.load(Relaxed),
-        rx_chunk_ring_drain: tcp::RX_CHUNK_RING_DRAIN.load(Relaxed),
+        syn_rx: c.syn_rx.get(),
+        synack_tx: c.synack_tx.get(),
+        rx_chunk_stash_hits: c.rx_chunk_stash_hits.get(),
+        rx_chunk_ring_drain: c.rx_chunk_ring_drain.get(),
     }
+}
+
+/// Render the TCP stack's full observability block (`tcp::diag`) as
+/// JSON into `w` — the `os:none` half of the `/obs` `"tcp"` block.
+/// The native backend stubs this `{}` (`native::tcp_obs_json`), so
+/// the app surfaces it through `waitless::diagnostics` without a
+/// direct dependency on the `os:none` `net` crate.
+pub fn tcp_obs_json(w: &mut dyn core::fmt::Write) {
+    let _ = tcp::diag::write_obs_json(w);
 }
 
 // ---- Event loop re-exports ------------------------------------------------

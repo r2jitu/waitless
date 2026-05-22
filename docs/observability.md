@@ -193,6 +193,16 @@ A subsystem may also keep a focused per-subsystem endpoint that
 reuses the *same* `write_obs_json` writer — QUIC keeps `/quic_stats`
 for that reason. There is no second rendering path.
 
+**The `os:none` seam.** App-reachable crates that build on the host
+(`quic`, `tls`, the runtime) plug into `/obs` directly. The
+`os:none`-only crates — the `net` stack, the NIC drivers — cannot
+be a dependency of the app crate without breaking its native build,
+so their `write_obs_json` is forwarded across the `waitless_backend`
+cfg-split: a `<sub>_obs_json(&mut dyn Write)` whose `bare` impl
+calls the real subsystem and whose `native` impl writes `{}`. The
+app calls `waitless::diagnostics::<sub>_obs_json`. TCP is the worked
+example (`waitless_backend::tcp_obs_json`).
+
 The `kernel_core::diag` ring is **not** part of this surface and is
 deliberately kept separate. It is a 4 KiB *keep-first* buffer whose
 one job is to preserve the first panic / unhandled-exception record
@@ -213,8 +223,10 @@ their invariant inputs, and a `write_obs_json` is wired into `/obs`.
 | Subsystem        | Crate                       | Status   | Notes |
 |------------------|-----------------------------|----------|-------|
 | QUIC             | `crates/proto/quic`         | ✅ Done   | Reference implementation — see below. |
+| TCP              | `crates/net/tcp`            | ✅ Done   | `tcp::diag` — 15 counters, `LAST_RST` / `LAST_TEARDOWN`; surfaced via the `waitless_backend` seam. |
 | NIC / gve driver | `crates/drivers/nic`        | ⬜ Pending | `gve_diag` counters exist; fold into the mechanism + `/obs`. |
-| TCP / IP stack   | `crates/net`                | ⬜ Pending | `tcp_diag` (`syn_rx`, `synack_tx`, …) exists; same. |
+| UDP              | `crates/net`                | ⬜ Pending | the UDP reactor path. |
+| IP / ARP / NDP   | `crates/net/stack`          | ⬜ Pending | lower-layer RX/TX. |
 | TLS              | `crates/proto/tls`          | ⬜ Pending | `tls::record` encrypt/decrypt stats; `tls_profile`. |
 | Async runtime    | `crates/runtime/executor`   | ⬜ Pending | per-core loop stats (`core_stats`). |
 | Kernel           | `crates/kernel`             | ⬜ Pending | heap stats; the `diag` ring stays panic-only. |

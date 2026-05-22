@@ -489,6 +489,7 @@ pub(crate) fn send_rst(
     seq: u32,
     ack: u32,
 ) {
+    crate::diag::COUNTERS.rst_sent.bump();
     send_segment(
         &SegmentMeta {
             local_ip,

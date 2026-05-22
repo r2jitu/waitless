@@ -5,8 +5,8 @@
 // `shutdown_all`. Also `init` (per-core pool / hash bring-up).
 
 use crate::pool::{
-    POOLS, RX_CHUNK_RING_DRAIN, RX_CHUNK_STASH_HITS, TCP_HASH, TcpHashCore, TcpPool,
-    alloc_connection, conn_ptr, decode_handle, encode_handle, free_connection, pool_capacity,
+    POOLS, TCP_HASH, TcpHashCore, TcpPool, alloc_connection, conn_ptr, decode_handle,
+    encode_handle, free_connection, pool_capacity,
 };
 use crate::send::{SegmentMeta, send_rst};
 use crate::state::{TCP_ACK, TCP_FIN, TcpState};
@@ -379,7 +379,7 @@ pub fn do_recv_chunk(handle: *mut (), generation: u16) -> Option<IOBuf> {
     }
     if let Some(iobuf) = c.pending_chunk.take() {
         // Zero-copy stash: the device RX buffer is surfaced as-is.
-        RX_CHUNK_STASH_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::diag::COUNTERS.rx_chunk_stash_hits.bump();
         return Some(iobuf);
     }
     let n = c.rx_used();
@@ -399,7 +399,7 @@ pub fn do_recv_chunk(handle: *mut (), generation: u16) -> Option<IOBuf> {
     // Ring-drain fallback: one memcpy (rx_ring → Heap IOBuf). Not
     // zero-copy — `into_owned()` on this is free, but the bytes
     // already moved through the ring.
-    RX_CHUNK_RING_DRAIN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    crate::diag::COUNTERS.rx_chunk_ring_drain.bump();
     Some(IOBuf::from(v))
 }
 

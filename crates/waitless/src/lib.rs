@@ -333,6 +333,16 @@ pub mod diagnostics {
         waitless_backend::tcp_diag()
     }
 
+    /// Render the TCP stack's observability block (`tcp::diag` —
+    /// counters + last-event snapshots) as JSON into `w`. This is
+    /// the TCP half of the `/obs` aggregate surface; see
+    /// `docs/observability.md`. Real on bare-metal, `{}` on native.
+    /// Routed through `waitless_backend` for the same reason as
+    /// [`tcp_diag`] — app crates stay off a direct `net`-crate dep.
+    pub fn tcp_obs_json(w: &mut dyn core::fmt::Write) {
+        waitless_backend::tcp_obs_json(w)
+    }
+
     /// TX-side hot-path counters: per-qp packet counts + small/big
     /// pool saturation + scan-depth aggregates. `None` when no
     /// driver is bound or the active driver hasn't wired the
