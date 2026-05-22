@@ -17,6 +17,7 @@ rust_library(
         "src/diag.rs",
         "src/lib.rs",
         "src/mmio.rs",
+        "src/obs.rs",
         "src/once.rs",
         "src/percpu.rs",
         "src/rng.rs",

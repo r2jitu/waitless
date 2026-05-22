@@ -17,6 +17,7 @@ pub mod clock;
 pub mod deque;
 pub mod diag;
 pub mod mmio;
+pub mod obs;
 pub mod once;
 pub mod percpu;
 pub mod rng;
