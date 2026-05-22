@@ -3,9 +3,9 @@
 //
 // Lives behind `#[cfg(test)]` so the dev-cert byte slices are
 // only compiled when `bazel test` builds with std. The
-// `dev_config()` helper is shared by every test below; the
-// `include_bytes!` paths step up FIVE levels (`../../../../../`)
-// from `crates/proto/quic/src/conn/` to reach
+// `dev_config()` / `big_chain_config()` helpers feed the tests
+// below; the `include_bytes!` paths step up FIVE levels
+// (`../../../../../`) from `crates/proto/quic/src/conn/` to reach
 // `apps/webserver/dev_certs/`, one more `../` than the original
 // flat `conn.rs` needed.
 //
@@ -46,23 +46,19 @@ fn connection_id_truncates_at_20() {
     assert_eq!(cid.as_slice(), &[0x55; 20]);
 }
 
-/// End-to-end: seal a synthetic "client Initial" containing a
-/// real ClientHello, feed it to a fresh server `Connection`,
-/// confirm the connection emits a coalesced Initial + Handshake
-/// reply that round-trips through *our* unprotect+decrypt path.
-/// This exercises the complete pipeline:
-///
-///   inbound:   parse header → HP unprotect → AEAD open →
-///              CRYPTO frame → push to QuicTls
-///   advance:   QuicTls runs handshake, produces ServerHello +
-///              EE/Cert/CV/Finished bytes
-///   outbound:  emit Initial (ServerHello) + Handshake
-///              (server flight) + ACK frames, AEAD seal,
-///              HP protect
-///   verify:    decrypt the outbound packets using the same
-///              keys our connection derived
-#[test]
-fn end_to_end_self_handshake() {
+/// The client-chosen DCID / SCID the synthetic Initial below
+/// carries. The server derives its Initial keys from the DCID
+/// (RFC 9001 §5.2) and echoes the SCID back as its reply's DCID.
+const CLIENT_DCID: [u8; 8] = [0xde, 0xad, 0xbe, 0xef, 0xfa, 0xce, 0xca, 0xfe];
+const CLIENT_SCID: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+
+/// Build a sealed, header-protected client Initial packet
+/// carrying a real TLS ClientHello — the synthetic inbound
+/// datagram both handshake tests drive a fresh server
+/// `Connection` with. The packet is padded past 1200 bytes so
+/// RFC 9000 §14.1 is satisfied and the server's anti-amplification
+/// budget (§8.1.2) is large enough for its full reply flight.
+fn make_client_initial() -> alloc::vec::Vec<u8> {
     use tls::handshake::{
         LEGACY_VERSION_TLS12, VERSION_TLS13, cipher_suite, ext_type, msg_type as mt, named_group,
     };
@@ -130,10 +126,8 @@ fn end_to_end_self_handshake() {
     let payload = padded.as_slice();
 
     // 3. Build a sealed Initial packet using client-direction
-    //    Initial keys derived from a synthetic DCID.
-    let client_dcid: [u8; 8] = [0xde, 0xad, 0xbe, 0xef, 0xfa, 0xce, 0xca, 0xfe];
-    let client_scid: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
-    let secrets = derive_initial_secrets(&client_dcid);
+    //    Initial keys derived from the synthetic DCID.
+    let secrets = derive_initial_secrets(&CLIENT_DCID);
     let client_keys = derive_initial_keys(&secrets.client);
     let client_dirkeys = DirKeys::from_initial(&client_keys);
 
@@ -144,10 +138,10 @@ fn end_to_end_self_handshake() {
     let mut packet = Vec::<u8>::new();
     packet.push(0xc0 | ((pn_length as u8) - 1));
     packet.extend_from_slice(&QUIC_VERSION_1.to_be_bytes());
-    packet.push(client_dcid.len() as u8);
-    packet.extend_from_slice(&client_dcid);
-    packet.push(client_scid.len() as u8);
-    packet.extend_from_slice(&client_scid);
+    packet.push(CLIENT_DCID.len() as u8);
+    packet.extend_from_slice(&CLIENT_DCID);
+    packet.push(CLIENT_SCID.len() as u8);
+    packet.extend_from_slice(&CLIENT_SCID);
     packet.push(0); // token len
     let mut lf = [0u8; 4];
     let lf_n = write_varint(length_field, &mut lf).unwrap();
@@ -176,6 +170,33 @@ fn end_to_end_self_handshake() {
     let (head, rest) = packet.split_at_mut(pn_offset);
     apply_hp_mask(&mut head[0], &mut rest[..pn_length], &mask, true);
 
+    packet
+}
+
+/// End-to-end: feed a synthetic client Initial to a fresh server
+/// `Connection`, confirm it emits a coalesced Initial + Handshake
+/// reply that round-trips through *our* unprotect+decrypt path.
+/// This exercises the complete pipeline:
+///
+///   inbound:   parse header → HP unprotect → AEAD open →
+///              CRYPTO frame → push to QuicTls
+///   advance:   QuicTls runs handshake, produces ServerHello +
+///              EE/Cert/CV/Finished bytes
+///   outbound:  emit Initial (ServerHello) + Handshake
+///              (server flight) + ACK frames, AEAD seal,
+///              HP protect
+///   verify:    decrypt the outbound packets using the same
+///              keys our connection derived
+///
+/// Uses the single-cert dev config, so the server flight fits one
+/// Handshake packet and Initial + Handshake coalesce into one
+/// datagram. The large-chain fragmentation path has its own test
+/// (`handshake_flight_fragments_across_mtu_datagrams`).
+#[test]
+fn end_to_end_self_handshake() {
+    // 1-3. Synthetic sealed client Initial.
+    let mut packet = make_client_initial();
+
     // 4. Drive the server-side connection with this datagram.
     let local_cid = ConnectionId::new(&[0xab; 8]);
     let mut conn = Connection::new_server(local_cid, [0x42u8; 32]);
@@ -191,6 +212,7 @@ fn end_to_end_self_handshake() {
     // 5. Drain the outbound datagram and verify both packets
     //    parse + decrypt with the *server* Initial / Handshake
     //    keys (which our connection derived).
+    let secrets = derive_initial_secrets(&CLIENT_DCID);
     let pkt = conn
         .pop_packet_owned()
         .expect("server reply datagram queued");
@@ -203,7 +225,7 @@ fn end_to_end_self_handshake() {
     let server_initial_dk = DirKeys::from_initial(&server_initial);
     let pre = parse_long_header_preamble(reply).unwrap();
     assert_eq!(pre.long_type, long_packet_type::INITIAL);
-    assert_eq!(pre.dcid, &client_scid[..]); // server echoes our SCID
+    assert_eq!(pre.dcid, &CLIENT_SCID[..]); // server echoes our SCID
     assert_eq!(pre.scid, &[0xab; 8][..]); // server's local CID
     // Continue parsing to find pn_offset.
     let initial_hdr = parse_initial_header(reply).unwrap();
@@ -230,10 +252,93 @@ fn end_to_end_self_handshake() {
         .expect("decrypt server Handshake");
 }
 
+/// Regression test for the gve HTTP/3 crash. A real
+/// leaf+intermediate cert chain makes the server's TLS flight
+/// (EncryptedExtensions + Certificate + CertificateVerify +
+/// Finished) far exceed one QUIC packet. Before the
+/// handshake-CRYPTO fragmentation fix, `flush_outbound` packed
+/// the whole flight into ONE Handshake packet — a single ~3 KB
+/// datagram. On the zero-copy `TxSlot` send path that overran
+/// the driver's 2 KiB TX-pool slot, reallocating a `Vec` off
+/// NIC-owned memory and corrupting the heap (the crash surfaced
+/// downstream as a `talc::free` page fault).
+///
+/// Here we drive the same oversized flight on the host. The host
+/// `Heap` send path uses a real heap `Vec`, so the *old* code
+/// merely produced one too-big datagram instead of crashing —
+/// which is exactly why this needs an explicit size assertion
+/// rather than relying on a crash. The test fails on the old
+/// encoder (one oversized datagram) and passes on the new one
+/// (the flight fragmented into MTU-bounded datagrams).
+#[test]
+fn handshake_flight_fragments_across_mtu_datagrams() {
+    use super::MAX_QUIC_DATAGRAM;
+    let headroom = executor::reactor::MAX_L2_HEADROOM;
+
+    let mut packet = make_client_initial();
+    let local_cid = ConnectionId::new(&[0xab; 8]);
+    let mut conn = Connection::new_server(local_cid, [0x42u8; 32]);
+    let cfg = big_chain_config();
+    conn.process_datagram(&mut packet, &cfg)
+        .expect("process inbound Initial with a large cert chain");
+    assert!(conn.has_outbound(), "server queued its handshake flight");
+
+    // Drain every datagram the server queued for this flight.
+    let mut datagrams: alloc::vec::Vec<_> = alloc::vec::Vec::new();
+    while let Some(pkt) = conn.pop_packet_owned() {
+        datagrams.push(pkt);
+    }
+
+    // The flight must span MORE than one datagram — that is the
+    // fragmentation the fix introduces. The pre-fix encoder
+    // produced exactly one (oversized) datagram.
+    assert!(
+        datagrams.len() >= 2,
+        "a large server flight must fragment across datagrams; got {}",
+        datagrams.len(),
+    );
+
+    // EVERY datagram must stay within MAX_QUIC_DATAGRAM — a
+    // violation is exactly what overran the driver TX slot on
+    // gve and corrupted the heap.
+    for (i, pkt) in datagrams.iter().enumerate() {
+        let total = pkt.vec().len();
+        assert!(
+            total <= MAX_QUIC_DATAGRAM,
+            "datagram {i} is {total} B, over MAX_QUIC_DATAGRAM {MAX_QUIC_DATAGRAM} B",
+        );
+        assert!(
+            total > headroom,
+            "datagram {i} carries no wire bytes past the L2 headroom",
+        );
+        // Each fragment is a long-header packet (Initial or
+        // Handshake): the long-header form bit and the fixed bit
+        // are both set.
+        assert_eq!(
+            pkt.vec()[headroom] & 0xc0,
+            0xc0,
+            "datagram {i} is not a long-header QUIC packet",
+        );
+    }
+}
+
 fn dev_config() -> TlsServerConfig {
     const CERT: &[u8] = include_bytes!("../../../../../apps/webserver/dev_certs/dev_cert.der");
     const KEY: &[u8] = include_bytes!("../../../../../apps/webserver/dev_certs/dev_key.der");
     TlsServerConfig::from_chain(&[CERT], KEY).expect("dev cert load")
+}
+
+/// A `TlsServerConfig` whose certificate chain is large enough to
+/// push the server's handshake flight past one QUIC packet — four
+/// copies of the dev cert (~2.2 KiB of certificate DER), close in
+/// size to a real Let's Encrypt leaf + intermediate. The server
+/// only serialises the chain into its Certificate message;
+/// nothing in these tests validates it, so repeated certs are a
+/// fine stand-in for a genuinely large chain.
+fn big_chain_config() -> TlsServerConfig {
+    const CERT: &[u8] = include_bytes!("../../../../../apps/webserver/dev_certs/dev_cert.der");
+    const KEY: &[u8] = include_bytes!("../../../../../apps/webserver/dev_certs/dev_key.der");
+    TlsServerConfig::from_chain(&[CERT, CERT, CERT, CERT], KEY).expect("big-chain cert load")
 }
 
 /// Server constructs Initial keys correctly given a client
