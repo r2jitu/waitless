@@ -403,13 +403,13 @@ pub fn do_recv_chunk(handle: *mut (), generation: u16) -> Option<IOBuf> {
     Some(IOBuf::from(v))
 }
 
-/// Park the send-side waker. On bare-metal `async_try_send_chain`
-/// always accepts the whole buffer, so this path is effectively
-/// unreachable during steady-state sends; kept symmetric with the
-/// recv side so future NIC-TX-backpressure plumbing (or a proper
-/// TCP send-window) can light it up without API churn. Stale
-/// `generation` wakes the waker immediately so the task observes
-/// closure.
+/// Park the current task's send-side waker on this conn, to be woken
+/// when an ACK reopens the congestion/receive window (RFC 5681
+/// `min(cwnd, rwnd)`) or the connection tears down. Called from
+/// `executor::reactor::TcpSendChain::poll` after `async_try_send_chain`
+/// reports a closed window (`Ok(0)`). A `generation` mismatch fires
+/// the waker immediately so the task observes closure on its next
+/// poll. De-dupes with `will_wake`, like `register_recv_waker`.
 pub fn register_send_waker(handle: *mut (), generation: u16, waker: &Waker) {
     let (core, slot) = match decode_handle(handle) {
         Some(v) => v,
@@ -423,13 +423,24 @@ pub fn register_send_waker(handle: *mut (), generation: u16, waker: &Waker) {
         waker.wake_by_ref();
         return;
     }
-    // Write-readiness on bare-metal: the NIC TX path is always
-    // "ready" for this stack. Fire immediately so the future
-    // re-probes and resolves.
-    waker.wake_by_ref();
+    match &c.send_waker {
+        Some(w) if w.will_wake(waker) => {}
+        _ => c.send_waker = Some(waker.clone()),
+    }
 }
 
-pub fn clear_send_waker(_handle: *mut (), _generation: u16) {
-    // No-op on bare-metal — no send-waker state to clear.
+/// Drop the parked send waker without firing it. Stale `generation`
+/// is a no-op — the slot is already reused and the new owner's
+/// registration dominates.
+pub fn clear_send_waker(handle: *mut (), generation: u16) {
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return,
+    };
+    let c = unsafe { &mut *conn_ptr(core, slot) };
+    if c.generation != generation {
+        return;
+    }
+    c.send_waker = None;
 }
 

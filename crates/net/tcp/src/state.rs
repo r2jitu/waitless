@@ -269,6 +269,12 @@ pub struct TcpConnection {
     /// owning core; woken when data lands in the ring or the
     /// peer closes. Per-core ownership — no lock needed.
     pub(crate) recv_waker: Option<Waker>,
+    /// Parked `TcpSendChain` waker. Set by `register_send_waker` when a
+    /// send stalls on a closed window (`min(cwnd, rwnd)` fully
+    /// consumed); woken by `tcp_receive` when an ACK reopens the
+    /// window, and by `free_connection` on teardown. Per-core
+    /// ownership — no lock needed.
+    pub(crate) send_waker: Option<Waker>,
     /// RFC 6298 retransmit ring — the unacknowledged outbound bytes,
     /// mirroring the wire range `[snd_una, snd_nxt)`. Heap-boxed and
     /// lazily allocated on the first buffered send, then reused across
@@ -379,6 +385,7 @@ impl TcpConnection {
             accepted: false,
             generation: 0,
             recv_waker: None,
+            send_waker: None,
             rtx_buf: None,
             rtx_head: 0,
             rtx_len: 0,

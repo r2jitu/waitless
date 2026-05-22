@@ -497,10 +497,14 @@ pub(crate) fn free_connection(core: u32, slot: usize) {
         let key = tcp_hash_key(c.remote_ip, c.remote_port, c.local_port);
         tcp_hash_remove(core, key);
     }
-    // Fire any parked `TcpRecv` waker before the slot is reset —
-    // the app handler needs to observe teardown (recv returns 0)
-    // rather than sleeping on a stale waker that would get dropped.
+    // Fire any parked `TcpRecv` / `TcpSendChain` waker before the slot
+    // is reset — the app handler needs to observe teardown (recv
+    // returns 0, send resolves `Err`) rather than sleeping on a stale
+    // waker that would get dropped.
     if let Some(w) = c.recv_waker.take() {
+        w.wake();
+    }
+    if let Some(w) = c.send_waker.take() {
         w.wake();
     }
     // Bump generation so any still-outstanding async handle detects

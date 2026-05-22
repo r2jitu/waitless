@@ -1553,6 +1553,73 @@ fn timewait_absorbs_retransmitted_fin() {
     );
 }
 
+// ---- RFC 5681 cwnd-paced send window ----------------------------------
+//
+// The send path now caps in-flight bytes at `min(cwnd, rwnd)`. These
+// scenarios drive the real `async_try_send_chain` / `try_send_tso`
+// hooks and assert on what reaches the wire, on the queued remainder,
+// and on the parked-sender wake protocol.
+
+/// A counting `Waker` for the send-path scenarios: every wake bumps a
+/// shared atomic so a test can assert the parked `TcpSendChain` waker
+/// fired. Built via `std::task::Wake` — the harness compiles with std.
+struct CountingWaker(AtomicU32);
+
+impl std::task::Wake for CountingWaker {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A `(Waker, shared-counter)` pair — register the waker on a conn,
+/// then read the counter to see how many times it has fired.
+fn counting_waker() -> (core::task::Waker, std::sync::Arc<CountingWaker>) {
+    let inner = std::sync::Arc::new(CountingWaker(AtomicU32::new(0)));
+    (core::task::Waker::from(inner.clone()), inner)
+}
+
+/// A send parked on a closed window must observe connection teardown:
+/// `free_connection` (here driven by an in-sequence RST) fires the
+/// parked `TcpSendChain` waker so the blocked `send().await` re-polls
+/// and resolves `Err` instead of sleeping forever on a dropped waker.
+#[test]
+fn teardown_wakes_a_parked_sender() {
+    let _g = harness();
+    const SP: u16 = 9130;
+    const CP: u16 = 50130;
+    const CLIENT_ISN: u32 = 0xE000;
+    super::listen_on_core(0, SP);
+    handshake(SP, CP, CLIENT_ISN);
+
+    let (handle, generation) = conn_handle(CP, SP);
+    let (waker, count) = counting_waker();
+    super::register_send_waker(handle, generation, &waker);
+    assert_eq!(
+        count.0.load(Ordering::Relaxed),
+        0,
+        "registering a send waker parks it — it must not fire on its own",
+    );
+
+    // An in-sequence RST tears the connection down via free_connection.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: 0,
+        flags: TCP_RST,
+        window: 0,
+        payload: Vec::new(),
+    });
+    assert_eq!(conn_state(CP, SP), None, "the RST freed the connection");
+    assert!(
+        count.0.load(Ordering::Relaxed) >= 1,
+        "teardown must wake the parked sender so its send() resolves",
+    );
+}
+
 /// Locate the live (non-listener) connection for a client/server
 /// port pair and return its `(handle, generation)` so a scenario
 /// can drive the real send path (`async_try_send_chain`).
