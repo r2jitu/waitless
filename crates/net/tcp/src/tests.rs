@@ -1620,6 +1620,392 @@ fn teardown_wakes_a_parked_sender() {
     );
 }
 
+/// Total TCP-payload bytes across every captured frame — the bytes
+/// the send path actually put on the wire. Eth(14) + IPv4(20) +
+/// TCP(20) = 54 bytes of headers precede each frame's payload.
+fn total_tx_payload() -> usize {
+    tx().iter().map(|f| f.len() - 34 - TCP_HDR_LEN).sum()
+}
+
+/// RFC 5681 §4 usable window: `min(cwnd, rwnd)` minus the in-flight
+/// bytes, saturating at 0. Pure arithmetic — exercised on a bare TCB.
+#[test]
+fn usable_window_arithmetic() {
+    let mut c = TcpConnection::new();
+    c.congestion_init(); // cwnd = 3·MSS_V4 = 4380 (new() leaves IPv4)
+    let smss = 1460u32;
+    c.snd_wnd = 65535;
+    c.snd_una = 1000;
+    c.snd_nxt = 1000;
+    assert_eq!(c.flight(), 0);
+    assert_eq!(c.usable_window(), 3 * smss, "an idle conn may send a full cwnd");
+
+    // In-flight bytes are subtracted from the window.
+    c.snd_nxt = 1000u32.wrapping_add(2 * smss);
+    assert_eq!(c.flight(), 2 * smss);
+    assert_eq!(c.usable_window(), smss, "in-flight bytes consume the window");
+
+    // A full congestion window closes the send window.
+    c.snd_nxt = 1000u32.wrapping_add(3 * smss);
+    assert_eq!(c.usable_window(), 0, "a full cwnd closes the window");
+
+    // The advertised receive window caps the send window below cwnd.
+    c.snd_nxt = 1000;
+    c.snd_wnd = 2000;
+    assert_eq!(c.usable_window(), 2000, "rwnd caps the window below cwnd");
+
+    // A peer that shrinks its window below the flight size closes
+    // the window without underflowing (saturating_sub).
+    c.snd_wnd = 500;
+    c.snd_nxt = 1000u32.wrapping_add(smss);
+    assert_eq!(c.usable_window(), 0, "an over-shrunk window saturates at 0");
+}
+
+/// A send larger than the congestion window puts exactly `cwnd`
+/// bytes on the wire (the connection has nothing else in flight) and
+/// leaves the rest queued in the chain.
+#[test]
+fn send_caps_in_flight_at_cwnd() {
+    let _g = harness();
+    const SP: u16 = 9131;
+    const CP: u16 = 50131;
+    const CLIENT_ISN: u32 = 0xE100;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+    let (handle, generation) = conn_handle(CP, SP);
+    // Nothing is in flight, so the usable window is exactly cwnd.
+    let (cwnd, _) = conn_cwnd_ssthresh(CP, SP);
+    clear_tx();
+    let mut chain = iobuf::IOBufChain::from(vec![0xABu8; 40_000]);
+    let sent = super::async_try_send_chain(handle, generation, &mut chain)
+        .expect("an established connection accepts the send");
+    assert_eq!(sent as u32, cwnd, "the send is capped at the congestion window");
+    assert_eq!(
+        chain.total_len(),
+        40_000 - sent,
+        "the bytes past the window stay queued in the chain",
+    );
+    assert_eq!(total_tx_payload(), sent, "exactly cwnd bytes hit the wire");
+    assert_eq!(
+        tx().len(),
+        sent.div_ceil(1460),
+        "the window ships as MSS-sized segments",
+    );
+    assert_eq!(
+        tcp_hdr(&tx()[0]).seq,
+        server_isn.wrapping_add(1),
+        "the first segment starts at snd_una",
+    );
+}
+
+/// A second send while the window is fully consumed by in-flight
+/// data puts nothing on the wire — `Ok(0)` — and leaves the chain
+/// untouched. No busy-wait, no dropped bytes.
+#[test]
+fn closed_window_sends_nothing() {
+    let _g = harness();
+    const SP: u16 = 9132;
+    const CP: u16 = 50132;
+    const CLIENT_ISN: u32 = 0xE200;
+    super::listen_on_core(0, SP);
+    handshake(SP, CP, CLIENT_ISN);
+
+    let (handle, generation) = conn_handle(CP, SP);
+    let mut chain = iobuf::IOBufChain::from(vec![0xCDu8; 40_000]);
+    let first = super::async_try_send_chain(handle, generation, &mut chain)
+        .expect("the first send is accepted");
+    let (cwnd, _) = conn_cwnd_ssthresh(CP, SP);
+    assert_eq!(first as u32, cwnd, "the first send fills the congestion window");
+
+    // No ACK — the window stays closed.
+    clear_tx();
+    let second = super::async_try_send_chain(handle, generation, &mut chain)
+        .expect("a closed-window send is not an error");
+    assert_eq!(second, 0, "a closed window sends nothing");
+    assert!(tx().is_empty(), "no segment goes out on a closed window");
+    assert_eq!(
+        chain.total_len(),
+        40_000 - first,
+        "the unsent bytes stay queued — not dropped",
+    );
+}
+
+/// An ACK that frees in-flight bytes reopens the window: the send
+/// that returned `Ok(0)` now drains the queued remainder.
+#[test]
+fn ack_reopens_the_send_window() {
+    let _g = harness();
+    const SP: u16 = 9133;
+    const CP: u16 = 50133;
+    const CLIENT_ISN: u32 = 0xE300;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+    let (handle, generation) = conn_handle(CP, SP);
+    let mut chain = iobuf::IOBufChain::from(vec![0u8; 10_000]);
+    let first = super::async_try_send_chain(handle, generation, &mut chain).unwrap() as u32;
+    assert!(first > 0, "the first send fills the window");
+
+    // The peer acknowledges the whole in-flight window.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1).wrapping_add(first),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+
+    // The window has reopened (and cwnd grew) — the queued remainder
+    // now goes out.
+    clear_tx();
+    let second = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(
+        second as u32,
+        10_000 - first,
+        "the ACK-reopened window drains the rest",
+    );
+    assert!(chain.is_empty(), "the whole body is now on the wire");
+}
+
+/// A sender parked on a closed window is woken by the ACK that
+/// reopens it — the resume signal the reactor's `TcpSendChain`
+/// future waits on.
+#[test]
+fn closed_window_wakes_parked_sender() {
+    let _g = harness();
+    const SP: u16 = 9134;
+    const CP: u16 = 50134;
+    const CLIENT_ISN: u32 = 0xE400;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+    let (handle, generation) = conn_handle(CP, SP);
+    let mut chain = iobuf::IOBufChain::from(vec![0u8; 10_000]);
+    let first = super::async_try_send_chain(handle, generation, &mut chain).unwrap() as u32;
+
+    // The window is closed — the reactor would park the send waker.
+    let (waker, count) = counting_waker();
+    super::register_send_waker(handle, generation, &waker);
+    assert_eq!(count.0.load(Ordering::Relaxed), 0, "no spurious wake on register");
+
+    // The ACK that reopens the window must wake the parked sender.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1).wrapping_add(first),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert!(
+        count.0.load(Ordering::Relaxed) >= 1,
+        "the window-opening ACK wakes the parked sender",
+    );
+}
+
+/// The send window is `min(cwnd, rwnd)`: a small advertised receive
+/// window caps in-flight bytes below the (larger) congestion window.
+#[test]
+fn send_respects_advertised_rwnd() {
+    let _g = harness();
+    const SP: u16 = 9135;
+    const CP: u16 = 50135;
+    const CLIENT_ISN: u32 = 0xE500;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+    // The peer advertises a 2000-byte window — below the 4380-byte
+    // initial cwnd.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 2000,
+        payload: Vec::new(),
+    });
+
+    let (handle, generation) = conn_handle(CP, SP);
+    clear_tx();
+    let mut chain = iobuf::IOBufChain::from(vec![0u8; 10_000]);
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(sent, 2000, "in-flight is capped by rwnd, not the larger cwnd");
+    assert_eq!(total_tx_payload(), 2000, "exactly rwnd bytes hit the wire");
+}
+
+/// RFC 9293 §3.10.7.4 SND.WL1/SND.WL2: the window from a stale
+/// (reordered) segment is ignored; the window from a current
+/// segment is taken.
+#[test]
+fn window_update_obeys_wl1_wl2() {
+    let _g = harness();
+    const SP: u16 = 9136;
+    const CP: u16 = 50136;
+    const CLIENT_ISN: u32 = 0xE600;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    // A stale segment — its seq sits *below* the one that last set
+    // the window (the 3-way ACK, at CLIENT_ISN+1) — must not install
+    // its tiny window.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN, // < snd_wl1
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 100,
+        payload: Vec::new(),
+    });
+    let mut chain = iobuf::IOBufChain::from(vec![0u8; 3000]);
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(
+        sent, 3000,
+        "the stale 100-byte window was rejected — the full cwnd applies",
+    );
+
+    // A current segment's window is accepted.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1 + 3000),
+        flags: TCP_ACK,
+        window: 1000,
+        payload: Vec::new(),
+    });
+    let mut chain2 = iobuf::IOBufChain::from(vec![0u8; 5000]);
+    let sent2 = super::async_try_send_chain(handle, generation, &mut chain2).unwrap();
+    assert_eq!(sent2, 1000, "the current segment's 1000-byte window is honoured");
+}
+
+/// RFC 5681 §3.1 slow start, observed at the send path: with each
+/// MSS segment acknowledged separately, `cwnd` opens by one SMSS per
+/// ACK, so the window the send path offers doubles every RTT.
+#[test]
+fn send_window_ramps_with_slow_start() {
+    let _g = harness();
+    const SP: u16 = 9137;
+    const CP: u16 = 50137;
+    const CLIENT_ISN: u32 = 0xE700;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    let mut chain = iobuf::IOBufChain::from(vec![0u8; 60_000]);
+
+    // RTT 1: the send path offers the initial congestion window.
+    let round1 = super::async_try_send_chain(handle, generation, &mut chain).unwrap() as u32;
+    assert!(round1 > 0, "RTT 1 sends the initial congestion window");
+
+    // Acknowledge that window one MSS segment at a time — RFC 5681
+    // slow start opens cwnd by one SMSS per ACK, so a whole RTT's
+    // worth of ACKs adds `round1` and the window doubles.
+    let mut acked = 0u32;
+    while acked < round1 {
+        acked += (round1 - acked).min(1460);
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN.wrapping_add(1),
+            ack: server_isn.wrapping_add(1).wrapping_add(acked),
+            flags: TCP_ACK,
+            window: 65535,
+            payload: Vec::new(),
+        });
+    }
+
+    // RTT 2: the window has doubled — exponential growth on the wire.
+    let round2 = super::async_try_send_chain(handle, generation, &mut chain).unwrap() as u32;
+    assert_eq!(round2, 2 * round1, "slow start doubled the send window over one RTT");
+}
+
+/// After an RTO collapses `cwnd` to one segment, the send path's
+/// window follows: it offers only the collapsed `cwnd` minus the
+/// still-unacked flight.
+#[test]
+fn send_window_tracks_cwnd_after_rto() {
+    let _g = harness();
+    const SP: u16 = 9138;
+    const CP: u16 = 50138;
+    const CLIENT_ISN: u32 = 0xE800;
+    super::listen_on_core(0, SP);
+    handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    // Send 1000 bytes and withhold the ACK.
+    let mut chain = iobuf::IOBufChain::from(vec![0u8; 1000]);
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(sent, 1000, "the small send fits the initial window");
+
+    // Cross the RTO — `congestion_on_rto` collapses cwnd to 1·SMSS.
+    kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 + 1);
+    super::on_tcp_tick();
+    let (cwnd, _) = conn_cwnd_ssthresh(CP, SP);
+    assert_eq!(cwnd, 1460, "the RTO collapsed cwnd to one segment");
+
+    // 1000 bytes are still in flight; the collapsed window offers
+    // only cwnd − flight = 1460 − 1000 = 460 bytes.
+    let mut more = iobuf::IOBufChain::from(vec![0u8; 5000]);
+    let after_rto = super::async_try_send_chain(handle, generation, &mut more).unwrap();
+    assert_eq!(
+        after_rto, 460,
+        "the send window is the collapsed cwnd minus the in-flight bytes",
+    );
+}
+
+/// A multi-hundred-KB transfer never trips `rtx_overflow`: the send
+/// window keeps in-flight bytes at or below the 64 KiB retransmit
+/// ring, so the ring always covers `[snd_una, snd_nxt)`.
+#[test]
+fn large_send_never_triggers_rtx_overflow() {
+    let _g = harness();
+    const SP: u16 = 9139;
+    const CP: u16 = 50139;
+    const CLIENT_ISN: u32 = 0xE900;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    let mut chain = iobuf::IOBufChain::from(vec![0u8; 400_000]);
+    let mut snd_nxt = server_isn.wrapping_add(1);
+
+    // Drain the whole body window by window, fully acknowledging
+    // each round before the next.
+    loop {
+        let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+        assert!(
+            sent <= RTX_BUF_BYTES,
+            "a single window never exceeds the retransmit ring",
+        );
+        assert!(
+            !conn_rtx_overflow(CP, SP),
+            "the retransmit ring never loses coverage of the unacked window",
+        );
+        if sent == 0 {
+            break;
+        }
+        snd_nxt = snd_nxt.wrapping_add(sent as u32);
+        // The peer acknowledges the whole window just sent.
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN.wrapping_add(1),
+            ack: snd_nxt,
+            flags: TCP_ACK,
+            window: 65535,
+            payload: Vec::new(),
+        });
+    }
+    assert!(chain.is_empty(), "the whole 400 KB body reached the wire");
+}
+
 /// Locate the live (non-listener) connection for a client/server
 /// port pair and return its `(handle, generation)` so a scenario
 /// can drive the real send path (`async_try_send_chain`).
@@ -1675,6 +2061,26 @@ fn conn_cwnd_ssthresh(client_port: u16, server_port: u16) -> (u32, u32) {
             && c.remote_port == client_port
         {
             return (c.cwnd, c.ssthresh);
+        }
+    }
+    panic!("no live connection for ports {client_port} -> {server_port}");
+}
+
+/// `rtx_overflow` of the live connection for a client/server port
+/// pair — lets a scenario assert the retransmit ring never lost
+/// coverage of the unacked window.
+fn conn_rtx_overflow(client_port: u16, server_port: u16) -> bool {
+    let core = 0u32;
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        // SAFETY: single worker, test-serialised by `TEST_LOCK`.
+        let c = unsafe { &*conn_ptr(core, i) };
+        if c.state != TcpState::Closed
+            && c.state != TcpState::Listen
+            && c.local_port == server_port
+            && c.remote_port == client_port
+        {
+            return c.rtx_overflow;
         }
     }
     panic!("no live connection for ports {client_port} -> {server_port}");

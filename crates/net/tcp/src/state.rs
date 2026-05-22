@@ -129,15 +129,17 @@ pub(crate) fn mss_for(local_ip: IpAddr) -> usize {
 // was never resent — an RFC 9293 MUST violation, and a real
 // correctness gap on a lossy path.
 
-/// Per-conn retransmit-ring capacity. Sized to hold one maximum TLS
-/// 1.3 record's ciphertext (16384-byte plaintext chunk + AEAD
-/// envelope) with margin — the largest single `async_try_send_chain`
-/// the server issues. An unacked window that outgrows this suspends
-/// retransmit coverage (`rtx_overflow`) until the peer's ACKs drain
-/// it; that is strictly better than the pre-RFC-6298 "retransmit
-/// nothing" and disappears once RFC 5681 `cwnd` bounds the in-flight
-/// window. Boxed + lazy like `rx_ring`, so idle slots stay cheap.
-pub(crate) const RTX_BUF_BYTES: usize = 17408;
+/// Per-conn retransmit-ring capacity. Sized to hold a full TCP
+/// receive window: `snd_wnd` is a `u16` (no RFC 7323 window scaling
+/// negotiated), so the peer can never advertise more than 65535
+/// bytes, and the RFC 5681 send path caps in-flight bytes at
+/// `min(cwnd, rwnd)`. A 64 KiB ring therefore always covers the
+/// whole unacked range `[snd_una, snd_nxt)` — which is what makes
+/// `rtx_overflow` from a window that outgrew the ring structurally
+/// impossible (the only residual `rtx_overflow` cause is an
+/// `ensure_rtx_buf` allocation failure). Boxed + lazy like
+/// `rx_ring`, so idle slots stay cheap.
+pub(crate) const RTX_BUF_BYTES: usize = 65536;
 /// Initial RTO before any RTT measurement (RFC 6298 §2.1), and the
 /// floor every computed RTO is clamped up to (§2.4 — round a sub-1 s
 /// estimate up to 1 s).
@@ -201,6 +203,21 @@ pub struct TcpConnection {
     pub(crate) remote_port: u16,
     pub(crate) snd_nxt: u32,
     pub(crate) snd_una: u32,
+    /// Peer's advertised receive window (RFC 9293 SND.WND), bytes —
+    /// the far end's free buffer space, and the receiver-side half
+    /// of the RFC 5681 send window `min(cwnd, rwnd)`. Refreshed from
+    /// `SEG.WND` only when the `snd_wl1`/`snd_wl2` check accepts the
+    /// segment. A raw `u16` (no RFC 7323 window scaling), so it
+    /// never exceeds 65535.
+    pub(crate) snd_wnd: u16,
+    /// RFC 9293 SND.WL1 — the `SEG.SEQ` of the segment that last
+    /// updated `snd_wnd`. Guards against a reordered segment
+    /// installing a stale window.
+    pub(crate) snd_wl1: u32,
+    /// RFC 9293 SND.WL2 — the `SEG.ACK` of the segment that last
+    /// updated `snd_wnd`. With `snd_wl1` it totally orders window
+    /// updates, so a retransmitted segment can't regress the window.
+    pub(crate) snd_wl2: u32,
     pub(crate) rcv_nxt: u32,
     pub(crate) rcv_wnd: u16,
     /// Per-conn RX ring buffer. Heap-allocated once at
@@ -336,8 +353,8 @@ pub struct TcpConnection {
     /// of how much unacknowledged data the path will accept. Grows on
     /// ACKs (slow start, then congestion avoidance) and collapses to
     /// one segment on an RTO. 0 until `congestion_init` runs at the
-    /// SYN. Maintained as bookkeeping today; the send path does not
-    /// yet pace against it.
+    /// SYN. The send path paces against it: `usable_window()` caps
+    /// in-flight bytes at `min(cwnd, rwnd)`.
     pub(crate) cwnd: u32,
     /// RFC 5681 slow-start threshold, bytes. While `cwnd < ssthresh`
     /// the controller is in slow start (exponential growth); at or
@@ -371,6 +388,9 @@ impl TcpConnection {
             remote_port: 0,
             snd_nxt: 0,
             snd_una: 0,
+            snd_wnd: 0,
+            snd_wl1: 0,
+            snd_wl2: 0,
             rcv_nxt: 0,
             rcv_wnd: RX_RING_BYTES as u16,
             rx_ring: None,
@@ -880,6 +900,28 @@ impl TcpConnection {
         self.ssthresh = u32::MAX;
     }
 
+    /// Bytes sent but not yet acknowledged — the wire range
+    /// `[snd_una, snd_nxt)`, RFC 9293's "FlightSize". 32-bit
+    /// wrap-around subtraction.
+    #[inline]
+    pub(crate) fn flight(&self) -> u32 {
+        self.snd_nxt.wrapping_sub(self.snd_una)
+    }
+
+    /// RFC 5681 §4 usable window: how many further bytes the send
+    /// path may put in flight right now. The send window is
+    /// `min(cwnd, rwnd)`; the bytes already in flight are subtracted.
+    /// `saturating_sub` floors the result at 0 — a peer that shrinks
+    /// its advertised window below the current flight size (RFC 9293
+    /// §3.8.6.2.1 says SHOULD NOT, but it is legal) simply closes the
+    /// send window until ACKs drain the excess.
+    #[inline]
+    pub(crate) fn usable_window(&self) -> u32 {
+        self.cwnd
+            .min(self.snd_wnd as u32)
+            .saturating_sub(self.flight())
+    }
+
     /// Fold an ACK of `acked` new bytes into the congestion window
     /// (RFC 5681 §3.1). Slow start (`cwnd < ssthresh`) opens the
     /// window by one SMSS per ACK — exponential per RTT. Congestion
@@ -909,8 +951,7 @@ impl TcpConnection {
     pub(crate) fn congestion_on_rto(&mut self) {
         let smss = mss_for(self.local_ip) as u32;
         if self.rtx_backoff == 0 {
-            let flight = self.snd_nxt.wrapping_sub(self.snd_una);
-            self.ssthresh = (flight / 2).max(2 * smss);
+            self.ssthresh = (self.flight() / 2).max(2 * smss);
         }
         self.cwnd = smss;
     }
@@ -923,8 +964,7 @@ impl TcpConnection {
     /// a segment that has left the network.
     fn fast_retransmit(&mut self) {
         let smss = mss_for(self.local_ip) as u32;
-        let flight = self.snd_nxt.wrapping_sub(self.snd_una);
-        self.ssthresh = (flight / 2).max(2 * smss);
+        self.ssthresh = (self.flight() / 2).max(2 * smss);
         self.retransmit_oldest_segment();
         self.cwnd = self.ssthresh.saturating_add(3 * smss);
     }

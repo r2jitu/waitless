@@ -49,6 +49,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
     let seq = ntohl(hdr.seq);
     let ack = ntohl(hdr.ack);
     let flags = hdr.flags;
+    let window = ntohs(hdr.window);
     let data_offset = ((hdr.data_offset >> 4) as usize) * 4;
     let payload_len = segment.total_len().saturating_sub(data_offset);
 
@@ -182,6 +183,12 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             let isn = next_seq();
             c.snd_nxt = isn;
             c.snd_una = c.snd_nxt;
+            // RFC 9293: seed the peer's advertised window from the
+            // SYN. SND.WL1 = the SYN's seq; SND.WL2 = 0 (a bare SYN
+            // carries no ACK) — the 3-way ACK then advances both.
+            c.snd_wnd = window;
+            c.snd_wl1 = seq;
+            c.snd_wl2 = 0;
             c.rcv_nxt = seq + 1;
             c.listener_port = dst_port;
             c.accepted = false;
@@ -281,6 +288,16 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             && payload_len == 0
             && flags & (TCP_SYN | TCP_FIN) == 0
             && seq_lt(c.snd_una, c.snd_nxt);
+        // RFC 9293 §3.10.7.4: refresh the peer's advertised window,
+        // but only from a segment at least as recent as the one that
+        // last set it. SND.WL1/SND.WL2 give window updates a total
+        // order, so a reordered or retransmitted segment cannot
+        // install a stale window.
+        if seq_lt(c.snd_wl1, seq) || (c.snd_wl1 == seq && !seq_lt(ack, c.snd_wl2)) {
+            c.snd_wnd = window;
+            c.snd_wl1 = seq;
+            c.snd_wl2 = ack;
+        }
         if c.state == TcpState::SynReceived {
             c.state = TcpState::Established;
             crate::diag::COUNTERS.conns_established.bump();
@@ -331,6 +348,15 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             c.on_dup_ack();
         } else if c.snd_una != old_una {
             c.on_new_data_ack();
+        }
+        // RFC 5681 §4: an ACK may have reopened the send window —
+        // `snd_una` advanced (in-flight shrank), `cwnd` grew, or the
+        // peer advertised more space. Wake a `TcpSendChain` parked on
+        // a previously-closed window so it re-polls and drains more.
+        if c.usable_window() > 0
+            && let Some(w) = c.send_waker.take()
+        {
+            w.wake();
         }
     }
 

@@ -353,6 +353,17 @@ pub fn try_send_tso(
     if min_payload <= mss {
         return None;
     }
+    // RFC 5681 §4: the TSO fast path must respect the congestion /
+    // receive window too. A TLS record is atomic — it cannot be
+    // fragmented at this layer — so when the usable window cannot
+    // admit the whole record, decline (`None`); the TLS layer then
+    // falls back to the windowed `async_try_send_chain` path, which
+    // can split the record's ciphertext across the open window.
+    // `min_payload` is the record's exact wire size for the sole
+    // caller (`tls::send_one_record`).
+    if min_payload > c.usable_window() as usize {
+        return None;
+    }
     let dst_mac = mac_resolve::resolve(c.remote_ip)?;
     let mut handle = nic::acquire_tx_tso_buf()?;
 
@@ -505,18 +516,48 @@ pub(crate) fn send_rst(
     );
 }
 
+/// Drop the first `n` bytes from the front of `chain` — the bytes a
+/// windowed `async_try_send_chain` has just put on the wire. Fully
+/// drained parts are `pop_front`ed (their `IOBuf` drops, recycling
+/// `External` device buffers back to driver pools); a partially-sent
+/// head part is `consume`d in place. Zero copy — only `IOBuf` offsets
+/// move; the unsent tail is left untouched for the next call.
+fn chain_drain_prefix(chain: &mut iobuf::IOBufChain, mut n: usize) {
+    while n > 0 {
+        let Some(front) = chain.front_mut() else {
+            return; // chain shorter than `n` — nothing left to drop
+        };
+        let flen = front.len();
+        if flen <= n {
+            n -= flen;
+            chain.pop_front();
+        } else {
+            // `consume` trims the front of the visible payload;
+            // `shrink_total_len` keeps a `Many` chain's cached length
+            // correct (a no-op for `Single`/`Empty`, whose length
+            // derives straight from the part).
+            let _ = front.consume(n);
+            chain.shrink_total_len(n);
+            return;
+        }
+    }
+}
+
 /// Async `TcpSendChain` try-send hook. Walks `chain` via cursor
 /// and emits MSS-sized TCP segments, copying directly from chain
 /// nodes into each segment's payload area — no user-space
-/// scratch coalesce. Drains the chain as bytes hit the wire so
-/// `External` IOBufs (NIC RX descriptors etc.) return to the
-/// driver pool as the response leaves the box, not all at the
-/// end.
+/// scratch coalesce. Drains the sent prefix off the chain as bytes
+/// hit the wire so `External` IOBufs (NIC RX descriptors etc.)
+/// return to the driver pool as the response leaves the box.
 ///
-/// Bare-metal's NIC TX never blocks under this stack's load
-/// model, so this always sends every byte in the chain (or
-/// returns `Err(TcpSendError::Closed)` on a dead conn / stale
-/// `gen`).
+/// RFC 5681 §4: the send is capped at the usable window
+/// (`min(cwnd, rwnd)` minus the in-flight bytes). It returns the
+/// byte count actually put on the wire — `< total` when the window
+/// is the limit, `Ok(0)` when the window is fully closed — and
+/// leaves the unsent remainder queued in `chain`. The reactor's
+/// `TcpSendChain` future loops until the chain is empty, parking the
+/// send waker on `Ok(0)`. `Err(TcpSendError::Closed)` on a dead conn
+/// / stale `gen`.
 pub fn async_try_send_chain(
     handle: *mut (),
     generation: u16,
@@ -536,6 +577,16 @@ pub fn async_try_send_chain(
 
     let total = chain.total_len();
     if total == 0 {
+        return Ok(0);
+    }
+    // RFC 5681 §4: cap this send at the usable window — the bytes
+    // `min(cwnd, rwnd)` admits beyond what is already in flight. The
+    // unsent remainder stays queued in the caller's `chain` (held by
+    // the `TcpSendChain` future). A fully-closed window returns
+    // `Ok(0)`; the reactor parks the send waker and `tcp_receive`
+    // re-wakes it when an ACK reopens the window.
+    let sendable = total.min(c.usable_window() as usize);
+    if sendable == 0 {
         return Ok(0);
     }
 
@@ -575,16 +626,16 @@ pub fn async_try_send_chain(
         window: c.rx_free() as u16,
     };
     if nic::tso_available()
-        && total > mss
-        && payload_offset(c.local_ip) + total <= TSO_FRAME_BUF_LEN
+        && sendable > mss
+        && payload_offset(c.local_ip) + sendable <= TSO_FRAME_BUF_LEN
     {
-        send_super_segment_from_cursor(&meta, &mut cursor, total);
-        c.snd_nxt = c.snd_nxt.wrapping_add(total as u32);
+        send_super_segment_from_cursor(&meta, &mut cursor, sendable);
+        c.snd_nxt = c.snd_nxt.wrapping_add(sendable as u32);
     } else {
         let mut sent = 0usize;
         let mut chunk_meta = meta;
-        while sent < total {
-            let chunk = (total - sent).min(mss);
+        while sent < sendable {
+            let chunk = (sendable - sent).min(mss);
             send_segment_from_cursor(&chunk_meta, &mut cursor, chunk);
             chunk_meta.seq = chunk_meta.seq.wrapping_add(chunk as u32);
             c.snd_nxt = c.snd_nxt.wrapping_add(chunk as u32);
@@ -597,20 +648,19 @@ pub fn async_try_send_chain(
     // `drop(cursor)`), but binding into `_` moves it and ends the
     // borrow at the same point.
     let _ = cursor;
-    // RFC 6298: retain the just-sent bytes so the RTO timer can
-    // retransmit them if their ACK never arrives, and start the
-    // timer if it is not already running. A fresh cursor re-walks
-    // the still-intact chain (one extra copy into `rtx_buf`); the
-    // chain is dropped immediately after.
+    // RFC 6298: retain the just-sent `sendable` bytes so the RTO
+    // timer can retransmit them if their ACK never arrives, and
+    // start the timer if it is not already running. A fresh cursor
+    // re-walks the chain from the front (one extra copy into
+    // `rtx_buf`) over exactly the prefix about to be drained.
     {
         let mut rtx_cursor = chain.cursor();
-        c.rtx_on_data_sent(total, &mut rtx_cursor);
+        c.rtx_on_data_sent(sendable, &mut rtx_cursor);
     }
-    // Drops fire in chain order (External callbacks recycle NIC
-    // descriptors back to driver pools).
-    chain.clear();
-    // Both paths (TSO super-segment + per-MSS loop) consume the
-    // entire chain — bare-metal NIC TX never blocks under our
-    // load model.
-    Ok(total)
+    // Drop the sent prefix off the chain; the unsent tail (if the
+    // window was the limit) stays queued for the next call. Drops
+    // fire front-to-back — `External` callbacks recycle NIC
+    // descriptors back to driver pools.
+    chain_drain_prefix(chain, sendable);
+    Ok(sendable)
 }
