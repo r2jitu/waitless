@@ -17,7 +17,7 @@
 # Usage:
 #   ./scripts/deploy-gcloud.sh build-only   # build disk.raw locally; stop
 #   ./scripts/deploy-gcloud.sh qemu-test    # build + boot in local QEMU
-#   ./scripts/deploy-gcloud.sh deploy       # full deploy (default)
+#   ./scripts/deploy-gcloud.sh deploy       # full deploy (default; blue/green if WAITLESS_ZERO_DOWNTIME=1)
 #   ./scripts/deploy-gcloud.sh serial       # one-shot dump of serial port 1
 #   ./scripts/deploy-gcloud.sh logs         # follow serial port of current VM
 #   ./scripts/deploy-gcloud.sh status       # show instance state + external IP
@@ -43,6 +43,14 @@
 #   WAITLESS_BAZEL_DEFINES — extra flags appended to the ISO build,
 #     e.g. `--define tls_cert=prod` to bake in the production TLS
 #     cert. `scripts/renew-and-deploy.sh` sets this.
+#   WAITLESS_ZERO_DOWNTIME — set to 1 to make `deploy` a blue/green
+#     deploy: build + boot the new image as a second instance,
+#     health-check it, then move WAITLESS_GCE_ADDRESS across and
+#     delete the old one. Needs WAITLESS_GCE_ADDRESS;
+#     scripts/renew-and-deploy.sh sets it. Default off — `deploy`
+#     replaces the instance in place (a multi-minute outage).
+#   WAITLESS_HEALTH_TIMEOUT — seconds to wait for a new instance to
+#     answer GET /health with 200 before aborting (default 150).
 
 set -euo pipefail
 
@@ -54,6 +62,9 @@ MODE="${1:-deploy}"
 NAME="${WAITLESS_GCE_NAME:-waitless-webserver}"
 # Default zone us-west1-c: only us-west1 zone with c3-highcpu-8.
 ZONE="${WAITLESS_GCE_ZONE:-us-west1-c}"
+# Region the zone sits in (us-west1-c -> us-west1) — where regional
+# resources such as the reserved static address live.
+REGION="${ZONE%-*}"
 # c3-highcpu-8 by default: 8 vCPU room for multi-core bench scaling.
 # (Both c3 and n2 negotiate `GqiQpl` from the gVNIC device on the
 # GCE images we've tested — DQO_RDA is on the c3 menu in principle
@@ -81,6 +92,79 @@ _require_project() {
         echo "Error: no GCP project set (env WAITLESS_GCE_PROJECT or gcloud config)" >&2
         exit 1
     fi
+}
+
+# --- Instance resolution + health check -----------------------------------
+# Shared by the ops subcommands and the blue/green deploy.
+
+# Name of the instance currently holding the reserved static IP, or
+# empty. An Address resource's `users` field lists the URLs of
+# whatever it is attached to.
+ip_holder() {
+    [ -n "${WAITLESS_GCE_ADDRESS:-}" ] || { echo ""; return; }
+    local users
+    users="$(gcloud compute addresses describe "$WAITLESS_GCE_ADDRESS" \
+        --region="$REGION" --project="$PROJECT" \
+        --format='value(users)' 2>/dev/null || true)"
+    if [ -n "$users" ]; then
+        basename "${users%%;*}" # take the first if several
+    else
+        echo ""
+    fi
+}
+
+# Name of the live webserver instance, or empty if none. Handles both
+# deploy styles: a single instance named exactly $NAME (plain
+# `deploy`, bench, or a legacy deploy), and the $NAME-blue /
+# $NAME-green pair a zero-downtime deploy leaves behind.
+resolve_instance() {
+    if gcloud compute instances describe "$NAME" \
+        --zone="$ZONE" --project="$PROJECT" \
+        --format='value(name)' >/dev/null 2>&1; then
+        echo "$NAME"
+        return
+    fi
+    local holder
+    holder="$(ip_holder)"
+    if [ -n "$holder" ] && gcloud compute instances describe "$holder" \
+        --zone="$ZONE" --project="$PROJECT" \
+        --format='value(name)' >/dev/null 2>&1; then
+        echo "$holder"
+        return
+    fi
+    gcloud compute instances list \
+        --filter="name=( ${NAME}-blue ${NAME}-green )" \
+        --zones="$ZONE" --project="$PROJECT" \
+        --format='value(name)' 2>/dev/null | head -n1
+}
+
+# Poll an instance until GET /health returns 200, or fail after
+# WAITLESS_HEALTH_TIMEOUT seconds (default 150). With
+# WAITLESS_CERT_DOMAIN set the probe is HTTPS with --resolve, so it
+# also confirms the new image serves a valid cert for the domain;
+# without it, a plain-HTTP probe. Args: <ip> <label>
+health_check() {
+    local ip="$1" label="$2"
+    local timeout="${WAITLESS_HEALTH_TIMEOUT:-150}"
+    local deadline=$((SECONDS + timeout))
+    local probe
+    if [ -n "${WAITLESS_CERT_DOMAIN:-}" ]; then
+        probe=(curl -fsS --max-time 5
+            --resolve "${WAITLESS_CERT_DOMAIN}:443:${ip}"
+            "https://${WAITLESS_CERT_DOMAIN}/health")
+    else
+        probe=(curl -fsS --max-time 5 "http://${ip}/health")
+    fi
+    echo "==> Health-checking ${label} (${ip}), up to ${timeout}s ..."
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if "${probe[@]}" >/dev/null 2>&1; then
+            echo "    ${label}: healthy"
+            return 0
+        fi
+        sleep 3
+    done
+    echo "    ${label}: NOT healthy after ${timeout}s" >&2
+    return 1
 }
 
 # --- Build disk.raw from the Limine ISO ---
@@ -375,19 +459,266 @@ deploy() {
 EOF
 }
 
+# --- Zero-downtime (blue/green) deploy -------------------------------------
+#
+# Used when WAITLESS_ZERO_DOWNTIME=1 (renew-and-deploy.sh sets it for
+# the production endpoint). The plain deploy() above deletes the
+# running VM and recreates it — a multi-minute outage, and a broken
+# image takes the site down with no rollback. This instead:
+#
+#   1. builds the new image while the old instance keeps serving;
+#   2. boots it as the idle colour ($NAME-blue / $NAME-green) on an
+#      ephemeral IP;
+#   3. health-checks that instance — a bad build aborts the deploy
+#      here, old instance untouched;
+#   4. cuts over by moving the reserved static IP old -> new;
+#   5. verifies the static IP, then deletes the old instance.
+#
+# The only outage is the IP move in step 4 (a couple of API calls —
+# seconds, not minutes). Requires WAITLESS_GCE_ADDRESS: the stable IP
+# is the pivot the cutover turns on.
+deploy_bluegreen() {
+    _require_project
+    if [ -z "${WAITLESS_GCE_ADDRESS:-}" ]; then
+        echo "Error: zero-downtime deploy needs a reserved static IP." >&2
+        echo "       Set WAITLESS_GCE_ADDRESS, or unset WAITLESS_ZERO_DOWNTIME" >&2
+        echo "       to use the plain in-place deploy." >&2
+        exit 1
+    fi
+
+    local static_ip
+    static_ip="$(gcloud compute addresses describe "$WAITLESS_GCE_ADDRESS" \
+        --region="$REGION" --project="$PROJECT" \
+        --format='value(address)' 2>/dev/null || true)"
+    if [ -z "$static_ip" ]; then
+        echo "Error: reserved address '$WAITLESS_GCE_ADDRESS' not found in region $REGION" >&2
+        exit 1
+    fi
+
+    local live target
+    live="$(resolve_instance || true)"
+    case "$live" in
+    "${NAME}-blue") target="${NAME}-green" ;;
+    *) target="${NAME}-blue" ;;
+    esac
+
+    echo "==> Zero-downtime deploy"
+    echo "    project: $PROJECT   zone: $ZONE   machine: $MACHINE_TYPE"
+    echo "    live:    ${live:-(none — first deploy)}"
+    echo "    target:  $target"
+    echo "    static IP: $WAITLESS_GCE_ADDRESS ($static_ip)"
+
+    echo "==> Ensuring GCS bucket: gs://$BUCKET"
+    gsutil ls "gs://$BUCKET" >/dev/null 2>&1 ||
+        gsutil mb -l "$REGION" "gs://$BUCKET"
+
+    # Upload the new tarball and (re)create the image. The old
+    # instance keeps serving throughout — nothing is torn down here.
+    echo "==> Upload + image build (old instance still serving) ..."
+    (
+        gsutil -q cp "$TARBALL" "gs://$BUCKET/${TARBALL_NAME}" &&
+            echo "    upload: done"
+    ) &
+    local upload_pid=$!
+    (
+        gcloud compute images delete "$IMAGE_NAME" \
+            --project="$PROJECT" --quiet >/dev/null 2>&1 &&
+            echo "    old image delete: done" ||
+            echo "    old image delete: (not present)"
+    ) &
+    local img_del_pid=$!
+    wait "$upload_pid" "$img_del_pid"
+
+    echo "==> Creating GCE image: $IMAGE_NAME"
+    gcloud compute images create "$IMAGE_NAME" \
+        --source-uri="gs://$BUCKET/${TARBALL_NAME}" \
+        --family=waitless \
+        --guest-os-features=UEFI_COMPATIBLE,GVNIC \
+        --project="$PROJECT" --quiet
+
+    # An interrupted earlier deploy may have left the target colour
+    # behind. Clear it so the create below is unambiguous.
+    if gcloud compute instances delete "$target" \
+        --zone="$ZONE" --project="$PROJECT" --quiet >/dev/null 2>&1; then
+        echo "==> Cleared a stale $target from an earlier run"
+    fi
+
+    # Firewall rule (tcp:80, tcp:443, udp:443 for tag http-server).
+    # Create-or-update; the target instance carries the tag.
+    gcloud compute firewall-rules create allow-http-waitless \
+        --allow=tcp:80,tcp:443,udp:443 --target-tags=http-server \
+        --project="$PROJECT" --quiet >/dev/null 2>&1 ||
+        gcloud compute firewall-rules update allow-http-waitless \
+            --allow=tcp:80,tcp:443,udp:443 \
+            --project="$PROJECT" --quiet >/dev/null 2>&1 || true
+
+    # Launch the target on an *ephemeral* external IP — the static IP
+    # stays with the live instance until cutover.
+    local qc="${QUEUE_COUNT:-8}"
+    local nic_args
+    if [[ "${LEGACY_VIRTIO_NIC:-}" == "1" ]]; then
+        nic_args="queue-count=${qc}"
+    else
+        nic_args="nic-type=GVNIC,queue-count=${qc}"
+    fi
+    local preempt_args=()
+    if [[ "${WAITLESS_GCE_PREEMPTIBLE:-1}" == "1" ]]; then
+        preempt_args=(
+            --provisioning-model=SPOT
+            --no-restart-on-failure
+            --maintenance-policy=TERMINATE
+        )
+    fi
+    echo "==> Launching $target (ephemeral IP, ${nic_args})"
+    gcloud compute instances create "$target" \
+        --zone="$ZONE" \
+        --machine-type="$MACHINE_TYPE" \
+        --image="$IMAGE_NAME" \
+        --image-project="$PROJECT" \
+        --network-interface="network=default,${nic_args}" \
+        --tags=http-server \
+        --metadata=serial-port-enable=TRUE \
+        ${preempt_args[@]+"${preempt_args[@]}"} \
+        --project="$PROJECT" --quiet
+
+    local target_ip
+    target_ip="$(gcloud compute instances describe "$target" \
+        --zone="$ZONE" --project="$PROJECT" \
+        --format='get(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null || true)"
+    if [ -z "$target_ip" ]; then
+        echo "Error: $target has no external IP — cannot health-check it" >&2
+        gcloud compute instances delete "$target" \
+            --zone="$ZONE" --project="$PROJECT" --quiet >/dev/null 2>&1 || true
+        exit 1
+    fi
+
+    # Health gate. Failure aborts here with the live instance still
+    # serving — production never sees the bad build.
+    if ! health_check "$target_ip" "$target"; then
+        echo "==> Deploy aborted: $target failed its health check." >&2
+        echo "    ${live:-No previous instance} still serving; deleting $target." >&2
+        gcloud compute instances delete "$target" \
+            --zone="$ZONE" --project="$PROJECT" --quiet >/dev/null 2>&1 || true
+        exit 1
+    fi
+
+    # An access config's name is only a label, but delete-access-config
+    # needs the exact one — and GCE names it "external-nat" for a
+    # --network-interface instance, not the "External NAT" the bare
+    # `create` produces. Query both instances rather than assume; name
+    # anything we create "external-nat" to match.
+    local new_ac="external-nat"
+    local live_ac="$new_ac" target_ac="$new_ac"
+    if [ -n "$live" ]; then
+        live_ac="$(gcloud compute instances describe "$live" \
+            --zone="$ZONE" --project="$PROJECT" \
+            --format='value(networkInterfaces[0].accessConfigs[0].name)' \
+            2>/dev/null || echo "$new_ac")"
+    fi
+    target_ac="$(gcloud compute instances describe "$target" \
+        --zone="$ZONE" --project="$PROJECT" \
+        --format='value(networkInterfaces[0].accessConfigs[0].name)' \
+        2>/dev/null || echo "$new_ac")"
+
+    # --- Cutover --------------------------------------------------------
+    # A static external IP can belong to only one instance, so a brief
+    # gap is unavoidable. Minimise it: drop the target's ephemeral IP
+    # first (live still serving — no gap), then free the static IP
+    # from live (gap starts) and attach it to target (gap ends).
+    echo "==> Cutover: $static_ip  ${live:-(none)} -> $target"
+
+    if ! gcloud compute instances delete-access-config "$target" \
+        --access-config-name="$target_ac" \
+        --zone="$ZONE" --project="$PROJECT" --quiet; then
+        echo "Error: could not release $target's ephemeral IP." >&2
+        echo "       ${live:-(none)} still serving; $target left up for inspection." >&2
+        exit 1
+    fi
+
+    if [ -n "$live" ]; then
+        if ! gcloud compute instances delete-access-config "$live" \
+            --access-config-name="$live_ac" \
+            --zone="$ZONE" --project="$PROJECT" --quiet; then
+            echo "Error: could not free the static IP from $live." >&2
+            echo "       $live still holds it and is serving; $target is idle." >&2
+            exit 1
+        fi
+    fi
+
+    if ! gcloud compute instances add-access-config "$target" \
+        --access-config-name="$new_ac" --address="$static_ip" \
+        --zone="$ZONE" --project="$PROJECT" --quiet; then
+        echo "Error: could not attach the static IP to $target. Rolling back..." >&2
+        if [ -n "$live" ]; then
+            gcloud compute instances add-access-config "$live" \
+                --access-config-name="$live_ac" --address="$static_ip" \
+                --zone="$ZONE" --project="$PROJECT" --quiet &&
+                echo "    static IP restored to $live." >&2 ||
+                echo "    !! FAILED to restore the IP to $live — fix manually." >&2
+        fi
+        exit 1
+    fi
+
+    # Verify the static IP now serves from target.
+    if ! health_check "$static_ip" "$target via $static_ip"; then
+        echo "==> Cutover verification failed — rolling back." >&2
+        gcloud compute instances delete-access-config "$target" \
+            --access-config-name="$new_ac" \
+            --zone="$ZONE" --project="$PROJECT" --quiet >/dev/null 2>&1 || true
+        if [ -n "$live" ]; then
+            gcloud compute instances add-access-config "$live" \
+                --access-config-name="$live_ac" --address="$static_ip" \
+                --zone="$ZONE" --project="$PROJECT" --quiet &&
+                echo "    static IP returned to $live; $target left up for inspection." >&2 ||
+                echo "    !! FAILED to restore the IP to $live — fix manually." >&2
+        else
+            echo "    no previous instance to roll back to." >&2
+        fi
+        exit 1
+    fi
+
+    # Cutover confirmed — retire the old instance.
+    if [ -n "$live" ]; then
+        echo "==> Retiring old instance: $live"
+        gcloud compute instances delete "$live" \
+            --zone="$ZONE" --project="$PROJECT" --quiet >/dev/null 2>&1 &&
+            echo "    $live deleted" ||
+            echo "    $live: (already gone)"
+    fi
+
+    cat <<EOF
+
+=========================================
+  Zero-downtime deploy complete
+=========================================
+  Live instance: $target   Zone: $ZONE
+  Static IP:     $static_ip
+  URL:           https://${WAITLESS_CERT_DOMAIN:-$static_ip}/
+
+  Serial console:  $0 logs
+=========================================
+EOF
+}
+
 read_serial() {
     _require_project
-    gcloud compute instances get-serial-port-output "$NAME" \
+    local inst
+    inst="$(resolve_instance || true)"
+    [ -n "$inst" ] || { echo "Error: no webserver instance found" >&2; exit 1; }
+    gcloud compute instances get-serial-port-output "$inst" \
         --zone="$ZONE" --project="$PROJECT"
 }
 
 tail_serial() {
     _require_project
-    echo "==> Following serial port 1 of $NAME (Ctrl-C to stop)..." >&2
+    local inst
+    inst="$(resolve_instance || true)"
+    [ -n "$inst" ] || { echo "Error: no webserver instance found" >&2; exit 1; }
+    echo "==> Following serial port 1 of $inst (Ctrl-C to stop)..." >&2
     local start=0
     while true; do
         local out
-        out="$(gcloud compute instances get-serial-port-output "$NAME" \
+        out="$(gcloud compute instances get-serial-port-output "$inst" \
             --zone="$ZONE" --project="$PROJECT" --start="$start" 2>/dev/null || true)"
         if [ -n "$out" ]; then
             printf '%s' "$out"
@@ -399,7 +730,10 @@ tail_serial() {
 
 show_status() {
     _require_project
-    gcloud compute instances describe "$NAME" \
+    local inst
+    inst="$(resolve_instance || true)"
+    [ -n "$inst" ] || { echo "(no webserver instance found)"; return; }
+    gcloud compute instances describe "$inst" \
         --zone="$ZONE" --project="$PROJECT" \
         --format='table(name,status,machineType.basename(),networkInterfaces[0].accessConfigs[0].natIP:label=EXTERNAL_IP)' \
         2>&1 || echo "(instance not found)"
@@ -407,37 +741,53 @@ show_status() {
 
 show_ip() {
     _require_project
-    gcloud compute instances describe "$NAME" \
+    local inst
+    inst="$(resolve_instance || true)"
+    [ -n "$inst" ] || return 0
+    gcloud compute instances describe "$inst" \
         --zone="$ZONE" --project="$PROJECT" \
         --format='get(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null
 }
 
 stop_vm() {
     _require_project
-    echo "==> Stopping $NAME..."
-    gcloud compute instances stop "$NAME" \
+    local inst
+    inst="$(resolve_instance || true)"
+    [ -n "$inst" ] || { echo "Error: no webserver instance found" >&2; exit 1; }
+    echo "==> Stopping $inst..."
+    gcloud compute instances stop "$inst" \
         --zone="$ZONE" --project="$PROJECT" --quiet
 }
 
 start_vm() {
     _require_project
-    echo "==> Starting $NAME..."
-    gcloud compute instances start "$NAME" \
+    local inst
+    inst="$(resolve_instance || true)"
+    [ -n "$inst" ] || { echo "Error: no webserver instance found" >&2; exit 1; }
+    echo "==> Starting $inst..."
+    gcloud compute instances start "$inst" \
         --zone="$ZONE" --project="$PROJECT" --quiet
     local ip
     ip="$(show_ip)"
     echo "    External IP: $ip   URL: http://$ip/"
 }
 
-# Delete the VM only. Keeps images so you can redeploy without
-# rebuilding + reuploading; keeps the firewall rule so a later
-# `deploy` doesn't need to recreate it.
+# Delete the webserver instance(s). Keeps images so you can redeploy
+# without rebuilding + reuploading; keeps the firewall rule so a later
+# `deploy` doesn't need to recreate it. Removes whichever of the
+# plain / blue / green names exist.
 delete_vm() {
     _require_project
-    echo "==> Deleting instance $NAME..."
-    gcloud compute instances delete "$NAME" \
-        --zone="$ZONE" --project="$PROJECT" --quiet 2>&1 ||
-        echo "(instance already gone)"
+    echo "==> Deleting webserver instance(s) in $PROJECT..."
+    local n found=0
+    for n in "$NAME" "${NAME}-blue" "${NAME}-green"; do
+        if gcloud compute instances delete "$n" \
+            --zone="$ZONE" --project="$PROJECT" --quiet >/dev/null 2>&1; then
+            echo "    deleted $n"
+            found=1
+        fi
+    done
+    [ "$found" = 1 ] || echo "    (no instance present)"
 }
 
 # Sweep out orphaned images + tarballs from the old timestamped-name
@@ -487,10 +837,12 @@ purge() {
     _require_project
     echo "==> Purging VM, images, bucket, and firewall rule in $PROJECT..."
 
-    gcloud compute instances delete "$NAME" \
-        --zone="$ZONE" --project="$PROJECT" --quiet 2>/dev/null &&
-        echo "    instance: deleted" ||
-        echo "    instance: (not present)"
+    local pn
+    for pn in "$NAME" "${NAME}-blue" "${NAME}-green"; do
+        gcloud compute instances delete "$pn" \
+            --zone="$ZONE" --project="$PROJECT" --quiet >/dev/null 2>&1 &&
+            echo "    instance: deleted $pn" || true
+    done
 
     # Delete every image in the waitless family. `--filter` keeps us
     # from nuking unrelated images that happen to live in the same
@@ -528,7 +880,11 @@ qemu-test)
     ;;
 deploy)
     build_disk
-    deploy
+    if [ "${WAITLESS_ZERO_DOWNTIME:-0}" = "1" ]; then
+        deploy_bluegreen
+    else
+        deploy
+    fi
     ;;
 serial) read_serial ;;
 logs) tail_serial ;;

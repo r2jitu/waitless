@@ -5,7 +5,7 @@
 # Three steps, one command:
 #   1. issue-cert.sh   — ACME DNS-01 issuance → apps/webserver/prod_certs/
 #   2. bazel build     — webserver_iso with `--define tls_cert=prod`
-#   3. deploy-gcloud.sh — upload the image and relaunch the GCE VM
+#   3. deploy-gcloud.sh — blue/green deploy of the new image
 #
 # Let's Encrypt certificates are valid 90 days. issue-cert.sh reuses
 # the staged cert and re-issues only once it nears expiry (default:
@@ -19,10 +19,12 @@
 #                 /path/to/waitless/scripts/renew-and-deploy.sh prod \
 #                 >> /var/log/waitless-renew.log 2>&1
 #
-# Downtime is the unikernel's ~50 ms reboot when the GCE VM relaunches
-# on the new image. For true zero downtime, deploy a second instance
-# and flip the external IP / forwarding rule — left as a follow-up;
-# the brief reboot is acceptable for a personal site.
+# The deploy is zero-downtime: deploy-gcloud.sh (with
+# WAITLESS_ZERO_DOWNTIME=1, set below) builds the new image, boots it
+# as a second blue/green instance, health-checks it, and only then
+# moves the reserved static IP across. A bad build is caught before
+# any traffic shifts; the sole outage is the IP move — a couple of
+# API calls. See scripts/deploy-gcloud.sh.
 #
 # Usage:
 #   ./scripts/renew-and-deploy.sh staging   # LE staging (default)
@@ -53,10 +55,14 @@ echo ""
 echo "=========================================="
 echo "  Step 2/3 + 3/3 — build (tls_cert=prod) + deploy"
 echo "=========================================="
-# deploy-gcloud.sh runs `bazel build` then the GCE upload/relaunch;
+# deploy-gcloud.sh runs `bazel build` then the GCE deploy.
 # WAITLESS_BAZEL_DEFINES threads the prod-cert define into that build
-# so the freshly issued cert from prod_certs/ is baked into the image.
+# so the cert in prod_certs/ is baked into the image; WAITLESS_ZERO_-
+# DOWNTIME=1 selects the blue/green path — health-check the new image
+# on a second instance, then flip the static IP — so the cutover is
+# seconds and a bad build never reaches production.
 WAITLESS_BAZEL_DEFINES="--define tls_cert=prod" \
+    WAITLESS_ZERO_DOWNTIME=1 \
     "$SCRIPT_DIR/deploy-gcloud.sh" deploy
 
 echo ""
