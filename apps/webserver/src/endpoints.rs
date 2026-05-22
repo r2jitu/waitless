@@ -373,18 +373,10 @@ pub(crate) fn stats_response() -> Response {
         // overhead dominates).
         let (tls_enc_b, tls_enc_r, tls_enc_cyc, tls_dec_b, tls_dec_r, tls_dec_cyc) =
             tls::record::encrypt_stats();
-        let qenc_b = quic::diag::COUNTERS
-            .aead_seal_bytes
-            .load(core::sync::atomic::Ordering::Relaxed);
-        let qenc_p = quic::diag::COUNTERS
-            .aead_seal_packets
-            .load(core::sync::atomic::Ordering::Relaxed);
-        let qdec_b = quic::diag::COUNTERS
-            .aead_open_bytes
-            .load(core::sync::atomic::Ordering::Relaxed);
-        let qdec_p = quic::diag::COUNTERS
-            .aead_open_packets
-            .load(core::sync::atomic::Ordering::Relaxed);
+        let qenc_b = quic::diag::COUNTERS.aead_seal_bytes.get();
+        let qenc_p = quic::diag::COUNTERS.aead_seal_packets.get();
+        let qdec_b = quic::diag::COUNTERS.aead_open_bytes.get();
+        let qdec_p = quic::diag::COUNTERS.aead_open_packets.get();
         let _ = write!(
             w,
             ",\"tls_encrypt_bytes\":{},\

@@ -251,12 +251,10 @@ impl Connection {
         if lost_threshold_n > 0 {
             crate::diag::COUNTERS
                 .packets_lost_threshold
-                .fetch_add(lost_threshold_n, core::sync::atomic::Ordering::Relaxed);
+                .add(lost_threshold_n);
         }
         if lost_time_n > 0 {
-            crate::diag::COUNTERS
-                .packets_lost_time
-                .fetch_add(lost_time_n, core::sync::atomic::Ordering::Relaxed);
+            crate::diag::COUNTERS.packets_lost_time.add(lost_time_n);
         }
     }
 

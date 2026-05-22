@@ -105,10 +105,10 @@ impl Connection {
         // Drive the TLS state machine + queue outbound after
         // consuming all packets in the datagram.
         self.advance_tls(config)?;
-        crate::diag::bump(&crate::diag::COUNTERS.flush_calls);
+        crate::diag::COUNTERS.flush_calls.bump();
         self.flush_outbound(config)?;
         self.reap_finished_streams();
-        crate::diag::bump(&crate::diag::COUNTERS.datagrams_processed);
+        crate::diag::COUNTERS.datagrams_processed.bump();
         Ok(())
     }
 
@@ -521,13 +521,10 @@ impl Connection {
             );
             ConnError::Decrypt
         })?;
-        crate::diag::COUNTERS.aead_open_bytes.fetch_add(
-            (payload_end - payload_start) as u64,
-            core::sync::atomic::Ordering::Relaxed,
-        );
         crate::diag::COUNTERS
-            .aead_open_packets
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            .aead_open_bytes
+            .add((payload_end - payload_start) as u64);
+        crate::diag::COUNTERS.aead_open_packets.bump();
 
         let payload = &buf[payload_start..payload_end];
         self.dispatch_frames(CryptoLevel::OneRtt, payload)?;
@@ -728,8 +725,22 @@ impl Connection {
                         ack_ranges,
                     );
                 }
-                Frame::ConnectionCloseTransport { .. }
-                | Frame::ConnectionCloseApplication { .. } => {
+                Frame::ConnectionCloseTransport {
+                    error_code,
+                    frame_type,
+                    reason,
+                } => {
+                    // Principle 4: capture the peer's close detail
+                    // rather than discarding it via `{ .. }`. The
+                    // error_code / frame_type / reason land in
+                    // `LAST_CONN_CLOSE` for `/quic_stats`.
+                    crate::diag::record_conn_close(false, error_code, frame_type, reason);
+                    self.state = ConnState::Failed;
+                    return Ok(());
+                }
+                Frame::ConnectionCloseApplication { error_code, reason } => {
+                    // Application close (0x1d) carries no frame_type.
+                    crate::diag::record_conn_close(true, error_code, 0, reason);
                     self.state = ConnState::Failed;
                     return Ok(());
                 }
@@ -781,7 +792,7 @@ impl Connection {
                         let s = self.recv_streams.get_mut(&stream_id).unwrap();
                         s.ingest(offset, data, fin);
                         if was_new {
-                            crate::diag::bump(&crate::diag::COUNTERS.recv_streams_created);
+                            crate::diag::COUNTERS.recv_streams_created.bump();
                             // Update the peer-stream-count high
                             // watermark per type. Stream IDs encode
                             // (initiator, type) in the low 2 bits:

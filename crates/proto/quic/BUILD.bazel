@@ -64,6 +64,10 @@ rust_library(
     }),
     deps = [
         "//crates/drivers/nic:api",
+        # `kernel_core::obs` — the shared observability primitives
+        # (`Counter`, `LastEvent`). QUIC is the doctrine's reference
+        # implementation; see `docs/observability.md`.
+        "//crates/kernel/core",
         "//crates/proto/tls",
         "//crates/runtime/executor",
         "//crates/waitless",

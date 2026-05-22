@@ -89,7 +89,7 @@ fn ship_datagram(
         let _ = sock.send_to_with_l2_headroom(peer_ip, peer_port, pkt.vec_mut());
         conn.borrow_mut().recycle_packet(pkt);
     }
-    crate::diag::bump(&crate::diag::COUNTERS.datagrams_sent);
+    crate::diag::COUNTERS.datagrams_sent.bump();
 }
 
 /// Maximum simultaneous QUIC connections per worker. Each slot
@@ -654,9 +654,17 @@ where
     let peer_ip: Rc<Cell<waitless::runtime::IpAddr>> = Rc::new(Cell::new(waitless::runtime::IpAddr::V4_ANY));
     let peer_port: Rc<Cell<u16>> = Rc::new(Cell::new(0));
     let mut handler_spawned = false;
+    // Observability (principle 3 — every exit is traced): each break
+    // site below classifies the teardown; the post-loop
+    // `record_conn_exit` snapshots `exit_reason` plus the idle
+    // invariant inputs into `LAST_CONN_EXIT`. Default is `ConnFailed`
+    // — the `state == Failed` exit path, which needs no explicit set.
+    let mut exit_reason = crate::diag::ExitReason::ConnFailed;
+    let mut iterations: u64 = 0;
 
     loop {
-        crate::diag::bump(&crate::diag::COUNTERS.conn_task_iterations);
+        crate::diag::COUNTERS.conn_task_iterations.bump();
+        iterations += 1;
         // Race the inbox against a single combined timer that
         // fires at the earliest of: idle-timeout deadline,
         // PTO deadline (if any in-flight ack-eliciting packets).
@@ -677,6 +685,7 @@ where
                 idle_us,
                 hex8(&local_cid_bytes)
             );
+            exit_reason = crate::diag::ExitReason::IdleTimeout;
             break;
         }
         let idle_deadline = last_recv_us + idle_us;
@@ -689,7 +698,11 @@ where
         let dgram = match waitless::runtime::select(inbox.pop(), waitless::runtime::sleep_us(remaining)).await
         {
             waitless::runtime::Either::Left(Some(d)) => d,
-            waitless::runtime::Either::Left(None) => break, // inbox closed
+            waitless::runtime::Either::Left(None) => {
+                // Inbox closed — listener torn down / slot reclaimed.
+                exit_reason = crate::diag::ExitReason::InboxClosed;
+                break;
+            }
             waitless::runtime::Either::Right(()) => {
                 // The timer fired. It was armed at
                 // `min(PTO deadline, idle deadline)`, so a wakeup
@@ -718,6 +731,7 @@ where
                         idle_us,
                         hex8(&local_cid_bytes)
                     );
+                    exit_reason = crate::diag::ExitReason::IdleTimeout;
                     break;
                 }
                 // Not idle — the PTO deadline is what woke us.
@@ -728,9 +742,7 @@ where
                 if pto_deadline.is_some_and(|p| after >= p) {
                     let probed = conn.borrow_mut().send_pto_probe();
                     if probed {
-                        crate::diag::COUNTERS
-                            .pto_probes_sent
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        crate::diag::COUNTERS.pto_probes_sent.bump();
                         // Drain the probe to the wire immediately
                         // via the ownership-transfer pop + recycle
                         // pattern.
@@ -797,6 +809,7 @@ where
                     c.close_with_error(code, reason);
                     c.flush_close();
                 }
+                exit_reason = crate::diag::ExitReason::ProcessError;
                 tearing_down = true;
                 break;
             }
@@ -855,10 +868,25 @@ where
 
         if matches!(conn.borrow().state(), ConnState::Failed) {
             // Wake the handler one last time so its await loops
-            // can observe `Failed` and exit.
+            // can observe `Failed` and exit. `exit_reason` keeps its
+            // `ConnFailed` default — peer / app close, not an error.
             progress.set();
             break;
         }
+    }
+    // Snapshot the teardown into `LAST_CONN_EXIT` (principle 3): the
+    // exit reason plus the idle invariant inputs — `last_recv_age_us`
+    // vs `idle_us` — that decide whether an idle exit was spurious.
+    {
+        let c = conn.borrow();
+        let last_recv_age = tls::ticket::now_us().saturating_sub(c.last_recv_us());
+        crate::diag::record_conn_exit(
+            exit_reason,
+            &local_cid_bytes,
+            iterations,
+            last_recv_age,
+            c.idle_timeout_us(),
+        );
     }
     // Mark the conn terminated BEFORE the final wake. The user
     // handler observes `state() == Failed` to break out of its

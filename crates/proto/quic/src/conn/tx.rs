@@ -55,7 +55,7 @@ impl Connection {
                 && datagram.len() > MAX_L2_HEADROOM
             {
                 self.outbound.push_back(datagram);
-                crate::diag::bump(&crate::diag::COUNTERS.connection_closes_emitted);
+                crate::diag::COUNTERS.connection_closes_emitted.bump();
             }
             self.state = ConnState::Failed;
         }
@@ -88,7 +88,7 @@ impl Connection {
     /// stream so the connection layer drains the send queue without
     /// waiting for the next inbound packet.
     pub fn flush(&mut self, config: &TlsServerConfig) -> Result<(), ConnError> {
-        crate::diag::bump(&crate::diag::COUNTERS.flush_calls);
+        crate::diag::COUNTERS.flush_calls.bump();
         self.flush_outbound(config)?;
         self.reap_finished_streams();
         Ok(())
@@ -111,7 +111,7 @@ impl Connection {
             self.encode_close_packet(datagram.vec_mut(), error_code, &reason)?;
             if datagram.len() > MAX_L2_HEADROOM {
                 self.outbound.push_back(datagram);
-                crate::diag::bump(&crate::diag::COUNTERS.connection_closes_emitted);
+                crate::diag::COUNTERS.connection_closes_emitted.bump();
             }
             self.state = ConnState::Failed;
             return Ok(());
@@ -215,7 +215,7 @@ impl Connection {
                 self.record_bytes_sent(n);
                 self.outbound.push_back(datagram);
             } else {
-                crate::diag::bump(&crate::diag::COUNTERS.anti_amp_throttled);
+                crate::diag::COUNTERS.anti_amp_throttled.bump();
             }
         }
 
@@ -257,7 +257,7 @@ impl Connection {
                 }
                 let n = (more.len() - MAX_L2_HEADROOM) as u64;
                 if n > self.anti_amp_remaining() {
-                    crate::diag::bump(&crate::diag::COUNTERS.anti_amp_throttled);
+                    crate::diag::COUNTERS.anti_amp_throttled.bump();
                     break;
                 }
                 self.record_bytes_sent(n);
@@ -299,7 +299,7 @@ impl Connection {
                 }
                 let n = (more.len() - MAX_L2_HEADROOM) as u64;
                 if n > self.anti_amp_remaining() {
-                    crate::diag::bump(&crate::diag::COUNTERS.anti_amp_throttled);
+                    crate::diag::COUNTERS.anti_amp_throttled.bump();
                     break;
                 }
                 self.record_bytes_sent(n);
@@ -956,12 +956,8 @@ impl Connection {
         let aad: &[u8] = &header_part[header_start..payload_offset];
         let payload_slice = &mut payload_part[..payload_len];
         let tag = keys.aead_seal(&nonce, aad, payload_slice);
-        crate::diag::COUNTERS
-            .aead_seal_bytes
-            .fetch_add(payload_len as u64, core::sync::atomic::Ordering::Relaxed);
-        crate::diag::COUNTERS
-            .aead_seal_packets
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::diag::COUNTERS.aead_seal_bytes.add(payload_len as u64);
+        crate::diag::COUNTERS.aead_seal_packets.bump();
         out[payload_offset + payload_len..payload_offset + payload_len + TAG_LEN]
             .copy_from_slice(&tag);
 

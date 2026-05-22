@@ -834,7 +834,7 @@ impl Connection {
                 .pop()
                 .unwrap_or_default();
             self.send_streams.insert(sid, new_stream);
-            crate::diag::bump(&crate::diag::COUNTERS.send_streams_created);
+            crate::diag::COUNTERS.send_streams_created.bump();
         }
         self.send_streams.get_mut(&sid).unwrap()
     }
@@ -954,7 +954,7 @@ impl Connection {
             // frame can't resurrect the stream and strand the H3
             // handler in `recv()` (see `reaped_streams` docstring).
             self.mark_reaped(sid);
-            crate::diag::bump(&crate::diag::COUNTERS.streams_reaped);
+            crate::diag::COUNTERS.streams_reaped.bump();
         }
     }
 

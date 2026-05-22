@@ -1,32 +1,42 @@
 // crates/proto/quic/src/diag.rs — observability for the QUIC stack.
 //
-// Every place in the QUIC stack that historically said "this is bad,
-// drop the packet/conn and move on" now goes through `quic_drop!`.
-// The macro both:
+// QUIC is the reference implementation of the observability doctrine
+// (`docs/observability.md`). Three things live here:
 //
-//   1. Increments a typed counter in `Counters` (atomic, lock-free)
-//   2. Emits a single-line log via `waitless::println!` so the operator can
-//      see the failure in real time
+//   1. `Counters` — one `obs::Counter` per drop / event reason.
+//      Cheap (relaxed atomic), always live.
+//   2. `quic_drop!` / `quic_event!` — macros that wrap every place
+//      the stack historically said "this is bad, drop the
+//      packet/conn and move on". They bump the counter and (gated
+//      by log level) emit a single line, replacing the silent
+//      `Err(_) -> drop` and `match _ => {}` patterns.
+//   3. `LastEvent` snapshot slots — `LAST_DROP`, `LAST_CONN_CLOSE`,
+//      `LAST_CONN_EXIT`. A counter says *how many*; a snapshot
+//      retains *what the most recent one looked like*, including
+//      the invariant inputs you would otherwise have to redeploy
+//      to capture. The h3-over-gve bug needed exactly this — the
+//      stack counted idle timeouts but discarded the 81 ms
+//      `last_recv_age` that proved the timeout spurious.
 //
-// `quic_event!` mirrors the same shape for non-failure events worth
-// surfacing (new conn allocated, handshake completed, packet sent).
-// Together they replace the silent `Err(_) -> drop` and
-// `match _ => {}` patterns that turned every QUIC interop bug into
-// "client times out 30 seconds later, no idea why".
+// Cost: a counter bump is one atomic increment. A snapshot
+// `record` takes a `Spinlock`, so it is COLD PATH ONLY — connection
+// close, conn-task teardown, drop sites. Never per packet on a
+// healthy flow. The `quic_drop!` println is gated by the runtime
+// log level (`LogLevel` below); benchmark builds pay only the
+// increment. Default is `Drops` — failure events log, normal
+// events don't. Override via the `quic.log=silent|drops|events`
+// token in `waitless::boot_info().boot_args`.
 //
-// Cost: each call site is one atomic increment + (gated) one
-// `waitless::println!`. The println is gated by the runtime log level
-// (`LogLevel` below) so benchmark builds pay only the increment.
-// Default is `Drops` — failure events log, normal events don't.
-// Override via the `quic.log=silent|drops|events` token in
-// `waitless::boot_info().boot_args`, parsed on first macro invocation.
-// The counters are always live so a future `/debug/quic_stats`
-// endpoint can dump them on demand without code changes.
+// Everything here is surfaced via `/quic_stats` and `/obs` without
+// a code change — see `write_obs_json`.
 
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::fmt;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-/// One atomic counter per drop / event reason. Cheap to read in bulk
-/// for a stats dump, cheap to increment on the hot path.
+use kernel_core::obs::{Counter, LastEvent, ObsRecord};
+
+/// One counter per drop / event reason. Cheap to read in bulk for a
+/// stats dump, cheap to increment on the hot path.
 ///
 /// Every field is named to match the `quic_drop!` / `quic_event!`
 /// reason argument exactly so a grep for the log line lands on the
@@ -35,61 +45,61 @@ pub struct Counters {
     // ── Endpoint-side drops (listener_loop) ──────────────────────
     /// Datagram arrived but `extract_dcid` rejected it (truncated /
     /// FIXED_BIT clear / wrong-length DCID). Junk packets, scanners.
-    pub no_dcid: AtomicU64,
+    pub no_dcid: Counter,
     /// Long-header non-Initial packet for an unknown DCID — peer
     /// retried with a stale CID, or genuinely random traffic.
-    pub unknown_long_header: AtomicU64,
+    pub unknown_long_header: Counter,
     /// Short-header packet for a CID that doesn't decode to any of
     /// our slots. Routine after a conn has fully closed.
-    pub unknown_short_header: AtomicU64,
+    pub unknown_short_header: Counter,
     /// Slot table is full; new conn refused. If this fires under
     /// normal load the table needs to grow.
-    pub slot_table_full: AtomicU64,
+    pub slot_table_full: Counter,
     /// `getrandom` failed when minting CID nonce or per-conn seed.
     /// Should be impossible — surface anyway because if it does
     /// happen we'd otherwise silently lose conns.
-    pub rng_failed: AtomicU64,
+    pub rng_failed: Counter,
 
     // ── Conn-side drops (process_one_packet & friends) ───────────
     /// Long-header preamble parse failed (truncated / malformed).
-    pub long_header_parse: AtomicU64,
+    pub long_header_parse: Counter,
     /// Initial header parse failed AFTER the long-header preamble
     /// (token-length / payload-length varint malformed).
-    pub initial_header_parse: AtomicU64,
+    pub initial_header_parse: Counter,
     /// AEAD decryption failed on an inbound packet. Either the peer
     /// is using stale keys or we derived the wrong ones.
-    pub aead_decrypt_failed: AtomicU64,
+    pub aead_decrypt_failed: Counter,
     /// Inbound frame parser couldn't classify a frame type.
-    pub unknown_frame: AtomicU64,
+    pub unknown_frame: Counter,
     /// We received a packet at a level we have no keys for (e.g.
     /// 1-RTT before handshake confirms).
-    pub bad_state: AtomicU64,
+    pub bad_state: Counter,
     /// Late Initial-level packet arrived after we discarded our
     /// Initial keys per RFC 9001 §4.9.1 (first received Handshake
     /// packet from the peer means both sides have moved past
     /// Initial). Counts the harmless straggler retransmits that
     /// previously surfaced as `aead_decrypt_failed` against stale
     /// keys.
-    pub late_initial_dropped: AtomicU64,
+    pub late_initial_dropped: Counter,
     /// Mirror of `late_initial_dropped` for Handshake-level
     /// stragglers after we've discarded Handshake keys per RFC
     /// 9001 §4.9.2 (TLS handshake confirmed).
-    pub late_handshake_dropped: AtomicU64,
+    pub late_handshake_dropped: Counter,
     /// Unspecified wire-format error not covered by a more specific
     /// counter above. Aggregates the long tail so they're at least
     /// visible.
-    pub other_wire: AtomicU64,
+    pub other_wire: Counter,
 
     // ── TLS-side drops ───────────────────────────────────────────
     /// ClientHello rejected by the parser / validator (missing
     /// x25519, no chacha20 cipher suite, malformed extension, etc.).
-    pub unsupported_client: AtomicU64,
+    pub unsupported_client: Counter,
     /// TLS internal error not attributable to peer input.
-    pub tls_internal: AtomicU64,
+    pub tls_internal: Counter,
 
     // ── Events (positive signal) ─────────────────────────────────
     /// New conn allocated for an Initial packet.
-    pub conns_allocated: AtomicU64,
+    pub conns_allocated: Counter,
     /// `Connection`'s `Drop` impl fired. Compare against
     /// `conns_allocated` at shutdown — a non-zero gap means N
     /// connections didn't drop, and their per-stream BTreeMaps,
@@ -98,33 +108,33 @@ pub struct Counters {
     /// `drain_all_arenas`, an `Rc<RefCell<Connection>>` is held
     /// somewhere outside the conn-task / user-handler future
     /// pair we expect to cover.
-    pub conns_dropped: AtomicU64,
+    pub conns_dropped: Counter,
     /// Initial-DCID lookup hit — the multi-packet ClientHello path
     /// did its job. If this stays at 0 under browser traffic the
     /// fix isn't reaching the right callers.
-    pub initial_dcid_hit: AtomicU64,
+    pub initial_dcid_hit: Counter,
     /// Handshake completed (Established).
-    pub handshakes_completed: AtomicU64,
+    pub handshakes_completed: Counter,
     /// NewSessionTicket emitted to a client after a fresh
     /// handshake. The client may present this ticket on a later
     /// connection to skip Cert/CV (Phase B) or to send 0-RTT data
     /// (Phase C). Counter rate ≈ rate of fresh handshakes once
     /// resumption support lands; `0` means clients have no path to
     /// resume.
-    pub tickets_emitted: AtomicU64,
+    pub tickets_emitted: Counter,
     /// PSK in ClientHello validated successfully and resumption
     /// went through (server skipped Cert+CV in the response). Ratio
     /// `tickets_accepted / handshakes_completed` ≈ resumption hit
     /// rate.
-    pub tickets_accepted: AtomicU64,
+    pub tickets_accepted: Counter,
     /// 0-RTT (early-data) packet-protection keys derived. Fires
     /// once per resumed handshake before the first 0-RTT packet
     /// can be unprotected.
-    pub early_keys_derived: AtomicU64,
+    pub early_keys_derived: Counter,
     /// Inbound 0-RTT packet successfully unprotected and frames
     /// dispatched. Counter rate = peer's effective 0-RTT request
     /// volume after our acceptance policy.
-    pub zero_rtt_accepted: AtomicU64,
+    pub zero_rtt_accepted: Counter,
     /// Peer-initiated 1-RTT key update (KEY_PHASE bit flipped) that
     /// we successfully decrypted with the next-phase keys, then
     /// rotated. Per RFC 9001 §6 each KU is a once-per-flight event;
@@ -133,36 +143,46 @@ pub struct Counters {
     /// spike paired with a spike in `aead_decrypt_failed` indicates
     /// a malfunctioning peer or an attacker probing for stale-keys
     /// behavior.
-    pub key_updates_accepted: AtomicU64,
+    pub key_updates_accepted: Counter,
     /// 0-RTT packet arrived before we'd derived the early-data recv
     /// keys (multi-packet CH still in flight, OR 0-RTT in its own
     /// datagram that arrived before the CH-completing Initial). The
     /// packet is buffered and replayed when keys land. Common at
     /// connection start; persistent growth indicates the peer keeps
     /// sending undecryptable 0-RTT or our key-derivation is stuck.
-    pub zero_rtt_buffered: AtomicU64,
+    pub zero_rtt_buffered: Counter,
     /// Buffered 0-RTT packets dropped because the handshake
     /// completed without resumption (e.g. peer presented a stale
     /// ticket). Counter equals packets dropped, not connections —
     /// a single peer-rejection can drop several pending packets at
     /// once. Expected to fire briefly after a server reboot when
     /// clients optimistically replay with the previous key's tickets.
-    pub zero_rtt_unresumable: AtomicU64,
+    pub zero_rtt_unresumable: Counter,
     /// Connection torn down because no inbound datagram arrived
     /// inside the negotiated `max_idle_timeout` window (RFC 9000
-    /// §10.1). Each fire = one slot freed. Sustained growth at idle
-    /// is normal hygiene; growth correlated with active traffic
-    /// would mean datagrams are getting stuck in the inbox or
-    /// `last_recv_us` isn't refreshing — investigate via
-    /// `[quic-event idle_timeouts]` log lines.
-    pub idle_timeouts: AtomicU64,
+    /// §10.1). Each fire = one slot freed, and one conn-task exit
+    /// (so `idle_timeouts` is the idle term of `conn_tasks_exited`).
+    /// Sustained growth at idle is normal hygiene; growth correlated
+    /// with active traffic would mean datagrams are getting stuck
+    /// in the inbox or `last_recv_us` isn't refreshing — read
+    /// `LAST_CONN_EXIT`, whose `last_recv_age_us` vs `idle_us` is
+    /// the exact pair the h3-over-gve bug turned on.
+    pub idle_timeouts: Counter,
     /// One CONNECTION_CLOSE frame was emitted to the peer because
     /// `process_datagram` returned `Err` or the application asked
     /// the conn to close (RFC 9000 §10.2). Lets the peer tear its
     /// state down immediately instead of waiting for its own idle
     /// timer. Each fire = one packet on the wire, then the conn
     /// task exits.
-    pub connection_closes_emitted: AtomicU64,
+    pub connection_closes_emitted: Counter,
+    /// One CONNECTION_CLOSE frame was *received* from the peer
+    /// (RFC 9000 §19.19, transport or application origin). The peer
+    /// asked us to tear down; the conn enters `Failed` and the task
+    /// exits via the `conn_task_exit_conn_failed` path. The
+    /// error_code / frame_type / reason the peer sent — discarded
+    /// before this counter existed — are retained in
+    /// `LAST_CONN_CLOSE`.
+    pub conn_closes_received: Counter,
     /// One packet declared lost by the packet-threshold rule
     /// (RFC 9002 §6.1.1: `pn < largest_acked - kPacketThreshold`).
     /// Counter only — we don't yet retransmit the frames that
@@ -170,12 +190,12 @@ pub struct Counters {
     /// can stall. Sustained growth on a healthy localhost link
     /// would point at a misordered ACK or an off-by-one in the
     /// detection logic, not real loss.
-    pub packets_lost_threshold: AtomicU64,
+    pub packets_lost_threshold: Counter,
     /// One packet declared lost by the time-threshold rule
     /// (RFC 9002 §6.1.2): older than the largest acked AND aged
     /// past `max(9/8 * max(SRTT, latest_rtt), kGranularity)`.
     /// Same caveat as `packets_lost_threshold` w.r.t. retx.
-    pub packets_lost_time: AtomicU64,
+    pub packets_lost_time: Counter,
     /// One PTO probe packet was emitted because the PTO timer
     /// fired before any ACK confirmed our most-recent ack-eliciting
     /// send (RFC 9002 §6.2). The probe is a PING-only packet at
@@ -183,23 +203,23 @@ pub struct Counters {
     /// without matching `packets_lost_*` growth means the network
     /// is just slow / the peer is briefly unresponsive; a bumped
     /// counter with matching loss growth means real loss.
-    pub pto_probes_sent: AtomicU64,
+    pub pto_probes_sent: Counter,
     /// Total RecvStream entries ever created (one per peer-initiated
     /// stream that arrived). Pair with `streams_reaped` to spot a
     /// leak: if `recv_streams_created - streams_reaped` keeps
     /// climbing, some sid is stuck with one side done and the other
     /// dangling — usually a request stream where the handler bailed
     /// without sending a response.
-    pub recv_streams_created: AtomicU64,
+    pub recv_streams_created: Counter,
     /// Total SendStream entries ever created (one per stream the app
     /// or H3 layer wrote to). For HTTP/3 servers each request creates
     /// one of these.
-    pub send_streams_created: AtomicU64,
+    pub send_streams_created: Counter,
     /// Streams pruned by `reap_finished_streams` after both sides
     /// FIN'd and buffers drained. Should track 1:1 with completed
     /// requests; lag means streams aren't reaching the reapable
     /// state.
-    pub streams_reaped: AtomicU64,
+    pub streams_reaped: Counter,
     /// Listener tried to push a datagram into a full
     /// `ConnInbox` (DEFAULT_CAPACITY=256) — usually because the
     /// peer is bursting faster than the conn task can drain.
@@ -207,7 +227,9 @@ pub struct Counters {
     /// the peer's side eventually recovers, manifesting as a
     /// stall followed by `aead_decrypt_failed` lines for late-
     /// arriving stragglers.
-    pub inbox_full_drops: AtomicU64,
+    pub inbox_full_drops: Counter,
+
+    // ── Conn-task lifecycle ──────────────────────────────────────
     /// One pass through the per-conn task loop: dequeue (or
     /// timer-fire), process_datagram, flush, drain. A flat
     /// counter that should be ticking continuously while a conn
@@ -215,18 +237,45 @@ pub struct Counters {
     /// seconds, the conn task is wedged (deadlock, runaway
     /// loop, or stuck in send_to). If it's ticking but
     /// throughput is zero, the bottleneck is downstream.
-    pub conn_task_iterations: AtomicU64,
+    pub conn_task_iterations: Counter,
+    /// One per-connection task reached an exit path, recorded its
+    /// `LAST_CONN_EXIT` snapshot, and freed its slot. Converges to
+    /// `conns_allocated` as connections close; a persistent gap
+    /// means tasks are wedged and not reaching teardown. Equals
+    /// `idle_timeouts + conn_task_exit_inbox_closed +
+    /// conn_task_exit_process_error + conn_task_exit_conn_failed`
+    /// by construction.
+    pub conn_tasks_exited: Counter,
+    /// Conn task exited because its `ConnInbox` closed (listener
+    /// torn down, slot reclaimed) while it was awaiting the next
+    /// datagram. Routine at shutdown; growth during steady-state
+    /// operation means slots are being reclaimed out from under
+    /// live conns.
+    pub conn_task_exit_inbox_closed: Counter,
+    /// Conn task exited because `process_datagram` returned `Err` —
+    /// the task sealed a CONNECTION_CLOSE and tore down. Growth
+    /// means inbound traffic is hitting a fatal parse/decrypt
+    /// failure; cross-check `LAST_DROP` (what failed last) and
+    /// `LAST_CONN_EXIT` (which conn).
+    pub conn_task_exit_process_error: Counter,
+    /// Conn task exited because the connection entered `Failed`
+    /// outside the process-error path — most often a peer
+    /// CONNECTION_CLOSE (see `conn_closes_received` + the
+    /// `LAST_CONN_CLOSE` detail) or an app-initiated close.
+    pub conn_task_exit_conn_failed: Counter,
+
+    // ── Flush / datagram throughput ──────────────────────────────
     /// One call to `flush_outbound`. Bumps from both
     /// `process_datagram` (once per inbound datagram) and
     /// `QuicConn::send`/`send_fin` (once per app write).
-    pub flush_calls: AtomicU64,
+    pub flush_calls: Counter,
     /// One UDP datagram successfully drained from
     /// `conn.outbound` and handed to `sock.send_to`. Pair with
     /// `flush_calls` to see fan-out (packets-per-flush).
-    pub datagrams_sent: AtomicU64,
+    pub datagrams_sent: Counter,
     /// One inbound datagram processed (parse + dispatch). Pair
     /// with `inbox_full_drops` to see drop ratio under load.
-    pub datagrams_processed: AtomicU64,
+    pub datagrams_processed: Counter,
     /// Outbound datagram suppressed by the anti-amplification
     /// limit (RFC 9000 §8.1.2). Bumps when the path isn't yet
     /// validated and emitting the packet would exceed 3× the
@@ -234,72 +283,77 @@ pub struct Counters {
     /// truncated); the peer treats it as loss and we'll retry
     /// once enough peer bytes accumulate, or once a Handshake
     /// packet arrives and the limit is lifted entirely.
-    pub anti_amp_throttled: AtomicU64,
+    pub anti_amp_throttled: Counter,
     /// Cumulative AEAD-sealed bytes (payload + frames protected
     /// per packet, before the 16-byte tag). Pair with
     /// `aead_seal_packets` to compute average packet size; pair
     /// with the wall clock to compute encrypt throughput. The
     /// AEAD primitive used is AES-128-GCM (negotiated by
     /// TLS_AES_128_GCM_SHA256, our only ciphersuite).
-    pub aead_seal_bytes: AtomicU64,
+    pub aead_seal_bytes: Counter,
     /// Number of packets that went through the AEAD seal.
-    pub aead_seal_packets: AtomicU64,
+    pub aead_seal_packets: Counter,
     /// Cumulative AEAD-opened bytes on inbound packets. Same
     /// semantics as `aead_seal_bytes` for the RX direction.
-    pub aead_open_bytes: AtomicU64,
+    pub aead_open_bytes: Counter,
     /// Number of packets that went through the AEAD open
     /// (successful decrypts only; failed opens bump
     /// `aead_decrypt_failed`).
-    pub aead_open_packets: AtomicU64,
+    pub aead_open_packets: Counter,
 }
 
 impl Counters {
     const fn new() -> Self {
         Counters {
-            no_dcid: AtomicU64::new(0),
-            unknown_long_header: AtomicU64::new(0),
-            unknown_short_header: AtomicU64::new(0),
-            slot_table_full: AtomicU64::new(0),
-            rng_failed: AtomicU64::new(0),
-            long_header_parse: AtomicU64::new(0),
-            initial_header_parse: AtomicU64::new(0),
-            aead_decrypt_failed: AtomicU64::new(0),
-            unknown_frame: AtomicU64::new(0),
-            bad_state: AtomicU64::new(0),
-            late_initial_dropped: AtomicU64::new(0),
-            late_handshake_dropped: AtomicU64::new(0),
-            other_wire: AtomicU64::new(0),
-            unsupported_client: AtomicU64::new(0),
-            tls_internal: AtomicU64::new(0),
-            conns_allocated: AtomicU64::new(0),
-            conns_dropped: AtomicU64::new(0),
-            initial_dcid_hit: AtomicU64::new(0),
-            handshakes_completed: AtomicU64::new(0),
-            tickets_emitted: AtomicU64::new(0),
-            tickets_accepted: AtomicU64::new(0),
-            early_keys_derived: AtomicU64::new(0),
-            zero_rtt_accepted: AtomicU64::new(0),
-            key_updates_accepted: AtomicU64::new(0),
-            zero_rtt_buffered: AtomicU64::new(0),
-            zero_rtt_unresumable: AtomicU64::new(0),
-            idle_timeouts: AtomicU64::new(0),
-            connection_closes_emitted: AtomicU64::new(0),
-            packets_lost_threshold: AtomicU64::new(0),
-            packets_lost_time: AtomicU64::new(0),
-            pto_probes_sent: AtomicU64::new(0),
-            recv_streams_created: AtomicU64::new(0),
-            send_streams_created: AtomicU64::new(0),
-            streams_reaped: AtomicU64::new(0),
-            inbox_full_drops: AtomicU64::new(0),
-            conn_task_iterations: AtomicU64::new(0),
-            flush_calls: AtomicU64::new(0),
-            datagrams_sent: AtomicU64::new(0),
-            datagrams_processed: AtomicU64::new(0),
-            anti_amp_throttled: AtomicU64::new(0),
-            aead_seal_bytes: AtomicU64::new(0),
-            aead_seal_packets: AtomicU64::new(0),
-            aead_open_bytes: AtomicU64::new(0),
-            aead_open_packets: AtomicU64::new(0),
+            no_dcid: Counter::new(),
+            unknown_long_header: Counter::new(),
+            unknown_short_header: Counter::new(),
+            slot_table_full: Counter::new(),
+            rng_failed: Counter::new(),
+            long_header_parse: Counter::new(),
+            initial_header_parse: Counter::new(),
+            aead_decrypt_failed: Counter::new(),
+            unknown_frame: Counter::new(),
+            bad_state: Counter::new(),
+            late_initial_dropped: Counter::new(),
+            late_handshake_dropped: Counter::new(),
+            other_wire: Counter::new(),
+            unsupported_client: Counter::new(),
+            tls_internal: Counter::new(),
+            conns_allocated: Counter::new(),
+            conns_dropped: Counter::new(),
+            initial_dcid_hit: Counter::new(),
+            handshakes_completed: Counter::new(),
+            tickets_emitted: Counter::new(),
+            tickets_accepted: Counter::new(),
+            early_keys_derived: Counter::new(),
+            zero_rtt_accepted: Counter::new(),
+            key_updates_accepted: Counter::new(),
+            zero_rtt_buffered: Counter::new(),
+            zero_rtt_unresumable: Counter::new(),
+            idle_timeouts: Counter::new(),
+            connection_closes_emitted: Counter::new(),
+            conn_closes_received: Counter::new(),
+            packets_lost_threshold: Counter::new(),
+            packets_lost_time: Counter::new(),
+            pto_probes_sent: Counter::new(),
+            recv_streams_created: Counter::new(),
+            send_streams_created: Counter::new(),
+            streams_reaped: Counter::new(),
+            inbox_full_drops: Counter::new(),
+            conn_task_iterations: Counter::new(),
+            conn_tasks_exited: Counter::new(),
+            conn_task_exit_inbox_closed: Counter::new(),
+            conn_task_exit_process_error: Counter::new(),
+            conn_task_exit_conn_failed: Counter::new(),
+            flush_calls: Counter::new(),
+            datagrams_sent: Counter::new(),
+            datagrams_processed: Counter::new(),
+            anti_amp_throttled: Counter::new(),
+            aead_seal_bytes: Counter::new(),
+            aead_seal_packets: Counter::new(),
+            aead_open_bytes: Counter::new(),
+            aead_open_packets: Counter::new(),
         }
     }
 }
@@ -309,16 +363,218 @@ impl Counters {
 /// for diagnostics).
 pub static COUNTERS: Counters = Counters::new();
 
-/// Bump a named counter by 1.
-#[inline]
-pub fn bump(field: &AtomicU64) {
-    field.fetch_add(1, Ordering::Relaxed);
+// ── Last-occurrence snapshots ───────────────────────────────────────
+//
+// Cold-path `LastEvent` slots that retain the decisive context of the
+// most recent occurrence of a category — the half of the doctrine a
+// bare counter can't supply. Recorded via the helpers below; rendered
+// by `write_obs_json`.
+
+/// Most recent failure drop (any `quic_drop!` site). Tells you which
+/// drop fired last and when even when serial logging is off.
+pub static LAST_DROP: LastEvent<DropRecord> = LastEvent::new();
+
+/// Most recent CONNECTION_CLOSE frame *received* from a peer. Holds
+/// the error_code / frame_type / reason the frame dispatcher used to
+/// discard via `{ .. }`.
+pub static LAST_CONN_CLOSE: LastEvent<ConnCloseRecord> = LastEvent::new();
+
+/// Most recent conn-task teardown. Holds the exit reason plus the
+/// invariant inputs — `last_recv_age_us` vs `idle_us` — that decide
+/// whether an idle-timeout exit was legitimate.
+pub static LAST_CONN_EXIT: LastEvent<ConnExitRecord> = LastEvent::new();
+
+/// Snapshot payload for `LAST_DROP`.
+#[derive(Clone, Copy)]
+pub struct DropRecord {
+    /// The `quic_drop!` reason — a counter field name, always
+    /// identifier-safe so it needs no JSON escaping.
+    pub reason: &'static str,
+    /// `tls::ticket::now_us()` at the drop.
+    pub at_us: u64,
+}
+
+impl ObsRecord for DropRecord {
+    fn write_fields(&self, w: &mut dyn fmt::Write) -> fmt::Result {
+        write!(w, "\"reason\":\"{}\",\"at_us\":{}", self.reason, self.at_us)
+    }
+}
+
+/// Snapshot payload for `LAST_CONN_CLOSE`.
+#[derive(Clone, Copy)]
+pub struct ConnCloseRecord {
+    /// `true` = application close (0x1d, RFC 9000 §19.19); `false` =
+    /// transport close (0x1c).
+    pub is_app: bool,
+    /// Peer-supplied error code. Transport codes are RFC 9000 §20.1;
+    /// application codes are protocol-defined (HTTP/3 = RFC 9114 §8.1).
+    pub error_code: u64,
+    /// Frame type the peer blamed (transport closes only; `0` for
+    /// application closes, which carry no frame_type field).
+    pub frame_type: u64,
+    /// Peer reason phrase, truncated to 32 bytes.
+    pub reason: [u8; 32],
+    /// Valid prefix length of `reason` (≤ 32).
+    pub reason_len: u8,
+    /// `tls::ticket::now_us()` at receipt.
+    pub at_us: u64,
+}
+
+impl ObsRecord for ConnCloseRecord {
+    fn write_fields(&self, w: &mut dyn fmt::Write) -> fmt::Result {
+        write!(
+            w,
+            "\"origin\":\"{}\",\"error_code\":{},\"frame_type\":{},\"at_us\":{},\"reason\":\"",
+            if self.is_app { "application" } else { "transport" },
+            self.error_code,
+            self.frame_type,
+            self.at_us,
+        )?;
+        write_json_ascii(w, &self.reason[..self.reason_len as usize])?;
+        w.write_str("\"")
+    }
+}
+
+/// Which conn-task loop-exit path was taken. One per `break` site in
+/// `endpoint::conn_task`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExitReason {
+    /// No inbound datagram for the full `max_idle_timeout` window
+    /// (RFC 9000 §10.1) — either of the two idle break sites.
+    IdleTimeout,
+    /// The `ConnInbox` closed while the task awaited it.
+    InboxClosed,
+    /// `process_datagram` returned `Err`; the task sealed a
+    /// CONNECTION_CLOSE and tore down.
+    ProcessError,
+    /// The connection reached `Failed` state outside the
+    /// process-error path (peer close, app close).
+    ConnFailed,
+}
+
+impl ExitReason {
+    /// Stable lowercase token for logs / JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExitReason::IdleTimeout => "idle_timeout",
+            ExitReason::InboxClosed => "inbox_closed",
+            ExitReason::ProcessError => "process_error",
+            ExitReason::ConnFailed => "conn_failed",
+        }
+    }
+}
+
+/// Snapshot payload for `LAST_CONN_EXIT`.
+#[derive(Clone, Copy)]
+pub struct ConnExitRecord {
+    /// Which exit path the conn task took.
+    pub reason: ExitReason,
+    /// The local CID we issued for the connection (8 bytes).
+    pub local_cid: [u8; 8],
+    /// Conn-task loop iterations this connection ran before exit.
+    pub iterations: u64,
+    /// Age of the last received datagram at exit. For an
+    /// `IdleTimeout` exit this should be ≥ `idle_us`; a value well
+    /// below it means a spurious reap — the h3-over-gve bug.
+    pub last_recv_age_us: u64,
+    /// The negotiated idle window the age above was compared to.
+    pub idle_us: u64,
+    /// `tls::ticket::now_us()` at exit.
+    pub at_us: u64,
+}
+
+impl ObsRecord for ConnExitRecord {
+    fn write_fields(&self, w: &mut dyn fmt::Write) -> fmt::Result {
+        write!(w, "\"reason\":\"{}\",\"local_cid\":\"", self.reason.as_str())?;
+        for b in &self.local_cid {
+            write!(w, "{b:02x}")?;
+        }
+        write!(
+            w,
+            "\",\"iterations\":{},\"last_recv_age_us\":{},\"idle_us\":{},\"at_us\":{}",
+            self.iterations, self.last_recv_age_us, self.idle_us, self.at_us,
+        )
+    }
+}
+
+/// Write `bytes` as the inner content of a JSON string, mapping
+/// anything that isn't safe printable ASCII to `.`. Peer reason
+/// phrases are attacker-controlled, so we never emit a raw quote,
+/// backslash, or control byte that could break the surrounding JSON.
+fn write_json_ascii(w: &mut dyn fmt::Write, bytes: &[u8]) -> fmt::Result {
+    for &b in bytes {
+        let c = if (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\' {
+            b as char
+        } else {
+            '.'
+        };
+        w.write_char(c)?;
+    }
+    Ok(())
+}
+
+/// Record a `quic_drop!` site into `LAST_DROP`. Called by the macro;
+/// not meant for direct use.
+pub fn record_drop(reason: &'static str) {
+    LAST_DROP.record(DropRecord {
+        reason,
+        at_us: tls::ticket::now_us(),
+    });
+}
+
+/// Record a received CONNECTION_CLOSE: bump `conn_closes_received`
+/// and snapshot the peer's error_code / frame_type / reason into
+/// `LAST_CONN_CLOSE`. `frame_type` is `0` for application closes.
+pub fn record_conn_close(is_app: bool, error_code: u64, frame_type: u64, reason: &[u8]) {
+    COUNTERS.conn_closes_received.bump();
+    let n = reason.len().min(32);
+    let mut buf = [0u8; 32];
+    buf[..n].copy_from_slice(&reason[..n]);
+    LAST_CONN_CLOSE.record(ConnCloseRecord {
+        is_app,
+        error_code,
+        frame_type,
+        reason: buf,
+        reason_len: n as u8,
+        at_us: tls::ticket::now_us(),
+    });
+}
+
+/// Record a conn-task exit: bump the per-reason counter (and the
+/// `conn_tasks_exited` total) and snapshot the teardown context into
+/// `LAST_CONN_EXIT`. The `IdleTimeout` reason has no dedicated
+/// counter — `idle_timeouts` already covers it (see that field).
+pub fn record_conn_exit(
+    reason: ExitReason,
+    local_cid: &[u8],
+    iterations: u64,
+    last_recv_age_us: u64,
+    idle_us: u64,
+) {
+    COUNTERS.conn_tasks_exited.bump();
+    match reason {
+        ExitReason::IdleTimeout => {}
+        ExitReason::InboxClosed => COUNTERS.conn_task_exit_inbox_closed.bump(),
+        ExitReason::ProcessError => COUNTERS.conn_task_exit_process_error.bump(),
+        ExitReason::ConnFailed => COUNTERS.conn_task_exit_conn_failed.bump(),
+    }
+    let n = local_cid.len().min(8);
+    let mut cid = [0u8; 8];
+    cid[..n].copy_from_slice(&local_cid[..n]);
+    LAST_CONN_EXIT.record(ConnExitRecord {
+        reason,
+        local_cid: cid,
+        iterations,
+        last_recv_age_us,
+        idle_us,
+        at_us: tls::ticket::now_us(),
+    });
 }
 
 // ── Log-level gating ────────────────────────────────────────────────
 //
 // The macros below check this u8 before printing. Counter increments
-// are unaffected — they're cheap and always run, so `/debug/quic_stats`
+// are unaffected — they're cheap and always run, so `/quic_stats`
 // stays accurate even in `Silent` mode.
 //
 //   0 = Silent  (counters only; for benchmarks)
@@ -346,7 +602,7 @@ static LEVEL: AtomicU8 = AtomicU8::new(LEVEL_DEFAULT);
 /// Whether we've parsed `boot_info().boot_args` yet. First macro
 /// invocation triggers the parse; subsequent calls hit the cached
 /// `LEVEL` directly.
-static LEVEL_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static LEVEL_INIT: AtomicBool = AtomicBool::new(false);
 
 /// Override the log level explicitly. Useful for tests, benchmarks,
 /// or when an app wants to force-enable verbose logging without
@@ -416,158 +672,121 @@ pub fn should_log_event() -> bool {
     LEVEL.load(Ordering::Relaxed) >= LogLevel::Events as u8
 }
 
-/// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
-/// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 40] {
+/// Snapshot of every drop / event counter, for `/quic_stats`-style
+/// dumps. Returns `(name, value)` pairs in declaration order. The
+/// four AEAD throughput counters are intentionally excluded — they
+/// are surfaced separately under `/stats`.
+pub fn snapshot() -> [(&'static str, u64); 45] {
     let c = &COUNTERS;
     [
-        ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
+        ("no_dcid", c.no_dcid.get()),
+        ("unknown_long_header", c.unknown_long_header.get()),
+        ("unknown_short_header", c.unknown_short_header.get()),
+        ("slot_table_full", c.slot_table_full.get()),
+        ("rng_failed", c.rng_failed.get()),
+        ("long_header_parse", c.long_header_parse.get()),
+        ("initial_header_parse", c.initial_header_parse.get()),
+        ("aead_decrypt_failed", c.aead_decrypt_failed.get()),
+        ("unknown_frame", c.unknown_frame.get()),
+        ("bad_state", c.bad_state.get()),
+        ("late_initial_dropped", c.late_initial_dropped.get()),
+        ("late_handshake_dropped", c.late_handshake_dropped.get()),
+        ("other_wire", c.other_wire.get()),
+        ("unsupported_client", c.unsupported_client.get()),
+        ("tls_internal", c.tls_internal.get()),
+        ("conns_allocated", c.conns_allocated.get()),
+        ("conns_dropped", c.conns_dropped.get()),
+        ("initial_dcid_hit", c.initial_dcid_hit.get()),
+        ("handshakes_completed", c.handshakes_completed.get()),
+        ("tickets_emitted", c.tickets_emitted.get()),
+        ("tickets_accepted", c.tickets_accepted.get()),
+        ("early_keys_derived", c.early_keys_derived.get()),
+        ("zero_rtt_accepted", c.zero_rtt_accepted.get()),
+        ("key_updates_accepted", c.key_updates_accepted.get()),
+        ("zero_rtt_buffered", c.zero_rtt_buffered.get()),
+        ("zero_rtt_unresumable", c.zero_rtt_unresumable.get()),
+        ("idle_timeouts", c.idle_timeouts.get()),
+        ("connection_closes_emitted", c.connection_closes_emitted.get()),
+        ("conn_closes_received", c.conn_closes_received.get()),
+        ("packets_lost_threshold", c.packets_lost_threshold.get()),
+        ("packets_lost_time", c.packets_lost_time.get()),
+        ("pto_probes_sent", c.pto_probes_sent.get()),
+        ("recv_streams_created", c.recv_streams_created.get()),
+        ("send_streams_created", c.send_streams_created.get()),
+        ("streams_reaped", c.streams_reaped.get()),
+        ("inbox_full_drops", c.inbox_full_drops.get()),
+        ("conn_task_iterations", c.conn_task_iterations.get()),
+        ("conn_tasks_exited", c.conn_tasks_exited.get()),
         (
-            "unknown_long_header",
-            c.unknown_long_header.load(Ordering::Relaxed),
+            "conn_task_exit_inbox_closed",
+            c.conn_task_exit_inbox_closed.get(),
         ),
         (
-            "unknown_short_header",
-            c.unknown_short_header.load(Ordering::Relaxed),
-        ),
-        ("slot_table_full", c.slot_table_full.load(Ordering::Relaxed)),
-        ("rng_failed", c.rng_failed.load(Ordering::Relaxed)),
-        (
-            "long_header_parse",
-            c.long_header_parse.load(Ordering::Relaxed),
+            "conn_task_exit_process_error",
+            c.conn_task_exit_process_error.get(),
         ),
         (
-            "initial_header_parse",
-            c.initial_header_parse.load(Ordering::Relaxed),
+            "conn_task_exit_conn_failed",
+            c.conn_task_exit_conn_failed.get(),
         ),
-        (
-            "aead_decrypt_failed",
-            c.aead_decrypt_failed.load(Ordering::Relaxed),
-        ),
-        ("unknown_frame", c.unknown_frame.load(Ordering::Relaxed)),
-        ("bad_state", c.bad_state.load(Ordering::Relaxed)),
-        (
-            "late_initial_dropped",
-            c.late_initial_dropped.load(Ordering::Relaxed),
-        ),
-        (
-            "late_handshake_dropped",
-            c.late_handshake_dropped.load(Ordering::Relaxed),
-        ),
-        ("other_wire", c.other_wire.load(Ordering::Relaxed)),
-        (
-            "unsupported_client",
-            c.unsupported_client.load(Ordering::Relaxed),
-        ),
-        ("tls_internal", c.tls_internal.load(Ordering::Relaxed)),
-        ("conns_allocated", c.conns_allocated.load(Ordering::Relaxed)),
-        ("conns_dropped", c.conns_dropped.load(Ordering::Relaxed)),
-        (
-            "initial_dcid_hit",
-            c.initial_dcid_hit.load(Ordering::Relaxed),
-        ),
-        (
-            "handshakes_completed",
-            c.handshakes_completed.load(Ordering::Relaxed),
-        ),
-        ("tickets_emitted", c.tickets_emitted.load(Ordering::Relaxed)),
-        (
-            "tickets_accepted",
-            c.tickets_accepted.load(Ordering::Relaxed),
-        ),
-        (
-            "early_keys_derived",
-            c.early_keys_derived.load(Ordering::Relaxed),
-        ),
-        (
-            "zero_rtt_accepted",
-            c.zero_rtt_accepted.load(Ordering::Relaxed),
-        ),
-        (
-            "key_updates_accepted",
-            c.key_updates_accepted.load(Ordering::Relaxed),
-        ),
-        (
-            "zero_rtt_buffered",
-            c.zero_rtt_buffered.load(Ordering::Relaxed),
-        ),
-        (
-            "zero_rtt_unresumable",
-            c.zero_rtt_unresumable.load(Ordering::Relaxed),
-        ),
-        ("idle_timeouts", c.idle_timeouts.load(Ordering::Relaxed)),
-        (
-            "connection_closes_emitted",
-            c.connection_closes_emitted.load(Ordering::Relaxed),
-        ),
-        (
-            "packets_lost_threshold",
-            c.packets_lost_threshold.load(Ordering::Relaxed),
-        ),
-        (
-            "packets_lost_time",
-            c.packets_lost_time.load(Ordering::Relaxed),
-        ),
-        ("pto_probes_sent", c.pto_probes_sent.load(Ordering::Relaxed)),
-        (
-            "recv_streams_created",
-            c.recv_streams_created.load(Ordering::Relaxed),
-        ),
-        (
-            "send_streams_created",
-            c.send_streams_created.load(Ordering::Relaxed),
-        ),
-        ("streams_reaped", c.streams_reaped.load(Ordering::Relaxed)),
-        (
-            "inbox_full_drops",
-            c.inbox_full_drops.load(Ordering::Relaxed),
-        ),
-        (
-            "conn_task_iterations",
-            c.conn_task_iterations.load(Ordering::Relaxed),
-        ),
-        ("flush_calls", c.flush_calls.load(Ordering::Relaxed)),
-        ("datagrams_sent", c.datagrams_sent.load(Ordering::Relaxed)),
-        (
-            "datagrams_processed",
-            c.datagrams_processed.load(Ordering::Relaxed),
-        ),
-        (
-            "anti_amp_throttled",
-            c.anti_amp_throttled.load(Ordering::Relaxed),
-        ),
+        ("flush_calls", c.flush_calls.get()),
+        ("datagrams_sent", c.datagrams_sent.get()),
+        ("datagrams_processed", c.datagrams_processed.get()),
+        ("anti_amp_throttled", c.anti_amp_throttled.get()),
     ]
 }
 
-/// Drop-site macro: increments the named counter and (if the log
-/// level allows) logs a single line. Use for "we couldn't continue
-/// here, packet/conn is being dropped" — never for normal completion.
+/// Render the full QUIC observability block as a JSON object —
+/// every drop / event counter as a flat `"name":value` member, then
+/// the `LastEvent` snapshots as nested objects. This is QUIC's
+/// contribution to the `/obs` surface and the body of `/quic_stats`;
+/// see `docs/observability.md` for the convention.
+pub fn write_obs_json(w: &mut dyn fmt::Write) -> fmt::Result {
+    w.write_str("{")?;
+    for (name, value) in snapshot() {
+        write!(w, "\"{name}\":{value},")?;
+    }
+    LAST_DROP.write_json(w, "last_drop")?;
+    w.write_str(",")?;
+    LAST_CONN_CLOSE.write_json(w, "last_conn_close")?;
+    w.write_str(",")?;
+    LAST_CONN_EXIT.write_json(w, "last_conn_exit")?;
+    w.write_str("}")
+}
+
+/// Drop-site macro: increments the named counter, records the drop
+/// into `LAST_DROP`, and (if the log level allows) logs a single
+/// line. Use for "we couldn't continue here, packet/conn is being
+/// dropped" — never for normal completion.
 ///
 /// The first arg is the bare counter field name from `Counters`;
 /// the rest is `format_args!`-shape detail.
 ///
-/// Counter increments unconditionally; the println is gated by
-/// `LogLevel >= Drops` (the default). Benchmark builds set
-/// `quic.log=silent` in `boot_args` and pay only the increment.
+/// Counter increment + `LAST_DROP` record run unconditionally; the
+/// println is gated by `LogLevel >= Drops` (the default). Benchmark
+/// builds set `quic.log=silent` in `boot_args` and pay only the
+/// increment + the cold-path snapshot.
 ///
 /// Example:
 ///   `quic_drop!(unsupported_client, "no x25519 in CH key_share");`
 #[macro_export]
 macro_rules! quic_drop {
     ($reason:ident, $($detail:tt)*) => {{
-        $crate::diag::bump(&$crate::diag::COUNTERS.$reason);
+        $crate::diag::COUNTERS.$reason.bump();
+        $crate::diag::record_drop(::core::stringify!($reason));
         if $crate::diag::should_log_drop() {
             ::waitless::println!(
                 "[quic-drop {}] {}",
-                stringify!($reason),
+                ::core::stringify!($reason),
                 ::core::format_args!($($detail)*),
             );
         }
     }};
     ($reason:ident) => {{
-        $crate::diag::bump(&$crate::diag::COUNTERS.$reason);
+        $crate::diag::COUNTERS.$reason.bump();
+        $crate::diag::record_drop(::core::stringify!($reason));
         if $crate::diag::should_log_drop() {
-            ::waitless::println!("[quic-drop {}]", stringify!($reason));
+            ::waitless::println!("[quic-drop {}]", ::core::stringify!($reason));
         }
     }};
 }
@@ -576,22 +795,99 @@ macro_rules! quic_drop {
 /// progress events. Gated by `LogLevel >= Events` so the default
 /// `Drops` level keeps these silent — they're useful for
 /// per-handshake debugging but noise during steady-state load.
+/// Events do not feed `LAST_DROP` (it is a failure-only slot).
 #[macro_export]
 macro_rules! quic_event {
     ($reason:ident, $($detail:tt)*) => {{
-        $crate::diag::bump(&$crate::diag::COUNTERS.$reason);
+        $crate::diag::COUNTERS.$reason.bump();
         if $crate::diag::should_log_event() {
             ::waitless::println!(
                 "[quic-event {}] {}",
-                stringify!($reason),
+                ::core::stringify!($reason),
                 ::core::format_args!($($detail)*),
             );
         }
     }};
     ($reason:ident) => {{
-        $crate::diag::bump(&$crate::diag::COUNTERS.$reason);
+        $crate::diag::COUNTERS.$reason.bump();
         if $crate::diag::should_log_event() {
-            ::waitless::println!("[quic-event {}]", stringify!($reason));
+            ::waitless::println!("[quic-event {}]", ::core::stringify!($reason));
         }
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::String;
+
+    #[test]
+    fn conn_close_record_renders_and_sanitizes() {
+        let mut rec = ConnCloseRecord {
+            is_app: true,
+            error_code: 0x010c,
+            frame_type: 0,
+            reason: [0u8; 32],
+            reason_len: 0,
+            at_us: 1234,
+        };
+        // A reason with a quote + control byte must not break JSON.
+        let raw = b"bad\"\x01reason";
+        rec.reason[..raw.len()].copy_from_slice(raw);
+        rec.reason_len = raw.len() as u8;
+        let mut s = String::new();
+        rec.write_fields(&mut s).unwrap();
+        assert_eq!(
+            s,
+            "\"origin\":\"application\",\"error_code\":268,\"frame_type\":0,\
+             \"at_us\":1234,\"reason\":\"bad..reason\""
+        );
+    }
+
+    #[test]
+    fn conn_exit_record_carries_idle_invariants() {
+        let rec = ConnExitRecord {
+            reason: ExitReason::IdleTimeout,
+            local_cid: [0xa1, 0xb2, 0xc3, 0xd4, 0, 0, 0, 0],
+            iterations: 7,
+            // The h3-bug shape: aged only 81 ms inside a 30 s window.
+            last_recv_age_us: 81_000,
+            idle_us: 30_000_000,
+            at_us: 9_000,
+        };
+        let mut s = String::new();
+        rec.write_fields(&mut s).unwrap();
+        assert_eq!(
+            s,
+            "\"reason\":\"idle_timeout\",\"local_cid\":\"a1b2c3d40000000\
+             0\",\"iterations\":7,\"last_recv_age_us\":81000,\
+             \"idle_us\":30000000,\"at_us\":9000"
+        );
+    }
+
+    #[test]
+    fn record_conn_close_bumps_counter_and_snapshot() {
+        let before = COUNTERS.conn_closes_received.get();
+        let (before_count, _) = LAST_CONN_CLOSE.snapshot();
+        record_conn_close(false, 0x0a, 0x06, b"protocol_violation");
+        assert_eq!(COUNTERS.conn_closes_received.get(), before + 1);
+        let (count, last) = LAST_CONN_CLOSE.snapshot();
+        assert_eq!(count, before_count + 1);
+        let last = last.expect("recorded");
+        assert!(!last.is_app);
+        assert_eq!(last.error_code, 0x0a);
+        assert_eq!(last.frame_type, 0x06);
+        assert_eq!(&last.reason[..last.reason_len as usize], b"protocol_violation");
+    }
+
+    #[test]
+    fn write_obs_json_is_one_object() {
+        let mut s = String::new();
+        write_obs_json(&mut s).unwrap();
+        assert!(s.starts_with('{'));
+        assert!(s.ends_with('}'));
+        // Counters present as flat members; snapshots nested.
+        assert!(s.contains("\"idle_timeouts\":"));
+        assert!(s.contains("\"last_conn_exit\":{\"count\":"));
+    }
 }
