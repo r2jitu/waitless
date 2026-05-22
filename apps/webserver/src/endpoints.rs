@@ -427,25 +427,37 @@ pub(crate) fn heap_response() -> Response {
     Response::ok(&b"application/json"[..], body)
 }
 
-/// Snapshot of the QUIC-stack counters (`quic::diag::snapshot`).
-/// Same numbers the Diagnostics page renders, exposed as JSON for
-/// programmatic monitoring.
+/// The QUIC stack's observability block as JSON — every drop /
+/// event counter plus the `LastEvent` snapshots (`last_drop`,
+/// `last_conn_close`, `last_conn_exit`). The render lives in
+/// `quic::diag::write_obs_json`, so there is exactly one rendering
+/// path shared with `/obs`. See `docs/observability.md`.
 pub(crate) fn quic_stats_response() -> Response {
-    // 1 KiB body region covers ~37 named u64 counters (the
-    // current snapshot size); render in place to skip the
+    // 4 KiB body region: 45 flat counters (worst-case u64 width)
+    // plus three nested snapshot objects, with margin. Slow path,
+    // so the reservation is free; rendered in place to skip the
     // String → IOBuf copy.
-    let mut body = http::body_iobuf(1024);
+    let mut body = http::body_iobuf(4096);
     {
         let mut w = body.writer();
-        let _ = w.write_str("{");
-        let mut first = true;
-        for (name, value) in quic::diag::snapshot() {
-            if !first {
-                let _ = w.write_str(",");
-            }
-            first = false;
-            let _ = write!(w, "\"{}\":{}", name, value);
-        }
+        let _ = quic::diag::write_obs_json(&mut w);
+    }
+    Response::ok(&b"application/json"[..], body)
+}
+
+/// Aggregate observability surface — one JSON object per subsystem
+/// that has adopted the doctrine, keyed by subsystem name:
+/// `{"quic":{…}}`. This is the single clean home for observability
+/// data; NIC, TCP, runtime, and kernel each become one more line
+/// here as they adopt the mechanism (see the rollout checklist in
+/// `docs/observability.md`). `/quic_stats` is the QUIC-only view of
+/// the same `write_obs_json` output.
+pub(crate) fn obs_response() -> Response {
+    let mut body = http::body_iobuf(4096);
+    {
+        let mut w = body.writer();
+        let _ = w.write_str("{\"quic\":");
+        let _ = quic::diag::write_obs_json(&mut w);
         let _ = w.write_str("}");
     }
     Response::ok(&b"application/json"[..], body)

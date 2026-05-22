@@ -390,8 +390,12 @@ Use <code>./scripts/open-browser-h3.sh</code> to launch Chrome with \
 RTTs swing the race the other way.</div>\
 <h2>Live counters</h2>\
 <p>Every hot-path drop and positive event in the QUIC stack is \
-counted in <code>quic::diag</code>. Render them as JSON at \
-<a href=\"/quic_stats\"><code>/quic_stats</code></a> or via the \
+counted in <code>quic::diag</code>, and each anomaly category keeps \
+a last-occurrence snapshot beside its counter — the received \
+CONNECTION_CLOSE detail, the conn-task exit reason and its idle \
+inputs. Render the lot as JSON at \
+<a href=\"/quic_stats\"><code>/quic_stats</code></a>, in the \
+aggregate <a href=\"/obs\"><code>/obs</code></a> surface, or via the \
 <a href=\"/diagnostics\">Diagnostics</a> page. Set the boot arg \
 <code>quic.log=events</code> to also emit human-readable lines per \
 event on the serial console.</p>";

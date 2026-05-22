@@ -397,6 +397,7 @@ async fn handle_request<S: http::HttpStream>(
         b"/stats" => stats_response(),
         b"/heap" => heap_response(),
         b"/quic_stats" => quic_stats_response(),
+        b"/obs" => obs_response(),
         b"/compute" => {
             core::hint::black_box(compute_work());
             Response::ok(b"application/json", b"{\"status\":\"computed\"}")
