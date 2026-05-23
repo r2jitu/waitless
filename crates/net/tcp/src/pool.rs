@@ -175,7 +175,17 @@ pub(crate) static POOLS: kernel_core::percpu::PerWorker<TcpPool> =
 //
 // Key packing: `(ip << 32) | (rport << 16) | lport | (1 << 63)`.
 // The top-bit flag makes "key == 0" the unambiguous empty marker.
-const TCP_HASH_SIZE: usize = 256;
+//
+// Sized at 32K entries per core. Below ~50% load the open-addressed
+// probe stays bounded; the segmented TCP slot pool now reaches up
+// to MAX_SEGMENTS*64 ≈ 65K slots per core, so 32K is "half its peak"
+// — enough headroom that the high-conn path keeps O(1) lookups, but
+// not so big that small-conn workloads pay for it (640 KB/core BSS,
+// only touched by the per-core owner so zero false sharing). Pure
+// experiment for now — if it moves the 10K-conn cliff we observed
+// on the Pareto bench rig, follow up with a segmented hash that
+// grows in lockstep with the pool.
+const TCP_HASH_SIZE: usize = 32768;
 const TCP_HASH_MASK: usize = TCP_HASH_SIZE - 1;
 
 pub(crate) struct TcpHashCore {
