@@ -5,9 +5,9 @@
 // `shutdown_all`. Also `init` (per-core pool / hash bring-up).
 
 use crate::pool::{
-    ACCEPT_RINGS, AcceptRingTable, LISTENERS, ListenerMap, POOLS, TCP_HASH, TcpHashCore, TcpPool,
-    accept_ring_pop, alloc_connection, conn_ptr, decode_handle, encode_handle, free_connection,
-    listener_register, pool_capacity,
+    ACCEPT_RINGS, AcceptRingTable, LISTENERS, ListenerMap, POOLS, TCP_HASH, TICK_HEAD, TcpHashCore,
+    TcpPool, TickHead, accept_ring_pop, alloc_connection, conn_ptr, decode_handle, encode_handle,
+    free_connection, listener_register, pool_capacity,
 };
 use crate::send::{SegmentMeta, send_rst};
 use crate::state::{TCP_ACK, TCP_FIN, TcpState};
@@ -37,6 +37,7 @@ pub fn init() {
     TCP_HASH.init(n, |_| TcpHashCore::new());
     ACCEPT_RINGS.init(n, |_| AcceptRingTable::new());
     LISTENERS.init(n, |_| ListenerMap::new());
+    TICK_HEAD.init(n, |_| TickHead::new());
 }
 
 /// Create a listener on a specific core. Called from

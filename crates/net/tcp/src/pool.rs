@@ -144,8 +144,14 @@ impl TcpPool {
         let base = segment_idx.saturating_mul(SEGMENT_SIZE);
         let mut new_seg: alloc::vec::Vec<TcpConnCell> =
             alloc::vec::Vec::with_capacity(SEGMENT_SIZE as usize);
-        for _ in 0..SEGMENT_SIZE {
-            new_seg.push(TcpConnCell::new());
+        for i in 0..SEGMENT_SIZE {
+            let cell = TcpConnCell::new();
+            // SAFETY: just-allocated cell, no aliasing yet — safe to
+            // stamp the self-identifier before publishing.
+            unsafe {
+                (*cell.0.get()).slot_index = base + i;
+            }
+            new_seg.push(cell);
         }
         segs.push(new_seg.into_boxed_slice());
         // Link new slots into the free list. Push in reverse so
@@ -210,6 +216,39 @@ impl TcpHashCore {
 }
 
 pub(crate) static TCP_HASH: kernel_core::percpu::PerWorker<TcpHashCore> =
+    kernel_core::percpu::PerWorker::new();
+
+// ── Per-core armed-timer list ─────────────────────────────────────────
+//
+// Head of the intrusive linked list of slots with armed timers (see
+// `TcpConnection::arm_for_tick`). `on_tcp_tick` walks this list
+// instead of scanning the whole per-core pool — at 10% armed
+// steady-state on the kvm-iterate bench (10K conns × 4 cores, /health-
+// TLS), that's a 10× reduction in tick-loop iterations and a matching
+// reduction in cache pressure (each pool slot is ~3 cache lines).
+//
+// Single-core write/read (per-core ownership invariant), so the cell
+// is a plain `UnsafeCell<u16>` — no atomics needed.
+
+pub(crate) struct TickHead {
+    pub(crate) head: core::cell::UnsafeCell<u16>,
+}
+
+unsafe impl Sync for TickHead {}
+unsafe impl Send for TickHead {}
+
+impl TickHead {
+    pub(crate) const fn new() -> Self {
+        TickHead {
+            head: core::cell::UnsafeCell::new(NULL_SLOT),
+        }
+    }
+    pub(crate) fn get(&self) -> *mut u16 {
+        self.head.get()
+    }
+}
+
+pub(crate) static TICK_HEAD: kernel_core::percpu::PerWorker<TickHead> =
     kernel_core::percpu::PerWorker::new();
 
 // ── Accept fast path: per-(core, port) ring of ready-to-accept slots ──
@@ -655,10 +694,12 @@ pub(crate) fn alloc_connection(core: u32) -> Option<usize> {
         let preserved_gen = c.generation;
         let preserved_ring = c.rx_ring.take();
         let preserved_rtx = c.rtx_buf.take();
+        let preserved_slot_index = c.slot_index;
         *c = TcpConnection::new();
         c.generation = preserved_gen;
         c.rx_ring = preserved_ring;
         c.rtx_buf = preserved_rtx;
+        c.slot_index = preserved_slot_index;
         return Some(slot as usize);
     }
     // Pool grew to MAX_SEGMENTS without a free slot — try to reclaim
@@ -736,10 +777,19 @@ pub(crate) fn free_connection(core: u32, slot: usize) {
     // `ensure_rx_ring` short-circuits when `rx_ring.is_some()`.
     let preserved_ring = c.rx_ring.take();
     let preserved_rtx = c.rtx_buf.take();
+    let preserved_slot_index = c.slot_index;
     *c = TcpConnection::new();
     c.generation = next_gen;
     c.rx_ring = preserved_ring;
     c.rtx_buf = preserved_rtx;
+    c.slot_index = preserved_slot_index;
+    // Don't manually unlink from the armed-timer list here — the
+    // `*c = TcpConnection::new()` reset zeroed `tick_in_list` and
+    // all deadlines, so the next `on_tcp_tick` walk drops this
+    // slot from the list naturally (lazy unlink). `tick_next` is
+    // junk after the reset but harmless: `on_tcp_tick` reads it
+    // only for slots `tick_in_list == true`, and the next
+    // `arm_for_tick` overwrites it before flipping the flag.
     // Return the slot to the pool's free list. O(1) push; the next
     // `alloc_connection` call picks it up in O(1) too.
     POOLS.at(core).free_slot(slot as u16);

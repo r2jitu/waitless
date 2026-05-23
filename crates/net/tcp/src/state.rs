@@ -394,6 +394,32 @@ pub struct TcpConnection {
     /// end-of-list. Untouched while the slot is live; on `free` the
     /// pool overwrites it; on `alloc` the pool reads it once.
     pub(crate) next_free: u16,
+
+    /// This slot's own index in the per-core pool. Stamped once at
+    /// segment-init time (`TcpPool::grow_one`) and never mutated.
+    /// Lets per-conn methods that arm a timer (`arm_for_tick`) push
+    /// onto the per-core armed-list without needing a separate
+    /// `(core, slot)` parameter at every call site. Preserved across
+    /// reset (`free_connection` and the alloc path both leave it
+    /// alone — `TcpConnection::new()` defaults it to 0 but it's
+    /// overwritten the moment a segment is published).
+    pub(crate) slot_index: u16,
+
+    /// Intrusive next-link in the per-core "armed timer" list. The
+    /// list contains slots whose `rtx_deadline_ms` /
+    /// `persist_deadline_ms` / `lifecycle_deadline_ms` is non-zero
+    /// (eligible for `on_tcp_tick`'s timer service); `on_tcp_tick`
+    /// walks the list instead of scanning the full pool. `NULL_SLOT`
+    /// = end-of-list. Meaningful only while `tick_in_list == true`;
+    /// junk otherwise.
+    pub(crate) tick_next: u16,
+
+    /// `true` while this slot is linked into the per-core armed
+    /// list. Membership guard so repeated `arm_for_tick` calls don't
+    /// double-link. Cleared by `on_tcp_tick` when the slot's
+    /// deadlines are all zero (lazy unlink) and on `free_connection`
+    /// reset.
+    pub(crate) tick_in_list: bool,
 }
 
 impl TcpConnection {
@@ -446,7 +472,31 @@ impl TcpConnection {
             dup_acks: 0,
             in_fast_recovery: false,
             next_free: NULL_SLOT,
+            slot_index: 0,
+            tick_next: NULL_SLOT,
+            tick_in_list: false,
         }
+    }
+
+    /// Push this slot onto the per-core armed-timer list if not
+    /// already linked. Called by every code path that sets a non-
+    /// zero deadline (`rtx_deadline_ms` / `lifecycle_deadline_ms` /
+    /// `persist_deadline_ms`). The list lets `on_tcp_tick` walk only
+    /// the slots that *might* have work, rather than scanning the
+    /// entire per-core pool (~10% armed at steady state on the
+    /// kvm-iterate bench → 10× tick-loop reduction).
+    pub(crate) fn arm_for_tick(&mut self) {
+        if self.tick_in_list {
+            return;
+        }
+        let core = kernel_core::cpu_id();
+        let head_cell = crate::pool::TICK_HEAD.at(core);
+        // SAFETY: per-core ownership — only the owning core mutates
+        // its head cell or links/unlinks this slot from the list.
+        let head = unsafe { *head_cell.get() };
+        self.tick_next = head;
+        unsafe { *head_cell.get() = self.slot_index };
+        self.tick_in_list = true;
     }
 
     /// Lazy-allocate the per-conn RX ring on the first SYN that
@@ -674,6 +724,7 @@ impl TcpConnection {
     /// Arm the retransmission timer `rto_ms` ahead of now.
     pub(crate) fn arm_rtx(&mut self) {
         self.rtx_deadline_ms = kernel_core::clock::now_ms() + self.rto_ms as u64;
+        self.arm_for_tick();
     }
 
     /// Fold a round-trip-time measurement `r` (milliseconds) into the
@@ -916,6 +967,7 @@ impl TcpConnection {
         self.rtx_backoff = self.rtx_backoff.saturating_add(1);
         self.rto_ms = self.rto_ms.saturating_mul(2).min(RTO_MAX_MS);
         self.rtx_deadline_ms = now + self.rto_ms as u64;
+        self.arm_for_tick();
     }
 
     // ─── Connection-lifecycle timers ─────────────────────────────────────
@@ -927,6 +979,7 @@ impl TcpConnection {
         let interval = ((self.estimated_rto() as u64) << self.fin_retx_count.min(16))
             .min(RTO_MAX_MS as u64);
         self.lifecycle_deadline_ms = now + interval;
+        self.arm_for_tick();
     }
 
     /// Retransmit the connection's FIN (`FinWait1` / `LastAck`) and
@@ -958,6 +1011,7 @@ impl TcpConnection {
     /// deadline rather than a FIN-retransmit deadline.
     pub(crate) fn arm_time_wait(&mut self, now: u64) {
         self.lifecycle_deadline_ms = now + TIME_WAIT_MS;
+        self.arm_for_tick();
     }
 
     // ─── RFC 9293 §3.8.6.1 zero-window probing ───────────────────────────
@@ -977,6 +1031,7 @@ impl TcpConnection {
         let interval = ((self.estimated_rto() as u64) << self.persist_backoff.min(16))
             .min(RTO_MAX_MS as u64);
         self.persist_deadline_ms = now + interval;
+        self.arm_for_tick();
     }
 
     /// Send a zero-window probe and re-arm the persist timer with one

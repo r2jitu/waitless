@@ -121,6 +121,9 @@ pub struct Counters {
     pub hash_find_probes: Counter,
     pub syn_scan_calls: Counter,
     pub syn_scan_iterations: Counter,
+    pub tick_calls: Counter,
+    pub tick_iterations: Counter,
+    pub tick_armed_seen: Counter,
 }
 
 impl Counters {
@@ -152,6 +155,9 @@ impl Counters {
             hash_find_probes: Counter::new(),
             syn_scan_calls: Counter::new(),
             syn_scan_iterations: Counter::new(),
+            tick_calls: Counter::new(),
+            tick_iterations: Counter::new(),
+            tick_armed_seen: Counter::new(),
         }
     }
 }
@@ -390,7 +396,7 @@ pub fn record_teardown(reason: TeardownReason, state: TcpState) {
 
 /// Counter `(name, value)` pairs in declaration order — the flat
 /// half of the `/obs` `"tcp"` block.
-pub fn snapshot() -> [(&'static str, u64); 26] {
+pub fn snapshot() -> [(&'static str, u64); 29] {
     let c = &COUNTERS;
     [
         ("syn_rx", c.syn_rx.get()),
@@ -419,6 +425,9 @@ pub fn snapshot() -> [(&'static str, u64); 26] {
         ("hash_find_probes", c.hash_find_probes.get()),
         ("syn_scan_calls", c.syn_scan_calls.get()),
         ("syn_scan_iterations", c.syn_scan_iterations.get()),
+        ("tick_calls", c.tick_calls.get()),
+        ("tick_iterations", c.tick_iterations.get()),
+        ("tick_armed_seen", c.tick_armed_seen.get()),
     ]
 }
 
