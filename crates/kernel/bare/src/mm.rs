@@ -170,6 +170,18 @@ fn init_heap(info: &BootInfo, kern_end_phys: u64) {
         if r.region_type != MEM_AVAILABLE {
             continue;
         }
+        // The x86_64 multiboot/PVH boot stub identity-maps only
+        // [0, 4 GiB). QEMU on q35 with `-m > 3 GiB` puts the
+        // overflow above 4 GiB (since the 3-4 GiB hole is PCI
+        // MMIO), and so does GCE. Claiming a region whose base is
+        // at or above 4 GiB triple-faults talc on the first write
+        // through the unmapped HHDM address. Caps usable heap at
+        // ~3 GiB on x86_64 multiboot/PVH boots — still ample for
+        // the bench. Limine on x86_64 has its own HHDM that
+        // covers the full RAM and doesn't hit this path.
+        if r.base >= 0x1_0000_0000 {
+            continue;
+        }
         total_ram += r.length;
         let region_end = r.base + r.length;
         if region_end > max_phys {

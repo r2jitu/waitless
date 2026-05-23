@@ -99,21 +99,22 @@ boot_pd3:
 .code32
 .global _start
 _start:
-    // Two boot protocols may call this entry point:
+    // Two boot protocols may call this entry point, and BOTH put the
+    // boot-info pointer in EBX:
     //   Multiboot2: EAX = 0x36d76289 (magic), EBX = multiboot2 info ptr
-    //   PVH/Xen:   EAX = undefined,            ESI = hvm_start_info ptr
+    //   PVH/Xen:   EAX = undefined,           EBX = hvm_start_info ptr
+    //                                         (per the PVH spec at
+    //                                         xenbits.xen.org/docs/unstable/misc/pvh.html)
     //
-    // Save the boot-info pointer in EDI (→ RDI in 64-bit mode, first arg to
-    // kernel_main). We detect the protocol by checking the multiboot2 magic.
-    cmp  $0x36d76289, %eax
-    je   .Lmb2_boot
-    // PVH boot: hvm_start_info is in ESI
-    mov  %esi, %edi
-    jmp  .Lboot_common
-.Lmb2_boot:
-    // Multiboot2 boot: multiboot2 info is in EBX
+    // Save the boot-info pointer in EDI (→ RDI in 64-bit mode, first arg
+    // to kernel_main). The Rust shim disambiguates by reading the magic
+    // at the pointer (HVM_START_MAGIC for PVH, total_size for MB2).
+    //
+    // Earlier versions of this file used ESI for the PVH path; that
+    // misreading of the spec silently fell through to the 128 MB
+    // memory-map fallback in `boot_shim_x86::shim` because ESI under
+    // PVH holds an unrelated value.
     mov  %ebx, %edi
-.Lboot_common:
 
     // ---- Set up identity-mapped page tables ----
 
