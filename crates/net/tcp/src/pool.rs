@@ -212,6 +212,123 @@ impl TcpHashCore {
 pub(crate) static TCP_HASH: kernel_core::percpu::PerWorker<TcpHashCore> =
     kernel_core::percpu::PerWorker::new();
 
+// ── Accept fast path: per-(core, port) ring of ready-to-accept slots ──
+//
+// `accept_on_port_core` used to linear-scan the entire per-core pool
+// for any `Established && !accepted` slot — O(pool_size) per accept,
+// dominant cost at high conn counts (measured 1257 iters/call at 10K
+// conns on the kvm-iterate bench). The Established transition in
+// `tcp_receive` pushes the slot onto this ring; `accept_on_port_core`
+// pops O(1) from it and only falls back to the full scan on miss
+// (handles the case where the ring overflowed or wasn't registered).
+//
+// Single-core SPSC: the slot's owner core writes on the Established
+// transition and reads on accept — same core for both (slot
+// allocation, hand-shake completion, and accept all run on the core
+// the SYN's RX queue landed on). No atomics needed; plain volatile
+// reads/writes keep the compiler from reordering the cursor updates
+// across the slot stores.
+
+pub(crate) const MAX_ACCEPT_RINGS: usize = 8;
+const ACCEPT_RING_CAPACITY: usize = 4096;
+const ACCEPT_RING_MASK: u32 = (ACCEPT_RING_CAPACITY as u32) - 1;
+
+pub(crate) struct AcceptRing {
+    port: core::cell::Cell<u16>,
+    head: core::cell::Cell<u32>, // producer cursor (Established push)
+    tail: core::cell::Cell<u32>, // consumer cursor (accept pop)
+    slots: core::cell::UnsafeCell<[u16; ACCEPT_RING_CAPACITY]>,
+}
+
+pub(crate) struct AcceptRingTable {
+    rings: [AcceptRing; MAX_ACCEPT_RINGS],
+}
+
+unsafe impl Sync for AcceptRingTable {}
+unsafe impl Send for AcceptRingTable {}
+
+impl AcceptRingTable {
+    pub(crate) const fn new() -> Self {
+        // Cannot use `[expr; N]` initializer with `UnsafeCell` (not Copy).
+        const fn empty_ring() -> AcceptRing {
+            AcceptRing {
+                port: core::cell::Cell::new(0),
+                head: core::cell::Cell::new(0),
+                tail: core::cell::Cell::new(0),
+                slots: core::cell::UnsafeCell::new([0; ACCEPT_RING_CAPACITY]),
+            }
+        }
+        AcceptRingTable {
+            rings: [
+                empty_ring(), empty_ring(), empty_ring(), empty_ring(),
+                empty_ring(), empty_ring(), empty_ring(), empty_ring(),
+            ],
+        }
+    }
+}
+
+pub(crate) static ACCEPT_RINGS: kernel_core::percpu::PerWorker<AcceptRingTable> =
+    kernel_core::percpu::PerWorker::new();
+
+/// Find or allocate the per-port ring on the calling core.
+/// Returns `None` if MAX_ACCEPT_RINGS ports already registered on
+/// this core — caller falls back to the linear-scan slow path.
+fn ring_for_port(core: u32, port: u16) -> Option<&'static AcceptRing> {
+    let t = ACCEPT_RINGS.at(core);
+    // First pass: existing port match.
+    for r in &t.rings {
+        if r.port.get() == port {
+            return Some(r);
+        }
+    }
+    // Second pass: claim the first unused (port == 0) slot.
+    for r in &t.rings {
+        if r.port.get() == 0 {
+            r.port.set(port);
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// Push `slot` onto the (core, port) accept ring. Called from the
+/// SYN-ACK→Established transition in `tcp_receive`. Silently drops
+/// on overflow — `accept_on_port_core` falls back to its linear
+/// scan in that case, so correctness is preserved.
+pub(crate) fn accept_ring_push(core: u32, port: u16, slot: u16) {
+    let Some(r) = ring_for_port(core, port) else {
+        return;
+    };
+    let head = r.head.get();
+    let tail = r.tail.get();
+    if head.wrapping_sub(tail) >= ACCEPT_RING_CAPACITY as u32 {
+        return; // full
+    }
+    let idx = (head & ACCEPT_RING_MASK) as usize;
+    // SAFETY: per-core ownership; the producing core is the only
+    // writer to head AND to slots[idx].
+    unsafe { (*r.slots.get())[idx] = slot };
+    r.head.set(head.wrapping_add(1));
+}
+
+/// Pop the oldest pending slot for (core, port), or `None` if the
+/// ring is empty.
+pub(crate) fn accept_ring_pop(core: u32, port: u16) -> Option<u16> {
+    let r = ring_for_port(core, port)?;
+    let head = r.head.get();
+    let tail = r.tail.get();
+    if head == tail {
+        return None;
+    }
+    let idx = (tail & ACCEPT_RING_MASK) as usize;
+    // SAFETY: per-core ownership; same core writes head/slot and
+    // reads tail. Read-then-advance is fine in this single-core
+    // model — no other thread can re-publish the slot.
+    let slot = unsafe { (*r.slots.get())[idx] };
+    r.tail.set(tail.wrapping_add(1));
+    Some(slot)
+}
+
 // TCP diagnostic counters moved to `crate::diag` (the observability
 // doctrine — `docs/observability.md`). `syn_rx` / `synack_tx` and the
 // `rx_chunk_*` zero-copy pair now live in `diag::COUNTERS`.

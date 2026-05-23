@@ -5,8 +5,8 @@
 // `shutdown_all`. Also `init` (per-core pool / hash bring-up).
 
 use crate::pool::{
-    POOLS, TCP_HASH, TcpHashCore, TcpPool, alloc_connection, conn_ptr, decode_handle,
-    encode_handle, free_connection, pool_capacity,
+    ACCEPT_RINGS, AcceptRingTable, POOLS, TCP_HASH, TcpHashCore, TcpPool, accept_ring_pop,
+    alloc_connection, conn_ptr, decode_handle, encode_handle, free_connection, pool_capacity,
 };
 use crate::send::{SegmentMeta, send_rst};
 use crate::state::{TCP_ACK, TCP_FIN, TcpState};
@@ -34,6 +34,7 @@ pub fn init() {
     let n = kernel_core::percpu::num_cores();
     POOLS.init(n, |_| TcpPool::new());
     TCP_HASH.init(n, |_| TcpHashCore::new());
+    ACCEPT_RINGS.init(n, |_| AcceptRingTable::new());
 }
 
 /// Create a listener on a specific core. Called from
@@ -63,6 +64,29 @@ pub fn accept_on_port(port: u16) -> executor::reactor::TcpStream {
 fn accept_on_port_core(core: u32, port: u16) -> executor::reactor::TcpStream {
     use executor::reactor::TcpStream;
     crate::diag::COUNTERS.accept_calls.bump();
+
+    // Fast path: pop the oldest pending Established slot off the
+    // per-(core, port) accept ring. Pushed at the SYN-ACK→Established
+    // transition in `tcp_receive`.
+    while let Some(slot) = accept_ring_pop(core, port) {
+        let i = slot as usize;
+        // SAFETY: per-core ownership.
+        let c = unsafe { &mut *conn_ptr(core, i) };
+        // Slot might have advanced state (peer FIN'd before we
+        // accepted) or been reused (generation drift). Re-check.
+        if c.state == TcpState::Established && c.listener_port == port && !c.accepted {
+            c.accepted = true;
+            crate::diag::COUNTERS.accept_iterations.add(1);
+            return TcpStream::from_raw(encode_handle(core, i), c.generation);
+        }
+        // Stale ring entry — drop it and try the next.
+    }
+
+    // Slow path: linear scan over the per-core pool. Only reached
+    // when the ring was empty (no Established slot was pushed since
+    // last accept) or all pushed entries were stale by the time we
+    // popped them. Also covers the case where ACCEPT_RINGS hadn't
+    // been registered (>MAX_ACCEPT_RINGS distinct ports on a core).
     let cap = pool_capacity(core);
     let mut iters: u64 = 0;
     for i in 0..cap {

@@ -337,6 +337,11 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             // which is the same core that owns this conn slot, so
             // the reactor's per-worker waker fires the right task.
             let port = c.listener_port;
+            // O(1) hand-off to the listener's accept ring — without
+            // this, `accept_on_port_core` linear-scans the entire
+            // per-core pool to find this slot (measured ~1257
+            // iters/call at 10K conns on the kvm-iterate bench).
+            crate::pool::accept_ring_push(core, port, slot as u16);
             executor::reactor::deliver_tcp_ready(port);
         } else if c.state == TcpState::LastAck && ack == c.snd_nxt {
             // The peer acknowledged our FIN — passive close complete.
