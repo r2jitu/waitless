@@ -22,8 +22,33 @@ use worker::{CurrentWorker, PerWorker};
 
 // ---- Task arena ------------------------------------------------------------
 
-pub const TASKS_PER_WORKER: usize = 64;
-const _: () = assert!(TASKS_PER_WORKER <= 64, "ready_bits is u64");
+/// Per-worker task slot count. With `WORKERS × TASKS_PER_WORKER`
+/// total in-flight tasks across the machine, this is the ceiling on
+/// concurrent connections / spawned futures the runtime can handle.
+/// Sized to fit the largest planned bench point (32K conns / 8
+/// workers = 4096 per worker) with headroom for non-conn tasks
+/// (listeners, timers, internal jobs).
+pub const TASKS_PER_WORKER: usize = 4096;
+/// Words in the slot bitmap; one bit per slot. Spawn linear-scans
+/// `used_bits` for a zero bit before CAS-claiming; `ready_bits`
+/// mirrors per-slot wake state for the tick poll loop.
+pub const TASKS_BITMAP_WORDS: usize = TASKS_PER_WORKER / 64;
+const _: () = assert!(
+    TASKS_PER_WORKER.is_power_of_two() && TASKS_PER_WORKER >= 64,
+    "TASKS_PER_WORKER must be a power-of-two ≥ 64 so the bitmap maths is clean",
+);
+
+/// Bits dedicated to the slot index in the waker's packed
+/// `(worker, slot)` data field. 16 covers TASKS_PER_WORKER up to
+/// 65536 with plenty of headroom; the high bits hold the worker
+/// id. Must be `≥ log2(TASKS_PER_WORKER)`.
+const WAKER_SLOT_BITS: u32 = 16;
+const WAKER_SLOT_MASK: usize = (1 << WAKER_SLOT_BITS) - 1;
+const WAKER_WORKER_SHIFT: u32 = WAKER_SLOT_BITS;
+const _: () = assert!(
+    TASKS_PER_WORKER <= (1 << WAKER_SLOT_BITS),
+    "slot index must fit in WAKER_SLOT_BITS",
+);
 
 /// Pre-boxed future shape accepted by [`spawn_boxed`]. Listeners
 /// that already type-erase per-conn futures into `Pin<Box<dyn …>>`
@@ -31,7 +56,6 @@ const _: () = assert!(TASKS_PER_WORKER <= 64, "ready_bits is u64");
 pub type BoxedFuture = Pin<Box<dyn Future<Output = ()>>>;
 
 pub struct TaskSlot {
-    used: AtomicBool,
     /// Cancel flag — set by `TaskHandle::abort` (possibly from a
     /// different worker). Checked by `tick` before polling; if set,
     /// the future is dropped in place and the slot freed.
@@ -48,7 +72,6 @@ pub struct TaskSlot {
 impl TaskSlot {
     const fn new() -> Self {
         TaskSlot {
-            used: AtomicBool::new(false),
             abort: AtomicBool::new(false),
             epoch: AtomicU32::new(0),
             future: UnsafeCell::new(None),
@@ -56,27 +79,60 @@ impl TaskSlot {
     }
 }
 
-// SAFETY: `used` / `abort` / `epoch` are atomic; `future` is
-// mutated only by the owning worker (CAS on `used` serialises
-// producers; polling runs on the same worker that spawned).
+// SAFETY: `abort` / `epoch` are atomic; `future` is mutated only by
+// the owning worker (the used-bitmap CAS serialises producers; only
+// the owning worker polls, so the UnsafeCell access is
+// single-threaded at any given time).
 unsafe impl Sync for TaskSlot {}
 unsafe impl Send for TaskSlot {}
 
 pub struct TaskArena {
     slots: [TaskSlot; TASKS_PER_WORKER],
+    /// Per-arena used bitmap — bit `i` set iff slot `i` currently
+    /// holds a live (or aborting) future. Spawn does a find-first-
+    /// zero scan + CAS-claim. Replaces the per-slot `AtomicBool used`
+    /// so that the scan is O(words) instead of O(slots).
+    used_bits: [AtomicU64; TASKS_BITMAP_WORDS],
     /// Per-arena ready bitmap — bit `i` set iff slot `i` is scheduled
-    /// to poll. Waker fires the bit; `tick` reads-and-clears the whole
-    /// word then iterates set bits via `trailing_zeros`. O(ready) work
-    /// per tick instead of O(TASKS_PER_WORKER).
-    ready_bits: AtomicU64,
+    /// to poll. Waker fires the bit; `tick` swaps each word to 0 and
+    /// iterates set bits via `trailing_zeros`. O(ready) work per tick
+    /// instead of O(TASKS_PER_WORKER).
+    ready_bits: [AtomicU64; TASKS_BITMAP_WORDS],
 }
 
 impl TaskArena {
     const fn new() -> Self {
         TaskArena {
             slots: [const { TaskSlot::new() }; TASKS_PER_WORKER],
-            ready_bits: AtomicU64::new(0),
+            used_bits: [const { AtomicU64::new(0) }; TASKS_BITMAP_WORDS],
+            ready_bits: [const { AtomicU64::new(0) }; TASKS_BITMAP_WORDS],
         }
+    }
+
+    /// True iff slot `idx` is currently in use. Wraps the per-word
+    /// bitmap lookup; callers should always check this on the poll /
+    /// abort paths to filter out spurious wakes against freed slots.
+    fn is_used(&self, idx: usize) -> bool {
+        let (word, bit) = (idx / 64, idx % 64);
+        (self.used_bits[word].load(Ordering::Acquire) & (1u64 << bit)) != 0
+    }
+
+    /// Clear the used bit for `idx`. Called from the tick loop when
+    /// a task completes or aborts, and from `drain_all_arenas`.
+    fn clear_used(&self, idx: usize) {
+        let (word, bit) = (idx / 64, idx % 64);
+        self.used_bits[word].fetch_and(!(1u64 << bit), Ordering::Release);
+    }
+
+    /// Set the ready bit for `idx` and return whether ANY ready bit
+    /// in the entire arena was already set before this call (per-
+    /// word check is a fast approximation that's good enough for the
+    /// "is the target tick already pending?" wake-suppression check
+    /// in `waker_wake_by_ref`).
+    fn mark_ready(&self, idx: usize) -> bool {
+        let (word, bit) = (idx / 64, idx % 64);
+        let prev = self.ready_bits[word].fetch_or(1u64 << bit, Ordering::Release);
+        prev != 0
     }
 }
 
@@ -121,9 +177,7 @@ impl TaskHandle {
         slot.abort.store(true, Ordering::Release);
         // Force a tick so the abort is honoured promptly, even if
         // the task isn't otherwise ready.
-        arena
-            .ready_bits
-            .fetch_or(1u64 << self.slot_idx, Ordering::Release);
+        arena.mark_ready(self.slot_idx as usize);
     }
 
     /// True iff the task has completed or been aborted. False
@@ -131,7 +185,8 @@ impl TaskHandle {
     pub fn is_finished(&self) -> bool {
         let arena = ARENAS.at(self.worker_id);
         let slot = &arena.slots[self.slot_idx as usize];
-        slot.epoch.load(Ordering::Acquire) != self.epoch || !slot.used.load(Ordering::Acquire)
+        slot.epoch.load(Ordering::Acquire) != self.epoch
+            || !arena.is_used(self.slot_idx as usize)
     }
 }
 
@@ -170,22 +225,46 @@ pub fn spawn_boxed(fut: BoxedFuture) -> Result<TaskHandle, SpawnError> {
     let worker_id = cc.id();
     let arena = ARENAS.current(&cc);
     let mut fut_opt = Some(fut);
-    for (idx, slot) in arena.slots.iter().enumerate() {
-        if slot
-            .used
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            // SAFETY: the CAS gives us exclusive access until we
-            // publish via the ready bit below.
+    // Find-first-zero scan over `used_bits`, CAS-claim the slot,
+    // publish via `ready_bits`. The bitmap collapses a linear
+    // per-slot AtomicBool scan (O(TASKS_PER_WORKER) on the spawn-
+    // when-full path) down to O(TASKS_BITMAP_WORDS) — at 4096
+    // slots that's 64 words instead of 4096 AtomicBool loads,
+    // and the typical case finds a free word on the first probe.
+    for word_idx in 0..TASKS_BITMAP_WORDS {
+        loop {
+            let word = arena.used_bits[word_idx].load(Ordering::Acquire);
+            if word == u64::MAX {
+                // Word fully claimed; try the next one. Most-loaded
+                // arenas have a sparse `!word`, so the find-first-
+                // zero (bitwise-NOT trailing_zeros) is one CPU op.
+                break;
+            }
+            let bit = (!word).trailing_zeros() as usize;
+            let mask = 1u64 << bit;
+            let prev = arena.used_bits[word_idx].fetch_or(mask, Ordering::AcqRel);
+            if (prev & mask) != 0 {
+                // Another spawn or wake raced us to this bit; retry
+                // the same word (a different bit may still be free).
+                continue;
+            }
+            // CAS succeeded — slot is ours. Compute the absolute
+            // slot index, populate, publish ready.
+            let idx = word_idx * 64 + bit;
+            let slot = &arena.slots[idx];
+            // SAFETY: the used-bit CAS gives us exclusive access to
+            // the slot's future cell until completion clears it.
             unsafe {
                 *slot.future.get() = fut_opt.take();
             }
             // Clear any stale abort flag from the prior task that
-            // lived in this slot (swap-not-store to be defensive).
+            // lived in this slot (defensive — abort sets-and-forgets,
+            // tick swaps-and-checks, so a leftover `true` from a
+            // previous incarnation would otherwise immediately drop
+            // the new future on its first tick).
             slot.abort.store(false, Ordering::Release);
             let epoch = slot.epoch.load(Ordering::Acquire);
-            arena.ready_bits.fetch_or(1u64 << idx, Ordering::Release);
+            arena.mark_ready(idx);
             crate::diag::COUNTERS.tasks_spawned.bump();
             return Ok(TaskHandle {
                 worker_id,
@@ -202,18 +281,17 @@ pub fn spawn_boxed(fut: BoxedFuture) -> Result<TaskHandle, SpawnError> {
 // ---- Waker vtable ----------------------------------------------------------
 //
 // `data: *const ()` is repurposed as a packed `(worker_id, slot_idx)`
-// integer (not a real pointer). Bits [0..6]: slot_idx (0..=63). Bits
-// [8..]: worker_id. The vtable is compile-time fixed, so knowing the
-// two indices is enough to locate the arena's ready_bits via
-// `ARENAS.at(worker_id)` and OR-in the bit.
+// integer (not a real pointer). Low `WAKER_SLOT_BITS` (16) hold the
+// slot index — enough for any reasonable `TASKS_PER_WORKER`; the
+// remaining high bits hold the worker id. The vtable is compile-
+// time fixed, so knowing the two indices is enough to locate the
+// arena's `used_bits` / `ready_bits` via `ARENAS.at(worker_id)` and
+// flip the appropriate bit.
 //
 // Packing as an integer avoids pointer-stability concerns (TaskSlot
 // is in a `static`, fine today, but this is simpler) and keeps
 // wake-site work to a single `fetch_or` — no indirection, no
-// per-slot AtomicBool scan.
-
-const WAKER_SLOT_MASK: usize = 0xFF;
-const WAKER_WORKER_SHIFT: u32 = 8;
+// per-slot scan.
 
 static WAKER_VTABLE: RawWakerVTable =
     RawWakerVTable::new(waker_clone, waker_wake, waker_wake_by_ref, waker_drop);
@@ -233,20 +311,21 @@ fn waker_wake_by_ref(data: *const ()) {
     if worker_id >= worker::num_workers() || slot_idx >= TASKS_PER_WORKER {
         return;
     }
-    let prev = ARENAS
-        .at(worker_id)
-        .ready_bits
-        .fetch_or(1u64 << slot_idx, Ordering::Release);
+    let any_was_ready = ARENAS.at(worker_id).mark_ready(slot_idx);
     // Cross-worker wake: the target may be in HLT/WFI / blocking
     // kqueue waiting for its next idle tick; bumping `ready_bits`
     // alone won't bring it back. Skip when:
     //   - the target IS the current worker (we'll observe the bit
     //     on our own next tick, no kernel round-trip needed), or
-    //   - `ready_bits` was already non-zero (the target is either
-    //     mid-tick or about to tick — another bit doesn't change
-    //     the wake semantics, and an extra IPI per packet under
-    //     heavy load just adds overhead).
-    if prev == 0 && worker_id != platform::current_worker() {
+    //   - any ready bit in that arena word was already set (the
+    //     target is either mid-tick or about to tick — another bit
+    //     doesn't change the wake semantics, and an extra IPI per
+    //     packet under heavy load just adds overhead). This is a
+    //     per-word check rather than per-arena; "any pending in
+    //     this word" is a strict subset of "any pending anywhere",
+    //     so we may issue a redundant wake in the multi-word case,
+    //     which is harmless.
+    if !any_was_ready && worker_id != platform::current_worker() {
         platform::wake_worker(worker_id);
     }
 }
@@ -281,38 +360,43 @@ pub fn tick(worker_id: u32) -> bool {
     crate::sleep::advance_timers(&cc);
 
     let arena = ARENAS.at(worker_id);
-    // Atomically take the current ready bitmap. Wakes that fire
-    // *during* this tick flip fresh bits for the next iteration.
-    let mut ready = arena.ready_bits.swap(0, Ordering::AcqRel);
+    // Atomically take the current ready bitmap, one word at a time.
+    // Wakes that fire *during* this tick flip fresh bits in the
+    // words we've already swept and get picked up on the next tick.
     let mut did_work = false;
-    while ready != 0 {
-        let slot_idx = ready.trailing_zeros() as usize;
-        ready &= ready - 1;
-        let slot = &arena.slots[slot_idx];
-        // Spurious wakes on freed slots are possible if an external
-        // reference fires a stale waker after the task completed.
-        // `used` guards the slot's future storage.
-        if !slot.used.load(Ordering::Acquire) {
-            continue;
-        }
-        // Cancellation beats polling: `TaskHandle::abort` set the
-        // flag + flipped the ready bit to force us here. Drop the
-        // future in place (on the owning worker, where it's safe),
-        // bump the epoch so lingering handles observe completion,
-        // then free the slot.
-        if slot.abort.swap(false, Ordering::AcqRel) {
-            // SAFETY: owning-worker-only access.
-            unsafe {
-                *slot.future.get() = None;
+    for word_idx in 0..TASKS_BITMAP_WORDS {
+        let mut ready = arena.ready_bits[word_idx].swap(0, Ordering::AcqRel);
+        while ready != 0 {
+            let bit = ready.trailing_zeros() as usize;
+            ready &= ready - 1;
+            let slot_idx = word_idx * 64 + bit;
+            let slot = &arena.slots[slot_idx];
+            // Spurious wakes on freed slots are possible if an
+            // external reference fires a stale waker after the task
+            // completed. The used bitmap guards the slot's future
+            // storage.
+            if !arena.is_used(slot_idx) {
+                continue;
             }
-            slot.epoch.fetch_add(1, Ordering::AcqRel);
-            slot.used.store(false, Ordering::Release);
-            crate::diag::COUNTERS.tasks_aborted.bump();
+            // Cancellation beats polling: `TaskHandle::abort` set
+            // the flag + flipped the ready bit to force us here.
+            // Drop the future in place (on the owning worker, where
+            // it's safe), bump the epoch so lingering handles
+            // observe completion, then free the slot.
+            if slot.abort.swap(false, Ordering::AcqRel) {
+                // SAFETY: owning-worker-only access.
+                unsafe {
+                    *slot.future.get() = None;
+                }
+                slot.epoch.fetch_add(1, Ordering::AcqRel);
+                arena.clear_used(slot_idx);
+                crate::diag::COUNTERS.tasks_aborted.bump();
+                did_work = true;
+                continue;
+            }
             did_work = true;
-            continue;
+            poll_slot(arena, slot, worker_id, slot_idx);
         }
-        did_work = true;
-        poll_slot(slot, worker_id, slot_idx);
     }
     did_work
 }
@@ -335,22 +419,25 @@ pub fn drain_all_arenas() {
     let n = worker::num_workers();
     for worker_id in 0..n {
         let arena = ARENAS.at(worker_id);
-        for slot in arena.slots.iter() {
-            if !slot.used.load(Ordering::Acquire) {
+        for slot_idx in 0..TASKS_PER_WORKER {
+            if !arena.is_used(slot_idx) {
                 continue;
             }
+            let slot = &arena.slots[slot_idx];
             // SAFETY: see fn-level comment — APs are post-eventloop-
             // break and not polling.
             unsafe {
                 *slot.future.get() = None;
             }
             slot.epoch.fetch_add(1, Ordering::AcqRel);
-            slot.used.store(false, Ordering::Release);
+            arena.clear_used(slot_idx);
             slot.abort.store(false, Ordering::Release);
         }
-        // Clear ready bits so a later spurious wake observes nothing
-        // to do.
-        arena.ready_bits.store(0, Ordering::Release);
+        // Clear ready bits across all words so a later spurious wake
+        // observes nothing to do.
+        for word in arena.ready_bits.iter() {
+            word.store(0, Ordering::Release);
+        }
     }
 }
 
@@ -365,10 +452,14 @@ pub fn has_pending(worker_id: u32) -> bool {
     if crate::sleep::has_timers(&cc) {
         return true;
     }
-    ARENAS.at(worker_id).ready_bits.load(Ordering::Acquire) != 0
+    let arena = ARENAS.at(worker_id);
+    arena
+        .ready_bits
+        .iter()
+        .any(|w| w.load(Ordering::Acquire) != 0)
 }
 
-fn poll_slot(slot: &TaskSlot, worker_id: u32, slot_idx: usize) {
+fn poll_slot(arena: &TaskArena, slot: &TaskSlot, worker_id: u32, slot_idx: usize) {
     let waker = make_waker_for(worker_id, slot_idx);
     let mut cx = Context::from_waker(&waker);
 
@@ -385,7 +476,7 @@ fn poll_slot(slot: &TaskSlot, worker_id: u32, slot_idx: usize) {
             // and any in-flight `abort` call on this handle becomes
             // a no-op rather than aborting the next task in this slot.
             slot.epoch.fetch_add(1, Ordering::AcqRel);
-            slot.used.store(false, Ordering::Release);
+            arena.clear_used(slot_idx);
             crate::diag::COUNTERS.tasks_completed.bump();
         }
     }
