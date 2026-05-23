@@ -297,7 +297,7 @@ pub mod diagnostics {
     /// Per-queue RX frame counts (Tier 1 multi-queue NIC). Index
     /// is the queue-pair number; `[0..num_queue_pairs()]` are
     /// meaningful, the rest are zero.
-    pub fn net_rx_counts() -> [u64; 8] {
+    pub fn net_rx_counts() -> [u64; waitless_backend::NET_DIAG_QP_CAP] {
         waitless_backend::net_rx_counts()
     }
 
@@ -310,7 +310,7 @@ pub mod diagnostics {
     /// Per-queue used-ring cursors `(device, driver)`. Useful for
     /// spotting "device produced but driver didn't consume" gaps
     /// (cursors apart) vs "host not delivering" (both stuck).
-    pub fn net_rx_used_cursors() -> [(u16, u16); 8] {
+    pub fn net_rx_used_cursors() -> [(u16, u16); waitless_backend::NET_DIAG_QP_CAP] {
         waitless_backend::net_rx_used_cursors()
     }
 

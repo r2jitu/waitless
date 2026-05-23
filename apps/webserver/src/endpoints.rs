@@ -160,8 +160,9 @@ fn write_nic_obs<W: core::fmt::Write>(w: &mut W) {
     // u16 slices so `emit_json_array` can render them — the helper
     // emits `T: Display` and there's no Display impl for `(u16, u16)`.
     let n = nqp.min(cursors.len());
-    let mut used_dev = [0u16; 8];
-    let mut used_drv = [0u16; 8];
+    const QP_CAP: usize = waitless::diagnostics::NET_DIAG_QP_CAP;
+    let mut used_dev = [0u16; QP_CAP];
+    let mut used_drv = [0u16; QP_CAP];
     for i in 0..n {
         used_dev[i] = cursors[i].0;
         used_drv[i] = cursors[i].1;

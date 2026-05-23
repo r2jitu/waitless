@@ -393,8 +393,8 @@ pub struct NicIdleOps {
 /// so legacy backends without TX-side instrumentation can return
 /// `None` without filling a zero struct.
 pub struct NicDiagOps {
-    pub rx_counts: fn() -> [u64; 8],
-    pub rx_used_cursors: fn() -> [(u16, u16); 8],
+    pub rx_counts: fn() -> [u64; DIAG_QP_CAP],
+    pub rx_used_cursors: fn() -> [(u16, u16); DIAG_QP_CAP],
     /// Snapshot of TX-pool saturation + per-qp TX packet counts.
     /// `None` when the driver hasn't been instrumented (kept as
     /// an Option to avoid forcing every backend to fill the
@@ -433,11 +433,12 @@ pub struct TxDescLogEntry {
     pub bytes: [u8; 16],
 }
 
-/// Cap on per-qp diagnostic arrays. Mirrors `rx_counts: [u64; 8]`
-/// so a single `TxDiag` snapshot fits the common case without
-/// heap allocation. Drivers with more queue-pairs sum the tail
-/// into `[7]` so the total still reflects the device.
-pub const DIAG_QP_CAP: usize = 8;
+/// Cap on per-qp diagnostic arrays. Sized to match `MAX_QUEUE_PAIRS`
+/// in the gve / virtio-net drivers. 22 covers c3-highcpu-22's queue
+/// pair count; lift here + in the driver `MAX_QUEUE_PAIRS` constants
+/// in lockstep if you ever need to go higher. Drivers with fewer
+/// active queues than the cap leave the tail entries at 0.
+pub const DIAG_QP_CAP: usize = 22;
 
 /// TX-side counters surfaced via [`NicDiagOps::tx_diag`]. All
 /// fields are zeroed at boot and only ever incremented (relaxed

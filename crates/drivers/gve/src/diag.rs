@@ -16,19 +16,19 @@ use crate::{MAX_QUEUE_PAIRS, RX_QUEUES, TX_BIG_POOL_SLOTS, TX_QUEUES, TX_SMALL_P
 /// Per-qp count of packets successfully handed to the device by
 /// `submit_tx*`. Diagnostic only — the device's own completion
 /// counter is the source of truth for "done", this counts "issued".
-pub(crate) static TX_PACKETS_PER_QP: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub(crate) static TX_PACKETS_PER_QP: [AtomicU64; MAX_QUEUE_PAIRS] = [const { AtomicU64::new(0) }; MAX_QUEUE_PAIRS];
 
 /// Per-qp cumulative TX wire bytes — sum of all `frame_len` values
 /// passed to `submit_tx` / `submit_tx_tso`. For TSO the count is the
 /// super-segment frame length (NOT the post-segmentation wire bytes
 /// the device actually emits), so a TSO/STD comparison is not
 /// byte-for-byte equal on the wire — interpret carefully.
-pub(crate) static TX_BYTES_PER_QP: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub(crate) static TX_BYTES_PER_QP: [AtomicU64; MAX_QUEUE_PAIRS] = [const { AtomicU64::new(0) }; MAX_QUEUE_PAIRS];
 
 /// Per-qp cumulative RX wire bytes — driver-side count of the
 /// frame length the callback receives. Includes Eth + IP + L4
 /// headers + payload.
-pub(crate) static RX_BYTES_PER_QP: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub(crate) static RX_BYTES_PER_QP: [AtomicU64; MAX_QUEUE_PAIRS] = [const { AtomicU64::new(0) }; MAX_QUEUE_PAIRS];
 
 /// Per-qp count of RX device buffers reposted to the receive ring
 /// (item B). DQO bumps it from the `dqo_repost` drop callback —
@@ -38,14 +38,14 @@ pub(crate) static RX_BYTES_PER_QP: [AtomicU64; 8] = [const { AtomicU64::new(0) }
 /// frame count — a persistent shortfall means a drop callback
 /// isn't firing (a leaked device buffer). Surfaced via the `/obs`
 /// `nic` block.
-pub static RX_BUF_REPOST_COUNT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub static RX_BUF_REPOST_COUNT: [AtomicU64; MAX_QUEUE_PAIRS] = [const { AtomicU64::new(0) }; MAX_QUEUE_PAIRS];
 
 /// Per-qp count of GQI frames dropped because the recycle pool was
 /// exhausted — no slab free to copy the frame into (item B).
 /// Always 0 on a healthy GQI queue; a non-zero value means the
 /// consumer isn't draining pooled slabs fast enough (see
 /// `gqi::GQI_RX_POOL_SLABS`). Surfaced via the `/obs` `nic` block.
-pub static GQI_RECYCLE_POOL_EXHAUSTED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub static GQI_RECYCLE_POOL_EXHAUSTED: [AtomicU64; MAX_QUEUE_PAIRS] = [const { AtomicU64::new(0) }; MAX_QUEUE_PAIRS];
 
 // ---- TX direct-fill pool saturation counters -------------------------------
 
@@ -228,8 +228,8 @@ pub(crate) fn tx_diag() -> nic_api::TxDiag {
 
 /// Per-queue RX frame count. Lock-free snapshot — uses the atomic
 /// `cons_cnt` on each live queue.
-pub(crate) fn rx_counts() -> [u64; 8] {
-    let mut out = [0u64; 8];
+pub(crate) fn rx_counts() -> [u64; MAX_QUEUE_PAIRS] {
+    let mut out = [0u64; MAX_QUEUE_PAIRS];
     for qp in 0..MAX_QUEUE_PAIRS.min(out.len()) {
         let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
         if !rx_ptr.is_null() {
@@ -245,8 +245,8 @@ pub(crate) fn rx_counts() -> [u64; 8] {
 /// (consumed by driver). Return `(fill_cnt, cons_cnt)` which maps
 /// naturally onto virtio's `(device_idx, driver_cursor)` in the
 /// `/obs` `nic` block.
-pub(crate) fn rx_used_cursors() -> [(u16, u16); 8] {
-    let mut out = [(0u16, 0u16); 8];
+pub(crate) fn rx_used_cursors() -> [(u16, u16); MAX_QUEUE_PAIRS] {
+    let mut out = [(0u16, 0u16); MAX_QUEUE_PAIRS];
     for qp in 0..MAX_QUEUE_PAIRS.min(out.len()) {
         let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
         if !rx_ptr.is_null() {

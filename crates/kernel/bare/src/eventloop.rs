@@ -59,10 +59,11 @@ impl CoreStats {
 }
 
 /// Fixed per-core stats array. Sized to match the rest of the tree's
-/// 8-core ceiling (`MAX_QUEUE_PAIRS` in the drivers, the 8-deep diag
-/// arrays in `waitless_net`). Sufficient for every machine type we
-/// target in production today.
-pub const MAX_CORE_STATS: usize = 8;
+/// per-core ceiling (`MAX_QUEUE_PAIRS` in the drivers, the matching
+/// diag arrays in `waitless_net`). 22 covers the c3-highcpu-22 machine
+/// type used in the bench rig; lift again if Google ships a larger
+/// predefined size we want to support.
+pub const MAX_CORE_STATS: usize = 22;
 
 static CORE_STATS: [CoreStats; MAX_CORE_STATS] = [const { CoreStats::new() }; MAX_CORE_STATS];
 

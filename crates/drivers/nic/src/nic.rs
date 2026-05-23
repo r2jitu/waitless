@@ -236,14 +236,17 @@ pub fn rearm_rx_napi(core_id: u32) -> bool {
 
 // ---- Diagnostics (/obs `nic` block) ---------------------------------------
 
-pub fn rx_counts() -> [u64; 8] {
-    active_ops().diag.map(|d| (d.rx_counts)()).unwrap_or([0; 8])
+pub fn rx_counts() -> [u64; DIAG_QP_CAP] {
+    active_ops()
+        .diag
+        .map(|d| (d.rx_counts)())
+        .unwrap_or([0; DIAG_QP_CAP])
 }
-pub fn rx_used_cursors() -> [(u16, u16); 8] {
+pub fn rx_used_cursors() -> [(u16, u16); DIAG_QP_CAP] {
     active_ops()
         .diag
         .map(|d| (d.rx_used_cursors)())
-        .unwrap_or([(0, 0); 8])
+        .unwrap_or([(0, 0); DIAG_QP_CAP])
 }
 
 /// TX-side diagnostics — per-qp packet counts + small/big pool

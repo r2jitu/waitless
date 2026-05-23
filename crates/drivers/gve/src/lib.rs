@@ -194,8 +194,9 @@ pub(crate) struct State {
 
 /// Matches `bus::virtio_net::MAX_QUEUE_PAIRS`. Upper bound for
 /// `net_rx_counts()` / `net_rx_used_cursors()` array sizes so the
-/// two drivers stay signature-compatible.
-pub(crate) const MAX_QUEUE_PAIRS: usize = 8;
+/// two drivers stay signature-compatible. Must equal
+/// `kernel_bare::eventloop::MAX_CORE_STATS` and `nic::DIAG_QP_CAP`.
+pub(crate) const MAX_QUEUE_PAIRS: usize = 22;
 
 /// Per-queue TX metadata. GQI_QPL format: outbound packets are
 /// memcpy'd into a pre-registered Queue Page List, and the

@@ -7,6 +7,7 @@
 //! itself — what happens to a frame — is `crate::rx`.
 
 use crate::rx;
+use kernel_bare::eventloop::MAX_CORE_STATS;
 use kernel_bare::percpu;
 
 /// Whether multi-core distribution has been initialized.
@@ -47,11 +48,11 @@ pub(crate) static JUST_DISTRIBUTED: kernel_bare::percpu::PerWorker<core::sync::a
 /// resolution is far finer than it needs to be, while the per-poll
 /// cost is a single owned-cache-line `fetch_add`.
 ///
-/// Sized to the tree-wide 8-core ceiling (`MAX_CORE_STATS`,
-/// `MAX_QUEUE_PAIRS`); each core touches only its own slot, so the
-/// counters never share a contended line across cores.
-static RTX_POLL_COUNT: [core::sync::atomic::AtomicU32; 8] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; 8];
+/// Sized to the tree-wide per-core ceiling (`MAX_CORE_STATS`); each
+/// core touches only its own slot, so the counters never share a
+/// contended line across cores.
+static RTX_POLL_COUNT: [core::sync::atomic::AtomicU32; MAX_CORE_STATS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_CORE_STATS];
 
 /// Mask selecting how often the retransmission tick runs — once per
 /// 1024 polls. A power-of-two mask keeps the gate a single `and`.

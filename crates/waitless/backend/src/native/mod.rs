@@ -1019,14 +1019,14 @@ pub extern "C" fn native_worker_loop(thread_id: u32) {
 // rx_used_cursors}` so cross-platform callers see the same names and
 // return zeros here.
 
-pub fn net_rx_counts() -> [u64; 8] {
-    [0; 8]
+pub fn net_rx_counts() -> [u64; nic_api::DIAG_QP_CAP] {
+    [0; nic_api::DIAG_QP_CAP]
 }
 pub fn net_num_queue_pairs() -> u16 {
     1
 }
-pub fn net_rx_used_cursors() -> [(u16, u16); 8] {
-    [(0, 0); 8]
+pub fn net_rx_used_cursors() -> [(u16, u16); nic_api::DIAG_QP_CAP] {
+    [(0, 0); nic_api::DIAG_QP_CAP]
 }
 
 // `tx_diag` mirrors the unikernel side's `Option`-returning accessor.
