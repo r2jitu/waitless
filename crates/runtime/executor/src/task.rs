@@ -395,6 +395,7 @@ pub fn tick(worker_id: u32) -> bool {
                 continue;
             }
             did_work = true;
+            crate::diag::bump_tasks_polled(worker_id);
             poll_slot(arena, slot, worker_id, slot_idx);
         }
     }
