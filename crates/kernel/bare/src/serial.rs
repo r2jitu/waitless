@@ -539,6 +539,33 @@ pub fn init() {
     }
 }
 
+// EARLY-BOOT DEBUG — direct COM1 byte write, no locks, no kernel
+// state. Used to bracket boot-path steps that run before `serial::init`
+// (or to find where a triple-fault happens). Slow (one vmexit per
+// byte) and synchronous (busy-waits on LSR). Remove once boot is stable.
+#[cfg(target_arch = "x86_64")]
+pub fn early_debug_byte(c: u8) {
+    use core::arch::asm;
+    unsafe {
+        loop {
+            let lsr: u8;
+            asm!("in al, dx", out("al") lsr, in("dx") 0x3f8u16 + 5,
+                 options(nomem, nostack, preserves_flags));
+            if lsr & 0x20 != 0 { break; }
+        }
+        asm!("out dx, al", in("dx") 0x3f8u16, in("al") c,
+             options(nomem, nostack, preserves_flags));
+    }
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn early_debug_byte(_c: u8) {}
+
+pub fn early_debug(s: &[u8]) {
+    for &c in s {
+        early_debug_byte(c);
+    }
+}
+
 /// Try to upgrade the early-boot console to virtio-console-pci.
 /// Caller must run this AFTER `bus::pci::init()` has
 /// populated the PCI device table. Returns `true` if the upgrade
