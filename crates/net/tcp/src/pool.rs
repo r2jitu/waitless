@@ -187,6 +187,12 @@ pub(crate) static POOLS: kernel_core::percpu::PerWorker<TcpPool> =
 // grows in lockstep with the pool.
 const TCP_HASH_SIZE: usize = 32768;
 const TCP_HASH_MASK: usize = TCP_HASH_SIZE - 1;
+// log2(TCP_HASH_SIZE) — bit count for the Fibonacci-hash top-bit
+// extract. Must match TCP_HASH_SIZE: extracting only 8 bits with a
+// 32K table funnels every key into 256 starting buckets, so
+// open-addressed probes from a clustered start spill across hundreds
+// of slots even at low load factor.
+const TCP_HASH_SHIFT: u32 = TCP_HASH_SIZE.trailing_zeros();
 
 pub(crate) struct TcpHashCore {
     keys: core::cell::UnsafeCell<[u64; TCP_HASH_SIZE]>,
@@ -241,10 +247,10 @@ pub(crate) fn tcp_hash_key(src_ip: IpAddr, src_port: u16, dst_port: u16) -> u64 
 #[inline]
 fn tcp_hash_bucket(key: u64) -> usize {
     // Fibonacci hash — multiplies by 2^64/phi and takes the top
-    // bits. Fast (one imul), good distribution for arbitrary
-    // 64-bit keys.
+    // log2(TCP_HASH_SIZE) bits. Fast (one imul), good distribution
+    // for arbitrary 64-bit keys.
     let h = key.wrapping_mul(0x9E3779B97F4A7C15);
-    (h >> (64 - 8)) as usize
+    (h >> (64 - TCP_HASH_SHIFT)) as usize
 }
 
 pub(crate) fn tcp_hash_find(core: u32, key: u64) -> Option<usize> {
@@ -253,16 +259,27 @@ pub(crate) fn tcp_hash_find(core: u32, key: u64) -> Option<usize> {
     let keys = unsafe { &*h.keys.get() };
     let slots = unsafe { &*h.slots.get() };
     let start = tcp_hash_bucket(key);
+    // Track max probe length seen — a worst-case sample is cheaper
+    // than a per-probe counter (which dominates rps in the hot path
+    // by adding an atomic to every probe step). `hash_find_probes`
+    // gets one bump at exit equal to the iteration count, so the
+    // ratio hash_find_probes / hash_find_calls is still the average
+    // probe depth.
+    let mut probes: u64 = 0;
     for i in 0..TCP_HASH_SIZE {
+        probes += 1;
         let idx = (start + i) & TCP_HASH_MASK;
         let k = keys[idx];
         if k == 0 {
+            crate::diag::COUNTERS.hash_find_probes.add(probes);
             return None;
         }
         if k == key {
+            crate::diag::COUNTERS.hash_find_probes.add(probes);
             return Some(slots[idx] as usize);
         }
     }
+    crate::diag::COUNTERS.hash_find_probes.add(probes);
     None
 }
 
@@ -372,8 +389,11 @@ pub(crate) fn tcp_linear_find(
     src_port: u16,
     dst_port: u16,
 ) -> Option<usize> {
+    crate::diag::COUNTERS.linear_find_calls.bump();
     let cap = pool_capacity(core);
+    let mut iters: u64 = 0;
     for i in 0..cap {
+        iters += 1;
         // SAFETY: per-core ownership — only the owning core scans.
         let c = unsafe { &*conn_ptr(core, i) };
         if c.state != TcpState::Closed
@@ -382,9 +402,11 @@ pub(crate) fn tcp_linear_find(
             && c.local_port == dst_port
             && c.remote_port == src_port
         {
+            crate::diag::COUNTERS.linear_find_iterations.add(iters);
             return Some(i);
         }
     }
+    crate::diag::COUNTERS.linear_find_iterations.add(iters);
     None
 }
 

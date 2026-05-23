@@ -62,15 +62,20 @@ pub fn accept_on_port(port: u16) -> executor::reactor::TcpStream {
 
 fn accept_on_port_core(core: u32, port: u16) -> executor::reactor::TcpStream {
     use executor::reactor::TcpStream;
+    crate::diag::COUNTERS.accept_calls.bump();
     let cap = pool_capacity(core);
+    let mut iters: u64 = 0;
     for i in 0..cap {
+        iters += 1;
         // SAFETY: per-core ownership.
         let c = unsafe { &mut *conn_ptr(core, i) };
         if c.state == TcpState::Established && c.listener_port == port && !c.accepted {
             c.accepted = true;
+            crate::diag::COUNTERS.accept_iterations.add(iters);
             return TcpStream::from_raw(encode_handle(core, i), c.generation);
         }
     }
+    crate::diag::COUNTERS.accept_iterations.add(iters);
     TcpStream::NULL
 }
 

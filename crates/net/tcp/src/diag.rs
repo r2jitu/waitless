@@ -107,6 +107,18 @@ pub struct Counters {
     /// `recv_chunk` resolved via the copying ring-drain fallback.
     /// `stash / (stash + ring_drain)` is the live zero-copy ratio.
     pub rx_chunk_ring_drain: Counter,
+
+    // ── High-conn scan-cost instrumentation ──────────────────────
+    // EXPERIMENTAL — added during the bench/pareto-rig cliff
+    // investigation to identify which O(pool_size) loops dominate
+    // at high conn counts. Ratios `iterations / calls` give the
+    // average scan depth; if `accept_iterations` per `accept_calls`
+    // tracks pool size, the accept scan is hot.
+    pub accept_calls: Counter,
+    pub accept_iterations: Counter,
+    pub linear_find_calls: Counter,
+    pub linear_find_iterations: Counter,
+    pub hash_find_probes: Counter,
 }
 
 impl Counters {
@@ -131,6 +143,11 @@ impl Counters {
             persist_probes: Counter::new(),
             rx_chunk_stash_hits: Counter::new(),
             rx_chunk_ring_drain: Counter::new(),
+            accept_calls: Counter::new(),
+            accept_iterations: Counter::new(),
+            linear_find_calls: Counter::new(),
+            linear_find_iterations: Counter::new(),
+            hash_find_probes: Counter::new(),
         }
     }
 }
@@ -369,7 +386,7 @@ pub fn record_teardown(reason: TeardownReason, state: TcpState) {
 
 /// Counter `(name, value)` pairs in declaration order — the flat
 /// half of the `/obs` `"tcp"` block.
-pub fn snapshot() -> [(&'static str, u64); 19] {
+pub fn snapshot() -> [(&'static str, u64); 24] {
     let c = &COUNTERS;
     [
         ("syn_rx", c.syn_rx.get()),
@@ -391,6 +408,11 @@ pub fn snapshot() -> [(&'static str, u64); 19] {
         ("persist_probes", c.persist_probes.get()),
         ("rx_chunk_stash_hits", c.rx_chunk_stash_hits.get()),
         ("rx_chunk_ring_drain", c.rx_chunk_ring_drain.get()),
+        ("accept_calls", c.accept_calls.get()),
+        ("accept_iterations", c.accept_iterations.get()),
+        ("linear_find_calls", c.linear_find_calls.get()),
+        ("linear_find_iterations", c.linear_find_iterations.get()),
+        ("hash_find_probes", c.hash_find_probes.get()),
     ]
 }
 
