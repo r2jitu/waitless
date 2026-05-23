@@ -5,5 +5,4 @@
 
 pub mod exceptions;
 pub mod fdt;
-pub mod mmu;
 pub mod smp;

@@ -10,6 +10,7 @@ pub mod cpu;
 pub mod cpu_info;
 pub mod eventloop;
 pub mod mm;
+pub mod mmu;
 pub mod rng;
 pub mod runtime;
 pub mod serial;

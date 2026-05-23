@@ -34,7 +34,9 @@ core::arch::global_asm!(include_str!("x86_64/ap_boot.S"), options(att_syntax));
 core::arch::global_asm!(include_str!("aarch64/boot.S"));
 
 #[cfg(target_arch = "aarch64")]
-use kernel_bare::aarch64::{exceptions, fdt, mmu, smp};
+use kernel_bare::aarch64::{exceptions, fdt, smp};
+#[cfg(target_arch = "aarch64")]
+use kernel_bare::mmu;
 use kernel_bare::{mm, serial, types};
 use types::{BootInfo, MEM_AVAILABLE, MemoryRegion, Protocol};
 // `MAX_MEMORY_REGIONS` / `MEM_RESERVED` are used only by the

@@ -2,8 +2,8 @@
 
 use core::ptr;
 
-#[cfg(target_arch = "aarch64")]
-use crate::map_device_range;
+use kernel_bare::mmu::map_device_range;
+
 use crate::pci::{
     enable_bus_mastering_inner, find_device, pci_device, read_bar64, read_config, write_config,
 };
@@ -113,7 +113,11 @@ fn resolve_bar(pci_idx: usize, bar_idx: usize) -> u64 {
         return 0;
     }
 
-    #[cfg(target_arch = "aarch64")]
+    // High-MMIO BARs need a runtime mapping. The boot stub's identity
+    // map covers only the first 4 GiB on both arches; q35 + SeaBIOS
+    // routinely places virtio's modern 64-bit BAR in its high MMIO
+    // window (observed at ~56 TiB on kvm-vm with `-m 4 GiB`), and the
+    // aarch64 high PCIe ECAM lives above 4 GiB as well.
     if addr >= 0x1_0000_0000 {
         map_device_range(addr & !0x1F_FFFF, 2 << 20);
     }

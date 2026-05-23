@@ -138,16 +138,19 @@ sudo pkill -9 qemu-system-x86_64 2>/dev/null || true
 sleep 0.3
 
 # Launch QEMU/KVM with the unikernel. Same shape as KvmEnv.start in
-# scripts/bench/envs.py. -m 4096 needed for high-conn runs (~80 KB/conn).
+# scripts/bench/envs.py. -m 4096 needed for high-conn runs
+# (~80 KB/conn, so 32K conns ≈ 2.5 GiB heap working set).
 #
-# pci-hole64-size=0 keeps all PCI BARs in the sub-4-GiB PCI hole so
-# that they fall within the kernel boot stub's 4-GiB identity map.
-# With the default 64-bit hole, q35 + SeaBIOS place virtio-net's
-# modern BAR above all RAM (~5 GiB on -m 4096) and our driver
-# page-faults on first BAR read.
+# With -m > 3 GiB, q35 spills RAM above 4 GiB and SeaBIOS places
+# virtio-net's 64-bit modern BAR in its high MMIO window (observed
+# at 0x3800_0000_0000 / 56 TiB on this kvm-vm). The boot stub's
+# identity map covers only [0, 4 GiB), so the virtio-net driver
+# would page-fault on first BAR access. bus::virtio::resolve_bar
+# now calls mm::map_device_range to install a runtime 2 MiB
+# identity mapping for any BAR at or above 4 GiB.
 NQUEUES=\$(( $VCPUS > 2 ? $VCPUS : 2 ))
 sudo qemu-system-x86_64 \
-    -machine q35 -accel kvm -cpu host -m 1024 -smp $VCPUS \
+    -machine q35 -accel kvm -cpu host -m 4096 -smp $VCPUS \
     -nographic -serial file:/tmp/kvm-iter.log -no-reboot \
     -device "virtio-net-pci,mac=52:54:00:12:34:56,mq=on,vectors=\$((2*\$NQUEUES+2)),netdev=net0" \
     -netdev "tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=on,queues=\$NQUEUES" \

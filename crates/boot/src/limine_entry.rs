@@ -99,7 +99,9 @@ core::arch::global_asm!(
 );
 
 #[cfg(target_arch = "aarch64")]
-use kernel_bare::aarch64::{fdt, mmu};
+use kernel_bare::aarch64::fdt;
+#[cfg(target_arch = "aarch64")]
+use kernel_bare::mmu;
 
 // ============================================================================
 // Limine request statics — placed in .limine_requests* by the crate.

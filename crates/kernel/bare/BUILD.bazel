@@ -10,6 +10,7 @@ rust_library(
         "src/eventloop.rs",
         "src/lib.rs",
         "src/mm.rs",
+        "src/mmu.rs",
         "src/rng.rs",
         "src/runtime.rs",
         "src/serial.rs",
@@ -27,7 +28,6 @@ rust_library(
         "//bazel/platforms:aarch64": [
             "src/aarch64/exceptions.rs",
             "src/aarch64/fdt.rs",
-            "src/aarch64/mmu.rs",
             "src/aarch64/mod.rs",
             "src/aarch64/smp.rs",
         ],
