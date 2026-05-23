@@ -29,11 +29,26 @@ rust-project.json
 bench/webserver_native
 __pycache__/
 
-# Cargo standalone build artefacts (under tools/hvf-runner). The
-# bazel build goes through crate_universe and writes elsewhere.
+# Cargo standalone build artefacts (under tools/hvf-runner, and
+# scripts/peer-linux/tokio-hyper). The bazel build goes through
+# crate_universe and writes elsewhere.
 target/
+
+# Pareto-frontier bench rig output (scripts/peer-linux/*). JSONL +
+# generated PNG charts, all regenerable; also contains GCE-internal
+# IPs we don't want to publish. Rebuild via `pareto-bench.sh`.
+/bench-results/
+
+# matplotlib venv for chart-pareto.py. Created on demand; lives next
+# to the script to keep dependencies out of the system Python.
+scripts/peer-linux/.chart-venv/
 
 # Production TLS cert material — obtained by scripts/issue-cert.sh,
 # baked in by a `--define tls_cert=prod` build. Never committed; the
 # checked-in apps/webserver/prod_certs/BUILD.bazel globs them.
 apps/webserver/prod_certs/*.der
+
+# tokio-hyper peer Cargo.lock — peer-deploy.sh + the Dockerfile both
+# rebuild on the target with the current registry; pinning hides upstream
+# updates without a corresponding bench re-run.
+scripts/peer-linux/tokio-hyper/Cargo.lock

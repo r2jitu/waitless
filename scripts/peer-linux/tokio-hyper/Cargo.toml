@@ -1,0 +1,44 @@
+[workspace]
+# Standalone crate — kept out of the unikernel workspace because it
+# has its own host-Linux dependency tree (axum, hyper, axum-server)
+# and there's no reason to share Cargo.lock.
+
+[package]
+name = "tokio-hyper-peer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Linux-only peer server for the waitless bench rig. Mirrors waitless's
+# /health, /static-64k, /discard, /compute endpoints over plain HTTP
+# (port 80), HTTPS (port 443), and an internal HTTP upstream (port
+# 8080) that nginx proxies /compute and /discard to.
+#
+# Built with --release on the bench-host VM via the deploy script
+# alongside it; bench harness invokes the binary directly. No tests
+# beyond the parity-verify script that hits the live server.
+
+[dependencies]
+axum = { version = "0.7", default-features = false, features = ["http1", "http2", "tokio"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+# Mirror waitless's release profile so codegen settings don't show up
+# as a confounding variable in the bench. LTO + 1 codegen unit makes
+# the linker work harder but produces tighter hot paths.
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+panic = "abort"
