@@ -270,6 +270,76 @@ impl AcceptRingTable {
 pub(crate) static ACCEPT_RINGS: kernel_core::percpu::PerWorker<AcceptRingTable> =
     kernel_core::percpu::PerWorker::new();
 
+// ── Listener slot lookup: per-core port → slot index ────────────────
+//
+// `tcp_receive`'s SYN handler used to linear-scan the per-core pool
+// to find the matching `Listen` slot for the SYN's dst_port
+// (measured 1285 iters/call at 10K conns). Same shape of bug as the
+// accept-side scan: data structure sized for tiny N, scanned at
+// O(pool_size). Apps register listeners at `listen_on_core`; we
+// remember (port → slot) on each core and the SYN handler does an
+// O(MAX_LISTENERS_PER_CORE) linear-array probe — tiny N, hot in
+// L1, single load per probe.
+
+pub(crate) const MAX_LISTENERS_PER_CORE: usize = 8;
+
+pub(crate) struct ListenerMap {
+    ports: core::cell::UnsafeCell<[u16; MAX_LISTENERS_PER_CORE]>,
+    slots: core::cell::UnsafeCell<[u16; MAX_LISTENERS_PER_CORE]>,
+}
+
+unsafe impl Sync for ListenerMap {}
+unsafe impl Send for ListenerMap {}
+
+impl ListenerMap {
+    pub(crate) const fn new() -> Self {
+        ListenerMap {
+            ports: core::cell::UnsafeCell::new([0; MAX_LISTENERS_PER_CORE]),
+            slots: core::cell::UnsafeCell::new([0; MAX_LISTENERS_PER_CORE]),
+        }
+    }
+}
+
+pub(crate) static LISTENERS: kernel_core::percpu::PerWorker<ListenerMap> =
+    kernel_core::percpu::PerWorker::new();
+
+/// Register a listener slot for `(core, port)`. Called from
+/// `listen_on_core` at bind time. No-op (silent) when the per-core
+/// table is full — the SYN handler then falls back to its linear
+/// pool scan, so correctness is preserved.
+pub(crate) fn listener_register(core: u32, port: u16, slot: u16) {
+    let m = LISTENERS.at(core);
+    // SAFETY: per-core ownership; `listen_on_core` is the only writer
+    // and runs single-threaded at bind time.
+    let ports = unsafe { &mut *m.ports.get() };
+    let slots = unsafe { &mut *m.slots.get() };
+    for i in 0..MAX_LISTENERS_PER_CORE {
+        if ports[i] == 0 || ports[i] == port {
+            ports[i] = port;
+            slots[i] = slot;
+            return;
+        }
+    }
+}
+
+/// O(MAX_LISTENERS_PER_CORE) probe for the listener slot matching
+/// `(core, port)`. Returns `None` if no slot was registered for
+/// this port (caller falls back to the linear pool scan).
+pub(crate) fn listener_find(core: u32, port: u16) -> Option<usize> {
+    let m = LISTENERS.at(core);
+    let ports = unsafe { &*m.ports.get() };
+    let slots = unsafe { &*m.slots.get() };
+    for i in 0..MAX_LISTENERS_PER_CORE {
+        if ports[i] == port {
+            return Some(slots[i] as usize);
+        }
+        if ports[i] == 0 {
+            return None;
+        }
+    }
+    None
+}
+
 /// Find or allocate the per-port ring on the calling core.
 /// Returns `None` if MAX_ACCEPT_RINGS ports already registered on
 /// this core — caller falls back to the linear-scan slow path.

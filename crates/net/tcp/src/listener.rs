@@ -5,8 +5,9 @@
 // `shutdown_all`. Also `init` (per-core pool / hash bring-up).
 
 use crate::pool::{
-    ACCEPT_RINGS, AcceptRingTable, POOLS, TCP_HASH, TcpHashCore, TcpPool, accept_ring_pop,
-    alloc_connection, conn_ptr, decode_handle, encode_handle, free_connection, pool_capacity,
+    ACCEPT_RINGS, AcceptRingTable, LISTENERS, ListenerMap, POOLS, TCP_HASH, TcpHashCore, TcpPool,
+    accept_ring_pop, alloc_connection, conn_ptr, decode_handle, encode_handle, free_connection,
+    listener_register, pool_capacity,
 };
 use crate::send::{SegmentMeta, send_rst};
 use crate::state::{TCP_ACK, TCP_FIN, TcpState};
@@ -35,6 +36,7 @@ pub fn init() {
     POOLS.init(n, |_| TcpPool::new());
     TCP_HASH.init(n, |_| TcpHashCore::new());
     ACCEPT_RINGS.init(n, |_| AcceptRingTable::new());
+    LISTENERS.init(n, |_| ListenerMap::new());
 }
 
 /// Create a listener on a specific core. Called from
@@ -50,6 +52,9 @@ pub fn listen_on_core(core: u32, port: u16) -> *mut () {
     let c = unsafe { &mut *conn_ptr(core, slot) };
     c.state = TcpState::Listen;
     c.local_port = port;
+    // Register so `tcp_receive`'s SYN handler can find the listener
+    // slot in O(MAX_LISTENERS) instead of O(pool_size).
+    listener_register(core, port, slot as u16);
     encode_handle(core, slot)
 }
 
