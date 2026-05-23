@@ -89,7 +89,7 @@ while ! mkdir "$LIMINE_LOCK" 2>/dev/null; do sleep 0.2; done
 
 if [[ ! -d "$LIMINE_DIR" ]]; then
     log "[ISO] Fetching Limine bootloader..."
-    git clone --depth=1 --branch=v8.x-binary \
+    git clone --depth=1 --branch=v9.x-binary \
         https://github.com/limine-bootloader/limine.git "$LIMINE_DIR" >/dev/null 2>&1
 fi
 
