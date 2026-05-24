@@ -100,13 +100,37 @@ ones to trust at ≥10 K conns.
 | 24 K   | 190 K        | 276 K           | **298 K**         | 3.46 s    | 3.13 s    | **2.12 s**        |
 | 32 K   | 168 K        | **227 K**       | 44 K (cliff)      | 4.50 s    | 4.98 s    | 4.70 s            |
 | 40 K   | **78 K**     | 44 K            | 4 K (dead)        | 5.29 s    | 5.59 s    | 2.54 s            |
-| 50 K   | collapse     | collapse        | collapse          | —         | —         | —                 |
+| 50 K   | 0 rps²       | 0 rps² (49 991 connect errors) | 0 rps to 15 K rps²,³ | — | — | varies (8.58 s on 15 K-rps run) |
 
 ¹ The waitless deep sweep was run mid-investigation against an
 earlier deploy and skipped 8 K. The pattern at 8 K is well-
 predicted by the 16 K / 24 K points.
 
-**The real story:**
+² **50 K is at the loadgen's edge.** `kvm-vm` is a c3-highcpu-8;
+at 50 K concurrent conns wrk needs ~50 K ephemeral source ports
+held simultaneously. The ip_local_port_range is set to
+`1024-65535` (≈63 K available) but during burst-establishment +
+TIME_WAIT recycling the effective pool is smaller, and wrk's
+per-thread connect rate caps out before all 50 K reach
+ESTABLISHED. The "collapse" we see at 50 K for **nginx**
+(0 rps, 0 connect errors but no requests complete) and
+**tokio** (49 991 connect errors — only 9 sockets even reached
+ESTABLISHED) is a different failure mode from the 32 K-40 K
+server-CPU cliff above — it's the wrk-on-c3-highcpu-8 side
+running out of TCP resources, not the server collapsing.
+
+³ Earlier in the investigation (2026-05-23 08:24 UTC) a
+`-t8 -c50000 -d30s` waitless run against the day-1 deploy
+returned **502 776 requests in 34.35 s ≈ 14.6 K rps** with
+zero connect errors. We didn't re-run that against nginx /
+tokio at the same time, so we don't have an apples-to-apples
+50 K data point where the loadgen was fully cooperative.
+Treat the 50 K row above as "this loadgen can't drive 50 K
+to nginx / tokio reliably," not "the servers collapse at
+50 K."
+
+**The real story (focus on the bands where the loadgen is not
+the bottleneck — ≤ 40 K conns):**
 
   * **At 16 K conns waitless matches tokio-hyper on rps (366 K vs
     375 K, within 2 %)** and beats nginx by ~66 %. This is the
@@ -121,8 +145,10 @@ predicted by the 16 K / 24 K points.
     past this point; waitless step-collapses. **This is the
     gap that load shedding (P0 #1) and per-poll cycle reduction
     (P1) close.**
-  * **At 50 K conns all three collapse.** No peer implements
-    real load shedding by default.
+  * **At 50 K conns the loadgen runs out of TCP resources** for
+    most runs (see footnote 2). One reproducible-but-not-repeated
+    waitless run survived 50 K at ~15 K rps; we don't have
+    nginx / tokio comparison numbers in that regime.
 
 So the gap-to-Linux isn't "waitless is permanently behind"; it
 is specifically "waitless cliffs ~24 K → 32 K conns where nginx
