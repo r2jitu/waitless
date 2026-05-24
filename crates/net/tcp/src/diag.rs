@@ -108,21 +108,23 @@ pub struct Counters {
     /// `stash / (stash + ring_drain)` is the live zero-copy ratio.
     pub rx_chunk_ring_drain: Counter,
 
-    // ── High-conn scan-cost instrumentation ──────────────────────
-    // EXPERIMENTAL — added during the bench/pareto-rig cliff
-    // investigation to identify which O(pool_size) loops dominate
-    // at high conn counts. Ratios `iterations / calls` give the
-    // average scan depth; if `accept_iterations` per `accept_calls`
-    // tracks pool size, the accept scan is hot.
+    // ── Scan-cost instrumentation ────────────────────────────────
+    // Ratios `iterations / calls` give the average scan depth.
+    // `accept_iterations` over `accept_calls` is the live signal
+    // for the per-(core, port) accept ring fast-path hit rate —
+    // it should stay near 1.0; rising values mean the ring is
+    // overflowing or going stale. `linear_find_calls` and
+    // `syn_scan_calls` are the fallback-path counters for the
+    // 4-tuple hash overflow and the per-core listener-map miss
+    // respectively — both should stay at 0 under normal load.
+    // `tick_calls` / `tick_armed_seen` track the armed-timer
+    // walk (`on_tcp_tick`); the latter doubles as iteration
+    // count since every walked slot is, by construction, armed.
     pub accept_calls: Counter,
     pub accept_iterations: Counter,
     pub linear_find_calls: Counter,
-    pub linear_find_iterations: Counter,
-    pub hash_find_probes: Counter,
     pub syn_scan_calls: Counter,
-    pub syn_scan_iterations: Counter,
     pub tick_calls: Counter,
-    pub tick_iterations: Counter,
     pub tick_armed_seen: Counter,
 }
 
@@ -151,12 +153,8 @@ impl Counters {
             accept_calls: Counter::new(),
             accept_iterations: Counter::new(),
             linear_find_calls: Counter::new(),
-            linear_find_iterations: Counter::new(),
-            hash_find_probes: Counter::new(),
             syn_scan_calls: Counter::new(),
-            syn_scan_iterations: Counter::new(),
             tick_calls: Counter::new(),
-            tick_iterations: Counter::new(),
             tick_armed_seen: Counter::new(),
         }
     }
@@ -164,6 +162,19 @@ impl Counters {
 
 /// Process-wide TCP counters. Relaxed atomics; lossy reads by design.
 pub static COUNTERS: Counters = Counters::new();
+
+/// Per-core sharded count of probes done by `tcp_hash_find`. Reads
+/// in the per-packet RX hot path, so a shared `Counter` showed up
+/// as cache-line ping-pong across cores in profiling — moved to a
+/// per-core `PerCoreCounter` per the `obs::Counter` doctrine
+/// ("shard hot counters per core; this is a deliberate, measured
+/// change, not the default"). Each `tcp_hash_find` call accumulates
+/// its probe count locally and bumps the calling core's shard once
+/// at exit (not per-probe). Sum across shards is exposed via
+/// `/obs`.
+const MAX_CORES_DIAG: usize = 22;
+pub static HASH_FIND_PROBES: obs::PerCoreCounter<MAX_CORES_DIAG> =
+    obs::PerCoreCounter::new();
 
 /// Most recent RST received from a peer — the context the bare
 /// `rst_received` count discards.
@@ -396,7 +407,7 @@ pub fn record_teardown(reason: TeardownReason, state: TcpState) {
 
 /// Counter `(name, value)` pairs in declaration order — the flat
 /// half of the `/obs` `"tcp"` block.
-pub fn snapshot() -> [(&'static str, u64); 29] {
+pub fn snapshot() -> [(&'static str, u64); 25] {
     let c = &COUNTERS;
     [
         ("syn_rx", c.syn_rx.get()),
@@ -421,12 +432,8 @@ pub fn snapshot() -> [(&'static str, u64); 29] {
         ("accept_calls", c.accept_calls.get()),
         ("accept_iterations", c.accept_iterations.get()),
         ("linear_find_calls", c.linear_find_calls.get()),
-        ("linear_find_iterations", c.linear_find_iterations.get()),
-        ("hash_find_probes", c.hash_find_probes.get()),
         ("syn_scan_calls", c.syn_scan_calls.get()),
-        ("syn_scan_iterations", c.syn_scan_iterations.get()),
         ("tick_calls", c.tick_calls.get()),
-        ("tick_iterations", c.tick_iterations.get()),
         ("tick_armed_seen", c.tick_armed_seen.get()),
     ]
 }
@@ -440,6 +447,10 @@ pub fn write_obs_json(w: &mut dyn fmt::Write) -> fmt::Result {
     for (name, value) in snapshot() {
         write!(w, "\"{name}\":{value},")?;
     }
+    // `hash_find_probes` is the per-core sharded counter (see
+    // `HASH_FIND_PROBES`); render its summed-across-cores value
+    // alongside the flat block so consumers see one number.
+    write!(w, "\"hash_find_probes\":{},", HASH_FIND_PROBES.sum())?;
     LAST_RST.write_json(w, "last_rst")?;
     w.write_str(",")?;
     LAST_TEARDOWN.write_json(w, "last_teardown")?;

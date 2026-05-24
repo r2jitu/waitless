@@ -6,7 +6,7 @@
 // persist, and lifecycle-timer methods live on `TcpConnection` (see
 // `state.rs`); this module just drives the per-core poll cadence.
 
-use crate::pool::{TICK_HEAD, conn_ptr, free_connection};
+use crate::pool::{conn_ptr, free_connection, tick_head_get, tick_head_publish, tick_head_take};
 use crate::state::{FIN_RETX_MAX, NULL_SLOT, PERSIST_MAX_PROBES, RTX_MAX_RETRIES, TcpState};
 
 /// Drive the per-core TCP timers for the current core's connection
@@ -30,32 +30,30 @@ pub fn on_tcp_tick() {
     let core = kernel_core::cpu_id();
     let now = kernel_core::clock::now_ms();
     crate::diag::COUNTERS.tick_calls.bump();
-    let mut iters: u64 = 0;
     let mut armed: u64 = 0;
 
     // Walk the per-core armed-timer list, rebuilding it as we go.
     // Slots whose timers fired and re-armed (the common case for
     // long-lived flows) get re-linked at the head of the new list;
     // slots whose timers all cleared (peer ACK'd everything, conn
-    // closed cleanly, …) drop off via `tick_in_list = false`. Same-
-    // core, no atomics — TICK_HEAD is just an UnsafeCell<u16>.
+    // closed cleanly, …) drop off via `tick_in_list = false`.
     //
-    // SAFETY: per-core ownership for both the head cell and every
-    // slot pointer; nothing else runs concurrently on this core.
-    let head_cell = TICK_HEAD.at(core);
-    let old_head = unsafe { *head_cell.get() };
-    unsafe { *head_cell.get() = NULL_SLOT };
+    // `tick_head_take` detaches the current list head and returns
+    // it; `tick_head_publish` reattaches the rebuilt head at the
+    // end (and chains any slot armed *during* the walk so we don't
+    // lose it).
+    let old_head = tick_head_take(core);
 
     let mut new_head: u16 = NULL_SLOT;
     let mut walker = old_head;
     while walker != NULL_SLOT {
-        iters += 1;
         let i = walker as usize;
-        // Snapshot `next` BEFORE any mutation — the timer handlers
-        // below may call `free_connection`, which resets the slot
-        // (including `tick_next`). The snapshot keeps the walk safe.
-        let next = unsafe { (*conn_ptr(core, i)).tick_next };
+        // Read `tick_next` and `&mut` the slot in one borrow. The
+        // handlers below may call `free_connection`, which resets
+        // the slot (including `tick_next`) — so we copy out `next`
+        // first, then it's safe to mutate.
         let c = unsafe { &mut *conn_ptr(core, i) };
+        let next = c.tick_next;
         armed += 1;
 
         // RFC 6298 data retransmission.
@@ -142,9 +140,12 @@ pub fn on_tcp_tick() {
 
         walker = next;
     }
-    unsafe { *head_cell.get() = new_head };
 
-    crate::diag::COUNTERS.tick_iterations.add(iters);
+    tick_head_publish(core, new_head);
+
+    // `tick_armed_seen` doubles as the iteration count: every
+    // walked slot is armed by construction (it's the in-list
+    // invariant). No separate `tick_iterations` needed.
     crate::diag::COUNTERS.tick_armed_seen.add(armed);
 }
 
@@ -154,14 +155,10 @@ pub fn on_tcp_tick() {
 /// before going fully idle so a core with a pending timer does not
 /// sleep past its deadline.
 pub fn has_armed_timers() -> bool {
-    let core = kernel_core::cpu_id();
     // O(1): the armed-timer list head is non-`NULL_SLOT` iff some
     // slot has at least one deadline set. Previously this scanned
-    // the per-core pool until finding the first armed slot —
-    // bounded by the open-conn density, which collapsed when the
-    // event loop tried to go idle on a sparse pool.
-    let head_cell = TICK_HEAD.at(core);
-    // SAFETY: per-core ownership; only the owning core reads/writes.
-    let head = unsafe { *head_cell.get() };
-    head != NULL_SLOT
+    // the per-core pool until finding the first armed slot — the
+    // event loop's go-to-idle check was O(pool_size) on a sparse
+    // pool.
+    tick_head_get(kernel_core::cpu_id()) != NULL_SLOT
 }

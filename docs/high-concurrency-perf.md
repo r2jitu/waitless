@@ -18,7 +18,7 @@ their analyses.
 | [`benchmarking.md`](benchmarking.md) | The bench harness (`bench.py`), GCE bench wrappers, the bench-environment matrix. Read this first for "how do I run a bench." |
 | [`rx-path-optimizations.md`](rx-path-optimizations.md) | Per-byte / per-frame RX cost. Memcpy reduction, IOBuf zero-copy, **HW GRO / RSC** (items I–O — directly owns P0 #2 below). |
 | [`tx-path-optimizations.md`](tx-path-optimizations.md) | Per-byte / per-frame TX cost. Encrypt-in-place, TSO, header-fusion (items A–G). Already trimmed cycles/poll significantly; further wins here would also lift the saturation point. |
-| [`observability.md`](observability.md) | The `Counter` / `LastEvent` / `LatencyHist` primitives and the `/obs` exposure rules. The instrumentation we added (`accept_iterations`, `tick_iterations`, `tasks_polled_per_worker`, etc.) follows this doctrine. |
+| [`observability.md`](observability.md) | The `Counter` / `LastEvent` / `LatencyHist` primitives and the `/obs` exposure rules. The instrumentation we added (`accept_iterations`, `tick_armed_seen`, `tasks_polled_per_worker`, etc.) follows this doctrine, and the per-core `PerCoreCounter` shard variant introduced here implements the doctrine's "shard hot counters per-core" note. |
 | [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md) | TCP RFC gaps (active opens, RFC 7323 window scaling, …). The intrusive-timer-list and accept-ring work below was perf-only; semantics unchanged. |
 | [`conformance-roadmap.md`](conformance-roadmap.md) | Conformance-testing strategy + QUIC RFC backlog. |
 | [`gvnic.md`](gvnic.md) | gVNIC device behaviour, DQO vs GQI queue formats. |
@@ -547,23 +547,24 @@ Surface that survived from the cliff investigation — cheap
 (batched bumps), useful as ongoing health metrics + regression
 guards. All in the TCP `/obs` block unless noted. Follows the
 `Counter` / `LastEvent` doctrine in
-[`observability.md`](observability.md) (specifically the
-"Performance observability" section there explains the
-batched-bump pattern used for `hash_find_probes` and the tick
-counters).
+[`observability.md`](observability.md) (and uses the per-core
+`PerCoreCounter` shard variant for `hash_find_probes` and
+`tasks_polled_per_worker`, the two genuinely per-packet /
+per-poll counters that would otherwise ping-pong a cache line
+across all cores).
 
-| Counter                                    | Healthy range                                  | What it tells us                                              |
-|--------------------------------------------|------------------------------------------------|---------------------------------------------------------------|
-| `accept_calls`, `accept_iterations`        | iters/call ≤ 5                                 | Accept ring fast-path hit rate                                |
-| `linear_find_calls`, `linear_find_iterations` | calls ≈ 0                                   | TCP hash overflow fallback — should never fire under load    |
-| `hash_find_probes`                          | probes/call ≤ 2                               | 4-tuple lookup probe depth (open-addressed)                  |
-| `tick_calls`, `tick_iterations`, `tick_armed_seen` | iters/call ≈ 10 % of live conns/core   | Per-tick armed-list walk; iters == armed_seen always now     |
-| `syn_scan_calls`, `syn_scan_iterations`     | calls ≈ 0                                     | SYN-handler pool-scan fallback — fires only when listener_map full |
-| `tasks_polled_per_worker` (runtime block)   | balanced across active workers                 | Per-core task work distribution                              |
+| Counter                                  | Healthy range                                  | What it tells us                                              |
+|------------------------------------------|------------------------------------------------|---------------------------------------------------------------|
+| `accept_calls`, `accept_iterations`      | iters/call ≤ 5                                 | Accept ring fast-path hit rate                                |
+| `linear_find_calls`                      | ≈ 0                                            | TCP hash overflow fallback — fires only when the hash is over capacity (P0 indicator to bump `TCP_HASH_SIZE`) |
+| `hash_find_probes`                       | probes/call ≤ 2                                | 4-tuple lookup probe depth (per-core sharded `PerCoreCounter` to avoid cache-line ping-pong; the rendered value is the sum) |
+| `tick_calls`, `tick_armed_seen`          | armed/call ≈ live armed-timer count            | Per-tick armed-list walk; every walked slot is armed by construction |
+| `syn_scan_calls`                         | ≈ 0                                            | SYN-handler pool-scan fallback — fires only when more than `MAX_LISTENERS_PER_CORE` ports are listening on this core |
+| `tasks_polled_per_worker` (runtime block) | balanced across active workers                | Per-core task work distribution (per-core sharded — see above) |
 
 **Use:**
 
-- `iterations / calls` is the average scan depth — should be O(1)-ish on healthy paths.
-- A non-zero `linear_find_calls` means the TCP hash overflowed — bump `TCP_HASH_SIZE`.
+- `accept_iterations / accept_calls` is the accept ring's miss rate; > ~5 means either the ring is overflowing or pushed entries are going stale before pop.
+- A non-zero `linear_find_calls` or `syn_scan_calls` means a fallback path is firing; both should stay at zero under healthy load.
 - Asymmetric `tasks_polled_per_worker` means work isn't distributed evenly across cores.
-- `tick_iterations / tick_calls` rising past ~50 % of pool means most conns have armed timers (high retx, abusive client, etc.).
+- `tick_armed_seen / tick_calls` rising past ~50 % of pool means most conns have armed timers (high retx, abusive client, etc.).

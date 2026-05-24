@@ -82,6 +82,91 @@ impl Default for Counter {
     }
 }
 
+/// Per-core sharded counter for the genuinely-hot path: each core
+/// gets its own cache-line-aligned `AtomicU64`, so writes are
+/// uncontended (the line never leaves the writing core's L1).
+/// Readers sum across cores. Use when a `Counter` shows up as a
+/// cache-line ping-pong in profiles — the obvious cases are
+/// per-packet and per-task-poll counters; the rest of the obs
+/// doctrine ("single shared Counter is fine") still applies to
+/// cold paths.
+///
+/// `N` is the per-core array width; pass the platform's
+/// `MAX_CORE_STATS` (or equivalent ceiling). Cores beyond `N`
+/// silently no-op their writes (same shape as `Counter` and the
+/// existing per-core stats arrays in `kernel_bare::eventloop`).
+///
+/// Storage cost is `N * 64` bytes (one cache line per core). At
+/// 22 cores that's 1.4 KB per counter — non-trivial vs a single
+/// `Counter`, so keep this for genuinely hot paths and not the
+/// default.
+#[repr(C, align(64))]
+pub struct PerCoreCell(AtomicU64);
+
+impl PerCoreCell {
+    pub const fn new() -> Self {
+        PerCoreCell(AtomicU64::new(0))
+    }
+}
+
+impl Default for PerCoreCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct PerCoreCounter<const N: usize> {
+    cells: [PerCoreCell; N],
+}
+
+impl<const N: usize> PerCoreCounter<N> {
+    /// Fresh zero-valued shards. `const` for `static` placement.
+    pub const fn new() -> Self {
+        PerCoreCounter {
+            cells: [const { PerCoreCell::new() }; N],
+        }
+    }
+
+    /// Increment the calling core's shard by 1.
+    #[inline]
+    pub fn bump(&self, core: u32) {
+        self.add(core, 1);
+    }
+
+    /// Increment the calling core's shard by `n`.
+    #[inline]
+    pub fn add(&self, core: u32, n: u64) {
+        if let Some(c) = self.cells.get(core as usize) {
+            c.0.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Sum across all shards. Lossy under concurrent writes (same
+    /// trade-off as `Counter::get`).
+    pub fn sum(&self) -> u64 {
+        self.cells
+            .iter()
+            .map(|c| c.0.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Per-core snapshot. Caller decides how many entries are
+    /// meaningful for the live worker count.
+    pub fn snapshot(&self) -> [u64; N] {
+        let mut out = [0u64; N];
+        for (i, c) in self.cells.iter().enumerate() {
+            out[i] = c.0.load(Ordering::Relaxed);
+        }
+        out
+    }
+}
+
+impl<const N: usize> Default for PerCoreCounter<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A "last occurrence" snapshot slot: holds the decisive context of
 /// the most recent time some category of event fired, plus a count
 /// of how many times it has fired in total.

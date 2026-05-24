@@ -231,7 +231,7 @@ pub(crate) static TCP_HASH: kernel_core::percpu::PerWorker<TcpHashCore> =
 // is a plain `UnsafeCell<u16>` — no atomics needed.
 
 pub(crate) struct TickHead {
-    pub(crate) head: core::cell::UnsafeCell<u16>,
+    head: core::cell::UnsafeCell<u16>,
 }
 
 unsafe impl Sync for TickHead {}
@@ -243,13 +243,87 @@ impl TickHead {
             head: core::cell::UnsafeCell::new(NULL_SLOT),
         }
     }
-    pub(crate) fn get(&self) -> *mut u16 {
-        self.head.get()
-    }
 }
 
 pub(crate) static TICK_HEAD: kernel_core::percpu::PerWorker<TickHead> =
     kernel_core::percpu::PerWorker::new();
+
+/// Read the per-core armed-timer list head. Used by
+/// `has_armed_timers` to make the "is the event loop allowed to
+/// idle?" decision in O(1).
+///
+/// SAFETY: per-core ownership; the owning core is the only
+/// reader/writer of its head cell.
+pub(crate) fn tick_head_get(core: u32) -> u16 {
+    unsafe { *TICK_HEAD.at(core).head.get() }
+}
+
+/// Push `slot` onto the calling core's armed-timer list if not
+/// already linked. Sets the slot's `tick_next` / `tick_in_list`
+/// fields. Idempotent — repeated calls with `tick_in_list == true`
+/// are a fast `return`. Called from every `TcpConnection` method
+/// that arms a deadline (`arm_rtx`, `arm_fin_timer`, `arm_persist`,
+/// `arm_time_wait`, and `retransmit_oldest`'s re-arm).
+pub(crate) fn register_armed_slot(slot: &mut TcpConnection) {
+    if slot.tick_in_list {
+        return;
+    }
+    let core = kernel_core::cpu_id();
+    // SAFETY: per-core ownership of both the head cell and the
+    // slot pointer (the slot was reached via &mut already).
+    unsafe {
+        let head_ptr = TICK_HEAD.at(core).head.get();
+        slot.tick_next = *head_ptr;
+        *head_ptr = slot.slot_index;
+    }
+    slot.tick_in_list = true;
+}
+
+/// Take ownership of the per-core armed-timer head, returning the
+/// previous value. Caller is expected to publish a new head via
+/// `tick_head_publish` once it's done walking. Used by
+/// `on_tcp_tick`'s rebuild-during-walk pattern.
+pub(crate) fn tick_head_take(core: u32) -> u16 {
+    // SAFETY: per-core ownership.
+    unsafe {
+        let head_ptr = TICK_HEAD.at(core).head.get();
+        let old = *head_ptr;
+        *head_ptr = NULL_SLOT;
+        old
+    }
+}
+
+/// Publish a new head value. Used by `on_tcp_tick` after walking
+/// the snapshot taken by `tick_head_take`. If `arm_for_tick` fired
+/// on a sibling slot during the walk the head will be non-NULL
+/// already (intruder chain); chain the intruders before the new
+/// head so we don't drop them.
+pub(crate) fn tick_head_publish(core: u32, new_head: u16) {
+    // SAFETY: per-core ownership.
+    unsafe {
+        let head_ptr = TICK_HEAD.at(core).head.get();
+        let intruder = *head_ptr;
+        if intruder == NULL_SLOT {
+            *head_ptr = new_head;
+            return;
+        }
+        // Walk the intruder chain to its tail and attach `new_head`
+        // so we don't lose freshly-armed slots. In practice this
+        // only happens if a timer handler arms a deadline on a
+        // *different* conn slot than its own, which today's
+        // handlers don't do — defensive belt-and-braces.
+        let mut tail = intruder;
+        loop {
+            let n = (*conn_ptr(core, tail as usize)).tick_next;
+            if n == NULL_SLOT {
+                break;
+            }
+            tail = n;
+        }
+        (*conn_ptr(core, tail as usize)).tick_next = new_head;
+        *head_ptr = intruder;
+    }
+}
 
 // ── Accept fast path: per-(core, port) ring of ready-to-accept slots ──
 //
@@ -273,13 +347,19 @@ const ACCEPT_RING_CAPACITY: usize = 4096;
 const ACCEPT_RING_MASK: u32 = (ACCEPT_RING_CAPACITY as u32) - 1;
 
 pub(crate) struct AcceptRing {
-    port: core::cell::Cell<u16>,
     head: core::cell::Cell<u32>, // producer cursor (Established push)
     tail: core::cell::Cell<u32>, // consumer cursor (accept pop)
     slots: core::cell::UnsafeCell<[u16; ACCEPT_RING_CAPACITY]>,
 }
 
+/// `ports` lives in its own 16-byte block (8 × u16) deliberately
+/// separated from the rings so `ring_for_port`'s linear probe
+/// hits one cache line for all 8 entries. Previously the `port`
+/// field was the first field of each `AcceptRing` and the
+/// `slots: [u16; 4096]` between them meant each port read pulled
+/// a different cache line — 8 cold loads per lookup.
 pub(crate) struct AcceptRingTable {
+    ports: core::cell::UnsafeCell<[u16; MAX_ACCEPT_RINGS]>,
     rings: [AcceptRing; MAX_ACCEPT_RINGS],
 }
 
@@ -291,13 +371,13 @@ impl AcceptRingTable {
         // Cannot use `[expr; N]` initializer with `UnsafeCell` (not Copy).
         const fn empty_ring() -> AcceptRing {
             AcceptRing {
-                port: core::cell::Cell::new(0),
                 head: core::cell::Cell::new(0),
                 tail: core::cell::Cell::new(0),
                 slots: core::cell::UnsafeCell::new([0; ACCEPT_RING_CAPACITY]),
             }
         }
         AcceptRingTable {
+            ports: core::cell::UnsafeCell::new([0; MAX_ACCEPT_RINGS]),
             rings: [
                 empty_ring(), empty_ring(), empty_ring(), empty_ring(),
                 empty_ring(), empty_ring(), empty_ring(), empty_ring(),
@@ -380,21 +460,28 @@ pub(crate) fn listener_find(core: u32, port: u16) -> Option<usize> {
 }
 
 /// Find or allocate the per-port ring on the calling core.
-/// Returns `None` if MAX_ACCEPT_RINGS ports already registered on
-/// this core — caller falls back to the linear-scan slow path.
-fn ring_for_port(core: u32, port: u16) -> Option<&'static AcceptRing> {
+/// Returns the ring index, or `None` if MAX_ACCEPT_RINGS ports
+/// already registered on this core (caller falls back to the
+/// linear-scan slow path). The 16-byte `ports` array fits in one
+/// cache line so this probe is L1-resident.
+#[inline]
+fn ring_idx_for_port(core: u32, port: u16) -> Option<usize> {
     let t = ACCEPT_RINGS.at(core);
+    // SAFETY: per-core ownership; only the owning core reads/writes
+    // `ports`. The `accept_ring_*` API and `listen_on_core` both run
+    // on the owning core for their respective ports.
+    let ports = unsafe { &mut *t.ports.get() };
     // First pass: existing port match.
-    for r in &t.rings {
-        if r.port.get() == port {
-            return Some(r);
+    for (i, &p) in ports.iter().enumerate() {
+        if p == port {
+            return Some(i);
         }
     }
     // Second pass: claim the first unused (port == 0) slot.
-    for r in &t.rings {
-        if r.port.get() == 0 {
-            r.port.set(port);
-            return Some(r);
+    for (i, p) in ports.iter_mut().enumerate() {
+        if *p == 0 {
+            *p = port;
+            return Some(i);
         }
     }
     None
@@ -405,35 +492,37 @@ fn ring_for_port(core: u32, port: u16) -> Option<&'static AcceptRing> {
 /// on overflow — `accept_on_port_core` falls back to its linear
 /// scan in that case, so correctness is preserved.
 pub(crate) fn accept_ring_push(core: u32, port: u16, slot: u16) {
-    let Some(r) = ring_for_port(core, port) else {
+    let Some(idx) = ring_idx_for_port(core, port) else {
         return;
     };
+    let r = &ACCEPT_RINGS.at(core).rings[idx];
     let head = r.head.get();
     let tail = r.tail.get();
     if head.wrapping_sub(tail) >= ACCEPT_RING_CAPACITY as u32 {
         return; // full
     }
-    let idx = (head & ACCEPT_RING_MASK) as usize;
+    let slot_idx = (head & ACCEPT_RING_MASK) as usize;
     // SAFETY: per-core ownership; the producing core is the only
-    // writer to head AND to slots[idx].
-    unsafe { (*r.slots.get())[idx] = slot };
+    // writer to head AND to slots[slot_idx].
+    unsafe { (*r.slots.get())[slot_idx] = slot };
     r.head.set(head.wrapping_add(1));
 }
 
 /// Pop the oldest pending slot for (core, port), or `None` if the
 /// ring is empty.
 pub(crate) fn accept_ring_pop(core: u32, port: u16) -> Option<u16> {
-    let r = ring_for_port(core, port)?;
+    let idx = ring_idx_for_port(core, port)?;
+    let r = &ACCEPT_RINGS.at(core).rings[idx];
     let head = r.head.get();
     let tail = r.tail.get();
     if head == tail {
         return None;
     }
-    let idx = (tail & ACCEPT_RING_MASK) as usize;
+    let slot_idx = (tail & ACCEPT_RING_MASK) as usize;
     // SAFETY: per-core ownership; same core writes head/slot and
     // reads tail. Read-then-advance is fine in this single-core
     // model — no other thread can re-publish the slot.
-    let slot = unsafe { (*r.slots.get())[idx] };
+    let slot = unsafe { (*r.slots.get())[slot_idx] };
     r.tail.set(tail.wrapping_add(1));
     Some(slot)
 }
@@ -485,27 +574,25 @@ pub(crate) fn tcp_hash_find(core: u32, key: u64) -> Option<usize> {
     let keys = unsafe { &*h.keys.get() };
     let slots = unsafe { &*h.slots.get() };
     let start = tcp_hash_bucket(key);
-    // Track max probe length seen — a worst-case sample is cheaper
-    // than a per-probe counter (which dominates rps in the hot path
-    // by adding an atomic to every probe step). `hash_find_probes`
-    // gets one bump at exit equal to the iteration count, so the
-    // ratio hash_find_probes / hash_find_calls is still the average
-    // probe depth.
+    // Accumulate probes locally; bump the per-core shard once at exit.
+    // The shared `Counter` version of this path showed cache-line
+    // ping-pong across cores in profiles — `PerCoreCounter` keeps the
+    // write uncontended.
     let mut probes: u64 = 0;
     for i in 0..TCP_HASH_SIZE {
         probes += 1;
         let idx = (start + i) & TCP_HASH_MASK;
         let k = keys[idx];
         if k == 0 {
-            crate::diag::COUNTERS.hash_find_probes.add(probes);
+            crate::diag::HASH_FIND_PROBES.add(core, probes);
             return None;
         }
         if k == key {
-            crate::diag::COUNTERS.hash_find_probes.add(probes);
+            crate::diag::HASH_FIND_PROBES.add(core, probes);
             return Some(slots[idx] as usize);
         }
     }
-    crate::diag::COUNTERS.hash_find_probes.add(probes);
+    crate::diag::HASH_FIND_PROBES.add(core, probes);
     None
 }
 
@@ -617,9 +704,7 @@ pub(crate) fn tcp_linear_find(
 ) -> Option<usize> {
     crate::diag::COUNTERS.linear_find_calls.bump();
     let cap = pool_capacity(core);
-    let mut iters: u64 = 0;
     for i in 0..cap {
-        iters += 1;
         // SAFETY: per-core ownership — only the owning core scans.
         let c = unsafe { &*conn_ptr(core, i) };
         if c.state != TcpState::Closed
@@ -628,11 +713,9 @@ pub(crate) fn tcp_linear_find(
             && c.local_port == dst_port
             && c.remote_port == src_port
         {
-            crate::diag::COUNTERS.linear_find_iterations.add(iters);
             return Some(i);
         }
     }
-    crate::diag::COUNTERS.linear_find_iterations.add(iters);
     None
 }
 

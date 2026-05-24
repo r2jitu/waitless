@@ -485,18 +485,9 @@ impl TcpConnection {
     /// the slots that *might* have work, rather than scanning the
     /// entire per-core pool (~10% armed at steady state on the
     /// kvm-iterate bench → 10× tick-loop reduction).
+    #[inline]
     pub(crate) fn arm_for_tick(&mut self) {
-        if self.tick_in_list {
-            return;
-        }
-        let core = kernel_core::cpu_id();
-        let head_cell = crate::pool::TICK_HEAD.at(core);
-        // SAFETY: per-core ownership — only the owning core mutates
-        // its head cell or links/unlinks this slot from the list.
-        let head = unsafe { *head_cell.get() };
-        self.tick_next = head;
-        unsafe { *head_cell.get() = self.slot_index };
-        self.tick_in_list = true;
+        crate::pool::register_armed_slot(self);
     }
 
     /// Lazy-allocate the per-conn RX ring on the first SYN that

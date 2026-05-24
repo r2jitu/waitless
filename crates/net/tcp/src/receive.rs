@@ -123,46 +123,32 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
         // (line further below), so look there first — O(1) hash
         // probe vs an O(pool_size) scan.
         let key = tcp_hash_key(src_ip, src_port, dst_port);
-        let mut stale_idx = match tcp_hash_find(core, key) {
-            Some(s) => {
-                let c = unsafe { &*conn_ptr(core, s) };
-                if c.state != TcpState::Closed
-                    && c.state != TcpState::Listen
-                    && c.state != TcpState::Established
-                    && c.remote_ip == src_ip
-                    && c.local_port == dst_port
-                    && c.remote_port == src_port
-                {
-                    Some(s)
-                } else {
-                    None
-                }
-            }
-            None => None,
-        };
+        let stale_idx = tcp_hash_find(core, key).and_then(|s| {
+            let c = unsafe { &*conn_ptr(core, s) };
+            (c.state != TcpState::Closed
+                && c.state != TcpState::Listen
+                && c.state != TcpState::Established
+                && c.remote_ip == src_ip
+                && c.local_port == dst_port
+                && c.remote_port == src_port)
+                .then_some(s)
+        });
 
-        // Fall back to a pool scan when:
-        //   * the listener wasn't registered in the per-core listener
-        //     map (>MAX_LISTENERS_PER_CORE listening ports), or
-        //   * the listener_find missed (unexpected — bind didn't
-        //     register?) and we want graceful behavior.
-        // The hash already covered stale_idx so we don't refind it.
+        // Fall back to a pool scan when the listener wasn't registered
+        // in the per-core listener map (>MAX_LISTENERS_PER_CORE
+        // listening ports on this core). Stale-twin detection above
+        // already used the hash, which is always populated.
         if listener_idx.is_none() {
             crate::diag::COUNTERS.syn_scan_calls.bump();
             let cap = pool_capacity(core);
-            let mut iters: u64 = 0;
             for i in 0..cap {
-                iters += 1;
                 let c = unsafe { &*conn_ptr(core, i) };
                 if c.state == TcpState::Listen && c.local_port == dst_port {
                     listener_idx = Some(i);
                     break;
                 }
             }
-            crate::diag::COUNTERS.syn_scan_iterations.add(iters);
         }
-        // Suppress unused warning when fallback path is the only writer.
-        let _ = &mut stale_idx;
 
         if listener_idx.is_none() {
             send_rst(dst_ip, src_ip, dst_port, src_port, 0, seq + 1);

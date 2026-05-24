@@ -13,29 +13,28 @@
 // out of `kernel_core`.
 
 use core::fmt;
-use core::sync::atomic::{AtomicU64, Ordering};
 
-use obs::{Counter, LastEvent, ObsRecord};
+use obs::{Counter, LastEvent, ObsRecord, PerCoreCounter};
 
-/// Maximum workers we track per-core diagnostics for. Matches
-/// `kernel_bare::eventloop::MAX_CORE_STATS`; we keep the constant
-/// local rather than depending on the kernel crate (executor sits
-/// strictly below `kernel_bare` in the crate graph).
-pub const MAX_WORKERS_DIAG: usize = 22;
+/// Per-core array width for the per-worker diagnostic counters
+/// below. Must be ≥ the platform's `MAX_CORE_STATS` (currently 22
+/// in `kernel_bare::eventloop`); shards beyond the live worker
+/// count just stay at zero. We don't import the kernel constant
+/// because the executor crate sits strictly below `kernel_bare`
+/// in the crate graph.
+const MAX_WORKERS_DIAG: usize = 22;
 
-/// Per-worker count of futures polled. Bumped in `task::tick` on
-/// every `poll_slot` call. Diagnostic for the bench/pareto-rig
-/// cliff investigation — surfaces "which worker is polling most
-/// tasks?" without instrumenting every `Future::poll`.
-pub static TASKS_POLLED_PER_WORKER: [AtomicU64; MAX_WORKERS_DIAG] =
-    [const { AtomicU64::new(0) }; MAX_WORKERS_DIAG];
+/// Per-worker count of futures polled. Bumped in `task::tick`
+/// every `poll_slot` call — high-frequency, so this is the
+/// cache-line-padded `PerCoreCounter` rather than a shared
+/// `Counter`. Surfaces "which worker is polling most tasks?"
+/// without instrumenting every `Future::poll`.
+pub static TASKS_POLLED_PER_WORKER: PerCoreCounter<MAX_WORKERS_DIAG> =
+    PerCoreCounter::new();
 
 #[inline]
 pub fn bump_tasks_polled(worker_id: u32) {
-    let i = worker_id as usize;
-    if i < MAX_WORKERS_DIAG {
-        TASKS_POLLED_PER_WORKER[i].fetch_add(1, Ordering::Relaxed);
-    }
+    TASKS_POLLED_PER_WORKER.bump(worker_id);
 }
 
 /// One counter per task-lifecycle event.
@@ -108,13 +107,11 @@ pub fn snapshot() -> [(&'static str, u64); 4] {
 /// the slice without knowing `MAX_WORKERS_DIAG`.
 pub fn write_tasks_polled_json(w: &mut dyn fmt::Write) -> fmt::Result {
     w.write_str("[")?;
-    let mut first = true;
-    for c in &TASKS_POLLED_PER_WORKER {
-        if !first {
+    for (i, v) in TASKS_POLLED_PER_WORKER.snapshot().iter().enumerate() {
+        if i > 0 {
             w.write_str(",")?;
         }
-        first = false;
-        write!(w, "{}", c.load(Ordering::Relaxed))?;
+        write!(w, "{v}")?;
     }
     w.write_str("]")
 }
