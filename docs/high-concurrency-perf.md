@@ -116,6 +116,127 @@ about 20 % more. Same task volume, same NIC frame distribution
 disappears entirely. The kvm-vm asymmetry was a measurement
 hazard, not a real bug.
 
+## Anatomy of CPU collapse
+
+The cliff isn't gradual — `c3+gVNIC` does 128 K rps at 14 K conns
+but **0 rps at 18 K conns**. It's a phase transition, not a smooth
+roll-off. The mechanism is a feedback loop with three stages:
+
+### Stage 1 — saturated but stable (≤ 14 K conns on c3)
+
+Per-core CPU is pegged near 100 % busy. Throughput plateaus at
+~170 K rps total because no core has slack to do more work. p50
+latency grows linearly with conn count (Little's Law):
+`latency ≈ conns / rps`. At 10 K conns / 170 K rps = ~60 ms p50.
+
+This is the "knee" — adding more conns no longer increases
+throughput, only latency. Service is still healthy from the
+client's perspective: every request gets a response, just slower.
+
+### Stage 2 — overload (~14 K ≤ conns < 18 K on c3)
+
+Per-conn latency climbs past wrk's `--timeout 10s`. **Some
+clients give up** — wrk closes the slow conn and the server
+sees an RST. The handler task that was about to write the
+response runs anyway, gets a generation-mismatch error from
+the closed slot, drops on the floor. **Every wasted handler
+poll burns CPU cycles that did not produce a completed
+request.**
+
+This is observable in the counters: `rst_received` ≈ 50% of
+conns_established at 10K (already significant) and climbs from
+there. Each RST means a request whose work was wasted.
+
+The feedback loop is now armed:
+
+1. Latency high → some requests time out
+2. Timeouts → wasted handler cycles
+3. Wasted cycles → less effective throughput per CPU second
+4. Less effective throughput → queue grows
+5. Queue grows → latency higher
+6. Go to 1
+
+The loop is slow-moving at this stage; effective throughput
+sags from 170 K to 128 K but doesn't crater.
+
+### Stage 3 — collapse (≥ 18 K conns on c3, ≥ 14 K on kvm-vm)
+
+Two new failure modes kick in:
+
+**A. NIC RX backlog overflow.** When the per-core poll loop falls
+behind, the virtio-net (or gVNIC) RX descriptor ring fills. The
+host has no flow control on a virtual NIC RX path — once the
+ring is full, **new packets including SYNs are silently
+dropped**. This is the `wrk … connect errors: 4904` symptom: 4904
+SYN packets never reached our TCP stack at all, so wrk's
+`connect()` timed out.
+
+**B. Working-set blow-up.** Each conn carries:
+
+  * `TcpConnection` slot (~200 B, 3+ cache lines)
+  * `rx_ring` (16 KB on first SYN)
+  * `rtx_buf` (64 KB on first send)
+  * Boxed handler future + its captured state (~1-2 KB)
+
+At 18 K conns / 8 cores = 2.25 K conns/core, working set per
+core is ~180 MB just for ring buffers. c3 L2 cache is 1 MB per
+core; L3 is 96 MB shared. Per-conn state stops fitting in L2,
+then L3. **Per-poll cycle cost rises with conn count** because
+every poll incurs more cache misses. This is itself a feedback
+loop: more conns → more cache pressure → slower polls → more
+queued work → more conns active simultaneously.
+
+The two failure modes compound:
+
+  * NIC drops SYNs → wrk retries → more conn churn
+  * Working set blows up → polls slow → more requests time out
+  * Timed-out conns RST → server processes RSTs (more wasted work)
+  * New SYNs flood (wrk retrying), pool grows further
+  * Eventually `pool_exhausted` increments, `alloc_connection`
+    returns None, SYNs get RST'd from our side too
+  * No request completes within wrk's timeout window
+  * **Effective rps → 0**
+
+Once the system enters Stage 3, it does not recover on its own
+within a bench run. Stopping the load lets the queue drain;
+the server itself never fell over.
+
+### Why kvm-vm cliffs harder than c3
+
+Same workload at 14 K conns: kvm-vm collapses to ~200 rps,
+c3+gVNIC still does 128 K rps.
+
+Two reasons:
+
+1. **Fewer cores**: kvm-vm has 4 vCPUs, c3 has 8. At 14 K conns
+   that's 3500 conns/core on kvm-vm vs 1750 on c3. Working set
+   per core is **2× larger** on kvm-vm — the cache-pressure
+   feedback loop above is much more severe.
+
+2. **Shared-host scheduling**: kvm-vm runs on a shared c3 host.
+   When other guests on the same host run, our vCPUs get
+   descheduled briefly. A descheduled vCPU can't poll its NIC
+   ring → packets pile up → on resume the queue is huge → big
+   stall. c3-direct doesn't have this layer.
+
+### Why load shedding fixes Stage 3
+
+Stop accepting new conns once `live_conns_per_core` exceeds a
+threshold (suggest ~2000). Refused SYNs get no SYN-ACK — wrk
+sees connect timeout and either retries (slowly) or fails. Crucially:
+
+  * No new entries pile into the pool past the saturation point
+  * Working set stays bounded → per-poll cost stays bounded
+  * Existing conns get full per-core service → keep doing ~128 K rps
+  * No NIC RX overflow → no SYN drops
+  * The feedback loop is **broken** at step 4 (queue can't grow)
+
+Aggregate from operator's view: stable plateau at ~128 K rps with
+some fraction of conns refused, instead of the cliff to 0 rps.
+The cliff position **does not move** — we still saturate the same
+8 cores — but the failure mode flips from "collapse" to "graceful
+degradation".
+
 ## Fixes shipped (commits on `bench/pareto-rig`)
 
 | # | Commit                                                  | What                                                     | Measured impact                                                                  |
