@@ -505,6 +505,27 @@ list, none yet measured:
     or conntrack table hitting a wall at ~24 K simultaneous
     flows. Worth ruling out before chasing server-side causes.
 
+### New diagnostic surface
+
+Commit `51914e2` landed the cycle-cost + working-set
+instrumentation the cliff investigation needed:
+
+  * `tcp.rx_cycles` / `tcp.rx_calls` — per-packet cycle cost
+    on the `tcp_receive` hot path. Derive `cycles_per_packet`.
+  * `tcp.tick_cycles` (pairs with the existing
+    `tick_armed_seen`) — per-tick cycle cost on the armed-list
+    walk. Derive `cycles_per_armed_slot`.
+  * `tcp.live_conns` — count of non-Closed / non-Listen slots
+    across all cores. The working-set gauge.
+  * `tcp.armed_now` — current armed-list length. Validates the
+    "armed list stays tiny" finding above on any new workload.
+
+First diagnostic question with the new surface: during a 24 K
+cliff bench, does `live_conns` actually reach 24 K, or do SYNs
+drop at the NIC (`gve_rx_discards` / virtio equivalent) before
+`alloc_connection` ever runs? That answer routes us between the
+upstream-of-us suspect list and the server-side one.
+
 ## Heap OOM root-cause analysis (2026-05-24)
 
 The "cliff" at 18–24 K conns on c3+gVNIC reaches the heap before
@@ -847,27 +868,6 @@ existing `kernel` block) is sufficient. The HVF `--ram` ceiling
 how high HVF can drive this kind of test; a future
 `--ram=2048` etc. would need a multi-block kernel-map change
 in `boot.S`.
-
-### New diagnostic surface
-
-Commit `51914e2` landed the cycle-cost + working-set
-instrumentation the cliff investigation needed:
-
-  * `tcp.rx_cycles` / `tcp.rx_calls` — per-packet cycle cost
-    on the `tcp_receive` hot path. Derive `cycles_per_packet`.
-  * `tcp.tick_cycles` (pairs with the existing
-    `tick_armed_seen`) — per-tick cycle cost on the armed-list
-    walk. Derive `cycles_per_armed_slot`.
-  * `tcp.live_conns` — count of non-Closed / non-Listen slots
-    across all cores. The working-set gauge.
-  * `tcp.armed_now` — current armed-list length. Validates the
-    "armed list stays tiny" finding above on any new workload.
-
-First diagnostic question with the new surface: during a 24 K
-cliff bench, does `live_conns` actually reach 24 K, or do SYNs
-drop at the NIC (`gve_rx_discards` / virtio equivalent) before
-`alloc_connection` ever runs? That answer routes us between the
-upstream-of-us suspect list and the server-side one.
 
 ## Load shedding: what role does it play
 
