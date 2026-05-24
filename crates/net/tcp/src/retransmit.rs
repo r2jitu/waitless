@@ -28,6 +28,12 @@ use crate::state::{FIN_RETX_MAX, NULL_SLOT, PERSIST_MAX_PROBES, RTX_MAX_RETRIES,
 ///     close is freed once the 2×MSL hold has elapsed.
 pub fn on_tcp_tick() {
     let core = kernel_core::cpu_id();
+    // Cost instrumentation: bracket the whole walk so we get
+    // cycles-per-tick directly. PerCoreCounter, single-writer per
+    // core — no atomics on the hot path. Tick fires at coarse
+    // cadence (~ms), so the two cycle reads per call are noise vs
+    // the walk body.
+    let tick_start = kernel_core::clock::now_cycles();
     let now = kernel_core::clock::now_ms();
     crate::diag::COUNTERS.tick_calls.bump();
     let mut armed: u64 = 0;
@@ -147,6 +153,8 @@ pub fn on_tcp_tick() {
     // walked slot is armed by construction (it's the in-list
     // invariant). No separate `tick_iterations` needed.
     crate::diag::COUNTERS.tick_armed_seen.add(armed);
+    let tick_elapsed = kernel_core::clock::now_cycles().wrapping_sub(tick_start);
+    crate::diag::TICK_CYCLES.add(core, tick_elapsed);
 }
 
 /// True if any connection on the current core has an armed timer — an

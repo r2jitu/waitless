@@ -277,6 +277,16 @@ pub extern "Rust" fn __kernel_bare_now_ms() -> u64 {
     since_boot_us() / 1000
 }
 
+/// Link-seam definition for `kernel_core::clock::now_cycles()`. Raw
+/// hardware cycle counter — TSC (x86_64) / CNTVCT_EL0 (aarch64).
+/// Cheap enough for inline instrumentation of hot paths; callers
+/// take `start = now_cycles()` / `delta = now_cycles().wrapping_sub(start)`
+/// to bound per-op cost without any conversion.
+#[unsafe(no_mangle)]
+pub extern "Rust" fn __kernel_bare_now_cycles() -> u64 {
+    now_cycles()
+}
+
 /// Print `[TIME] LABEL: N ms` (since boot) on the serial console.
 /// Cheap: one cycle counter read, one TSC-rate read (cached after the
 /// first x86 PIT calibration), and a few `serial::puts`. Not on a hot

@@ -175,6 +175,30 @@ pub static COUNTERS: Counters = Counters::new();
 pub static HASH_FIND_PROBES: obs::PerCoreCounter<{ obs::MAX_CORES }> =
     obs::PerCoreCounter::new();
 
+// ── Hot-path cost instrumentation ─────────────────────────────────
+//
+// Per-core sharded cycle / call counters wrapping `tcp_receive` and
+// `on_tcp_tick`. Ratios `rx_cycles / rx_calls` and `tick_cycles /
+// tick_armed_seen` give the live per-packet and per-armed-slot cost
+// in TSC/CNTVCT ticks — direct cache-pressure signal for the cliff
+// investigation. PerCoreCounter is single-writer per core (no
+// atomics on the hot path); `/obs` sums across shards.
+
+/// Cycles spent inside `tcp_receive` (TSC/CNTVCT ticks). Divide by
+/// `rx_calls` for per-packet cost; divide by core count for per-core
+/// busy attribution.
+pub static RX_CYCLES: obs::PerCoreCounter<{ obs::MAX_CORES }> = obs::PerCoreCounter::new();
+
+/// `tcp_receive` invocations — one per inbound TCP segment seen by
+/// the stack. Per-core sharded to avoid cache-line ping-pong in the
+/// packet hot path.
+pub static RX_CALLS: obs::PerCoreCounter<{ obs::MAX_CORES }> = obs::PerCoreCounter::new();
+
+/// Cycles spent inside `on_tcp_tick` walking the armed-timer list
+/// (`retransmit::on_tcp_tick`). Divide by `tick_calls` for cost per
+/// tick or by `tick_armed_seen` for cost per walked slot.
+pub static TICK_CYCLES: obs::PerCoreCounter<{ obs::MAX_CORES }> = obs::PerCoreCounter::new();
+
 /// Most recent RST received from a peer — the context the bare
 /// `rst_received` count discards.
 pub static LAST_RST: LastEvent<RstRecord> = LastEvent::new();
@@ -437,6 +461,27 @@ pub fn snapshot() -> [(&'static str, u64); 25] {
     ]
 }
 
+/// Across-shard sums of the per-core sharded counters that don't
+/// live on the `Counters` struct. Same `(name, value)` shape as
+/// [`snapshot`]; same render path — one place to read the counter
+/// list, one ordering invariant the diff tools rely on.
+pub fn per_core_snapshot() -> [(&'static str, u64); 4] {
+    [
+        ("hash_find_probes", HASH_FIND_PROBES.sum()),
+        ("rx_calls", RX_CALLS.sum()),
+        ("rx_cycles", RX_CYCLES.sum()),
+        ("tick_cycles", TICK_CYCLES.sum()),
+    ]
+}
+
+/// On-demand working-set gauges. Walked at `/obs` render time (not
+/// on any hot path) so the bench harness can correlate per-conn
+/// working-set against rps without standing per-event counters.
+pub fn gauges() -> [(&'static str, u64); 2] {
+    let (live, armed) = crate::pool::live_and_armed_snapshot();
+    [("live_conns", live), ("armed_now", armed)]
+}
+
 /// Render the TCP observability block as a JSON object — every
 /// counter flat, then the `LastEvent` snapshots nested. This is
 /// TCP's contribution to `/obs`; `waitless_backend::tcp_obs_json`
@@ -446,10 +491,12 @@ pub fn write_obs_json(w: &mut dyn fmt::Write) -> fmt::Result {
     for (name, value) in snapshot() {
         write!(w, "\"{name}\":{value},")?;
     }
-    // `hash_find_probes` is the per-core sharded counter (see
-    // `HASH_FIND_PROBES`); render its summed-across-cores value
-    // alongside the flat block so consumers see one number.
-    write!(w, "\"hash_find_probes\":{},", HASH_FIND_PROBES.sum())?;
+    for (name, value) in per_core_snapshot() {
+        write!(w, "\"{name}\":{value},")?;
+    }
+    for (name, value) in gauges() {
+        write!(w, "\"{name}\":{value},")?;
+    }
     LAST_RST.write_json(w, "last_rst")?;
     w.write_str(",")?;
     LAST_TEARDOWN.write_json(w, "last_teardown")?;

@@ -51,6 +51,35 @@ pub fn now_ms() -> u64 {
     mock::now_ms()
 }
 
+/// Monotonic hardware cycle counter — TSC on x86_64, CNTVCT_EL0 on
+/// aarch64. Cheap single-instruction read; intended for in-loop
+/// instrumentation of hot paths (e.g. cycles-per-`tcp_receive`).
+///
+/// On `target_os = "none"` resolves to `//crates/kernel/bare`'s
+/// `time::now_cycles` via the `__kernel_bare_now_cycles` link seam.
+/// On host builds reads from the same monotonic counter `now_ms`
+/// uses (a u64 the test mock advances). Unit-tested code should
+/// avoid relying on the *meaning* of the cycle value on host (it's
+/// not a real CPU counter there) — diffs are still well-ordered.
+#[cfg(target_os = "none")]
+#[inline]
+pub fn now_cycles() -> u64 {
+    unsafe extern "Rust" {
+        fn __kernel_bare_now_cycles() -> u64;
+    }
+    // SAFETY: same link contract as `__kernel_bare_now_ms` above.
+    unsafe { __kernel_bare_now_cycles() }
+}
+
+/// Host build: mirror `now_ms` for ordering. Cycle deltas are
+/// meaningless on host but the value is monotonic, which is all
+/// the tests / mock-driven code needs.
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn now_cycles() -> u64 {
+    mock::now_ms()
+}
+
 /// Host-only test clock. Compiled out of every `os:none` build, so
 /// production code can neither reach nor advance it — exactly as the
 /// rng seam's host stream is unreachable on bare metal.

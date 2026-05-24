@@ -697,6 +697,42 @@ pub(crate) fn pool_capacity(core: u32) -> usize {
     POOLS.at(core).capacity() as usize
 }
 
+/// (live, armed) snapshot summed across all cores. `live` = slots
+/// in any non-Closed / non-Listen state — the working-set count the
+/// cliff bench cares about. `armed` = length of the per-core
+/// armed-timer list (sums `tick_in_list` slots across cores) —
+/// what `on_tcp_tick` walks each tick. O(`pool_capacity` ×
+/// `num_cores`) — call from `/obs` render, never on a hot path.
+pub(crate) fn live_and_armed_snapshot() -> (u64, u64) {
+    let n = kernel_core::percpu::num_cores();
+    let mut live = 0u64;
+    let mut armed = 0u64;
+    for core in 0..n {
+        let cap = pool_capacity(core);
+        for slot in 0..cap {
+            // SAFETY: cross-core diagnostic read — deliberately
+            // outside the usual per-core ownership rule. The
+            // owning core is the sole writer to its slots; we
+            // sample two byte-sized fields (`state` enum repr u8,
+            // `tick_in_list` bool) whose stores are naturally
+            // atomic on aarch64 and x86_64. A torn read that
+            // racing-classifies a slot as wrong-state just
+            // miscounts by one — fine for a per-`/obs` sample.
+            // No fence: the bench harness reads `/obs` from a
+            // different thread and tolerates eventual consistency
+            // by design.
+            let c = unsafe { &*conn_ptr(core, slot) };
+            if c.state != TcpState::Closed && c.state != TcpState::Listen {
+                live += 1;
+            }
+            if c.tick_in_list {
+                armed += 1;
+            }
+        }
+    }
+    (live, armed)
+}
+
 /// Linear-scan fallback for `tcp_hash_find`: walk the pool for a
 /// live connection matching the 4-tuple.
 ///

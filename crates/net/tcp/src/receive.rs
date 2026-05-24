@@ -15,6 +15,36 @@ use from_bytes::FromBytes;
 use iobuf::{Chain, IOBuf, OwnedIOBuf};
 use types::{IpAddr, ntohl, ntohs};
 
+/// Drop-guard that wraps `tcp_receive` in a cycle-counter bracket.
+/// Fires on every exit path (early returns included) so per-packet
+/// cost is the true measurement, not the happy-path subset. Two
+/// cycle-counter reads on construct/drop — negligible against the
+/// segment body. `PerCoreCounter` is single-writer per core, so
+/// `RX_CYCLES.add` / `RX_CALLS.add` are uncontended stores.
+struct RxGuard {
+    core: u32,
+    start: u64,
+}
+
+impl RxGuard {
+    #[inline]
+    fn new(core: u32) -> Self {
+        Self {
+            core,
+            start: kernel_core::clock::now_cycles(),
+        }
+    }
+}
+
+impl Drop for RxGuard {
+    #[inline]
+    fn drop(&mut self) {
+        let elapsed = kernel_core::clock::now_cycles().wrapping_sub(self.start);
+        crate::diag::RX_CYCLES.add(self.core, elapsed);
+        crate::diag::RX_CALLS.add(self.core, 1);
+    }
+}
+
 /// Process an incoming TCP packet. Called on the owning core (via flow hash).
 /// `src_ip` and `dst_ip` are family-tagged so v4 and v6 connections
 /// share the same TCB pool, hash table, and dispatch path.
@@ -34,6 +64,12 @@ use types::{IpAddr, ntohl, ntohs};
 /// is plumbing, the copy count is unchanged, only the input is now
 /// IOBuf-typed.
 pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf>) {
+    // Cost instrumentation: bracket every exit (early-return paths
+    // included) with a cycle-counter delta. Placed first so we
+    // attribute the full per-packet wall clock — including the
+    // header-parse early returns the unmeasured version skipped.
+    let _rx_guard = RxGuard::new(kernel_core::cpu_id());
+
     // The TCP header is contiguous in the first chain part: a frame's
     // L2/L3/L4 headers all land in the device's first RX buffer, and
     // the caller narrowed the chain to start exactly at the TCP header.
