@@ -365,31 +365,41 @@ dropped**. This is the `wrk … connect errors: 4904` symptom: 4904
 SYN packets never reached our TCP stack at all, so wrk's
 `connect()` timed out.
 
-**B. Working-set blow-up.** Each conn carries:
+**B. ~~Working-set blow-up~~ — tested and falsified (2026-05-24).**
+This was originally proposed as the second half of the failure
+mode: each conn carries `TcpConnection` (~200 B, 3+ cache lines)
++ `rx_ring` (16 KB) + `rtx_buf` (64 KB) + boxed handler future
+(~1–2 KB), so at 18 K conns / 8 cores the working set blows past
+L2 / L3 and per-poll cycle cost rises with conn count. The
+`tcp-hot-cold-split` branch tested this directly — shrunk
+`TcpConnection` to a 64 B cache-line hot half + `Box<Cold>` —
+and **the cliff position did not move** (same 24 K saturation
+point on a side-by-side conn-count sweep, on the same
+production-shape `gcp-deploy-bench.sh` harness). Per-packet
+cycles were in fact *3–19 % worse* on the split (the Box-deref
+penalty dominates the cache-line savings on real production
+shapes where the armed-tick list is small, ~2 slots). So the
+per-conn working set may be big, but it's not what's driving
+the cliff — see "Falsified hypotheses" below for what remains
+and the new diagnostic surface added for the next cut.
 
-  * `TcpConnection` slot (~200 B, 3+ cache lines)
-  * `rx_ring` (16 KB on first SYN)
-  * `rtx_buf` (64 KB on first send)
-  * Boxed handler future + its captured state (~1-2 KB)
-
-At 18 K conns / 8 cores = 2.25 K conns/core, working set per
-core is ~180 MB just for ring buffers. c3 L2 cache is 1 MB per
-core; L3 is 96 MB shared. Per-conn state stops fitting in L2,
-then L3. **Per-poll cycle cost rises with conn count** because
-every poll incurs more cache misses. This is itself a feedback
-loop: more conns → more cache pressure → slower polls → more
-queued work → more conns active simultaneously.
-
-The two failure modes compound:
+With hypothesis B falsified the residual collapse mechanism is
+narrower than the original write-up implied — failure mode A
+(NIC RX overflow → silent SYN drops → retry storms → wasted RSTs
+→ `pool_exhausted` → server-side RSTs) is sufficient on its own
+to drive rps → 0. The chain that survives:
 
   * NIC drops SYNs → wrk retries → more conn churn
-  * Working set blows up → polls slow → more requests time out
   * Timed-out conns RST → server processes RSTs (more wasted work)
   * New SYNs flood (wrk retrying), pool grows further
   * Eventually `pool_exhausted` increments, `alloc_connection`
     returns None, SYNs get RST'd from our side too
   * No request completes within wrk's timeout window
   * **Effective rps → 0**
+
+Which suspects remain as plausible **second** drivers (beyond
+A) is now an open question — see "Falsified hypotheses + open
+suspects" below.
 
 Once the system enters Stage 3, it does not recover on its own
 within a bench run. Stopping the load lets the queue drain;
@@ -430,6 +440,91 @@ some fraction of conns refused, instead of the cliff to 0 rps.
 The cliff position **does not move** — we still saturate the same
 8 cores — but the failure mode flips from "collapse" to "graceful
 degradation".
+
+## Falsified hypotheses + open suspects (2026-05-24)
+
+`tcp-hot-cold-split` was P0 #2 in an earlier revision of this
+doc, the supposed cliff-mover for hypothesis B above. The branch
+shipped, was tested rigorously on the production-shape harness,
+and **rejected**. Recording the result here so we don't recycle
+the same hypothesis.
+
+### What we measured
+
+`gcp-deploy-bench.sh` shape (waitless-webserver + kvm-vm),
+`health-tls`, 4 cores, 10 s, `wrk -t4`, side-by-side
+main-vs-feature sweep:
+
+| Conns | main rps | feature rps | main cy/pkt | feature cy/pkt |
+|------:|---------:|------------:|------------:|----------------:|
+|  1 K  | 345 708  | 346 266     | 1 036       | 1 067           |
+|  4 K  | 268 726  | 269 013     | 1 291       | 1 418           |
+|  8 K  | 214 604  | 216 047     | 1 454       | 1 727           |
+| 16 K  | 134 424  | 137 591     |   989       | 1 142           |
+| 24 K  |       0  |       0     | —           | —               |
+
+  * rps within ±3 % across the sweep.
+  * **Cliff at the same position on both branches** (24 K, not
+    18 K, not 32 K — both prior numbers in this doc).
+  * Feature is **3–19 % slower per packet** (Box-deref overhead
+    on the cold half exceeds any cache savings; grows with conn
+    count).
+  * Tick-walk savings only **3–5 %** (`next_deadline_ms`
+    fast-skip is real but the armed list stays tiny on
+    production-shape, ~2 slots, so there's nothing to skip).
+
+### What this rules out
+
+  * **Per-conn `TcpConnection` layout is not the bottleneck.**
+    A 64 B hot half + Box cold does not move the cliff. The
+    "working-set blow-up" feedback loop in Stage 3 above did
+    not survive direct measurement.
+  * **The armed-tick walk is already cheap enough.** The 1.8–
+    2.8× tick-walk savings observed earlier on kvm-iterate were
+    artifacts of that environment — armed lists are tiny here.
+
+### What remains plausible
+
+The 24 K cliff has the *same shape* on both branches, so its
+cause is upstream of `TcpConnection` cache footprint. Suspect
+list, none yet measured:
+
+  * **SO_REUSEPORT-style conn distribution** breaking down at
+    high N — flows piling on a subset of cores.
+  * **Accept-ring overflow** at burst-establishment rates
+    (`accept_iterations / accept_calls` was a watchpoint earlier;
+    still is).
+  * **TLS handshake serialization** — the handshake path may
+    have a single-flight bottleneck that surfaces above some
+    establishment rate.
+  * **NIC RX-descriptor pressure** before any code on our side
+    runs — SYNs dropping at the gVNIC ring rather than at our
+    pool. The doctrine half of P0 #3 (deterministic conn cap)
+    only helps if we know the cliff *isn't* upstream of us.
+  * **Loadgen-side ceiling** — `kvm-vm`'s ephemeral-port pool
+    or conntrack table hitting a wall at ~24 K simultaneous
+    flows. Worth ruling out before chasing server-side causes.
+
+### New diagnostic surface
+
+Commit `51914e2` landed the cycle-cost + working-set
+instrumentation the cliff investigation needed:
+
+  * `tcp.rx_cycles` / `tcp.rx_calls` — per-packet cycle cost
+    on the `tcp_receive` hot path. Derive `cycles_per_packet`.
+  * `tcp.tick_cycles` (pairs with the existing
+    `tick_armed_seen`) — per-tick cycle cost on the armed-list
+    walk. Derive `cycles_per_armed_slot`.
+  * `tcp.live_conns` — count of non-Closed / non-Listen slots
+    across all cores. The working-set gauge.
+  * `tcp.armed_now` — current armed-list length. Validates the
+    "armed list stays tiny" finding above on any new workload.
+
+First diagnostic question with the new surface: during a 24 K
+cliff bench, does `live_conns` actually reach 24 K, or do SYNs
+drop at the NIC (`gve_rx_discards` / virtio equivalent) before
+`alloc_connection` ever runs? That answer routes us between the
+upstream-of-us suspect list and the server-side one.
 
 ## Load shedding: what role does it play
 
@@ -634,16 +729,12 @@ order of impact-per-effort, ranked by what we'd ship next.
 
 ### P0 — Ship next
 
-P0 is the two items that **raise where the cliff sits** (RX
-coalescing + hot/cold split) plus the small deterministic-cap
-shed that **bounds what happens at the cliff** in code rather
-than via NIC SYN drops. Together: higher saturation point and
-a known failure mode at it. The adaptive controller form of
-load shedding was demoted to P3 (see "Load shedding: what role
-does it play" above) — there is no production-validated
-precedent for the per-core idle % signal, and the items below
-attack the actual cliff causes (per-frame stack cost and
-per-conn cache footprint) directly.
+Prior revision of this section had **two** cliff-mover items
+(RX coalescing + the `TcpConnection` hot/cold split) plus a
+small deterministic-cap shed. The hot/cold split was **tested
+and rejected** — see "Falsified hypotheses + open suspects"
+above. P0 is now one cliff-mover, one diagnostic step, and the
+small cap shed:
 
 1. **RX coalescing (GRO / RSC)** _(medium-large, owned by
    [`rx-path-optimizations.md`](rx-path-optimizations.md))_
@@ -661,20 +752,26 @@ per-conn cache footprint) directly.
      enable). Those items pre-existed this investigation — they
      own the implementation; this doc just names them as the
      highest-impact cycles/poll reducer left. Precondition item
-     **M** already landed 2026-05-18.
+     **M** already landed 2026-05-18. The first ship attempt
+     (`rx-items-i-j-dqo-rsc`) regressed catastrophically on
+     `upload_32k_*` and 4 c `get_tcp`; bisecting I-only vs I+J
+     is the next move for that branch.
 
-2. **`TcpConnection` hot/cold split** _(medium, this doc)_
-   - Struct is ~200 B → 3+ cache lines per slot. Every per-conn
-     access (`tcp_receive`, `poll_slot`, tick walk) touches all
-     of them. Split into a 64 B hot half (state, ports, seq nums,
-     deadlines, wakers) and a pointer to a cold half (rings,
-     IOBufs, RTT history). Cuts cache-line touches per poll by ~3×.
-     Directly attacks the cache-pressure half of the Stage-3
-     mechanism: at 18 K conns / 8 cores per-core working set
-     blows past L2; shrinking the hot footprint pushes that
-     blow-up point further out. **Lives here**: it's a per-conn
-     data-structure layout change, same scope as the slot pool
-     itself.
+2. **Diagnose the 24 K cliff with the new `/obs` surface**
+   _(diagnostic, no LOC if measurement only)_
+   - The Stage-3 cache-pressure hypothesis was falsified by the
+     hot/cold split experiment. We don't yet know what *is*
+     driving the 24 K cliff. Commit `51914e2` landed
+     `rx_cycles` / `tick_cycles` / `live_conns` / `armed_now`
+     on `main`; use them. First question: during a 24 K-conn
+     bench, does `live_conns` reach 24 K, or do SYNs drop at the
+     gVNIC ring before `alloc_connection` ever runs? Cross-check
+     against `gve_rx_discards`. The answer routes between the
+     server-side suspect list (accept ring, TLS handshake
+     serialization, conn distribution) and the upstream-of-us
+     suspects (NIC ring, loadgen ephemeral ports). **Do this
+     before designing the next cliff-mover** — the wrong
+     hypothesis sank the hot/cold split.
 
 3. **Deterministic conn-count cap (minimal load shedding)**
    _(small, ~30 LOC, this doc)_
@@ -685,29 +782,39 @@ per-conn cache footprint) directly.
      SYN drops. No controller, no idle-% sampling, no hysteresis
      — pure capacity wall, the form Linux's `listen(backlog)`
      uses. Bench impact same as the adaptive form would deliver:
-     stable plateau under overload instead of collapse to 0. The
-     P0 #1 / #2 items above raise *where* the plateau sits;
-     this one bounds *what happens at it*. See "Load shedding:
-     what role does it play" above for the design discussion and
-     the deferred adaptive variants.
+     stable plateau under overload instead of collapse to 0.
+     **Caveat after the hot/cold split outcome:** this only
+     helps if the cliff is server-side (P0 #2 confirms). If
+     SYNs are dropping upstream of us, a cap does nothing.
+     See "Load shedding: what role does it play" above for the
+     design discussion and the deferred adaptive variants.
 
-4. ~~**Run Linux peer baseline (nginx + tokio-hyper)**~~ _(✓ done
+4. ~~**`TcpConnection` hot/cold split**~~ — **tested and
+   rejected 2026-05-24.** Branch `tcp-hot-cold-split` is the
+   unmerged record (delete the branch + `snug-flower` worktree
+   when convenient). Cliff didn't move; per-packet cycles got
+   *worse*. Full data in "Falsified hypotheses + open suspects".
+
+5. ~~**Run Linux peer baseline (nginx + tokio-hyper)**~~ _(✓ done
    May 2026 — see "Headline: waitless vs Linux peers" above)_
    - Confirmed: waitless beats nginx by ~15–20 % rps everywhere
-     and trails tokio-hyper by ~17–25 %. The gap-to-tokio
-     measures the per-poll cycle headroom available — closing it
-     is what the P0 #2 + P1 items below are sized to do
-     (`~109 K cy/req` → `~85 K cy/req` would put us at parity).
+     and trails tokio-hyper by ~17–25 %. Closing the gap-to-tokio
+     is what the P1 items below are sized to do (`~109 K cy/req`
+     → `~85 K cy/req` would put us at parity).
 
 ### P1 — Per-poll cycle reduction
 
-5. **Prefetch slot at `poll_slot` entry** _(tiny, this doc)_
+6. **Prefetch slot at `poll_slot` entry** _(tiny, this doc;
+   value uncertain after hot/cold split rejection)_
    - One `_mm_prefetch` on the slot before the future runs hides
-     L2→L1 latency on the slot's hot half. Free hint. ~5–10 %
-     when cache-bound. Stacks with P0 #2 (hot/cold split): the
-     prefetch is more effective when the hot half fits a line.
+     L2→L1 latency on the slot. Originally pitched as ~5–10 %
+     when cache-bound, paired with the now-rejected hot/cold
+     split. With the cache-pressure hypothesis falsified, this
+     is unlikely to do much on production-shape — measure with
+     `rx_cycles` before / after rather than estimating. Cheap
+     enough to try if profiling points here.
 
-6. **AES-GCM TLS cipher** _(medium, partly in
+7. **AES-GCM TLS cipher** _(medium, partly in
    [`tx-path-optimizations.md`](tx-path-optimizations.md))_
    - We negotiate only `TLS_CHACHA20_POLY1305_SHA256` (~20 cy/B
      measured). AES-GCM-128 with AESNI is 1–3 cy/B — ~10× faster
@@ -720,7 +827,7 @@ per-conn cache footprint) directly.
 
 ### P2 — Bigger architectural wins
 
-7. **Softirq-style inline handler path** _(large)_
+8. **Softirq-style inline handler path** _(large)_
    - Trivial handlers (`/health`, `/static-*` with `&'static [u8]`
      bodies, no async work) could run **inline in `tcp_receive`**
      when a request completes — no task wakeup, no scheduler
@@ -728,13 +835,13 @@ per-conn cache footprint) directly.
      tax for known-cheap endpoints. Expected 2–3× on /health-TLS
      specifically. Large change; sacrifices uniformity.
 
-8. **Concrete handler type (drop `Box<dyn Future>`)** _(medium-large)_
+9. **Concrete handler type (drop `Box<dyn Future>`)** _(medium-large)_
    - Per-conn handler tasks all share one concrete future type for
      a given app. Storing them as `Box<dyn Future>` forces vtable
      dispatch on every poll. A `spawn_typed<F>` path with the
      concrete `F` lets LLVM inline the entire HTTP loop. ~5–10 %.
 
-9. **SYN cookies** _(medium)_
+10. **SYN cookies** _(medium)_
    - Defer slot allocation until the 3-way ACK arrives — currently
      we allocate ~16 KB on every SYN (the rx_ring on first send).
      Encode all needed state in the SYN-ACK sequence number.
@@ -742,13 +849,13 @@ per-conn cache footprint) directly.
 
 ### P3 — Foundational
 
-10. **Per-CPU slab allocator** _(large)_
+11. **Per-CPU slab allocator** _(large)_
     - Single `Spinlock<Talc>` heap shared across cores. The slot
       pool's preserve-across-reuse covers steady-state, but
       first-time rx_ring/rtx_buf allocation during warmup still
       hits the lock. Per-CPU caches eliminate the contention.
 
-11. **Adaptive admission controller (CoDel or Netflix Vegas)** _(medium)_
+12. **Adaptive admission controller (CoDel or Netflix Vegas)** _(medium)_
     - Only after P0 #3's fixed cap is in place *and* measurement
       shows the workload's per-conn cost varies enough that one
       number doesn't fit. Pick a **validated** signal — CoDel's
@@ -760,7 +867,7 @@ per-conn cache footprint) directly.
       do NOT reach for per-core idle % as the signal here
       (lagging + noisy + no production precedent).
 
-12. **eBPF/XDP-style early filter** _(large, possibly unfeasible)_
+13. **eBPF/XDP-style early filter** _(large, possibly unfeasible)_
     - DDoS / bad-source-IP drop at the NIC RX boundary, before
       the TCP stack runs. Requires a programmable filter point we
       don't have today. Defer until we have a real abuse story.
@@ -785,6 +892,10 @@ across all cores).
 | `tick_calls`, `tick_armed_seen`          | armed/call ≈ live armed-timer count            | Per-tick armed-list walk; every walked slot is armed by construction |
 | `syn_scan_calls`                         | ≈ 0                                            | SYN-handler pool-scan fallback — fires only when more than `MAX_LISTENERS_PER_CORE` ports are listening on this core |
 | `tasks_polled_per_worker` (runtime block) | balanced across active workers                | Per-core task work distribution (per-core sharded — see above) |
+| `rx_cycles`, `rx_calls`                  | derive `cycles_per_packet`                     | Direct per-packet cost on the `tcp_receive` hot path (commit `51914e2`; landed for the cliff investigation, kept) |
+| `tick_cycles`                            | pair with `tick_armed_seen`                    | Per-tick walk cost; derive `cycles_per_armed_slot` (commit `51914e2`) |
+| `live_conns`                             | working-set gauge — should rise to bench target| Count of non-Closed / non-Listen slots, summed across cores. Diagnostic for "are SYNs reaching `alloc_connection` at all?" — if `live_conns << target conns` during a high-N bench, the cliff is upstream of us (NIC ring / loadgen ephemeral ports) (commit `51914e2`) |
+| `armed_now`                              | typically ≤ ~10 on production-shape            | Current armed-list length (gauge, not counter). The hot/cold split rejection found this stays tiny in practice — `tick_cycles` is consequently small (commit `51914e2`) |
 
 **Use:**
 
@@ -792,3 +903,5 @@ across all cores).
 - A non-zero `linear_find_calls` or `syn_scan_calls` means a fallback path is firing; both should stay at zero under healthy load.
 - Asymmetric `tasks_polled_per_worker` means work isn't distributed evenly across cores.
 - `tick_armed_seen / tick_calls` rising past ~50 % of pool means most conns have armed timers (high retx, abusive client, etc.).
+- `rx_cycles / rx_calls` rising sharply with conn count is the cache-pressure signal the hot/cold split was supposed to flatten — if it ever does grow steeply on a new workload, revisit the rejected hypothesis with fresh evidence.
+- `live_conns` not matching the bench target is the first thing to check at a cliff bench (see P0 #2).
