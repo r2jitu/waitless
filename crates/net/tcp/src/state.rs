@@ -478,13 +478,29 @@ impl TcpConnection {
         }
     }
 
-    /// Push this slot onto the per-core armed-timer list if not
-    /// already linked. Called by every code path that sets a non-
-    /// zero deadline (`rtx_deadline_ms` / `lifecycle_deadline_ms` /
-    /// `persist_deadline_ms`). The list lets `on_tcp_tick` walk only
-    /// the slots that *might* have work, rather than scanning the
-    /// entire per-core pool (~10% armed at steady state on the
-    /// kvm-iterate bench → 10× tick-loop reduction).
+    /// Reset to a fresh `TcpConnection` while preserving the
+    /// per-slot identity (`slot_index`), the bumped generation
+    /// counter, and the lazily-allocated per-conn heap buffers
+    /// (`rx_ring`, `rtx_buf`). Re-allocating the rings on every
+    /// reset would cost a `Box::new([0; …])` per accept on the
+    /// close-conn /health hot path — preserving them across the
+    /// SYN/close cycle keeps the steady-state hot path heap-free.
+    /// Used by `alloc_connection` and `free_connection`; both call
+    /// sites used to inline the same `let preserved_… = …; *c =
+    /// new(); restore` block.
+    pub(crate) fn reset_preserving(&mut self, next_gen: u16) {
+        let ring = self.rx_ring.take();
+        let rtx = self.rtx_buf.take();
+        let slot = self.slot_index;
+        *self = TcpConnection::new();
+        self.generation = next_gen;
+        self.rx_ring = ring;
+        self.rtx_buf = rtx;
+        self.slot_index = slot;
+    }
+
+    /// Link into the per-core armed-timer list; see
+    /// [`pool::register_armed_slot`].
     #[inline]
     pub(crate) fn arm_for_tick(&mut self) {
         crate::pool::register_armed_slot(self);

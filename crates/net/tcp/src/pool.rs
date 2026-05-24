@@ -243,6 +243,37 @@ impl TickHead {
             head: core::cell::UnsafeCell::new(NULL_SLOT),
         }
     }
+
+    /// Read the current head value.
+    /// SAFETY: per-core ownership; caller is the owning core.
+    fn get(&self) -> u16 {
+        unsafe { *self.head.get() }
+    }
+
+    /// Store a new head value.
+    /// SAFETY: per-core ownership; caller is the owning core.
+    fn set(&self, v: u16) {
+        unsafe { *self.head.get() = v };
+    }
+
+    /// Atomically swap-in NULL_SLOT and return the previous head.
+    /// SAFETY: per-core ownership.
+    fn take(&self) -> u16 {
+        // No actual atomic — same core does the read and the write
+        // and nothing else mutates the cell.
+        let old = self.get();
+        self.set(NULL_SLOT);
+        old
+    }
+
+    /// Link a single slot onto the head; returns the previous head
+    /// (which the caller stores in the slot's `tick_next`).
+    /// SAFETY: per-core ownership.
+    fn push(&self, slot_index: u16) -> u16 {
+        let old = self.get();
+        self.set(slot_index);
+        old
+    }
 }
 
 pub(crate) static TICK_HEAD: kernel_core::percpu::PerWorker<TickHead> =
@@ -251,11 +282,8 @@ pub(crate) static TICK_HEAD: kernel_core::percpu::PerWorker<TickHead> =
 /// Read the per-core armed-timer list head. Used by
 /// `has_armed_timers` to make the "is the event loop allowed to
 /// idle?" decision in O(1).
-///
-/// SAFETY: per-core ownership; the owning core is the only
-/// reader/writer of its head cell.
 pub(crate) fn tick_head_get(core: u32) -> u16 {
-    unsafe { *TICK_HEAD.at(core).head.get() }
+    TICK_HEAD.at(core).get()
 }
 
 /// Push `slot` onto the calling core's armed-timer list if not
@@ -269,13 +297,7 @@ pub(crate) fn register_armed_slot(slot: &mut TcpConnection) {
         return;
     }
     let core = kernel_core::cpu_id();
-    // SAFETY: per-core ownership of both the head cell and the
-    // slot pointer (the slot was reached via &mut already).
-    unsafe {
-        let head_ptr = TICK_HEAD.at(core).head.get();
-        slot.tick_next = *head_ptr;
-        *head_ptr = slot.slot_index;
-    }
+    slot.tick_next = TICK_HEAD.at(core).push(slot.slot_index);
     slot.tick_in_list = true;
 }
 
@@ -284,13 +306,7 @@ pub(crate) fn register_armed_slot(slot: &mut TcpConnection) {
 /// `tick_head_publish` once it's done walking. Used by
 /// `on_tcp_tick`'s rebuild-during-walk pattern.
 pub(crate) fn tick_head_take(core: u32) -> u16 {
-    // SAFETY: per-core ownership.
-    unsafe {
-        let head_ptr = TICK_HEAD.at(core).head.get();
-        let old = *head_ptr;
-        *head_ptr = NULL_SLOT;
-        old
-    }
+    TICK_HEAD.at(core).take()
 }
 
 /// Publish a new head value. Used by `on_tcp_tick` after walking
@@ -299,19 +315,21 @@ pub(crate) fn tick_head_take(core: u32) -> u16 {
 /// already (intruder chain); chain the intruders before the new
 /// head so we don't drop them.
 pub(crate) fn tick_head_publish(core: u32, new_head: u16) {
-    // SAFETY: per-core ownership.
+    let head = TICK_HEAD.at(core);
+    let intruder = head.get();
+    if intruder == NULL_SLOT {
+        head.set(new_head);
+        return;
+    }
+    // Walk the intruder chain to its tail and attach `new_head`
+    // so we don't lose freshly-armed slots. In practice this
+    // only happens if a timer handler arms a deadline on a
+    // *different* conn slot than its own, which today's
+    // handlers don't do — defensive belt-and-braces.
+    // SAFETY: per-core ownership of every slot reachable from
+    // the intruder chain (their `tick_in_list` is true, so they
+    // were linked in by `register_armed_slot` on this core).
     unsafe {
-        let head_ptr = TICK_HEAD.at(core).head.get();
-        let intruder = *head_ptr;
-        if intruder == NULL_SLOT {
-            *head_ptr = new_head;
-            return;
-        }
-        // Walk the intruder chain to its tail and attach `new_head`
-        // so we don't lose freshly-armed slots. In practice this
-        // only happens if a timer handler arms a deadline on a
-        // *different* conn slot than its own, which today's
-        // handlers don't do — defensive belt-and-braces.
         let mut tail = intruder;
         loop {
             let n = (*conn_ptr(core, tail as usize)).tick_next;
@@ -321,8 +339,8 @@ pub(crate) fn tick_head_publish(core: u32, new_head: u16) {
             tail = n;
         }
         (*conn_ptr(core, tail as usize)).tick_next = new_head;
-        *head_ptr = intruder;
     }
+    head.set(intruder);
 }
 
 // ── Accept fast path: per-(core, port) ring of ready-to-accept slots ──
@@ -774,15 +792,8 @@ pub(crate) fn alloc_connection(core: u32) -> Option<usize> {
         // TcpConnection::new()` reset would drop it without this
         // hand-off, costing one heap free + one re-allocation per
         // close-conn /health cycle on the bench hot path.
-        let preserved_gen = c.generation;
-        let preserved_ring = c.rx_ring.take();
-        let preserved_rtx = c.rtx_buf.take();
-        let preserved_slot_index = c.slot_index;
-        *c = TcpConnection::new();
-        c.generation = preserved_gen;
-        c.rx_ring = preserved_ring;
-        c.rtx_buf = preserved_rtx;
-        c.slot_index = preserved_slot_index;
+        let next_gen = c.generation;
+        c.reset_preserving(next_gen);
         return Some(slot as usize);
     }
     // Pool grew to MAX_SEGMENTS without a free slot — try to reclaim
@@ -851,27 +862,15 @@ pub(crate) fn free_connection(core: u32, slot: usize) {
         w.wake();
     }
     // Bump generation so any still-outstanding async handle detects
-    // the slot has been reused on its next hook call. Preserved
-    // across the reset below.
+    // the slot has been reused on its next hook call.
     let next_gen = c.generation.wrapping_add(1);
-    // Preserve the 8 KiB heap-allocated RX ring across reuse — re-
-    // allocating it on every SYN would cost a `Box::new([0; 8192])`
-    // per accept on the close-conn /health hot path. The next SYN's
-    // `ensure_rx_ring` short-circuits when `rx_ring.is_some()`.
-    let preserved_ring = c.rx_ring.take();
-    let preserved_rtx = c.rtx_buf.take();
-    let preserved_slot_index = c.slot_index;
-    *c = TcpConnection::new();
-    c.generation = next_gen;
-    c.rx_ring = preserved_ring;
-    c.rtx_buf = preserved_rtx;
-    c.slot_index = preserved_slot_index;
+    c.reset_preserving(next_gen);
     // Don't manually unlink from the armed-timer list here — the
-    // `*c = TcpConnection::new()` reset zeroed `tick_in_list` and
-    // all deadlines, so the next `on_tcp_tick` walk drops this
-    // slot from the list naturally (lazy unlink). `tick_next` is
-    // junk after the reset but harmless: `on_tcp_tick` reads it
-    // only for slots `tick_in_list == true`, and the next
+    // `reset_preserving` above zeroed `tick_in_list` and all
+    // deadlines, so the next `on_tcp_tick` walk drops this slot
+    // from the list naturally (lazy unlink). `tick_next` is junk
+    // after the reset but harmless: `on_tcp_tick` reads it only
+    // for slots `tick_in_list == true`, and the next
     // `arm_for_tick` overwrites it before flipping the flag.
     // Return the slot to the pool's free list. O(1) push; the next
     // `alloc_connection` call picks it up in O(1) too.

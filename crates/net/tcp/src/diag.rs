@@ -172,8 +172,7 @@ pub static COUNTERS: Counters = Counters::new();
 /// its probe count locally and bumps the calling core's shard once
 /// at exit (not per-probe). Sum across shards is exposed via
 /// `/obs`.
-const MAX_CORES_DIAG: usize = 22;
-pub static HASH_FIND_PROBES: obs::PerCoreCounter<MAX_CORES_DIAG> =
+pub static HASH_FIND_PROBES: obs::PerCoreCounter<{ obs::MAX_CORES }> =
     obs::PerCoreCounter::new();
 
 /// Most recent RST received from a peer — the context the bare

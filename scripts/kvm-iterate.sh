@@ -108,6 +108,10 @@ gcloud compute scp --zone="$KVM_ZONE" \
 # The remote script is sent verbatim via heredoc; CONNS/DURATION/etc.
 # get interpolated by the local shell before sending. Inside the
 # heredoc, `$VAR` refers to the value sent over.
+#
+# `OBS_DELTA_PY` interpolates the shared /obs-delta script body
+# from scripts/bench/obs_delta.py — same body c3-bench-once.sh uses.
+OBS_DELTA_PY="$(cat "$SCRIPT_DIR/bench/obs_delta.py")"
 gcloud compute ssh "$KVM_VM" --zone="$KVM_ZONE" --command="bash -s" <<REMOTE
 set -euo pipefail
 cd ~/kvm-iter
@@ -195,38 +199,7 @@ wait \$QEMU_PID 2>/dev/null || true
 # /obs deltas.
 echo "" >&2
 echo "==> /obs deltas (post - pre):" >&2
-python3 - <<'PY'
-import json
-pre = json.load(open('/tmp/obs-pre.json'))
-post = json.load(open('/tmp/obs-post.json'))
-def delta_block(name, keys=None):
-    p, q = pre.get(name, {}), post.get(name, {})
-    print(f"  [{name}]")
-    for k in (keys or sorted(set(p.keys()) | set(q.keys()))):
-        v1, v2 = p.get(k, 0), q.get(k, 0)
-        if isinstance(v2, (int, float)) and isinstance(v1, (int, float)):
-            d = v2 - v1
-            if d != 0:
-                print(f"    {k:35s} {v1:>12} -> {v2:>12}  Δ={d:+d}")
-        elif isinstance(v2, list) and v2 != v1:
-            print(f"    {k:35s} {v1} -> {v2}")
-delta_block('runtime')
-delta_block('tcp')
-delta_block('http')
-delta_block('nic', ['rx_frames', 'tx_packets', 'num_queue_pairs', 'rx_max_min_ratio_x100'])
-tp, tq = pre.get('tls', {}), post.get('tls', {})
-db = tq.get('encrypt_bytes',0) - tp.get('encrypt_bytes',0)
-dc = tq.get('encrypt_cycles',0) - tp.get('encrypt_cycles',0)
-if db > 0:
-    print(f"  [tls] encrypt {db} B, {dc} cy, {dc/db:.2f} cy/B")
-el_p, el_q = pre.get('event_loop',{}), post.get('event_loop',{})
-def ed(f): return [b-a for a,b in zip(el_p.get(f,[]), el_q.get(f,[]))]
-busy, idle = ed('core_busy_cycles'), ed('core_idle_cycles')
-loops, poll, svc, rt = ed('core_loops'), ed('core_poll_work'), ed('core_service_work'), ed('core_runtime_work')
-for i in range(len(busy)):
-    tot = busy[i] + idle[i]
-    ip = 100*idle[i]/tot if tot>0 else 0
-    rpl = rt[i] / max(loops[i],1)
-    print(f"  c{i}: loops={loops[i]:>9} poll={poll[i]:>7} svc={svc[i]:>7} rt={rt[i]:>7} idle={ip:5.1f}% rt/loop={rpl:.4f}")
+python3 - /tmp/obs-pre.json /tmp/obs-post.json <<'PY'
+$OBS_DELTA_PY
 PY
 REMOTE

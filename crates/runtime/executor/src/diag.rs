@@ -14,22 +14,14 @@
 
 use core::fmt;
 
-use obs::{Counter, LastEvent, ObsRecord, PerCoreCounter};
-
-/// Per-core array width for the per-worker diagnostic counters
-/// below. Must be ≥ the platform's `MAX_CORE_STATS` (currently 22
-/// in `kernel_bare::eventloop`); shards beyond the live worker
-/// count just stay at zero. We don't import the kernel constant
-/// because the executor crate sits strictly below `kernel_bare`
-/// in the crate graph.
-const MAX_WORKERS_DIAG: usize = 22;
+use obs::{Counter, LastEvent, MAX_CORES, ObsRecord, PerCoreCounter};
 
 /// Per-worker count of futures polled. Bumped in `task::tick`
 /// every `poll_slot` call — high-frequency, so this is the
 /// cache-line-padded `PerCoreCounter` rather than a shared
 /// `Counter`. Surfaces "which worker is polling most tasks?"
 /// without instrumenting every `Future::poll`.
-pub static TASKS_POLLED_PER_WORKER: PerCoreCounter<MAX_WORKERS_DIAG> =
+pub static TASKS_POLLED_PER_WORKER: PerCoreCounter<MAX_CORES> =
     PerCoreCounter::new();
 
 #[inline]

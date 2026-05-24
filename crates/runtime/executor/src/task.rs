@@ -360,10 +360,30 @@ pub fn tick(worker_id: u32) -> bool {
     crate::sleep::advance_timers(&cc);
 
     let arena = ARENAS.at(worker_id);
+    // Idle-worker fast path: a `swap(0, AcqRel)` on every word is
+    // ~6 cy/word × 64 words ≈ 400 cy per empty tick. A worker
+    // that spends most of its time idle (waiting for the NIC RX
+    // queue to produce a frame, then doing one tick of work, then
+    // idling again) pays this for nothing. A cheaper relaxed-load
+    // scan first lets the idle path short-circuit before any
+    // atomic-RMW work runs. Pure observation — relaxed loads
+    // can't see writes our local core hasn't yet acquired, but
+    // any wake that landed *here* must have come from this same
+    // core (single-core arena ownership for the writer side
+    // beyond cross-core wakes, which use `wake_worker` after the
+    // bit flip — that IPI guarantees we'll re-enter `tick` after
+    // they land).
+    let mut did_work = false;
+    if arena
+        .ready_bits
+        .iter()
+        .all(|w| w.load(Ordering::Relaxed) == 0)
+    {
+        return did_work;
+    }
     // Atomically take the current ready bitmap, one word at a time.
     // Wakes that fire *during* this tick flip fresh bits in the
     // words we've already swept and get picked up on the next tick.
-    let mut did_work = false;
     for word_idx in 0..TASKS_BITMAP_WORDS {
         let mut ready = arena.ready_bits[word_idx].swap(0, Ordering::AcqRel);
         while ready != 0 {
@@ -378,6 +398,7 @@ pub fn tick(worker_id: u32) -> bool {
             if !arena.is_used(slot_idx) {
                 continue;
             }
+            did_work = true;
             // Cancellation beats polling: `TaskHandle::abort` set
             // the flag + flipped the ready bit to force us here.
             // Drop the future in place (on the owning worker, where
@@ -391,10 +412,8 @@ pub fn tick(worker_id: u32) -> bool {
                 slot.epoch.fetch_add(1, Ordering::AcqRel);
                 arena.clear_used(slot_idx);
                 crate::diag::COUNTERS.tasks_aborted.bump();
-                did_work = true;
                 continue;
             }
-            did_work = true;
             crate::diag::bump_tasks_polled(worker_id);
             poll_slot(arena, slot, worker_id, slot_idx);
         }

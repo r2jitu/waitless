@@ -115,6 +115,27 @@ impl Default for PerCoreCell {
     }
 }
 
+// The whole point of `PerCoreCell` is that an array of them places
+// each shard on its own cache line. A future field add inside the
+// struct (or losing `align(64)`) would silently break that and
+// regress the per-core counter perf invariant; pin the layout here.
+const _: () = assert!(core::mem::size_of::<PerCoreCell>() == 64);
+const _: () = assert!(core::mem::align_of::<PerCoreCell>() == 64);
+
+/// Default per-core array width for shared per-core counters.
+/// Matches the platform's `MAX_CORE_STATS` in
+/// `kernel_bare::eventloop`; lives here in the `obs` leaf crate so
+/// per-core `Counter` consumers
+/// (`net::tcp::diag::HASH_FIND_PROBES`,
+/// `runtime::executor::diag::TASKS_POLLED_PER_WORKER`) can size
+/// their shards from a single source of truth.
+///
+/// **If you lift this**: also bump `kernel_bare::eventloop::MAX_CORE_STATS`
+/// (which controls `CORE_STATS` array width) and
+/// `crates/drivers/gve/src/lib.rs::MAX_QUEUE_PAIRS`. The three are
+/// independently named for historic reasons but must agree.
+pub const MAX_CORES: usize = 22;
+
 pub struct PerCoreCounter<const N: usize> {
     cells: [PerCoreCell; N],
 }
