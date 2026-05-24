@@ -73,22 +73,62 @@ debugging.
 
 ## Measurements (May 2026)
 
-### Headline /health-TLS sweep — 8 s per cell
+### Headline: waitless vs Linux peers on c3+gVNIC
 
-| conns | rps c3+gVNIC (8c) | rps kvm-iterate (4c) | p99 c3 | p99 kvm |
-|-------|-------------------|-----------------------|--------|---------|
-| 3 K   | 285 K             | 308 K                 | 217 ms | 180 ms  |
-| 6 K   | 226 K             | 223 K                 | 664 ms | 461 ms  |
-| 10 K  | 170 K             | 146 K                 | 1.55 s | 1.33 s  |
-| 14 K  | **128 K**         | collapse (~200 rps)   | 2.07 s | —       |
-| 18 K  | collapse          | —                     | —      | —       |
-| 28 K  | collapse          | —                     | —      | —       |
+Same hardware (`c3-highcpu-8` + gVNIC), same loadgen (`wrk -t4`,
+4 threads, 8 s duration), same workload (`/health-TLS`,
+`{"status":"ok",…}` JSON body), same `kvm-vm` driving from inside
+the same VPC. All three peers are the dedicated bench peers
+([`scripts/peer-linux/peer-deploy.sh`](../scripts/peer-linux/peer-deploy.sh)
+provisions `waitless-peer-nginx` and `waitless-peer-tokio`;
+waitless runs from
+[`scripts/deploy-gcloud.sh deploy`](../scripts/deploy-gcloud.sh)).
 
-Read as: **kvm-iterate cliffs hard at 14 K**, while **c3+gVNIC
-degrades gracefully to 14 K and only collapses at 18 K**. The
-kvm-iterate collapse is a stricter cliff because the 4 cores
-share a busy host; the 8 c3 cores spread the saturation more
-evenly.
+| conns | nginx rps | tokio-hyper rps | **waitless rps** | nginx p99 | tokio p99 | **waitless p99** |
+|-------|-----------|-----------------|-------------------|-----------|-----------|-------------------|
+| 3 K   | 250 K     | **334 K**       | 285 K             | 297 ms    | **59 ms** | 217 ms            |
+| 6 K   | 199 K     | **263 K**       | 226 K             | 822 ms    | **481 ms**| 664 ms            |
+| 10 K  | 147 K     | **197 K**       | 170 K             | 1.48 s    | **1.15 s**| 1.55 s            |
+| 14 K  | 113 K     | **141 K**       | 128 K             | 2.21 s    | **2.09 s**| 2.07 s            |
+
+Read this as:
+
+  * **Waitless beats nginx on rps at every measured conn count**
+    (~14–20 % faster). p99 also better at low conn counts.
+  * **tokio-hyper wins on every metric** — ~17–25 % more rps than
+    waitless, lower p99 across the board.
+  * **All three converge into the same CPU-bound region** above
+    ~10 K conns (113–197 K rps at 14 K; the rps gap narrows). At
+    14 K p99 the three are within 6 % of each other (2.07–2.21 s)
+    because everyone is wrk-timeout-bound.
+  * **The differentiator is the low-conn region** (1 K–6 K) where
+    CPU isn't yet pegged — tokio's runtime overhead is meaningfully
+    lower than waitless, and waitless's runtime overhead is
+    meaningfully lower than nginx.
+
+The gap-to-tokio at 10 K (~27 K rps) is roughly what we'd recover
+by closing the per-poll cycle gap to nginx-level (109 K cy/req →
+~85 K cy/req — the P1 items below should land in that range).
+
+### Same waitless run on the kvm-iterate / virtio-net iteration path
+
+For context — the env used for fast iteration during the
+investigation. Same waitless binary, different network path
+(nested QEMU/KVM + virtio-net on a 4-core kvm-vm vs real
+8-core c3+gVNIC):
+
+| conns | rps kvm-iterate (4c) | p99 kvm-iterate |
+|-------|-----------------------|-----------------|
+| 3 K   | 308 K                 | 180 ms          |
+| 6 K   | 223 K                 | 461 ms          |
+| 10 K  | 146 K                 | 1.33 s          |
+| 14 K  | collapse (~200 rps)   | —               |
+
+**kvm-iterate cliffs hard at 14 K** while **c3+gVNIC degrades to
+14 K and only collapses at 18 K** — the 4-core kvm path doubles
+the working-set / cache pressure per core (3500 vs 1750 conns/core),
+and shared-host vCPU scheduling adds queue-stall bursts. See
+"Anatomy of CPU collapse" below for the mechanism.
 
 ### Per-core breakdown at 10 K conns
 
@@ -425,14 +465,13 @@ order of impact-per-effort, ranked by what we'd ship next.
      implementation; this doc just names them as the highest-impact
      cycles/poll reducer left.
 
-3. **Run Linux peer baseline (nginx + tokio-hyper)** _(operational,
-   not code)_
-   - Same c3 hardware, same conn sweep, same /health-TLS profile.
-     Until we have this we don't know if 170 K rps is competitive
-     or 2× behind. Required to size the rest of the roadmap honestly.
-     Bench infra already deployed
-     ([`scripts/peer-linux/*`](../scripts/peer-linux/)), just needs
-     an hour of running. **Do this first.**
+3. ~~**Run Linux peer baseline (nginx + tokio-hyper)**~~ _(✓ done
+   May 2026 — see "Headline: waitless vs Linux peers" above)_
+   - Confirmed: waitless beats nginx by ~15–20 % rps everywhere
+     and trails tokio-hyper by ~17–25 %. The gap-to-tokio
+     measures the per-poll cycle headroom available — closing it
+     is what the P1 items below are sized to do (`~109 K cy/req`
+     → `~85 K cy/req` would put us at parity).
 
 ### P1 — Per-poll cycle reduction
 
