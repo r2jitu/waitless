@@ -53,17 +53,30 @@ production datapath:
    cycle, no GCE round-trip. Covers async runtime + TCP + HTTP +
    TLS hot paths. Can't reproduce gVNIC-specific behavior (HVF
    uses a userspace TCP proxy, not virtio).
-2. **`scripts/kvm-iterate.sh`** — QEMU/KVM on the GCE `kvm-vm`
-   loadgen box. ~45 s cycle. Real Linux host TCP stack, real
-   virtio-net + vhost-net multi-queue. **Not** gVNIC, and the
-   measurements pick up nested-virt + shared-host-CPU artifacts
-   (see "Asymmetric core load" below).
-3. **`scripts/c3-bench-once.sh`** — Deploy waitless to a real
-   `c3-highcpu-8` GCE instance, drive wrk from `kvm-vm` over the
-   VPC. Production-shape datapath (gVNIC, Andromeda). ~5 min for
-   the first run (image build + upload); subsequent calls are
-   single-curl. Mirrors the `/obs` delta block that the other two
-   scripts print, so output is comparable across envs.
+2. **`scripts/kvm-iterate.sh`** — **Iteration env, not a clean
+   bench.** QEMU/KVM on the GCE `kvm-vm` (a c3-highcpu-8): the
+   guest waitless runs with `-smp 4` (4 vCPU threads) AND wrk
+   runs with `-t4` (4 wrk threads) AND vhost-net workers AND the
+   host kernel + virtio-net all share the same 8 host cores.
+   That's a deliberate shared-host setup — fast cycle time
+   (~45 s vs ~5 min for c3-bench-once) at the cost of contention
+   between the server and the loadgen. Use kvm-iterate for code-
+   change iteration ("did this commit make rps go up or down on
+   the same shared-host setup?"), **never for headline numbers**.
+   Real Linux host TCP stack and real virtio-net + vhost-net
+   multi-queue are the things this env reproduces that HVF
+   can't; the absolute rps numbers come from c3-bench-once.
+3. **`scripts/c3-bench-once.sh`** — **The clean bench.** Deploys
+   waitless to a real `c3-highcpu-8` GCE instance
+   (`waitless-webserver` — 8 dedicated cores, gVNIC). Drives wrk
+   from `kvm-vm` (a *separate* c3-highcpu-8 — 8 dedicated cores
+   for the loadgen). Traffic crosses the VPC over gVNIC. **No
+   server↔loadgen CPU sharing.** Production-shape datapath
+   (gVNIC, Andromeda). ~5 min for the first run (image build +
+   upload); subsequent calls are single-curl. Mirrors the
+   `/obs` delta block the other two scripts print so output is
+   comparable across envs. The headline measurements below come
+   from this env.
 
 `scripts/peer-linux/pareto-bench.sh` exists for full
 multi-peer / multi-conn sweeps emitting JSONL the
@@ -198,23 +211,39 @@ by closing the per-poll cycle gap to nginx-level (109 K cy/req →
 
 ### Same waitless run on the kvm-iterate / virtio-net iteration path
 
-For context — the env used for fast iteration during the
-investigation. Same waitless binary, different network path
-(nested QEMU/KVM + virtio-net on a 4-core kvm-vm vs real
-8-core c3+gVNIC):
+**These numbers are not directly comparable to the c3+gVNIC
+table above** — kvm-iterate runs **the server and the loadgen
+on the same 8-core c3-highcpu-8 host** (QEMU vCPU threads,
+wrk threads, vhost-net workers, and the host kernel all share
+the host CPU). Use them only for *delta* (did a code change
+move rps in one direction or the other on this shared-host
+setup?), not absolute capacity. The headline table above is
+the unshared-hardware truth.
 
-| conns | rps kvm-iterate (4c) | p99 kvm-iterate |
-|-------|-----------------------|-----------------|
-| 3 K   | 308 K                 | 180 ms          |
-| 6 K   | 223 K                 | 461 ms          |
-| 10 K  | 146 K                 | 1.33 s          |
-| 14 K  | collapse (~200 rps)   | —               |
+| conns | rps kvm-iterate (4c, shared host) | p99 kvm-iterate |
+|-------|-------------------------------------|-----------------|
+| 3 K   | 308 K                                | 180 ms          |
+| 6 K   | 223 K                                | 461 ms          |
+| 10 K  | 146 K                                | 1.33 s          |
+| 14 K  | collapse (~200 rps)                  | —               |
 
 **kvm-iterate cliffs hard at 14 K** while **c3+gVNIC degrades to
-14 K and only collapses at 18 K** — the 4-core kvm path doubles
-the working-set / cache pressure per core (3500 vs 1750 conns/core),
-and shared-host vCPU scheduling adds queue-stall bursts. See
-"Anatomy of CPU collapse" below for the mechanism.
+14 K and only collapses at 18 K**. Three things compound:
+
+  * **4 cores vs 8** — twice the working-set / cache pressure
+    per core (3500 vs 1750 conns/core).
+  * **Server↔loadgen sharing the same 8 host cores** — when the
+    guest waitless is pegged, the wrk threads (and vhost-net
+    workers, and the host TCP stack) are competing for the
+    same physical cores, so each side's behaviour starves the
+    other and the cliff appears earlier than it would on
+    separated hardware.
+  * **Nested KVM scheduling jitter** — KVM on a shared c3 host
+    can deschedule a vCPU briefly when another guest runs,
+    making the per-poll wall-clock variance higher than on
+    dedicated hardware.
+
+See "Anatomy of CPU collapse" below for the per-stage mechanism.
 
 ### Per-core breakdown at 10 K conns
 
@@ -246,9 +275,16 @@ c3: loops=1.47M  rt=7.2K  idle=13.2% rt/loop=0.0049
 
 c0/c1 pinned at 0.5 % idle while c2/c3 sit at 13–21 % idle —
 the asymmetry that drove most of our investigation. **It does
-not reproduce on c3**, so this is a kvm-vm host-side artifact
-(KVM vCPU placement on a shared c3 host, vhost-net IRQ steering,
-or similar). Not a guest-fixable bottleneck.
+not reproduce on c3+gVNIC** with the server and loadgen on
+**separated** c3-highcpu-8 hosts, so this is a kvm-iterate
+test-setup artifact. Most-likely cause: wrk on the same
+8-core host as the QEMU vCPUs steals from whichever guest
+vCPUs the Linux host scheduler picks (typically the
+lower-numbered ones first), making them effectively slower
+per loop iteration. Secondary contributors: vhost-net IRQ
+steering, MSI-X vector affinity. **Not a guest-fixable
+bottleneck.** Fixing the test setup (= move wrk to a separate
+host, which is what c3-bench-once does) makes it disappear.
 
 ### Per-request CPU budget
 
