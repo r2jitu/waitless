@@ -221,9 +221,9 @@ Two reasons:
 
 ### Why load shedding fixes Stage 3
 
-Stop accepting new conns once `live_conns_per_core` exceeds a
-threshold (suggest ~2000). Refused SYNs get no SYN-ACK — wrk
-sees connect timeout and either retries (slowly) or fails. Crucially:
+Refuse new conns once the core is genuinely saturated. Refused
+SYNs get no SYN-ACK — wrk sees connect timeout and either retries
+(slowly) or fails. Crucially:
 
   * No new entries pile into the pool past the saturation point
   * Working set stays bounded → per-poll cost stays bounded
@@ -236,6 +236,110 @@ some fraction of conns refused, instead of the cliff to 0 rps.
 The cliff position **does not move** — we still saturate the same
 8 cores — but the failure mode flips from "collapse" to "graceful
 degradation".
+
+## Load shedding: how to decide without capping throughput
+
+The naive shedder ("refuse when `live_conns_per_core > 2000`")
+works but has a real cost: a hardcoded threshold caps the system
+**below** its true capacity on lighter workloads (where each conn
+costs fewer cycles) and **above** its true capacity on heavier
+workloads (where the cliff hits earlier). On a hot path that
+varies — `/health` vs `/static-1m` vs an app handler doing real
+work — that's a 5–10× spread in per-conn cost. One number can't
+fit all.
+
+The fix is to shed based on **capacity utilisation**, not on a
+count.
+
+### Signal: per-core CPU idle %
+
+We already record `busy_cycles` / `idle_cycles` per core in
+`CORE_STATS` (the data the `event_loop` `/obs` block exposes).
+Sampled over a short window (~50 ms), the idle % is a direct
+read on "do we have CPU left for another conn?":
+
+  * **idle ≥ 8 %** — core has headroom; accept everything
+  * **idle ≤ 1 %** — core is saturated; new conns will degrade
+    existing ones; refuse
+  * **1 % < idle < 8 %** — the band where we **stay with the
+    last decision** (hysteresis prevents flapping)
+
+The 1 % / 8 % numbers come straight from the cliff measurements:
+the c3 saturation point sits at ~0.5 % idle, the healthy zone is
+above ~12 %. Pick thresholds inside those observed bands with a
+small safety margin.
+
+### Why this doesn't cap full potential
+
+The threshold is on **capacity** (idle %), not on **count**. So:
+
+  * **Light workload** (`/health`, ~21 K rps/core): saturates at
+    ~1500 conns/core → shed kicks in at 1500
+  * **Heavy workload** (`/compute`, much fewer rps/core):
+    saturates at ~200 conns/core → shed kicks in at 200
+  * **Mixed workload that shifts mid-bench**: as the per-conn
+    cost goes up, idle drops, shed engages earlier, automatically
+  * **CPU contention from another guest** (kvm-vm artifact):
+    available capacity shrinks, shed engages earlier, again
+    automatically
+
+We never refuse a conn we **could** have served — by definition
+the gate only fires when the core has no spare cycles. The cost
+is one cheap "current idle %" read per SYN (a window-bounded
+EWMA, no per-SYN atomic chain).
+
+### Hysteresis
+
+Without a gap between the shed-on and shed-off thresholds the
+gate oscillates: shed fires at 1 % idle → load drops → idle pops
+to 2 % → shed releases → load resumes → idle dips to 0.9 % →
+shed fires → ... A 1 %/8 % band with the "stay with last
+decision" rule above gives the system time to absorb the change
+before re-evaluating. Standard thermostat pattern.
+
+### Where the gate goes
+
+One place: `alloc_connection` in `crates/net/tcp/src/pool.rs` —
+the SYN handler's first allocation point. Roughly:
+
+```rust
+pub(crate) fn alloc_connection(core: u32) -> Option<usize> {
+    if core_overloaded(core) {
+        crate::diag::COUNTERS.syn_shed.bump();
+        return None;   // SYN dropped, no SYN-ACK
+    }
+    // ... existing find-free-slot logic ...
+}
+```
+
+`core_overloaded(core)` reads the most recent idle-window
+sample. The sample is updated by a low-priority background task
+(or by the per-core event-loop itself, every N iterations) —
+each update is a `CORE_STATS` read + an EWMA fold. The cost on
+the SYN path is one atomic load.
+
+A refused SYN means **no SYN-ACK**: wrk's connect just times
+out. Retried SYNs from the same client succeed when the core is
+no longer overloaded. From a TCP-stack viewpoint this is no
+different from a SYN arriving during transient packet loss; it's
+the correct standard behaviour.
+
+### Beyond per-core idle %
+
+When per-core idle is not enough, two well-known next steps:
+
+  * **CoDel** (Linux's CAKE qdisc, RFC 8290): track the
+    accept-to-handler-completion delay; shed when the **minimum**
+    over a sliding window exceeds a target. Catches bufferbloat
+    that idle % misses (a core can be "busy" doing wasted work on
+    timed-out conns and still have low effective throughput).
+  * **Adaptive concurrency limits** (Netflix's Vegas / Gradient
+    algorithms): run a feedback controller on p99 latency vs a
+    target — admit more when latency drops, less when it grows.
+    Better for tracking the actual knee of the throughput curve.
+
+Per-core idle is the cheap first cut; CoDel-style is the obvious
+follow-up once we measure load shedding's effect on the cliff.
 
 ## Fixes shipped (commits on `bench/pareto-rig`)
 
