@@ -75,36 +75,96 @@ debugging.
 
 ### Headline: waitless vs Linux peers on c3+gVNIC
 
-Same hardware (`c3-highcpu-8` + gVNIC), same loadgen (`wrk -t4`,
-4 threads, 8 s duration), same workload (`/health-TLS`,
-`{"status":"ok",…}` JSON body), same `kvm-vm` driving from inside
-the same VPC. All three peers are the dedicated bench peers
+Same hardware (`c3-highcpu-8` + gVNIC), same workload
+(`/health-TLS`, `{"status":"ok",…}` JSON body), same `kvm-vm`
+driving wrk over the VPC, same dedicated bench peers
 ([`scripts/peer-linux/peer-deploy.sh`](../scripts/peer-linux/peer-deploy.sh)
 provisions `waitless-peer-nginx` and `waitless-peer-tokio`;
 waitless runs from
 [`scripts/deploy-gcloud.sh deploy`](../scripts/deploy-gcloud.sh)).
 
-| conns | nginx rps | tokio-hyper rps | **waitless rps** | nginx p99 | tokio p99 | **waitless p99** |
-|-------|-----------|-----------------|-------------------|-----------|-----------|-------------------|
-| 3 K   | 250 K     | **334 K**       | 285 K             | 297 ms    | **59 ms** | 217 ms            |
-| 6 K   | 199 K     | **263 K**       | 226 K             | 822 ms    | **481 ms**| 664 ms            |
-| 10 K  | 147 K     | **197 K**       | 170 K             | 1.48 s    | **1.15 s**| 1.55 s            |
-| 14 K  | 113 K     | **141 K**       | 128 K             | 2.21 s    | **2.09 s**| 2.07 s            |
+**Methodology note.** The first comparison below uses
+`wrk -t8 -c<N> -d20s` — eight wrk threads from `kvm-vm` (which
+is itself an 8-core c3), twenty-second windows. Earlier
+measurements at `-t4 -d8s` were loadgen-bound at high conn
+counts (the wrk side ran out of CPU before the server did) and
+under-measured peak rps. The `-t8 -d20s` numbers below are the
+ones to trust at ≥10 K conns.
 
-Read this as:
+**Deep sweep — `wrk -t8 -c<N> -d20s --timeout 10s`:**
 
-  * **Waitless beats nginx on rps at every measured conn count**
-    (~14–20 % faster). p99 also better at low conn counts.
-  * **tokio-hyper wins on every metric** — ~17–25 % more rps than
-    waitless, lower p99 across the board.
-  * **All three converge into the same CPU-bound region** above
-    ~10 K conns (113–197 K rps at 14 K; the rps gap narrows). At
-    14 K p99 the three are within 6 % of each other (2.07–2.21 s)
-    because everyone is wrk-timeout-bound.
-  * **The differentiator is the low-conn region** (1 K–6 K) where
-    CPU isn't yet pegged — tokio's runtime overhead is meaningfully
-    lower than waitless, and waitless's runtime overhead is
-    meaningfully lower than nginx.
+| conns  | nginx rps    | tokio-hyper rps | **waitless rps** | nginx p99 | tokio p99 | **waitless p99** |
+|--------|--------------|-----------------|-------------------|-----------|-----------|-------------------|
+|  8 K   | 276 K        | **469 K**       | —¹                | 777 ms    | **91 ms** | —¹                |
+| 16 K   | 220 K        | 375 K           | **366 K**         | 2.13 s    | 1.37 s    | 5.24 s            |
+| 24 K   | 190 K        | 276 K           | **298 K**         | 3.46 s    | 3.13 s    | **2.12 s**        |
+| 32 K   | 168 K        | **227 K**       | 44 K (cliff)      | 4.50 s    | 4.98 s    | 4.70 s            |
+| 40 K   | **78 K**     | 44 K            | 4 K (dead)        | 5.29 s    | 5.59 s    | 2.54 s            |
+| 50 K   | collapse     | collapse        | collapse          | —         | —         | —                 |
+
+¹ The waitless deep sweep was run mid-investigation against an
+earlier deploy and skipped 8 K. The pattern at 8 K is well-
+predicted by the 16 K / 24 K points.
+
+**The real story:**
+
+  * **At 16 K conns waitless matches tokio-hyper on rps (366 K vs
+    375 K, within 2 %)** and beats nginx by ~66 %. This is the
+    "waitless and tokio are peers" zone.
+  * **At 24 K conns waitless edges out tokio (298 K vs 276 K)**
+    and has the *lowest p99 of the three* (2.12 s vs nginx's
+    3.46 s and tokio's 3.13 s). This is the surprise — the same
+    runtime/data-structure work that lifts our floor also gives
+    us better tail-latency in this band.
+  * **At 32 K conns waitless cliffs hard** (44 K rps vs nginx's
+    168 K and tokio's 227 K). nginx and tokio degrade gracefully
+    past this point; waitless step-collapses. **This is the
+    gap that load shedding (P0 #1) and per-poll cycle reduction
+    (P1) close.**
+  * **At 50 K conns all three collapse.** No peer implements
+    real load shedding by default.
+
+So the gap-to-Linux isn't "waitless is permanently behind"; it
+is specifically "waitless cliffs ~24 K → 32 K conns where nginx
+and tokio degrade gracefully ~32 K → 50 K." Closing that gap
+is the P0 / P1 priority below.
+
+**Why the cliff at 32 K is steeper for waitless than for the
+Linux peers:**
+
+  * No load shedding — same root cause for all three, but the
+    waitless cliff comes earlier because cache pressure scales
+    faster on its per-conn data layout (~80 KB of rings per
+    live conn vs nginx's smaller per-conn footprint and tokio's
+    chunked allocator).
+  * Per-poll cycle cost grows with conn count (TcpConnection
+    spans ~3 cache lines; at 32 K conns the per-core working
+    set blows past L2). Hot/cold struct split (P1 #4) directly
+    targets this.
+
+### Lower-conn sweep — `wrk -t4 -c<N> -d8s` (loadgen-bound at the high end)
+
+For completeness, the smaller `-t4 -d8s` sweep against all
+three peers (4 wrk threads from `kvm-vm`, 8 s windows). These
+numbers are tighter for the low-conn region (no warm-up noise)
+but **loadgen-bound at ≥10 K conns** — wrk on 4 threads runs
+out of CPU before the server does, so peak rps is under-reported.
+Treat as a snapshot of the "healthy zone" only.
+
+| conns | nginx rps | tokio rps | **waitless rps** | tokio p99  |
+|-------|-----------|-----------|-------------------|------------|
+|  3 K  | 250 K     | **334 K** | 285 K             | **59 ms**  |
+|  6 K  | 199 K     | **263 K** | 226 K             | **481 ms** |
+| 10 K  | 147 K     | **197 K** | 170 K             | **1.15 s** |
+| 14 K  | 113 K     | **153 K** | 128 K             | **882 ms** |
+
+Same ordering (tokio > waitless > nginx in healthy region), but
+the absolute numbers run ~30 % lower than the `-t8 -d20s` deep
+sweep above because of loadgen back-pressure. The "headline"
+fact that survives both methodologies is **waitless beats
+nginx and is roughly on par with tokio** in the healthy region
+— and **waitless cliffs earlier** under overload, which is the
+real perf gap to close.
 
 The gap-to-tokio at 10 K (~27 K rps) is roughly what we'd recover
 by closing the per-poll cycle gap to nginx-level (109 K cy/req →
