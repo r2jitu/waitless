@@ -431,21 +431,87 @@ The cliff position **does not move** — we still saturate the same
 8 cores — but the failure mode flips from "collapse" to "graceful
 degradation".
 
-## Load shedding: how to decide without capping throughput
+## Load shedding: what role does it play
 
-The naive shedder ("refuse when `live_conns_per_core > 2000`")
-works but has a real cost: a hardcoded threshold caps the system
-**below** its true capacity on lighter workloads (where each conn
-costs fewer cycles) and **above** its true capacity on heavier
-workloads (where the cliff hits earlier). On a hot path that
-varies — `/health` vs `/static-1m` vs an app handler doing real
-work — that's a 5–10× spread in per-conn cost. One number can't
-fit all.
+Load shedding is a **survival** property, not a **protection**
+property. It bounds the failure mode under overload — keeps the
+server in a known degraded state ("some conns refused, the rest
+served at ~128 K rps") instead of an unknown collapsed state
+("0 rps, NIC silently dropping SYNs"). It does not:
 
-The fix is to shed based on **capacity utilisation**, not on a
-count.
+  * Distinguish attackers from legitimate clients (per-IP limits /
+    WAF / SYN cookies do that, not the admission gate).
+  * Defend against volumetric attacks (link saturation is an
+    upstream-scrubbing problem — Cloudflare / Cloud Armor / etc.).
+  * Defend against SYN floods (that's SYN cookies — P2 #9).
+  * **Move the saturation point** — that's what RX coalescing
+    (P0 #1) and the per-poll cycle items do.
 
-### Signal: per-core CPU idle %
+So it is the *floor* in the survival stack: necessary so the
+cliff at saturation isn't catastrophic, but smaller in headline
+impact than the items that raise where the cliff sits.
+
+### What Linux / nginx / Envoy actually do
+
+Useful reference, because the cheaper-than-it-looks pitfall is
+inventing a homemade controller when a validated mechanism
+exists:
+
+  * **Linux kernel**: bounded `listen(backlog)` queue; SYN drops
+    on overflow (`LINUX_MIB_LISTENOVERFLOWS`). SYN cookies extend
+    capacity when the SYN queue fills (they don't shed). CoDel
+    qdisc for packet-level AQM. **No CPU-feedback admission gate
+    in the kernel.**
+  * **nginx**: static caps — `worker_connections`, `limit_conn`,
+    `limit_req`. Count-based, not feedback-based.
+  * **Envoy / Netflix concurrency-limits**: adaptive concurrency
+    on a latency target (Vegas / Gradient) — admit more when p99
+    drops, less when it grows.
+
+The validated forms are queue-depth (Linux) and latency-target
+(Netflix). Per-core idle % is a homemade variant — cheap to
+read, but lagging (it fires after you've already entered the
+feedback loop) and noisy (sampled EWMA). Reserve it for "we
+tried the validated signals and they cost too much."
+
+### Recommended layering
+
+In ascending sophistication / cost:
+
+1. **Deterministic count cap** (small; ship anytime).
+   `alloc_connection` already returns `None` past slot-pool
+   exhaustion — make that path *counted* (`syn_shed` counter)
+   and add a per-core cap below the pool size so **the cliff is
+   bounded by code, not by NIC drops**. Closest analogue:
+   Linux's `listen(backlog)`. No controller, no signal — pure
+   capacity wall. This is the ship-now form. Bench impact:
+   stable plateau at ~128 K rps under overload instead of cliff
+   to 0, same as any controller would deliver, with none of the
+   tuning surface.
+2. **Adaptive controller on a validated signal** (medium; only
+   with measurement). Once (1) is in place *and* RX coalescing
+   + hot/cold split have landed *and* the cliff still moves with
+   workload, pick **one** validated signal — accept-to-completion
+   delay (CoDel-style) or p99 latency vs target (Vegas-style) —
+   and feed an EWMA into the gate. Aim for the layer that
+   matches the *failure shape* (latency tail) rather than a CPU
+   symptom.
+3. **Per-core idle %** (aspirational; cheap-but-lagging variant
+   of (2)). Design notes preserved below in case profiling
+   later shows the validated signals cost too much for this
+   workload. Don't ship this before (1) and only consider it
+   after (2)'s measurement evidence motivates a cheaper signal.
+
+Steps (2) and (3) are P3 territory until measurement says the
+fixed cap from (1) is provably insufficient.
+
+### Design notes — adaptive controller on per-core idle % (aspirational)
+
+The remainder of this section is preserved from the original
+proposal as design reference if (3) is ever revisited. It is
+**not** what we ship first.
+
+#### Signal: per-core CPU idle %
 
 We already record `busy_cycles` / `idle_cycles` per core in
 `CORE_STATS` (the data the `event_loop` `/obs` block exposes).
@@ -463,7 +529,7 @@ the c3 saturation point sits at ~0.5 % idle, the healthy zone is
 above ~12 %. Pick thresholds inside those observed bands with a
 small safety margin.
 
-### Why this doesn't cap full potential
+#### Why this doesn't cap full potential
 
 The threshold is on **capacity** (idle %), not on **count**. So:
 
@@ -482,7 +548,7 @@ the gate only fires when the core has no spare cycles. The cost
 is one cheap "current idle %" read per SYN (a window-bounded
 EWMA, no per-SYN atomic chain).
 
-### Hysteresis
+#### Hysteresis
 
 Without a gap between the shed-on and shed-off thresholds the
 gate oscillates: shed fires at 1 % idle → load drops → idle pops
@@ -491,7 +557,7 @@ shed fires → ... A 1 %/8 % band with the "stay with last
 decision" rule above gives the system time to absorb the change
 before re-evaluating. Standard thermostat pattern.
 
-### Where the gate goes
+#### Where the gate goes
 
 One place: `alloc_connection` in `crates/net/tcp/src/pool.rs` —
 the SYN handler's first allocation point. Roughly:
@@ -518,9 +584,12 @@ no longer overloaded. From a TCP-stack viewpoint this is no
 different from a SYN arriving during transient packet loss; it's
 the correct standard behaviour.
 
-### Beyond per-core idle %
+#### Sibling signals worth considering instead
 
-When per-core idle is not enough, two well-known next steps:
+If we ever reach for an adaptive controller, these are the
+validated alternatives — both are what production stacks
+actually ship, and either is preferable to idle % as a first
+adaptive signal:
 
   * **CoDel** (Linux's CAKE qdisc, RFC 8290): track the
     accept-to-handler-completion delay; shed when the **minimum**
@@ -532,8 +601,10 @@ When per-core idle is not enough, two well-known next steps:
     target — admit more when latency drops, less when it grows.
     Better for tracking the actual knee of the throughput curve.
 
-Per-core idle is the cheap first cut; CoDel-style is the obvious
-follow-up once we measure load shedding's effect on the cliff.
+Either of these is the (2) in "Recommended layering" above.
+Per-core idle stays an option only as a cheap fallback if
+profiling shows the per-request timestamping that CoDel /
+Vegas need is itself too expensive on this workload.
 
 ## Fixes shipped (commits on `bench/pareto-rig`)
 
@@ -563,16 +634,18 @@ order of impact-per-effort, ranked by what we'd ship next.
 
 ### P0 — Ship next
 
-1. **Load shedding** _(small, ~50 LOC, this doc)_
-   - Capacity-signal-based admission gate in `alloc_connection`
-     (see "Load shedding: how to decide" above). Stops the collapse
-     past CPU saturation; converts the 14K→18K cliff into a 14K
-     plateau with refused conns. Bench impact: stable `~128 K` rps
-     under overload instead of collapse to ~0. Production impact:
-     bounded p99 during traffic spikes. **Lives here**: this is a
-     per-conn-admission concern, not a per-packet one.
+P0 is the two items that **raise where the cliff sits** (RX
+coalescing + hot/cold split) plus the small deterministic-cap
+shed that **bounds what happens at the cliff** in code rather
+than via NIC SYN drops. Together: higher saturation point and
+a known failure mode at it. The adaptive controller form of
+load shedding was demoted to P3 (see "Load shedding: what role
+does it play" above) — there is no production-validated
+precedent for the per-core idle % signal, and the items below
+attack the actual cliff causes (per-frame stack cost and
+per-conn cache footprint) directly.
 
-2. **RX coalescing (GRO / RSC)** _(medium-large, owned by
+1. **RX coalescing (GRO / RSC)** _(medium-large, owned by
    [`rx-path-optimizations.md`](rx-path-optimizations.md))_
    - `init_pci_modern` currently masks off `VIRTIO_NET_F_GUEST_TSO4`
      and friends (see `VIRTIO_NET_RX_OFFLOAD_MASK`) — the comment
@@ -580,36 +653,59 @@ order of impact-per-effort, ranked by what we'd ship next.
      Enabling these lets the host coalesce N segments into one
      super-frame, cutting per-packet stack overhead 5–10× on the
      RX hot path. Single biggest expected lift for `cycles/request`
-     past the cliff investigation's data-structure wins. **Defer to**
-     `rx-path-optimizations.md` items **I + M–O** (virtio-net
-     `MRG_RXBUF` + RSC) and **J** (gve DQO_RDA RSC enable). Those
-     items pre-existed this investigation — they own the
-     implementation; this doc just names them as the highest-impact
-     cycles/poll reducer left.
+     past the cliff investigation's data-structure wins, and the
+     direct fix for the NIC-RX-overflow half of the Stage-3
+     mechanism (fewer frames per byte → ring fills more slowly).
+     **Defer to** `rx-path-optimizations.md` items **I + M–O**
+     (virtio-net `MRG_RXBUF` + RSC) and **J** (gve DQO_RDA RSC
+     enable). Those items pre-existed this investigation — they
+     own the implementation; this doc just names them as the
+     highest-impact cycles/poll reducer left. Precondition item
+     **M** already landed 2026-05-18.
 
-3. ~~**Run Linux peer baseline (nginx + tokio-hyper)**~~ _(✓ done
-   May 2026 — see "Headline: waitless vs Linux peers" above)_
-   - Confirmed: waitless beats nginx by ~15–20 % rps everywhere
-     and trails tokio-hyper by ~17–25 %. The gap-to-tokio
-     measures the per-poll cycle headroom available — closing it
-     is what the P1 items below are sized to do (`~109 K cy/req`
-     → `~85 K cy/req` would put us at parity).
-
-### P1 — Per-poll cycle reduction
-
-4. **`TcpConnection` hot/cold split** _(medium, this doc)_
+2. **`TcpConnection` hot/cold split** _(medium, this doc)_
    - Struct is ~200 B → 3+ cache lines per slot. Every per-conn
      access (`tcp_receive`, `poll_slot`, tick walk) touches all
      of them. Split into a 64 B hot half (state, ports, seq nums,
      deadlines, wakers) and a pointer to a cold half (rings,
      IOBufs, RTT history). Cuts cache-line touches per poll by ~3×.
-     **Lives here**: it's a per-conn data-structure layout change,
-     same scope as the slot pool itself.
+     Directly attacks the cache-pressure half of the Stage-3
+     mechanism: at 18 K conns / 8 cores per-core working set
+     blows past L2; shrinking the hot footprint pushes that
+     blow-up point further out. **Lives here**: it's a per-conn
+     data-structure layout change, same scope as the slot pool
+     itself.
+
+3. **Deterministic conn-count cap (minimal load shedding)**
+   _(small, ~30 LOC, this doc)_
+   - `alloc_connection` already returns `None` past slot-pool
+     exhaustion — make that path *counted* (`syn_shed` counter
+     in TCP `/obs`) and add a per-core cap *below* slot-pool size
+     so the cliff is bounded by code rather than by NIC RX-ring
+     SYN drops. No controller, no idle-% sampling, no hysteresis
+     — pure capacity wall, the form Linux's `listen(backlog)`
+     uses. Bench impact same as the adaptive form would deliver:
+     stable plateau under overload instead of collapse to 0. The
+     P0 #1 / #2 items above raise *where* the plateau sits;
+     this one bounds *what happens at it*. See "Load shedding:
+     what role does it play" above for the design discussion and
+     the deferred adaptive variants.
+
+4. ~~**Run Linux peer baseline (nginx + tokio-hyper)**~~ _(✓ done
+   May 2026 — see "Headline: waitless vs Linux peers" above)_
+   - Confirmed: waitless beats nginx by ~15–20 % rps everywhere
+     and trails tokio-hyper by ~17–25 %. The gap-to-tokio
+     measures the per-poll cycle headroom available — closing it
+     is what the P0 #2 + P1 items below are sized to do
+     (`~109 K cy/req` → `~85 K cy/req` would put us at parity).
+
+### P1 — Per-poll cycle reduction
 
 5. **Prefetch slot at `poll_slot` entry** _(tiny, this doc)_
    - One `_mm_prefetch` on the slot before the future runs hides
      L2→L1 latency on the slot's hot half. Free hint. ~5–10 %
-     when cache-bound.
+     when cache-bound. Stacks with P0 #2 (hot/cold split): the
+     prefetch is more effective when the hot half fits a line.
 
 6. **AES-GCM TLS cipher** _(medium, partly in
    [`tx-path-optimizations.md`](tx-path-optimizations.md))_
@@ -652,11 +748,17 @@ order of impact-per-effort, ranked by what we'd ship next.
       first-time rx_ring/rtx_buf allocation during warmup still
       hits the lock. Per-CPU caches eliminate the contention.
 
-11. **Adaptive concurrency (Netflix RED-style)** _(medium)_
-    - Replace P0's fixed-threshold shedding with an EWMA on p99
-      latency — when p99 climbs past target, throttle accept
-      rate. Tracks the actual saturation point as workloads
-      change (vs hardcoded conns/core).
+11. **Adaptive admission controller (CoDel or Netflix Vegas)** _(medium)_
+    - Only after P0 #3's fixed cap is in place *and* measurement
+      shows the workload's per-conn cost varies enough that one
+      number doesn't fit. Pick a **validated** signal — CoDel's
+      accept-to-completion delay minimum, or Vegas's p99 latency
+      target — and feed an EWMA into the gate. Tracks the actual
+      knee of the throughput curve as workloads change. See
+      "Load shedding: what role does it play" → "Recommended
+      layering" step (2) above for the full design discussion;
+      do NOT reach for per-core idle % as the signal here
+      (lagging + noisy + no production precedent).
 
 12. **eBPF/XDP-style early filter** _(large, possibly unfeasible)_
     - DDoS / bad-source-IP drop at the NIC RX boundary, before
