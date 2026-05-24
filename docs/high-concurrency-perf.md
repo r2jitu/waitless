@@ -5,6 +5,32 @@ conns competitively" investigation. Captures the measurements and
 fixes from the `bench/pareto-rig` work and ranks the remaining gaps
 we believe matter most for the next round.
 
+## How this fits with the other perf docs
+
+The repo has several long-running trackers that each own a slice of
+the perf story. This doc focuses on the **high-concurrency cliff**
+(10 K + concurrent conns / saturation behaviour) and where it
+overlaps with the others, defers to them rather than duplicating
+their analyses.
+
+| Doc                                  | What it owns                                                  |
+|--------------------------------------|---------------------------------------------------------------|
+| [`benchmarking.md`](benchmarking.md) | The bench harness (`bench.py`), GCE bench wrappers, the bench-environment matrix. Read this first for "how do I run a bench." |
+| [`rx-path-optimizations.md`](rx-path-optimizations.md) | Per-byte / per-frame RX cost. Memcpy reduction, IOBuf zero-copy, **HW GRO / RSC** (items I–O — directly owns P0 #2 below). |
+| [`tx-path-optimizations.md`](tx-path-optimizations.md) | Per-byte / per-frame TX cost. Encrypt-in-place, TSO, header-fusion (items A–G). Already trimmed cycles/poll significantly; further wins here would also lift the saturation point. |
+| [`observability.md`](observability.md) | The `Counter` / `LastEvent` / `LatencyHist` primitives and the `/obs` exposure rules. The instrumentation we added (`accept_iterations`, `tick_iterations`, `tasks_polled_per_worker`, etc.) follows this doctrine. |
+| [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md) | TCP RFC gaps (active opens, RFC 7323 window scaling, …). The intrusive-timer-list and accept-ring work below was perf-only; semantics unchanged. |
+| [`conformance-roadmap.md`](conformance-roadmap.md) | Conformance-testing strategy + QUIC RFC backlog. |
+| [`gvnic.md`](gvnic.md) | gVNIC device behaviour, DQO vs GQI queue formats. |
+
+The high-level rule for "where does this fix belong?":
+
+  * **per-byte / per-packet RX cost** → `rx-path-optimizations.md`
+  * **per-byte / per-packet TX cost** → `tx-path-optimizations.md`
+  * **per-conn data structures, per-conn scheduling, saturation
+    behaviour, load shedding** → this doc
+  * **RFC correctness** → `tcp-conformance-backlog.md`
+
 ## Goal
 
 Best-in-class concurrent HTTP/TLS throughput on the bare-metal
@@ -13,6 +39,12 @@ tokio-hyper) at the same conn counts on the same hardware, with
 graceful degradation past saturation.
 
 ## How to bench
+
+For the full bench harness (`bench.py`, workload matrix,
+before/after measurement workflow) see
+[`benchmarking.md`](benchmarking.md). The scripts below are the
+fast single-cell iteration scripts that grew out of this
+investigation, layered on top of that harness.
 
 Three iteration envs, ranked by speed and faithfulness to the
 production datapath:
@@ -369,50 +401,65 @@ order of impact-per-effort, ranked by what we'd ship next.
 
 ### P0 — Ship next
 
-1. **Load shedding** _(small, ~50 LOC)_
-   - Drop SYNs when `live_conns_per_core > threshold` (suggest
-     ~2000 from current data). Stops the collapse past CPU
-     saturation; converts the 14K→18K cliff into a 14K plateau
-     with refused conns. Bench impact: stable `~128 K` rps under
-     overload instead of collapse to ~0. Production impact:
-     bounded p99 during traffic spikes.
+1. **Load shedding** _(small, ~50 LOC, this doc)_
+   - Capacity-signal-based admission gate in `alloc_connection`
+     (see "Load shedding: how to decide" above). Stops the collapse
+     past CPU saturation; converts the 14K→18K cliff into a 14K
+     plateau with refused conns. Bench impact: stable `~128 K` rps
+     under overload instead of collapse to ~0. Production impact:
+     bounded p99 during traffic spikes. **Lives here**: this is a
+     per-conn-admission concern, not a per-packet one.
 
-2. **RX coalescing (GRO equivalent)** _(medium, ~200 LOC)_
+2. **RX coalescing (GRO / RSC)** _(medium-large, owned by
+   [`rx-path-optimizations.md`](rx-path-optimizations.md))_
    - `init_pci_modern` currently masks off `VIRTIO_NET_F_GUEST_TSO4`
      and friends (see `VIRTIO_NET_RX_OFFLOAD_MASK`) — the comment
      notes our RX path only handles single-descriptor ≤MTU frames.
      Enabling these lets the host coalesce N segments into one
      super-frame, cutting per-packet stack overhead 5–10× on the
-     RX hot path. Single biggest expected lift for `cycles/request`.
+     RX hot path. Single biggest expected lift for `cycles/request`
+     past the cliff investigation's data-structure wins. **Defer to**
+     `rx-path-optimizations.md` items **I + M–O** (virtio-net
+     `MRG_RXBUF` + RSC) and **J** (gve DQO_RDA RSC enable). Those
+     items pre-existed this investigation — they own the
+     implementation; this doc just names them as the highest-impact
+     cycles/poll reducer left.
 
 3. **Run Linux peer baseline (nginx + tokio-hyper)** _(operational,
    not code)_
    - Same c3 hardware, same conn sweep, same /health-TLS profile.
      Until we have this we don't know if 170 K rps is competitive
      or 2× behind. Required to size the rest of the roadmap honestly.
-     Bench infra already deployed (`scripts/peer-linux/*`), just
-     needs an hour of running. **Do this first.**
+     Bench infra already deployed
+     ([`scripts/peer-linux/*`](../scripts/peer-linux/)), just needs
+     an hour of running. **Do this first.**
 
 ### P1 — Per-poll cycle reduction
 
-4. **`TcpConnection` hot/cold split** _(medium)_
+4. **`TcpConnection` hot/cold split** _(medium, this doc)_
    - Struct is ~200 B → 3+ cache lines per slot. Every per-conn
      access (`tcp_receive`, `poll_slot`, tick walk) touches all
      of them. Split into a 64 B hot half (state, ports, seq nums,
      deadlines, wakers) and a pointer to a cold half (rings,
      IOBufs, RTT history). Cuts cache-line touches per poll by ~3×.
+     **Lives here**: it's a per-conn data-structure layout change,
+     same scope as the slot pool itself.
 
-5. **Prefetch slot at `poll_slot` entry** _(tiny)_
+5. **Prefetch slot at `poll_slot` entry** _(tiny, this doc)_
    - One `_mm_prefetch` on the slot before the future runs hides
      L2→L1 latency on the slot's hot half. Free hint. ~5–10 %
      when cache-bound.
 
-6. **AES-GCM TLS cipher** _(medium)_
+6. **AES-GCM TLS cipher** _(medium, partly in
+   [`tx-path-optimizations.md`](tx-path-optimizations.md))_
    - We negotiate only `TLS_CHACHA20_POLY1305_SHA256` (~20 cy/B
      measured). AES-GCM-128 with AESNI is 1–3 cy/B — ~10× faster
      bulk encrypt. Bigger payoff on `/static-*` than `/health`;
      /health gets ~10 % rps lift since TLS is only ~10 % of the
-     poll budget there.
+     poll budget there. Related: `tx-path-optimizations.md` items
+     **C + D** already fused encrypt into the TX-slot to remove
+     the post-encrypt memcpy; the cipher choice itself is the
+     remaining lever.
 
 ### P2 — Bigger architectural wins
 
@@ -459,7 +506,12 @@ order of impact-per-effort, ranked by what we'd ship next.
 
 Surface that survived from the cliff investigation — cheap
 (batched bumps), useful as ongoing health metrics + regression
-guards. All in the TCP `/obs` block unless noted.
+guards. All in the TCP `/obs` block unless noted. Follows the
+`Counter` / `LastEvent` doctrine in
+[`observability.md`](observability.md) (specifically the
+"Performance observability" section there explains the
+batched-bump pattern used for `hash_find_probes` and the tick
+counters).
 
 | Counter                                    | Healthy range                                  | What it tells us                                              |
 |--------------------------------------------|------------------------------------------------|---------------------------------------------------------------|

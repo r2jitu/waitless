@@ -5,6 +5,12 @@ encrypt and the wire. Covers both HTTPS-over-TCP and HTTPS-over-H3
 (QUIC). Each item below is sized to land as one (or a small batch
 of) commit(s); check items off as we ship them.
 
+> **See also:** [`high-concurrency-perf.md`](high-concurrency-perf.md)
+> for the high-conn cliff context — the encrypt-in-place + header-
+> fusion work shipped here (items A–D, G) already moved
+> `cycles/request` down significantly. Remaining TX-side lever
+> tracked there is the AES-GCM cipher choice.
+
 ## Why this doc exists
 
 We measured the per-byte guest-side memcpy count starting at **5

@@ -13,6 +13,12 @@ HTTP/3 (QUIC) where applicable. Each item below is sized to land
 as one (or a small batch of) commit(s); check items off as we
 ship them.
 
+> **See also:** [`high-concurrency-perf.md`](high-concurrency-perf.md)
+> for the high-conn cliff investigation. Items I + J + M–O below
+> are P0 on that doc's gap list — RX coalescing is the biggest
+> remaining lever on `cycles/request` past the data-structure
+> work shipped in `bench/pareto-rig`.
+
 Phase 1 of this work — streaming request body via `BodyReader`
 — landed 2026-05-15 (commit `820a2e6`) and is documented at the
 top of the progress log. This doc covers Phase 2 (IOBuf-based
