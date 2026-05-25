@@ -81,7 +81,30 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // the operator sees the boot context that led up to the panic
     // even if the crash beat the post-PCI upgrade.
     serial::flush_early_buf();
-    serial::puts(b"PANIC in entry\n");
+    // Mirror the panic location + message that we just appended to
+    // the diag ring to serial as well — the high-concurrency cliff
+    // investigation (2026-05-24) revealed that under burst load all
+    // 8 cores can panic on alloc failure simultaneously, and
+    // `/diag-panic` is unreachable by then because the unikernel is
+    // about to power off. A serial dump on every panic is the only
+    // post-mortem channel that survives.
+    //
+    // Single `write_fmt` so the whole block goes out under one
+    // `SERIAL_TX_LOCK` acquire — without that, multiple cores
+    // panicking simultaneously would interleave at `write_str`-chunk
+    // granularity, garbling both records. When location is None the
+    // `"?":0` rendering is intentional and unambiguous (no real path
+    // is `?` and no real source line is 0).
+    let (file, line) = info
+        .location()
+        .map(|l| (l.file(), l.line()))
+        .unwrap_or(("?", 0));
+    serial::write_fmt(format_args!(
+        "\n=== PANIC ===\n  at {}:{}\n  msg: {}\n==============\n",
+        file,
+        line,
+        info.message(),
+    ));
     unsafe { arch_shutdown() }
 }
 
