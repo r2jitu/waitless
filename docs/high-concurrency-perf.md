@@ -505,6 +505,349 @@ list, none yet measured:
     or conntrack table hitting a wall at ~24 K simultaneous
     flows. Worth ruling out before chasing server-side causes.
 
+## Heap OOM root-cause analysis (2026-05-24)
+
+The "cliff" at 18–24 K conns on c3+gVNIC reaches the heap before
+it reaches CPU: `mm::alloc` returns null, the two non-graceful
+allocation primitives in the data path
+(`crates/proto/tls/src/lib.rs:598` and
+`crates/net/tcp/src/pool.rs:146`) panic via Rust's default
+alloc-error handler, the `#[panic_handler]` in
+`crates/boot/src/entry.rs:51` calls `arch_shutdown`, and GCE marks
+the VM `guestTerminate`. A separate branch is making those two
+sites graceful. This subsection answers the prior question of
+*why* the heap fills at 18 K when the nominal per-conn budget
+suggested ~30 K. Short answer: the nominal was wrong by ~2× —
+the per-conn slope is ~180 KB, not 98 KB — and on top of that
+the close path shreds the heap into a ~170× higher fragment
+count, so the actual ceiling is reached well before the
+per-conn × conn-count product would predict.
+
+Measurement env: HVF runner with `--ram=768 --cpus=4`. The runner
+caps mapped guest RAM at 1 GiB (vm.rs:207 — one L1 block at the
+ARM 4 KiB granule), so the absolute conn ceiling on HVF is ~¼
+of GCE's; the **shape of the heap-usage curve** is what we read
+out. Boot reports `mem: 764 / 768 MB heap`,
+`/obs.kernel.heap_claimed_bytes = 802 811 904`.
+
+### H1 — Heap is 3 GB on GCE / 766 MB on HVF: **CONFIRMED, but GCE shape is wrong**
+
+`/obs.kernel` at idle on HVF reports
+`heap_allocated_bytes = 6.85 MB`,
+`heap_available_bytes = 758.76 MB`,
+`heap_claimed_bytes = 765.8 MB` — matches `mem: 764 / 768 MB heap`
+on the boot banner. GCE c3 deploy boot log shows `mem: 3011 /
+3012 MB heap`.
+
+**But c3-highcpu-8 has 16 GB of RAM** (Google's spec). We are
+using **3 of 16 GB**. The 13 GB shortfall is two stacked
+boot-time limits:
+
+1. **`boot.S` identity-maps only the first 4 GiB.** `boot_pml4
+    → boot_pdpt → boot_pd0..3` covers "4 × 512 × 2MB = 4GB" of
+    physical address space (boot.S:77-78, boot.S:144-157). Any
+    physical address ≥ 4 GiB is not mapped at boot. GCE puts the
+    16 GiB of guest RAM as `[0, 3 GiB)` (below the PCI MMIO
+    window at 3-4 GiB) plus `[4 GiB, 16 GiB)` above the hole.
+    Only the low ~3 GiB is reachable through the boot map.
+2. **`mm::init_heap` defensively skips any `MEM_AVAILABLE`
+    region with `base >= 0x1_0000_0000`** (mm.rs:182, comment
+    on line 173-184). Even if the boot map did cover more,
+    `claim_phys` writes through `hhdm + phys`; without an HHDM
+    or identity map for the upper RAM that write would
+    triple-fault talc on the first claim. So the 13 GiB above
+    4 GiB is silently dropped from the heap-claim loop.
+
+The mm.rs comment on line 180-181 claims "Limine on x86_64 has
+its own HHDM that covers the full RAM and doesn't hit this
+path." That is **stale** as of this writing — the GCE deploy
+target is `//apps/webserver:webserver_iso_x86_64` (Limine ISO,
+per `deploy-gcloud.sh`), but the skip at mm.rs:182 fires
+regardless of `hhdm_offset`. The boot log proves it: a c3-
+highcpu-8 with 16 GiB physical RAM reports
+`mem: 3011 / 3012 MB heap`.
+
+So the 3 GB heap on GCE is not a hardware ceiling — it's a
+boot-stub / heap-init pair that was sized for the kvm-vm 4 GiB
+guest and hasn't been revisited since c3 became the production
+shape. Fixing the boot stub to identity-map past 4 GiB (or use
+Limine's HHDM properly for `claim_phys`) **multiplies the heap
+ceiling by 5×, with no per-conn-slope work**. This dominates
+every other ceiling-mover in this investigation.
+
+### H2 — Per-conn nominal is wrong; actual slope is ~182 KB/conn: **CONFIRMED**
+
+Drove HTTPS `/health` against the local HVF for 30 s at multiple
+N, sampling `/obs` at t=8 s, 15 s, 23 s into each run. Per-conn
+delta vs the idle baseline (`alloc=6.85 MB`, `live_conns=1`):
+
+| N (target) | live_conns | heap_alloc | per-live-conn | tasks_spawned | frag_count |
+|-----------:|-----------:|-----------:|--------------:|--------------:|-----------:|
+| (idle)     |          1 |   6.85 MB  |          —    |            29 |          9 |
+|        100 |        102 |  24.64 MB  | **179.8 KB**  |           130 |          9 |
+|        500 |        504 |  96.10 MB  | **181.6 KB**  |           560 |         21 |
+|      1 500 |      1 598 | 290.76 MB  | **182.0 KB**  |         2 061 |        104 |
+|      2 500 |      2 502 | 451.89 MB  | **182.0 KB**  |         2 530 |         11 |
+
+The slope is flat at ~182 KB/live-conn across two orders of
+magnitude. Nominal per-conn from the assignment was 98 KB. The
+~84 KB gap is everything the nominal omitted:
+
+| Source                                                        | Bytes |
+|---------------------------------------------------------------|------:|
+| TCP `rx_ring` (lazy, preserved per slot)                      | 16 KB |
+| TCP `rtx_buf` (lazy, preserved per slot)                      | 64 KB |
+| `Box<TlsConnImpl>` (per-conn TLS state — 3×4 KB inline buffers + keys + cfg Arc) | ~12 KB |
+| `TlsStream` `record_scratch` (lazy on scratch fallback; `TLS_RECORD_LEN` ≈ 16 KB) | ~16 KB |
+| **Handler future `Box`** — `serve_conn` future state:         |      |
+| &nbsp;&nbsp;`buf: [u8; 16384]` parse buffer                       | 16 KB |
+| &nbsp;&nbsp;`req: Request` (16-header array + 256 B path)         | ~5.5 KB |
+| &nbsp;&nbsp;`header_storage: [u8; 1024]`                         | 1 KB |
+| &nbsp;&nbsp;`TlsStream.cipher_buf: [u8; 8192]`                    | 8 KB |
+| &nbsp;&nbsp;`TlsStream.tx_scratch: [u8; 2048]`                    | 2 KB |
+| `TcpConnection` slot (in pool segment, ~600 B)                | ~1 KB |
+| Talc per-allocation headers + alignment slack                 | ~40 KB |
+| **Total**                                                     | **~182 KB** |
+
+The **handler future Box alone is ~33 KB** — 16× the
+1–2 KB the assignment expected. The single biggest contributor
+is `serve_conn`'s inline `buf: [u8; BUF_SIZE]` (16 KB) — the
+request parse buffer that was folded into the future state in
+commit-history note "one fewer alloc per conn-accept." That
+optimisation removed per-request churn, but it loaded 16 KB per
+live conn onto the heap as long as the conn is alive. The
+Box-per-spawn pays once per accept (handler future) and once per
+TLS conn (`Box<TlsConnImpl>` = ~12 KB metadata + 12 KB inline rx/tx/pt).
+
+Apply 182 KB to GCE's 3 GB heap → **ceiling ≈ 16.9 K conns**
+before fragmentation. That's exactly the 18 K end of the
+"cliffs at 18–24 K" band; the per-conn slope alone explains the
+cliff position.
+
+### H3 — Buffers preserved across conn close: **CONFIRMED with twist**
+
+`free_connection` → `reset_preserving` hands `rx_ring` and
+`rtx_buf` back to the same slot — the 80 KB ride along on every
+slot reuse (state.rs:491). For the slots that ever transition
+out of `Closed`, the 80 KB is locked to the slot until pool
+shutdown.
+
+But the more interesting load-bearing fact: `live_conns` counts
+**every non-Closed / non-Listen state** including the
+`TimeWait` 2×MSL hold (60 s, state.rs:184). Draining a 2 500-conn
+bench:
+
+| phase                       | live_conns | heap_alloc | alloc_count | fragment_count |
+|-----------------------------|-----------:|-----------:|------------:|---------------:|
+| peak (t=23 s mid-bench)     |     2 504  |  452.1 MB  |    16 233   |             11 |
+| after wrk exits (+3 s)      |     1 132  |  317.3 MB  |    10 792   |      **1 853** |
+| after 5 s of 100 fresh conns|     1 133  |  317.3 MB  |    10 790   |          1 857 |
+
+The 1 132 `TIME_WAIT` slots still consume 317 MB — 280 KB each
+above the 6.85 MB baseline. That's more than the 80 KB preserved
+buffers alone, which suggests the per-conn handler task hasn't
+completed for those slots yet (likely blocked on TLS
+`close_notify` or sitting in the recv-loop drain) and is still
+holding the ~33 KB future Box + ~12 KB TLS Box + ~16 KB
+`record_scratch`. The TLS `record_scratch` IS dropped on conn
+close (per `TlsStream`'s `Drop`), but only once the future
+itself drops — same epoch as the handler task completing.
+
+Static-analysis correction: `record_scratch` is **not**
+preserved-per-slot. It lives inside `TlsStream` which is a
+field of the per-conn handler future. When the future returns,
+the box drops. So at any moment, it's bounded by live-conn count,
+not peak-conn count.
+
+### H4 — talc fragmentation chews the deficit: **CONFIRMED, fires on drain**
+
+`fragment_count` is the load-bearing signal:
+
+| phase                           | fragment_count | (claimed - allocated) - available |
+|---------------------------------|---------------:|----------------------------------:|
+| idle                            |              9 |                              0 MB |
+| steady state (2 500 conns)      |             11 |                              0 MB |
+| drain (1 100 TIME_WAIT slots)   |      **1 853** |                              0 MB |
+| after 5 s of 100 fresh conns    |          1 857 |                              0 MB |
+
+At steady-state, the per-core "fill segments sequentially" pattern
+keeps the heap tightly packed (just 11 holes across 16 K live
+allocations). The instant wrk closes its conns the fragment count
+goes up 170×. The pattern:
+
+  * Live alloc shape per conn: 16 KB rx_ring, 64 KB rtx_buf,
+    ~16 KB record_scratch, ~12 KB TlsConnImpl, ~33 KB future
+    Box. Mixed sizes interleaved on the heap.
+  * On conn close the future/TLS/record_scratch free at scattered
+    offsets, leaving rtx_buf-sized (64 KB) and record_scratch-sized
+    (16 KB) holes around still-live structures. Slot-preserved
+    rx_ring + rtx_buf don't free — they stay with the slot.
+  * The next batch of accepts allocates new futures + TLS state
+    + record_scratch from the segregated-free-list, but the holes
+    don't always match the new requests' sizes — slow consolidation.
+
+So the GCE Stage-2/3 collapse mechanism gets worse the moment
+wrk's `--timeout` starts firing and conns churn. Each
+close→retry cycle adds fragmentation; eventually a 64 KB rtx_buf
+or 16 KB record_scratch request can't be satisfied even though
+`available_bytes` says there's room.
+
+`(claimed - allocated) - available` stayed at 0 across this
+measurement — talc accounts every byte. The fragment count *is*
+the deadweight signal; bytes-wise the cost is bounded by talc's
+~32 B per-block header (1 853 × 32 ≈ 60 KB direct overhead) but
+the structural cost (which large alloc *can't fit anywhere*) is
+unbounded.
+
+### H5 — Real memory leak: **REJECTED**
+
+Heap returns to a steady-state baseline modulo H3:
+
+  * t=23 s peak: 452 MB
+  * drain (live=1 132): 317 MB (released 135 MB ≈ 1 372 conns × ~100 KB
+    of non-preserved per-conn — future Box, TLS state, record_scratch)
+  * after 5 s of 100 fresh conns (live=1 133): 317.3 MB — net **+0 MB**
+
+`heap_total_allocation_count` advanced 16 283 → 16 669 (+386 over
+the drive-100 phase), so allocator activity continued, but
+`heap_allocated_bytes` did not grow. Allocation/deallocation
+balance.
+
+### H6 — Multiple-allocator surprises: **REJECTED**
+
+Audit of allocations outside talc's view:
+
+  * Driver DMA buffers (virtio-net, gve): allocated once at boot
+    via `alloc_pages` → talc-tracked, counted in
+    `heap_allocated_bytes`. ~1 MB total.
+  * Page-table pages (x86_64 mmu) and AP stacks (SMP boot):
+    same — all through `alloc_pages` → talc.
+  * Task arena `TaskArena.slots: [TaskSlot; 4096]` per worker:
+    **static BSS**, not heap. The `BoxedFuture` each slot owns
+    *is* heap, counted in H2's slope.
+  * `TCP_HASH` (32 K entries × 10 B × per-core) and `LISTENERS`,
+    `ACCEPT_RINGS`, `TICK_HEAD`: all static BSS, not heap.
+  * `TlsConnPool.slots` (per-worker `Vec<Box<TlsConnImpl>>`,
+    cap = 16): a small fixed pool that recycles a handful of
+    boxes — negligible vs. per-live-conn cost.
+
+Talc's `heap_allocated_bytes` is the authoritative number for
+this stack.
+
+### Reconciled accounting at the cliff
+
+GCE c3-highcpu-8, 3 GB usable heap (out of 16 GB physical — see
+H1), 8 cores, healthy zone before the cliff (cliff at 18 K conns):
+
+```
+Static  (boot) .................   ~7 MB
+Per live conn × 18 K × 182 KB ...  3 200 MB              ← the cliff
+Talc bookkeeping (~32 B/header) .   ~16 MB
+Fragmentation slack (variable) ..  +0 to +200 MB during churn
+────────────────────────────────────────────
+                                   ≥ 3 200 MB        > 3 GB heap → OOM
+```
+
+The per-conn slope alone takes the heap past 3 GB at ~16.5 K
+conns. The observed cliff at 18 K conns matches once you account
+for some lazy buffers (rtx_buf, record_scratch) being deferred
+until the first send. Fragmentation is the multiplier on top —
+when conns start cycling (loss / timeout / RST) the fragment
+count balloons and any individual 16 KB or 64 KB request can hit
+"can't fit" even before bytes-allocated exhausts.
+
+### Recommended ceiling-movers (ranked by ceiling-shift)
+
+The goal is to push the cliff past the current 18–24 K band. The
+first item dwarfs everything below it.
+
+0. **Unlock the other 13 GB of RAM on c3 (boot-stub / heap-init
+   fix).** The c3-highcpu-8 has 16 GB; we use 3 GB (see H1). Two
+   coupled fixes:
+   * In `boot.S`, extend the bootstrap identity map past 4 GiB —
+     either grow `boot_pdpt` to 16 entries (covers 16 GiB) plus
+     16 PDs, or pivot to a single 1 GiB-page-mapped PDPT (cheaper:
+     one PDPT × 16 entries with PS=1, no PD tables). Same shim,
+     bigger reach.
+   * In `mm::init_heap`, drop the `r.base >= 0x1_0000_0000` skip
+     once the boot map covers the upper RAM. The skip exists
+     because `claim_phys` writes through `hhdm + phys` and would
+     fault on an unmapped upper region; with the boot map
+     extended (or with proper Limine-HHDM use on the ISO path),
+     the writes succeed.
+   * Effect at current per-conn slope: **3 GB → 16 GB heap takes
+     the cliff from 18 K → ~96 K conns**, before any per-conn
+     work below. Even with conservative fragmentation slack the
+     cliff lands well past 64 K — into the territory where CPU
+     saturation (the original P0 #1–#3 in this doc) is the
+     binding constraint again, which is the regime the rest of
+     the doc was written for. *This item alone is the largest
+     single ceiling-mover in the whole document.*
+
+1. **`serve_conn` parse buffer: 16 KB inline → 4 KB inline + spill.**
+   The `buf: [u8; 16384]` was sized for "worst-case header sets
+   plus the leading bytes of a POST body" (server.rs:24). A 4 KB
+   inline buffer covers every typical HTTP/1.1 GET headers and the
+   handful of headers wrk / browsers send; oversized requests can
+   fall through to a heap-spill grow path or get rejected with 431.
+   **Saves 12 KB/conn → 18 K → 25 K cliff on GCE shape.**
+
+2. **`TcpConnection` rtx_buf default: 64 KB → 16 KB.**
+   `RTX_BUF_BYTES = 65536` is sized to cover the largest possible
+   `min(cwnd, rwnd)` (state.rs:142). For `/health` and most static
+   workloads the in-flight window peaks at a small multiple of
+   MSS (≤ 16 KB) — most slots never need 64 KB. Make it size-on-
+   demand: start at 16 KB, double on overflow up to 64 KB. **Saves
+   up to 48 KB/conn on idle keep-alive slots; up to 16 K → 30 K
+   cliff if the bench workload tops out below 16 KB in flight.**
+
+3. **`TlsStream.cipher_buf`: 8 KB inline → 4 KB inline.**
+   Sized for "one TCP MTU's worth of inbound ciphertext per recv
+   call" (lib.rs:444). 4 KB still covers the common case (most
+   `recv` returns one MTU = ~1.4 KB), and short reads loop. **Saves
+   4 KB/conn.**
+
+4. **`Request` headers array: `[Header; 16]` → smaller default + grow.**
+   Each `Header = 336 B`, so 16 × 336 = 5.4 KB. Browsers send
+   8–12 headers; wrk sends 2–4. Cap at 8 inline + lazy `Vec`
+   overflow. **Saves ~2.7 KB/conn.**
+
+5. **Defragmentation pass on slot reuse.**
+   At drain time we go from 11 → 1 853 fragments. A "best-fit
+   coalesce" hint on every nth `free_connection` (or even just at
+   slot recycle time) could keep the fragment_count lower. Talc
+   exposes no defrag API today — would need a per-CPU slab for the
+   common 16 KB / 64 KB sizes, or migrate to a buddy allocator
+   underneath the per-size pools.
+
+Items 1–4 are pure parameter changes, no architectural work,
+and stack additively. 1+2+3+4 drop from 182 KB to ~99 KB / conn —
+back-of-envelope **3 GB / 99 KB ≈ 31 K conns**, moving the cliff
+past 24 K so the load-shedding doctrine (P0 #3) can take over.
+But item 0 is **5× larger** on its own and is a one-time boot
+fix, so it should land first regardless.
+
+The cliff-correlated counters that already exist in `/obs` are
+sufficient for tracking this:
+
+  * `kernel.heap_allocated_bytes` / `heap_available_bytes` —
+    drives the "are we approaching the wall?" graph.
+  * `kernel.heap_fragment_count` — the early-warning signal;
+    crosses 1 000 well before bytes-allocated saturates.
+  * `tcp.live_conns` × per-conn slope = predicted heap
+    consumption; deviation between predicted and observed flags
+    a leak or unexpected allocator.
+  * `kernel.heap_oom` / `last_oom` — the post-mortem if the
+    in-flight graceful-handling branch is reverted.
+
+No new probes worth keeping landed in this investigation — the
+existing surface (commits `51914e2` for `live_conns` + the
+existing `kernel` block) is sufficient. The HVF `--ram` ceiling
+(~1 GB hard cap from the L1-block-size map in vm.rs:207) limits
+how high HVF can drive this kind of test; a future
+`--ram=2048` etc. would need a multi-block kernel-map change
+in `boot.S`.
+
 ### New diagnostic surface
 
 Commit `51914e2` landed the cycle-cost + working-set
