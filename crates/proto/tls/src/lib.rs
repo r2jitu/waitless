@@ -594,8 +594,23 @@ impl TlsStream {
             record_scratch,
             ..
         } = self;
-        let scratch = record_scratch
-            .get_or_insert_with(|| alloc::vec![0u8; TLS_RECORD_LEN].into_boxed_slice());
+        // Lazy first-use alloc of the per-conn TLS record scratch
+        // (`TLS_RECORD_LEN` ≈ 16 KB). Under high-concurrency load the
+        // heap can be exhausted by the time the Nth conn reaches its
+        // first app-data send; `try_reserve_exact` lets us refuse the
+        // send gracefully (returns `Err(())` like any other TLS send
+        // failure) instead of `arch_shutdown`-ing the unikernel via
+        // Rust's default alloc-error handler. Mirrors the pattern in
+        // `tcp::state::ensure_rx_ring` / `ensure_rtx_buf`.
+        if record_scratch.is_none() {
+            let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+            if v.try_reserve_exact(TLS_RECORD_LEN).is_err() {
+                return Err(());
+            }
+            v.resize(TLS_RECORD_LEN, 0);
+            *record_scratch = Some(v.into_boxed_slice());
+        }
+        let scratch = record_scratch.as_mut().expect("just-ensured Some");
         let n = tls.seal_app_data(src, &mut scratch[..]).map_err(|_| ())?;
         // SAFETY: `scratch` is owned by `self` and stays alive
         // across the `tcp.send.await` (we hold `&mut self` for
