@@ -234,6 +234,22 @@ pub fn run(core_id: u32) -> ! {
     let mut runtime_work: u64 = 0;
     let mut iter_start_cycles = crate::time::now_cycles();
 
+    // Per-core liveness watchdog. Prints one line every WD_PERIOD_US
+    // from the bottom of this loop on this core, so a post-hang
+    // serial dump shows the last timestamp each core was making
+    // progress. If a core stops printing, its event loop is wedged
+    // (deadlocked in a callback, spinning inside a function,
+    // permanently in HLT with no wake source). Cost: ~5 µs/core every
+    // 250 ms ≈ 0.004 % CPU; one print per core every 250 ms across
+    // 8 cores is ~1.6 KB/s of serial — well below the GCE serial
+    // buffer. Diagnostic for the high-concurrency hang investigation
+    // in docs/high-concurrency-perf.md ("Disambiguation sweep" —
+    // 2026-05-24).
+    const WD_PERIOD_US: u64 = 250_000;
+    let mut last_wd_us: u64 = crate::time::since_boot_us();
+    let mut last_wd_loops: u64 = 0;
+    let mut last_wd_runtime: u64 = 0;
+
     // How many no-work iterations to spin through before arming the
     // next RX IRQ and going idle. Each iteration is a full poll +
     // drain + service cycle and costs ~200ns.
@@ -462,6 +478,33 @@ pub fn run(core_id: u32) -> ! {
             stats.busy_cycles.fetch_add(delta, Ordering::Relaxed);
         }
         iter_start_cycles = now;
+
+        // Liveness watchdog (see WD_PERIOD_US comment above). Reads
+        // `since_boot_us` cheaply, prints one line per core ~4×/s.
+        // Format: `[wd t=NNms c=N loops=N (+N/s) rt=N (+N/s)
+        // idle_enters=N did=B]`. If a core stops printing, that's
+        // where it wedged. Reads `last_*` locals so the per-print
+        // computed rates are insensitive to drift.
+        let wd_now_us = crate::time::since_boot_us();
+        if wd_now_us.wrapping_sub(last_wd_us) >= WD_PERIOD_US {
+            let dt_us = wd_now_us.wrapping_sub(last_wd_us).max(1);
+            let dl = loops.wrapping_sub(last_wd_loops);
+            let dr = runtime_work.wrapping_sub(last_wd_runtime);
+            crate::serial::write_fmt(format_args!(
+                "[wd t={}ms c={} loops={} (+{}/s) rt={} (+{}/s) idle_enters={} did={}]\n",
+                wd_now_us / 1000,
+                core_id,
+                loops,
+                dl * 1_000_000 / dt_us,
+                runtime_work,
+                dr * 1_000_000 / dt_us,
+                idle_count,
+                did_work as u8,
+            ));
+            last_wd_us = wd_now_us;
+            last_wd_loops = loops;
+            last_wd_runtime = runtime_work;
+        }
     }
 
     // Print diagnostics
