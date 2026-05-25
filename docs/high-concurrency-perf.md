@@ -869,6 +869,197 @@ how high HVF can drive this kind of test; a future
 `--ram=2048` etc. would need a multi-block kernel-map change
 in `boot.S`.
 
+## Graceful-OOM tolerance audit (2026-05-25, post-fix branch)
+
+The `fix/cliff-graceful-oom` branch made two allocation sites
+graceful — the TLS record scratch (`crates/proto/tls/src/lib.rs:598`)
+and the TCP pool segment growth (`crates/net/tcp/src/pool.rs:146`).
+This subsection answers the next question: **with those two sites
+fixed, does the unikernel actually survive a heap-OOM event, or
+does it just hit a different panic site instead?** Answer:
+**partial — one large panic site remains in the per-conn path** that
+will still take the VM down when the heap fills.
+
+### Method
+
+Walk the allocation cascade from "SYN arrives" to "first byte of
+response sent," classify every allocation as **GRACEFUL** (uses
+`try_reserve_exact` or a manual `alloc::alloc::alloc` + null-check,
+returns an error on failure), **PANIC** (uses `Vec::with_capacity`
+/ `vec![…]` / `Box::new` / `Box::pin` without a graceful fallback),
+or **INFALLIBLE** (allocation is into a static / BSS region; can't
+fail). The audit covered `crates/net/tcp`, `crates/proto/tls`,
+`crates/proto/http`, `crates/proto/http3`, `crates/runtime`, and
+the driver hot paths.
+
+### The conn-accept cascade
+
+Per accepted TCP conn, in order (sizes are the bytes the request
+asks the allocator for, including per-allocation overhead estimates
+where applicable):
+
+| # | Site | Bytes | Status |
+|---|------|------:|--------|
+| 1 | `tcp::pool.rs::grow_segment` — pool segment growth | ~64 K | **GRACEFUL** (fix branch) |
+| 2 | `tcp::state.rs::ensure_rx_ring` — TCP receive ring | 16 K | **GRACEFUL** (try_reserve_exact, pre-existing) |
+| 3 | `reactor/tcp.rs:665` — `Box::pin(handler_future)` | **~33 K** | **PANIC** |
+| 4 | `tls::server.rs:355` — `Box::<TlsServer>::new_uninit()` | ~12 K | **PANIC** (mitigated by `TlsConnPool` recycle, cap=16/worker) |
+| 5 | `tcp::state.rs::ensure_rtx_buf` — retransmit buffer | 64 K | **GRACEFUL** (try_reserve_exact, pre-existing) |
+| 6 | `tls::lib.rs:598` — `record_scratch` (TLS app-data send) | ~16 K | **GRACEFUL** (fix branch) |
+
+The fix branch closes #1 and #6. Sites #2 and #5 were already
+graceful (TCP rings were the original pattern my fixes mirrored).
+Site #4 is mitigated by per-worker pool recycling — after the
+first 16 conns per worker (128 across the 8-core c3), every
+subsequent accept pops a pre-allocated `Box<TlsServer>` from the
+pool, no fresh alloc. So under sustained load, site #4 is a non-issue.
+
+**Site #3 is the residual gap.** Every accepted TCP conn goes
+through `Box::pin(async move { body(stream).await })` at
+[`crates/runtime/executor/src/reactor/tcp.rs:665`](../crates/runtime/executor/src/reactor/tcp.rs#L665).
+That's a ~33 KB heap allocation (the future state includes
+`serve_conn`'s inline `[u8; 16384]` parse buffer, the
+`Request` struct, `TlsStream`'s 8 KB cipher_buf, the 2 KB
+tx_scratch, and the handler body's own captured state — see
+the "H2" breakdown above). The standard-library `Box::pin`
+uses the global allocator and panics on null via
+`alloc::alloc::handle_alloc_error`. With the heap exhausted,
+this panic fires, runs `#[panic_handler]`, calls
+`arch_shutdown`, and the VM goes `guestTerminate` — the
+exact failure mode the fix branch was meant to eliminate.
+
+### What the fix branch *does* prevent
+
+Despite the residual gap, the two fixes do narrow the
+failure window:
+
+  * **Pool-segment growth failure (site #1) is now graceful.** Hit
+    when the per-core slot pool grows past its current capacity
+    AND the inner ~64 KB Vec alloc fails. Each fresh batch of 64
+    conns/core triggers one such alloc; under cliff conditions
+    this is the first big heap request after the small per-conn
+    work (rx_ring is 16 KB, smaller chunks fit longer). So the
+    fix catches the case where pool growth is the first request
+    big enough to exceed available heap.
+  * **TLS record scratch failure (site #6) is now graceful.** Hit
+    on first app-data send per conn. Conns that successfully
+    handshake but fail their first send (because the heap filled
+    between handshake and send) now tear down gracefully instead
+    of panicking.
+
+What the fixes don't catch is the *common* OOM order — where the
+heap fills *during* a burst of accept-loop spawns, with site #3
+firing repeatedly across cores. That's the actual cliff
+mechanism.
+
+### Per-request panic sites
+
+Once a conn is established, every request handler runs more
+allocations. Most are small but still panic-on-OOM. Even with
+admission gating at the accept level, a long-lived conn that
+sees a transient OOM mid-request would die:
+
+| Site | Bytes | When |
+|------|------:|------|
+| `tls::record.rs:649` — `vec![0u8; HEADER_LEN + plaintext_len + 1 + TAG_LEN]` | up to 16 K | TLS seal fallback (per-record) |
+| `tls::record.rs:695` — `vec![0u8; HEADER_LEN + MAX_INNER_PLAINTEXT + TAG_LEN]` | ~16 K | TLS seal fallback (per-record) |
+| `tls::aead.rs:431` — `vec![0u8; total]` | variable | AEAD seal/open |
+| `tls::handshake/client_hello.rs:558-612` — several `vec![]` | small | TLS PSK handshake parsing (cold) |
+| `http3::server.rs:321` — `vec![0u8; FRAMING_BUF_SIZE]` | 288 | HTTP/3 framing (small) |
+
+The TLS record sites are the largest of these; under sustained
+OOM where established conns continue to send, any of these would
+panic. Less urgent than site #3 (per-request is much less
+frequent than per-conn at the cliff) but worth fixing for
+defense in depth.
+
+### Driver path
+
+Audited — clean. All driver-side allocations are once-at-boot:
+
+  * gve / virtio-net DMA buffers and descriptor rings → allocated
+    via `mm::alloc_pages` at driver init, never freed, never
+    re-allocated on the per-packet path.
+  * Page-table pages (x86_64 mmu) and AP stacks (SMP boot) — same.
+  * `TaskArena.slots: [TaskSlot; 4096]` per worker — static BSS.
+    Spawn IS heap (site #3 above), but the arena that hosts the
+    spawned future is not.
+
+No per-packet allocations on the driver hot path; the cliff is
+purely the per-conn cascade.
+
+### Gap list — what's needed for true graceful-OOM tolerance
+
+In ranked priority:
+
+1. **Make `Box::pin(handler_future)` graceful at
+   `reactor/tcp.rs:665`** _(medium, ~30 LOC)_. The standard
+   library doesn't expose a stable `Box::try_new` for arbitrary
+   types, but the codebase has a precedent for the manual
+   pattern at [`runtime/worker/src/lib.rs:173`](../crates/runtime/worker/src/lib.rs#L173):
+   ```rust
+   let layout = Layout::new::<F>();
+   let raw = unsafe { alloc::alloc::alloc(layout) } as *mut F;
+   if raw.is_null() {
+       // graceful: don't spawn, drop the stream, count the
+       // refused accept.
+       return;
+   }
+   unsafe { raw.write(future); }
+   let boxed = unsafe { Box::from_raw(raw) };
+   let pinned: Pin<Box<dyn Future<Output = ()>>> = Pin::from(boxed);
+   ```
+   On failure, drop the `TcpStream` (which closes the conn with
+   RST via TCP's existing `Drop` path) and bump a `spawn_oom`
+   counter in TCP `/obs`. Wrap as `try_box_pin` in
+   `runtime/executor/src/task.rs` so the same pattern can be
+   reused at other `Box::pin` sites
+   ([`reactor/udp.rs:1069`](../crates/runtime/executor/src/reactor/udp.rs#L1069)
+   has the UDP equivalent).
+
+2. **Heap-aware admission cap (P0 #4 below)** — _(small, ~30 LOC)_.
+   The actually correct fix at the architecture level. With a
+   `MIN_HEAP_HEADROOM_BYTES` check in `alloc_connection`, SYNs
+   are refused upstream of the entire cascade so #3 never fires
+   under OOM regardless of whether it's been made graceful.
+   This + the existing fixes give "stable plateau under
+   overload" instead of "graceful conn refusal at heap-OOM."
+   The graceful-Box::pin work (item 1) becomes defense-in-depth
+   for the case where admission control's predicted-heap
+   estimate undershoots the actual.
+
+3. **Make the per-request TLS record allocs graceful** _(small,
+   each site ~5 LOC)_. The sites in `tls/record.rs:649` and
+   `tls/record.rs:695` and `tls/aead.rs:431` should use
+   `Vec::new()` + `try_reserve_exact` + return `Err` paths.
+   The TLS send path already propagates `Err` upward; the
+   audit just confirmed these sites currently panic on the
+   alloc.
+
+4. **Defense in depth: `TlsServer::new_box`** _(small, ~10 LOC)_.
+   The `Box::<TlsServer>::new_uninit()` at
+   `tls/server.rs:355` panics on OOM. Mitigated by the
+   per-worker pool (cap=16 recycled boxes) so it only fires
+   during warmup, but a strict graceful build would also fix
+   this using the same `alloc::alloc::alloc` + null-check
+   pattern.
+
+### What "tolerate OOM" means after items 1+2 land
+
+Item 1 alone gives "any individual conn-accept that hits OOM
+gracefully drops the conn instead of taking down the VM" —
+the VM survives but new conns get refused per-attempt. Item 2
+makes the refusal predictable and counted (`syn_shed` in
+TCP `/obs`) rather than racy and concentrated at the alloc
+point. Together they deliver the production-ready
+"stable plateau under overload" behavior, matching nginx /
+tokio-hyper at the same cliff point.
+
+Item 3 makes *existing* conns survive transient OOM during
+their own request handling — a strictly weaker property than
+the conn-accept survival above, but the right defense-in-depth
+once the accept path is solid.
+
 ## Load shedding: what role does it play
 
 Load shedding is a **survival** property, not a **protection**
