@@ -35,6 +35,18 @@ rust_library(
     }),
     crate_name = "kernel_bare",
     crate_root = "src/lib.rs",
+    # `verbose_diag` is the opt-in cfg for high-volume diagnostic
+    # prints (currently the per-core event-loop watchdog in
+    # `eventloop::run`). Declared so `#[cfg(verbose_diag)]` doesn't
+    # trip rustc's check-cfg lint; enable via `--cfg=verbose_diag`
+    # in `rustc_flags` of this rule for a debug build (same pattern
+    # as `tls_debug` in `//crates/proto/tls`). Off by default — the
+    # watchdog adds a TSC read per event-loop iteration and emits
+    # ~1.6 KB/s of serial across 8 cores, neither of which production
+    # deployments want full-time.
+    rustc_flags = [
+        "--check-cfg=cfg(verbose_diag)",
+    ],
     # Unikernel-only: links against MMU / APIC / IDT / boot-section
     # code that only makes sense under a bare-metal target. Host
     # compilation hits mach-o-unfriendly `#[link_section = ".boot_bss"]`

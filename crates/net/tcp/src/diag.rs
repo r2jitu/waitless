@@ -211,6 +211,15 @@ pub static LAST_TEARDOWN: LastEvent<TeardownRecord> = LastEvent::new();
 /// count discards.
 pub static LAST_ACK_UNSENT: LastEvent<AckUnsentRecord> = LastEvent::new();
 
+/// Most recent SYN dropped because `alloc_connection` returned
+/// `None` — the per-core pool was at capacity and the
+/// FIN-wait reclaim path turned up no reusable slot. The bare
+/// `pool_exhausted` counter only says "how many"; this snapshot
+/// records *when* the first / most-recent drop happened and on
+/// which core, which is the missing context for high-concurrency
+/// cliff debugging (see `docs/high-concurrency-perf.md`).
+pub static LAST_POOL_EXHAUSTED: LastEvent<PoolExhaustedRecord> = LastEvent::new();
+
 /// Snapshot payload for `LAST_RST`.
 #[derive(Clone, Copy)]
 pub struct RstRecord {
@@ -345,6 +354,31 @@ impl ObsRecord for TeardownRecord {
     }
 }
 
+/// Snapshot payload for `LAST_POOL_EXHAUSTED`.
+#[derive(Clone, Copy)]
+pub struct PoolExhaustedRecord {
+    /// Core whose per-core pool was full when the SYN arrived.
+    pub core: u32,
+    /// Slot capacity on that core at the moment of drop —
+    /// `pool_capacity(core)` evaluated synchronously. Lets a
+    /// post-mortem distinguish "hit MAX_SEGMENTS" (capacity at
+    /// `MAX_SEGMENTS × SEGMENT_SIZE`) from "grow_segment OOM'd
+    /// mid-resize" (capacity well below the per-core cap).
+    pub capacity: u32,
+    /// `kernel_core::clock::now_ms()` at the drop.
+    pub at_ms: u64,
+}
+
+impl ObsRecord for PoolExhaustedRecord {
+    fn write_fields(&self, w: &mut dyn fmt::Write) -> fmt::Result {
+        write!(
+            w,
+            "\"core\":{},\"capacity\":{},\"at_ms\":{}",
+            self.core, self.capacity, self.at_ms,
+        )
+    }
+}
+
 /// Stable lowercase name for a `TcpState` — for JSON / logs.
 pub fn state_name(s: TcpState) -> &'static str {
     match s {
@@ -401,6 +435,18 @@ pub fn record_ack_unsent(
         snd_una,
         snd_nxt,
         conn_state,
+        at_ms: kernel_core::clock::now_ms(),
+    });
+}
+
+/// Record a SYN drop due to pool exhaustion: bump `pool_exhausted`
+/// and snapshot core + capacity + timestamp into `LAST_POOL_EXHAUSTED`.
+/// Called from `receive.rs` when `alloc_connection` returns `None`.
+pub fn record_pool_exhausted(core: u32) {
+    COUNTERS.pool_exhausted.bump();
+    LAST_POOL_EXHAUSTED.record(PoolExhaustedRecord {
+        core,
+        capacity: crate::pool::pool_capacity(core) as u32,
         at_ms: kernel_core::clock::now_ms(),
     });
 }
@@ -502,6 +548,8 @@ pub fn write_obs_json(w: &mut dyn fmt::Write) -> fmt::Result {
     LAST_TEARDOWN.write_json(w, "last_teardown")?;
     w.write_str(",")?;
     LAST_ACK_UNSENT.write_json(w, "last_ack_unsent")?;
+    w.write_str(",")?;
+    LAST_POOL_EXHAUSTED.write_json(w, "last_pool_exhausted")?;
     w.write_str("}")
 }
 

@@ -202,8 +202,13 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             Some(i) => i,
             None => {
                 // No free slot and nothing reclaimable — the SYN is
-                // dropped. Genuinely unexpected below the pool ceiling.
-                crate::diag::COUNTERS.pool_exhausted.bump();
+                // dropped. Genuinely unexpected below the pool ceiling;
+                // `record_pool_exhausted` snapshots the timestamp +
+                // core + capacity into `LAST_POOL_EXHAUSTED` so a
+                // post-mortem `/obs` shows *when* the cliff first hit
+                // and on which core, not just "how many" via the bare
+                // `pool_exhausted` counter.
+                crate::diag::record_pool_exhausted(core);
                 return;
             }
         };
