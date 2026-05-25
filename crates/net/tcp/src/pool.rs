@@ -133,17 +133,39 @@ impl TcpPool {
     }
 
     /// Append a fresh segment of `SEGMENT_SIZE` slots and link them
-    /// all into the free list. Returns false at `MAX_SEGMENTS`.
+    /// all into the free list. Returns false at `MAX_SEGMENTS`, or
+    /// if the per-segment Vec allocation (~64 KB for 64
+    /// `TcpConnection` cells) cannot be satisfied. The original
+    /// `Vec::with_capacity` would panic via Rust's default alloc-
+    /// error handler when the allocator returns null — under the
+    /// high-concurrency cliff that panic fires `#[panic_handler]` →
+    /// `arch_shutdown` → GCE `guestTerminate`. `try_reserve_exact`
+    /// on a fresh `Vec::new()` instead lets us fail gracefully:
+    /// `alloc()` returns `None`, `alloc_connection` bumps
+    /// `pool_exhausted`, and the SYN gets dropped. See
+    /// `docs/high-concurrency-perf.md` "Graceful-OOM tolerance
+    /// audit" subsection (site #1 in the conn-accept cascade).
+    ///
+    /// The outer `segs` Vec growth (one `Box<[_]>` pointer per
+    /// segment, capped at `MAX_SEGMENTS = 1023` ≈ 8 KB total) is
+    /// left to panic via `segs.push` — its allocator call is so
+    /// small it's effectively guaranteed below the heap-exhaustion
+    /// threshold that the inner ~64 KB alloc hits, and an explicit
+    /// `try_reserve_exact(1)` here triggered a parallel-test hang
+    /// in `tcp_test` that didn't reproduce in production
+    /// (single-writer per core).
     fn grow_segment(&self) -> bool {
         // SAFETY: per-core ownership.
         let segs = unsafe { &mut *self.segments.get() };
         if segs.len() >= MAX_SEGMENTS {
             return false;
         }
+        let mut new_seg: alloc::vec::Vec<TcpConnCell> = alloc::vec::Vec::new();
+        if new_seg.try_reserve_exact(SEGMENT_SIZE as usize).is_err() {
+            return false;
+        }
         let segment_idx = segs.len() as u16;
         let base = segment_idx.saturating_mul(SEGMENT_SIZE);
-        let mut new_seg: alloc::vec::Vec<TcpConnCell> =
-            alloc::vec::Vec::with_capacity(SEGMENT_SIZE as usize);
         for i in 0..SEGMENT_SIZE {
             let cell = TcpConnCell::new();
             // SAFETY: just-allocated cell, no aliasing yet — safe to
