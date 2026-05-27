@@ -132,18 +132,43 @@ where
             crate::diag::COUNTERS.header_buffer_overflow.bump();
             return;
         }
-        let recv_fut = stream.recv(&mut buf[buf_len..]);
-        let got = match waitless::runtime::timeout_us(IDLE_TIMEOUT_US, recv_fut).await {
-            Some(n) => n,
+        // Fetch the next inbound segment as a `RecvChunkGuard` over
+        // the transport's own buffer (NIC RX IOBuf on bare metal,
+        // syscall heap-IOBuf on native, in-place plaintext view on
+        // TLS) and memcpy its bytes into the parse buffer. Routing
+        // through `recv_chunk` drops the rx_ring → user-buf step on
+        // the bare-metal TCP path (one fewer copy per recv) and is
+        // the prerequisite for retiring the `recv_buf_slot` /
+        // `direct_bytes` machinery on `TcpConnection`. See
+        // docs/high-concurrency-perf.md "Anatomy of CPU collapse" + H2.
+        let space = BUF_SIZE - buf_len;
+        let chunk_fut = stream.recv_chunk();
+        let got = match waitless::runtime::timeout_us(IDLE_TIMEOUT_US, chunk_fut).await {
+            Some(Some(guard)) => {
+                let data = guard.data();
+                if data.len() > space {
+                    // Single inbound chunk exceeds remaining HEAD-buffer
+                    // space. We cannot push an `IOBuf` back to the
+                    // transport, so this is unrecoverable — same fate
+                    // as the loop-top `buf_len == BUF_SIZE` check, just
+                    // observed at the chunk boundary instead of the
+                    // byte boundary. A real "push back" hook is
+                    // deferred to the broader chunk-native refactor.
+                    crate::diag::COUNTERS.header_buffer_overflow.bump();
+                    return;
+                }
+                buf[buf_len..buf_len + data.len()].copy_from_slice(data);
+                data.len()
+            }
+            Some(None) => {
+                crate::diag::COUNTERS.peer_eof.bump();
+                return; // EOF / fatal recv
+            }
             None => {
                 crate::diag::COUNTERS.idle_timeout.bump();
                 return; // idle timeout
             }
         };
-        if got == 0 {
-            crate::diag::COUNTERS.peer_eof.bump();
-            return; // EOF / fatal recv
-        }
         buf_len += got;
 
         // Drain every complete request sitting in the buffer.
