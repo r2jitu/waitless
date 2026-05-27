@@ -439,10 +439,6 @@ const PLAINTEXT_CHUNK: usize = record::MAX_INNER_PLAINTEXT - 1;
 /// `seal_app_data` writes into.
 const TLS_RECORD_LEN: usize = TLS_HEADROOM + PLAINTEXT_CHUNK + TLS_TAILROOM;
 
-/// Inline ciphertext scratch in `TlsStream` — sized for one TCP
-/// MTU's worth of inbound ciphertext per `recv` call.
-const CIPHER_BUF_LEN: usize = 8192;
-
 /// HTTPS-side `HttpStream`: owns the `TcpStream` + `PooledTlsConn`
 /// and drives the TLS state machine. `recv` blocks until decrypted
 /// plaintext is available (pumping handshake records as needed);
@@ -451,11 +447,6 @@ const CIPHER_BUF_LEN: usize = 8192;
 pub struct TlsStream {
     tcp: waitless::runtime::TcpStream,
     tls: PooledTlsConn,
-    /// Inline ciphertext scratch reused across recvs. Folded into
-    /// the struct so the future state machine that holds the
-    /// `TlsStream` carries the buffer inline — one fewer alloc
-    /// per HTTPS conn accept.
-    cipher_buf: [u8; CIPHER_BUF_LEN],
     /// Stack-friendly scratch for draining `pop_tx` output.
     tx_scratch: [u8; 2048],
     /// Lazily-allocated scratch for the TLS record fallback path
@@ -475,7 +466,6 @@ impl TlsStream {
         TlsStream {
             tcp,
             tls,
-            cipher_buf: [0u8; CIPHER_BUF_LEN],
             tx_scratch: [0u8; 2048],
             record_scratch: None,
         }
@@ -515,28 +505,34 @@ impl TlsStream {
     /// error). Caller drops the conn.
     async fn pump_rx(&mut self) -> Result<(), ()> {
         self.drain_tx().await?;
-        let got = self.tcp.recv(&mut self.cipher_buf).await;
-        if got == 0 {
-            return Err(());
-        }
-        // `push_rx` may accept fewer bytes than offered when the
-        // TLS-side rx_buf is near full. Loop, advancing between
-        // pushes so the state machine drains parsed records and
-        // frees space for the rest of this `cipher_buf` slice.
-        // Without this loop, leftover bytes would be silently
-        // dropped — bulk uploads that span multiple TCP segments
-        // would stall mid-record.
-        let mut off = 0usize;
-        while off < got {
-            let n = self.tls.push_rx(&self.cipher_buf[off..got]);
-            self.tls.advance().map_err(|_| ())?;
-            if n == 0 {
-                // advance() didn't drain anything and the buffer
-                // can't accept more — the peer sent a record
-                // bigger than rx_buf can hold. Fatal.
+        // Read ciphertext zero-copy from the TCP transport's own
+        // buffer. The guard borrows `&mut self.tcp` for its life
+        // and is scoped to drop before the trailing `drain_tx`,
+        // which also needs `&mut self.tcp`.
+        {
+            let Some(guard) = self.tcp.recv_chunk().await else {
                 return Err(());
+            };
+            let cipher = guard.data();
+            // `push_rx` may accept fewer bytes than offered when the
+            // TLS-side rx_buf is near full. Loop, advancing between
+            // pushes so the state machine drains parsed records and
+            // frees space for the rest of this chunk. Without this
+            // loop, leftover bytes would be silently dropped — bulk
+            // uploads that span multiple TCP segments would stall
+            // mid-record.
+            let mut off = 0usize;
+            while off < cipher.len() {
+                let n = self.tls.push_rx(&cipher[off..]);
+                self.tls.advance().map_err(|_| ())?;
+                if n == 0 {
+                    // advance() didn't drain anything and the buffer
+                    // can't accept more — the peer sent a record
+                    // bigger than rx_buf can hold. Fatal.
+                    return Err(());
+                }
+                off += n;
             }
-            off += n;
         }
         self.drain_tx().await
     }
