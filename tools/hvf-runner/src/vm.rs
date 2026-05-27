@@ -489,31 +489,50 @@ fn run_vcpu(
                             .contains(&fault_ipa)
                         {
                             // Cooperative yield — block in the inline
-                            // poll until host I/O arrives. The vCPU
-                            // thread itself does the polling now, so
-                            // there's no separate worker to wait on.
-                            // Cap each poll at 10ms so we re-check the
-                            // global shutdown flag promptly.
+                            // poll until host I/O arrives or the
+                            // 10-ms-bounded wall-clock budget expires,
+                            // then return to the guest.
                             //
-                            // Also break if the stdin reader has pushed
-                            // a byte into virtio_console::RX_BUF, and
-                            // drive the console RX queue so the byte
-                            // is sitting in guest RAM by the time the
-                            // vCPU resumes. Otherwise a parked vCPU
-                            // would never notice Ctrl-C (the 0x03
-                            // sits in RX_BUF but the guest can't run
-                            // to poll virtio-console while it's stuck
-                            // here), and the only way out would be a
-                            // network packet or the global shutdown
-                            // flag — neither of which Ctrl-C produces
-                            // on its own.
-                            while !shutdown.load(Ordering::Acquire) {
+                            // **The bound is the load-bearing part.** A
+                            // guest with armed TCP timers (TimeWait
+                            // expiry, FIN retransmit, RFC 6298 RTO)
+                            // needs its own event loop to run
+                            // periodically to service them. Spinning
+                            // here unboundedly until a host packet
+                            // arrives wedges the guest's net stack
+                            // during quiet intervals: a closed HTTPS
+                            // conn sits in FinWait1 with the
+                            // FIN-retransmit timer armed, no host
+                            // traffic to break the spin, and the slot
+                            // accumulates forever — visible symptom is
+                            // the server going unresponsive after a
+                            // few back-to-back conns. The fix is to
+                            // re-enter the guest after a bounded wait
+                            // so its event loop can drain the timer
+                            // wheel and fire `on_tcp_tick`.
+                            //
+                            // The 10-ms budget matches the existing
+                            // per-`vcpu_poll` timeout — the runner used
+                            // to repeat that call indefinitely; now it
+                            // calls it once. The guest will re-yield
+                            // immediately if it still has no work, so
+                            // the cap only governs how long the guest
+                            // is parked between event-loop
+                            // iterations.
+                            //
+                            // Console RX gets a fast path: if the
+                            // stdin reader has pushed a byte (e.g.
+                            // Ctrl-C), drive the console RX queue so
+                            // the byte is sitting in guest RAM by the
+                            // time the vCPU resumes — otherwise the
+                            // guest can't poll virtio-console while
+                            // it's parked here and would miss the
+                            // signal.
+                            if !shutdown.load(Ordering::Acquire) {
                                 if crate::virtio_console::rx_has_data() {
                                     crate::virtio_console::drive_rx();
-                                    break;
-                                }
-                                if crate::userspace_net::vcpu_poll(vcpu_id, 10) {
-                                    break;
+                                } else {
+                                    crate::userspace_net::vcpu_poll(vcpu_id, 10);
                                 }
                             }
                             let pc = get_reg(vcpu, HvReg::Pc);
