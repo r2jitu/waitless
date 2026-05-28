@@ -1009,7 +1009,7 @@ impl TcpConnection {
         // successful round trip restores the estimator's value).
         self.rtx_backoff = 0;
         self.rto_ms = self.estimated_rto();
-        if self.rtx_len == 0 {
+        if self.rtx_bytes_in_flight == 0 {
             // §5.2: everything outstanding is ACK'd — stop the timer.
             self.rtx_deadline_ms = 0;
         } else {
@@ -1100,7 +1100,7 @@ impl TcpConnection {
     /// RTO (§5.5), and re-arm the timer. Called by `on_tcp_tick` when
     /// the deadline has passed.
     pub(crate) fn retransmit_oldest(&mut self, now: u64) {
-        if self.rtx_len == 0 {
+        if self.rtx_bytes_in_flight == 0 {
             self.rtx_deadline_ms = 0; // nothing to retransmit
             return;
         }
