@@ -181,6 +181,7 @@ where
                         // shipped so the stash holds only the tail —
                         // subsequent iterations drain it directly via
                         // its own visible window.
+                        crate::diag::COUNTERS.chunk_spill_hits.bump();
                         buf[buf_len..buf_len + space].copy_from_slice(&data[..space]);
                         let mut owned = guard.into_owned();
                         owned.consume(space).expect("space <= data().len()");
