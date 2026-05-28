@@ -1443,3 +1443,22 @@ across all cores).
 - `tick_armed_seen / tick_calls` rising past ~50 % of pool means most conns have armed timers (high retx, abusive client, etc.).
 - `rx_cycles / rx_calls` rising sharply with conn count is the cache-pressure signal the hot/cold split was supposed to flatten — if it ever does grow steeply on a new workload, revisit the rejected hypothesis with fresh evidence.
 - `live_conns` not matching the bench target is the first thing to check at a cliff bench (see P0 #2).
+
+## Stack-level GCE A/B — streaming-parser stack (2026-05-27)
+
+4-way `gcp-bench --env kvm --workload get_tcp,get_tls --cores 1,2 --duration 10` against a single GCE c3-highcpu-8 spot instance, loopback. Each cell is `req/s`; `Δ vs main` is the running net change against the pre-stack tip.
+
+| Workload | main (`d30c8ed`) | recv-chunk (`11d9fb6`) | streaming pre-O1 (`4773d6a`) | streaming + vector (`5182eb2`) |
+|---|---:|---:|---:|---:|
+| `get_tcp` 1c | 228 936 | 229 549 (+0.3 %) | 225 137 (−1.7 %) | 228 242 (−0.3 %) |
+| `get_tcp` 2c | 347 824 | 374 509 (+7.7 %) | 359 850 (+3.5 %) | **376 093 (+8.1 %)** |
+| `get_tls` 1c | 131 694 | 131 503 (flat) | 130 172 (−1.2 %) | 130 547 (−0.9 %) |
+| `get_tls` 2c | 235 713 | 249 483 (+5.8 %) | 222 367 (−5.7 %) | **232 416 (−1.4 %)** |
+
+Reads:
+
+* **recv_chunk migration** is a clear 2c scaling win (+7.7 % TCP, +5.8 % TLS); 1c is bandwidth-flat as expected.
+* **Streaming-parser pre-optimization** regressed `get_tls` 2c by ~6 % vs main (~11 % vs the recv-chunk peak) — the per-byte HEAD-bytes-cap check inside the byte-by-byte parser loop was the suspect.
+* **Vectorized parser + chunk-entry cap clamp** recovers the loss: `get_tcp` 2c lands +8.1 % over main (above the recv-chunk peak); `get_tls` 2c lands within run-to-run noise of main (~11 % variance across the four 10 s 2c-TLS runs).
+
+End-state vs main: TCP +8 % at 2c, TLS flat at 2c, single-core flat — paid for with the 16 KiB inline parse buffer gone from per-conn future state and the no-delimiter DoS gap closed.
