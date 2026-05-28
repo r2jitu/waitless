@@ -125,6 +125,21 @@ where
     // each successfully-consumed request so the next pipelined
     // request starts a fresh scan.
     let mut parser_state = ParserState::default();
+    // Overflow stash for an inbound chunk that didn't fit in the
+    // remaining HEAD-buffer space in one shot. `RecvChunkGuard`
+    // holds `&mut stream`, so we can't keep its borrowed view alive
+    // across a handler `.await` — but `into_owned()` detaches the
+    // chunk to its own storage (zero copy for NIC-RX owned IOBufs,
+    // one memcpy for TLS borrowed views, paid only on overflow).
+    // Subsequent outer-loop iterations top `buf` up from the stash
+    // before pulling a fresh chunk; the inner request-drain loop
+    // shifts `buf` down between iterations so the stash gets fed
+    // through in pieces over multiple passes. Without this a
+    // 16 KiB TLS record arriving on top of any `buf_len > 0` tail
+    // would falsely trip `header_buffer_overflow` on well-formed
+    // pipelined traffic.
+    let mut spill: Option<IOBuf> = None;
+    let mut spill_cursor: usize = 0;
     loop {
         if buf_len == BUF_SIZE {
             // Parse buffer full and no complete request in it —
@@ -132,39 +147,62 @@ where
             crate::diag::COUNTERS.header_buffer_overflow.bump();
             return;
         }
-        // Fetch the next inbound segment as a `RecvChunkGuard` over
-        // the transport's own buffer (NIC RX IOBuf on bare metal,
-        // syscall heap-IOBuf on native, in-place plaintext view on
-        // TLS) and memcpy its bytes into the parse buffer. Routing
-        // through `recv_chunk` drops the rx_ring → user-buf step on
-        // the bare-metal TCP path (one fewer copy per recv). See
-        // docs/high-concurrency-perf.md "Anatomy of CPU collapse" + H2.
+        // Top `buf` up. Drain from the overflow stash first (if any);
+        // otherwise pull the next inbound segment as a
+        // `RecvChunkGuard` over the transport's own buffer (NIC RX
+        // IOBuf on bare metal, syscall heap-IOBuf on native, in-place
+        // plaintext view on TLS) and memcpy its bytes into the parse
+        // buffer. Routing through `recv_chunk` drops the rx_ring →
+        // user-buf step on the bare-metal TCP path (one fewer copy per
+        // recv). See docs/high-concurrency-perf.md "Anatomy of CPU
+        // collapse" + H2.
         let space = BUF_SIZE - buf_len;
-        let chunk_fut = stream.recv_chunk();
-        let got = match waitless::runtime::timeout_us(IDLE_TIMEOUT_US, chunk_fut).await {
-            Some(Some(guard)) => {
-                let data = guard.data();
-                if data.len() > space {
-                    // Single inbound chunk exceeds remaining HEAD-buffer
-                    // space. We cannot push an `IOBuf` back to the
-                    // transport, so this is unrecoverable — same fate
-                    // as the loop-top `buf_len == BUF_SIZE` check, just
-                    // observed at the chunk boundary instead of the
-                    // byte boundary. A real "push back" hook is
-                    // deferred to the broader chunk-native refactor.
-                    crate::diag::COUNTERS.header_buffer_overflow.bump();
-                    return;
+        let got = if spill.is_some() {
+            let n;
+            let drained;
+            {
+                let stash = spill.as_ref().unwrap();
+                let data = stash.data();
+                n = (data.len() - spill_cursor).min(space);
+                buf[buf_len..buf_len + n]
+                    .copy_from_slice(&data[spill_cursor..spill_cursor + n]);
+                drained = spill_cursor + n == data.len();
+            }
+            spill_cursor += n;
+            if drained {
+                spill = None;
+                spill_cursor = 0;
+            }
+            n
+        } else {
+            let chunk_fut = stream.recv_chunk();
+            match waitless::runtime::timeout_us(IDLE_TIMEOUT_US, chunk_fut).await {
+                Some(Some(guard)) => {
+                    let data = guard.data();
+                    if data.len() <= space {
+                        buf[buf_len..buf_len + data.len()].copy_from_slice(data);
+                        data.len()
+                    } else {
+                        // Chunk overflows current HEAD-buffer space.
+                        // Copy what fits, then detach the chunk from
+                        // the stream so we can release the recv
+                        // borrow and resume handler work; the
+                        // remainder feeds back through `spill` over
+                        // subsequent iterations.
+                        buf[buf_len..buf_len + space].copy_from_slice(&data[..space]);
+                        spill = Some(guard.into_owned());
+                        spill_cursor = space;
+                        space
+                    }
                 }
-                buf[buf_len..buf_len + data.len()].copy_from_slice(data);
-                data.len()
-            }
-            Some(None) => {
-                crate::diag::COUNTERS.peer_eof.bump();
-                return; // EOF / fatal recv
-            }
-            None => {
-                crate::diag::COUNTERS.idle_timeout.bump();
-                return; // idle timeout
+                Some(None) => {
+                    crate::diag::COUNTERS.peer_eof.bump();
+                    return; // EOF / fatal recv
+                }
+                None => {
+                    crate::diag::COUNTERS.idle_timeout.bump();
+                    return; // idle timeout
+                }
             }
         };
         buf_len += got;
