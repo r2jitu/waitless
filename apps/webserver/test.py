@@ -495,6 +495,20 @@ class WebserverShutdownTest(unittest.TestCase):
             env=_launcher_env(port, tls_port, udp_port, tcp_echo_port),
         )
         stop_hammer = [False]
+        # Track every hammer thread so `finally` can `join` them. Each
+        # iteration parks in `subprocess.run(... --max-time 1)` /
+        # `asyncio.run(h3_get)` for up to ~2 s after `stop_hammer[0]`
+        # flips, so without joining, daemons leak into the next test
+        # method's `PtyLauncher.__init__` — and `pty.fork()` in a
+        # multi-threaded process can deadlock the child on the macOS
+        # malloc lock, stalling the guest mid-boot.
+        workers: list[threading.Thread] = []
+
+        def _spawn(target) -> None:
+            w = threading.Thread(target=target, daemon=True)
+            workers.append(w)
+            w.start()
+
         try:
             self.assertTrue(
                 pty_launcher.wait_for(BOOT_MARKER, timeout=15.0),
@@ -517,11 +531,8 @@ class WebserverShutdownTest(unittest.TestCase):
                             capture_output=True,
                         )
 
-                workers = [
-                    threading.Thread(target=_hammer, daemon=True) for _ in range(3)
-                ]
-                for w in workers:
-                    w.start()
+                for _ in range(3):
+                    _spawn(_hammer)
             if h3_hammer:
                 # H3 hammer: each iteration opens a fresh QUIC conn,
                 # sends one GET, awaits the response, closes. Exercises
@@ -538,12 +549,8 @@ class WebserverShutdownTest(unittest.TestCase):
                         except Exception:
                             pass
 
-                workers_h3 = [
-                    threading.Thread(target=_h3_hammer, daemon=True) for _ in range(8)
-                ]
-                for w in workers_h3:
-                    w.start()
-            persistent_thread = None
+                for _ in range(8):
+                    _spawn(_h3_hammer)
             if h3_persistent:
                 # Single LONG-LIVED H3 conn that stays alive across ^C.
                 # Mirrors a real browser keeping a tab open: conn stays
@@ -610,8 +617,7 @@ class WebserverShutdownTest(unittest.TestCase):
                     except Exception:
                         pass
 
-                persistent_thread = threading.Thread(target=_persistent, daemon=True)
-                persistent_thread.start()
+                _spawn(_persistent)
             # Longer dwell when h3-hammering so the test exercises
             # enough conns to surface a per-conn leak signal above
             # noise. Plain HTTP hammer keeps the original 2 s.
@@ -627,6 +633,8 @@ class WebserverShutdownTest(unittest.TestCase):
             return pty_launcher.buffer
         finally:
             stop_hammer[0] = True
+            for w in workers:
+                w.join(timeout=3.0)
             pty_launcher.kill()
 
     def test_ctrlc_exits_within_8s(self) -> None:
