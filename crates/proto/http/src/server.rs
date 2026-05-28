@@ -10,24 +10,10 @@ use alloc::sync::Arc;
 use iobuf::{IOBuf, IOBufChain};
 
 use crate::body::BodyReader;
-#[cfg(http_legacy_buffered_parser)]
-use crate::request::{ParserState, parse_request_with_state};
 use crate::request::Request;
 use crate::response::{Response, write_response_into_iobuf};
 use crate::stream::HttpStream;
-#[cfg(not(http_legacy_buffered_parser))]
 use crate::streaming;
-
-/// Per-connection parse buffer. Sized for the request HEAD only —
-/// status line + headers, terminated by `\r\n\r\n`. Bodies are
-/// delivered to the handler via [`BodyReader`] which streams from
-/// the transport stream (with any body bytes that happened to land
-/// in this buffer as a prefix). 16 KiB covers worst-case header
-/// sets we expect from bench / browser clients plus headroom for
-/// the leading bytes of a POST body. Buffered serve_conn only —
-/// the streaming variant carries no parse buffer.
-#[cfg(http_legacy_buffered_parser)]
-const BUF_SIZE: usize = 16 * 1024;
 
 /// Idle-connection timeout. After this long without inbound data,
 /// the per-conn task tears down the connection and releases its
@@ -77,52 +63,30 @@ where
 
 /// Per-conn keep-alive loop. Reads bytes from `stream` (plain or
 /// TLS — same code path), parses pipelined requests, calls
-/// `handler`, sends responses. Returns when the peer closes,
-/// idle timeout fires, or the buffer overflows on a too-large
-/// request.
+/// `handler`, sends responses. Returns when the peer closes, the
+/// idle timeout fires, or a transport error occurs.
 ///
 /// Public so transport-specific listeners (HTTPS in `tls`,
 /// HTTP/3 in `http3`) can drive their own `HttpStream` impls
 /// through the same request/response machinery.
 ///
-/// Two implementations live behind the `http_legacy_buffered_parser`
-/// cfg flag — the streaming one (default) feeds chunk bytes straight
-/// into `StreamingRequestParser`, with no per-conn parse buffer; the
-/// buffered one (cfg-on; legacy) copies bytes into a 16 KiB inline
-/// parse buffer and runs `parse_request_with_state` on it. They
-/// share the same signature and handler contract. The buffered path
-/// stays for a few releases as an opt-out escape hatch; C5 removes
-/// it.
-#[cfg(http_legacy_buffered_parser)]
+/// Parse path: `StreamingRequestParser` reads chunk bytes directly
+/// off `recv_chunk`'s guard and writes parsed values into the
+/// caller's `Request` as they arrive — no per-conn parse buffer,
+/// no chunk-to-buffer memcpy. `carry: Option<IOBuf>` holds the
+/// bytes that landed in the same chunk past a HEAD terminator
+/// (body bytes for the current request, then start-of-next-
+/// pipelined-request bytes after the body drains). `into_owned`
+/// detaches the chunk from the recv borrow when carry is needed
+/// past the borrow's life — zero copy on NIC-RX, one memcpy on
+/// TLS, paid only when carry is non-empty.
 pub async fn serve_conn<S, H>(handler: Arc<H>, mut stream: S)
 where
     S: HttpStream,
     H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, S>) -> Response,
 {
-    // Inline request-parse buffer in the future state. The
-    // async runtime allocates the future once (as a
-    // `Pin<Box<dyn Future>>` per accepted conn); folding `buf` in
-    // turns the previous "future alloc + Box<[u8]> alloc" pair
-    // into a single alloc per conn-accept. Sized to BODY_CAP +
-    // header headroom so a full bulk-upload request fits in one
-    // parse pass.
     crate::diag::COUNTERS.connections_served.bump();
-    let mut buf = [0u8; BUF_SIZE];
-    let mut buf_len = 0usize;
-    // Per-connection scratch reused across every request on this
-    // conn — `Request` carries BODY_CAP of body buffer and 256 B
-    // of path. Allocating + zero-initing it per request was costing
-    // ~1 GB/s of memory bandwidth per core at peak request rate.
-    // `parse_request` resets length fields up front, so a stale
-    // tail is invisible to the read path; only the
-    // writes-then-reads-back range is observed.
     let mut req = Request::new();
-    // Outbound chain is amortised across every response on this
-    // connection — `send` drains it via `pop_front`, leaving
-    // the chain empty but with its `VecDeque` allocation
-    // preserved. Capacity 4 covers the common shapes (header +
-    // 1 body part, header + 2-3 chunked body parts) without
-    // forcing the deque to grow.
     let mut out_chain = IOBufChain::with_capacity(4);
     // Inline storage for the response-header IOBuf, sized for the
     // typical header set plus the worst-case transport reserve.
@@ -132,268 +96,6 @@ where
     // + Content-Type + Content-Length + Connection + a handful
     // of `with_header`-set extras (Alt-Svc, Cache-Control,
     // Set-Cookie) with room to spare.
-    const HEADER_BUF_SIZE: usize = 1024;
-    let mut header_storage = [0u8; HEADER_BUF_SIZE];
-    // Carries the parser's progress (`scan_pos`) across calls
-    // when a request arrives in multiple recv'd segments — the
-    // `find_header_end` scan resumes from the last position
-    // instead of restarting at byte 0. Reset to default after
-    // each successfully-consumed request so the next pipelined
-    // request starts a fresh scan.
-    let mut parser_state = ParserState::default();
-    // Overflow stash for an inbound chunk that didn't fit in the
-    // remaining HEAD-buffer space in one shot. `RecvChunkGuard`
-    // holds `&mut stream`, so we can't keep its borrowed view alive
-    // across a handler `.await` — but `into_owned()` detaches the
-    // chunk to its own storage (zero copy for NIC-RX owned IOBufs,
-    // one memcpy for TLS borrowed views, paid only on overflow).
-    // Subsequent outer-loop iterations top `buf` up from the stash
-    // before pulling a fresh chunk; the inner request-drain loop
-    // shifts `buf` down between iterations so the stash gets fed
-    // through in pieces over multiple passes. Without this a
-    // 16 KiB TLS record arriving on top of any `buf_len > 0` tail
-    // would falsely trip `header_buffer_overflow` on well-formed
-    // pipelined traffic.
-    let mut spill: Option<IOBuf> = None;
-    loop {
-        if buf_len == BUF_SIZE {
-            // Parse buffer full and no complete request in it —
-            // client sent something larger than we handle.
-            crate::diag::COUNTERS.header_buffer_overflow.bump();
-            return;
-        }
-        // Top `buf` up. Drain from the overflow stash first (if any);
-        // otherwise pull the next inbound segment as a
-        // `RecvChunkGuard` over the transport's own buffer (NIC RX
-        // IOBuf on bare metal, syscall heap-IOBuf on native, in-place
-        // plaintext view on TLS) and memcpy its bytes into the parse
-        // buffer. Routing through `recv_chunk` drops the rx_ring →
-        // user-buf step on the bare-metal TCP path (one fewer copy per
-        // recv). See docs/high-concurrency-perf.md "Anatomy of CPU
-        // collapse" + H2.
-        let space = BUF_SIZE - buf_len;
-        let got = if let Some(stash) = spill.as_mut() {
-            // `IOBuf::consume(n)` advances the visible window past the
-            // bytes we just copied — no separate cursor needed.
-            let n = stash.data().len().min(space);
-            buf[buf_len..buf_len + n].copy_from_slice(&stash.data()[..n]);
-            stash.consume(n).expect("n <= data().len()");
-            if stash.data().is_empty() {
-                spill = None;
-            }
-            n
-        } else {
-            let chunk_fut = stream.recv_chunk();
-            match waitless::runtime::timeout_us(IDLE_TIMEOUT_US, chunk_fut).await {
-                Some(Some(guard)) => {
-                    let data = guard.data();
-                    if data.len() <= space {
-                        buf[buf_len..buf_len + data.len()].copy_from_slice(data);
-                        data.len()
-                    } else {
-                        // Chunk overflows current HEAD-buffer space.
-                        // Copy what fits, then detach the chunk from
-                        // the stream and `consume` the bytes we just
-                        // shipped so the stash holds only the tail —
-                        // subsequent iterations drain it directly via
-                        // its own visible window.
-                        crate::diag::COUNTERS.chunk_spill_hits.bump();
-                        buf[buf_len..buf_len + space].copy_from_slice(&data[..space]);
-                        let mut owned = guard.into_owned();
-                        owned.consume(space).expect("space <= data().len()");
-                        spill = Some(owned);
-                        space
-                    }
-                }
-                Some(None) => {
-                    crate::diag::COUNTERS.peer_eof.bump();
-                    return; // EOF / fatal recv
-                }
-                None => {
-                    crate::diag::COUNTERS.idle_timeout.bump();
-                    return; // idle timeout
-                }
-            }
-        };
-        buf_len += got;
-
-        // Drain every complete request sitting in the buffer.
-        while buf_len > 0 {
-            let body_start = parse_request_with_state(&buf[..buf_len], &mut req, &mut parser_state);
-            if body_start == 0 {
-                break; // need more bytes
-            }
-            crate::diag::COUNTERS.requests_parsed.bump();
-            let content_length = req.content_length;
-
-            // A request the HTTP/1.1 parser flagged as malformed —
-            // today only a `Transfer-Encoding: chunked` request,
-            // which we don't frame yet (item E in
-            // docs/rx-path-optimizations.md). Answer it with a
-            // hard `400 Bad Request` and force the connection
-            // closed. Falling through to the keep-alive path would
-            // be a request-smuggling hole: the chunk-framed body
-            // bytes still sit in `buf` and the next loop iteration
-            // would misparse them as a second pipelined request.
-            // So skip the handler and the `BodyReader` entirely
-            // and drop into the shared send path below with
-            // `want_close` forced on — that emits `Connection:
-            // close` and `return`s without touching the
-            // post-header bytes.
-            let want_close;
-            let resp;
-            if req.reject {
-                crate::diag::record_reject(&req);
-                resp = Response::bad_request();
-                want_close = true;
-            } else {
-                want_close = match req.header(b"Connection") {
-                    Some(v) => v.eq_ignore_ascii_case(b"close"),
-                    None => false,
-                };
-
-                // Construct the streaming body reader. `prebuf` is
-                // the body bytes already sitting in `buf` after the
-                // headers; the reader will draw stream bytes for
-                // any tail that didn't fit. Restrict the prebuf to
-                // body-only bytes (the slice may otherwise include
-                // the start of the next pipelined request).
-                let prebuf_end = (body_start + content_length).min(buf_len);
-                let body_drained_ok;
-                {
-                    let prebuf = &buf[body_start..prebuf_end];
-                    let mut body = BodyReader::new(&mut stream, prebuf, content_length);
-                    resp = (*handler)(&req, &mut body).await;
-                    // Drain any leftover body bytes the handler
-                    // didn't consume. Keep-alive contract requires
-                    // the connection to be positioned at the start
-                    // of the next request before we ship the
-                    // response; skipping bytes mid-body would let
-                    // them be mis-parsed as the next request's
-                    // bytes. If the handler asked for
-                    // `Connection: close` we tear down without
-                    // draining (the conn is going away anyway).
-                    body_drained_ok = want_close || body.is_empty() || body.discard().await.is_ok();
-                }
-                if !body_drained_ok {
-                    crate::diag::COUNTERS.body_drain_failed.bump();
-                    return;
-                }
-            }
-
-            // Wrap the per-conn `header_storage` array as an
-            // a `Borrowed` IOBuf so the framing layer can build
-            // headers in stack-resident memory without a heap
-            // allocation per response. SAFETY contract:
-            //   * `header_storage` outlives every IOBuf wrapping
-            //     it (it's a future-state field, the future is
-            //     pinned, and we drop the IOBuf inside this
-            //     iteration before constructing the next one).
-            //   * No two IOBufs ever alias the same bytes — the
-            //     IOBuf is `push_back`'d into `out_chain`,
-            //     drained by `send` (which drops it after
-            //     committing the bytes to the wire), and only
-            //     then does the next iteration construct a fresh
-            //     IOBuf wrapping the same storage.
-            //   * No drop callback (`drop_fn = None`) — the
-            //     storage is borrowed, not owned, so the IOBuf's
-            //     drop should be a no-op for the array.
-            let header = unsafe {
-                IOBuf::borrow(
-                    core::ptr::NonNull::new_unchecked(header_storage.as_mut_ptr()),
-                    HEADER_BUF_SIZE as u32,
-                    0,
-                    0,
-                )
-            };
-            // SAFETY: the only IOBuf currently aliasing
-            // `header_storage` is `header` itself (we just
-            // constructed it). `write_response_into_iobuf` writes
-            // through `header` exclusively.
-            let mut header = header;
-            write_response_into_iobuf(&mut header, &resp, !want_close);
-
-            // Stage the response into the per-conn outbound chain.
-            // Order: header IOBuf first, then body parts. The
-            // transport (TCP / TLS) drains the chain and decides
-            // the wire chunking — TCP coalesces parts into
-            // MSS-bounded segments so this header-plus-body shape
-            // ships in one TCP segment for tiny replies; TLS
-            // encrypts each part as its own record (in-place when
-            // reserves match).
-            //
-            // `out_chain` is empty here (`send` drains it
-            // each iteration). Move the body's parts in via
-            // `into_parts()`, then `push_front` the header so the
-            // wire order is [header, body0, body1, ...].
-            debug_assert!(out_chain.is_empty());
-            for part in resp.into_body().into_parts() {
-                out_chain.push_back(part);
-            }
-            out_chain.push_front(header);
-
-            if stream.send(&mut out_chain).await.is_err() {
-                crate::diag::COUNTERS.send_failed.bump();
-                return;
-            }
-            crate::diag::COUNTERS.responses_sent.bump();
-
-            if want_close {
-                // Send TLS close_notify (no-op for plain TCP) before
-                // the conn drops. Without this, TLS clients tear
-                // down their session-resumption state on the
-                // perceived unclean close — which is why every
-                // post-resumption-PR fresh handshake from rustls or
-                // openssl was unable to follow up with a resumed
-                // one despite tickets flowing correctly on the wire.
-                let _ = stream.close().await;
-                return;
-            }
-            // Shift any post-body bytes (start of the next
-            // pipelined request) to the front of `buf`. The body
-            // may have extended past the parse buffer's end (in
-            // which case `BodyReader` pulled the tail from the
-            // transport directly); compute the end-of-body offset
-            // capped at the current `buf_len`.
-            let body_end_in_buf = (body_start + content_length).min(buf_len);
-            let remaining = buf_len - body_end_in_buf;
-            if remaining > 0 {
-                buf.copy_within(body_end_in_buf..buf_len, 0);
-            }
-            buf_len = remaining;
-            // The next pipelined request starts at byte 0 of the
-            // shifted buffer, so the parser state has to forget
-            // its "already scanned" cursor.
-            parser_state = ParserState::default();
-        }
-    }
-}
-
-/// Streaming-parser variant of [`serve_conn`]. Same contract; the
-/// difference is the parse path:
-///
-///   * No 16 KiB inline `buf`. No `spill`. No
-///     `chunk_spill_hits` bookkeeping.
-///   * `StreamingRequestParser` reads chunk bytes directly off
-///     `recv_chunk`'s guard; partial requests flow naturally across
-///     chunk boundaries through the parser's per-field cursors.
-///   * `carry: Option<IOBuf>` holds whatever survived the last
-///     chunk past the HEAD — body bytes for the current request,
-///     then start-of-next-pipelined-request bytes after the body
-///     drains. `into_owned` detaches the chunk from the stream when
-///     we need to keep it past the recv borrow.
-///
-/// Behaviour parity with the buffered variant is the contract the
-/// equivalence harness in `streaming::equivalence` pins.
-#[cfg(not(http_legacy_buffered_parser))]
-pub async fn serve_conn<S, H>(handler: Arc<H>, mut stream: S)
-where
-    S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, S>) -> Response,
-{
-    crate::diag::COUNTERS.connections_served.bump();
-    let mut req = Request::new();
-    let mut out_chain = IOBufChain::with_capacity(4);
     const HEADER_BUF_SIZE: usize = 1024;
     let mut header_storage = [0u8; HEADER_BUF_SIZE];
     let mut parser = streaming::StreamingRequestParser::new();
@@ -492,6 +194,17 @@ where
             }
         }
 
+        // SAFETY contract for the borrowed header IOBuf:
+        //   * `header_storage` outlives every IOBuf wrapping it
+        //     (future-state field; future is pinned; we drop the
+        //     IOBuf inside this iteration before constructing the
+        //     next one).
+        //   * No two IOBufs ever alias the same bytes — the IOBuf
+        //     is push_back'd into out_chain, drained by send (which
+        //     drops it after committing the bytes), only then does
+        //     the next iteration wrap the same storage.
+        //   * No drop callback (drop_fn = None) — the storage is
+        //     borrowed, so the IOBuf's drop is a no-op.
         let header = unsafe {
             IOBuf::borrow(
                 core::ptr::NonNull::new_unchecked(header_storage.as_mut_ptr()),
@@ -516,6 +229,10 @@ where
         crate::diag::COUNTERS.responses_sent.bump();
 
         if want_close {
+            // Send TLS close_notify (no-op for plain TCP) before
+            // the conn drops. Without this, TLS clients tear down
+            // their session-resumption state on the perceived
+            // unclean close.
             let _ = stream.close().await;
             return;
         }
@@ -532,148 +249,5 @@ where
                 carry = Some(c);
             }
         }
-    }
-}
-
-#[cfg(all(test, http_legacy_buffered_parser))]
-mod serve_conn_tests {
-    use super::serve_conn;
-    use crate::body::BodyReader;
-    use crate::request::Request;
-    use crate::response::Response;
-    use crate::stream::HttpStream;
-    use alloc::collections::VecDeque;
-    use alloc::rc::Rc;
-    use alloc::sync::Arc;
-    use alloc::vec::Vec;
-    use core::cell::RefCell;
-    use core::future::Future;
-    use core::pin::Pin;
-    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    use iobuf::{IOBuf, IOBufChain};
-    use waitless::runtime::RecvChunkGuard;
-
-    /// Pre-canned-chunk transport. `recv_chunk` pops the next entry
-    /// from `chunks` (`Some(bytes)` -> wrap in a guard, `None` ->
-    /// signal EOF so `serve_conn` returns via the `peer_eof` arm);
-    /// `send` appends every part to `sent`. Both fields are shared
-    /// via `Rc<RefCell<_>>` so the test can read `sent` back after
-    /// the future has consumed the stream by value.
-    struct MockStream {
-        chunks: Rc<RefCell<VecDeque<Option<Vec<u8>>>>>,
-        sent: Rc<RefCell<Vec<u8>>>,
-    }
-
-    impl HttpStream for MockStream {
-        async fn recv(&mut self, _: &mut [u8]) -> usize {
-            unreachable!("serve_conn's HEAD path is on recv_chunk; handler reads no body");
-        }
-        async fn recv_chunk(&mut self) -> Option<RecvChunkGuard<'_>> {
-            match self.chunks.borrow_mut().pop_front() {
-                Some(Some(bytes)) => Some(RecvChunkGuard::new(IOBuf::from(bytes))),
-                Some(None) | None => None,
-            }
-        }
-        async fn send(&mut self, chain: &mut IOBufChain) -> Result<(), ()> {
-            let mut sent = self.sent.borrow_mut();
-            while let Some(part) = chain.pop_front() {
-                sent.extend_from_slice(part.data());
-            }
-            Ok(())
-        }
-    }
-
-    /// Single-poll driver. Every await this test exercises resolves
-    /// Ready on first poll: `MockStream` methods are inline-Ready
-    /// `async fn`s, and `select(fut, sleep)` inside `timeout_us`
-    /// short-circuits to Ready before the sleep's waker dance fires.
-    fn block_on<F: Future>(mut fut: F) -> F::Output {
-        fn noop(_: *const ()) {}
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(core::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
-        let mut cx = Context::from_waker(&waker);
-        // SAFETY: `fut` is a local that is not moved again before
-        // the poll below.
-        let fut = unsafe { Pin::new_unchecked(&mut fut) };
-        match fut.poll(&mut cx) {
-            Poll::Ready(v) => v,
-            Poll::Pending => panic!("future pended unexpectedly"),
-        }
-    }
-
-    async fn ok_handler(_: &Request, _: &mut BodyReader<'_, MockStream>) -> Response {
-        Response::ok(b"text/plain".as_slice(), b"OK".as_slice())
-    }
-
-    /// Engineered two-chunk pipelined burst that forces the spill arm:
-    /// chunk 1 lands a 5999-byte partial header; chunk 2 (10554 bytes)
-    /// completes that header and carries a second pipelined request,
-    /// overflowing `BUF_SIZE - 5999 = 10385` by 169 bytes. Without the
-    /// spill the second chunk would be rejected as
-    /// `header_buffer_overflow` and the second response would never
-    /// ship. With it: both responses ship; `chunk_spill_hits` ticks
-    /// exactly once.
-    #[test]
-    fn spill_carries_chunk_overflow_into_next_iteration() {
-        const BUF_SIZE: usize = 16 * 1024;
-
-        let mut part1: Vec<u8> = b"GET /a HTTP/1.1\r\nHost: x\r\n".to_vec();
-        while part1.len() < 5999 {
-            part1.extend_from_slice(b"X-A: a\r\n");
-        }
-        part1.truncate(5999);
-
-        let mut req2: Vec<u8> = b"GET /b HTTP/1.1\r\nHost: x\r\nX-Big: ".to_vec();
-        req2.extend(core::iter::repeat_n(b'a', 10500));
-        req2.extend_from_slice(b"\r\n\r\n");
-        let mut part2: Vec<u8> = b"X-End: y\r\n\r\n".to_vec();
-        part2.extend_from_slice(&req2);
-
-        let space = BUF_SIZE - part1.len();
-        assert!(part2.len() > space, "test must overflow by design");
-
-        let chunks = Rc::new(RefCell::new(VecDeque::from([
-            Some(part1),
-            Some(part2),
-            None,
-        ])));
-        let sent = Rc::new(RefCell::new(Vec::new()));
-
-        let before_spill = crate::diag::COUNTERS.chunk_spill_hits.get();
-        let before_parsed = crate::diag::COUNTERS.requests_parsed.get();
-        let before_sent = crate::diag::COUNTERS.responses_sent.get();
-
-        let mock = MockStream {
-            chunks: Rc::clone(&chunks),
-            sent: Rc::clone(&sent),
-        };
-        let handler = Arc::new(ok_handler);
-        block_on(serve_conn(handler, mock));
-
-        assert_eq!(
-            crate::diag::COUNTERS.chunk_spill_hits.get() - before_spill,
-            1,
-            "spill arm should fire exactly once on the engineered burst",
-        );
-        assert_eq!(
-            crate::diag::COUNTERS.requests_parsed.get() - before_parsed,
-            2,
-            "both pipelined requests should parse",
-        );
-        assert_eq!(
-            crate::diag::COUNTERS.responses_sent.get() - before_sent,
-            2,
-            "both responses should ship",
-        );
-
-        let sent_bytes = sent.borrow();
-        let count = sent_bytes
-            .windows(b"HTTP/1.1 200 OK".len())
-            .filter(|w| *w == b"HTTP/1.1 200 OK")
-            .count();
-        assert_eq!(count, 2, "expected 2 200-OK response lines in sent bytes");
     }
 }

@@ -34,9 +34,11 @@ pub struct Counters {
     /// `400 Bad Request` + `Connection: close`. Read `LAST_REJECT`
     /// for the offending path; subset of `requests_parsed`.
     pub requests_rejected: Counter,
-    /// The 16 KiB request-HEAD parse buffer filled before any
-    /// complete request terminated — request head too large, or a
-    /// peer that never sent `\r\n\r\n`. The connection is dropped.
+    /// Reserved for a future strictness pass that rejects oversized
+    /// request HEADs. The streaming parser today silently truncates
+    /// oversize fields (path / header name / header value) rather
+    /// than rejecting; this counter stays at 0 in production until
+    /// a strictness pass wires it up.
     pub header_buffer_overflow: Counter,
     /// The handler left body bytes unread and draining them off
     /// the transport stream failed (an error mid-body). The
@@ -52,15 +54,6 @@ pub struct Counters {
     /// `recv` returned 0 — the peer closed, or a fatal recv error.
     /// The ordinary end of a keep-alive connection.
     pub peer_eof: Counter,
-    /// A `recv_chunk` returned more bytes than the parse buffer had
-    /// space for in one shot — the tail was detached via `into_owned`
-    /// and carried forward to the next outer-loop iteration. Common
-    /// trigger: a 16 KiB TLS record arriving while `buf_len > 0`. A
-    /// non-zero count is normal under TLS load with pipelined or
-    /// partial-record traffic; sustained growth without parsed
-    /// requests would mean clients are sending HEADs that come in
-    /// just-too-large to fit in a single buffer.
-    pub chunk_spill_hits: Counter,
 }
 
 impl Counters {
@@ -75,7 +68,6 @@ impl Counters {
             send_failed: Counter::new(),
             idle_timeout: Counter::new(),
             peer_eof: Counter::new(),
-            chunk_spill_hits: Counter::new(),
         }
     }
 }
@@ -156,7 +148,7 @@ pub fn record_reject(req: &Request) {
 }
 
 /// Counter `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 10] {
+pub fn snapshot() -> [(&'static str, u64); 9] {
     let c = &COUNTERS;
     [
         ("connections_served", c.connections_served.get()),
@@ -168,7 +160,6 @@ pub fn snapshot() -> [(&'static str, u64); 10] {
         ("send_failed", c.send_failed.get()),
         ("idle_timeout", c.idle_timeout.get()),
         ("peer_eof", c.peer_eof.get()),
-        ("chunk_spill_hits", c.chunk_spill_hits.get()),
     ]
 }
 

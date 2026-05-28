@@ -168,169 +168,6 @@ impl Request {
 
 // ---- HTTP request parser ----------------------------------------------------
 
-/// Parser state retained across `parse_request` calls on the same
-/// pipelined request. Lets `find_header_end` skip bytes it's
-/// already scanned — the previous implementation re-walked the
-/// whole accumulated buffer on every recv, costing O(N²) on
-/// requests that arrive in many small segments. With this state
-/// the scan is amortised O(N) regardless of segment shape.
-///
-/// `serve_conn` keeps one of these per connection and resets it
-/// to `Default::default()` after each successfully-consumed
-/// request so the next pipelined request starts a fresh scan.
-#[cfg(any(test, http_legacy_buffered_parser))]
-#[derive(Default)]
-pub struct ParserState {
-    /// Bytes 0..scan_pos already scanned without finding the
-    /// `\r\n\r\n` terminator. New recv data extends past
-    /// `scan_pos`; the scan resumes from `scan_pos.saturating_sub(3)`
-    /// so a terminator straddling the recv boundary still matches.
-    scan_pos: usize,
-}
-
-#[cfg(any(test, http_legacy_buffered_parser))]
-pub(crate) fn parse_request_with_state(
-    data: &[u8],
-    req: &mut Request,
-    state: &mut ParserState,
-) -> usize {
-    req.clear();
-
-    // Find end of headers ("\r\n\r\n"). Resume from the last
-    // scanned position (minus 3 so a terminator straddling the
-    // previous-call buffer boundary is caught).
-    let resume = state.scan_pos.saturating_sub(3);
-    let header_end = find_header_end_from(data, resume);
-    if header_end.is_none() {
-        // Mark how far we've scanned so the next call doesn't
-        // redo this work.
-        state.scan_pos = data.len();
-        return 0;
-    }
-    let header_end_pos = header_end.unwrap();
-
-    // Parse request line: "METHOD /path HTTP/1.x\r\n"
-    let mut pos = 0;
-
-    if data[pos..].starts_with(b"GET ") {
-        req.method = Method::Get;
-        pos += 4;
-    } else if data[pos..].starts_with(b"POST ") {
-        req.method = Method::Post;
-        pos += 5;
-    } else if data[pos..].starts_with(b"PUT ") {
-        req.method = Method::Put;
-        pos += 4;
-    } else if data[pos..].starts_with(b"DELETE ") {
-        req.method = Method::Delete;
-        pos += 7;
-    } else if data[pos..].starts_with(b"HEAD ") {
-        req.method = Method::Head;
-        pos += 5;
-    } else {
-        req.method = Method::Unknown;
-    }
-
-    // Extract path
-    let mut path_len = 0;
-    while pos < data.len()
-        && data[pos] != b' '
-        && data[pos] != b'\r'
-        && data[pos] != b'\n'
-        && path_len < 255
-    {
-        req.path[path_len] = data[pos];
-        path_len += 1;
-        pos += 1;
-    }
-    req.path_len = path_len;
-
-    // Skip to end of request line
-    while pos < data.len() && data[pos] != b'\n' {
-        pos += 1;
-    }
-    if pos < data.len() {
-        pos += 1; // skip \n
-    }
-
-    // Parse headers
-    while pos < header_end_pos {
-        if data[pos] == b'\r' || data[pos] == b'\n' {
-            break;
-        }
-
-        if req.header_count < 16 {
-            let h = &mut req.headers[req.header_count];
-
-            // Header name (up to ':')
-            let mut ni = 0;
-            while pos < data.len() && data[pos] != b':' && data[pos] != b'\r' && ni < 63 {
-                h.name[ni] = data[pos];
-                ni += 1;
-                pos += 1;
-            }
-            h.name_len = ni;
-
-            // Skip ':' and spaces
-            while pos < data.len() && (data[pos] == b':' || data[pos] == b' ') {
-                pos += 1;
-            }
-
-            // Header value
-            let mut vi = 0;
-            while pos < data.len() && data[pos] != b'\r' && data[pos] != b'\n' && vi < 255 {
-                h.value[vi] = data[pos];
-                vi += 1;
-                pos += 1;
-            }
-            h.value_len = vi;
-
-            req.header_count += 1;
-        }
-
-        // Skip to next line
-        while pos < data.len() && data[pos] != b'\n' {
-            pos += 1;
-        }
-        if pos < data.len() {
-            pos += 1;
-        }
-    }
-
-    let body_start = header_end_pos + 4; // skip \r\n\r\n
-
-    // Extract Content-Length into the Request so the handler's
-    // `BodyReader` knows how many body bytes to deliver. The body
-    // bytes themselves stay in the caller's parse buffer (and the
-    // transport stream); `serve_conn` constructs the reader against
-    // them after this function returns. Bodies that span more than
-    // one recv are handled by the streaming reader, NOT by waiting
-    // here for all bytes to arrive.
-    req.content_length = match req.header(b"Content-Length") {
-        Some(cl_val) => parse_usize(cl_val),
-        None => 0,
-    };
-
-    // Reject `Transfer-Encoding: chunked`. Chunked framing is not
-    // implemented yet (deferred to the Phase 4 parser refresh);
-    // ignoring the header — which is what the parser did before
-    // item E — silently treats the chunk-framed body as a
-    // length-0 body, leaving the chunk bytes in the caller's
-    // buffer to be misparsed as the next pipelined request: an
-    // HTTP request-smuggling vector. Flag it so `serve_conn`
-    // answers `400 Bad Request` + `Connection: close` and reads
-    // no body. `req.header` already matches the header *name*
-    // case-insensitively; `transfer_encoding_is_chunked` matches
-    // `chunked` case-insensitively anywhere in the comma-separated
-    // transfer-coding list (e.g. `gzip, chunked`).
-    req.reject = match req.header(b"Transfer-Encoding") {
-        Some(te) => transfer_encoding_is_chunked(te),
-        None => false,
-    };
-
-    body_start
-}
-
 /// Extract the port from an HTTP `Host` header value. Handles:
 ///   `localhost:8443`           → 8443
 ///   `localhost`                → None (caller defaults)
@@ -366,20 +203,6 @@ fn host_header_port(host: &[u8]) -> Option<u16> {
 }
 
 // ---- Helper functions -------------------------------------------------------
-
-/// Locate `\r\n\r\n` (the headers/body terminator) starting from
-/// byte `start`. The caller has already scanned `data[..start]`
-/// without finding it; this restarts there to avoid the O(N²)
-/// re-scan when a request arrives in many small recv segments.
-/// Returns the absolute index of the terminator within `data`.
-#[cfg(any(test, http_legacy_buffered_parser))]
-fn find_header_end_from(data: &[u8], start: usize) -> Option<usize> {
-    let suffix = data.get(start..)?;
-    suffix
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + start)
-}
 
 pub(crate) fn parse_usize(data: &[u8]) -> usize {
     let mut n: usize = 0;
@@ -435,89 +258,31 @@ mod host_port_tests {
     }
 }
 
-/// Item E — the request parser must flag a `Transfer-Encoding:
-/// chunked` request for a `400` rejection rather than silently
-/// mis-frame its body (an HTTP request-smuggling vector). These
-/// tests pin both the value-matching helper and the parser flag.
+/// Tests for the `Transfer-Encoding: chunked` value-matching
+/// helper. The parser-side `reject`-flag setting is exercised in
+/// the streaming parser's own tests (`streaming::tests`).
 #[cfg(test)]
-mod chunked_reject_tests {
-    use super::{ParserState, Request, parse_request_with_state, transfer_encoding_is_chunked};
-
-    /// Parse one request out of `raw` and report `(body_start,
-    /// reject)` — `body_start` is the parser's return value (0
-    /// means "headers incomplete, need more bytes"), `reject` is
-    /// the flag `serve_conn` turns into a 400.
-    fn parse(raw: &[u8]) -> (usize, bool) {
-        let mut req = Request::new();
-        let mut state = ParserState::default();
-        let body_start = parse_request_with_state(raw, &mut req, &mut state);
-        (body_start, req.reject)
-    }
+mod chunked_helper_tests {
+    use super::transfer_encoding_is_chunked;
 
     #[test]
-    fn helper_matches_chunked_case_insensitively() {
+    fn matches_chunked_case_insensitively() {
         assert!(transfer_encoding_is_chunked(b"chunked"));
         assert!(transfer_encoding_is_chunked(b"Chunked"));
         assert!(transfer_encoding_is_chunked(b"CHUNKED"));
     }
 
     #[test]
-    fn helper_matches_chunked_anywhere_in_the_coding_list() {
+    fn matches_chunked_anywhere_in_the_coding_list() {
         assert!(transfer_encoding_is_chunked(b"gzip, chunked"));
         assert!(transfer_encoding_is_chunked(b"chunked, gzip"));
         assert!(transfer_encoding_is_chunked(b"gzip , chunked , deflate"));
     }
 
     #[test]
-    fn helper_ignores_non_chunked_codings() {
+    fn ignores_non_chunked_codings() {
         assert!(!transfer_encoding_is_chunked(b""));
         assert!(!transfer_encoding_is_chunked(b"gzip"));
         assert!(!transfer_encoding_is_chunked(b"identity"));
-    }
-
-    #[test]
-    fn chunked_request_is_flagged_for_rejection() {
-        let raw = b"POST /upload HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-        let (body_start, reject) = parse(raw);
-        assert!(reject, "a chunked-TE request must be flagged for a 400");
-        assert!(
-            body_start > 0,
-            "headers are complete, body_start must be set"
-        );
-    }
-
-    #[test]
-    fn transfer_encoding_header_name_match_is_case_insensitive() {
-        let raw = b"POST / HTTP/1.1\r\ntRaNsFeR-eNcOdInG: chunked\r\n\r\n";
-        let (_, reject) = parse(raw);
-        assert!(reject);
-    }
-
-    #[test]
-    fn chunked_in_a_coding_list_is_flagged() {
-        let raw = b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
-        let (_, reject) = parse(raw);
-        assert!(reject);
-    }
-
-    #[test]
-    fn plain_content_length_request_is_not_flagged() {
-        let raw = b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
-        let (body_start, reject) = parse(raw);
-        assert!(
-            !reject,
-            "a normal Content-Length request must not be flagged"
-        );
-        assert!(body_start > 0);
-    }
-
-    #[test]
-    fn incomplete_headers_are_not_flagged() {
-        // No CRLF-CRLF terminator yet: the parser returns 0
-        // ("need more bytes") before it inspects any header.
-        let raw = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n";
-        let (body_start, reject) = parse(raw);
-        assert_eq!(body_start, 0, "incomplete headers => need more bytes");
-        assert!(!reject);
     }
 }

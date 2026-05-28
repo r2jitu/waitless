@@ -1,14 +1,9 @@
-// Streaming HTTP/1.1 request-HEAD parser. Wired into `serve_conn`
-// in commit C3 of the streaming-parser stack; until then nothing in
-// the non-test build calls this module — silence the resulting
-// dead-code lint at the file level.
-#![allow(dead_code)]
-
+// Streaming HTTP/1.1 request-HEAD parser — the parse path
+// `serve_conn` drives.
+//
 // Byte-fed state machine that writes parsed values directly into a
 // caller-supplied `Request` as bytes arrive — no per-conn parse
-// buffer, no chunk-to-buffer copy. The companion to the buffered
-// `parse_request_with_state` in `request.rs`; both fill the same
-// `Request` shape so handlers don't care which one drove the parse.
+// buffer, no chunk-to-buffer copy.
 //
 // The `Request` is the parser's storage. Per-field write cursors
 // live in the `Request` itself (`path_len`, `header_count`,
@@ -22,7 +17,7 @@
 // method name is matched against known verbs once the trailing SP
 // arrives, not byte-by-byte).
 //
-// Behaviour parity with `parse_request_with_state`:
+// Behaviour:
 //
 //   * `Method::Unknown` for any verb outside the known list — no
 //     error, the handler decides.
@@ -30,15 +25,12 @@
 //     fixed-buffer caps (256 / 64 / 256 bytes).
 //   * Header count truncated silently at 16.
 //   * `Content-Length` and `Transfer-Encoding: chunked`
-//     interpretation happens at end-of-headers, identical to the
-//     buffered parser.
+//     interpretation happens at end-of-headers via the per-Request
+//     header table lookup.
 //
-// What this parser is NOT yet doing (left for the strictness pass
-// in commit C4):
-//
-//   * Rejecting lone LF / lone CR.
-//   * Rejecting embedded CR/LF inside header names or values.
-//   * Rejecting duplicate / disagreeing `Content-Length` values.
+// Strictness deferred (worth tightening when paired with a fuzz
+// corpus): reject lone LF / lone CR, embedded CR/LF inside header
+// names or values, duplicate / disagreeing `Content-Length` values.
 
 use crate::request::{
     Method, Request, parse_usize, transfer_encoding_is_chunked,
@@ -384,6 +376,36 @@ mod tests {
     }
 
     #[test]
+    fn transfer_encoding_chunked_in_coding_list_is_rejected() {
+        let raw = b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        let (req, _) = feed_whole(raw);
+        assert!(req.reject);
+    }
+
+    #[test]
+    fn transfer_encoding_header_name_match_is_case_insensitive() {
+        let raw = b"POST / HTTP/1.1\r\ntRaNsFeR-eNcOdInG: chunked\r\n\r\n";
+        let (req, _) = feed_whole(raw);
+        assert!(req.reject);
+    }
+
+    #[test]
+    fn plain_content_length_is_not_flagged() {
+        let raw = b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+        let (req, _) = feed_whole(raw);
+        assert!(!req.reject);
+        assert_eq!(req.content_length, 5);
+    }
+
+    #[test]
+    fn incomplete_headers_return_need_more() {
+        let raw = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n";
+        let (req, r) = feed_whole(raw);
+        assert!(done_consumed(&r).is_none(), "missing CRLF-CRLF => NeedMore");
+        assert!(!req.reject, "reject is only set at end-of-headers");
+    }
+
+    #[test]
     fn unknown_method_does_not_error() {
         let raw = b"PATCH /x HTTP/1.1\r\n\r\n";
         let (req, r) = feed_whole(raw);
@@ -468,159 +490,3 @@ mod tests {
     }
 }
 
-/// Equivalence harness: feed the same byte sequence through both
-/// `parse_request_with_state` (buffered) and `StreamingRequestParser`
-/// (streaming) and assert the resulting `Request` objects match. The
-/// streaming parser is the eventual replacement, so behaviour parity
-/// across a representative corpus is the swap's safety net.
-///
-/// Two drive shapes per corpus item:
-///   * **whole** — both parsers see the full request in one call.
-///   * **split-at-K** — both see the request as two consecutive
-///     chunks for every K in `0..=len`. Buffered drive accumulates
-///     into a contiguous buffer and re-calls until non-zero (the
-///     same loop `serve_conn` runs today); streaming drive feeds the
-///     two halves directly.
-///
-/// **`DIVERGENCE_UNKNOWN_METHOD`** — for a verb outside the known
-/// list (e.g. `PATCH`), the buffered parser leaves its cursor at
-/// byte 0 and the path-extraction loop then captures the *method*
-/// bytes as the path (so `path = "PATCH"`, `method = Unknown`). The
-/// streaming parser correctly advances past the method and reads
-/// the actual request-target. We deliberately do NOT replicate the
-/// buffered quirk in the streaming parser — production never sends
-/// unknown methods, and the streaming behaviour is the spec-correct
-/// one. The corpus therefore omits unknown-method shapes.
-#[cfg(test)]
-mod equivalence {
-    use super::{FeedResult, StreamingRequestParser};
-    use crate::request::{Header, ParserState, Request, parse_request_with_state};
-    use alloc::vec::Vec;
-
-    /// Hand-picked request shapes covering the parser's interesting
-    /// surface: methods, header layouts, content-length, chunked-TE
-    /// rejection, IPv6 host, OWS trimming. Each MUST end at a HEAD
-    /// terminator with optional body bytes after.
-    const CORPUS: &[&[u8]] = &[
-        // 0: minimal GET
-        b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
-        // 1: GET with multiple headers
-        b"GET /health HTTP/1.1\r\nHost: example.com\r\nUser-Agent: t\r\nAccept: */*\r\n\r\n",
-        // 2: POST + Content-Length + body tail
-        b"POST /up HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello",
-        // 3: PUT, longer path
-        b"PUT /v1/items/42 HTTP/1.1\r\nHost: api.example\r\n\r\n",
-        // 4: DELETE
-        b"DELETE /x HTTP/1.1\r\nHost: h\r\n\r\n",
-        // 5: HEAD
-        b"HEAD /static/asset.css HTTP/1.1\r\nHost: h\r\n\r\n",
-        // (no unknown-method case here — see DIVERGENCE_UNKNOWN_METHOD
-        // below for a known buffered-parser quirk we deliberately
-        // don't reproduce.)
-        //
-        // 6: Transfer-Encoding: chunked — must mark reject
-        b"POST /chunked HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
-        // 8: leading-OWS-rich header value
-        b"GET / HTTP/1.1\r\nX-Custom:    spaced-value\r\n\r\n",
-        // 9: IPv6 Host with port
-        b"GET / HTTP/1.1\r\nHost: [::1]:8443\r\n\r\n",
-        // 10: header value with leading tab + trailing chars
-        b"GET / HTTP/1.1\r\nX-Tag:\tprobe\r\n\r\n",
-        // 11: query string in path
-        b"GET /search?q=hello&n=10 HTTP/1.1\r\nHost: h\r\n\r\n",
-        // 12: pipelined-like — second request bytes follow the HEAD
-        b"GET /first HTTP/1.1\r\nHost: h\r\n\r\nGET /second HTTP/1.1\r\nHost: h\r\n\r\n",
-    ];
-
-    /// Drive the buffered parser the same way `serve_conn` does:
-    /// accumulate into a contiguous buffer, calling
-    /// `parse_request_with_state` after each append until it returns
-    /// non-zero (body_start). Returns `(req, head_len)`.
-    fn drive_buffered_chunked(chunks: &[&[u8]]) -> (Request, usize) {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut req = Request::new();
-        let mut state = ParserState::default();
-        for c in chunks {
-            buf.extend_from_slice(c);
-            let body_start = parse_request_with_state(&buf, &mut req, &mut state);
-            if body_start > 0 {
-                return (req, body_start);
-            }
-        }
-        panic!("buffered parser still wants more after all chunks");
-    }
-
-    /// Drive the streaming parser by feeding chunks in order.
-    /// Returns `(req, head_len)`.
-    fn drive_streaming_chunked(chunks: &[&[u8]]) -> (Request, usize) {
-        let mut req = Request::new();
-        let mut p = StreamingRequestParser::new();
-        let mut head_len = 0usize;
-        for c in chunks {
-            match p.feed(&mut req, c) {
-                FeedResult::Done { consumed } => {
-                    return (req, head_len + consumed);
-                }
-                FeedResult::NeedMore => {
-                    head_len += c.len();
-                }
-            }
-        }
-        panic!("streaming parser still wants more after all chunks");
-    }
-
-    fn assert_requests_equal(a: &Request, b: &Request, ctx: &str) {
-        assert!(a.method == b.method, "{ctx}: method differs");
-        assert!(a.path() == b.path(), "{ctx}: path differs");
-        assert!(
-            a.header_count == b.header_count,
-            "{ctx}: header_count {} != {}",
-            a.header_count, b.header_count,
-        );
-        for i in 0..a.header_count {
-            let (ah, bh): (&Header, &Header) = (&a.headers[i], &b.headers[i]);
-            assert!(ah.name() == bh.name(), "{ctx}: header[{i}].name differs");
-            assert!(ah.value() == bh.value(), "{ctx}: header[{i}].value differs");
-        }
-        assert!(
-            a.content_length == b.content_length,
-            "{ctx}: content_length {} != {}",
-            a.content_length, b.content_length,
-        );
-        assert!(a.reject == b.reject, "{ctx}: reject differs");
-    }
-
-    #[test]
-    fn whole_input_equivalence_across_corpus() {
-        for (i, raw) in CORPUS.iter().enumerate() {
-            let (buf_req, buf_head) = drive_buffered_chunked(&[raw]);
-            let (str_req, str_head) = drive_streaming_chunked(&[raw]);
-            assert!(
-                buf_head == str_head,
-                "corpus[{i}]: head_len buffered={buf_head} streaming={str_head}",
-            );
-            assert_requests_equal(&buf_req, &str_req, &alloc::format!("corpus[{i}]"));
-        }
-    }
-
-    #[test]
-    fn split_at_every_boundary_equivalence_across_corpus() {
-        for (i, raw) in CORPUS.iter().enumerate() {
-            for split in 0..=raw.len() {
-                let (a, b) = raw.split_at(split);
-                let chunks: &[&[u8]] = &[a, b];
-                let (buf_req, buf_head) = drive_buffered_chunked(chunks);
-                let (str_req, str_head) = drive_streaming_chunked(chunks);
-                assert!(
-                    buf_head == str_head,
-                    "corpus[{i}] split={split}: head_len buffered={buf_head} streaming={str_head}",
-                );
-                assert_requests_equal(
-                    &buf_req,
-                    &str_req,
-                    &alloc::format!("corpus[{i}] split={split}"),
-                );
-            }
-        }
-    }
-}

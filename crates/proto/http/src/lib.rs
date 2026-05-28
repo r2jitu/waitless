@@ -27,8 +27,6 @@ mod streaming;
 
 pub use body::{BodyChunkGuard, BodyReader};
 pub use request::{Header, Method, Request};
-#[cfg(any(test, http_legacy_buffered_parser))]
-pub use request::ParserState;
 pub use response::{Bytes, MAX_EXTRA_HEADERS, Response, bytes_owned, bytes_static};
 pub use server::{listen, serve_conn};
 pub use stream::{BufferedBody, HttpStream, NullStream};
