@@ -368,7 +368,7 @@ SYN packets never reached our TCP stack at all, so wrk's
 **B. ~~Working-set blow-up~~ — tested and falsified (2026-05-24).**
 This was originally proposed as the second half of the failure
 mode: each conn carries `TcpConnection` (~200 B, 3+ cache lines)
-+ `rx_ring` (16 KB) + `rtx_buf` (64 KB) + boxed handler future
++ `rx_ring` (16 KB) + ~~`rtx_buf` (64 KB)~~ → `rtx_queue` (on-demand) + boxed handler future
 (~1–2 KB), so at 18 K conns / 8 cores the working set blows past
 L2 / L3 and per-poll cycle cost rises with conn count. The
 `tcp-hot-cold-split` branch tested this directly — shrunk
@@ -617,7 +617,7 @@ magnitude. Nominal per-conn from the assignment was 98 KB. The
 | Source                                                        | Bytes |
 |---------------------------------------------------------------|------:|
 | TCP `rx_ring` (lazy, preserved per slot)                      | 16 KB |
-| TCP `rtx_buf` (lazy, preserved per slot)                      | 64 KB |
+| ~~TCP `rtx_buf` (lazy, preserved per slot)~~ **RETIRED — replaced by `rtx_queue`** | ~~64 KB~~ → on-demand |
 | `Box<TlsConnImpl>` (per-conn TLS state — 3×4 KB inline buffers + keys + cfg Arc) | ~12 KB |
 | `TlsStream` `record_scratch` (lazy on scratch fallback; `TLS_RECORD_LEN` ≈ 16 KB) | ~16 KB |
 | **Handler future `Box`** — `serve_conn` future state:         |      |
@@ -648,10 +648,13 @@ cliff position.
 
 ### H3 — Buffers preserved across conn close: **CONFIRMED with twist**
 
-`free_connection` → `reset_preserving` hands `rx_ring` and
-`rtx_buf` back to the same slot — the 80 KB ride along on every
-slot reuse (state.rs:491). For the slots that ever transition
-out of `Closed`, the 80 KB is locked to the slot until pool
+`free_connection` → `reset_preserving` hands `rx_ring` (16 KB) and
+the `rtx_queue` deque (idle capacity, tens of bytes) back to the
+same slot. Pre-`rtx_queue` retirement, this was an 80 KB
+ride-along (the 64 KB `rtx_buf` was the other slot-preserved
+block); the queue's per-entry IOBufs are not preserved, only the
+deque's small backing vec. For slots that ever transition out of
+`Closed`, the 16 KB rx_ring is locked to the slot until pool
 shutdown.
 
 But the more interesting load-bearing fact: `live_conns` counts
@@ -666,8 +669,11 @@ bench:
 | after 5 s of 100 fresh conns|     1 133  |  317.3 MB  |    10 790   |          1 857 |
 
 The 1 132 `TIME_WAIT` slots still consume 317 MB — 280 KB each
-above the 6.85 MB baseline. That's more than the 80 KB preserved
-buffers alone, which suggests the per-conn handler task hasn't
+above the 6.85 MB baseline. (At the time of this measurement, the
+preserved per-slot blocks were 80 KB; post-`rtx_queue` retirement
+they are ~16 KB. Numbers below predate the queue migration.)
+That's more than the 80 KB preserved buffers alone, which
+suggests the per-conn handler task hasn't
 completed for those slots yet (likely blocked on TLS
 `close_notify` or sitting in the recv-loop drain) and is still
 holding the ~33 KB future Box + ~12 KB TLS Box + ~16 KB
@@ -697,21 +703,25 @@ keeps the heap tightly packed (just 11 holes across 16 K live
 allocations). The instant wrk closes its conns the fragment count
 goes up 170×. The pattern:
 
-  * Live alloc shape per conn: 16 KB rx_ring, 64 KB rtx_buf,
-    ~16 KB record_scratch, ~12 KB TlsConnImpl, ~33 KB future
-    Box. Mixed sizes interleaved on the heap.
+  * Live alloc shape per conn: 16 KB rx_ring, on-demand rtx_queue
+    entries (≤ MSS each), ~16 KB record_scratch, ~12 KB TlsConnImpl,
+    ~33 KB future Box. Mixed sizes interleaved on the heap.
   * On conn close the future/TLS/record_scratch free at scattered
-    offsets, leaving rtx_buf-sized (64 KB) and record_scratch-sized
-    (16 KB) holes around still-live structures. Slot-preserved
-    rx_ring + rtx_buf don't free — they stay with the slot.
+    offsets, leaving ~16 KB-sized holes around still-live structures.
+    Slot-preserved rx_ring doesn't free — it stays with the slot.
+    The retired 64 KB `rtx_buf` used to be the other slot-preserved
+    block; with `rtx_queue` the only retained per-slot capacity is
+    the deque's backing vec (tens of bytes at idle, low KB when
+    sending), so the "64 KB hole-around-the-still-live-slot"
+    fragmentation pattern is gone.
   * The next batch of accepts allocates new futures + TLS state
     + record_scratch from the segregated-free-list, but the holes
     don't always match the new requests' sizes — slow consolidation.
 
 So the GCE Stage-2/3 collapse mechanism gets worse the moment
 wrk's `--timeout` starts firing and conns churn. Each
-close→retry cycle adds fragmentation; eventually a 64 KB rtx_buf
-or 16 KB record_scratch request can't be satisfied even though
+close→retry cycle adds fragmentation; eventually a 16 KB
+record_scratch request can't be satisfied even though
 `available_bytes` says there's room.
 
 `(claimed - allocated) - available` stayed at 0 across this
@@ -772,11 +782,12 @@ Fragmentation slack (variable) ..  +0 to +200 MB during churn
 
 The per-conn slope alone takes the heap past 3 GB at ~16.5 K
 conns. The observed cliff at 18 K conns matches once you account
-for some lazy buffers (rtx_buf, record_scratch) being deferred
-until the first send. Fragmentation is the multiplier on top —
-when conns start cycling (loss / timeout / RST) the fragment
-count balloons and any individual 16 KB or 64 KB request can hit
-"can't fit" even before bytes-allocated exhausts.
+for some lazy buffers (record_scratch) being deferred until the
+first send. Fragmentation is the multiplier on top — when conns
+start cycling (loss / timeout / RST) the fragment count balloons
+and any individual 16 KB request can hit "can't fit" even before
+bytes-allocated exhausts. (Pre-rtx_queue retirement, 64 KB
+requests for `rtx_buf` were the other failure point.)
 
 ### Recommended ceiling-movers (ranked by ceiling-shift)
 
@@ -815,14 +826,17 @@ first item dwarfs everything below it.
    HEAD terminator. **Saved 16 KB/conn → cliff moved from ~18 K to
    ~25 K on GCE shape.**
 
-2. **`TcpConnection` rtx_buf default: 64 KB → 16 KB.**
-   `RTX_BUF_BYTES = 65536` is sized to cover the largest possible
-   `min(cwnd, rwnd)` (state.rs:142). For `/health` and most static
-   workloads the in-flight window peaks at a small multiple of
-   MSS (≤ 16 KB) — most slots never need 64 KB. Make it size-on-
-   demand: start at 16 KB, double on overflow up to 64 KB. **Saves
-   up to 48 KB/conn on idle keep-alive slots; up to 16 K → 30 K
-   cliff if the bench workload tops out below 16 KB in flight.**
+2. **`TcpConnection` rtx_buf → IOBuf-backed `rtx_queue`. (DONE)**
+   The fixed 64 KiB `Box<[u8; RTX_BUF_BYTES]>` is gone; the per-conn
+   retransmit-coverage path is now a `VecDeque<RtxEntry>` of owned
+   IOBufs allocated per send and freed per ACK. Peak per-conn
+   footprint scales with the live send window (≤ MSS × in-flight
+   segments ≈ ~1.8 KB at a 64 KiB cwnd) rather than the fixed
+   64 KiB reservation. The SG-TX follow-up will swap the
+   `into_owned()` at insertion for refcount-shared storage so the
+   same IOBuf is alive in the queue while the wire-DMA is in flight,
+   eliminating the staging memcpy. **Saves ~64 KB/conn on every
+   slot that ever sent data; moves the cliff well past 24 K.**
 
 3. **`TlsStream.cipher_buf`: 8 KB inline → REMOVED.** (DONE)
    `pump_rx` now pulls ciphertext via `TcpStream::recv_chunk` and
@@ -905,7 +919,7 @@ where applicable):
 | 2 | `tcp::state.rs::ensure_rx_ring` — TCP receive ring | 16 K | **GRACEFUL** (try_reserve_exact, pre-existing) |
 | 3 | `reactor/tcp.rs:665` — `Box::pin(handler_future)` | **~33 K** | **PANIC** |
 | 4 | `tls::server.rs:355` — `Box::<TlsServer>::new_uninit()` | ~12 K | **PANIC** (mitigated by `TlsConnPool` recycle, cap=16/worker) |
-| 5 | `tcp::state.rs::ensure_rtx_buf` — retransmit buffer | 64 K | **GRACEFUL** (try_reserve_exact, pre-existing) |
+| 5 | `tcp::state.rs::rtx_push` — retransmit queue grow | per-entry | **GRACEFUL** (try_reserve; sets `rtx_alloc_failed`) |
 | 6 | `tls::lib.rs:598` — `record_scratch` (TLS app-data send) | ~16 K | **GRACEFUL** (fix branch) |
 
 The fix branch closes #1 and #6. Sites #2 and #5 were already
@@ -1390,8 +1404,9 @@ small cap shed:
 11. **Per-CPU slab allocator** _(large)_
     - Single `Spinlock<Talc>` heap shared across cores. The slot
       pool's preserve-across-reuse covers steady-state, but
-      first-time rx_ring/rtx_buf allocation during warmup still
-      hits the lock. Per-CPU caches eliminate the contention.
+      first-time rx_ring allocation during warmup and per-send
+      rtx_queue entry allocs still hit the lock. Per-CPU caches
+      eliminate the contention.
 
 12. **Adaptive admission controller (CoDel or Netflix Vegas)** _(medium)_
     - Only after P0 #3's fixed cap is in place *and* measurement

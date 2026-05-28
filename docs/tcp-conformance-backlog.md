@@ -185,8 +185,9 @@ challenge-ACK rate.
 window caps a single connection's throughput at `64 KiB / RTT` — e.g.
 ~1.3 MB/s at a 50 ms WAN RTT, regardless of link speed.
 
-**Fix.** Widen `rcv_wnd`/`snd_wnd` (and `RTX_BUF_BYTES`, currently
-sized to the 64 KiB ceiling) to `u32`; negotiate and apply the scale
+**Fix.** Widen `rcv_wnd`/`snd_wnd` to `u32` (the queue's
+`rtx_bytes_in_flight` is already `u32`, so the retx-coverage path
+takes no fixed-size cap with it); negotiate and apply the scale
 shift; add Timestamps + PAWS. Cross-cutting — touches all window
 arithmetic. **Effort: L.**
 
