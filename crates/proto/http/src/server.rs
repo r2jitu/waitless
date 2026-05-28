@@ -111,14 +111,12 @@ where
         // bytes from `carry` first (left over from the previous
         // iteration), then fresh `recv_chunk` calls.
         loop {
-            if let Some(mut buf) = carry.take() {
+            if let Some(buf) = carry.take() {
                 match parser.feed(&mut req, buf.data()) {
                     streaming::FeedResult::Done { consumed } => {
-                        buf.consume(consumed)
+                        carry = buf
+                            .into_remainder(consumed)
                             .expect("consumed <= data().len()");
-                        if !buf.data().is_empty() {
-                            carry = Some(buf);
-                        }
                         break;
                     }
                     streaming::FeedResult::NeedMore => {
@@ -130,13 +128,9 @@ where
                 match waitless::runtime::timeout_us(IDLE_TIMEOUT_US, chunk_fut).await {
                     Some(Some(guard)) => match parser.feed(&mut req, guard.data()) {
                         streaming::FeedResult::Done { consumed } => {
-                            let mut owned = guard.into_owned();
-                            owned
-                                .consume(consumed)
+                            carry = guard
+                                .into_remainder(consumed)
                                 .expect("consumed <= data().len()");
-                            if !owned.data().is_empty() {
-                                carry = Some(owned);
-                            }
                             break;
                         }
                         streaming::FeedResult::NeedMore => {
@@ -241,13 +235,11 @@ where
         // (BodyReader handed them to the handler from `carry`'s
         // prefix; `discard` finished anything the handler skipped).
         // What's left is the start of the next pipelined request.
-        if let Some(mut c) = carry.take() {
+        if let Some(c) = carry.take() {
             let body_from_carry = content_length.min(c.data().len());
-            c.consume(body_from_carry)
+            carry = c
+                .into_remainder(body_from_carry)
                 .expect("body_from_carry <= data().len()");
-            if !c.data().is_empty() {
-                carry = Some(c);
-            }
         }
     }
 }

@@ -227,6 +227,29 @@ impl IOBuf {
         dispatch!(mut self, b => b.trim_end(n))
     }
 
+    /// Consume `n` bytes from the front and return the IOBuf if
+    /// the visible payload is non-empty after the advance, or
+    /// `Ok(None)` if it's now empty. The "carry the leftover
+    /// forward" primitive — used when a caller parsed the first
+    /// `n` bytes of this buffer and wants to thread anything past
+    /// `n` into the next iteration (e.g. body bytes that landed
+    /// in the same chunk as a request HEAD).
+    ///
+    /// Borrow-preserving: a `Borrowed` IOBuf yields a `Borrowed`
+    /// remainder. Callers that need an owned tail (i.e. need to
+    /// hold it past the borrow's lifetime) follow with
+    /// `into_owned()` on the `Some(_)` branch — see
+    /// `RecvChunkGuard::into_remainder` for the bundled version.
+    ///
+    /// Returns the same `IOBufError` shape as `consume(n)` if `n`
+    /// exceeds the visible payload; choice of panic vs propagate
+    /// stays at the call site.
+    #[inline]
+    pub fn into_remainder(mut self, n: usize) -> Result<Option<IOBuf>, IOBufError> {
+        self.consume(n)?;
+        Ok((!self.data().is_empty()).then_some(self))
+    }
+
     /// `core::fmt::Write` adapter that appends formatted bytes into
     /// the IOBuf's tailroom — `write!(buf.writer(), "{}", value)`
     /// renders straight into the IOBuf with no intermediate `String`.
@@ -586,6 +609,57 @@ mod tests {
             released.load(Ordering::SeqCst),
             "drop callback fires exactly once after into_owned"
         );
+    }
+
+    #[test]
+    fn into_remainder_returns_none_on_full_consume() {
+        let b = IOBuf::from(alloc::vec![1u8, 2, 3, 4]);
+        assert!(b.into_remainder(4).expect("in-range").is_none());
+    }
+
+    #[test]
+    fn into_remainder_returns_tail_on_partial_consume() {
+        let b = IOBuf::from(alloc::vec![1u8, 2, 3, 4]);
+        let tail = b
+            .into_remainder(2)
+            .expect("in-range")
+            .expect("non-empty after partial consume");
+        assert_eq!(tail.data(), &[3, 4]);
+    }
+
+    #[test]
+    fn into_remainder_zero_keeps_full_buffer() {
+        let b = IOBuf::from(alloc::vec![1u8, 2, 3, 4]);
+        let tail = b
+            .into_remainder(0)
+            .expect("in-range")
+            .expect("zero consume keeps everything");
+        assert_eq!(tail.data(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn into_remainder_preserves_borrowed_variant() {
+        let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
+        storage[..16].copy_from_slice(b"AAAAAAAAtailtail");
+        let ptr = core::ptr::NonNull::new(storage.as_mut_ptr()).unwrap();
+        // SAFETY: storage outlives the IOBuf in this block.
+        let b = unsafe { IOBuf::borrow(ptr, 32, 0, 16) };
+        assert!(matches!(b.inner, Inner::Borrowed(_)));
+        let tail = b
+            .into_remainder(8)
+            .expect("in-range")
+            .expect("tail is non-empty");
+        assert!(
+            matches!(tail.inner, Inner::Borrowed(_)),
+            "into_remainder is borrow-preserving — callers wanting an owned tail follow with into_owned()",
+        );
+        assert_eq!(tail.data(), b"tailtail");
+    }
+
+    #[test]
+    fn into_remainder_returns_err_on_overconsume() {
+        let b = IOBuf::from(alloc::vec![1u8, 2, 3, 4]);
+        assert!(b.into_remainder(5).is_err());
     }
 
     #[test]

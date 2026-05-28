@@ -922,6 +922,25 @@ impl<'a> RecvChunkGuard<'a> {
     pub fn into_owned(self) -> iobuf::IOBuf {
         self.iobuf.into_owned()
     }
+
+    /// Consume the first `n` bytes and return the rest as an owned
+    /// IOBuf, or `Ok(None)` if nothing remains. The "I parsed K
+    /// bytes off the front of this chunk; carry the tail past the
+    /// recv borrow" primitive — used by `serve_conn` when a chunk
+    /// runs past a request-HEAD terminator into the body / next
+    /// pipelined request.
+    ///
+    /// Runs the `consume(n)` advance BEFORE `into_owned`, so for
+    /// `Borrowed` chunks (TLS plaintext) the copy is sized to the
+    /// leftover only — not the whole pre-consume chunk. NIC-RX
+    /// `ExternalOwned` chunks stay zero-copy through both steps.
+    ///
+    /// Returns `Err(IOBufError)` if `n` exceeds the chunk's visible
+    /// length; the panic-vs-propagate choice stays at the call site.
+    #[inline]
+    pub fn into_remainder(self, n: usize) -> Result<Option<iobuf::IOBuf>, iobuf::IOBufError> {
+        Ok(self.iobuf.into_remainder(n)?.map(|t| t.into_owned()))
+    }
 }
 
 /// Future returned by [`TcpStream::recv_chunk`]. Resolves to
