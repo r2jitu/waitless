@@ -196,9 +196,12 @@ where
                     || body.discard().await.is_ok();
                 // Pick up any residue BodyReader stashed when a
                 // stream-side chunk straddled the body boundary.
-                // Only meaningful when the body was fully drained;
-                // a failed drain returns immediately anyway.
-                body_leftover = if body_drained_ok {
+                // Only meaningful when the body was fully drained
+                // AND the body actually drew from the stream
+                // (CL > 0); a CL=0 body cannot have created a
+                // straddle, so skip the call entirely on the GET
+                // fast path.
+                body_leftover = if body_drained_ok && content_length > 0 {
                     body.into_leftover()
                 } else {
                     None
@@ -253,12 +256,15 @@ where
             return;
         }
 
-        // Advance `carry` past the body bytes that were just served
-        // (BodyReader handed them to the handler from `carry`'s
-        // prefix; `discard` finished anything the handler skipped).
-        // What's left in carry is the start of the next pipelined
-        // request.
-        if let Some(c) = carry.take() {
+        // Advance `carry` past the body bytes that were just served.
+        // GET fast path (CL=0): no bytes to advance past — `carry`
+        // already points at the next pipelined request's HEAD bytes
+        // (if any), so leave it untouched. Skipping the function
+        // call + Option dance is the hot-path saving the bench
+        // wanted back.
+        if content_length > 0
+            && let Some(c) = carry.take()
+        {
             let body_from_carry = content_length.min(c.data().len());
             carry = c
                 .into_remainder(body_from_carry)
