@@ -1446,24 +1446,26 @@ across all cores).
 
 ## Stack-level GCE A/B — streaming-parser stack (2026-05-27)
 
-`gcp-bench --env kvm --workload get_tcp,get_tls --cores 1,2 --duration 30` against a single GCE c3-highcpu-8 spot instance, loopback.
+`gcp-bench --env kvm --workload get_tcp,get_tls --cores 1,2,4 --duration 30` against a single GCE c3-highcpu-8 spot instance, loopback.
 
 The 30 s duration matters. An initial 10 s pass surfaced what looked like a 5–7 % `get_tls` 2c regression in the streaming tip vs a recv-chunk-migration "peak" of 249 483, which triggered an optimisation round. A 30 s repeat showed that 249 k was a high outlier on a noise band that's ~10 % wide at 10 s; 30 s tightens the band to ~3 % and the gap dissolves.
 
-| Workload | recv-chunk-migration (`11d9fb6`) | streaming + all opts (`5f6d25b`) | Δ |
+| Workload | recv-chunk-migration (`11d9fb6`) | streaming + all opts (`a0155e5`) | Δ |
 |---|---:|---:|---:|
-| `get_tcp` 1c | 228 823 | 228 947 | flat |
-| `get_tcp` 2c | 357 191 | **371 950** | **+4.1 %** |
-| `get_tls` 1c | 130 706 | 130 426 | flat |
-| `get_tls` 2c | 231 985 | 228 208 | −1.6 % (within noise) |
+| `get_tcp` 1c | 228 642 | 227 083 | flat |
+| `get_tcp` 2c | 369 006 | 366 956 | flat |
+| `get_tcp` 4c | 364 400 (`cli=2.1`) | 365 354 (`cli=2.0`) | flat (client-bound) |
+| `get_tls` 1c | 131 031 | 131 252 | flat |
+| `get_tls` 2c | 231 221 | **239 537** | **+3.6 %** |
+| `get_tls` 4c | 239 491 (`cli=2.5`) | **244 889** (`cli=2.6`) | **+2.3 %** |
 
 Reads:
 
-* **`get_tcp` 2c**: real +4 % win on top of the recv-chunk-migration baseline — eliminating the chunk → buf memcpy is visible.
-* **`get_tcp` 1c, `get_tls` 1c**: bandwidth-flat (expected — single-core was never memcpy-bound).
-* **`get_tls` 2c**: within noise. TLS is AEAD-bound at 2 c; saving the HEAD-parse memcpy doesn't move the dial.
+* **`get_tls` 2c and 4c**: real +2–4 % win — memcpy elimination shows where the workload is compute-balanced (TLS spends most of its time in AEAD; the saved memcpy is the marginal cycle freed).
+* **`get_tcp` 4c**: client-bound on the 8-vCPU host. wrk uses 2.0–2.1 cores; server uses 4; vhost-net adds per-queue kthreads. Total ≈ 6+ / 8 cores, no headroom for the load gen to scale further. Both branches plateau at ~365 k req/s — the copy-elimination win can't surface through that ceiling. An 8+ vCPU bench host would let `get_tcp` 4c be a clean measurement.
+* **`get_tcp` 1c+2c, `get_tls` 1c**: bandwidth-flat (single-core was never memcpy-bound; 2c TCP carries ~3 % noise across the two 30 s runs of the same commit we did across this session).
 
-End-state vs the pre-stack starting point: `get_tcp` 2 c improved, everything else flat, paid for with the 16 KiB inline parse buffer gone from per-conn future state and the no-delimiter DoS gap closed.
+End-state vs the pre-stack starting point: TLS up across 2c+4c, everything else flat or client-bound, paid for with the 16 KiB inline parse buffer gone from per-conn future state and the no-delimiter DoS gap closed.
 
 ### Optimisations that mattered
 
