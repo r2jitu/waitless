@@ -782,18 +782,6 @@ impl TcpConnection {
         acked
     }
 
-    /// Mutable accessor for the head of the retransmit queue —
-    /// used by the RTO path to reconstruct the retransmitted segment
-    /// from the existing IOBuf bytes (zero-copy retransmit) and to
-    /// bump `tx_count` for Karn's rule.
-    ///
-    /// Currently dead code — wired into the RTO path in a follow-up
-    /// commit.
-    #[allow(dead_code)]
-    pub(crate) fn rtx_head_for_retx(&mut self) -> Option<&mut RtxEntry> {
-        self.rtx_queue.front_mut()
-    }
-
     /// Lazy-allocate the per-conn retransmit ring on the first
     /// buffered send. Reused across SYN/close cycles like `rx_ring`
     /// (the pool free-list dance preserves it). Returns `false` on
@@ -1035,28 +1023,59 @@ impl TcpConnection {
     /// retransmit; the caller owns the congestion-window adjustment
     /// and the RTO-timer bookkeeping. No-op when nothing is buffered.
     fn retransmit_oldest_segment(&mut self) {
-        let n = (self.rtx_len as usize).min(mss_for(self.local_ip));
-        if n == 0 {
-            return;
-        }
-        // Copy the (≤ MSS) bytes out of the ring into a contiguous
-        // scratch buffer — the ring segment may wrap, and `send_segment`
-        // takes a flat slice. Off the steady-state path (only fires on
-        // actual loss), so the stack copy is not a hot-path cost.
+        let mss = mss_for(self.local_ip);
+        // Dual-route stage: the wire-send bytes come from `rtx_queue`'s
+        // head IOBuf. A debug_assert against `rtx_buf` confirms the
+        // two byte streams match through the migration. After commit
+        // 6 the queue is the sole source.
         let mut scratch = [0u8; MSS_MAX];
-        {
+        let n;
+        if let Some(head) = self.rtx_queue.front_mut() {
+            n = (head.len as usize).min(mss);
+            if n == 0 {
+                return;
+            }
+            // Copy out of the head IOBuf into scratch — the underlying
+            // ring stays untouched. The copy is cheap (≤ MSS bytes,
+            // off the steady-state path) and avoids any borrow
+            // contortion to call `send_segment` while still holding a
+            // `&mut self` reference. After commit 6, the head's IOBuf
+            // bytes are passed directly to the wire without scratch.
+            scratch[..n].copy_from_slice(&head.iobuf.data()[..n]);
+            // Bump the entry's tx_count for Karn's rule. >0 marks the
+            // entry as "retransmitted"; a future RTT-sampling commit
+            // refuses to take samples from such entries.
+            head.tx_count = head.tx_count.saturating_add(1);
+        } else {
+            // Queue empty — fall back to rtx_buf so a no-data retx
+            // (impossible in practice) still works. Defensive only;
+            // gone in commit 6.
+            n = (self.rtx_len as usize).min(mss);
+            if n == 0 {
+                return;
+            }
             let Some(buf) = self.rtx_buf.as_ref() else {
                 return;
             };
-            let head = self.rtx_head as usize;
-            if head + n <= RTX_BUF_BYTES {
-                scratch[..n].copy_from_slice(&buf[head..head + n]);
+            let head_off = self.rtx_head as usize;
+            if head_off + n <= RTX_BUF_BYTES {
+                scratch[..n].copy_from_slice(&buf[head_off..head_off + n]);
             } else {
-                let first = RTX_BUF_BYTES - head;
-                scratch[..first].copy_from_slice(&buf[head..]);
+                let first = RTX_BUF_BYTES - head_off;
+                scratch[..first].copy_from_slice(&buf[head_off..]);
                 scratch[first..n].copy_from_slice(&buf[..n - first]);
             }
         }
+        // Equivalence: the same bytes must live at the rtx_buf head.
+        // Compare the prefix we're about to ship against rtx_buf.
+        debug_assert!({
+            if let Some(buf) = self.rtx_buf.as_ref() {
+                let buf_head = self.rtx_head as usize;
+                (0..n).all(|i| scratch[i] == buf[(buf_head + i) % RTX_BUF_BYTES])
+            } else {
+                true
+            }
+        });
         send_segment(
             &SegmentMeta {
                 local_ip: self.local_ip,
