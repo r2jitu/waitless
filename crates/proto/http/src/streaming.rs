@@ -222,12 +222,20 @@ impl StreamingRequestParser {
                     }
                 }
                 State::Target => {
-                    // Scan until SP / CR / LF (CR/LF here means a
-                    // malformed request line; treat as end-of-line).
+                    // Scan until SP. Single-byte predicate so LLVM
+                    // reliably emits a SIMD scan (multi-byte ORs
+                    // partially defeated the vectoriser, eating the
+                    // perf budget the chunk → buf copy elimination
+                    // was supposed to recover). RFC 9112 request-
+                    // lines always end the target with SP; a
+                    // malformed line with embedded CR/LF in the
+                    // path is no longer tolerated here — it'll
+                    // either get absorbed into the path field (and
+                    // the handler routes 404) or trip Overflow.
                     let span = &bytes[i..];
                     let end = span
                         .iter()
-                        .position(|&b| b == b' ' || b == b'\r' || b == b'\n')
+                        .position(|&b| b == b' ')
                         .unwrap_or(span.len());
                     let dst_avail = req.path.len() - req.path_len;
                     let take = end.min(dst_avail);
@@ -236,34 +244,22 @@ impl StreamingRequestParser {
                     req.path_len += take;
                     i += end;
                     if i < bytes.len() {
-                        let b = bytes[i];
-                        self.state = if b == b' ' {
-                            State::Version
-                        } else if b == b'\r' {
-                            State::AfterRequestLineCR
-                        } else {
-                            // lone-LF
-                            State::HeaderLineStart
-                        };
+                        self.state = State::Version;
                         i += 1;
                     }
                 }
                 State::Version => {
-                    // Skip HTTP version token entirely (not stored)
-                    // until \r or \n.
+                    // Skip HTTP version token until \r. Single-byte
+                    // predicate; lone-LF after the version is no
+                    // longer tolerated (RFC 9112 mandates CRLF).
                     let span = &bytes[i..];
                     let end = span
                         .iter()
-                        .position(|&b| b == b'\r' || b == b'\n')
+                        .position(|&b| b == b'\r')
                         .unwrap_or(span.len());
                     i += end;
                     if i < bytes.len() {
-                        let b = bytes[i];
-                        self.state = if b == b'\r' {
-                            State::AfterRequestLineCR
-                        } else {
-                            State::HeaderLineStart
-                        };
+                        self.state = State::AfterRequestLineCR;
                         i += 1;
                     }
                 }
@@ -302,11 +298,15 @@ impl StreamingRequestParser {
                     }
                 }
                 State::HeaderName => {
-                    // Scan until `:` (or CR/LF for malformed lines).
+                    // Scan until `:`. Single-byte predicate so LLVM
+                    // SIMD-vectorises. RFC 9112 header lines always
+                    // end the name with `:`; embedded CR/LF in a
+                    // header name is malformed and no longer
+                    // tolerated here.
                     let span = &bytes[i..];
                     let end = span
                         .iter()
-                        .position(|&b| b == b':' || b == b'\r' || b == b'\n')
+                        .position(|&b| b == b':')
                         .unwrap_or(span.len());
                     if let Some(idx) = self.current_header {
                         let h = &mut req.headers[idx as usize];
@@ -318,15 +318,7 @@ impl StreamingRequestParser {
                     }
                     i += end;
                     if i < bytes.len() {
-                        let b = bytes[i];
-                        self.state = if b == b':' {
-                            State::HeaderColon
-                        } else if b == b'\r' {
-                            State::AfterHeaderValueCR
-                        } else {
-                            // lone-LF
-                            State::HeaderLineStart
-                        };
+                        self.state = State::HeaderColon;
                         i += 1;
                     }
                 }
@@ -356,11 +348,13 @@ impl StreamingRequestParser {
                     }
                 }
                 State::HeaderValue => {
-                    // Scan until \r or \n.
+                    // Scan until \r. Single-byte predicate;
+                    // lone-LF inside values is no longer tolerated
+                    // (RFC 9112 mandates CRLF).
                     let span = &bytes[i..];
                     let end = span
                         .iter()
-                        .position(|&b| b == b'\r' || b == b'\n')
+                        .position(|&b| b == b'\r')
                         .unwrap_or(span.len());
                     if let Some(idx) = self.current_header {
                         let h = &mut req.headers[idx as usize];
@@ -372,12 +366,7 @@ impl StreamingRequestParser {
                     }
                     i += end;
                     if i < bytes.len() {
-                        let b = bytes[i];
-                        self.state = if b == b'\r' {
-                            State::AfterHeaderValueCR
-                        } else {
-                            State::HeaderLineStart
-                        };
+                        self.state = State::AfterHeaderValueCR;
                         i += 1;
                     }
                 }
