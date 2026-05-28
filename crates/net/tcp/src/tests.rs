@@ -2897,3 +2897,140 @@ fn enter_timewait(server_port: u16, client_port: u16, client_isn: u32) -> u32 {
     });
     server_isn
 }
+
+// ---- rtx_queue scaffolding ---------------------------------------------
+//
+// The rtx_queue methods on `TcpConnection` are dead code today (the
+// send / ACK / RTO paths still drive `rtx_buf` exclusively). These
+// tests pin the queue's per-entry behaviour — head-pop, partial-narrow,
+// bytes-in-flight sum, deque-allocation preserved across reset — so
+// the follow-up commits that wire the send / ACK / RTO paths through
+// the queue are swapping a proven-equivalent implementation in.
+//
+// Driven through a real connection slot (via `handshake`) so the
+// per-core pool, the armed-timer list, and the mock clock are all
+// initialised — the queue's `arm_rtx` call into `register_armed_slot`
+// would null-deref `PerWorker::at` without that setup.
+
+/// `rtx_push` seeds the entry's bookkeeping and the bytes-in-flight
+/// sum, and arms the RTT anchor when one is not already outstanding.
+#[test]
+fn rtx_push_seeds_entry_and_anchor() {
+    let _g = harness();
+    const SP: u16 = 9180;
+    const CP: u16 = 50180;
+    handshake(SP, CP, 0xF800);
+    super::listen_on_core(0, SP);
+    let _ = handshake(SP, CP, 0xF800);
+
+    let core = 0u32;
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        let c = unsafe { &mut *conn_ptr(core, i) };
+        if c.state != crate::state::TcpState::Closed
+            && c.state != crate::state::TcpState::Listen
+            && c.local_port == SP
+            && c.remote_port == CP
+        {
+            // Clear the RTT anchor the handshake left set so the
+            // push exercises the seed branch.
+            c.rtt_anchor_active = false;
+            let buf = iobuf::IOBuf::from(vec![0u8; 100]);
+            assert!(c.rtx_push(buf, 1000, 100, 42));
+            assert_eq!(c.rtx_queue.len(), 1);
+            assert_eq!(c.rtx_bytes_in_flight, 100);
+            let head = c.rtx_queue.front().unwrap();
+            assert_eq!(head.seq_start, 1000);
+            assert_eq!(head.len, 100);
+            assert_eq!(head.first_tx_ms, 42);
+            assert_eq!(head.tx_count, 1);
+            assert!(c.rtt_anchor_active);
+            assert_eq!(c.rtt_anchor_seq, 1100);
+            return;
+        }
+    }
+    panic!("no live connection for ports {CP} -> {SP}");
+}
+
+/// `rtx_ack` covering the full head entry pops it; covering a prefix
+/// of the head entry narrows the IOBuf forward.
+#[test]
+fn rtx_ack_pops_and_narrows() {
+    let _g = harness();
+    const SP: u16 = 9181;
+    const CP: u16 = 50181;
+    super::listen_on_core(0, SP);
+    handshake(SP, CP, 0xF810);
+
+    let core = 0u32;
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        let c = unsafe { &mut *conn_ptr(core, i) };
+        if c.state != crate::state::TcpState::Closed
+            && c.state != crate::state::TcpState::Listen
+            && c.local_port == SP
+            && c.remote_port == CP
+        {
+            let mk = |seed: u8, len: usize| {
+                let v: Vec<u8> = (0..len).map(|i| seed.wrapping_add(i as u8)).collect();
+                iobuf::IOBuf::from(v)
+            };
+            c.rtx_push(mk(0xA0, 100), 1000, 100, 1);
+            c.rtx_push(mk(0xB0, 200), 1100, 200, 2);
+
+            // Full ACK of the head entry pops it.
+            let acked = c.rtx_ack(1100, 10);
+            assert_eq!(acked, 100);
+            assert_eq!(c.rtx_queue.len(), 1);
+            assert_eq!(c.rtx_bytes_in_flight, 200);
+
+            // Partial ACK of the new head (30 of 200) narrows in place.
+            let acked = c.rtx_ack(1130, 11);
+            assert_eq!(acked, 30);
+            assert_eq!(c.rtx_queue.len(), 1);
+            assert_eq!(c.rtx_bytes_in_flight, 170);
+            let head = c.rtx_queue.front().unwrap();
+            assert_eq!(head.seq_start, 1130);
+            assert_eq!(head.len, 170);
+            assert_eq!(head.iobuf.data().len(), 170);
+            assert_eq!(head.iobuf.data()[0], 0xB0u8.wrapping_add(30));
+            return;
+        }
+    }
+    panic!("no live connection for ports {CP} -> {SP}");
+}
+
+/// `rtx_ack` covers multiple entries cumulatively.
+#[test]
+fn rtx_ack_cumulative_drains_multiple() {
+    let _g = harness();
+    const SP: u16 = 9182;
+    const CP: u16 = 50182;
+    super::listen_on_core(0, SP);
+    handshake(SP, CP, 0xF820);
+
+    let core = 0u32;
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        let c = unsafe { &mut *conn_ptr(core, i) };
+        if c.state != crate::state::TcpState::Closed
+            && c.state != crate::state::TcpState::Listen
+            && c.local_port == SP
+            && c.remote_port == CP
+        {
+            c.rtx_push(iobuf::IOBuf::from(vec![0u8; 100]), 1000, 100, 1);
+            c.rtx_push(iobuf::IOBuf::from(vec![0u8; 200]), 1100, 200, 2);
+            c.rtx_push(iobuf::IOBuf::from(vec![0u8; 50]), 1300, 50, 3);
+            // ACK retires the first two entries fully + 10 bytes of
+            // the third.
+            assert_eq!(c.rtx_ack(1310, 10), 310);
+            assert_eq!(c.rtx_queue.len(), 1);
+            assert_eq!(c.rtx_bytes_in_flight, 40);
+            let head = c.rtx_queue.front().unwrap();
+            assert_eq!(head.seq_start, 1310);
+            assert_eq!(head.len, 40);
+            return;
+        }
+    }
+    panic!("no live connection for ports {CP} -> {SP}");
+}

@@ -7,6 +7,7 @@
 
 use crate::send::{SegmentMeta, send_segment};
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use core::task::Waker;
 use from_bytes::FromBytes;
 use iobuf::IOBuf;
@@ -182,6 +183,37 @@ pub(crate) const PERSIST_MAX_PROBES: u8 = 8;
 /// FIN still finds a TCB to re-acknowledge.
 pub(crate) const TIME_WAIT_MS: u64 = 60_000;
 
+/// One entry in the per-conn retransmit queue — the payload bytes of
+/// a single outbound TCP segment plus the RFC 6298 / 9293 bookkeeping
+/// needed to retransmit it on RTO expiry. The IOBuf is owned (heap-
+/// resident), independent of any NIC-side reference; a future commit
+/// will replace this with refcount-shared storage so the same IOBuf
+/// is alive in the queue while the wire-DMA is in flight, without an
+/// insertion memcpy.
+//
+// `first_tx_ms` and `tx_count` are read by the RTO path in a follow-up
+// commit; allow them as dead until then so this can land as scaffolding.
+#[allow(dead_code)]
+pub(crate) struct RtxEntry {
+    /// Owned IOBuf carrying this segment's payload bytes. `IOBuf::data()`
+    /// reads the bytes to retransmit; `narrow` advances the visible
+    /// window on a partial-ACK of the head entry.
+    pub(crate) iobuf: IOBuf,
+    /// First sequence number this entry covers (snd_una when this
+    /// was the head of in-flight).
+    pub(crate) seq_start: u32,
+    /// Payload byte count — `iobuf.data().len()` post-narrow. Caches
+    /// the length so the cwnd-paced bytes-in-flight sum is O(1).
+    pub(crate) len: u16,
+    /// Wall-clock ms of the first transmission of these bytes.
+    /// Anchors RFC 6298 RTT sampling for the head-of-queue entry
+    /// (subject to Karn's rule via `tx_count`).
+    pub(crate) first_tx_ms: u64,
+    /// Number of transmissions this entry has been through. >0 means
+    /// retransmitted (Karn's rule: don't sample RTT from this entry).
+    pub(crate) tx_count: u8,
+}
+
 pub struct TcpConnection {
     pub state: TcpState,
     /// Peer's IP — IPv4 or IPv6. Used as the destination of every
@@ -288,6 +320,25 @@ pub struct TcpConnection {
     /// the 64 KiB ring always holds; an `ensure_rtx_buf` allocation
     /// failure is the sole residual trigger.
     pub(crate) rtx_overflow: bool,
+    /// IOBuf-backed retransmit queue — the new path that replaces
+    /// `rtx_buf`. Each entry holds one outbound segment's payload as
+    /// an owned IOBuf; the queue mirrors the wire range
+    /// `[snd_una, snd_nxt)` one segment at a time, instead of one
+    /// flat 64 KiB ring. Allocation is preserved across SYN/close
+    /// cycles via `reset_preserving` — the entries drop (returning
+    /// their IOBufs) but the deque's capacity stays.
+    pub(crate) rtx_queue: VecDeque<RtxEntry>,
+    /// Cached sum of `entry.len` across `rtx_queue` — the
+    /// bytes-in-flight count the cwnd-paced send window reads. O(1)
+    /// per send/ACK instead of summing the queue.
+    pub(crate) rtx_bytes_in_flight: u32,
+    /// Set when a `rtx_queue` push failed to grow the deque — the OOM
+    /// equivalent of the old `rtx_overflow` flag. Coverage is
+    /// suspended until ACKs drain the in-flight window; `rtx_on_ack`
+    /// clears this once `snd_una == snd_nxt`. The "window outgrew
+    /// ring" half of `rtx_overflow` is structurally impossible for the
+    /// queue (no fixed capacity), so this flag is OOM-only.
+    pub(crate) rtx_alloc_failed: bool,
     /// Current retransmission timeout, milliseconds. Doubles on each
     /// RTO expiry (§5.5); re-initialised when new data is ACK'd.
     pub(crate) rto_ms: u32,
@@ -423,6 +474,9 @@ impl TcpConnection {
             rtx_head: 0,
             rtx_len: 0,
             rtx_overflow: false,
+            rtx_queue: VecDeque::new(),
+            rtx_bytes_in_flight: 0,
+            rtx_alloc_failed: false,
             rto_ms: RTO_INITIAL_MS,
             rtx_deadline_ms: 0,
             rtx_backoff: 0,
@@ -460,11 +514,18 @@ impl TcpConnection {
     pub(crate) fn reset_preserving(&mut self, next_gen: u16) {
         let ring = self.rx_ring.take();
         let rtx = self.rtx_buf.take();
+        // Drop the entries (their IOBufs return to the heap) but keep
+        // the deque's backing allocation across the SYN/close cycle —
+        // same "reuse capacity, lose contents" shape as `rx_ring` and
+        // `rtx_buf`. `VecDeque::clear` does exactly this.
+        let mut rtx_queue = core::mem::take(&mut self.rtx_queue);
+        rtx_queue.clear();
         let slot = self.slot_index;
         *self = TcpConnection::new();
         self.generation = next_gen;
         self.rx_ring = ring;
         self.rtx_buf = rtx;
+        self.rtx_queue = rtx_queue;
         self.slot_index = slot;
     }
 
@@ -635,6 +696,106 @@ impl TcpConnection {
     }
 
     // ─── RFC 6298 retransmission ─────────────────────────────────────────
+
+    /// Push one outbound segment's payload + bookkeeping onto the
+    /// per-conn retransmit queue. `iobuf` is `into_owned()`'d at
+    /// insertion so the queue's storage is heap-resident and
+    /// independent of any NIC-side reference. Returns `false` on a
+    /// `try_reserve` failure — caller then suspends coverage via
+    /// `rtx_alloc_failed = true` (the OOM equivalent of the old
+    /// `rtx_overflow` flag). Arms the RTO timer if the queue was
+    /// empty before this push (RFC 6298 §5.1) and seeds the RTT
+    /// anchor (§3) if no sample is outstanding.
+    ///
+    /// Currently dead code — wired into the send path in a follow-up
+    /// commit. The accompanying unit tests exercise push/ack/narrow
+    /// on a fresh `TcpConnection` to lock in the queue's behaviour
+    /// before the send path starts driving it.
+    #[allow(dead_code)]
+    pub(crate) fn rtx_push(
+        &mut self,
+        iobuf: IOBuf,
+        seq_start: u32,
+        len: u16,
+        now_ms: u64,
+    ) -> bool {
+        if self.rtx_queue.try_reserve(1).is_err() {
+            self.rtx_alloc_failed = true;
+            return false;
+        }
+        let was_empty = self.rtx_queue.is_empty();
+        self.rtx_queue.push_back(RtxEntry {
+            iobuf: iobuf.into_owned(),
+            seq_start,
+            len,
+            first_tx_ms: now_ms,
+            tx_count: 1,
+        });
+        self.rtx_bytes_in_flight = self.rtx_bytes_in_flight.saturating_add(len as u32);
+        if was_empty && self.rtx_deadline_ms == 0 {
+            self.arm_rtx();
+        }
+        if !self.rtt_anchor_active {
+            self.rtt_anchor_active = true;
+            self.rtt_anchor_seq = seq_start.wrapping_add(len as u32);
+            self.rtt_anchor_ms = now_ms;
+        }
+        true
+    }
+
+    /// Fold an inbound ACK of `ack_num` into the retransmit queue.
+    /// Pops fully-acked entries from the head and narrows a
+    /// partially-acked head entry forward by the consumed prefix.
+    /// Returns the byte count this ACK retired from the queue.
+    /// Does NOT itself touch `snd_una`, the RTO deadline, or the
+    /// congestion controller — the caller folds those in.
+    ///
+    /// Currently dead code — wired into the ACK path in a follow-up
+    /// commit.
+    #[allow(dead_code)]
+    pub(crate) fn rtx_ack(&mut self, ack_num: u32, _now_ms: u64) -> usize {
+        let mut acked = 0usize;
+        while let Some(head) = self.rtx_queue.front_mut() {
+            let head_end = head.seq_start.wrapping_add(head.len as u32);
+            // Fully acked: `ack_num` covers the whole entry.
+            if !seq_lt(ack_num, head_end) {
+                acked += head.len as usize;
+                self.rtx_bytes_in_flight =
+                    self.rtx_bytes_in_flight.saturating_sub(head.len as u32);
+                self.rtx_queue.pop_front();
+                continue;
+            }
+            // Partial ack: `ack_num` is strictly inside the head entry
+            // (we already know `ack_num < head_end`; check it's also
+            // strictly past `seq_start`).
+            if seq_lt(head.seq_start, ack_num) {
+                let consumed = ack_num.wrapping_sub(head.seq_start) as usize;
+                // `consume` advances the IOBuf's visible window past
+                // the acked prefix — zero copy, just an offset bump.
+                if head.iobuf.consume(consumed).is_ok() {
+                    head.seq_start = ack_num;
+                    head.len = head.len.saturating_sub(consumed as u16);
+                    self.rtx_bytes_in_flight =
+                        self.rtx_bytes_in_flight.saturating_sub(consumed as u32);
+                    acked += consumed;
+                }
+            }
+            break;
+        }
+        acked
+    }
+
+    /// Mutable accessor for the head of the retransmit queue —
+    /// used by the RTO path to reconstruct the retransmitted segment
+    /// from the existing IOBuf bytes (zero-copy retransmit) and to
+    /// bump `tx_count` for Karn's rule.
+    ///
+    /// Currently dead code — wired into the RTO path in a follow-up
+    /// commit.
+    #[allow(dead_code)]
+    pub(crate) fn rtx_head_for_retx(&mut self) -> Option<&mut RtxEntry> {
+        self.rtx_queue.front_mut()
+    }
 
     /// Lazy-allocate the per-conn retransmit ring on the first
     /// buffered send. Reused across SYN/close cycles like `rx_ring`
@@ -1121,3 +1282,4 @@ impl TcpConnection {
 pub(crate) fn seq_lt(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) < 0
 }
+

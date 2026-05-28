@@ -248,6 +248,13 @@ pub fn shutdown_all() {
             let c = unsafe { &mut *conn_ptr(core, slot) };
             c.rx_ring = None;
             c.rtx_buf = None;
+            // Release the rtx_queue's backing allocation too — same
+            // shutdown rationale as `rtx_buf`. `core::mem::take` swaps
+            // in a fresh empty deque (no allocation); the old deque's
+            // entries drop (returning their IOBufs to the heap) and
+            // its backing vec is freed.
+            let _ = core::mem::take(&mut c.rtx_queue);
+            c.rtx_bytes_in_flight = 0;
         }
     }
     // The caller (`net::bare_shutdown_all`) flushes the NIC TX
