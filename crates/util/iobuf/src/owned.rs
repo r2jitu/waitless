@@ -12,10 +12,11 @@
 // is the prerequisite for PR 3's `Shared(Arc<…>)` variant, where one
 // storage feeds many views via `Arc::clone`.
 
+use alloc::sync::Arc;
 use core::ptr::NonNull;
 
 use crate::iobuf::{IOBuf, Inner};
-use crate::{Chain, ExternalOwned, HeapStorage, IOBufDropFn, IOBufError, IOBufRead};
+use crate::{Chain, ExternalOwned, HeapStorage, IOBufDropFn, IOBufError, IOBufRead, SharedRegion};
 
 /// An IOBuf restricted to the two **owning** storage variants —
 /// `HeapStorage` and `ExternalOwned`. Both are `Send`, so `OwnedIOBuf`
@@ -58,6 +59,10 @@ pub(crate) enum OwnedStorage {
     Heap(HeapStorage),
     /// A foreign region owned via a drop callback.
     External(ExternalOwned),
+    /// Refcounted backing — produced by `share()`, cloned by
+    /// `clone_shared()`. Multiple IOBufs share the same bytes; each
+    /// carries its own `(offset, len)` view via the outer struct.
+    Shared(Arc<SharedRegion>),
 }
 
 /// Static assertion: `OwnedIOBuf` (and a chain of them) is `Send` by
@@ -113,6 +118,7 @@ impl OwnedIOBuf {
         match &self.storage {
             OwnedStorage::Heap(h) => h.capacity(),
             OwnedStorage::External(e) => e.capacity(),
+            OwnedStorage::Shared(r) => r.capacity(),
         }
     }
 
@@ -130,6 +136,50 @@ impl OwnedIOBuf {
                 // this IOBuf for its lifetime.
                 unsafe { core::slice::from_raw_parts(e.base().as_ptr().add(o), l) }
             }
+            OwnedStorage::Shared(r) => &r.bytes()[o..o + l],
+        }
+    }
+
+    /// Promote to refcounted storage so the same bytes can back
+    /// multiple `OwnedIOBuf` views via `clone_shared`. **Move-only**
+    /// — bytes do NOT copy; the existing `HeapStorage` /
+    /// `ExternalOwned` is lifted into a fresh `Arc<SharedRegion>`.
+    /// Idempotent on a buffer that is already `Shared`.
+    ///
+    /// One small Arc allocation. The canonical caller is the TCP
+    /// rtx queue: keep a refcounted shadow of each sent segment so
+    /// a retransmit can replay without memcpy.
+    pub fn share(self) -> Self {
+        let storage = match self.storage {
+            OwnedStorage::Heap(h) => OwnedStorage::Shared(Arc::new(SharedRegion::new_heap(h))),
+            OwnedStorage::External(e) => {
+                OwnedStorage::Shared(Arc::new(SharedRegion::new_external(e)))
+            }
+            already @ OwnedStorage::Shared(_) => already,
+        };
+        OwnedIOBuf {
+            storage,
+            offset: self.offset,
+            len: self.len,
+        }
+    }
+
+    /// Cheap clone of a shareable buffer — bumps the
+    /// `Arc<SharedRegion>` strong count and carries the same view.
+    /// `Err(NotShared)` if `share()` was not called first.
+    ///
+    /// The plan's design keeps refcounting opt-in: a non-Shared
+    /// buffer (`Heap` / `External`) is exclusively owned, with no
+    /// atomics on the hot path. Callers explicitly promote with
+    /// `share()` only when they need the shadow.
+    pub fn clone_shared(&self) -> Result<Self, IOBufError> {
+        match &self.storage {
+            OwnedStorage::Shared(arc) => Ok(OwnedIOBuf {
+                storage: OwnedStorage::Shared(Arc::clone(arc)),
+                offset: self.offset,
+                len: self.len,
+            }),
+            _ => Err(IOBufError::NotShared),
         }
     }
 
@@ -244,6 +294,11 @@ impl From<OwnedIOBuf> for IOBuf {
                 offset: o.offset,
                 len: o.len,
             },
+            OwnedStorage::Shared(r) => Inner::Shared {
+                storage: r,
+                offset: o.offset,
+                len: o.len,
+            },
         };
         IOBuf { inner }
     }
@@ -256,6 +311,138 @@ impl From<OwnedIOBuf> for IOBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `share()` lifts an `OwnedIOBuf`'s storage into an
+    /// `Arc<SharedRegion>` **without copying bytes** — observable
+    /// via pointer-equality between the original buffer's data
+    /// pointer and the shared buffer's data pointer.
+    #[test]
+    fn share_is_move_only_no_byte_copy() {
+        use core::ptr::NonNull;
+        unsafe fn cb(_base: NonNull<u8>, _cap: u32, _ctx: *mut ()) {}
+
+        let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
+        storage[4..12].copy_from_slice(b"original");
+        let ptr = NonNull::new(storage.as_mut_ptr()).unwrap();
+        // SAFETY: storage outlives the IOBuf in this block; cb is a no-op.
+        let buf =
+            unsafe { OwnedIOBuf::wrap_owned(ptr, 32, 4, 8, cb, core::ptr::null_mut()) };
+        let ptr_before = buf.data().as_ptr();
+
+        let shared = buf.share();
+        assert!(matches!(shared.storage, OwnedStorage::Shared(_)));
+        assert_eq!(shared.data(), b"original");
+        assert_eq!(
+            shared.data().as_ptr(),
+            ptr_before,
+            "share() must not copy bytes — same backing pointer",
+        );
+    }
+
+    /// `clone_shared()` bumps the `Arc<SharedRegion>` refcount;
+    /// both clones read the same bytes through the same backing
+    /// pointer, and adjust offset/len independently.
+    #[test]
+    fn clone_shared_yields_two_views_of_same_bytes() {
+        let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
+        storage[4..12].copy_from_slice(b"abcdefgh");
+        let ptr = core::ptr::NonNull::new(storage.as_mut_ptr()).unwrap();
+        unsafe fn cb(_b: core::ptr::NonNull<u8>, _c: u32, _ctx: *mut ()) {}
+        // SAFETY: storage outlives both views; cb is a no-op.
+        let buf =
+            unsafe { OwnedIOBuf::wrap_owned(ptr, 32, 4, 8, cb, core::ptr::null_mut()) };
+
+        let a = buf.share();
+        let b = a.clone_shared().unwrap();
+        assert_eq!(a.data(), b"abcdefgh");
+        assert_eq!(b.data(), b"abcdefgh");
+        assert_eq!(
+            a.data().as_ptr(),
+            b.data().as_ptr(),
+            "both views share the same backing pointer",
+        );
+
+        // Narrowing one view's window doesn't disturb the other.
+        let mut b = b;
+        b.narrow(2, 4).unwrap();
+        assert_eq!(b.data(), b"cdef");
+        assert_eq!(a.data(), b"abcdefgh", "the other view's window is independent");
+    }
+
+    /// `share()` on an already-Shared buffer is idempotent — same
+    /// underlying Arc, no extra allocation. We detect this by
+    /// pointer-equality of the SharedRegion bytes (a fresh Arc would
+    /// move the storage to a new heap address).
+    #[test]
+    fn share_is_idempotent_on_already_shared() {
+        let buf = OwnedIOBuf {
+            storage: OwnedStorage::Heap(HeapStorage::new(
+                alloc::vec![1u8, 2, 3, 4].into_boxed_slice(),
+            )),
+            offset: 0,
+            len: 4,
+        };
+        let once = buf.share();
+        let ptr_after_first_share = once.data().as_ptr();
+        let twice = once.share();
+        assert_eq!(twice.data(), &[1u8, 2, 3, 4]);
+        assert_eq!(
+            twice.data().as_ptr(),
+            ptr_after_first_share,
+            "share() on a Shared buffer must not re-allocate",
+        );
+    }
+
+    /// `clone_shared()` on a non-Shared buffer (Heap / External)
+    /// returns `Err(NotShared)`. The caller must explicitly opt-in
+    /// to refcounting via `share()` first.
+    #[test]
+    fn clone_shared_on_non_shared_errors() {
+        let buf = OwnedIOBuf {
+            storage: OwnedStorage::Heap(HeapStorage::new(alloc::vec![1u8].into_boxed_slice())),
+            offset: 0,
+            len: 1,
+        };
+        assert!(matches!(buf.clone_shared(), Err(IOBufError::NotShared)));
+    }
+
+    /// A `Shared(External)`'s drop callback fires **exactly once**
+    /// — when the last `Arc<SharedRegion>` strong reference drops,
+    /// not before. Two clones; drop one, callback hasn't fired;
+    /// drop the last, callback fires.
+    #[test]
+    fn shared_external_drop_callback_runs_exactly_once() {
+        use core::ptr::NonNull;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let drop_count = StdArc::new(AtomicUsize::new(0));
+        unsafe fn cb(_base: NonNull<u8>, _cap: u32, ctx: *mut ()) {
+            let arc: StdArc<AtomicUsize> = unsafe { StdArc::from_raw(ctx as *const AtomicUsize) };
+            arc.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut storage: alloc::vec::Vec<u8> = alloc::vec![9u8; 16];
+        let ptr = NonNull::new(storage.as_mut_ptr()).unwrap();
+        let ctx = StdArc::into_raw(drop_count.clone()) as *mut ();
+        let buf = unsafe { OwnedIOBuf::wrap_owned(ptr, 16, 0, 16, cb, ctx) };
+
+        let a = buf.share();
+        let b = a.clone_shared().unwrap();
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+        drop(a);
+        assert_eq!(
+            drop_count.load(Ordering::SeqCst),
+            0,
+            "callback must not fire while one Arc clone is alive",
+        );
+        drop(b);
+        assert_eq!(
+            drop_count.load(Ordering::SeqCst),
+            1,
+            "callback fires exactly once when the last Arc clone drops",
+        );
+    }
 
     /// RX item D's core primitive: `narrow` clamps the visible window
     /// to an inner sub-range (an L4 segment inside a frame), shifting

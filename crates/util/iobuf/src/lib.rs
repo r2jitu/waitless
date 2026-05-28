@@ -61,7 +61,7 @@ pub use pool::IOBufPool;
 // The four per-variant storage structs + the debug-mode borrow
 // tracker. `IOBuf` / `OwnedIOBuf` are flat enums over these.
 mod storage;
-pub use storage::{BorrowedView, ExternalOwned, HeapStorage, IOBufDropFn, StaticView};
+pub use storage::{BorrowedView, ExternalOwned, HeapStorage, IOBufDropFn, SharedRegion, StaticView};
 
 // `Chain<B>` — a chain of `B: IOBufRead` segments — plus `Cursor`.
 mod chain;
@@ -121,6 +121,10 @@ pub enum IOBufError {
     NoTailroom,
     OutOfBounds,
     Immutable,
+    /// `clone_shared` was called on a buffer that hadn't been
+    /// promoted to `Shared` first. Refcounted clones are explicit
+    /// by design — the exclusive-heap TX hot path stays atomic-free.
+    NotShared,
 }
 
 // ============================================================================

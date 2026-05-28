@@ -177,6 +177,15 @@ pub struct ExternalOwned {
 // `Send` by *auto-derivation*, with no container-level `unsafe`.
 unsafe impl Send for ExternalOwned {}
 
+// SAFETY: `ExternalOwned` is Sync once wrapped in an `Arc` (the
+// `Shared` variant): multiple `&ExternalOwned` references can
+// concurrently read the bytes (via `data()` paths), and mutating
+// access (`bytes_mut` reachable only via `Arc::get_mut`) requires
+// the Arc to be uniquely held — so the borrow checker rules out
+// concurrent read + write. `Drop` fires exactly once, on whichever
+// thread held the last Arc.
+unsafe impl Sync for ExternalOwned {}
+
 impl ExternalOwned {
     /// Construct from the raw `(base, capacity)` plus the release
     /// callback. The caller's safety contract is the
@@ -274,6 +283,99 @@ impl BorrowedView {
     #[inline]
     pub(crate) fn base(&self) -> NonNull<u8> {
         self.base
+    }
+}
+
+// ============================================================================
+// SharedRegion — refcounted backing for the `Shared` variant.
+// ============================================================================
+
+/// Backing storage for the `Shared` variant — `HeapStorage` or
+/// `ExternalOwned`, lifted behind an `Arc` so multiple IOBufs can
+/// reference the same bytes without copying. The TCP rtx queue's
+/// canonical use case (PR 5): keep a shadow of a sent segment with
+/// no memcpy, paying only the Arc clone on the reference.
+///
+/// `Send + Sync` by auto-derivation: both `HeapStorage` (a
+/// `Box<[u8]>`) and `ExternalOwned` (post-PR-3 `unsafe impl Sync`)
+/// are. The `Arc<SharedRegion>` is therefore `Send`, so an
+/// `OwnedIOBuf::Shared` is still `Send` by auto-derivation.
+///
+/// Mutating access is only safe when the Arc is uniquely held —
+/// callers reach it via `Arc::get_mut`, which returns `Some` only
+/// when `strong_count == 1 && weak_count == 0`. The IOBuf
+/// mutators (`prepend` / `append_slice` / `extend_uninit` /
+/// `data_mut`) try `get_mut` first and CoW into a fresh
+/// `HeapStorage` if it returns `None`.
+pub struct SharedRegion {
+    inner: SharedInner,
+}
+
+/// The two backing shapes a `SharedRegion` can wrap: the same two
+/// owning storage structs `OwnedIOBuf` already exposes — heap-owned
+/// `Box<[u8]>` and a foreign region with a drop callback. Both
+/// `Send + Sync`, so `Arc<SharedRegion>` is `Send`.
+enum SharedInner {
+    Heap(HeapStorage),
+    External(ExternalOwned),
+}
+
+impl SharedRegion {
+    /// Wrap an owned heap region for sharing.
+    pub(crate) fn new_heap(h: HeapStorage) -> Self {
+        SharedRegion {
+            inner: SharedInner::Heap(h),
+        }
+    }
+
+    /// Wrap a foreign owned region for sharing. The drop callback
+    /// fires once when the last `Arc<SharedRegion>` drops.
+    pub(crate) fn new_external(e: ExternalOwned) -> Self {
+        SharedRegion {
+            inner: SharedInner::External(e),
+        }
+    }
+
+    /// Total bytes of the backing region.
+    #[inline]
+    pub(crate) fn capacity(&self) -> usize {
+        match &self.inner {
+            SharedInner::Heap(h) => h.capacity(),
+            SharedInner::External(e) => e.capacity(),
+        }
+    }
+
+    /// Read-only view of the entire backing region. Concurrent
+    /// readers across `Arc` clones go through here.
+    #[inline]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        match &self.inner {
+            SharedInner::Heap(h) => h.bytes(),
+            SharedInner::External(e) => {
+                // SAFETY: `base..base+capacity` is the foreign
+                // region the `wrap_owned` caller guaranteed valid
+                // for the IOBuf's lifetime; the `Arc<SharedRegion>`
+                // refcount keeps that lifetime alive across clones.
+                unsafe { core::slice::from_raw_parts(e.base().as_ptr(), e.capacity()) }
+            }
+        }
+    }
+
+    /// Mutable view of the entire backing region. Reachable only
+    /// when the caller has `&mut SharedRegion` — which the IOBuf
+    /// mutators obtain via `Arc::get_mut`, i.e. only when the Arc
+    /// is uniquely held. Concurrent mutation is therefore
+    /// structurally ruled out.
+    #[inline]
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        match &mut self.inner {
+            SharedInner::Heap(h) => h.bytes_mut(),
+            SharedInner::External(e) => {
+                // SAFETY: as `bytes()`, plus `&mut self` ⇒ Arc is
+                // uniquely held ⇒ no concurrent reader exists.
+                unsafe { core::slice::from_raw_parts_mut(e.base().as_ptr(), e.capacity()) }
+            }
+        }
     }
 }
 
