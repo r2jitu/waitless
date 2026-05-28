@@ -113,12 +113,19 @@ pub trait IOBufRead {
 }
 
 /// Trivial impl for a `&[u8]` slice — lets `Chain<&'a [u8]>` (and
-/// any other read-only chain consumer) accept raw slices alongside
-/// `IOBuf` / `OwnedIOBuf`. Headroom / tailroom are 0 (no reserved
-/// frame around a borrowed slice). Saves an `unsafe IOBuf::borrow`
-/// mint at sites that don't mix borrowed and owned parts —
-/// `TcpStream::send_bytes`, TLS send-scratch — letting the lifetime
-/// flow through the type system instead.
+/// any other read-only chain consumer generic over `B: IOBufRead`)
+/// accept raw slices alongside `IOBuf` / `OwnedIOBuf`. Headroom /
+/// tailroom are 0 (no reserved frame around a borrowed slice).
+///
+/// A latent capability today: the obvious migration target — the
+/// TX send path (`TcpStream::send_bytes`, TLS send-scratch, which
+/// currently `unsafe IOBuf::borrow` a slice into a `Chain<IOBuf>`)
+/// — can't adopt it, because that path dispatches through a
+/// monomorphic backend function pointer over `Chain<IOBuf>` *and*
+/// retains parts into the TCP rtx queue via `IOBuf::share` (which
+/// needs owned storage, not a borrow). This impl is here for a
+/// future *read-only* generic chain consumer (e.g. a checksum /
+/// scan pass) that wants borrowed slices without an `unsafe` mint.
 impl IOBufRead for &[u8] {
     #[inline]
     fn data(&self) -> &[u8] {

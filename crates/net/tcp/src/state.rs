@@ -878,32 +878,24 @@ impl TcpConnection {
                 total -= front_len;
             } else {
                 // Partial-boundary IOBuf: split via share +
-                // clone_shared. Queue gets the prefix view; chain
-                // keeps the tail view. Both reference the same
-                // `SharedRegion` Arc.
+                // clone_shared into a prefix view (→ queue) and a
+                // tail view (→ back on the chain). Both reference
+                // the same `SharedRegion` Arc — zero copy.
                 let iobuf = chain.pop_front().expect("front_mut returned Some");
-                let mut shared = iobuf.share();
-                let mut clone = shared
-                    .clone_shared()
-                    .expect("share()'d IOBuf is shareable");
-                clone
+                let mut prefix = iobuf.share();
+                let mut tail = prefix.clone_shared().expect("share()'d IOBuf is shareable");
+                prefix
                     .trim_end(front_len - total)
-                    .expect("front_len > total in this arm");
-                if !self.rtx_push(clone, seq, total as u16, now_ms) {
+                    .expect("front_len > total in this arm"); // prefix = [0, total)
+                tail.consume(total)
+                    .expect("front_len > total in this arm"); // tail = [total, front_len)
+                // Restore the unsent tail to the chain *before* the
+                // push, so the send-chain future sees a well-formed
+                // chain whether or not the queue push succeeds.
+                chain.push_front(tail);
+                if !self.rtx_push(prefix, seq, total as u16, now_ms) {
                     self.handle_rtx_push_oom();
-                    // Restore the un-acked tail to the chain so
-                    // the caller's send-chain future sees a
-                    // well-formed chain on its next poll.
-                    shared
-                        .consume(total)
-                        .expect("front_len > total in this arm");
-                    chain.push_front(shared);
-                    return;
                 }
-                shared
-                    .consume(total)
-                    .expect("front_len > total in this arm");
-                chain.push_front(shared);
                 return;
             }
         }
