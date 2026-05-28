@@ -747,11 +747,9 @@ impl TcpConnection {
     /// partially-acked head entry forward by the consumed prefix.
     /// Returns the byte count this ACK retired from the queue.
     /// Does NOT itself touch `snd_una`, the RTO deadline, or the
-    /// congestion controller — the caller folds those in.
-    ///
-    /// Currently dead code — wired into the ACK path in a follow-up
-    /// commit.
-    #[allow(dead_code)]
+    /// congestion controller — the caller (`rtx_on_ack`) folds those
+    /// in against `rtx_buf` today; commit 6 will collapse the two
+    /// paths to this method alone.
     pub(crate) fn rtx_ack(&mut self, ack_num: u32, _now_ms: u64) -> usize {
         let mut acked = 0usize;
         while let Some(head) = self.rtx_queue.front_mut() {
@@ -884,9 +882,17 @@ impl TcpConnection {
             // Heap exhaustion — genuinely unexpected, so trace it.
             crate::diag::COUNTERS.rtx_buf_oom.bump();
             self.rtx_overflow = true;
+            self.rtx_alloc_failed = true;
             self.rtx_head = 0;
             self.rtx_len = 0;
             self.rtx_deadline_ms = 0;
+            // Equivalence: clear the queue too so the two paths stay
+            // in lockstep. The queue's existing entries refer to data
+            // the rtx_buf path just discarded; keeping them around
+            // would diverge the byte streams under the dual-write
+            // harness.
+            self.rtx_queue.clear();
+            self.rtx_bytes_in_flight = 0;
             return;
         }
         // A window outgrowing the ring is structurally impossible: the
@@ -970,6 +976,7 @@ impl TcpConnection {
         if self.rtx_overflow {
             if self.snd_una == self.snd_nxt {
                 self.rtx_overflow = false;
+                self.rtx_alloc_failed = false;
                 self.rtx_backoff = 0;
                 self.rto_ms = RTO_INITIAL_MS;
             }
@@ -995,13 +1002,19 @@ impl TcpConnection {
         // RFC 6298 §3 (Karn): if this ACK covers the anchored byte and
         // no retransmission has invalidated the sample, fold the
         // round-trip time into the estimator.
+        let now_ms = kernel_core::clock::now_ms();
         if self.rtt_anchor_active && !seq_lt(self.snd_una, self.rtt_anchor_seq) {
-            let elapsed = kernel_core::clock::now_ms().saturating_sub(self.rtt_anchor_ms);
+            let elapsed = now_ms.saturating_sub(self.rtt_anchor_ms);
             self.sample_rtt(elapsed.min(u32::MAX as u64) as u32);
             self.rtt_anchor_active = false;
         }
         self.rtx_head = ((self.rtx_head as usize + drop) % RTX_BUF_BYTES) as u16;
         self.rtx_len -= drop as u16;
+        // Dual-route: drop acknowledged bytes from `rtx_queue` so the
+        // queue mirrors the rtx_buf window post-ACK. The byte counts
+        // match by construction — both paths receive the same `drop`
+        // bytes of new data from this ACK.
+        let _ = self.rtx_ack(self.snd_una, now_ms);
         // New data acknowledged: the peer is making progress, so clear
         // the §5.5 backoff and reset the RTO to the current estimate
         // (RFC 6298 §5.7 — a backed-off RTO holds only until a

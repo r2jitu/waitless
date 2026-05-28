@@ -3122,6 +3122,56 @@ fn dual_write_send_path_tso_matches_rtx_buf() {
     assert_eq!(conn_rtx_queue_bytes(CP, SP), body);
 }
 
+/// Equivalence harness for commit 3 (dual ACK): after a peer ACK,
+/// the rtx_buf window and rtx_queue concatenation must still agree
+/// byte-for-byte. Drives a chain send, peeks the equivalence pre-ACK,
+/// then partial-ACKs and full-ACKs to exercise both ack branches.
+#[test]
+fn dual_route_ack_path_keeps_queue_in_lockstep() {
+    let _g = harness();
+    const SP: u16 = 9185;
+    const CP: u16 = 50185;
+    const CLIENT_ISN: u32 = 0xF850;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    let body = (0..6000u32).map(|i| ((i ^ 0x99) & 0xFF) as u8).collect::<Vec<u8>>();
+    let mut chain = iobuf::IOBufChain::from(body.clone());
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(sent, body.len());
+    assert_eq!(conn_rtx_buf_bytes(CP, SP), conn_rtx_queue_bytes(CP, SP));
+    assert_eq!(conn_rtx_queue_bytes(CP, SP).len(), body.len());
+
+    // Partial ACK: the peer acknowledges the first 2000 bytes of the
+    // unacked window. Both paths drop those bytes.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1 + 2000),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert_eq!(conn_rtx_buf_bytes(CP, SP), conn_rtx_queue_bytes(CP, SP));
+    assert_eq!(conn_rtx_queue_bytes(CP, SP), body[2000..]);
+
+    // Full ACK: the peer retires the rest of the window. Both paths
+    // empty.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1 + body.len() as u32),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert_eq!(conn_rtx_buf_bytes(CP, SP), conn_rtx_queue_bytes(CP, SP));
+    assert!(conn_rtx_queue_bytes(CP, SP).is_empty());
+}
+
 /// `rtx_ack` covers multiple entries cumulatively.
 #[test]
 fn rtx_ack_cumulative_drains_multiple() {
