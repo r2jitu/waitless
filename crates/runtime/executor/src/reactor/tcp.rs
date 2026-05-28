@@ -127,12 +127,11 @@ impl TcpStream {
     /// *opaque backend pointer* — the borrow checker cannot see the
     /// per-connection state aliased through that raw handle, so the
     /// `&mut self` exclusivity is the *only* lever that enforces
-    /// "at most one read outstanding per stream." `recv` registers
-    /// `buf`'s pointer with the connection for the direct-copy fast
-    /// path; two overlapping reads would have the second silently
-    /// steal the first's slot. `&mut self` makes that a compile
-    /// error instead — the same discipline [`Self::recv_chunk`]
-    /// already used, now applied uniformly across the API.
+    /// "at most one read outstanding per stream." Two overlapping
+    /// reads would race for the recv-waker slot on the conn; the
+    /// `&mut self` borrow makes that a compile error — the same
+    /// discipline [`Self::recv_chunk`] already used, now applied
+    /// uniformly across the API.
     ///
     /// ```compile_fail
     /// # async fn two_reads(s: &mut executor::reactor::TcpStream) {
@@ -841,49 +840,27 @@ impl<'a> Future for TcpRecv<'a> {
         // Fast path — probe, read, clear any stale waker.
         if (b.has_data)(h, g) {
             (b.clear_recv_waker)(h, g);
-            if let Some(clear) = b.clear_recv_buf_slot {
-                clear(h, g);
-            }
             return Poll::Ready((b.do_recv)(h, g, this.buf));
         }
-        // Register waker AND (optionally) the direct-copy slot.
-        // The slot lets `tcp_receive` write payload bytes straight
-        // into `this.buf` when the next packet lands, bypassing
-        // the per-conn ring. Bare-metal sets `set_recv_buf_slot`;
-        // native leaves it `None` and copies via `do_recv` as
-        // before.
-        if let Some(set) = b.set_recv_buf_slot {
-            // Cap at u16 to match the conn-side field width — TCP
-            // recv buffers larger than 64 KiB would just truncate
-            // the registered slot but the ring would absorb the
-            // remainder on the next call.
-            let cap = this.buf.len().min(u16::MAX as usize) as u16;
-            set(h, g, this.buf.as_mut_ptr(), cap);
-        }
+        // Park the waker and re-probe once — closes the wake-before-
+        // park race with the data-arrival site.
+        //
+        // The recv path no longer registers a direct-copy slot on
+        // the conn: bare-metal `tcp_receive` always pushes payload
+        // bytes through the per-conn rx ring, and `do_recv` drains
+        // the ring into `this.buf` on resolve. The historical "write
+        // directly into the parked future's buf" fast-path-bypass
+        // saved one memcpy per recv but cost ~14 B/conn of slot
+        // state and a multi-path `deliver_payload`; with the
+        // in-tree HTTPS / HTTP hot paths now on `recv_chunk` (zero
+        // copy from the device buffer), the slot's hot-path benefit
+        // is gone and the conn-side simplification dominates.
         (b.register_recv_waker)(h, g, cx.waker());
         if (b.has_data)(h, g) {
             (b.clear_recv_waker)(h, g);
-            if let Some(clear) = b.clear_recv_buf_slot {
-                clear(h, g);
-            }
             return Poll::Ready((b.do_recv)(h, g, this.buf));
         }
         Poll::Pending
-    }
-}
-
-impl<'a> Drop for TcpRecv<'a> {
-    fn drop(&mut self) {
-        // Cancel-safety: if the future is dropped before its waker
-        // fires (parent task aborted, select! losing branch, etc.),
-        // clear the recv_buf_slot pointer we registered above so a
-        // subsequent `tcp_receive` doesn't write into freed user
-        // memory.
-        if let Some(b) = tcp_backend()
-            && let Some(clear) = b.clear_recv_buf_slot
-        {
-            clear(self.handle, self.generation);
-        }
     }
 }
 
