@@ -361,6 +361,55 @@ impl IOBufChain {
     pub fn push_with_reserve(&mut self, payload: &[u8], headroom: usize, tailroom: usize) {
         self.push_back(IOBuf::from_slice_with_headroom(headroom, payload, tailroom));
     }
+
+    /// Ensure the first `n` bytes of the chain are contiguous in the
+    /// front part, then return them as a borrowed slice. Equivalent
+    /// to Linux's `pskb_may_pull`: a header parser calls `pull` to
+    /// get a linear region it can index directly.
+    ///
+    /// Cheap when the front part already holds `n` bytes (the common
+    /// case) — just hands back `&front.data()[..n]`. Otherwise pops
+    /// parts off the front, copies their first `n` bytes into a
+    /// fresh heap-backed `IOBuf`, and pushes that as the new front:
+    /// the chain's logical bytes are unchanged, only their physical
+    /// layout. A part that contributes only some of its bytes stays
+    /// on the chain with its remainder via `consume`.
+    ///
+    /// Returns `IOBufError::OutOfBounds` if the chain holds fewer
+    /// than `n` total bytes. `n == 0` always succeeds and yields
+    /// `&[]`.
+    pub fn pull(&mut self, n: usize) -> Result<&[u8], IOBufError> {
+        if n == 0 {
+            return Ok(&[]);
+        }
+        if n > self.total_len() {
+            return Err(IOBufError::OutOfBounds);
+        }
+        let front_len = self.get_part(0).map_or(0, |b| b.len());
+        if front_len < n {
+            // Slow path: coalesce front parts into a fresh heap IOBuf.
+            // `total_len() >= n` (checked above) bounds the loop.
+            let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(n);
+            while buf.len() < n {
+                let mut part = self
+                    .pop_front()
+                    .expect("total_len() >= n bounds the loop");
+                let take = (n - buf.len()).min(part.len());
+                buf.extend_from_slice(&part.data()[..take]);
+                if take < part.len() {
+                    // `take < part.len()` ⇒ `consume(take)` is in-range.
+                    part.consume(take)
+                        .expect("take < part.len() keeps consume in-range");
+                    self.push_front(part);
+                }
+            }
+            self.push_front(IOBuf::from(buf));
+        }
+        Ok(&self
+            .get_part(0)
+            .expect("front exists: n > 0 and total_len >= n")
+            .data()[..n])
+    }
 }
 
 /// `iter_mut`'s return type. A hand-rolled enum iterator: the three
@@ -796,5 +845,155 @@ mod tests {
         let mut c2: Chain<OwnedIOBuf> = Chain::new();
         c2.push_back(owned_buf(b"x"));
         drop(c2);
+    }
+
+    /// Fast path: the front part already holds `n` contiguous bytes.
+    /// `pull` is a no-op — the returned slice borrows directly from
+    /// the existing front part (pointer-equal), no coalesce, no copy.
+    #[test]
+    fn pull_linear_already_is_noop() {
+        let mut c = IOBufChain::new();
+        c.push_back(IOBuf::from_static(b"HEADERtail"));
+        c.push_back(IOBuf::from_static(b"more"));
+        let front_ptr = c.get_part(0).unwrap().data().as_ptr();
+
+        let head = c.pull(6).unwrap();
+        assert_eq!(head, b"HEADER");
+        assert_eq!(
+            head.as_ptr(),
+            front_ptr,
+            "fast path returns a borrow of the original front part"
+        );
+        // The chain shape is unchanged: still 2 parts, same totals.
+        assert_eq!(c.part_count(), 2);
+        assert_eq!(c.total_len(), 14);
+    }
+
+    /// Coalesce-from-second-part: the front part is shorter than the
+    /// requested header. `pull` materialises a fresh heap front part
+    /// of exactly the requested length, with the leftover of the
+    /// second part still on the chain.
+    #[test]
+    fn pull_coalesces_from_second_part() {
+        let mut c = IOBufChain::new();
+        c.push_back(IOBuf::from_static(b"HEA"));
+        c.push_back(IOBuf::from_static(b"DERtail"));
+
+        let head = c.pull(6).unwrap();
+        assert_eq!(head, b"HEADER");
+        // Coalesced front (6) + leftover ("tail") of the second part.
+        assert_eq!(c.part_count(), 2);
+        assert_eq!(c.total_len(), 10);
+        assert_eq!(c.get_part(0).unwrap().data(), b"HEADER");
+        assert_eq!(c.get_part(1).unwrap().data(), b"tail");
+    }
+
+    /// Coalesce-across-N-parts: front three parts together cover the
+    /// header. `pull` absorbs the first two whole and the prefix of
+    /// the third, leaving the third's leftover on the chain.
+    #[test]
+    fn pull_coalesces_across_n_parts() {
+        let mut c = IOBufChain::new();
+        c.push_back(IOBuf::from_static(b"HE"));
+        c.push_back(IOBuf::from_static(b"AD"));
+        c.push_back(IOBuf::from_static(b"ERtail"));
+        c.push_back(IOBuf::from_static(b"trailing"));
+
+        let head = c.pull(6).unwrap();
+        assert_eq!(head, b"HEADER");
+        // Two whole parts absorbed, third's prefix absorbed; the
+        // third's leftover ("tail") + the untouched fourth remain.
+        assert_eq!(c.part_count(), 3);
+        assert_eq!(c.total_len(), 6 + 4 + 8);
+        assert_eq!(c.get_part(0).unwrap().data(), b"HEADER");
+        assert_eq!(c.get_part(1).unwrap().data(), b"tail");
+        assert_eq!(c.get_part(2).unwrap().data(), b"trailing");
+    }
+
+    /// A coalesce that consumes the front parts exactly — no
+    /// leftover to push back. The new front part is the only one
+    /// covering the pulled range; later parts are untouched.
+    #[test]
+    fn pull_coalesces_exact_part_boundary() {
+        let mut c = IOBufChain::new();
+        c.push_back(IOBuf::from_static(b"HE"));
+        c.push_back(IOBuf::from_static(b"AD"));
+        c.push_back(IOBuf::from_static(b"ER"));
+        c.push_back(IOBuf::from_static(b"body"));
+
+        let head = c.pull(6).unwrap();
+        assert_eq!(head, b"HEADER");
+        assert_eq!(c.part_count(), 2);
+        assert_eq!(c.total_len(), 10);
+        assert_eq!(c.get_part(0).unwrap().data(), b"HEADER");
+        assert_eq!(c.get_part(1).unwrap().data(), b"body");
+    }
+
+    /// Cursor reads of the chain after `pull` see the same bytes in
+    /// the same order — `pull` reorganises layout without changing
+    /// the chain's logical content.
+    #[test]
+    fn pull_preserves_logical_bytes() {
+        let mut c = IOBufChain::new();
+        c.push_back(IOBuf::from_static(b"HE"));
+        c.push_back(IOBuf::from_static(b"ADER"));
+        c.push_back(IOBuf::from_static(b"body"));
+
+        let before: alloc::vec::Vec<u8> = {
+            let mut out = alloc::vec![0u8; c.total_len()];
+            let n = c.cursor().read(&mut out);
+            out.truncate(n);
+            out
+        };
+        let _ = c.pull(6).unwrap();
+        let after: alloc::vec::Vec<u8> = {
+            let mut out = alloc::vec![0u8; c.total_len()];
+            let n = c.cursor().read(&mut out);
+            out.truncate(n);
+            out
+        };
+        assert_eq!(before, after);
+    }
+
+    /// `pull(0)` always succeeds with an empty slice, including on
+    /// an empty chain.
+    #[test]
+    fn pull_zero_is_empty_slice() {
+        let mut c = IOBufChain::new();
+        assert_eq!(c.pull(0).unwrap(), b"");
+        assert!(c.is_empty());
+
+        c.push_back(IOBuf::from_static(b"abc"));
+        assert_eq!(c.pull(0).unwrap(), b"");
+        assert_eq!(c.part_count(), 1);
+    }
+
+    /// `pull(n)` errors when the chain holds fewer than `n` bytes,
+    /// and leaves the chain untouched.
+    #[test]
+    fn pull_past_end_errors() {
+        let mut c = IOBufChain::new();
+        c.push_back(IOBuf::from_static(b"ab"));
+        c.push_back(IOBuf::from_static(b"cd"));
+        assert_eq!(c.pull(5), Err(IOBufError::OutOfBounds));
+        assert_eq!(c.part_count(), 2);
+        assert_eq!(c.total_len(), 4);
+
+        // Empty chain: any non-zero pull is OutOfBounds.
+        let mut empty = IOBufChain::new();
+        assert_eq!(empty.pull(1), Err(IOBufError::OutOfBounds));
+    }
+
+    /// `pull` works against a Single-repr chain too: when the lone
+    /// part already holds the requested bytes, fast path; if it
+    /// holds fewer, the chain has too few bytes total and we err.
+    #[test]
+    fn pull_on_single_repr_chain() {
+        let mut c = IOBufChain::new();
+        c.push_back(IOBuf::from_static(b"HEADER"));
+        // Single repr ⇒ fast path.
+        let head = c.pull(6).unwrap();
+        assert_eq!(head, b"HEADER");
+        assert_eq!(c.part_count(), 1);
     }
 }
