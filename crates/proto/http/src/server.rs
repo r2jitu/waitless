@@ -10,9 +10,13 @@ use alloc::sync::Arc;
 use iobuf::{IOBuf, IOBufChain};
 
 use crate::body::BodyReader;
-use crate::request::{ParserState, Request, parse_request_with_state};
+#[cfg(not(http_streaming_parser))]
+use crate::request::{ParserState, parse_request_with_state};
+use crate::request::Request;
 use crate::response::{Response, write_response_into_iobuf};
 use crate::stream::HttpStream;
+#[cfg(http_streaming_parser)]
+use crate::streaming;
 
 /// Per-connection parse buffer. Sized for the request HEAD only —
 /// status line + headers, terminated by `\r\n\r\n`. Bodies are
@@ -20,7 +24,9 @@ use crate::stream::HttpStream;
 /// the transport stream (with any body bytes that happened to land
 /// in this buffer as a prefix). 16 KiB covers worst-case header
 /// sets we expect from bench / browser clients plus headroom for
-/// the leading bytes of a POST body.
+/// the leading bytes of a POST body. Buffered serve_conn only —
+/// the streaming variant carries no parse buffer.
+#[cfg(not(http_streaming_parser))]
 const BUF_SIZE: usize = 16 * 1024;
 
 /// Idle-connection timeout. After this long without inbound data,
@@ -78,6 +84,14 @@ where
 /// Public so transport-specific listeners (HTTPS in `tls`,
 /// HTTP/3 in `http3`) can drive their own `HttpStream` impls
 /// through the same request/response machinery.
+///
+/// Two implementations live behind the `http_streaming_parser` cfg
+/// flag — the buffered one (default) copies bytes into a 16 KiB
+/// inline parse buffer and runs `parse_request_with_state` on it;
+/// the streaming one (cfg-on) skips the buffer entirely and feeds
+/// chunk bytes straight into `StreamingRequestParser`. They share
+/// the same signature and handler contract.
+#[cfg(not(http_streaming_parser))]
 pub async fn serve_conn<S, H>(handler: Arc<H>, mut stream: S)
 where
     S: HttpStream,
@@ -353,7 +367,173 @@ where
     }
 }
 
-#[cfg(test)]
+/// Streaming-parser variant of [`serve_conn`]. Same contract; the
+/// difference is the parse path:
+///
+///   * No 16 KiB inline `buf`. No `spill`. No
+///     `chunk_spill_hits` bookkeeping.
+///   * `StreamingRequestParser` reads chunk bytes directly off
+///     `recv_chunk`'s guard; partial requests flow naturally across
+///     chunk boundaries through the parser's per-field cursors.
+///   * `carry: Option<IOBuf>` holds whatever survived the last
+///     chunk past the HEAD — body bytes for the current request,
+///     then start-of-next-pipelined-request bytes after the body
+///     drains. `into_owned` detaches the chunk from the stream when
+///     we need to keep it past the recv borrow.
+///
+/// Behaviour parity with the buffered variant is the contract the
+/// equivalence harness in `streaming::equivalence` pins.
+#[cfg(http_streaming_parser)]
+pub async fn serve_conn<S, H>(handler: Arc<H>, mut stream: S)
+where
+    S: HttpStream,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, S>) -> Response,
+{
+    crate::diag::COUNTERS.connections_served.bump();
+    let mut req = Request::new();
+    let mut out_chain = IOBufChain::with_capacity(4);
+    const HEADER_BUF_SIZE: usize = 1024;
+    let mut header_storage = [0u8; HEADER_BUF_SIZE];
+    let mut parser = streaming::StreamingRequestParser::new();
+    // Bytes carried over from the previous chunk. After HEAD parse:
+    // contains body bytes for the current request, then start-of-
+    // next-pipelined-request bytes once the body drains. Owned (via
+    // `into_owned`) so it outlives the recv borrow.
+    let mut carry: Option<IOBuf> = None;
+    loop {
+        req.clear();
+        parser.reset();
+        // Feed bytes until the parser signals HEAD complete. Source
+        // bytes from `carry` first (left over from the previous
+        // iteration), then fresh `recv_chunk` calls.
+        loop {
+            if let Some(mut buf) = carry.take() {
+                match parser.feed(&mut req, buf.data()) {
+                    streaming::FeedResult::Done { consumed } => {
+                        buf.consume(consumed)
+                            .expect("consumed <= data().len()");
+                        if !buf.data().is_empty() {
+                            carry = Some(buf);
+                        }
+                        break;
+                    }
+                    streaming::FeedResult::NeedMore => {
+                        drop(buf);
+                    }
+                }
+            } else {
+                let chunk_fut = stream.recv_chunk();
+                match waitless::runtime::timeout_us(IDLE_TIMEOUT_US, chunk_fut).await {
+                    Some(Some(guard)) => match parser.feed(&mut req, guard.data()) {
+                        streaming::FeedResult::Done { consumed } => {
+                            let mut owned = guard.into_owned();
+                            owned
+                                .consume(consumed)
+                                .expect("consumed <= data().len()");
+                            if !owned.data().is_empty() {
+                                carry = Some(owned);
+                            }
+                            break;
+                        }
+                        streaming::FeedResult::NeedMore => {
+                            drop(guard);
+                        }
+                    },
+                    Some(None) => {
+                        crate::diag::COUNTERS.peer_eof.bump();
+                        return;
+                    }
+                    None => {
+                        crate::diag::COUNTERS.idle_timeout.bump();
+                        return;
+                    }
+                }
+            }
+        }
+        crate::diag::COUNTERS.requests_parsed.bump();
+        let content_length = req.content_length;
+
+        let want_close;
+        let resp;
+        if req.reject {
+            crate::diag::record_reject(&req);
+            resp = Response::bad_request();
+            want_close = true;
+        } else {
+            want_close = match req.header(b"Connection") {
+                Some(v) => v.eq_ignore_ascii_case(b"close"),
+                None => false,
+            };
+            let body_drained_ok;
+            {
+                // Body prebuf comes from `carry` (the bytes that
+                // landed in the same chunk as the HEAD terminator).
+                // Trim to declared `Content-Length` so we don't
+                // hand the body reader bytes that belong to the
+                // next pipelined request.
+                let prebuf: &[u8] = match carry.as_ref() {
+                    Some(c) => {
+                        let n = content_length.min(c.data().len());
+                        &c.data()[..n]
+                    }
+                    None => &[],
+                };
+                let mut body = BodyReader::new(&mut stream, prebuf, content_length);
+                resp = (*handler)(&req, &mut body).await;
+                body_drained_ok = want_close
+                    || body.is_empty()
+                    || body.discard().await.is_ok();
+            }
+            if !body_drained_ok {
+                crate::diag::COUNTERS.body_drain_failed.bump();
+                return;
+            }
+        }
+
+        let header = unsafe {
+            IOBuf::borrow(
+                core::ptr::NonNull::new_unchecked(header_storage.as_mut_ptr()),
+                HEADER_BUF_SIZE as u32,
+                0,
+                0,
+            )
+        };
+        let mut header = header;
+        write_response_into_iobuf(&mut header, &resp, !want_close);
+
+        debug_assert!(out_chain.is_empty());
+        for part in resp.into_body().into_parts() {
+            out_chain.push_back(part);
+        }
+        out_chain.push_front(header);
+
+        if stream.send(&mut out_chain).await.is_err() {
+            crate::diag::COUNTERS.send_failed.bump();
+            return;
+        }
+        crate::diag::COUNTERS.responses_sent.bump();
+
+        if want_close {
+            let _ = stream.close().await;
+            return;
+        }
+
+        // Advance `carry` past the body bytes that were just served
+        // (BodyReader handed them to the handler from `carry`'s
+        // prefix; `discard` finished anything the handler skipped).
+        // What's left is the start of the next pipelined request.
+        if let Some(mut c) = carry.take() {
+            let body_from_carry = content_length.min(c.data().len());
+            c.consume(body_from_carry)
+                .expect("body_from_carry <= data().len()");
+            if !c.data().is_empty() {
+                carry = Some(c);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, not(http_streaming_parser)))]
 mod serve_conn_tests {
     use super::serve_conn;
     use crate::body::BodyReader;
