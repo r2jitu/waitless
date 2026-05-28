@@ -88,8 +88,9 @@ pub struct Counters {
     /// A send could not grow the per-conn retransmit queue — heap
     /// exhaustion. Retransmit coverage is suspended
     /// (`rtx_alloc_failed`) until the unacked window drains.
-    /// Genuinely unexpected.
-    pub rtx_buf_oom: Counter,
+    /// Genuinely unexpected; `LAST_RTX_ALLOC_FAIL` has the
+    /// connection state at the moment of the OOM.
+    pub rtx_alloc_fail: Counter,
 
     // ── Retransmission ───────────────────────────────────────────
     /// RFC 6298 data retransmissions — the oldest unacked segment
@@ -145,7 +146,7 @@ impl Counters {
             pool_exhausted: Counter::new(),
             pool_reclaimed: Counter::new(),
             rx_ring_oom: Counter::new(),
-            rtx_buf_oom: Counter::new(),
+            rtx_alloc_fail: Counter::new(),
             data_retransmits: Counter::new(),
             fin_retransmits: Counter::new(),
             persist_probes: Counter::new(),
@@ -220,6 +221,13 @@ pub static LAST_ACK_UNSENT: LastEvent<AckUnsentRecord> = LastEvent::new();
 /// which core, which is the missing context for high-concurrency
 /// cliff debugging (see `docs/high-concurrency-perf.md`).
 pub static LAST_POOL_EXHAUSTED: LastEvent<PoolExhaustedRecord> = LastEvent::new();
+
+/// Most recent rtx_queue push that failed to grow the deque — the
+/// connection state, in-flight byte count, and core at the moment
+/// retransmit coverage was suspended. Bare `rtx_alloc_fail` says
+/// only "how many"; this snapshot says *which conn shape* hit the
+/// heap ceiling.
+pub static LAST_RTX_ALLOC_FAIL: LastEvent<RtxAllocFailRecord> = LastEvent::new();
 
 /// Snapshot payload for `LAST_RST`.
 #[derive(Clone, Copy)]
@@ -380,6 +388,33 @@ impl ObsRecord for PoolExhaustedRecord {
     }
 }
 
+/// Snapshot payload for `LAST_RTX_ALLOC_FAIL`.
+#[derive(Clone, Copy)]
+pub struct RtxAllocFailRecord {
+    /// Core whose `rtx_push` `try_reserve` failed.
+    pub core: u32,
+    /// Connection state at the moment of failure.
+    pub conn_state: TcpState,
+    /// `rtx_bytes_in_flight` at failure — the byte count whose
+    /// retransmit coverage is being suspended.
+    pub bytes_in_flight: u32,
+    /// `kernel_core::clock::now_ms()` at the failure.
+    pub at_ms: u64,
+}
+
+impl ObsRecord for RtxAllocFailRecord {
+    fn write_fields(&self, w: &mut dyn fmt::Write) -> fmt::Result {
+        write!(
+            w,
+            "\"core\":{},\"conn_state\":\"{}\",\"bytes_in_flight\":{},\"at_ms\":{}",
+            self.core,
+            state_name(self.conn_state),
+            self.bytes_in_flight,
+            self.at_ms,
+        )
+    }
+}
+
 /// Stable lowercase name for a `TcpState` — for JSON / logs.
 pub fn state_name(s: TcpState) -> &'static str {
     match s {
@@ -440,6 +475,20 @@ pub fn record_ack_unsent(
     });
 }
 
+/// Record an rtx_queue OOM: bump `rtx_alloc_fail` and snapshot the
+/// conn state + bytes-in-flight + core into `LAST_RTX_ALLOC_FAIL`.
+/// Called from `rtx_retain` when `rtx_push`'s `try_reserve` returns
+/// `Err`.
+pub fn record_rtx_alloc_fail(conn_state: TcpState, bytes_in_flight: u32) {
+    COUNTERS.rtx_alloc_fail.bump();
+    LAST_RTX_ALLOC_FAIL.record(RtxAllocFailRecord {
+        core: kernel_core::cpu_id(),
+        conn_state,
+        bytes_in_flight,
+        at_ms: kernel_core::clock::now_ms(),
+    });
+}
+
 /// Record a SYN drop due to pool exhaustion: bump `pool_exhausted`
 /// and snapshot core + capacity + timestamp into `LAST_POOL_EXHAUSTED`.
 /// Called from `receive.rs` when `alloc_connection` returns `None`.
@@ -493,7 +542,7 @@ pub fn snapshot() -> [(&'static str, u64); 25] {
         ("pool_exhausted", c.pool_exhausted.get()),
         ("pool_reclaimed", c.pool_reclaimed.get()),
         ("rx_ring_oom", c.rx_ring_oom.get()),
-        ("rtx_buf_oom", c.rtx_buf_oom.get()),
+        ("rtx_alloc_fail", c.rtx_alloc_fail.get()),
         ("data_retransmits", c.data_retransmits.get()),
         ("fin_retransmits", c.fin_retransmits.get()),
         ("persist_probes", c.persist_probes.get()),
@@ -551,6 +600,8 @@ pub fn write_obs_json(w: &mut dyn fmt::Write) -> fmt::Result {
     LAST_ACK_UNSENT.write_json(w, "last_ack_unsent")?;
     w.write_str(",")?;
     LAST_POOL_EXHAUSTED.write_json(w, "last_pool_exhausted")?;
+    w.write_str(",")?;
+    LAST_RTX_ALLOC_FAIL.write_json(w, "last_rtx_alloc_fail")?;
     w.write_str("}")
 }
 

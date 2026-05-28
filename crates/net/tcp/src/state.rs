@@ -813,7 +813,7 @@ impl TcpConnection {
             // window and wait for the peer to ACK everything before
             // re-engaging. `rtx_on_ack` clears the flag once
             // `snd_una == snd_nxt`.
-            crate::diag::COUNTERS.rtx_buf_oom.bump();
+            crate::diag::record_rtx_alloc_fail(self.state, self.rtx_bytes_in_flight);
             self.rtx_queue.clear();
             self.rtx_bytes_in_flight = 0;
             self.rtx_deadline_ms = 0;
