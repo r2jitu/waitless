@@ -185,6 +185,12 @@ pub(crate) const TIME_WAIT_MS: u64 = 60_000;
 /// instead of the real `try_reserve`. Lets the conformance harness
 /// exercise the `rtx_alloc_failed` flow without manipulating the
 /// global allocator. Production builds compile this out.
+///
+/// Process-global, so safe only because the test harness's `TEST_LOCK`
+/// serialises scenarios; do not run the tcp tests in parallel without
+/// re-thinking the gate. `harness()` clears it on every entry so a
+/// scenario that arms it without firing the push cannot leak the
+/// trigger into the next.
 #[cfg(test)]
 pub(crate) static FAIL_RTX_PUSH_ONCE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);

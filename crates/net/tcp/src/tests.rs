@@ -254,6 +254,11 @@ fn harness() -> std::sync::MutexGuard<'static, ()> {
     // Start every scenario at t=0 so a timer-driven test never
     // inherits clock advanced by an earlier one.
     kernel_core::clock::mock::reset();
+    // Disarm the rtx_push fault-injector — defensive against a future
+    // test that arms it (`crate::state::FAIL_RTX_PUSH_ONCE.store(true)`)
+    // without firing the push, which would leak the trigger into the
+    // next scenario.
+    crate::state::FAIL_RTX_PUSH_ONCE.store(false, Ordering::Relaxed);
     guard
 }
 
@@ -2925,9 +2930,14 @@ fn rtx_push_seeds_entry_and_anchor() {
             && c.local_port == SP
             && c.remote_port == CP
         {
-            // Clear the RTT anchor the handshake left set so the
-            // push exercises the seed branch.
-            c.rtt_anchor_active = false;
+            // Confirm the precondition: the handshake (control-plane
+            // segments only — SYN-ACK + ACK) never calls `rtx_push`,
+            // which is the sole writer of `rtt_anchor_active`. So the
+            // first user-data push is what seeds the anchor.
+            assert!(
+                !c.rtt_anchor_active,
+                "the handshake should not have seeded the anchor",
+            );
             let buf = iobuf::IOBuf::from(vec![0u8; 100]);
             assert!(c.rtx_push(buf, 1000, 100, 42));
             assert_eq!(c.rtx_queue.len(), 1);
@@ -3158,7 +3168,6 @@ fn rtx_ack_cumulative_drains_multiple() {
     panic!("no live connection for ports {CP} -> {SP}");
 }
 
-
 /// An `rtx_push` heap-OOM suspends retransmit coverage: the queue
 /// clears, the `rtx_alloc_failed` flag latches, subsequent sends
 /// while the flag is set don't grow the queue (they still go on the
@@ -3183,6 +3192,7 @@ fn rtx_push_oom_suspends_coverage_until_full_drain() {
     let (handle, generation) = conn_handle(CP, SP);
 
     let fail_before = super::diag::COUNTERS.rtx_alloc_fail.get();
+    let (last_count_before, _) = super::diag::LAST_RTX_ALLOC_FAIL.snapshot();
 
     // Send one batch normally so the queue has bytes the OOM path
     // is going to discard.
@@ -3211,9 +3221,21 @@ fn rtx_push_oom_suspends_coverage_until_full_drain() {
         fail_before + 1,
         "the rtx_alloc_fail counter advanced",
     );
-    assert!(
-        super::diag::LAST_RTX_ALLOC_FAIL.snapshot().1.is_some(),
-        "LAST_RTX_ALLOC_FAIL recorded the event",
+    let (last_count_after, last_record) = super::diag::LAST_RTX_ALLOC_FAIL.snapshot();
+    assert_eq!(
+        last_count_after,
+        last_count_before + 1,
+        "LAST_RTX_ALLOC_FAIL recorded one new event",
+    );
+    let record = last_record.expect("a recorded event must be present");
+    assert_eq!(
+        record.conn_state,
+        crate::state::TcpState::Established,
+        "record captured the conn state at the moment of the OOM",
+    );
+    assert_eq!(
+        record.bytes_in_flight, 1000,
+        "record's bytes_in_flight is the pre-clear in-flight count",
     );
 
     // A third send while the flag is set still puts bytes on the wire
