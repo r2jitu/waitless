@@ -716,13 +716,13 @@ backpressure. CPU-bound at ChaCha20-Poly1305 decrypt rate
 - **Streaming response bodies (large echo)**: `Response` is
   fully-buffered today. Echo-100-MB needs a streaming-source
   Response variant. Separate plan.
-- **Streaming HTTP header parser**: a state-machine parser would
-  shrink the per-conn parse buf from 16 KiB to ~256 B (saves
-  ~22 MB/core at fanout_tcp's 1500 conn/core) AND eliminate the
-  prebuf memcpy (the one remaining copy on the body path after
-  this plan). Substantial parser rewrite; lives with the
-  chunked-encoding support (item E rejects it; a real
-  implementation goes in this Phase 4 work).
+- **Streaming HTTP header parser** (DONE — `StreamingRequestParser`):
+  byte-fed state machine writes parsed values directly into the
+  per-conn `Request`; the 16 KiB inline parse buffer is gone (saves
+  ~22 MB/core at fanout_tcp's 1500 conn/core). The prebuf memcpy on
+  the body path is also gone — `carry` is an `IOBuf` that
+  `BodyReader` reads from directly. Chunked-encoding support (item
+  E) still rejects; a real implementation is separate Phase 4 work.
 - **In-place TLS RX decrypt** (zero-copy `into_owned()` on the
   TLS path): item G's `TlsStream::recv_chunk` surfaces a
   `Borrowed` view into `pt_buf` — `data()` is zero copy, but
@@ -1668,13 +1668,13 @@ transport chunk and cannot be told a limit. `chunk` therefore caps
 the *delivered* slice (`take = guard.data().len().min(want_max)`),
 which keeps the handler and the `delivered` accounting correct. The
 residue — a transport chunk straddling the `Content-Length`
-boundary — is dropped when the guard drops. That straddle is
-reachable only by pipelining a follow-up request into the tail
-segment of a body that overflowed the 16 KiB parse buffer; the
-pre-Phase-4 server has no streaming header parser and no test or
-bench exercises it, so this is a documented limitation, not a
-regression of a supported path. The proper fix lives with the
-Phase-4 streaming parser (already an "Out of scope" bullet).
+boundary — is dropped when the guard drops. With the streaming
+header parser landed, the streaming `serve_conn` keeps a `carry:
+Option<IOBuf>` slot for exactly the pipelined-after-body straddle
+case; only the legacy `BodyReader::chunk` path's straddle case
+remains documented as a corner where the residue is dropped. No
+test or bench exercises this BodyReader corner; documented
+limitation, not a regression of a supported path.
 
 **Tests.** Four `body_reader_tests` added to `http_test`
 (now 17 tests): prebuf `data()` zero-copy view, prebuf
@@ -1891,13 +1891,14 @@ match.
 
 **Deprecating the non-zero-copy path — assessment.** `recv` is
 deprecatable for proxy/echo handlers *now* (native `do_recv_chunk`
-unblocked it; `tcp_echo` is migrated). It is **blocked for
-`serve_conn`** until the Phase-4 streaming HTTP header parser —
-`serve_conn` needs a contiguous parse buffer, `recv_chunk` delivers
-discontiguous chunks. The ring-drain copy inside `do_recv_chunk` is
-**never** deprecatable: the per-conn `rx_ring` is a structural
-backpressure buffer (the math forbids IOBufs in it). Full `recv`
-removal is a Phase-4 endgame.
+unblocked it; `tcp_echo` is migrated). The `serve_conn` block has
+been lifted — `StreamingRequestParser` consumes `recv_chunk`
+output directly, no contiguous parse buffer needed. The ring-drain
+copy inside `do_recv_chunk` is **never** deprecatable: the per-conn
+`rx_ring` is a structural backpressure buffer (the math forbids
+IOBufs in it). Full `recv` removal is now down to the remaining
+trait-default `recv` callsites and the body-prebuf path inside
+`BodyReader`.
 
 Verified: `webserver_qemu_x86_64` + `webserver.elf` aarch64 builds;
 `test_hvf`; `http_test`; native backend compile via

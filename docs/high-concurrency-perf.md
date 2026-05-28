@@ -621,25 +621,27 @@ magnitude. Nominal per-conn from the assignment was 98 KB. The
 | `Box<TlsConnImpl>` (per-conn TLS state — 3×4 KB inline buffers + keys + cfg Arc) | ~12 KB |
 | `TlsStream` `record_scratch` (lazy on scratch fallback; `TLS_RECORD_LEN` ≈ 16 KB) | ~16 KB |
 | **Handler future `Box`** — `serve_conn` future state:         |      |
-| &nbsp;&nbsp;`buf: [u8; 16384]` parse buffer                       | 16 KB |
 | &nbsp;&nbsp;`req: Request` (16-header array + 256 B path)         | ~5.5 KB |
 | &nbsp;&nbsp;`header_storage: [u8; 1024]`                         | 1 KB |
 | &nbsp;&nbsp;`TlsStream.tx_scratch: [u8; 2048]`                    | 2 KB |
+| &nbsp;&nbsp;`carry: Option<IOBuf>` (only when chunk overruns HEAD) | ~24 B |
 | `TcpConnection` slot (in pool segment, ~600 B)                | ~1 KB |
 | Talc per-allocation headers + alignment slack                 | ~40 KB |
-| **Total**                                                     | **~182 KB** |
+| **Total**                                                     | **~166 KB** |
 
-The **handler future Box alone is ~33 KB** — 16× the
-1–2 KB the assignment expected. The single biggest contributor
-is `serve_conn`'s inline `buf: [u8; BUF_SIZE]` (16 KB) — the
-request parse buffer that was folded into the future state in
-commit-history note "one fewer alloc per conn-accept." That
-optimisation removed per-request churn, but it loaded 16 KB per
-live conn onto the heap as long as the conn is alive. The
-Box-per-spawn pays once per accept (handler future) and once per
-TLS conn (`Box<TlsConnImpl>` = ~12 KB metadata + 12 KB inline rx/tx/pt).
+The **handler future Box** used to be ~33 KB — half of that was
+`serve_conn`'s inline 16 KiB parse buffer. The streaming-parser
+refactor (`StreamingRequestParser`) dropped the buffer entirely;
+the parser writes directly into the per-conn `Request` fields as
+chunk bytes arrive off `recv_chunk`. What's left in the future
+state is the `Request` itself, the response-header IOBuf scratch,
+and a small `carry: Option<IOBuf>` slot for the rare case where a
+chunk carries body bytes / next-pipelined-request bytes past the
+HEAD terminator. The Box-per-spawn still pays once per accept
+(handler future) and once per TLS conn (`Box<TlsConnImpl>` =
+~12 KB metadata + 12 KB inline rx/tx/pt).
 
-Apply 182 KB to GCE's 3 GB heap → **ceiling ≈ 16.9 K conns**
+Apply 166 KB to GCE's 3 GB heap → **ceiling ≈ 18.5 K conns**
 before fragmentation. That's exactly the 18 K end of the
 "cliffs at 18–24 K" band; the per-conn slope alone explains the
 cliff position.
@@ -804,13 +806,14 @@ first item dwarfs everything below it.
      the doc was written for. *This item alone is the largest
      single ceiling-mover in the whole document.*
 
-1. **`serve_conn` parse buffer: 16 KB inline → 4 KB inline + spill.**
-   The `buf: [u8; 16384]` was sized for "worst-case header sets
-   plus the leading bytes of a POST body" (server.rs:24). A 4 KB
-   inline buffer covers every typical HTTP/1.1 GET headers and the
-   handful of headers wrk / browsers send; oversized requests can
-   fall through to a heap-spill grow path or get rejected with 431.
-   **Saves 12 KB/conn → 18 K → 25 K cliff on GCE shape.**
+1. **`serve_conn` parse buffer: 16 KB inline → REMOVED.** (DONE)
+   `StreamingRequestParser` reads chunk bytes directly off
+   `recv_chunk`'s guard and writes parsed values straight into the
+   per-conn `Request` fields — no inline parse buffer in the future
+   state. `carry: Option<IOBuf>` (~24 B) handles the rare case
+   where a chunk carries body bytes / next-pipelined bytes past the
+   HEAD terminator. **Saved 16 KB/conn → cliff moved from ~18 K to
+   ~25 K on GCE shape.**
 
 2. **`TcpConnection` rtx_buf default: 64 KB → 16 KB.**
    `RTX_BUF_BYTES = 65536` is sized to cover the largest possible
@@ -915,12 +918,14 @@ pool, no fresh alloc. So under sustained load, site #4 is a non-issue.
 **Site #3 is the residual gap.** Every accepted TCP conn goes
 through `Box::pin(async move { body(stream).await })` at
 [`crates/runtime/executor/src/reactor/tcp.rs:665`](../crates/runtime/executor/src/reactor/tcp.rs#L665).
-That's a ~25 KB heap allocation (the future state includes
-`serve_conn`'s inline `[u8; 16384]` parse buffer, the
-`Request` struct, the 2 KB `tx_scratch`, and the handler body's
-own captured state — see the "H2" breakdown above; the 8 KB
-`TlsStream.cipher_buf` it used to include is gone — `pump_rx`
-now uses `TcpStream::recv_chunk`). The standard-library `Box::pin`
+That's a ~9 KB heap allocation (the future state includes the
+`Request` struct, the 1 KB `header_storage`, the 2 KB
+`tx_scratch`, the `carry: Option<IOBuf>` slot, and the handler
+body's own captured state — see the "H2" breakdown above; the
+16 KiB inline parse buffer and the 8 KB `TlsStream.cipher_buf`
+that used to dominate this allocation are both gone —
+`StreamingRequestParser` reads chunk bytes directly and
+`pump_rx` uses `TcpStream::recv_chunk`). The standard-library `Box::pin`
 uses the global allocator and panics on null via
 `alloc::alloc::handle_alloc_error`. With the heap exhausted,
 this panic fires, runs `#[panic_handler]`, calls
