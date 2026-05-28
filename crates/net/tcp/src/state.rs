@@ -707,11 +707,10 @@ impl TcpConnection {
     /// empty before this push (RFC 6298 §5.1) and seeds the RTT
     /// anchor (§3) if no sample is outstanding.
     ///
-    /// Currently dead code — wired into the send path in a follow-up
-    /// commit. The accompanying unit tests exercise push/ack/narrow
-    /// on a fresh `TcpConnection` to lock in the queue's behaviour
-    /// before the send path starts driving it.
-    #[allow(dead_code)]
+    /// Wired into the send path: `rtx_retain` calls this after the
+    /// rtx_buf write so the queue mirrors the unacked window through
+    /// the dual-write transition. Equivalence harnesses in tests
+    /// compare the queue's bytes against the rtx_buf window per send.
     pub(crate) fn rtx_push(
         &mut self,
         iobuf: IOBuf,
@@ -861,13 +860,20 @@ impl TcpConnection {
 
     /// Shared core of the two retransmit-retain entry points
     /// (`rtx_on_data_sent` for the chain path, `rtx_on_data_sent_slice`
-    /// for the TSO path). Reserves `total` bytes at the tail of the
-    /// retransmit ring and invokes `write` with each (possibly
-    /// wrapped) destination slice in order — the caller fills them
-    /// from a chain cursor or a contiguous slice. Handles the
-    /// allocation guard, the ring wrap, `rtx_len`, the RFC 6298 §5.1
-    /// RTO timer, and the §3 RTT anchor.
-    fn rtx_retain(&mut self, total: usize, mut write: impl FnMut(&mut [u8])) {
+    /// for the TSO path). Stages `total` bytes through an owned
+    /// `Vec<u8>` via the caller's `fill` closure, then dual-writes
+    /// them into both `rtx_buf` (legacy) and `rtx_queue` (new IOBuf
+    /// path). Handles the allocation guard, the ring wrap, `rtx_len`,
+    /// the RFC 6298 §5.1 RTO timer, and the §3 RTT anchor.
+    ///
+    /// Stage-1 of the rtx_buf → IOBuf-queue migration: the queue
+    /// path runs alongside the ring so the follow-up commits (ACK,
+    /// RTO, cwnd) can switch reads to the queue one site at a time
+    /// while equivalence harnesses prove the byte streams match. The
+    /// vec is the queue's IOBuf storage at no extra alloc — once the
+    /// ring is deleted, the vec→ring copy goes away and the
+    /// staging vec becomes the only write.
+    fn rtx_retain(&mut self, total: usize, fill: impl FnOnce(&mut [u8])) {
         if total == 0 || self.rtx_overflow {
             return; // nothing to retain, or coverage already suspended
         }
@@ -893,14 +899,18 @@ impl TcpConnection {
             "in-flight bytes outgrew the retransmit ring — the send \
              window should have bounded them at min(cwnd, rwnd)",
         );
+        // Stage into an owned Vec — the queue's eventual storage.
+        let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; total];
+        fill(&mut staging);
+
         let tail = (self.rtx_head as usize + self.rtx_len as usize) % RTX_BUF_BYTES;
         let buf = self.rtx_buf.as_mut().expect("ensure_rtx_buf succeeded");
         if tail + total <= RTX_BUF_BYTES {
-            write(&mut buf[tail..tail + total]);
+            buf[tail..tail + total].copy_from_slice(&staging);
         } else {
             let first = RTX_BUF_BYTES - tail;
-            write(&mut buf[tail..]);
-            write(&mut buf[..total - first]);
+            buf[tail..].copy_from_slice(&staging[..first]);
+            buf[..total - first].copy_from_slice(&staging[first..]);
         }
         self.rtx_len += total as u16;
         // §5.1: start the timer if it is not already running.
@@ -910,11 +920,21 @@ impl TcpConnection {
         // RFC 6298 §3: take at most one RTT sample per RTT. Anchor on
         // the sequence number just past this send (`snd_nxt` already
         // advanced); the ACK covering it yields the measurement.
+        let now_ms = kernel_core::clock::now_ms();
         if !self.rtt_anchor_active {
             self.rtt_anchor_active = true;
             self.rtt_anchor_seq = self.snd_nxt;
-            self.rtt_anchor_ms = kernel_core::clock::now_ms();
+            self.rtt_anchor_ms = now_ms;
         }
+        // Stage-1 dual-write: push the same bytes onto rtx_queue.
+        // `snd_nxt` has already advanced by `total` at the caller, so
+        // this entry covers `[snd_nxt - total, snd_nxt)`. The push's
+        // own arm / anchor-seed are idempotent against the rtx_buf
+        // path above (deadline already armed, anchor already seeded
+        // to the same `snd_nxt`).
+        let seq_start = self.snd_nxt.wrapping_sub(total as u32);
+        let iobuf = IOBuf::from(staging);
+        let _ = self.rtx_push(iobuf, seq_start, total as u16, now_ms);
     }
 
     /// Retain the `total` just-sent bytes — read from a fresh cursor
@@ -934,10 +954,8 @@ impl TcpConnection {
     /// a TSO segment is covered by the RTO timer exactly like a
     /// chain-sent one.
     pub(crate) fn rtx_on_data_sent_slice(&mut self, bytes: &[u8]) {
-        let mut off = 0usize;
         self.rtx_retain(bytes.len(), |dst| {
-            dst.copy_from_slice(&bytes[off..off + dst.len()]);
-            off += dst.len();
+            dst.copy_from_slice(bytes);
         });
     }
 

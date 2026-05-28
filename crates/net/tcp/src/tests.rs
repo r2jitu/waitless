@@ -3000,6 +3000,128 @@ fn rtx_ack_pops_and_narrows() {
     panic!("no live connection for ports {CP} -> {SP}");
 }
 
+/// Collect the live connection's `rtx_buf` bytes (the unacked window,
+/// in wire order) into a flat `Vec`. Reads `rtx_buf[rtx_head..]` with
+/// wrap, capped at `rtx_len`. The dual-write equivalence harness
+/// compares this against the rtx_queue's concatenated entry payloads.
+fn conn_rtx_buf_bytes(client_port: u16, server_port: u16) -> Vec<u8> {
+    let core = 0u32;
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        let c = unsafe { &*conn_ptr(core, i) };
+        if c.state != crate::state::TcpState::Closed
+            && c.state != crate::state::TcpState::Listen
+            && c.local_port == server_port
+            && c.remote_port == client_port
+        {
+            let Some(buf) = c.rtx_buf.as_ref() else {
+                return Vec::new();
+            };
+            let head = c.rtx_head as usize;
+            let len = c.rtx_len as usize;
+            let mut out = Vec::with_capacity(len);
+            if head + len <= crate::state::RTX_BUF_BYTES {
+                out.extend_from_slice(&buf[head..head + len]);
+            } else {
+                let first = crate::state::RTX_BUF_BYTES - head;
+                out.extend_from_slice(&buf[head..]);
+                out.extend_from_slice(&buf[..len - first]);
+            }
+            return out;
+        }
+    }
+    panic!("no live connection for ports {client_port} -> {server_port}");
+}
+
+/// Collect the live connection's `rtx_queue` bytes (the unacked
+/// window, in wire order) into a flat `Vec`. Concatenates each
+/// entry's `iobuf.data()` from front to back — the queue holds
+/// entries in send order, so this is the wire-order byte stream.
+fn conn_rtx_queue_bytes(client_port: u16, server_port: u16) -> Vec<u8> {
+    let core = 0u32;
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        let c = unsafe { &*conn_ptr(core, i) };
+        if c.state != crate::state::TcpState::Closed
+            && c.state != crate::state::TcpState::Listen
+            && c.local_port == server_port
+            && c.remote_port == client_port
+        {
+            let mut out = Vec::new();
+            for entry in c.rtx_queue.iter() {
+                out.extend_from_slice(entry.iobuf.data());
+            }
+            return out;
+        }
+    }
+    panic!("no live connection for ports {client_port} -> {server_port}");
+}
+
+/// Equivalence harness for commit 2 (dual-write): every send pushes
+/// the same bytes onto rtx_buf and rtx_queue. After a chain send the
+/// two byte streams must match exactly, including a partial chain
+/// send where the window only admits a prefix.
+#[test]
+fn dual_write_send_path_chain_matches_rtx_buf() {
+    let _g = harness();
+    const SP: u16 = 9183;
+    const CP: u16 = 50183;
+    const CLIENT_ISN: u32 = 0xF830;
+    super::listen_on_core(0, SP);
+    let _server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    // First send: a small chain that fits in one MSS.
+    let body1 = (0..900u32).map(|i| (i & 0xFF) as u8).collect::<Vec<u8>>();
+    let mut chain = iobuf::IOBufChain::from(body1.clone());
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(sent, body1.len());
+    assert_eq!(conn_rtx_buf_bytes(CP, SP), conn_rtx_queue_bytes(CP, SP),);
+
+    // Second send: a multi-MSS chain. Still one rtx_retain call per
+    // async_try_send_chain, so one queue entry covering the batch.
+    let body2 = (0..5000u32).map(|i| ((i ^ 0x55) & 0xFF) as u8).collect::<Vec<u8>>();
+    let mut chain = iobuf::IOBufChain::from(body2.clone());
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(sent, body2.len());
+    assert_eq!(conn_rtx_buf_bytes(CP, SP), conn_rtx_queue_bytes(CP, SP),);
+
+    // Sanity: the queue's bytes match the wire order — first byte is
+    // body1[0], then body2 follows.
+    let queue_bytes = conn_rtx_queue_bytes(CP, SP);
+    assert_eq!(queue_bytes.len(), body1.len() + body2.len());
+    assert_eq!(&queue_bytes[..body1.len()], &body1[..]);
+    assert_eq!(&queue_bytes[body1.len()..], &body2[..]);
+}
+
+/// Equivalence harness for the TSO retain path — `try_send_tso` calls
+/// `rtx_on_data_sent_slice` after sealing into a TX-pool slot, and
+/// the dual-write must produce the same bytes in rtx_buf and the
+/// queue.
+#[test]
+fn dual_write_send_path_tso_matches_rtx_buf() {
+    let _g = harness();
+    const SP: u16 = 9184;
+    const CP: u16 = 50184;
+    const CLIENT_ISN: u32 = 0xF840;
+    super::listen_on_core(0, SP);
+    let _server_isn = handshake(SP, CP, CLIENT_ISN);
+    set_active_ops(&MOCK_OPS_TSO);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    // TSO super-segment with 2000 bytes.
+    let body = (0..2000u32).map(|i| ((i ^ 0xA5) & 0xFF) as u8).collect::<Vec<u8>>();
+    assert_eq!(
+        super::try_send_tso(handle, generation, body.len(), &mut |slot: &mut [u8]| {
+            slot[..body.len()].copy_from_slice(&body);
+            Ok(body.len())
+        }),
+        Some(Ok(2000)),
+    );
+    assert_eq!(conn_rtx_buf_bytes(CP, SP), conn_rtx_queue_bytes(CP, SP));
+    assert_eq!(conn_rtx_queue_bytes(CP, SP), body);
+}
+
 /// `rtx_ack` covers multiple entries cumulatively.
 #[test]
 fn rtx_ack_cumulative_drains_multiple() {
