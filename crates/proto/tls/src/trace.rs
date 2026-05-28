@@ -170,17 +170,6 @@ pub fn do_client_finished_entry(rx_len: usize, first_byte: Option<u8>) {
 pub fn do_client_finished_entry(_rx_len: usize, _first_byte: Option<u8>) {}
 
 #[cfg(tls_debug)]
-pub fn waiting_for_bytes(have: usize, need: usize) {
-    serial::puts(b"[tls]   waiting for more bytes (have ");
-    put_u16_dec(have as u16);
-    serial::puts(b", need ");
-    put_u16_dec(need as u16);
-    serial::puts(b")\n");
-}
-#[cfg(not(tls_debug))]
-pub fn waiting_for_bytes(_have: usize, _need: usize) {}
-
-#[cfg(tls_debug)]
 pub fn record_header(content_type: u8, total_len: usize) {
     serial::puts(b"[tls]   full record arrived, content_type=0x");
     put_u16_hex(content_type as u16);

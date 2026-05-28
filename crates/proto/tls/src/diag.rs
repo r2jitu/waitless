@@ -21,7 +21,7 @@ use crate::server::{HandshakeError, State};
 pub struct Counters {
     /// Handshakes that reached `Established`.
     pub handshakes_completed: Counter,
-    /// `advance()` returned `Err` — a handshake aborted. Read
+    /// `process_chunk()` returned `Err` — a handshake aborted. Read
     /// `LAST_HANDSHAKE_FAILURE` for the state + cause.
     pub handshake_failures: Counter,
     /// The `UnsupportedClient` subset of `handshake_failures` — a

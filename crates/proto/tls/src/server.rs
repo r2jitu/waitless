@@ -1,5 +1,7 @@
-// TLS 1.3 server handshake state machine. Sans-io: caller feeds bytes
-// via `push_rx` / `pop_tx`, drives state with `advance`.
+// TLS 1.3 server handshake state machine. Sans-io: caller feeds
+// inbound bytes via `process_chunk` (one TCP-recv chunk at a time),
+// drains outbound TX via `pop_tx`, and pops decrypted plaintext
+// records via `pop_plaintext`.
 //
 // Supports exactly:
 //   - TLS 1.3, TLS_AES_128_GCM_SHA256, X25519
@@ -11,12 +13,17 @@
 // §5 (Record protocol), §7.1 (Key schedule).
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use core::ptr::{self, addr_of_mut};
 
+use iobuf::IOBuf;
 use p256::ecdsa::SigningKey;
 
 use crate::handshake::ParseError;
-use crate::record::{RecordError, content_type, seal as record_seal};
+use crate::record::{
+    MAX_RECORD_LEN, RecordError, content_type, seal as record_seal,
+};
 use crate::schedule::{HASH_LEN, KeySchedule, TrafficKey, Transcript, X25519ServerKey};
 
 // File-local aliases. Sibling modules of this crate referenced
@@ -29,33 +36,6 @@ use crate::schedule as tls;
 // ============================================================================
 // Tunables
 // ============================================================================
-//
-// rx/tx/pt buffers are now inline `[u8; N]` arrays inside `TlsServer`
-// (was: three separate `Box<[u8]>` allocations). Inline brings the
-// fresh-conn allocation count from 4 → 1: a single
-// `Box<TlsConnImpl>` covers the metadata, all three buffers, and the
-// shared cfg pointer in one contiguous heap block.
-//
-// Stack-overflow on the boot path is avoided by `init_in_place`
-// below — it writes every field via `addr_of_mut!` without ever
-// constructing the 12 KB struct on the stack. `TlsServer::new_box`
-// is the only public constructor; struct-literal construction
-// (`TlsServer { ... }`) would create the stack temp the comment
-// previously warned about, so it's intentionally not exposed.
-//
-// Sized to fit a typical ClientHello / server flight / HTTP/1.1
-// request respectively; 4 KB is generous for all three.
-
-/// Max raw TLS bytes we buffer from the peer before advancing the
-/// state machine. TLS 1.3 lets peers send records up to ~16 KiB
-/// plaintext + 22 B AEAD/record overhead = 16406 B; production
-/// clients (rustls, OpenSSL, Chrome, Safari) routinely fill that
-/// for bulk uploads. Sized to one full max-size record so a
-/// 32 KiB POST that splits into 2 records can still be processed
-/// one-at-a-time: each record fills rx_buf, gets parsed +
-/// drained, then the next arrives. Anything bigger than this in
-/// a single record will close the connection.
-pub const RX_BUF_LEN: usize = 17 * 1024;
 
 /// Max raw TLS bytes we emit during the server flight
 /// (ServerHello + CCS + encrypted {EncExt, Certificate, CertVerify,
@@ -69,13 +49,11 @@ pub const RX_BUF_LEN: usize = 17 * 1024;
 /// not to MAX_INNER_PLAINTEXT.
 pub const TX_BUF_LEN: usize = 4 * 1024;
 
-/// Max decrypted plaintext we buffer for the app between
-/// `take_plaintext_chunk` calls. Must fit one full TLS 1.3 record's
-/// worth of plaintext (16 KiB max) — `do_app_data` refuses to
-/// consume a record whose plaintext exceeds remaining space,
-/// so a smaller cap stalls bulk uploads (curl test:
-/// >4 KiB POST hung at "0 bytes received" before this bump).
-pub const PT_BUF_LEN: usize = 17 * 1024;
+/// One full TLS 1.3 record's wire footprint = 5 B header +
+/// `MAX_RECORD_LEN` (body + AEAD tag). The `rx_partial` straddle
+/// buffer is sized to exactly one record so a single in-flight
+/// straddle never overflows it.
+pub const MAX_RECORD_TOTAL: usize = record::HEADER_LEN + MAX_RECORD_LEN;
 
 // ============================================================================
 // Configuration
@@ -260,21 +238,23 @@ pub enum State {
 /// TLS 1.3 server connection state.
 ///
 /// The caller owns the TCP socket; this struct owns the TLS state.
-/// Typical event-loop glue per connection:
+/// Typical event-loop glue per connection: hand each recv'd chunk
+/// to `process_chunk` (decrypts in place, queues plaintext records),
+/// drain `pop_tx` between handshake stages, pop decrypted records
+/// via `pop_plaintext` for the app.
 ///
 /// ```ignore
 /// // On each tick:
-/// let bytes_read = tcp.recv(&mut tmp);
-/// tls.push_rx(&tmp[..bytes_read]);
+/// let mut chunk = tcp.recv_chunk().await?;
+/// tls.process_chunk(chunk.data_mut(), &cfg)?;
+/// drop(chunk);   // NIC slot returns; plaintext is in pending_plaintext.
 /// loop {
 ///     let n_tx = tls.pop_tx(&mut tx_tmp);
 ///     if n_tx > 0 { tcp.send(&tx_tmp[..n_tx]); continue; }
-///     if tls.has_plaintext() {
-///         let pt = tls.take_plaintext_chunk();
-///         app.handle(pt);
+///     if let Some(pt) = tls.pop_plaintext() {
+///         app.handle(pt.data());
 ///         continue;
 ///     }
-///     match tls.advance(config) { ... }
 ///     break;
 /// }
 /// ```
@@ -287,22 +267,37 @@ pub struct TlsServer {
     /// caller actually wants to inspect post-mortem.
     pub(crate) error: Option<HandshakeError>,
 
-    // Raw TLS bytes received from peer (may contain partial or
-    // multiple records). Inline `[u8; N]` arrays now live with the
-    // metadata in a single Box<TlsConnImpl> — the boxed allocation
-    // is one heap block per conn, no per-buffer secondary allocs.
-    // See `init_in_place` for the stack-temp-avoidance scheme.
-    pub(crate) rx_buf: [u8; RX_BUF_LEN],
-    pub(crate) rx_len: usize,
+    // Lazy straddle buffer: holds a partial record carried across
+    // chunk boundaries. Empty in steady state (most /health-style
+    // workloads are MSS-aligned; no straddle, no allocation).
+    // Sized to one full TLS 1.3 record on first use, then kept
+    // warm across the conn's life (and across pool recycle via
+    // `reset`).
+    pub(crate) rx_partial: Option<Box<[u8]>>,
+    /// Number of bytes valid in `rx_partial[..]`. `u16` because
+    /// `MAX_RECORD_TOTAL < 2^14 + small constant`.
+    pub(crate) rx_partial_len: u16,
 
     // Raw TLS bytes waiting to be sent to peer.
     pub(crate) tx_buf: [u8; TX_BUF_LEN],
     pub(crate) tx_len: usize,
     pub(crate) tx_pos: usize, // how many bytes we've handed out via pop_tx()
 
-    // Decrypted application data waiting to be consumed by the app.
-    pub(crate) pt_buf: [u8; PT_BUF_LEN],
-    pub(crate) pt_len: usize,
+    // Decrypted application data records waiting for the app.
+    // One owned byte buffer per record; consumer drains from the
+    // front via `pop_plaintext` which lifts the head to a Heap
+    // `IOBuf` (zero-copy: `IOBuf::from(Vec<u8>)` reuses the
+    // allocation). Typical depth is 0 or 1 — the consumer pulls a
+    // record, parses, and either replies or asks for the next.
+    //
+    // Stored as `Vec<u8>` rather than `IOBuf` because `IOBuf` is
+    // `!Send` (the `Borrowed` variant propagates a non-Send
+    // marker through the enum), and `TlsServer` types end up in a
+    // `WorkerLocal` that the type-system demands be `Sync<T:Send>`
+    // — even though by construction one TlsConnImpl never crosses
+    // worker threads. Vec<u8> sidesteps the constraint without
+    // costing a copy.
+    pub(crate) pending_plaintext: VecDeque<Vec<u8>>,
 
     // Key schedule + transcript
     pub(crate) transcript: Transcript,
@@ -327,9 +322,10 @@ impl Drop for TlsServer {
         // wipe `key` / `iv` / `secret`. The raw handshake-secret
         // arrays in this struct are separately held, so scrub them
         // here before the backing memory is released back to the
-        // global allocator. (rx/tx/pt buffers are inline arrays;
-        // they hold ciphertext and decrypted request plaintext,
-        // not secret key material — no scrub needed before free.)
+        // global allocator. (tx_buf is an inline array; it only
+        // holds handshake ciphertext, not secret key material.
+        // rx_partial and pending_plaintext IOBufs drop via their
+        // own Drop impls.)
         if let Some(mut s) = self.server_hs_secret.take() {
             tls::secure_zero(&mut s);
         }
@@ -341,19 +337,17 @@ impl Drop for TlsServer {
 
 impl TlsServer {
     /// Allocate a fresh boxed `TlsServer` and initialise it in
-    /// place — single 12 KB heap allocation, no per-buffer
-    /// secondary allocs. `seed` is 32 bytes of entropy for the
-    /// ephemeral X25519 keypair (caller supplies from
+    /// place. `seed` is 32 bytes of entropy for the ephemeral
+    /// X25519 keypair (caller supplies from
     /// `kernel_bare::rng::fill_bytes()`).
     ///
-    /// The struct is too large to round-trip through a stack
-    /// temporary (3 × 4 KB inline buffers), so we go through
-    /// `Box::<MaybeUninit<Self>>::new_uninit()` and write each
-    /// field via raw pointer in `init_in_place`. RVO/NRVO is not
-    /// guaranteed across all build configurations and the
-    /// pre-inline boot stack was tight enough that the original
-    /// design boxed the buffers separately to dodge this exact
-    /// problem; the in-place writer makes inlining safe again.
+    /// Goes through `Box::<MaybeUninit<Self>>::new_uninit()` and
+    /// writes each field via raw pointer in `init_in_place` so the
+    /// 4 KB `tx_buf` inline array never round-trips through a
+    /// stack temporary (the pre-streaming RX design had 12 KB of
+    /// inline buffers — `init_in_place` was load-bearing there;
+    /// now it's defensive for the still-inline TX side and lets
+    /// the construction stay one cohesive primitive).
     pub fn new_box(x25519_seed: [u8; 32]) -> Box<Self> {
         let mut b = Box::<Self>::new_uninit();
         // SAFETY: `b.as_mut_ptr()` returns a valid `*mut TlsServer`
@@ -370,10 +364,9 @@ impl TlsServer {
     /// uninitialised pointer.
     ///
     /// Each field is written via `addr_of_mut!` so the compiler
-    /// never materialises a struct-shaped stack temporary; in
-    /// particular the three 4 KB buffers are zero-filled directly
-    /// via `write_bytes` on the heap pointer rather than
-    /// `[0u8; N]` literals.
+    /// never materialises a struct-shaped stack temporary; the
+    /// 4 KB `tx_buf` is zero-filled directly via `write_bytes` on
+    /// the heap pointer rather than `[0u8; N]` literals.
     ///
     /// # Safety
     ///
@@ -386,17 +379,17 @@ impl TlsServer {
         unsafe {
             addr_of_mut!((*this).state).write(State::WaitClientHello);
             addr_of_mut!((*this).error).write(None);
-            addr_of_mut!((*this).rx_len).write(0);
+            addr_of_mut!((*this).rx_partial).write(None);
+            addr_of_mut!((*this).rx_partial_len).write(0);
             addr_of_mut!((*this).tx_len).write(0);
             addr_of_mut!((*this).tx_pos).write(0);
-            addr_of_mut!((*this).pt_len).write(0);
 
-            // Buffers: zero-fill in place. Writing `[0u8; N]` would
+            // tx_buf: zero-fill in place. Writing `[0u8; N]` would
             // construct the array on the stack first; `write_bytes`
             // on the field pointer does it directly on the heap.
-            ptr::write_bytes(addr_of_mut!((*this).rx_buf) as *mut u8, 0, RX_BUF_LEN);
             ptr::write_bytes(addr_of_mut!((*this).tx_buf) as *mut u8, 0, TX_BUF_LEN);
-            ptr::write_bytes(addr_of_mut!((*this).pt_buf) as *mut u8, 0, PT_BUF_LEN);
+
+            addr_of_mut!((*this).pending_plaintext).write(VecDeque::new());
 
             // Sub-objects with their own constructors. These return
             // by value but are small (Transcript ≈ SHA-256 state ~
@@ -416,26 +409,21 @@ impl TlsServer {
     }
 
     /// Reset this TlsServer for reuse on a fresh connection. The
-    /// whole struct (incl. the 12 KB of inline rx/tx/pt buffers)
-    /// stays in its existing heap slot — no allocations happen
-    /// here. Observable state matches `TlsServer::new_box(seed)`
-    /// after the call: buffers are logically empty (length cursors
-    /// at 0), fresh X25519 keypair, all traffic keys cleared,
-    /// transcript / key schedule reinitialised. The buffer storage
-    /// itself isn't touched (see the buffer-secrecy note below).
+    /// `rx_partial` straddle buffer (when previously allocated)
+    /// stays warm across the reset — its 16 KB box is kept around
+    /// so a pooled conn doesn't re-pay the allocation on its first
+    /// inbound straddle. The plaintext queue's IOBufs drop here
+    /// (any leftover undelivered records from a prior conn — e.g.
+    /// a half-closed peer — get freed).
     ///
-    /// Used by the per-worker conn-state pool (item M in
-    /// docs/tx-path-optimizations.md): a freed `Box<TlsConnImpl>`
-    /// is reset and pushed back to the pool; the next accept pops
-    /// it instead of allocating a new TlsServer + 3 buffers.
+    /// Observable state matches `TlsServer::new_box(seed)` after
+    /// the call: fresh X25519 keypair, all traffic keys cleared,
+    /// transcript / key schedule reinitialised, no buffered RX or
+    /// plaintext.
     ///
-    /// Buffer contents are not zeroed — the buffer slots
-    /// (`..rx_len`, `..tx_len`, `..pt_len`) are inaccessible via
-    /// the API once their length cursors reset to 0, and
-    /// application plaintext that lived in `pt_buf` during the
-    /// previous conn isn't secret cryptographic material in our
-    /// model (the application already saw it). `rx_buf` / `tx_buf`
-    /// only ever held ciphertext.
+    /// Used by the per-worker conn-state pool: a freed
+    /// `Box<TlsConnImpl>` is reset and pushed back; the next accept
+    /// pops it instead of allocating fresh.
     pub fn reset(&mut self, x25519_seed: [u8; 32]) {
         // Wipe handshake-secret arrays before clearing — same
         // discipline as our Drop impl. TrafficKey and KeySchedule
@@ -450,10 +438,12 @@ impl TlsServer {
 
         self.state = State::WaitClientHello;
         self.error = None;
-        self.rx_len = 0;
+        // Keep the rx_partial box (if allocated) but mark its
+        // content empty — the next straddle reuses the warm slot.
+        self.rx_partial_len = 0;
         self.tx_len = 0;
         self.tx_pos = 0;
-        self.pt_len = 0;
+        self.pending_plaintext.clear();
         self.transcript = Transcript::new();
         self.schedule = KeySchedule::new_without_psk();
         self.ephemeral = Some(X25519ServerKey::from_seed(x25519_seed));
@@ -465,17 +455,6 @@ impl TlsServer {
     }
 
     // ── Outward API (caller-driven) ─────────────────────────────────
-
-    /// Push raw TLS bytes from the peer into the RX buffer. Returns
-    /// the number of bytes accepted (may be less than `data.len()` if
-    /// our buffer is temporarily full).
-    pub fn push_rx(&mut self, data: &[u8]) -> usize {
-        let space = RX_BUF_LEN - self.rx_len;
-        let n = core::cmp::min(space, data.len());
-        self.rx_buf[self.rx_len..self.rx_len + n].copy_from_slice(&data[..n]);
-        self.rx_len += n;
-        n
-    }
 
     /// Drain buffered outgoing TLS bytes into `out`. Returns bytes copied.
     pub fn pop_tx(&mut self, out: &mut [u8]) -> usize {
@@ -490,40 +469,24 @@ impl TlsServer {
         n
     }
 
-    /// `true` when undelivered decrypted plaintext is buffered —
-    /// i.e. the next
-    /// [`take_plaintext_chunk`](Self::take_plaintext_chunk) would
-    /// hand back bytes. A peek; does not consume.
+    /// `true` when an undelivered decrypted plaintext record is
+    /// queued. A peek; does not consume.
     pub fn has_plaintext(&self) -> bool {
-        self.pt_len > 0
+        !self.pending_plaintext.is_empty()
     }
 
-    /// Hand back the buffered plaintext window `pt_buf[..pt_len]`
-    /// *in place* and reset `pt_len` to 0, instead of copying it
-    /// into a caller buffer.
+    /// Pop the next decrypted plaintext record as a `Heap` IOBuf.
+    /// Returns `None` when the queue is empty. The byte buffer was
+    /// owned at AEAD-decrypt time (`do_app_data` copied the
+    /// in-place plaintext into a fresh `Vec`), so the NIC RX slot
+    /// it came from has long since returned to the pool — callers
+    /// can hold the IOBuf indefinitely without back-pressuring the
+    /// NIC.
     ///
-    /// The plaintext *bytes* in `pt_buf` are untouched — only
-    /// `pt_len` resets. So a reader holding the returned slice
-    /// keeps seeing valid plaintext until the next
-    /// [`advance`](Self::advance) decrypts a fresh record into
-    /// `pt_buf`. The caller MUST therefore keep this `TlsServer`
-    /// borrowed and un-`advance`d for as long as it reads the
-    /// slice: `TlsStream::recv_chunk` does exactly that — the
-    /// `RecvChunkGuard` it returns carries the `&mut TlsStream`
-    /// borrow, which the borrow checker then forbids `pump_rx`
-    /// (the lone `advance` caller) to run under.
-    ///
-    /// `pt_buf` holds at most one record's plaintext, so the
-    /// returned slice is a single contiguous chunk. Returns an
-    /// empty slice when nothing is buffered; callers gate on
-    /// [`has_plaintext`](Self::has_plaintext).
-    pub fn take_plaintext_chunk(&mut self) -> &mut [u8] {
-        let hi = self.pt_len;
-        // Consume the window now (eager): the caller wraps these
-        // bytes in a borrow-guarded view, and the next
-        // `take_plaintext_chunk` must not re-deliver them.
-        self.pt_len = 0;
-        &mut self.pt_buf[..hi]
+    /// Zero copy: `IOBuf::from(Vec<u8>)` reuses the existing heap
+    /// allocation (`Vec::into_boxed_slice` when `len == capacity`).
+    pub fn pop_plaintext(&mut self) -> Option<IOBuf> {
+        self.pending_plaintext.pop_front().map(IOBuf::from)
     }
 
     /// Emit a TLS 1.3 `close_notify` alert record (RFC 8446 §6.1)
@@ -591,49 +554,205 @@ impl TlsServer {
         record::seal_chain(tk, content_type::APPLICATION_DATA, src_chain, dst).map_err(|e| e.into())
     }
 
-    /// Advance the state machine as far as possible with what's in
-    /// `rx_buf`. Returns the current state.
+    /// Consume one inbound TCP chunk: walk record headers in
+    /// `cipher` (and any partial record carried over from the
+    /// previous chunk), dispatch each complete record to the
+    /// state-appropriate handler, and stash any straddler in
+    /// `rx_partial` for the next call.
     ///
-    /// Loops until no further progress is possible: each state handler
-    /// processes at most one record, but a single caller push may have
-    /// delivered multiple records across state-transition boundaries
-    /// (e.g. ClientChangeCipherSpec + ClientFinished + first
-    /// application_data record all arrive in one TCP segment). Without
-    /// the loop, the handler that transitions WaitClientFinished →
-    /// Established would consume Finished and return, leaving the app
-    /// data record stranded in `rx_buf` until the next caller push —
-    /// which for a short HTTPS request never comes, wedging the conn.
-    pub fn advance(&mut self, config: &TlsServerConfig) -> Result<State, HandshakeError> {
-        // State on entry — so a fresh transition to `Established`
-        // can be counted exactly once (the doctrine handshake-
-        // completed counter), regardless of how many inner steps run.
+    /// `cipher` is borrowed mutably because record-layer AEAD
+    /// `open` decrypts in place — the chunk's ciphertext bytes are
+    /// overwritten with plaintext as records are consumed. The
+    /// caller (`TlsStream::pump_rx`) drops the underlying NIC RX
+    /// chunk immediately on return, so the scrambled bytes are
+    /// never observed again.
+    ///
+    /// Returns the current state on success. Transitions across
+    /// multiple records inside a single chunk are handled by the
+    /// per-record dispatch — e.g. a chunk containing
+    /// `[middlebox-CCS, ClientFinished, first app_data]` advances
+    /// `WaitClientFinished -> Established` between records 2 and 3
+    /// and decrypts record 3 with the application traffic key.
+    pub fn process_chunk(
+        &mut self,
+        cipher: &mut [u8],
+        config: &TlsServerConfig,
+    ) -> Result<State, HandshakeError> {
         let entry_state = self.state;
-        loop {
-            let before_state = self.state;
-            let before_rx = self.rx_len;
-            let before_pt = self.pt_len;
-            let before_tx = self.tx_len;
-            let step_result: Result<(), HandshakeError> = match self.state {
-                State::WaitClientHello => self.do_client_hello(config),
-                State::WaitClientFinished => self.do_client_finished(),
-                State::Established => self.do_app_data(),
-                State::Closed | State::Failed => return Ok(self.state),
-            };
-            if let Err(e) = step_result {
-                crate::trace::error(before_state, &e);
-                crate::diag::record_handshake_failure(before_state, &e);
-                return Err(e);
+        let result = self.process_chunk_inner(cipher, config);
+        if entry_state != State::Established && self.state == State::Established {
+            crate::diag::COUNTERS.handshakes_completed.bump();
+        }
+        match result {
+            Ok(()) => Ok(self.state),
+            Err(e) => {
+                crate::trace::error(self.state, &e);
+                crate::diag::record_handshake_failure(self.state, &e);
+                Err(e)
             }
-            let progressed = self.state != before_state
-                || self.rx_len != before_rx
-                || self.pt_len != before_pt
-                || self.tx_len != before_tx;
-            if !progressed {
-                if entry_state != State::Established && self.state == State::Established {
-                    crate::diag::COUNTERS.handshakes_completed.bump();
-                }
-                return Ok(self.state);
+        }
+    }
+
+    fn process_chunk_inner(
+        &mut self,
+        cipher: &mut [u8],
+        config: &TlsServerConfig,
+    ) -> Result<(), HandshakeError> {
+        // Phase 1: complete any partial record carried from the
+        // previous chunk. If still incomplete after consuming part
+        // of `cipher`, return — wait for more.
+        let cursor = self.complete_partial(cipher, config)?;
+        if self.rx_partial_len > 0 {
+            // Still straddled — `complete_partial` consumed the
+            // whole remaining slice into rx_partial.
+            debug_assert_eq!(cursor, cipher.len());
+            return Ok(());
+        }
+
+        // Phase 2: walk `cipher[cursor..]` record-by-record.
+        let mut off = cursor;
+        while off < cipher.len() {
+            // Closed / Failed terminate early — any trailing bytes
+            // are dropped on the floor (the conn is being torn
+            // down).
+            if matches!(self.state, State::Closed | State::Failed) {
+                return Ok(());
             }
+
+            let remaining = &cipher[off..];
+            if remaining.len() < record::HEADER_LEN {
+                // Header straddles into the next chunk.
+                self.save_to_partial(remaining)?;
+                return Ok(());
+            }
+            let len_field =
+                u16::from_be_bytes([remaining[3], remaining[4]]) as usize;
+            let total = record::HEADER_LEN + len_field;
+            if total > MAX_RECORD_TOTAL {
+                return Err(RecordError::RecordTooLarge.into());
+            }
+            if remaining.len() < total {
+                // Body straddles — stash and wait.
+                self.save_to_partial(remaining)?;
+                return Ok(());
+            }
+            // Complete record — dispatch to the state handler.
+            self.dispatch_record(&mut cipher[off..off + total], config)?;
+            off += total;
+        }
+        Ok(())
+    }
+
+    /// Drain any prior-chunk straddler. Returns the number of
+    /// `cipher` bytes consumed (always 0 when `rx_partial_len ==
+    /// 0`). On exit either `rx_partial_len == 0` (record dispatched)
+    /// or the full remaining `cipher` was absorbed and we're still
+    /// short.
+    fn complete_partial(
+        &mut self,
+        cipher: &mut [u8],
+        config: &TlsServerConfig,
+    ) -> Result<usize, HandshakeError> {
+        if self.rx_partial_len == 0 {
+            return Ok(0);
+        }
+        // SAFETY-by-invariant: rx_partial_len > 0 only after
+        // save_to_partial allocated rx_partial.
+        let partial = self
+            .rx_partial
+            .as_mut()
+            .expect("rx_partial_len > 0 implies allocated");
+        let mut have = self.rx_partial_len as usize;
+        let mut cursor = 0usize;
+
+        // Bring in enough bytes to read the 5-byte record header.
+        if have < record::HEADER_LEN {
+            let need = record::HEADER_LEN - have;
+            let to_copy = need.min(cipher.len());
+            partial[have..have + to_copy].copy_from_slice(&cipher[..to_copy]);
+            have += to_copy;
+            cursor += to_copy;
+            self.rx_partial_len = have as u16;
+            if have < record::HEADER_LEN {
+                return Ok(cursor); // still short of a full header
+            }
+        }
+
+        // Now we can compute the expected total record size.
+        let len_field = u16::from_be_bytes([partial[3], partial[4]]) as usize;
+        let total = record::HEADER_LEN + len_field;
+        if total > MAX_RECORD_TOTAL {
+            return Err(RecordError::RecordTooLarge.into());
+        }
+        let need = total - have;
+        let available = cipher.len() - cursor;
+        let to_copy = need.min(available);
+        partial[have..have + to_copy]
+            .copy_from_slice(&cipher[cursor..cursor + to_copy]);
+        cursor += to_copy;
+        have += to_copy;
+        self.rx_partial_len = have as u16;
+
+        if have < total {
+            // Still short — caller leaves cursor at end of cipher.
+            return Ok(cursor);
+        }
+
+        // Complete: dispatch the record. Take rx_partial out by
+        // value so we can borrow `&mut self` for the dispatcher
+        // without aliasing the box; put it back afterward.
+        self.rx_partial_len = 0;
+        let mut owned = self
+            .rx_partial
+            .take()
+            .expect("present from invariant above");
+        let dispatch_result = self.dispatch_record(&mut owned[..total], config);
+        self.rx_partial = Some(owned);
+        dispatch_result?;
+        Ok(cursor)
+    }
+
+    /// Lazily allocate `rx_partial` (one max-record-sized box) on
+    /// first straddle and stash `bytes` (one partial record's
+    /// worth) inside it. The box is kept warm across `reset()` so
+    /// pooled conns don't re-pay the allocation.
+    ///
+    /// OOM is graceful: returns `HandshakeError::Internal`, which
+    /// the caller surfaces as a conn-fatal error rather than a
+    /// panic — same admission discipline as the per-conn RTX ring.
+    fn save_to_partial(&mut self, bytes: &[u8]) -> Result<(), HandshakeError> {
+        if bytes.len() > MAX_RECORD_TOTAL {
+            // Caller framed a longer-than-max chunk; that's a
+            // protocol error we'd have caught above anyway, but
+            // defend on the path too.
+            return Err(RecordError::RecordTooLarge.into());
+        }
+        if self.rx_partial.is_none() {
+            let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+            if v.try_reserve_exact(MAX_RECORD_TOTAL).is_err() {
+                return Err(HandshakeError::Internal);
+            }
+            v.resize(MAX_RECORD_TOTAL, 0);
+            self.rx_partial = Some(v.into_boxed_slice());
+        }
+        let buf = self.rx_partial.as_mut().expect("just-ensured Some");
+        buf[..bytes.len()].copy_from_slice(bytes);
+        self.rx_partial_len = bytes.len() as u16;
+        Ok(())
+    }
+
+    /// Dispatch one complete record (already framed by the
+    /// orchestrator) to the state-appropriate handler.
+    fn dispatch_record(
+        &mut self,
+        record: &mut [u8],
+        config: &TlsServerConfig,
+    ) -> Result<(), HandshakeError> {
+        match self.state {
+            State::WaitClientHello => self.do_client_hello(record, config),
+            State::WaitClientFinished => self.do_client_finished(record),
+            State::Established => self.do_app_data(record),
+            State::Closed | State::Failed => Ok(()),
         }
     }
 }

@@ -376,16 +376,16 @@ impl Drop for PooledTlsConn {
 }
 
 impl PooledTlsConn {
-    fn push_rx(&mut self, bytes: &[u8]) -> usize {
-        self.inner.tls.push_rx(bytes)
-    }
-
-    fn advance(&mut self) -> Result<(), ()> {
-        // Reborrow split: take an immutable Arc clone of cfg first
-        // so the subsequent `&mut self.inner.tls` borrow doesn't
-        // conflict with reading `self.inner.cfg`.
+    /// Consume one TCP chunk worth of ciphertext, walking complete
+    /// records and dispatching each to the right state handler.
+    /// `cipher` is mutated in place by record-layer AEAD `open`.
+    fn process_chunk(&mut self, cipher: &mut [u8]) -> Result<(), ()> {
         let inner = &mut **self.inner;
-        inner.tls.advance(&inner.cfg).map(|_| ()).map_err(|_| ())
+        inner
+            .tls
+            .process_chunk(cipher, &inner.cfg)
+            .map(|_| ())
+            .map_err(|_| ())
     }
 
     fn pop_tx(&mut self, out: &mut [u8]) -> usize {
@@ -396,8 +396,8 @@ impl PooledTlsConn {
         self.inner.tls.has_plaintext()
     }
 
-    fn take_plaintext_chunk(&mut self) -> &mut [u8] {
-        self.inner.tls.take_plaintext_chunk()
+    fn pop_plaintext(&mut self) -> Option<IOBuf> {
+        self.inner.tls.pop_plaintext()
     }
 
     fn seal_app_data(
@@ -481,17 +481,24 @@ impl TlsStream {
 
     /// One full sans-io RX pump cycle:
     ///   1. Drain any TLS TX bytes left in `tx_buf` from a prior
-    ///      `advance` (preserves NST / alert ordering — they must
-    ///      hit the wire before we block waiting for more peer
-    ///      bytes).
-    ///   2. Read fresh ciphertext from TCP.
-    ///   3. Hand it to the TLS state machine and `advance`.
-    ///   4. Drain anything `advance` produced (handshake reply,
-    ///      app data ACK in future versions, etc.).
+    ///      step (preserves NST / alert ordering — they must hit
+    ///      the wire before we block waiting for more peer bytes).
+    ///   2. Read fresh ciphertext from TCP as one chunk.
+    ///   3. Hand the chunk's bytes to `process_chunk`, which walks
+    ///      complete records and dispatches each to the
+    ///      state-appropriate handler. Decryption is in place — the
+    ///      chunk's ciphertext is overwritten with plaintext as
+    ///      records are consumed; any straddler is copied into the
+    ///      TLS layer's `rx_partial` for next chunk.
+    ///   4. Drop the chunk guard (NIC slot returns to the pool —
+    ///      plaintext is already owned by the per-conn pending
+    ///      queue).
+    ///   5. Drain anything `process_chunk` produced (handshake
+    ///      reply, NewSessionTicket, alert, ...).
     ///
-    /// One call advances the conn by exactly one wire round-trip's
-    /// worth of received bytes. The handshake driver and the
-    /// app-data RX loop both bottom out here — there's no separate
+    /// One call advances the conn by exactly one chunk's worth of
+    /// received bytes. The handshake driver and the app-data RX
+    /// loop both bottom out here — there's no separate
     /// "handshake state machine driver" task because the handshake
     /// runs inside the same `recv_chunk` that consumes app data;
     /// once `has_plaintext()` flips true, the handshake is done.
@@ -500,34 +507,18 @@ impl TlsStream {
     /// error). Caller drops the conn.
     async fn pump_rx(&mut self) -> Result<(), ()> {
         self.drain_tx().await?;
-        // Read ciphertext zero-copy from the TCP transport's own
-        // buffer. The guard borrows `&mut self.tcp` for its life
-        // and is scoped to drop before the trailing `drain_tx`,
-        // which also needs `&mut self.tcp`.
         {
-            let Some(guard) = self.tcp.recv_chunk().await else {
+            let Some(mut guard) = self.tcp.recv_chunk().await else {
                 return Err(());
             };
-            let cipher = guard.data();
-            // `push_rx` may accept fewer bytes than offered when the
-            // TLS-side rx_buf is near full. Loop, advancing between
-            // pushes so the state machine drains parsed records and
-            // frees space for the rest of this chunk. Without this
-            // loop, leftover bytes would be silently dropped — bulk
-            // uploads that span multiple TCP segments would stall
-            // mid-record.
-            let mut off = 0usize;
-            while off < cipher.len() {
-                let n = self.tls.push_rx(&cipher[off..]);
-                self.tls.advance().map_err(|_| ())?;
-                if n == 0 {
-                    // advance() didn't drain anything and the buffer
-                    // can't accept more — the peer sent a record
-                    // bigger than rx_buf can hold. Fatal.
-                    return Err(());
-                }
-                off += n;
-            }
+            // Hand the chunk's bytes straight to the AEAD via
+            // process_chunk — records are decrypted in place inside
+            // the chunk's own storage; no staging copy through any
+            // intermediate TLS RX buffer.
+            self.tls.process_chunk(guard.data_mut())?;
+            // Guard drops here — NIC RX slot returns immediately;
+            // any decrypted plaintext is already owned by the
+            // pending-plaintext queue as Heap IOBufs.
         }
         self.drain_tx().await
     }
@@ -617,11 +608,11 @@ impl TlsStream {
 }
 
 impl http::HttpStream for TlsStream {
-    /// Resolve a `RecvChunkGuard` over a `Borrowed` `IOBuf` viewing
-    /// the TLS layer's `pt_buf` *in place* — eliminating step 7 of
-    /// the TLS RX path table (the `pt_buf` → user-buf copy).
-    /// [`BodyReader::chunk`] drives it for HTTPS request bodies past
-    /// the prebuf (RX item H).
+    /// Resolve a `RecvChunkGuard` over a `Heap` `IOBuf` carrying
+    /// one decrypted plaintext record. The IOBuf was minted at
+    /// AEAD-decrypt time (`do_app_data` → `into_owned`'d off the
+    /// chunk's in-place plaintext), so the underlying NIC RX slot
+    /// has long since returned to the pool.
     ///
     /// Resolves to `Some(guard)` once a record's worth of plaintext
     /// is available, or `None` on peer close / decrypt error / any
@@ -629,26 +620,10 @@ impl http::HttpStream for TlsStream {
     /// the first one or two `pump_rx` iterations drive the
     /// handshake to completion before any guard is returned.
     ///
-    /// **`&mut self` is load-bearing, not incidental.** The
-    /// returned guard carries that borrow for its whole life (it is
-    /// `RecvChunkGuard<'_>` with `'_` tied to `&mut self`), so the
-    /// borrow checker forbids a second `recv_chunk` — hence
-    /// `pump_rx`, hence the AEAD decrypt that overwrites `pt_buf`
-    /// — while the guard is live. That is what makes the
-    /// `Borrowed`-into-`pt_buf` view sound: the bytes it points at
-    /// cannot be rewritten under it. A bare
-    /// `recv_chunk() -> Option<IOBuf>` would be borrow-*unsafe*
-    /// here — `IOBuf` has no lifetime parameter — which is the
-    /// whole reason RX item F chose the guard shape.
-    ///
     /// `guard.data()` reads the plaintext in place (zero copy);
-    /// `guard.into_owned()` lifts it to an owned `Heap` `IOBuf` at
-    /// the cost of one memcpy (the `Borrowed` → `Heap` case — the
-    /// TLS path has no `ExternalOwned` plaintext buffer to hand out
-    /// for free; closing that last copy is the documented Phase-4
-    /// in-place-decrypt follow-up).
+    /// `guard.into_owned()` is a no-op (the IOBuf is already Heap).
     async fn recv_chunk(&mut self) -> Option<waitless::runtime::RecvChunkGuard<'_>> {
-        // Drive the conn until `pt_buf` holds decrypted plaintext.
+        // Drive the conn until a plaintext record is queued.
         // Handshake records produce none, so early iterations just
         // advance the handshake.
         while !self.tls.has_plaintext() {
@@ -656,36 +631,7 @@ impl http::HttpStream for TlsStream {
                 return None;
             }
         }
-
-        // Consume the plaintext window. `take_plaintext_chunk`
-        // resets `pt_len` *now* (eager, not on guard drop): the
-        // guard's `&mut self` borrow means no code can observe
-        // `pt_len` — or re-`pump_rx` `pt_buf` — between here and
-        // the guard's drop, so on-drop bookkeeping would be
-        // indistinguishable. The cross-crate `RecvChunkGuard` has
-        // no `Drop` hook by design (RX item F); eager advance
-        // needs none.
-        let window: &mut [u8] = self.tls.take_plaintext_chunk();
-        let len = window.len() as u32;
-        let base = window.as_mut_ptr();
-
-        // SAFETY: `IOBuf::borrow` requires the region stay valid,
-        // unaliased, and not mutated from elsewhere for the
-        // IOBuf's whole life.
-        //  * `base` points into `pt_buf`, an inline array in the
-        //    `Box<TlsConnImpl>` owned by `self.tls`; `len` bytes
-        //    from it are in-bounds (`take_plaintext_chunk`
-        //    sliced them out of `pt_buf`). `base` is a slice
-        //    pointer, hence non-null and aligned.
-        //  * The returned guard borrows `&mut self` for its whole
-        //    life, so `self` — hence the box, `pt_buf`, and these
-        //    bytes — can neither move nor be re-`pump_rx`'d (the
-        //    sole `pt_buf` writer) while the guard reads them.
-        //  * At most one guard exists at a time — the same
-        //    `&mut self` borrow — so no second view overlaps.
-        //  * The `Borrowed` IOBuf drops with the guard, ending the
-        //    borrow before the next `recv` / `recv_chunk` can run.
-        let iobuf = unsafe { IOBuf::borrow(core::ptr::NonNull::new_unchecked(base), len, 0, len) };
+        let iobuf = self.tls.pop_plaintext()?;
         Some(waitless::runtime::RecvChunkGuard::new(iobuf))
     }
 

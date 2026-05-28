@@ -2,16 +2,19 @@
 //
 // Implements the three non-terminal transitions of the server state
 // machine as `impl super::TlsServer` methods. The crate-root
-// `advance()` loops over these until no further progress is
-// possible:
+// `process_chunk` orchestrator frames one record at a time off the
+// inbound TCP chunk and dispatches to:
 //
 //     WaitClientHello    -> do_client_hello    -> WaitClientFinished
 //     WaitClientFinished -> do_client_finished -> Established
 //     Established        -> do_app_data        -> Established | Closed
 //
-// The handlers are free to consume one record at a time from
-// `rx_buf`, buffer plaintext into `pt_buf`, and emit sealed records
-// into `tx_buf`; they never perform I/O directly.
+// Handlers take a `record: &mut [u8]` of the exact bytes of one
+// complete TLS record (header + body — encrypted or plaintext per
+// state), AEAD-decrypt them in place when needed, push any
+// decrypted application plaintext to `pending_plaintext` as an
+// owned Heap IOBuf, and emit sealed handshake records into
+// `tx_buf`. No direct I/O.
 
 use p256::ecdsa::{Signature as EcdsaSignature, signature::Signer};
 
@@ -195,40 +198,44 @@ pub fn try_resume(
 }
 
 impl TlsServer {
-    /// Handle the WaitClientHello state. Looks for one plaintext record
-    /// of content_type::handshake containing ClientHello. If found,
-    /// emits the full server flight into tx_buf and transitions to
-    /// WaitClientFinished.
+    /// Handle the WaitClientHello state. `record` is one complete
+    /// plaintext TLS record framed by the chunk orchestrator —
+    /// expected to carry a ClientHello (`content_type::handshake`).
+    /// On success the full server flight is emitted into tx_buf and
+    /// state advances to WaitClientFinished.
     pub(super) fn do_client_hello(
         &mut self,
+        record: &mut [u8],
         config: &TlsServerConfig,
     ) -> Result<(), HandshakeError> {
-        // Need at least a record header.
-        if self.rx_len < record::HEADER_LEN {
-            return Ok(());
-        }
         // Begin per-stage cycle profile. `t` threads through each
         // stage boundary via `profile::mark()` until the handshake is
         // complete.
         let t = profile::start();
-        // Peek at the plaintext record. `Truncated` means the record
-        // is fragmented across TCP segments and we need to wait for
-        // more bytes — NOT a fatal error.
-        let (ct, body, consumed) = match record::parse_plaintext(&self.rx_buf[..self.rx_len]) {
-            Ok(tuple) => tuple,
-            Err(RecordError::Truncated) => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
+        // The orchestrator already framed exactly one complete
+        // plaintext record. Parse the header and content.
+        let (ct, body, _consumed) = record::parse_plaintext(record).map_err(|e| {
+            // Truncation here would mean the orchestrator framed a
+            // shorter record than the header advertised — which is
+            // impossible given the framing pass — but map to
+            // RecordError just in case to keep the trace token
+            // stable.
+            HandshakeError::from(if matches!(e, RecordError::Truncated) {
+                RecordError::RecordTooLarge
+            } else {
+                e
+            })
+        })?;
         if ct != content_type::HANDSHAKE {
             return Err(HandshakeError::UnexpectedRecord);
         }
-        // Check handshake type. A partial handshake message inside a
-        // complete record is theoretically possible (fragmentation) but
-        // ClientHello always fits in one record in practice, so treat
-        // a parse failure as Truncated → wait for more data.
+        // Parse handshake type. ClientHello always fits in one
+        // record in practice; a `Truncated` parse here would mean
+        // the inner handshake-length field exceeds the framed
+        // record body — a malformed client.
         let (hs_type, hs_body) = match parse_handshake(body) {
             Ok(tuple) => tuple,
-            Err(ParseError::Truncated) => return Ok(()),
+            Err(ParseError::Truncated) => return Err(HandshakeError::UnsupportedClient),
             Err(e) => return Err(e.into()),
         };
         if hs_type != msg_type::CLIENT_HELLO {
@@ -238,11 +245,10 @@ impl TlsServer {
         // Parse ClientHello for the fields we need (client random,
         // session_id, X25519 share). We copy the few fields we care
         // about into owned locals immediately so we can drop the
-        // borrow into `self.rx_buf` and continue. The resumption
-        // attempt is bracketed inside the same scope so PskOffer's
-        // slices into hs_body are still live; the returned
-        // `ResumeAccept` is owned (no borrows) and stays valid past
-        // the subsequent `drain_rx`.
+        // borrow into `record` and continue. The resumption attempt
+        // is bracketed inside the same scope so PskOffer's slices
+        // into hs_body are still live; the returned `ResumeAccept`
+        // is owned (no borrows) and stays valid past return.
         // Buffer for the selected ALPN protocol name. We pull it out
         // of `ch.alpn_protocol_list` while ch is still in scope (the
         // list borrows into `hs_body` which dies with `body`), then
@@ -301,15 +307,10 @@ impl TlsServer {
             trace::step(b"[tls] ClientHello parsed\n");
         }
 
-        // Update transcript with the full handshake message (body is
-        // still borrowed into self.rx_buf; that's fine — transcript
-        // reads it and releases).
+        // Update transcript with the full handshake message. `body`
+        // borrows from `record` (the chunk slice); transcript copies
+        // through SHA-256 update, the borrow ends here.
         self.transcript.update(body);
-
-        // Consume the ClientHello record from rx_buf. After this the
-        // `body`/`hs_body` borrows are invalid; we've already extracted
-        // everything we need into owned locals.
-        self.drain_rx(consumed);
         let t = profile::mark(profile::Stage::Parse, t);
 
         // ── Generate and emit ServerHello ──────────────────────────
@@ -562,54 +563,34 @@ impl TlsServer {
         Ok(())
     }
 
-    /// Handle the WaitClientFinished state. Parses one incoming
-    /// encrypted record under the client handshake traffic key and
-    /// expects it to contain a Finished message.
-    pub(super) fn do_client_finished(&mut self) -> Result<(), HandshakeError> {
-        trace::do_client_finished_entry(
-            self.rx_len,
-            if self.rx_len >= 1 {
-                Some(self.rx_buf[0])
-            } else {
-                None
-            },
-        );
-        // Skip any middlebox-compat ChangeCipherSpec the client sends
-        // (plaintext record with content_type 20, 1-byte body = 0x01).
-        loop {
-            if self.rx_len < record::HEADER_LEN {
-                return Ok(());
-            }
-            if self.rx_buf[0] != content_type::CHANGE_CIPHER_SPEC {
-                break;
-            }
-            // Parse the plaintext CCS record and drop it. Treat
-            // Truncated as wait-for-more-data.
-            let (_ct, _body, consumed) = match record::parse_plaintext(&self.rx_buf[..self.rx_len])
-            {
-                Ok(tuple) => tuple,
-                Err(RecordError::Truncated) => return Ok(()),
-                Err(e) => return Err(e.into()),
-            };
-            self.drain_rx(consumed);
+    /// Handle the WaitClientFinished state. `record` is one
+    /// complete TLS record framed by the chunk orchestrator —
+    /// either a middlebox-compat ChangeCipherSpec (which we skip)
+    /// or the client's encrypted Finished message.
+    pub(super) fn do_client_finished(
+        &mut self,
+        record: &mut [u8],
+    ) -> Result<(), HandshakeError> {
+        trace::do_client_finished_entry(record.len(), record.first().copied());
+
+        // Middlebox-compat: a plaintext CCS (0x14) record can land
+        // here per RFC 8446 §D.4. Just drop it — state stays
+        // WaitClientFinished and the next record will be the real
+        // encrypted Finished.
+        if record[0] == content_type::CHANGE_CIPHER_SPEC {
+            // Validate the framing is at least syntactically a
+            // record (5-byte header + body).
+            let _ = record::parse_plaintext(record)?;
             trace::step(b"[tls]   skipped ChangeCipherSpec\n");
+            return Ok(());
         }
 
-        // Need a full encrypted record.
-        if self.rx_len < record::HEADER_LEN {
-            return Ok(());
-        }
-        let record_len_field = u16::from_be_bytes([self.rx_buf[3], self.rx_buf[4]]) as usize;
-        let total = record::HEADER_LEN + record_len_field;
-        if self.rx_len < total {
-            trace::waiting_for_bytes(self.rx_len, total);
-            return Ok(());
-        }
-        trace::record_header(self.rx_buf[0], total);
+        let total = record.len();
+        trace::record_header(record[0], total);
 
         // Decrypt in place under the client handshake traffic key.
         let tk = self.client_hs_tk.as_mut().ok_or(HandshakeError::Internal)?;
-        let (inner_type, pt, consumed) = record_open(tk, &mut self.rx_buf[..total])?;
+        let (inner_type, pt, _consumed) = record_open(tk, record)?;
         trace::decrypted_record(inner_type, pt.len());
         if inner_type == content_type::ALERT && pt.len() >= 2 {
             trace::alert_received(pt[0], pt[1]);
@@ -618,7 +599,9 @@ impl TlsServer {
             return Err(HandshakeError::UnexpectedRecord);
         }
         // Parse the handshake message out of the decrypted body.
-        // `pt` borrows from self.rx_buf; copy it out so we can drain.
+        // `pt` borrows from `record`; copy it out so the transcript
+        // update can take a separate `&mut self.transcript` borrow
+        // without aliasing.
         let mut msg_copy = [0u8; 256];
         if pt.len() > msg_copy.len() {
             return Err(HandshakeError::Internal);
@@ -650,8 +633,6 @@ impl TlsServer {
 
         // Now we can update the transcript with Client Finished.
         self.transcript.update(&msg_copy[..pt_len]);
-        // Consume the record.
-        self.drain_rx(consumed);
 
         // Issue exactly one resumption ticket. The handshake state
         // machine has already advanced `self.schedule.secret` to
@@ -748,53 +729,49 @@ impl TlsServer {
         Ok(())
     }
 
-    /// Once established, decrypt incoming application-data records
-    /// and buffer the plaintext.
-    pub(super) fn do_app_data(&mut self) -> Result<(), HandshakeError> {
-        loop {
-            if self.rx_len < record::HEADER_LEN {
-                return Ok(());
-            }
-            let record_len_field = u16::from_be_bytes([self.rx_buf[3], self.rx_buf[4]]) as usize;
-            let total = record::HEADER_LEN + record_len_field;
-            if self.rx_len < total {
-                return Ok(());
-            }
-            let tk = self.client_ap_tk.as_mut().ok_or(HandshakeError::Internal)?;
-            let (inner_type, pt, consumed) = record_open(tk, &mut self.rx_buf[..total])?;
-            match inner_type {
-                content_type::APPLICATION_DATA => {
-                    // Append to plaintext buffer.
-                    let pt_len = pt.len();
-                    if self.pt_len + pt_len > self.pt_buf.len() {
-                        // Plaintext ring is full — pause until the
-                        // app drains it. Don't consume the record.
-                        return Ok(());
-                    }
-                    self.pt_buf[self.pt_len..self.pt_len + pt_len].copy_from_slice(pt);
-                    self.pt_len += pt_len;
-                    // Drop borrow and consume record.
-                    let _ = pt;
-                    self.drain_rx(consumed);
-                }
-                content_type::ALERT => {
-                    // Peer close_notify or fatal alert. Either way we
-                    // move to Closed.
-                    let _ = pt;
-                    self.drain_rx(consumed);
-                    self.state = State::Closed;
+    /// Once established, decrypt one incoming application_data
+    /// record and enqueue its plaintext for the app. The chunk
+    /// orchestrator frames the record; this handler only AEAD-opens
+    /// it and pushes a fresh Heap `IOBuf` carrying the plaintext to
+    /// `pending_plaintext`.
+    pub(super) fn do_app_data(&mut self, record: &mut [u8]) -> Result<(), HandshakeError> {
+        let tk = self.client_ap_tk.as_mut().ok_or(HandshakeError::Internal)?;
+        let (inner_type, pt, _consumed) = record_open(tk, record)?;
+        match inner_type {
+            content_type::APPLICATION_DATA => {
+                // Lift the plaintext slice (borrow into `record`) to
+                // an owned Heap IOBuf so the chunk's storage can be
+                // released back to the NIC pool the moment
+                // process_chunk returns. Empty records are legal
+                // (RFC 8446 §5.4 anti-traffic-analysis padding may
+                // produce zero-length content) but uninteresting to
+                // surface as a "chunk" — the consumer's reader would
+                // see them as a false zero-byte EOF. Drop silently.
+                if pt.is_empty() {
                     return Ok(());
                 }
-                _ => {
-                    return Err(HandshakeError::UnexpectedRecord);
+                let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                if v.try_reserve_exact(pt.len()).is_err() {
+                    return Err(HandshakeError::Internal);
                 }
+                v.extend_from_slice(pt);
+                // Drop the pt borrow into `record` before mutating
+                // self below (push_back may grow the deque).
+                let _ = pt;
+                if self.pending_plaintext.try_reserve(1).is_err() {
+                    return Err(HandshakeError::Internal);
+                }
+                self.pending_plaintext.push_back(v);
+                Ok(())
             }
+            content_type::ALERT => {
+                // Peer close_notify or fatal alert. Either way we
+                // move to Closed.
+                let _ = pt;
+                self.state = State::Closed;
+                Ok(())
+            }
+            _ => Err(HandshakeError::UnexpectedRecord),
         }
-    }
-
-    fn drain_rx(&mut self, n: usize) {
-        debug_assert!(n <= self.rx_len);
-        self.rx_buf.copy_within(n..self.rx_len, 0);
-        self.rx_len -= n;
     }
 }
