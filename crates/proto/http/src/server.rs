@@ -139,7 +139,6 @@ where
     // would falsely trip `header_buffer_overflow` on well-formed
     // pipelined traffic.
     let mut spill: Option<IOBuf> = None;
-    let mut spill_cursor: usize = 0;
     loop {
         if buf_len == BUF_SIZE {
             // Parse buffer full and no complete request in it —
@@ -157,21 +156,14 @@ where
         // recv). See docs/high-concurrency-perf.md "Anatomy of CPU
         // collapse" + H2.
         let space = BUF_SIZE - buf_len;
-        let got = if spill.is_some() {
-            let n;
-            let drained;
-            {
-                let stash = spill.as_ref().unwrap();
-                let data = stash.data();
-                n = (data.len() - spill_cursor).min(space);
-                buf[buf_len..buf_len + n]
-                    .copy_from_slice(&data[spill_cursor..spill_cursor + n]);
-                drained = spill_cursor + n == data.len();
-            }
-            spill_cursor += n;
-            if drained {
+        let got = if let Some(stash) = spill.as_mut() {
+            // `IOBuf::consume(n)` advances the visible window past the
+            // bytes we just copied — no separate cursor needed.
+            let n = stash.data().len().min(space);
+            buf[buf_len..buf_len + n].copy_from_slice(&stash.data()[..n]);
+            stash.consume(n).expect("n <= data().len()");
+            if stash.data().is_empty() {
                 spill = None;
-                spill_cursor = 0;
             }
             n
         } else {
@@ -185,13 +177,14 @@ where
                     } else {
                         // Chunk overflows current HEAD-buffer space.
                         // Copy what fits, then detach the chunk from
-                        // the stream so we can release the recv
-                        // borrow and resume handler work; the
-                        // remainder feeds back through `spill` over
-                        // subsequent iterations.
+                        // the stream and `consume` the bytes we just
+                        // shipped so the stash holds only the tail —
+                        // subsequent iterations drain it directly via
+                        // its own visible window.
                         buf[buf_len..buf_len + space].copy_from_slice(&data[..space]);
-                        spill = Some(guard.into_owned());
-                        spill_cursor = space;
+                        let mut owned = guard.into_owned();
+                        owned.consume(space).expect("space <= data().len()");
+                        spill = Some(owned);
                         space
                     }
                 }
