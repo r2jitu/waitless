@@ -909,6 +909,59 @@ pub(crate) fn free_connection(core: u32, slot: usize) {
         let key = tcp_hash_key(c.remote_ip, c.remote_port, c.local_port);
         tcp_hash_remove(core, key);
     }
+    // Unlink from the intrusive armed-timer list BEFORE the reset.
+    //
+    // The "lazy unlink" comment that used to live here was a
+    // correctness bug: it assumed the slot's own `tick_in_list` /
+    // `tick_next` reset (via `*self = TcpConnection::new()`) was
+    // enough to drop it from the list. It's not — other slots
+    // still hold this index in their `tick_next` fields, AND
+    // `TICK_HEAD` may still point at it. Once the slot is
+    // re-allocated and a new conn `arm_for_tick`s it back to the
+    // head, the list reaches the slot via TWO paths: the fresh
+    // head push and the stale predecessor's `tick_next`. The next
+    // `on_tcp_tick` walks the freshly-pushed head, follows
+    // `tick_next` (just set by the push), and silently skips
+    // every armed slot that lived past the stale predecessor in
+    // the old list — those slots' `TimeWait` / FIN-retx
+    // deadlines never expire. Symptom on HVF burst tests: HTTPS
+    // connections pile up in `TimeWait`, `live_conns` grows
+    // unbounded, and the server wedges after a few back-to-back
+    // conns. Bisected to commit 9af0c19 (the original armed-list
+    // introduction). Walk the per-core armed list once (O(armed),
+    // typically tiny — most slots aren't armed at any moment) to
+    // splice this slot out before the reset zeroes the bookkeeping.
+    if c.tick_in_list {
+        let slot_u16 = slot as u16;
+        let head_cell = TICK_HEAD.at(core);
+        let head = head_cell.get();
+        if head == slot_u16 {
+            head_cell.set(c.tick_next);
+        } else if head != NULL_SLOT {
+            // SAFETY: per-core ownership of every slot reachable
+            // from the list (their `tick_in_list` was set by
+            // `register_armed_slot` on this core).
+            let mut prev_idx = head;
+            loop {
+                let prev_next = unsafe { (*conn_ptr(core, prev_idx as usize)).tick_next };
+                if prev_next == slot_u16 {
+                    unsafe {
+                        (*conn_ptr(core, prev_idx as usize)).tick_next = c.tick_next;
+                    }
+                    break;
+                }
+                if prev_next == NULL_SLOT {
+                    // Defensive: not found in the list. Possible if
+                    // the walker is mid-rebuild and hasn't re-published
+                    // the new head yet. Leaving `tick_in_list = true`
+                    // here is fine — `reset_preserving` below zeroes
+                    // it, so the next `arm_for_tick` push works.
+                    break;
+                }
+                prev_idx = prev_next;
+            }
+        }
+    }
     // Fire any parked `TcpRecv` / `TcpSendChain` waker before the slot
     // is reset — the app handler needs to observe teardown (recv
     // returns 0, send resolves `Err`) rather than sleeping on a stale
@@ -923,13 +976,6 @@ pub(crate) fn free_connection(core: u32, slot: usize) {
     // the slot has been reused on its next hook call.
     let next_gen = c.generation.wrapping_add(1);
     c.reset_preserving(next_gen);
-    // Don't manually unlink from the armed-timer list here — the
-    // `reset_preserving` above zeroed `tick_in_list` and all
-    // deadlines, so the next `on_tcp_tick` walk drops this slot
-    // from the list naturally (lazy unlink). `tick_next` is junk
-    // after the reset but harmless: `on_tcp_tick` reads it only
-    // for slots `tick_in_list == true`, and the next
-    // `arm_for_tick` overwrites it before flipping the flag.
     // Return the slot to the pool's free list. O(1) push; the next
     // `alloc_connection` call picks it up in O(1) too.
     POOLS.at(core).free_slot(slot as u16);
