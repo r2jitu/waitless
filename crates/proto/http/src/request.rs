@@ -10,7 +10,7 @@
 /// HTTP request method. `Unknown` covers anything outside the
 /// listed verbs — the parser stores it without erroring; apps that
 /// care should reject it themselves.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(i32)]
 pub enum Method {
     Get = 0,
@@ -22,10 +22,10 @@ pub enum Method {
 }
 
 pub struct Header {
-    name: [u8; 64],
-    name_len: usize,
-    value: [u8; 256],
-    value_len: usize,
+    pub(crate) name: [u8; 64],
+    pub(crate) name_len: usize,
+    pub(crate) value: [u8; 256],
+    pub(crate) value_len: usize,
 }
 
 impl Header {
@@ -49,10 +49,10 @@ impl Header {
 
 pub struct Request {
     pub method: Method,
-    path: [u8; 256],
-    path_len: usize,
-    headers: [Header; 16],
-    header_count: usize,
+    pub(crate) path: [u8; 256],
+    pub(crate) path_len: usize,
+    pub(crate) headers: [Header; 16],
+    pub(crate) header_count: usize,
     /// Content-Length from the request headers, or 0 if absent.
     /// Authoritative count of body bytes that follow the headers
     /// on the wire — the `BodyReader` handed to the handler will
@@ -157,7 +157,7 @@ impl Request {
         self.header_count += 1;
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.method = Method::Unknown;
         self.path_len = 0;
         self.header_count = 0;
@@ -378,7 +378,7 @@ fn find_header_end_from(data: &[u8], start: usize) -> Option<usize> {
         .map(|p| p + start)
 }
 
-fn parse_usize(data: &[u8]) -> usize {
+pub(crate) fn parse_usize(data: &[u8]) -> usize {
     let mut n: usize = 0;
     for &b in data {
         if b.is_ascii_digit() {
@@ -398,7 +398,7 @@ fn parse_usize(data: &[u8]) -> usize {
 /// return `true` while `gzip` or `identity` return `false`. The
 /// caller has already matched the header *name* case-
 /// insensitively via `Request::header`.
-fn transfer_encoding_is_chunked(value: &[u8]) -> bool {
+pub(crate) fn transfer_encoding_is_chunked(value: &[u8]) -> bool {
     value
         .split(|&b| b == b',')
         .any(|coding| coding.trim_ascii().eq_ignore_ascii_case(b"chunked"))

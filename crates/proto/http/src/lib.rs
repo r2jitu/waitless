@@ -23,6 +23,7 @@ mod request;
 mod response;
 mod server;
 mod stream;
+mod streaming;
 
 pub use body::{BodyChunkGuard, BodyReader};
 pub use request::{Header, Method, ParserState, Request};

@@ -16,6 +16,7 @@ rust_library(
         "src/response.rs",
         "src/server.rs",
         "src/stream.rs",
+        "src/streaming.rs",
     ],
     crate_name = "http",
     deps = [
