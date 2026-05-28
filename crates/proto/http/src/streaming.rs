@@ -78,7 +78,21 @@ pub(crate) enum FeedResult {
     /// chunk; bytes past that point (if any) are body / next
     /// pipelined request.
     Done { consumed: usize },
+    /// HEAD exceeded the per-request byte cap before reaching the
+    /// `\r\n\r\n` terminator. The caller should drop the connection
+    /// — without this guard a malicious peer streaming bytes that
+    /// never contain a state-terminating delimiter (SP after method,
+    /// `:` after header name, `\r` after value, blank line after
+    /// headers) holds the parser open forever. Mirrors the old
+    /// buffered parser's BUF_SIZE-full → drop-conn behaviour.
+    Overflow,
 }
+
+/// Per-request cap on HEAD bytes the parser will accept before
+/// signalling [`FeedResult::Overflow`]. Matches the legacy
+/// `serve_conn` `BUF_SIZE` so the maximum-acceptable HEAD is
+/// preserved across the parser swap.
+pub(crate) const MAX_HEAD_BYTES: u32 = 16 * 1024;
 
 /// Streaming HTTP/1.1 request-HEAD parser. One per connection;
 /// reset between pipelined requests via [`reset`](Self::reset).
@@ -92,6 +106,13 @@ pub(crate) struct StreamingRequestParser {
     /// `state` is `HeaderName`, `HeaderColon`, `HeaderValue`, or
     /// `AfterHeaderValueCR`; `None` otherwise.
     current_header: Option<u8>,
+    /// HEAD bytes accepted across all `feed()` calls for this
+    /// request — i.e. cumulative across multi-chunk HEADs.
+    /// Compared against [`MAX_HEAD_BYTES`] at every byte; reset
+    /// by [`reset`](Self::reset) for the next pipelined request.
+    /// `saturating_add` against `u32` capacity, so even an
+    /// adversarial 4 GiB feed stays well-defined.
+    prior_head_bytes: u32,
 }
 
 impl Default for StreamingRequestParser {
@@ -107,6 +128,7 @@ impl StreamingRequestParser {
             method_buf: [0; 8],
             method_buf_len: 0,
             current_header: None,
+            prior_head_bytes: 0,
         }
     }
 
@@ -116,12 +138,14 @@ impl StreamingRequestParser {
         self.state = State::Method;
         self.method_buf_len = 0;
         self.current_header = None;
+        self.prior_head_bytes = 0;
     }
 
     /// Feed the next chunk of bytes. Either returns `NeedMore` (the
-    /// whole chunk was consumed) or `Done { consumed }` (the HEAD
-    /// terminated `consumed` bytes into the chunk; remaining bytes
-    /// belong to body / next pipelined request).
+    /// whole chunk was consumed), `Done { consumed }` (the HEAD
+    /// terminated `consumed` bytes into the chunk — remaining bytes
+    /// belong to body / next pipelined request), or `Overflow` (the
+    /// HEAD exceeded [`MAX_HEAD_BYTES`] — caller drops the conn).
     ///
     /// Must be called with a freshly `clear`'d `Request` on the
     /// first feed of a new request; subsequent feeds within the
@@ -143,6 +167,18 @@ impl StreamingRequestParser {
         };
         let mut i = 0;
         while i < bytes.len() {
+            // Per-byte HEAD-bytes cap — refuses a peer that streams
+            // bytes lacking the state-terminating delimiters (DoS
+            // foothold the old buffered parser's BUF_SIZE-full check
+            // closed structurally; the streaming parser has no
+            // backing buffer, so the cap is explicit here).
+            if self
+                .prior_head_bytes
+                .saturating_add(i as u32)
+                >= MAX_HEAD_BYTES
+            {
+                return FeedResult::Overflow;
+            }
             let b = bytes[i];
             match self.state {
                 State::Method => {
@@ -305,6 +341,10 @@ impl StreamingRequestParser {
                 }
             }
         }
+        // Whole chunk consumed without reaching the HEAD terminator
+        // — record the cumulative byte count so the next feed's cap
+        // check sees the right total.
+        self.prior_head_bytes = self.prior_head_bytes.saturating_add(i as u32);
         FeedResult::NeedMore
     }
 
@@ -354,7 +394,7 @@ mod tests {
     fn done_consumed(r: &FeedResult) -> Option<usize> {
         match r {
             FeedResult::Done { consumed } => Some(*consumed),
-            FeedResult::NeedMore => None,
+            FeedResult::NeedMore | FeedResult::Overflow => None,
         }
     }
 
@@ -418,6 +458,72 @@ mod tests {
         assert!(!req.reject, "reject is only set at end-of-headers");
     }
 
+    /// HEAD whose total bytes exceed `MAX_HEAD_BYTES` (16 KiB) is
+    /// rejected with `Overflow` before the terminator arrives.
+    #[test]
+    fn oversize_head_returns_overflow() {
+        let mut raw: Vec<u8> = b"GET / HTTP/1.1\r\n".to_vec();
+        while raw.len() < (super::MAX_HEAD_BYTES as usize) + 1024 {
+            raw.extend_from_slice(b"X-Pad: padpadpadpadpadpadpadpadpad\r\n");
+        }
+        raw.extend_from_slice(b"\r\n");
+        let mut req = Request::new();
+        let mut p = StreamingRequestParser::new();
+        assert!(matches!(p.feed(&mut req, &raw), FeedResult::Overflow));
+    }
+
+    /// DoS shape: peer streams bytes that never contain SP after
+    /// the method — without a cap the `Method` state loop accepts
+    /// forever. With the cap, the parser bails after
+    /// `MAX_HEAD_BYTES`. Defends `serve_conn` against a malicious
+    /// peer that holds the connection open indefinitely without
+    /// ever producing a parseable HEAD.
+    #[test]
+    fn dos_no_sp_returns_overflow() {
+        let evil = alloc::vec![b'a'; (super::MAX_HEAD_BYTES as usize) + 1];
+        let mut req = Request::new();
+        let mut p = StreamingRequestParser::new();
+        assert!(matches!(p.feed(&mut req, &evil), FeedResult::Overflow));
+    }
+
+    /// Multi-chunk version: cap is cumulative across `feed()` calls
+    /// for the same request, so an adversarial stream split across
+    /// many tiny chunks still trips Overflow at the right total.
+    /// Four 4 KiB chunks consume exactly `MAX_HEAD_BYTES`; the
+    /// fifth chunk's first byte is past the cap.
+    #[test]
+    fn dos_no_sp_returns_overflow_across_chunks() {
+        let mut req = Request::new();
+        let mut p = StreamingRequestParser::new();
+        let chunk = alloc::vec![b'a'; 4096];
+        for _ in 0..4 {
+            assert!(matches!(p.feed(&mut req, &chunk), FeedResult::NeedMore));
+        }
+        // Fifth chunk: prior == cap, so iter 0 trips immediately.
+        assert!(matches!(p.feed(&mut req, &chunk), FeedResult::Overflow));
+    }
+
+    /// HEAD just under the cap parses normally — boundary case.
+    #[test]
+    fn under_cap_succeeds() {
+        // X-Pad header is 33 bytes (\"X-Pad: \" + 24 chars + \r\n).
+        // Leave a comfortable margin so the loop doesn't overshoot.
+        let mut raw: Vec<u8> = b"GET / HTTP/1.1\r\n".to_vec();
+        while raw.len() + 200 < (super::MAX_HEAD_BYTES as usize) {
+            raw.extend_from_slice(b"X-Pad: padpadpadpadpadpadpadpad\r\n");
+        }
+        raw.extend_from_slice(b"\r\n");
+        assert!(
+            raw.len() < super::MAX_HEAD_BYTES as usize,
+            "test setup: HEAD must be under cap (len={} cap={})",
+            raw.len(),
+            super::MAX_HEAD_BYTES,
+        );
+        let (req, r) = feed_whole(&raw);
+        assert!(done_consumed(&r).is_some());
+        assert_eq!(req.method, Method::Get);
+    }
+
     #[test]
     fn unknown_method_does_not_error() {
         let raw = b"PATCH /x HTTP/1.1\r\n\r\n";
@@ -464,10 +570,14 @@ mod tests {
             let mut p = StreamingRequestParser::new();
             let total_consumed = match p.feed(&mut req, a) {
                 FeedResult::Done { consumed } => consumed,
+                FeedResult::Overflow => panic!("split={split}: unexpected Overflow on first feed"),
                 FeedResult::NeedMore => match p.feed(&mut req, b) {
                     FeedResult::Done { consumed } => a.len() + consumed,
+                    FeedResult::Overflow => {
+                        panic!("split={split}: unexpected Overflow on second feed")
+                    }
                     FeedResult::NeedMore => {
-                        panic!("split={split}: parser still wants more after both halves");
+                        panic!("split={split}: parser still wants more after both halves")
                     }
                 },
             };

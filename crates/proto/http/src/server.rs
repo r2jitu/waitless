@@ -122,6 +122,10 @@ where
                     streaming::FeedResult::NeedMore => {
                         drop(buf);
                     }
+                    streaming::FeedResult::Overflow => {
+                        crate::diag::COUNTERS.header_buffer_overflow.bump();
+                        return;
+                    }
                 }
             } else {
                 let chunk_fut = stream.recv_chunk();
@@ -135,6 +139,10 @@ where
                         }
                         streaming::FeedResult::NeedMore => {
                             drop(guard);
+                        }
+                        streaming::FeedResult::Overflow => {
+                            crate::diag::COUNTERS.header_buffer_overflow.bump();
+                            return;
                         }
                     },
                     Some(None) => {

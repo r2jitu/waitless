@@ -34,11 +34,12 @@ pub struct Counters {
     /// `400 Bad Request` + `Connection: close`. Read `LAST_REJECT`
     /// for the offending path; subset of `requests_parsed`.
     pub requests_rejected: Counter,
-    /// Reserved for a future strictness pass that rejects oversized
-    /// request HEADs. The streaming parser today silently truncates
-    /// oversize fields (path / header name / header value) rather
-    /// than rejecting; this counter stays at 0 in production until
-    /// a strictness pass wires it up.
+    /// The streaming parser's per-request HEAD-bytes cap
+    /// (`streaming::MAX_HEAD_BYTES`, 16 KiB) fired before the
+    /// `\r\n\r\n` terminator arrived. Either the peer sent a HEAD
+    /// genuinely larger than the cap, or — the DoS shape — the peer
+    /// streamed bytes that never contained a state-terminating
+    /// delimiter. The connection is dropped.
     pub header_buffer_overflow: Counter,
     /// The handler left body bytes unread and draining them off
     /// the transport stream failed (an error mid-body). The
