@@ -646,6 +646,22 @@ before fragmentation. That's exactly the 18 K end of the
 "cliffs at 18–24 K" band; the per-conn slope alone explains the
 cliff position.
 
+**Post-`rtx_queue` retirement, the measured slope dropped to 88 KB
+at 18 K conns** (A/B against branch baseline 909f570 on 2026-05-28,
+both at 18 K live conns, same throughput; full table further down
+in "Recommended ceiling-movers" #2). The 67 KB delta vs the
+measured baseline matches the retired `rtx_buf` (64 KB) within
+talc per-allocation noise. The H2 estimate above (166 KB) ran
+~11 KB hot of the measured baseline (155 KB) — probably the lazy
+`record_scratch` line didn't fire on every conn within the bench
+window; the relative drop is the load-bearing number.
+
+Linear projection on the measured slope: 3 GB / 88 KB ≈ **34 K**
+conns vs the 18 K observed on the old slope. Fragmentation will
+take some of that back, but the bench above ran the new slope to
+exactly the old cliff (18 K conns) and finished with 1.62 GB heap
+and 2.83 GB available — nowhere near OOM.
+
 ### H3 — Buffers preserved across conn close: **CONFIRMED with twist**
 
 `free_connection` → `reset_preserving` hands `rx_ring` (16 KB) and
@@ -826,7 +842,7 @@ first item dwarfs everything below it.
    HEAD terminator. **Saved 16 KB/conn → cliff moved from ~18 K to
    ~25 K on GCE shape.**
 
-2. **`TcpConnection` rtx_buf → IOBuf-backed `rtx_queue`. (DONE)**
+2. **`TcpConnection` rtx_buf → IOBuf-backed `rtx_queue`. (DONE — measured)**
    The fixed 64 KiB `Box<[u8; RTX_BUF_BYTES]>` is gone; the per-conn
    retransmit-coverage path is now a `VecDeque<RtxEntry>` of owned
    IOBufs allocated per send and freed per ACK. Peak per-conn
@@ -835,8 +851,27 @@ first item dwarfs everything below it.
    64 KiB reservation. The SG-TX follow-up will swap the
    `into_owned()` at insertion for refcount-shared storage so the
    same IOBuf is alive in the queue while the wire-DMA is in flight,
-   eliminating the staging memcpy. **Saves ~64 KB/conn on every
-   slot that ever sent data; moves the cliff well past 24 K.**
+   eliminating the staging memcpy.
+
+   **Measured (2026-05-28, GCE c3-highcpu-8, `https://…/health`
+   wrk -c 18000 -d 30s, peak `/obs` poll):**
+
+   | branch                                  | peak heap | live_conns | bytes/conn | req/s   |
+   |-----------------------------------------|----------:|-----------:|-----------:|--------:|
+   | baseline (909f570, pre-`rtx_queue`)     | 2.79 GB   |     18 001 | **155 KB** | 319 K   |
+   | `tcp/rtx-iobuf-queue` tip               | 1.62 GB   |     18 001 | **88 KB**  | 320 K   |
+
+   **Saves 63 KB/conn (matches the ~64 KB structural prediction —
+   the residual KB is talc per-block header overhead). Throughput
+   flat. Heap savings at 18 K conns: 1.17 GB.** Linear projection:
+   3 GB / 88 KB ≈ 34 K-conn cliff vs the 18 K cliff at 155 KB/conn —
+   the rest of the items below now bound the next cliff move.
+
+   Caveat: `heap_total_allocation_count` jumped 88× (110 K → 9.8 M
+   over 30 s) — the per-send `Vec<u8>` staging in `rtx_retain` is
+   the new alloc-pressure source. Throughput stays flat because
+   talc handles the small `Vec` well; the SG-TX follow-up retires
+   the staging vec anyway.
 
 3. **`TlsStream.cipher_buf`: 8 KB inline → REMOVED.** (DONE)
    `pump_rx` now pulls ciphertext via `TcpStream::recv_chunk` and
