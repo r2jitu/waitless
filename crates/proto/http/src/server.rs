@@ -243,3 +243,173 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod serve_conn_tests {
+    use super::serve_conn;
+    use crate::body::BodyReader;
+    use crate::request::{Method, Request};
+    use crate::response::Response;
+    use crate::stream::HttpStream;
+    use alloc::collections::VecDeque;
+    use alloc::rc::Rc;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use iobuf::{IOBuf, IOBufChain};
+    use waitless::runtime::RecvChunkGuard;
+
+    /// Pre-canned-chunk transport. `recv_chunk` pops entries from
+    /// `chunks` (`Some(bytes)` -> wrap in a guard, `None` -> signal
+    /// EOF so `serve_conn` returns via the `peer_eof` arm); `send`
+    /// appends every part to `sent`. Both fields are shared via
+    /// `Rc<RefCell<_>>` so the test can read `sent` back after the
+    /// future has consumed the stream by value.
+    struct MockStream {
+        chunks: Rc<RefCell<VecDeque<Option<Vec<u8>>>>>,
+        sent: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl HttpStream for MockStream {
+        async fn recv(&mut self, _: &mut [u8]) -> usize {
+            unreachable!("serve_conn HEAD path uses recv_chunk");
+        }
+        async fn recv_chunk(&mut self) -> Option<RecvChunkGuard<'_>> {
+            match self.chunks.borrow_mut().pop_front() {
+                Some(Some(bytes)) => Some(RecvChunkGuard::new(IOBuf::from(bytes))),
+                Some(None) | None => None,
+            }
+        }
+        async fn send(&mut self, chain: &mut IOBufChain) -> Result<(), ()> {
+            let mut sent = self.sent.borrow_mut();
+            while let Some(part) = chain.pop_front() {
+                sent.extend_from_slice(part.data());
+            }
+            Ok(())
+        }
+    }
+
+    /// Single-poll driver. Every await this test exercises resolves
+    /// Ready on first poll: `MockStream` methods are inline-Ready
+    /// `async fn`s, and `select(fut, sleep)` inside `timeout_us`
+    /// short-circuits to Ready before the sleep's waker dance fires.
+    fn block_on<F: Future>(mut fut: F) -> F::Output {
+        fn noop(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VTABLE)
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        // SAFETY: `fut` is a local that is not moved again before
+        // the poll below.
+        let fut = unsafe { Pin::new_unchecked(&mut fut) };
+        match fut.poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("future pended unexpectedly"),
+        }
+    }
+
+    // Per-test recording of (method, path, body_bytes) for every
+    // request the handler sees. thread_local! because the handler
+    // must be a plain `async fn` (a state-capturing closure fights
+    // the compiler over the HRTB
+    // `for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, S>)`).
+    // Each test resets the cell before driving serve_conn.
+    type ObservedReq = (Method, Vec<u8>, Vec<u8>);
+
+    thread_local! {
+        static OBSERVED: RefCell<Vec<ObservedReq>> = const { RefCell::new(Vec::new()) };
+    }
+
+    async fn observe_handler(req: &Request, body: &mut BodyReader<'_, MockStream>) -> Response {
+        let mut body_bytes = Vec::new();
+        while let Some(guard) = body.chunk().await {
+            body_bytes.extend_from_slice(guard.data());
+        }
+        OBSERVED.with(|o| {
+            o.borrow_mut()
+                .push((req.method, req.path().to_vec(), body_bytes))
+        });
+        Response::ok(b"text/plain".as_slice(), b"OK".as_slice())
+    }
+
+    fn reset_observed() {
+        OBSERVED.with(|o| o.borrow_mut().clear());
+    }
+
+    fn drive(chunks_vec: Vec<Option<Vec<u8>>>) -> (Vec<u8>, Vec<ObservedReq>) {
+        reset_observed();
+        let chunks = Rc::new(RefCell::new(VecDeque::from(chunks_vec)));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let mock = MockStream {
+            chunks: Rc::clone(&chunks),
+            sent: Rc::clone(&sent),
+        };
+        let handler = Arc::new(observe_handler);
+        block_on(serve_conn(handler, mock));
+        let observed = OBSERVED.with(|o| o.borrow().clone());
+        let sent_bytes = Rc::try_unwrap(sent).ok().unwrap().into_inner();
+        (sent_bytes, observed)
+    }
+
+    fn count_ok(bytes: &[u8]) -> usize {
+        bytes
+            .windows(b"HTTP/1.1 200 OK".len())
+            .filter(|w| *w == b"HTTP/1.1 200 OK")
+            .count()
+    }
+
+    /// Two pipelined requests packed into a SINGLE inbound chunk —
+    /// the carry-stressing path. After parsing req1's HEAD,
+    /// `carry` holds (body₁ ‖ HEAD₂). The handler reads body₁ from
+    /// `carry`'s prefix; `into_remainder` advances past it. The
+    /// next outer iteration sees `carry` non-empty and feeds it to
+    /// the parser — req2's HEAD is parsed entirely from carry, no
+    /// fresh recv. req2 has `Content-Length: 0`, so the body is
+    /// empty; the conn returns via `peer_eof` on the next loop.
+    ///
+    /// Without correct carry advancement (`into_remainder` keeping
+    /// the right tail) the parser would either never reach req2 or
+    /// would parse a body-byte-contaminated path/method.
+    #[test]
+    fn carry_threads_body_then_next_pipelined_head_one_chunk() {
+        let raw = b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nBODYGET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+        let (sent, observed) = drive(alloc::vec![Some(raw.to_vec()), None]);
+        assert_eq!(count_ok(&sent), 2);
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].0, Method::Post);
+        assert_eq!(observed[0].1, b"/a");
+        assert_eq!(observed[0].2, b"BODY", "body served from carry");
+        assert_eq!(observed[1].0, Method::Get);
+        assert_eq!(observed[1].1, b"/b", "next-pipelined HEAD parsed from carry");
+        assert!(observed[1].2.is_empty());
+    }
+
+    /// Variant where the next-pipelined HEAD straddles chunk
+    /// boundaries: chunk 1 = HEAD₁ + full body₁ + first half of
+    /// HEAD₂; chunk 2 = rest of HEAD₂. Verifies the carry from
+    /// chunk 1's leftover into chunk 2's parser feed walks the
+    /// parser through `NeedMore` -> `Done` correctly across the
+    /// outer loop boundary.
+    ///
+    /// (Body bytes spanning chunks is a known BodyReader-side
+    /// limitation; this scenario keeps the body entirely inside
+    /// chunk 1's carry so it isolates the HEAD-carry behaviour.)
+    #[test]
+    fn carry_threads_head_across_chunks_after_body() {
+        let chunk1 =
+            b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nBODYGET /b HT".to_vec();
+        let chunk2 = b"TP/1.1\r\nHost: x\r\n\r\n".to_vec();
+        let (sent, observed) = drive(alloc::vec![Some(chunk1), Some(chunk2), None]);
+        assert_eq!(count_ok(&sent), 2, "both responses ship across chunks");
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].0, Method::Post);
+        assert_eq!(observed[0].2, b"BODY");
+        assert_eq!(observed[1].0, Method::Get);
+        assert_eq!(observed[1].1, b"/b");
+    }
+}
