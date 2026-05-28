@@ -94,11 +94,6 @@ impl<'a, S: HttpStream> BodyReader<'a, S> {
         self.leftover
     }
 
-    /// Total body length (Content-Length).
-    pub fn len(&self) -> usize {
-        self.total
-    }
-
     /// Bytes still to be delivered.
     pub fn remaining(&self) -> usize {
         self.total - self.delivered

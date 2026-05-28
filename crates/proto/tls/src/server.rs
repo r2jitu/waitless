@@ -70,7 +70,7 @@ pub const RX_BUF_LEN: usize = 17 * 1024;
 pub const TX_BUF_LEN: usize = 4 * 1024;
 
 /// Max decrypted plaintext we buffer for the app between
-/// `pop_plaintext` calls. Must fit one full TLS 1.3 record's
+/// `take_plaintext_chunk` calls. Must fit one full TLS 1.3 record's
 /// worth of plaintext (16 KiB max) — `do_app_data` refuses to
 /// consume a record whose plaintext exceeds remaining space,
 /// so a smaller cap stalls bulk uploads (curl test:
@@ -269,8 +269,11 @@ pub enum State {
 /// loop {
 ///     let n_tx = tls.pop_tx(&mut tx_tmp);
 ///     if n_tx > 0 { tcp.send(&tx_tmp[..n_tx]); continue; }
-///     let n_pt = tls.pop_plaintext(&mut pt_tmp);
-///     if n_pt > 0 { app.handle(&pt_tmp[..n_pt]); continue; }
+///     if tls.has_plaintext() {
+///         let pt = tls.take_plaintext_chunk();
+///         app.handle(pt);
+///         continue;
+///     }
 ///     match tls.advance(config) { ... }
 ///     break;
 /// }
@@ -300,7 +303,6 @@ pub struct TlsServer {
     // Decrypted application data waiting to be consumed by the app.
     pub(crate) pt_buf: [u8; PT_BUF_LEN],
     pub(crate) pt_len: usize,
-    pub(crate) pt_pos: usize,
 
     // Key schedule + transcript
     pub(crate) transcript: Transcript,
@@ -388,7 +390,6 @@ impl TlsServer {
             addr_of_mut!((*this).tx_len).write(0);
             addr_of_mut!((*this).tx_pos).write(0);
             addr_of_mut!((*this).pt_len).write(0);
-            addr_of_mut!((*this).pt_pos).write(0);
 
             // Buffers: zero-fill in place. Writing `[0u8; N]` would
             // construct the array on the stack first; `write_bytes`
@@ -453,7 +454,6 @@ impl TlsServer {
         self.tx_len = 0;
         self.tx_pos = 0;
         self.pt_len = 0;
-        self.pt_pos = 0;
         self.transcript = Transcript::new();
         self.schedule = KeySchedule::new_without_psk();
         self.ephemeral = Some(X25519ServerKey::from_seed(x25519_seed));
@@ -490,36 +490,21 @@ impl TlsServer {
         n
     }
 
-    /// Drain decrypted application data into `out`.
-    pub fn pop_plaintext(&mut self, out: &mut [u8]) -> usize {
-        let available = self.pt_len - self.pt_pos;
-        let n = core::cmp::min(available, out.len());
-        out[..n].copy_from_slice(&self.pt_buf[self.pt_pos..self.pt_pos + n]);
-        self.pt_pos += n;
-        if self.pt_pos == self.pt_len {
-            self.pt_len = 0;
-            self.pt_pos = 0;
-        }
-        n
-    }
-
     /// `true` when undelivered decrypted plaintext is buffered —
-    /// i.e. the next [`pop_plaintext`](Self::pop_plaintext) /
+    /// i.e. the next
     /// [`take_plaintext_chunk`](Self::take_plaintext_chunk) would
-    /// hand back bytes. A peek; does not move the cursor.
+    /// hand back bytes. A peek; does not consume.
     pub fn has_plaintext(&self) -> bool {
-        self.pt_pos < self.pt_len
+        self.pt_len > 0
     }
 
-    /// Zero-copy sibling of [`pop_plaintext`](Self::pop_plaintext):
-    /// hand back the buffered plaintext window `pt_buf[pt_pos..pt_len]`
-    /// *in place* and consume it from the cursors' point of view,
-    /// instead of copying it into a caller buffer.
+    /// Hand back the buffered plaintext window `pt_buf[..pt_len]`
+    /// *in place* and reset `pt_len` to 0, instead of copying it
+    /// into a caller buffer.
     ///
-    /// The plaintext *bytes* in `pt_buf` are untouched — only the
-    /// `pt_pos` / `pt_len` cursors reset (matching the full-drain
-    /// branch of `pop_plaintext`). So a reader holding the returned
-    /// slice keeps seeing valid plaintext until the next
+    /// The plaintext *bytes* in `pt_buf` are untouched — only
+    /// `pt_len` resets. So a reader holding the returned slice
+    /// keeps seeing valid plaintext until the next
     /// [`advance`](Self::advance) decrypts a fresh record into
     /// `pt_buf`. The caller MUST therefore keep this `TlsServer`
     /// borrowed and un-`advance`d for as long as it reads the
@@ -533,15 +518,12 @@ impl TlsServer {
     /// empty slice when nothing is buffered; callers gate on
     /// [`has_plaintext`](Self::has_plaintext).
     pub fn take_plaintext_chunk(&mut self) -> &mut [u8] {
-        let lo = self.pt_pos;
         let hi = self.pt_len;
         // Consume the window now (eager): the caller wraps these
         // bytes in a borrow-guarded view, and the next
-        // `pop_plaintext` / `take_plaintext_chunk` must not
-        // re-deliver them.
-        self.pt_pos = 0;
+        // `take_plaintext_chunk` must not re-deliver them.
         self.pt_len = 0;
-        &mut self.pt_buf[lo..hi]
+        &mut self.pt_buf[..hi]
     }
 
     /// Emit a TLS 1.3 `close_notify` alert record (RFC 8446 §6.1)

@@ -30,15 +30,8 @@ use crate::body::BodyReader;
 /// accepted the connection, so cross-worker Send is never needed.
 #[allow(async_fn_in_trait)]
 pub trait HttpStream {
-    /// Read up to `buf.len()` bytes from the peer (after
-    /// decryption, for TLS streams). Returns `0` on EOF / fatal
-    /// transport error. Implementors decide whether to wake on
-    /// partial reads or drain a full segment first.
-    async fn recv(&mut self, buf: &mut [u8]) -> usize;
-
-    /// Zero-copy sibling of [`recv`](Self::recv): resolve the next
-    /// inbound run of bytes as a [`RecvChunkGuard`] over the
-    /// transport's *own* buffer, instead of copying into a caller
+    /// Resolve the next inbound run of bytes as a [`RecvChunkGuard`]
+    /// over the transport's *own* buffer, with no copy into a caller
     /// slice. `None` on peer close / EOF, or on a transport with no
     /// streaming chunk path.
     ///
@@ -47,10 +40,9 @@ pub trait HttpStream {
     /// no intermediate copy — item H of
     /// `docs/rx-path-optimizations.md`.
     ///
-    /// The default returns `None`: a transport that hands the whole
-    /// request body to the HTTP layer pre-buffered ([`NullStream`],
-    /// the HTTP/3 case) has no streaming chunk path, and
-    /// `BodyReader` then serves the body from its prebuf alone.
+    /// The default returns `None`: [`NullStream`] (HTTP/3, body
+    /// pre-buffered) has no streaming chunk path, and `BodyReader`
+    /// then serves the body from its prebuf alone.
     /// `waitless::runtime::TcpStream` and `tls::TlsStream` override
     /// this with their real `recv_chunk` implementations.
     ///
@@ -105,9 +97,8 @@ pub trait HttpStream {
 /// path never fires. `NullStream` exists so the generic type
 /// parameter is satisfied for those transports: it inherits the
 /// default `recv_chunk` (returns `None`, so `BodyReader` serves
-/// from the prebuf alone) and the trivial `recv` return-0; calling
-/// `send` panics — that transport does not write through
-/// `HttpStream`.
+/// from the prebuf alone); calling `send` panics — that transport
+/// does not write through `HttpStream`.
 pub struct NullStream;
 
 /// Friendly alias for a [`BodyReader`] over [`NullStream`] — i.e.
@@ -117,9 +108,6 @@ pub struct NullStream;
 pub type BufferedBody<'a> = BodyReader<'a, NullStream>;
 
 impl HttpStream for NullStream {
-    async fn recv(&mut self, _buf: &mut [u8]) -> usize {
-        0
-    }
     async fn send(&mut self, _chain: &mut IOBufChain) -> Result<(), ()> {
         panic!("NullStream::send: this transport does not write through HttpStream")
     }
@@ -129,10 +117,6 @@ impl HttpStream for NullStream {
 }
 
 impl HttpStream for waitless::runtime::TcpStream {
-    async fn recv(&mut self, buf: &mut [u8]) -> usize {
-        (*self).recv(buf).await
-    }
-
     /// Forwards to the inherent `waitless::runtime::TcpStream::recv_chunk`.
     ///
     /// Deliberately a plain `fn` returning the *concrete* `RecvChunk`

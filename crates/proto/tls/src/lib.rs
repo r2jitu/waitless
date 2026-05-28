@@ -392,10 +392,6 @@ impl PooledTlsConn {
         self.inner.tls.pop_tx(out)
     }
 
-    fn pop_plaintext(&mut self, out: &mut [u8]) -> usize {
-        self.inner.tls.pop_plaintext(out)
-    }
-
     fn has_plaintext(&self) -> bool {
         self.inner.tls.has_plaintext()
     }
@@ -440,10 +436,10 @@ const PLAINTEXT_CHUNK: usize = record::MAX_INNER_PLAINTEXT - 1;
 const TLS_RECORD_LEN: usize = TLS_HEADROOM + PLAINTEXT_CHUNK + TLS_TAILROOM;
 
 /// HTTPS-side `HttpStream`: owns the `TcpStream` + `PooledTlsConn`
-/// and drives the TLS state machine. `recv` blocks until decrypted
-/// plaintext is available (pumping handshake records as needed);
-/// `send` encrypts via `seal_app_data` and flushes ciphertext to
-/// TCP.
+/// and drives the TLS state machine. `recv_chunk` blocks until
+/// decrypted plaintext is available (pumping handshake records as
+/// needed); `send` encrypts via `seal_app_data` and flushes
+/// ciphertext to TCP.
 pub struct TlsStream {
     tcp: waitless::runtime::TcpStream,
     tls: PooledTlsConn,
@@ -497,9 +493,8 @@ impl TlsStream {
     /// worth of received bytes. The handshake driver and the
     /// app-data RX loop both bottom out here — there's no separate
     /// "handshake state machine driver" task because the handshake
-    /// runs inside the same `recv` that consumes app data; once
-    /// `pop_plaintext` starts returning bytes, the handshake is
-    /// done.
+    /// runs inside the same `recv_chunk` that consumes app data;
+    /// once `has_plaintext()` flips true, the handshake is done.
     ///
     /// `Err(())` is fatal (peer closed, decrypt error, or TCP
     /// error). Caller drops the conn.
@@ -622,49 +617,24 @@ impl TlsStream {
 }
 
 impl http::HttpStream for TlsStream {
-    async fn recv(&mut self, buf: &mut [u8]) -> usize {
-        loop {
-            // Try plaintext first — `pump_rx` may have decrypted
-            // app data on a previous iteration, or the TLS state
-            // machine may have buffered it from earlier records.
-            let n = self.tls.pop_plaintext(buf);
-            if n > 0 {
-                return n;
-            }
-            // No plaintext available → pump one wire round-trip
-            // through the TLS state machine. Returns Err on TCP
-            // close, decrypt error, or other fatal TLS error.
-            // Handshake records produce no plaintext, so the
-            // first 1-2 iterations of this loop drive the
-            // handshake to completion; subsequent iterations are
-            // app-data decrypt.
-            if self.pump_rx().await.is_err() {
-                return 0;
-            }
-        }
-    }
-
-    /// Zero-copy sibling of [`recv`](Self::recv). Where `recv`
-    /// copies decrypted plaintext out of the TLS layer's `pt_buf`
-    /// into a caller buffer, `recv_chunk` surfaces a
-    /// `RecvChunkGuard` over a `Borrowed` `IOBuf` viewing `pt_buf`
-    /// *in place* — eliminating step 7 of the TLS RX path table
-    /// (the `pt_buf` → user-buf copy). [`BodyReader::chunk`] drives
-    /// it for HTTPS request bodies past the prebuf (RX item H).
+    /// Resolve a `RecvChunkGuard` over a `Borrowed` `IOBuf` viewing
+    /// the TLS layer's `pt_buf` *in place* — eliminating step 7 of
+    /// the TLS RX path table (the `pt_buf` → user-buf copy).
+    /// [`BodyReader::chunk`] drives it for HTTPS request bodies past
+    /// the prebuf (RX item H).
     ///
     /// Resolves to `Some(guard)` once a record's worth of plaintext
     /// is available, or `None` on peer close / decrypt error / any
-    /// fatal TLS error — the same conditions under which `recv`
-    /// resolves to `0`. Handshake records carry no plaintext, so
+    /// fatal TLS error. Handshake records carry no plaintext, so
     /// the first one or two `pump_rx` iterations drive the
-    /// handshake to completion exactly as in `recv`.
+    /// handshake to completion before any guard is returned.
     ///
     /// **`&mut self` is load-bearing, not incidental.** The
     /// returned guard carries that borrow for its whole life (it is
     /// `RecvChunkGuard<'_>` with `'_` tied to `&mut self`), so the
-    /// borrow checker forbids a second `recv` / `recv_chunk` —
-    /// hence `pump_rx`, hence the AEAD decrypt that overwrites
-    /// `pt_buf` — while the guard is live. That is what makes the
+    /// borrow checker forbids a second `recv_chunk` — hence
+    /// `pump_rx`, hence the AEAD decrypt that overwrites `pt_buf`
+    /// — while the guard is live. That is what makes the
     /// `Borrowed`-into-`pt_buf` view sound: the bytes it points at
     /// cannot be rewritten under it. A bare
     /// `recv_chunk() -> Option<IOBuf>` would be borrow-*unsafe*
@@ -680,7 +650,7 @@ impl http::HttpStream for TlsStream {
     async fn recv_chunk(&mut self) -> Option<waitless::runtime::RecvChunkGuard<'_>> {
         // Drive the conn until `pt_buf` holds decrypted plaintext.
         // Handshake records produce none, so early iterations just
-        // advance the handshake — same loop shape as `recv`.
+        // advance the handshake.
         while !self.tls.has_plaintext() {
             if self.pump_rx().await.is_err() {
                 return None;
@@ -688,12 +658,12 @@ impl http::HttpStream for TlsStream {
         }
 
         // Consume the plaintext window. `take_plaintext_chunk`
-        // resets `pt_pos` / `pt_len` *now* (eager, not on guard
-        // drop): the guard's `&mut self` borrow means no code can
-        // observe the cursors — or re-`pump_rx` `pt_buf` — between
-        // here and the guard's drop, so on-drop bookkeeping would
-        // be indistinguishable. The cross-crate `RecvChunkGuard`
-        // has no `Drop` hook by design (RX item F); eager advance
+        // resets `pt_len` *now* (eager, not on guard drop): the
+        // guard's `&mut self` borrow means no code can observe
+        // `pt_len` — or re-`pump_rx` `pt_buf` — between here and
+        // the guard's drop, so on-drop bookkeeping would be
+        // indistinguishable. The cross-crate `RecvChunkGuard` has
+        // no `Drop` hook by design (RX item F); eager advance
         // needs none.
         let window: &mut [u8] = self.tls.take_plaintext_chunk();
         let len = window.len() as u32;

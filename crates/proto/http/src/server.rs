@@ -316,9 +316,6 @@ mod serve_conn_tests {
     }
 
     impl HttpStream for MockStream {
-        async fn recv(&mut self, _: &mut [u8]) -> usize {
-            unreachable!("serve_conn HEAD path uses recv_chunk");
-        }
         async fn recv_chunk(&mut self) -> Option<RecvChunkGuard<'_>> {
             match self.chunks.borrow_mut().pop_front() {
                 Some(Some(bytes)) => Some(RecvChunkGuard::new(IOBuf::from(bytes))),
