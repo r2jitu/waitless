@@ -818,58 +818,128 @@ impl TcpConnection {
             .clamp(RTO_INITIAL_MS, RTO_MAX_MS)
     }
 
-    /// Shared core of the two retransmit-retain entry points
-    /// (`rtx_on_data_sent` for the chain path, `rtx_on_data_sent_slice`
-    /// for the TSO path). Stages `total` bytes through an owned
-    /// `Vec<u8>` via the caller's `fill` closure, then pushes them
-    /// onto `rtx_queue` as one `RtxEntry`. The vec becomes the entry's
-    /// IOBuf storage at no extra copy. `rtx_push` arms the RFC 6298
-    /// §5.1 RTO timer if the queue was empty and seeds the §3 RTT
-    /// anchor if no sample is outstanding.
-    fn rtx_retain(&mut self, total: usize, fill: impl FnOnce(&mut [u8])) {
-        if total == 0 || self.rtx_alloc_failed {
-            return; // nothing to retain, or coverage already suspended
+    /// Take ownership of the first `total` bytes of `chain` into
+    /// the retransmit queue — no staging memcpy. Each chain part
+    /// becomes its own `RtxEntry` after `IOBuf::share`'ing the
+    /// part into refcounted (`Shared`) storage, so a future SG-TX
+    /// commit can hand the wire DMA a `clone_shared` of the same
+    /// backing.
+    ///
+    /// On the partial-boundary IOBuf (when `total` doesn't align
+    /// to an IOBuf edge) the share-then-`clone_shared` dance
+    /// leaves the queue holding the consumed-prefix view and
+    /// pushes the remaining suffix back onto the chain's front.
+    /// After the call returns the chain's front is exactly the
+    /// unsent tail — the caller does not need a follow-up
+    /// `chain_drain_prefix`. `rtx_push` arms the RFC 6298 §5.1
+    /// RTO timer (first push when the queue was empty) and seeds
+    /// the §3 RTT anchor.
+    ///
+    /// OOM (`rtx_alloc_failed` or a per-entry push failure):
+    /// coverage is suspended and the prefix is still drained off
+    /// `chain` (bytes are on the wire; the chain mustn't re-emit
+    /// them on the next send call).
+    pub(crate) fn rtx_on_data_sent(
+        &mut self,
+        chain: &mut iobuf::IOBufChain,
+        mut total: usize,
+    ) {
+        if total == 0 {
+            return;
         }
-        let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; total];
-        fill(&mut staging);
-        // `snd_nxt` has already advanced by `total` at the caller, so
-        // this entry covers `[snd_nxt - total, snd_nxt)`.
-        let seq_start = self.snd_nxt.wrapping_sub(total as u32);
+        if self.rtx_alloc_failed {
+            // Coverage already suspended — drain without queueing.
+            drain_chain_prefix(chain, total);
+            return;
+        }
+        let now_ms = kernel_core::clock::now_ms();
+        // `snd_nxt` has already advanced by `total` at the caller,
+        // so the pushed entries span `[snd_nxt - total, snd_nxt)`.
+        let mut seq = self.snd_nxt.wrapping_sub(total as u32);
+        while total > 0 {
+            let Some(front_len) = chain.front_mut().map(|b| b.len()) else {
+                // Chain shorter than `total` — caller invariant
+                // violated. Bail rather than panic.
+                break;
+            };
+            if front_len <= total {
+                // Whole IOBuf moves into the queue.
+                let iobuf = chain.pop_front().expect("front_mut returned Some");
+                let shared = iobuf.share();
+                if !self.rtx_push(shared, seq, front_len as u16, now_ms) {
+                    self.handle_rtx_push_oom();
+                    // Bytes are on the wire — drop the remainder
+                    // off `chain` so a later send call doesn't
+                    // re-emit them.
+                    drain_chain_prefix(chain, total - front_len);
+                    return;
+                }
+                seq = seq.wrapping_add(front_len as u32);
+                total -= front_len;
+            } else {
+                // Partial-boundary IOBuf: split via share +
+                // clone_shared. Queue gets the prefix view; chain
+                // keeps the tail view. Both reference the same
+                // `SharedRegion` Arc.
+                let iobuf = chain.pop_front().expect("front_mut returned Some");
+                let mut shared = iobuf.share();
+                let mut clone = shared
+                    .clone_shared()
+                    .expect("share()'d IOBuf is shareable");
+                clone
+                    .trim_end(front_len - total)
+                    .expect("front_len > total in this arm");
+                if !self.rtx_push(clone, seq, total as u16, now_ms) {
+                    self.handle_rtx_push_oom();
+                    // Restore the un-acked tail to the chain so
+                    // the caller's send-chain future sees a
+                    // well-formed chain on its next poll.
+                    shared
+                        .consume(total)
+                        .expect("front_len > total in this arm");
+                    chain.push_front(shared);
+                    return;
+                }
+                shared
+                    .consume(total)
+                    .expect("front_len > total in this arm");
+                chain.push_front(shared);
+                return;
+            }
+        }
+    }
+
+    /// OOM-bailout helper for the retransmit-retain paths: suspend
+    /// retransmit coverage and drop the partially-tracked window.
+    /// `rtx_on_ack` clears the flag once `snd_una == snd_nxt`.
+    fn handle_rtx_push_oom(&mut self) {
+        crate::diag::record_rtx_alloc_fail(self.state, self.rtx_bytes_in_flight);
+        self.rtx_queue.clear();
+        self.rtx_bytes_in_flight = 0;
+        self.rtx_deadline_ms = 0;
+    }
+
+    /// Retain just-sent bytes handed in as a contiguous slice —
+    /// the TSO fast path's entry point. `try_send_tso` seals
+    /// ciphertext directly into a driver TX-pool slot; this copies
+    /// that slot's payload into the retransmit queue before the
+    /// slot recycles, so a TSO segment is covered by the RTO timer
+    /// exactly like a chain-sent one. Unlike the chain path the
+    /// source bytes are in a transient TX-pool slot that's about
+    /// to recycle, so we can't `share` them — one heap copy is
+    /// the only option.
+    pub(crate) fn rtx_on_data_sent_slice(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() || self.rtx_alloc_failed {
+            return;
+        }
+        let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; bytes.len()];
+        staging.copy_from_slice(bytes);
+        let seq_start = self.snd_nxt.wrapping_sub(bytes.len() as u32);
         let now_ms = kernel_core::clock::now_ms();
         let iobuf = IOBuf::from(staging);
-        if !self.rtx_push(iobuf, seq_start, total as u16, now_ms) {
-            // Heap exhaustion — genuinely unexpected, so trace it.
-            // Suspend retransmit coverage: drop any partially-tracked
-            // window and wait for the peer to ACK everything before
-            // re-engaging. `rtx_on_ack` clears the flag once
-            // `snd_una == snd_nxt`.
-            crate::diag::record_rtx_alloc_fail(self.state, self.rtx_bytes_in_flight);
-            self.rtx_queue.clear();
-            self.rtx_bytes_in_flight = 0;
-            self.rtx_deadline_ms = 0;
+        if !self.rtx_push(iobuf, seq_start, bytes.len() as u16, now_ms) {
+            self.handle_rtx_push_oom();
         }
-    }
-
-    /// Retain the `total` just-sent bytes — read from a fresh cursor
-    /// over the chain `async_try_send_chain` already transmitted — so
-    /// the RTO timer can retransmit them, and start the timer if it
-    /// is not already running (RFC 6298 §5.1).
-    pub(crate) fn rtx_on_data_sent(&mut self, total: usize, cur: &mut iobuf::Cursor<'_>) {
-        self.rtx_retain(total, |dst| {
-            cur.read(dst);
-        });
-    }
-
-    /// Retain just-sent bytes handed in as a contiguous slice — the
-    /// TSO fast path's entry point. `try_send_tso` seals ciphertext
-    /// directly into a driver TX-pool slot; this copies that slot's
-    /// payload into the retransmit ring before the slot recycles, so
-    /// a TSO segment is covered by the RTO timer exactly like a
-    /// chain-sent one.
-    pub(crate) fn rtx_on_data_sent_slice(&mut self, bytes: &[u8]) {
-        self.rtx_retain(bytes.len(), |dst| {
-            dst.copy_from_slice(bytes);
-        });
     }
 
     /// Fold an ACK into the retransmission state: drop acknowledged
@@ -1210,5 +1280,28 @@ impl TcpConnection {
 #[inline]
 pub(crate) fn seq_lt(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) < 0
+}
+
+/// Drop the first `n` bytes off the front of `chain`: fully-
+/// consumed parts pop (their drop callbacks fire as `External`
+/// IOBufs recycle), the boundary part's visible window advances
+/// via `consume`. Used by `rtx_on_data_sent`'s OOM-bailout to keep
+/// the chain in sync with `snd_nxt` (bytes are on the wire; the
+/// chain mustn't re-emit them next send).
+fn drain_chain_prefix(chain: &mut iobuf::IOBufChain, mut n: usize) {
+    while n > 0 {
+        let Some(front) = chain.front_mut() else {
+            return;
+        };
+        let flen = front.len();
+        if flen <= n {
+            n -= flen;
+            chain.pop_front();
+        } else {
+            let _ = front.consume(n);
+            chain.shrink_total_len(n);
+            return;
+        }
+    }
 }
 

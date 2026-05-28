@@ -528,33 +528,6 @@ pub(crate) fn send_rst(
     );
 }
 
-/// Drop the first `n` bytes from the front of `chain` — the bytes a
-/// windowed `async_try_send_chain` has just put on the wire. Fully
-/// drained parts are `pop_front`ed (their `IOBuf` drops, recycling
-/// `External` device buffers back to driver pools); a partially-sent
-/// head part is `consume`d in place. Zero copy — only `IOBuf` offsets
-/// move; the unsent tail is left untouched for the next call.
-fn chain_drain_prefix(chain: &mut iobuf::IOBufChain, mut n: usize) {
-    while n > 0 {
-        let Some(front) = chain.front_mut() else {
-            return; // chain shorter than `n` — nothing left to drop
-        };
-        let flen = front.len();
-        if flen <= n {
-            n -= flen;
-            chain.pop_front();
-        } else {
-            // `consume` trims the front of the visible payload;
-            // `shrink_total_len` keeps a `Many` chain's cached length
-            // correct (a no-op for `Single`/`Empty`, whose length
-            // derives straight from the part).
-            let _ = front.consume(n);
-            chain.shrink_total_len(n);
-            return;
-        }
-    }
-}
-
 /// Async `TcpSendChain` try-send hook. Walks `chain` via cursor
 /// and emits MSS-sized TCP segments, copying directly from chain
 /// nodes into each segment's payload area — no user-space
@@ -668,19 +641,16 @@ pub fn async_try_send_chain(
     // `drop(cursor)`), but binding into `_` moves it and ends the
     // borrow at the same point.
     let _ = cursor;
-    // RFC 6298: retain the just-sent `sendable` bytes so the RTO
-    // timer can retransmit them if their ACK never arrives, and
-    // start the timer if it is not already running. A fresh cursor
-    // re-walks the chain from the front (one copy into the queue's
-    // staging Vec) over exactly the prefix about to be drained.
-    {
-        let mut rtx_cursor = chain.cursor();
-        c.rtx_on_data_sent(sendable, &mut rtx_cursor);
-    }
-    // Drop the sent prefix off the chain; the unsent tail (if the
-    // window was the limit) stays queued for the next call. Drops
-    // fire front-to-back — `External` callbacks recycle NIC
-    // descriptors back to driver pools.
-    chain_drain_prefix(chain, sendable);
+    // RFC 6298: take ownership of the sent prefix into the
+    // retransmit queue. Each chain part is `IOBuf::share`'d into
+    // refcounted storage and stored as its own `RtxEntry`; the
+    // boundary part (when `sendable` doesn't align to an IOBuf
+    // edge) is split via `clone_shared` so the queue and the
+    // chain each carry their own view. After this call the
+    // chain's front is the unsent tail — no follow-up
+    // `chain_drain_prefix` is needed. Drops of fully-consumed
+    // parts (no longer in chain or queue) fire front-to-back —
+    // `External` callbacks recycle NIC descriptors as they leave.
+    c.rtx_on_data_sent(chain, sendable);
     Ok(sendable)
 }
