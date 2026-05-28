@@ -1,9 +1,14 @@
-// `IOBuf` — the flat `!Send` enum over all four storage structs.
+// `IOBuf` — the flat `!Send` enum over all four storage variants.
 //
 // See the crate root for the borrowed/owned type-split rationale.
 // `IOBuf` is the TX-path buffer: it mixes owned and borrowed parts,
 // and `BorrowedView`'s `PhantomData<*const ()>` propagates through
 // the enum to make the whole type `!Send + !Sync`.
+//
+// As of PR 2 each variant of `Inner` carries its own `(offset, len)`
+// view alongside the storage; the per-variant structs in `storage.rs`
+// hold bytes only. Static keeps its self-contained slide semantics
+// (no outer offset/len) — its slice is its view.
 
 use alloc::boxed::Box;
 use core::ptr::NonNull;
@@ -23,41 +28,30 @@ pub struct IOBuf {
 }
 
 /// Storage backing an [`IOBuf`]. Private: `IOBuf`'s public surface is
-/// its methods. A flat enum over the four per-variant structs — the
-/// per-variant logic lives on each struct (`storage.rs`); the arms
-/// here only forward.
+/// its methods. Each variant carries its bytes-only storage plus the
+/// visible `(offset, len)` view — except `Static`, whose slice IS its
+/// view (consume/trim_end slide the slice; headroom/tailroom = 0).
 pub(crate) enum Inner {
-    /// Heap-owned `Box<[u8]>`.
-    Heap(HeapStorage),
-    /// A `&'static [u8]` borrow. Immutable.
+    /// Heap-owned `Box<[u8]>` + view.
+    Heap {
+        storage: HeapStorage,
+        offset: u32,
+        len: u32,
+    },
+    /// A `&'static [u8]` borrow. Immutable. Slides internally.
     Static(StaticView),
-    /// A foreign region owned via a drop callback (NIC RX, pools).
-    External(ExternalOwned),
-    /// A non-owning view of foreign storage — the `!Send` variant.
-    Borrowed(BorrowedView),
-}
-
-/// Forward an `IOBuf` method to the active variant struct. The
-/// per-variant logic is written once on the struct (`storage.rs`);
-/// this is the thin, mechanical dispatch the doc calls "written
-/// twice" — once here for `&self`, once for `&mut self`.
-macro_rules! dispatch {
-    ($self:ident, $b:ident => $body:expr) => {
-        match &$self.inner {
-            Inner::Heap($b) => $body,
-            Inner::Static($b) => $body,
-            Inner::External($b) => $body,
-            Inner::Borrowed($b) => $body,
-        }
-    };
-    (mut $self:ident, $b:ident => $body:expr) => {
-        match &mut $self.inner {
-            Inner::Heap($b) => $body,
-            Inner::Static($b) => $body,
-            Inner::External($b) => $body,
-            Inner::Borrowed($b) => $body,
-        }
-    };
+    /// A foreign region owned via a drop callback (NIC RX, pools) + view.
+    External {
+        storage: ExternalOwned,
+        offset: u32,
+        len: u32,
+    },
+    /// A non-owning view of foreign storage + view — the `!Send` variant.
+    Borrowed {
+        view: BorrowedView,
+        offset: u32,
+        len: u32,
+    },
 }
 
 impl IOBuf {
@@ -72,7 +66,11 @@ impl IOBuf {
         // initial-zeroing keeps info-leak-class bugs away.
         let storage = alloc::vec![0u8; cap].into_boxed_slice();
         IOBuf {
-            inner: Inner::Heap(HeapStorage::new(storage, headroom as u32, 0)),
+            inner: Inner::Heap {
+                storage: HeapStorage::new(storage),
+                offset: headroom as u32,
+                len: 0,
+            },
         }
     }
 
@@ -98,7 +96,11 @@ impl IOBuf {
         // contract is that no byte is read before being written.
         let storage = unsafe { Box::<[u8]>::new_uninit_slice(cap).assume_init() };
         IOBuf {
-            inner: Inner::Heap(HeapStorage::new(storage, headroom as u32, 0)),
+            inner: Inner::Heap {
+                storage: HeapStorage::new(storage),
+                offset: headroom as u32,
+                len: 0,
+            },
         }
     }
 
@@ -141,21 +143,60 @@ impl IOBuf {
     ///   * If multiple IOBufs view the same storage, their visible
     ///     regions do not overlap when any is mutated.
     pub unsafe fn borrow(base: NonNull<u8>, capacity: u32, offset: u32, len: u32) -> Self {
+        debug_assert!(offset.saturating_add(len) <= capacity);
         IOBuf {
-            inner: Inner::Borrowed(BorrowedView::new(base, capacity, offset, len)),
+            inner: Inner::Borrowed {
+                view: BorrowedView::new(base, capacity),
+                offset,
+                len,
+            },
         }
     }
 
     /// Visible payload bytes.
     #[inline]
     pub fn data(&self) -> &[u8] {
-        dispatch!(self, b => b.data())
+        match &self.inner {
+            Inner::Heap { storage, offset, len } => {
+                let o = *offset as usize;
+                &storage.bytes()[o..o + *len as usize]
+            }
+            Inner::Static(s) => s.data(),
+            Inner::External { storage, offset, len } => {
+                // SAFETY: offset + len <= capacity (construction
+                // precondition, maintained by every mutator); the
+                // region is exclusively owned for this IOBuf's
+                // lifetime.
+                unsafe {
+                    core::slice::from_raw_parts(
+                        storage.base().as_ptr().add(*offset as usize),
+                        *len as usize,
+                    )
+                }
+            }
+            Inner::Borrowed { view, offset, len } => {
+                // SAFETY: the `borrow` caller guaranteed the region
+                // is valid for this IOBuf's lifetime and not
+                // concurrently mutated; offset + len <= capacity.
+                unsafe {
+                    core::slice::from_raw_parts(
+                        view.base().as_ptr().add(*offset as usize),
+                        *len as usize,
+                    )
+                }
+            }
+        }
     }
 
     /// Visible payload length.
     #[inline]
     pub fn len(&self) -> usize {
-        dispatch!(self, b => b.len())
+        match &self.inner {
+            Inner::Heap { len, .. }
+            | Inner::External { len, .. }
+            | Inner::Borrowed { len, .. } => *len as usize,
+            Inner::Static(s) => s.len(),
+        }
     }
 
     #[inline]
@@ -166,13 +207,29 @@ impl IOBuf {
     /// Bytes available before the payload. `0` for static borrows.
     #[inline]
     pub fn headroom(&self) -> usize {
-        dispatch!(self, b => b.headroom())
+        match &self.inner {
+            Inner::Heap { offset, .. }
+            | Inner::External { offset, .. }
+            | Inner::Borrowed { offset, .. } => *offset as usize,
+            Inner::Static(_) => 0,
+        }
     }
 
     /// Bytes available after the payload. `0` for static borrows.
     #[inline]
     pub fn tailroom(&self) -> usize {
-        dispatch!(self, b => b.tailroom())
+        match &self.inner {
+            Inner::Heap { storage, offset, len } => storage
+                .capacity()
+                .saturating_sub(*offset as usize + *len as usize),
+            Inner::Static(_) => 0,
+            Inner::External { storage, offset, len } => storage
+                .capacity()
+                .saturating_sub(*offset as usize + *len as usize),
+            Inner::Borrowed { view, offset, len } => view
+                .capacity()
+                .saturating_sub(*offset as usize + *len as usize),
+        }
     }
 
     /// Mutable access to the visible payload. Returns `None` for
@@ -180,26 +237,172 @@ impl IOBuf {
     /// seals into the source bytes).
     #[inline]
     pub fn data_mut(&mut self) -> Option<&mut [u8]> {
-        dispatch!(mut self, b => b.data_mut())
+        match &mut self.inner {
+            Inner::Heap { storage, offset, len } => {
+                let o = *offset as usize;
+                let l = *len as usize;
+                Some(&mut storage.bytes_mut()[o..o + l])
+            }
+            Inner::Static(_) => None,
+            Inner::External { storage, offset, len } => {
+                // SAFETY: as in `data`, plus `&mut self` gives
+                // exclusive write access for this call.
+                Some(unsafe {
+                    core::slice::from_raw_parts_mut(
+                        storage.base().as_ptr().add(*offset as usize),
+                        *len as usize,
+                    )
+                })
+            }
+            Inner::Borrowed { view, offset, len } => {
+                // SAFETY: the `borrow` caller guaranteed no
+                // concurrent mutation; `&mut self` gives exclusive
+                // write access for this call.
+                Some(unsafe {
+                    core::slice::from_raw_parts_mut(
+                        view.base().as_ptr().add(*offset as usize),
+                        *len as usize,
+                    )
+                })
+            }
+        }
     }
 
     /// Prepend `data` into the headroom and grow the visible payload.
     /// `Err(NoHeadroom)` if headroom is too small; `Err(Immutable)`
     /// for static borrows.
     pub fn prepend(&mut self, data: &[u8]) -> Result<(), IOBufError> {
-        dispatch!(mut self, b => b.prepend(data))
+        let n = data.len();
+        match &mut self.inner {
+            Inner::Static(_) => Err(IOBufError::Immutable),
+            Inner::Heap { storage, offset, len } => {
+                if n > *offset as usize {
+                    return Err(IOBufError::NoHeadroom);
+                }
+                let new_offset = *offset - n as u32;
+                storage.bytes_mut()[new_offset as usize..*offset as usize].copy_from_slice(data);
+                *offset = new_offset;
+                *len += n as u32;
+                Ok(())
+            }
+            Inner::External { storage, offset, len } => {
+                if n > *offset as usize {
+                    return Err(IOBufError::NoHeadroom);
+                }
+                let new_offset = *offset - n as u32;
+                // SAFETY: `new_offset..*offset` is in-bounds
+                // (new_offset >= 0 by the check); the region is
+                // exclusively owned; `&mut self` gives exclusive
+                // write access.
+                unsafe {
+                    core::slice::from_raw_parts_mut(
+                        storage.base().as_ptr().add(new_offset as usize),
+                        n,
+                    )
+                    .copy_from_slice(data);
+                }
+                *offset = new_offset;
+                *len += n as u32;
+                Ok(())
+            }
+            Inner::Borrowed { view, offset, len } => {
+                if n > *offset as usize {
+                    return Err(IOBufError::NoHeadroom);
+                }
+                let new_offset = *offset - n as u32;
+                // SAFETY: as `External` above; the `borrow` caller
+                // guaranteed no concurrent mutation.
+                unsafe {
+                    core::slice::from_raw_parts_mut(
+                        view.base().as_ptr().add(new_offset as usize),
+                        n,
+                    )
+                    .copy_from_slice(data);
+                }
+                *offset = new_offset;
+                *len += n as u32;
+                Ok(())
+            }
+        }
     }
 
     /// Append `data` into the tailroom and grow the visible payload.
     pub fn append_slice(&mut self, data: &[u8]) -> Result<(), IOBufError> {
-        dispatch!(mut self, b => b.append_slice(data))
+        let n = data.len();
+        match &mut self.inner {
+            Inner::Static(_) => Err(IOBufError::Immutable),
+            Inner::Heap { storage, offset, len } => {
+                let end = *offset as usize + *len as usize;
+                if end + n > storage.capacity() {
+                    return Err(IOBufError::NoTailroom);
+                }
+                storage.bytes_mut()[end..end + n].copy_from_slice(data);
+                *len += n as u32;
+                Ok(())
+            }
+            Inner::External { storage, offset, len } => {
+                let end = *offset as usize + *len as usize;
+                if end + n > storage.capacity() {
+                    return Err(IOBufError::NoTailroom);
+                }
+                // SAFETY: end..end+n is in-bounds (check above);
+                // exclusive ownership; exclusive access via `&mut self`.
+                unsafe {
+                    core::slice::from_raw_parts_mut(storage.base().as_ptr().add(end), n)
+                        .copy_from_slice(data);
+                }
+                *len += n as u32;
+                Ok(())
+            }
+            Inner::Borrowed { view, offset, len } => {
+                let end = *offset as usize + *len as usize;
+                if end + n > view.capacity() {
+                    return Err(IOBufError::NoTailroom);
+                }
+                // SAFETY: as `External` above.
+                unsafe {
+                    core::slice::from_raw_parts_mut(view.base().as_ptr().add(end), n)
+                        .copy_from_slice(data);
+                }
+                *len += n as u32;
+                Ok(())
+            }
+        }
     }
 
     /// Grow the visible payload by `n` bytes (contents
     /// uninitialised) and return a mutable slice over them. Used by
     /// AEAD seal: advance the visible len, write the tag in place.
     pub fn extend_uninit(&mut self, n: usize) -> Result<&mut [u8], IOBufError> {
-        dispatch!(mut self, b => b.extend_uninit(n))
+        match &mut self.inner {
+            Inner::Static(_) => Err(IOBufError::Immutable),
+            Inner::Heap { storage, offset, len } => {
+                let end = *offset as usize + *len as usize;
+                if end + n > storage.capacity() {
+                    return Err(IOBufError::NoTailroom);
+                }
+                *len += n as u32;
+                Ok(&mut storage.bytes_mut()[end..end + n])
+            }
+            Inner::External { storage, offset, len } => {
+                let end = *offset as usize + *len as usize;
+                if end + n > storage.capacity() {
+                    return Err(IOBufError::NoTailroom);
+                }
+                *len += n as u32;
+                // SAFETY: end..end+n in-bounds; exclusive access.
+                Ok(unsafe { core::slice::from_raw_parts_mut(storage.base().as_ptr().add(end), n) })
+            }
+            Inner::Borrowed { view, offset, len } => {
+                let end = *offset as usize + *len as usize;
+                if end + n > view.capacity() {
+                    return Err(IOBufError::NoTailroom);
+                }
+                *len += n as u32;
+                // SAFETY: as `External` above.
+                Ok(unsafe { core::slice::from_raw_parts_mut(view.base().as_ptr().add(end), n) })
+            }
+        }
     }
 
     /// Narrow the visible payload to `[offset..offset+len]` relative
@@ -218,13 +421,36 @@ impl IOBuf {
     /// Trim `n` bytes from the FRONT of the visible payload.
     #[inline]
     pub fn consume(&mut self, n: usize) -> Result<(), IOBufError> {
-        dispatch!(mut self, b => b.consume(n))
+        match &mut self.inner {
+            Inner::Static(s) => s.consume(n),
+            Inner::Heap { offset, len, .. }
+            | Inner::External { offset, len, .. }
+            | Inner::Borrowed { offset, len, .. } => {
+                if n > *len as usize {
+                    return Err(IOBufError::OutOfBounds);
+                }
+                *offset += n as u32;
+                *len -= n as u32;
+                Ok(())
+            }
+        }
     }
 
     /// Trim `n` bytes from the BACK of the visible payload.
     #[inline]
     pub fn trim_end(&mut self, n: usize) -> Result<(), IOBufError> {
-        dispatch!(mut self, b => b.trim_end(n))
+        match &mut self.inner {
+            Inner::Static(s) => s.trim_end(n),
+            Inner::Heap { len, .. }
+            | Inner::External { len, .. }
+            | Inner::Borrowed { len, .. } => {
+                if n > *len as usize {
+                    return Err(IOBufError::OutOfBounds);
+                }
+                *len -= n as u32;
+                Ok(())
+            }
+        }
     }
 
     /// Consume `n` bytes from the front and return the IOBuf if
@@ -277,7 +503,7 @@ impl IOBuf {
     /// a cross-*time* tool, orthogonal to the borrowed/owned split's
     /// cross-*core* `OwnedIOBuf` typing.
     pub fn into_owned(mut self) -> IOBuf {
-        if matches!(self.inner, Inner::Borrowed(_)) {
+        if matches!(self.inner, Inner::Borrowed { .. }) {
             // Copy the visible payload into owned heap storage.
             // `data()`'s borrow ends at `.to_vec()`; the subsequent
             // `self.inner` write drops the old `Borrowed`, whose
@@ -285,7 +511,11 @@ impl IOBuf {
             // tracker — symmetric with the `borrow` that minted it.
             let owned: Box<[u8]> = self.data().to_vec().into_boxed_slice();
             let len = owned.len() as u32;
-            self.inner = Inner::Heap(HeapStorage::new(owned, 0, len));
+            self.inner = Inner::Heap {
+                storage: HeapStorage::new(owned),
+                offset: 0,
+                len,
+            };
         }
         self
     }
@@ -340,7 +570,11 @@ impl From<alloc::vec::Vec<u8>> for IOBuf {
         // `from_slice_with_headroom`.
         let len = v.len() as u32;
         IOBuf {
-            inner: Inner::Heap(HeapStorage::new(v.into_boxed_slice(), 0, len)),
+            inner: Inner::Heap {
+                storage: HeapStorage::new(v.into_boxed_slice()),
+                offset: 0,
+                len,
+            },
         }
     }
 }
@@ -564,7 +798,7 @@ mod tests {
         let b = IOBuf::from(alloc::vec![1u8, 2, 3, 4]);
         let ptr_before = b.data().as_ptr() as usize;
         let o = b.into_owned();
-        assert!(matches!(o.inner, Inner::Heap(_)));
+        assert!(matches!(o.inner, Inner::Heap { .. }));
         assert_eq!(o.data(), &[1, 2, 3, 4]);
         assert_eq!(
             o.data().as_ptr() as usize,
@@ -601,7 +835,7 @@ mod tests {
             // reconstructs the Arc from ctx and lets it drop.
             let b = IOBuf::from(unsafe { OwnedIOBuf::wrap_owned(ptr, 16, 0, 4, cb, ctx) });
             let o = b.into_owned();
-            assert!(matches!(o.inner, Inner::External(_)));
+            assert!(matches!(o.inner, Inner::External { .. }));
             assert_eq!(o.data(), b"data");
             assert!(!released.load(Ordering::SeqCst), "callback not yet run");
         }
@@ -644,13 +878,13 @@ mod tests {
         let ptr = core::ptr::NonNull::new(storage.as_mut_ptr()).unwrap();
         // SAFETY: storage outlives the IOBuf in this block.
         let b = unsafe { IOBuf::borrow(ptr, 32, 0, 16) };
-        assert!(matches!(b.inner, Inner::Borrowed(_)));
+        assert!(matches!(b.inner, Inner::Borrowed { .. }));
         let tail = b
             .into_remainder(8)
             .expect("in-range")
             .expect("tail is non-empty");
         assert!(
-            matches!(tail.inner, Inner::Borrowed(_)),
+            matches!(tail.inner, Inner::Borrowed { .. }),
             "into_remainder is borrow-preserving — callers wanting an owned tail follow with into_owned()",
         );
         assert_eq!(tail.data(), b"tailtail");
@@ -671,10 +905,10 @@ mod tests {
             // SAFETY: storage outlives the borrow; the borrow ends
             // when into_owned consumes it.
             let b = unsafe { IOBuf::borrow(ptr, 32, 4, 8) };
-            assert!(matches!(b.inner, Inner::Borrowed(_)));
+            assert!(matches!(b.inner, Inner::Borrowed { .. }));
             b.into_owned()
         };
-        assert!(matches!(owned.inner, Inner::Heap(_)));
+        assert!(matches!(owned.inner, Inner::Heap { .. }));
         assert_eq!(owned.data(), b"abcdefgh");
         storage[4..12].copy_from_slice(b"XXXXXXXX");
         assert_eq!(owned.data(), b"abcdefgh", "owned copy is independent");
@@ -711,7 +945,7 @@ mod tests {
             // Widen — infallible, zero copy. The storage struct is
             // re-tagged into `Inner::External`.
             let widened: IOBuf = owned.into();
-            assert!(matches!(widened.inner, Inner::External(_)));
+            assert!(matches!(widened.inner, Inner::External { .. }));
             assert_eq!(widened.data(), b"owned-rx");
             assert!(
                 !released.load(Ordering::SeqCst),

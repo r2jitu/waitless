@@ -5,13 +5,17 @@
 // two owning storage variants (`HeapStorage`, `ExternalOwned`), both
 // `Send`, so `OwnedIOBuf` is `Send` by auto-derivation — no
 // `unsafe impl`, no human-maintained invariant.
+//
+// As of PR 2 the per-variant `(offset, len)` view lives at the top
+// of `OwnedIOBuf` rather than inside each storage struct: bytes are
+// in the storage, the visible window is on the outer type. The split
+// is the prerequisite for PR 3's `Shared(Arc<…>)` variant, where one
+// storage feeds many views via `Arc::clone`.
 
 use core::ptr::NonNull;
 
 use crate::iobuf::{IOBuf, Inner};
 use crate::{Chain, ExternalOwned, HeapStorage, IOBufDropFn, IOBufError, IOBufRead};
-// `HeapStorage` is used inside the `OwnedInner::Heap(_)` variant
-// declaration; importing it keeps that bare-name reference resolvable.
 
 /// An IOBuf restricted to the two **owning** storage variants —
 /// `HeapStorage` and `ExternalOwned`. Both are `Send`, so `OwnedIOBuf`
@@ -34,11 +38,18 @@ use crate::{Chain, ExternalOwned, HeapStorage, IOBufDropFn, IOBufError, IOBufRea
 /// Widening is one-way: `From<OwnedIOBuf> for IOBuf`. Nothing
 /// narrows `IOBuf -> OwnedIOBuf`.
 pub struct OwnedIOBuf {
-    inner: OwnedInner,
+    pub(crate) storage: OwnedStorage,
+    /// Visible-payload start, relative to the storage base. `prepend`
+    /// shrinks it toward 0; `consume` grows it.
+    pub(crate) offset: u32,
+    /// Visible-payload byte length.
+    pub(crate) len: u32,
 }
 
-/// Storage backing an [`OwnedIOBuf`] — the owning subset of `Inner`.
-enum OwnedInner {
+/// Storage backing an [`OwnedIOBuf`] — the owning subset of
+/// `iobuf::Inner`. Bytes only; the visible window lives on
+/// `OwnedIOBuf`.
+pub(crate) enum OwnedStorage {
     /// Heap-owned `Box<[u8]>`. Modelled for completeness (it is one
     /// of the two owning storage structs and keeps `From<OwnedIOBuf>`
     /// total), but no current `OwnedIOBuf` constructor mints it — the
@@ -59,23 +70,6 @@ const _: () = {
     assert_send::<OwnedIOBuf>();
     assert_send::<Chain<OwnedIOBuf>>();
 };
-
-/// Forward an `OwnedIOBuf` read or mutate method to the active variant
-/// struct. The two-arm counterpart of `IOBuf`'s `dispatch!`.
-macro_rules! owned_dispatch {
-    ($self:ident, $b:ident => $body:expr) => {
-        match &$self.inner {
-            OwnedInner::Heap($b) => $body,
-            OwnedInner::External($b) => $body,
-        }
-    };
-    (mut $self:ident, $b:ident => $body:expr) => {
-        match &mut $self.inner {
-            OwnedInner::Heap($b) => $body,
-            OwnedInner::External($b) => $body,
-        }
-    };
-}
 
 impl OwnedIOBuf {
     /// Wrap a foreign region this IOBuf takes ownership of via a drop
@@ -104,40 +98,63 @@ impl OwnedIOBuf {
         drop_fn: IOBufDropFn,
         drop_ctx: *mut (),
     ) -> Self {
+        debug_assert!(offset.saturating_add(len) <= capacity);
         OwnedIOBuf {
-            inner: OwnedInner::External(ExternalOwned::new(
-                base, capacity, offset, len, drop_fn, drop_ctx,
-            )),
+            storage: OwnedStorage::External(ExternalOwned::new(base, capacity, drop_fn, drop_ctx)),
+            offset,
+            len,
+        }
+    }
+
+    /// Total bytes of the underlying storage (independent of the
+    /// current visible window).
+    #[inline]
+    fn capacity(&self) -> usize {
+        match &self.storage {
+            OwnedStorage::Heap(h) => h.capacity(),
+            OwnedStorage::External(e) => e.capacity(),
         }
     }
 
     /// Visible payload bytes.
     #[inline]
     pub fn data(&self) -> &[u8] {
-        owned_dispatch!(self, b => b.data())
+        let o = self.offset as usize;
+        let l = self.len as usize;
+        match &self.storage {
+            OwnedStorage::Heap(h) => &h.bytes()[o..o + l],
+            OwnedStorage::External(e) => {
+                // SAFETY: `base + offset .. base + offset + len` is
+                // in-bounds (offset + len <= capacity, construction
+                // precondition); the region is exclusively owned by
+                // this IOBuf for its lifetime.
+                unsafe { core::slice::from_raw_parts(e.base().as_ptr().add(o), l) }
+            }
+        }
     }
 
     /// Visible payload length.
     #[inline]
     pub fn len(&self) -> usize {
-        owned_dispatch!(self, b => b.len())
+        self.len as usize
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len == 0
     }
 
     /// Bytes available before the payload.
     #[inline]
     pub fn headroom(&self) -> usize {
-        owned_dispatch!(self, b => b.headroom())
+        self.offset as usize
     }
 
     /// Bytes available after the payload.
     #[inline]
     pub fn tailroom(&self) -> usize {
-        owned_dispatch!(self, b => b.tailroom())
+        self.capacity()
+            .saturating_sub(self.offset as usize + self.len as usize)
     }
 
     /// Restrict the visible payload to `[offset..offset+len]` of the
@@ -153,7 +170,7 @@ impl OwnedIOBuf {
     #[inline]
     pub fn narrow(&mut self, offset: usize, len: usize) -> Result<(), IOBufError> {
         self.consume(offset)?;
-        let visible = self.len();
+        let visible = self.len as usize;
         if visible > len {
             self.trim_end(visible - len)?;
         }
@@ -164,14 +181,23 @@ impl OwnedIOBuf {
     /// region start advances; headroom grows).
     #[inline]
     pub fn consume(&mut self, n: usize) -> Result<(), IOBufError> {
-        owned_dispatch!(mut self, b => b.consume(n))
+        if n > self.len as usize {
+            return Err(IOBufError::OutOfBounds);
+        }
+        self.offset += n as u32;
+        self.len -= n as u32;
+        Ok(())
     }
 
     /// Trim `n` bytes from the BACK of the visible payload (the
     /// region end retreats; tailroom grows).
     #[inline]
     pub fn trim_end(&mut self, n: usize) -> Result<(), IOBufError> {
-        owned_dispatch!(mut self, b => b.trim_end(n))
+        if n > self.len as usize {
+            return Err(IOBufError::OutOfBounds);
+        }
+        self.len -= n as u32;
+        Ok(())
     }
 }
 
@@ -207,9 +233,17 @@ impl IOBufRead for OwnedIOBuf {
 /// materialise a `Borrowed`/`Static` part.
 impl From<OwnedIOBuf> for IOBuf {
     fn from(o: OwnedIOBuf) -> IOBuf {
-        let inner = match o.inner {
-            OwnedInner::Heap(h) => Inner::Heap(h),
-            OwnedInner::External(e) => Inner::External(e),
+        let inner = match o.storage {
+            OwnedStorage::Heap(h) => Inner::Heap {
+                storage: h,
+                offset: o.offset,
+                len: o.len,
+            },
+            OwnedStorage::External(e) => Inner::External {
+                storage: e,
+                offset: o.offset,
+                len: o.len,
+            },
         };
         IOBuf { inner }
     }

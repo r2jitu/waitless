@@ -1,15 +1,18 @@
-// crates/util/iobuf/src/storage.rs — the four per-variant storage structs.
+// crates/util/iobuf/src/storage.rs — the per-variant storage structs.
 //
-// `IOBuf` is one type with two ownership models. Rather than inline
-// every variant's offset/len arithmetic into a match arm of every
-// `IOBuf` method (the logic for one variant scattered across ten
-// methods), each ownership variant is **its own struct** here, with
-// its data *and* its logic in one place. `IOBuf` (and `OwnedIOBuf`)
-// become thin flat enums that forward to these — see `lib.rs`.
+// Storage carries **bytes only** — the visible `(offset, len)` view
+// lives on the outer `IOBuf` / `OwnedIOBuf`. Splitting storage from
+// view sets up PR 3's `Shared` variant, where one `Arc<SharedRegion>`
+// feeds many views via `Arc::clone` — the storage refcount stays put
+// while each clone carries its own `(offset, len)` slider.
 //
 //   * `HeapStorage`   — heap-owned `Box<[u8]>`. `Send` (auto).
 //   * `StaticView`    — a `&'static [u8]` borrow. Immutable. `Send`.
-//   * `ExternalOwned` — a foreign region this IOBuf owns via a drop
+//                       Its slice IS its view: consume/trim_end slide
+//                       the slice reference (not an outer offset/len)
+//                       so a static IOBuf reports headroom = tailroom
+//                       = 0 unchanged across slides.
+//   * `ExternalOwned` — a foreign region this storage owns via a drop
 //                       callback (NIC zero-copy RX, pool slabs).
 //                       `Send` via the one `unsafe impl` in the
 //                       crate — the genuine leaf assertion.
@@ -26,8 +29,6 @@
 use alloc::boxed::Box;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
-
-use crate::{IOBufError, IOBufRead};
 
 // The borrow tracker (`cfg(test)`-only aliasing detection for
 // `BorrowedView`) and its `BorrowGuard` live at the *end* of this
@@ -48,108 +49,37 @@ pub type IOBufDropFn = unsafe fn(base: NonNull<u8>, capacity: u32, ctx: *mut ())
 // HeapStorage — heap-owned `Box<[u8]>`.
 // ============================================================================
 
-/// Heap-owned byte storage. The buffer's full capacity is
-/// `storage.len()`; the visible payload spans `[offset..offset+len]`.
-/// Headroom is `offset` (bytes before the payload that lower layers
-/// can prepend into); tailroom is `storage.len() - offset - len`
-/// (bytes after the payload, e.g. for AEAD tags).
-///
-/// `offset` / `len` are `u32` (saves 8 B per node vs `usize`); 4 GiB
-/// per chunk is plenty for any unikernel workload. `Send` by
+/// Heap-owned byte storage. Bytes only; the visible `(offset, len)`
+/// window is tracked on the outer `IOBuf` / `OwnedIOBuf`. `Send` by
 /// auto-derivation — a `Box<[u8]>` is exclusively owned.
 pub struct HeapStorage {
     storage: Box<[u8]>,
-    offset: u32,
-    len: u32,
 }
 
 impl HeapStorage {
-    /// Wrap an owned `Box<[u8]>` with the visible payload at
-    /// `[offset..offset+len]`.
-    pub(crate) fn new(storage: Box<[u8]>, offset: u32, len: u32) -> Self {
-        debug_assert!(offset as usize + len as usize <= storage.len());
-        HeapStorage {
-            storage,
-            offset,
-            len,
-        }
+    /// Wrap an owned `Box<[u8]>`. The visible window is set by the
+    /// outer `IOBuf` / `OwnedIOBuf`.
+    pub(crate) fn new(storage: Box<[u8]>) -> Self {
+        HeapStorage { storage }
     }
 
-    pub(crate) fn data_mut(&mut self) -> Option<&mut [u8]> {
-        let o = self.offset as usize;
-        let l = self.len as usize;
-        Some(&mut self.storage[o..o + l])
-    }
-
-    pub(crate) fn prepend(&mut self, data: &[u8]) -> Result<(), IOBufError> {
-        let n = data.len();
-        if n > self.offset as usize {
-            return Err(IOBufError::NoHeadroom);
-        }
-        let new_offset = self.offset - n as u32;
-        self.storage[new_offset as usize..self.offset as usize].copy_from_slice(data);
-        self.offset = new_offset;
-        self.len += n as u32;
-        Ok(())
-    }
-
-    pub(crate) fn append_slice(&mut self, data: &[u8]) -> Result<(), IOBufError> {
-        let end = self.offset as usize + self.len as usize;
-        let n = data.len();
-        if end + n > self.storage.len() {
-            return Err(IOBufError::NoTailroom);
-        }
-        self.storage[end..end + n].copy_from_slice(data);
-        self.len += n as u32;
-        Ok(())
-    }
-
-    pub(crate) fn extend_uninit(&mut self, n: usize) -> Result<&mut [u8], IOBufError> {
-        let end = self.offset as usize + self.len as usize;
-        if end + n > self.storage.len() {
-            return Err(IOBufError::NoTailroom);
-        }
-        self.len += n as u32;
-        Ok(&mut self.storage[end..end + n])
-    }
-
-    pub(crate) fn consume(&mut self, n: usize) -> Result<(), IOBufError> {
-        if n > self.len as usize {
-            return Err(IOBufError::OutOfBounds);
-        }
-        self.offset += n as u32;
-        self.len -= n as u32;
-        Ok(())
-    }
-
-    pub(crate) fn trim_end(&mut self, n: usize) -> Result<(), IOBufError> {
-        if n > self.len as usize {
-            return Err(IOBufError::OutOfBounds);
-        }
-        self.len -= n as u32;
-        Ok(())
-    }
-}
-
-impl IOBufRead for HeapStorage {
+    /// Total bytes of the storage.
     #[inline]
-    fn data(&self) -> &[u8] {
-        let o = self.offset as usize;
-        &self.storage[o..o + self.len as usize]
+    pub(crate) fn capacity(&self) -> usize {
+        self.storage.len()
     }
+
+    /// Full backing region.
     #[inline]
-    fn len(&self) -> usize {
-        self.len as usize
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.storage
     }
+
+    /// Mutable view of the full backing region. `Box<[u8]>` is
+    /// exclusively owned, so `&mut self` is enough.
     #[inline]
-    fn headroom(&self) -> usize {
-        self.offset as usize
-    }
-    #[inline]
-    fn tailroom(&self) -> usize {
-        self.storage
-            .len()
-            .saturating_sub(self.offset as usize + self.len as usize)
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.storage
     }
 }
 
@@ -160,8 +90,12 @@ impl IOBufRead for HeapStorage {
 /// Borrowed reference to static-lifetime bytes. Immutable; no
 /// headroom / tailroom semantics. Common for HTML literal chunks,
 /// the QPACK static table, etc. `Send` (a `&'static [u8]` is an
-/// immortal borrow) — but it is deliberately *not* part of
-/// `OwnedIOBuf`: it is a view, not owned storage.
+/// immortal borrow).
+///
+/// Unlike the other variants, `StaticView`'s slice IS its view —
+/// `consume`/`trim_end` slide the slice reference rather than an
+/// outer `(offset, len)`, keeping headroom/tailroom permanently 0
+/// (you cannot prepend or append onto a static borrow).
 pub struct StaticView {
     data: &'static [u8],
 }
@@ -171,51 +105,34 @@ impl StaticView {
         StaticView { data }
     }
 
-    /// Always `None` — static borrows are immutable.
-    pub(crate) fn data_mut(&mut self) -> Option<&mut [u8]> {
-        None
+    #[inline]
+    pub(crate) fn data(&self) -> &[u8] {
+        self.data
     }
-    pub(crate) fn prepend(&mut self, _data: &[u8]) -> Result<(), IOBufError> {
-        Err(IOBufError::Immutable)
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.data.len()
     }
-    pub(crate) fn append_slice(&mut self, _data: &[u8]) -> Result<(), IOBufError> {
-        Err(IOBufError::Immutable)
-    }
-    pub(crate) fn extend_uninit(&mut self, _n: usize) -> Result<&mut [u8], IOBufError> {
-        Err(IOBufError::Immutable)
-    }
-    pub(crate) fn consume(&mut self, n: usize) -> Result<(), IOBufError> {
+
+    /// Slide the slice forward, dropping the first `n` bytes from
+    /// the view. Returns `Err(OutOfBounds)` past the end.
+    pub(crate) fn consume(&mut self, n: usize) -> Result<(), crate::IOBufError> {
         if n > self.data.len() {
-            return Err(IOBufError::OutOfBounds);
+            return Err(crate::IOBufError::OutOfBounds);
         }
         self.data = &self.data[n..];
         Ok(())
     }
-    pub(crate) fn trim_end(&mut self, n: usize) -> Result<(), IOBufError> {
+
+    /// Shrink the slice from the back by `n` bytes. Returns
+    /// `Err(OutOfBounds)` past the end.
+    pub(crate) fn trim_end(&mut self, n: usize) -> Result<(), crate::IOBufError> {
         if n > self.data.len() {
-            return Err(IOBufError::OutOfBounds);
+            return Err(crate::IOBufError::OutOfBounds);
         }
         self.data = &self.data[..self.data.len() - n];
         Ok(())
-    }
-}
-
-impl IOBufRead for StaticView {
-    #[inline]
-    fn data(&self) -> &[u8] {
-        self.data
-    }
-    #[inline]
-    fn len(&self) -> usize {
-        self.data.len()
-    }
-    #[inline]
-    fn headroom(&self) -> usize {
-        0
-    }
-    #[inline]
-    fn tailroom(&self) -> usize {
-        0
     }
 }
 
@@ -226,9 +143,10 @@ impl IOBufRead for StaticView {
 /// Externally-owned buffer with a drop callback. Canonical use
 /// cases: NIC zero-copy RX (callback returns the descriptor to the
 /// receive ring) and pool-backed buffers (callback pushes a slab
-/// back to a free list). Same offset/len semantics as
-/// [`HeapStorage`]; the storage isn't dropped — the callback fires
-/// instead, exactly once, with the original `(base, capacity)`.
+/// back to a free list). Bytes only — the visible `(offset, len)`
+/// window lives on the outer `IOBuf` / `OwnedIOBuf`. The storage
+/// isn't dropped — the callback fires instead, exactly once, with
+/// the original `(base, capacity)`.
 ///
 /// This is the genuine leaf where a raw region + drop_fn's
 /// thread-safety is asserted (see the `unsafe impl Send` below) —
@@ -237,13 +155,8 @@ pub struct ExternalOwned {
     /// Start of the underlying region.
     base: NonNull<u8>,
     /// Total bytes of the region (`base + capacity` is one past the
-    /// end). The visible payload is at `[offset..offset+len]`.
+    /// end). The visible window is set by the outer IOBuf.
     capacity: u32,
-    /// Visible-payload start, relative to `base`. `prepend` shrinks
-    /// it toward 0; `consume` grows it toward `offset + len`.
-    offset: u32,
-    /// Visible-payload byte length.
-    len: u32,
     /// Release callback — always present for `ExternalOwned`
     /// (borrowed views with no callback are [`BorrowedView`]).
     drop_fn: IOBufDropFn,
@@ -265,123 +178,34 @@ pub struct ExternalOwned {
 unsafe impl Send for ExternalOwned {}
 
 impl ExternalOwned {
-    /// Construct from the raw `(base, capacity, offset, len)` plus
-    /// the release callback. The caller's safety contract is the
+    /// Construct from the raw `(base, capacity)` plus the release
+    /// callback. The caller's safety contract is the
     /// `IOBuf::wrap_owned` / `OwnedIOBuf::wrap_owned` doc.
     pub(crate) fn new(
         base: NonNull<u8>,
         capacity: u32,
-        offset: u32,
-        len: u32,
         drop_fn: IOBufDropFn,
         drop_ctx: *mut (),
     ) -> Self {
-        debug_assert!(offset.saturating_add(len) <= capacity);
         ExternalOwned {
             base,
             capacity,
-            offset,
-            len,
             drop_fn,
             drop_ctx,
         }
     }
 
-    pub(crate) fn data_mut(&mut self) -> Option<&mut [u8]> {
-        // SAFETY: base + offset is in-bounds (offset + len <=
-        // capacity, the construction precondition); the region is
-        // exclusively owned by this IOBuf, and `&mut self` gives
-        // exclusive write access for this call.
-        Some(unsafe {
-            core::slice::from_raw_parts_mut(
-                self.base.as_ptr().add(self.offset as usize),
-                self.len as usize,
-            )
-        })
-    }
-
-    pub(crate) fn prepend(&mut self, data: &[u8]) -> Result<(), IOBufError> {
-        let n = data.len();
-        if n > self.offset as usize {
-            return Err(IOBufError::NoHeadroom);
-        }
-        let new_offset = self.offset - n as u32;
-        // SAFETY: bounds checked above; exclusive access via `&mut self`.
-        unsafe {
-            core::slice::from_raw_parts_mut(self.base.as_ptr().add(new_offset as usize), n)
-                .copy_from_slice(data);
-        }
-        self.offset = new_offset;
-        self.len += n as u32;
-        Ok(())
-    }
-
-    pub(crate) fn append_slice(&mut self, data: &[u8]) -> Result<(), IOBufError> {
-        let end = self.offset as usize + self.len as usize;
-        let n = data.len();
-        if end + n > self.capacity as usize {
-            return Err(IOBufError::NoTailroom);
-        }
-        // SAFETY: bounds checked above; exclusive access via `&mut self`.
-        unsafe {
-            core::slice::from_raw_parts_mut(self.base.as_ptr().add(end), n).copy_from_slice(data);
-        }
-        self.len += n as u32;
-        Ok(())
-    }
-
-    pub(crate) fn extend_uninit(&mut self, n: usize) -> Result<&mut [u8], IOBufError> {
-        let end = self.offset as usize + self.len as usize;
-        if end + n > self.capacity as usize {
-            return Err(IOBufError::NoTailroom);
-        }
-        self.len += n as u32;
-        // SAFETY: bounds checked above; exclusive access via `&mut self`.
-        Ok(unsafe { core::slice::from_raw_parts_mut(self.base.as_ptr().add(end), n) })
-    }
-
-    pub(crate) fn consume(&mut self, n: usize) -> Result<(), IOBufError> {
-        if n > self.len as usize {
-            return Err(IOBufError::OutOfBounds);
-        }
-        self.offset += n as u32;
-        self.len -= n as u32;
-        Ok(())
-    }
-
-    pub(crate) fn trim_end(&mut self, n: usize) -> Result<(), IOBufError> {
-        if n > self.len as usize {
-            return Err(IOBufError::OutOfBounds);
-        }
-        self.len -= n as u32;
-        Ok(())
-    }
-}
-
-impl IOBufRead for ExternalOwned {
+    /// Total bytes of the foreign region.
     #[inline]
-    fn data(&self) -> &[u8] {
-        // SAFETY: base + offset is in-bounds by the construction
-        // precondition (offset + len <= capacity); the memory is
-        // exclusively owned by this IOBuf for its lifetime.
-        unsafe {
-            core::slice::from_raw_parts(
-                self.base.as_ptr().add(self.offset as usize),
-                self.len as usize,
-            )
-        }
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity as usize
     }
+
+    /// Start of the foreign region. Outer-type methods compute
+    /// `base.add(offset)` for the visible window.
     #[inline]
-    fn len(&self) -> usize {
-        self.len as usize
-    }
-    #[inline]
-    fn headroom(&self) -> usize {
-        self.offset as usize
-    }
-    #[inline]
-    fn tailroom(&self) -> usize {
-        (self.capacity as usize).saturating_sub(self.offset as usize + self.len as usize)
+    pub(crate) fn base(&self) -> NonNull<u8> {
+        self.base
     }
 }
 
@@ -408,17 +232,16 @@ impl Drop for ExternalOwned {
 /// per-conn stack-resident header arrays, a `&[u8]` borrowed for one
 /// async send.
 ///
-/// `!Send` via the `PhantomData<*const ()>` — the borrow contract is
-/// per-worker / per-stack-frame, and this `!Send`-ness propagates
-/// through `IOBuf`'s enum so a borrowed view *cannot* reach a
-/// cross-core path. The cross-core path is typed `OwnedIOBuf`, which
-/// has no `BorrowedView` variant — a compile-time guarantee, not a
-/// human-maintained invariant.
+/// Bytes only — the visible `(offset, len)` window lives on the
+/// outer `IOBuf`. `!Send` via the `PhantomData<*const ()>` — the
+/// borrow contract is per-worker / per-stack-frame, and this
+/// `!Send`-ness propagates through `IOBuf`'s enum so a borrowed view
+/// *cannot* reach a cross-core path. The cross-core path is typed
+/// `OwnedIOBuf`, which has no `BorrowedView` variant — a compile-
+/// time guarantee, not a human-maintained invariant.
 pub struct BorrowedView {
     base: NonNull<u8>,
     capacity: u32,
-    offset: u32,
-    len: u32,
     /// Makes `BorrowedView` (and therefore `IOBuf`) `!Send + !Sync`.
     _not_send: PhantomData<*const ()>,
     /// Test-mode aliasing-tracker registration guard. The field is
@@ -428,117 +251,29 @@ pub struct BorrowedView {
 }
 
 impl BorrowedView {
-    /// Construct a view over `[base..base+capacity)` with the
-    /// visible payload at `[offset..offset+len]`. The caller's
+    /// Construct a view over `[base..base+capacity)`. The caller's
     /// safety contract is the `IOBuf::borrow` doc.
-    pub(crate) fn new(base: NonNull<u8>, capacity: u32, offset: u32, len: u32) -> Self {
-        debug_assert!(offset.saturating_add(len) <= capacity);
+    pub(crate) fn new(base: NonNull<u8>, capacity: u32) -> Self {
         BorrowedView {
             base,
             capacity,
-            offset,
-            len,
             _not_send: PhantomData,
             #[cfg(test)]
             _guard: BorrowGuard::new(base, capacity),
         }
     }
 
-    pub(crate) fn data_mut(&mut self) -> Option<&mut [u8]> {
-        // SAFETY: the `borrow` caller guaranteed the region is not
-        // concurrently mutated through any other route; `&mut self`
-        // gives exclusive write access for this call.
-        Some(unsafe {
-            core::slice::from_raw_parts_mut(
-                self.base.as_ptr().add(self.offset as usize),
-                self.len as usize,
-            )
-        })
-    }
-
-    pub(crate) fn prepend(&mut self, data: &[u8]) -> Result<(), IOBufError> {
-        let n = data.len();
-        if n > self.offset as usize {
-            return Err(IOBufError::NoHeadroom);
-        }
-        let new_offset = self.offset - n as u32;
-        // SAFETY: bounds checked above; exclusive access via `&mut
-        // self`; `borrow` caller guaranteed no concurrent mutation.
-        unsafe {
-            core::slice::from_raw_parts_mut(self.base.as_ptr().add(new_offset as usize), n)
-                .copy_from_slice(data);
-        }
-        self.offset = new_offset;
-        self.len += n as u32;
-        Ok(())
-    }
-
-    pub(crate) fn append_slice(&mut self, data: &[u8]) -> Result<(), IOBufError> {
-        let end = self.offset as usize + self.len as usize;
-        let n = data.len();
-        if end + n > self.capacity as usize {
-            return Err(IOBufError::NoTailroom);
-        }
-        // SAFETY: bounds checked above; exclusive access; `borrow`
-        // caller guaranteed no concurrent mutation.
-        unsafe {
-            core::slice::from_raw_parts_mut(self.base.as_ptr().add(end), n).copy_from_slice(data);
-        }
-        self.len += n as u32;
-        Ok(())
-    }
-
-    pub(crate) fn extend_uninit(&mut self, n: usize) -> Result<&mut [u8], IOBufError> {
-        let end = self.offset as usize + self.len as usize;
-        if end + n > self.capacity as usize {
-            return Err(IOBufError::NoTailroom);
-        }
-        self.len += n as u32;
-        // SAFETY: bounds checked above; exclusive access via `&mut self`.
-        Ok(unsafe { core::slice::from_raw_parts_mut(self.base.as_ptr().add(end), n) })
-    }
-
-    pub(crate) fn consume(&mut self, n: usize) -> Result<(), IOBufError> {
-        if n > self.len as usize {
-            return Err(IOBufError::OutOfBounds);
-        }
-        self.offset += n as u32;
-        self.len -= n as u32;
-        Ok(())
-    }
-
-    pub(crate) fn trim_end(&mut self, n: usize) -> Result<(), IOBufError> {
-        if n > self.len as usize {
-            return Err(IOBufError::OutOfBounds);
-        }
-        self.len -= n as u32;
-        Ok(())
-    }
-}
-
-impl IOBufRead for BorrowedView {
+    /// Total bytes of the borrowed region.
     #[inline]
-    fn data(&self) -> &[u8] {
-        // SAFETY: the `borrow` caller guaranteed the region is valid
-        // for this IOBuf's lifetime and not concurrently mutated.
-        unsafe {
-            core::slice::from_raw_parts(
-                self.base.as_ptr().add(self.offset as usize),
-                self.len as usize,
-            )
-        }
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity as usize
     }
+
+    /// Start of the borrowed region. Outer-type methods compute
+    /// `base.add(offset)` for the visible window.
     #[inline]
-    fn len(&self) -> usize {
-        self.len as usize
-    }
-    #[inline]
-    fn headroom(&self) -> usize {
-        self.offset as usize
-    }
-    #[inline]
-    fn tailroom(&self) -> usize {
-        (self.capacity as usize).saturating_sub(self.offset as usize + self.len as usize)
+    pub(crate) fn base(&self) -> NonNull<u8> {
+        self.base
     }
 }
 
