@@ -525,11 +525,6 @@ pub(super) static NATIVE_TCP_BACKEND: executor::reactor::TcpBackend =
         do_recv: native_tcp_do_recv,
         register_recv_waker: native_tcp_register_recv_waker,
         clear_recv_waker: native_tcp_clear_recv_waker,
-        // Native (POSIX `recv`) already copies into the user buf in
-        // one shot at the syscall boundary — no benefit to wiring a
-        // bare-metal-style direct-copy slot. Leave both `None` and
-        // `TcpRecv::poll` falls through to `do_recv` after the
-        // wake.
         // Zero-copy chunk recv (RX items F/H). `do_recv_chunk` is
         // wired (not `None`) so `TcpStream::recv_chunk` resolves to
         // a real chunk on native — handlers get one uniform API

@@ -58,11 +58,10 @@ impl Drop for RxGuard {
 ///
 /// The chain — and the device RX buffer(s) it owns — drops at
 /// return; that drop reposts the buffer(s) to the NIC / pool.
-/// Payload bytes are copied out before then: into a parked
-/// `TcpRecv`'s direct-copy slot, with the rest into the per-conn
-/// ring. RX item D keeps the ring a `Box<[u8; 16384]>` — this commit
-/// is plumbing, the copy count is unchanged, only the input is now
-/// IOBuf-typed.
+/// Payload bytes are copied into the per-conn rx ring before then,
+/// or — when a `recv_chunk` consumer is parked and the ring is
+/// empty — the single-part device buffer is moved into
+/// `pending_chunk` zero-copy.
 pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf>) {
     // Cost instrumentation: bracket every exit (early-return paths
     // included) with a cycle-counter delta. Placed first so we
@@ -459,15 +458,15 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
     {
         if seq == c.rcv_nxt {
             // A parked `recv_chunk` consumer wants the payload as an
-            // owned IOBuf. When the ring is empty and no direct-copy
-            // `recv` slot is registered, *move* a single-part
-            // segment's device buffer straight into `pending_chunk`
-            // — zero copy, no `rx_ring` round-trip. Multi-part chains
-            // (item I's coalesced super-segments) and the ring-non-
-            // empty case fall through to the copy path, which keeps
-            // stream order: `pending_chunk` is only ever stashed when
-            // the ring is empty, so it holds the *oldest* unread
-            // bytes and `do_recv_chunk` drains it strictly first.
+            // owned IOBuf. When the ring is empty, *move* a single-
+            // part segment's device buffer straight into
+            // `pending_chunk` — zero copy, no `rx_ring` round-trip.
+            // Multi-part chains (item I's coalesced super-segments)
+            // and the ring-non-empty case fall through to the copy
+            // path, which keeps stream order: `pending_chunk` is only
+            // ever stashed when the ring is empty, so it holds the
+            // *oldest* unread bytes and `do_recv_chunk` drains it
+            // strictly first.
             //
             // `chunk_wanted` is false unless a `recv_chunk` future is
             // parked, so a conn with only `recv` consumers never
