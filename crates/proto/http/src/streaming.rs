@@ -128,6 +128,19 @@ impl StreamingRequestParser {
     /// same request must reuse the same `Request` so the in-progress
     /// field cursors line up.
     pub(crate) fn feed(&mut self, req: &mut Request, bytes: &[u8]) -> FeedResult {
+        // Pin the parser-side contract: every `Done { consumed }` we
+        // return must satisfy `consumed <= bytes.len()`, otherwise
+        // the caller's `into_remainder(consumed).expect(...)` panics
+        // on something the parser produced. Debug-only — release
+        // builds trust the static argument.
+        let done = |consumed: usize| -> FeedResult {
+            debug_assert!(
+                consumed <= bytes.len(),
+                "parser returned consumed={consumed} > bytes.len()={}",
+                bytes.len(),
+            );
+            FeedResult::Done { consumed }
+        };
         let mut i = 0;
         while i < bytes.len() {
             let b = bytes[i];
@@ -186,7 +199,7 @@ impl StreamingRequestParser {
                     } else if b == b'\n' {
                         // Lone-LF blank line — end of headers.
                         self.finish_headers(req);
-                        return FeedResult::Done { consumed: i + 1 };
+                        return done(i + 1);
                     } else {
                         // First byte of a new header name. Start a
                         // header slot (if 16-cap not yet reached)
@@ -280,15 +293,15 @@ impl StreamingRequestParser {
                     // it doesn't validate the trailing \n strictly).
                     if b == b'\n' {
                         self.finish_headers(req);
-                        return FeedResult::Done { consumed: i + 1 };
+                        return done(i + 1);
                     } else {
                         self.finish_headers(req);
-                        return FeedResult::Done { consumed: i };
+                        return done(i);
                     }
                 }
                 State::Done => {
                     // Should not be re-entered without `reset`.
-                    return FeedResult::Done { consumed: i };
+                    return done(i);
                 }
             }
         }
