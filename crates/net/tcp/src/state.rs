@@ -180,6 +180,15 @@ pub(crate) const PERSIST_MAX_PROBES: u8 = 8;
 /// FIN still finds a TCB to re-acknowledge.
 pub(crate) const TIME_WAIT_MS: u64 = 60_000;
 
+/// Test-only fault-injection: armed via `store(true)`, the next
+/// `rtx_push` `swap`s it back to `false` and forces the OOM branch
+/// instead of the real `try_reserve`. Lets the conformance harness
+/// exercise the `rtx_alloc_failed` flow without manipulating the
+/// global allocator. Production builds compile this out.
+#[cfg(test)]
+pub(crate) static FAIL_RTX_PUSH_ONCE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// One entry in the per-conn retransmit queue — the payload bytes of
 /// a single outbound TCP segment plus the RFC 6298 / 9293 bookkeeping
 /// needed to retransmit it on RTO expiry. The IOBuf is owned (heap-
@@ -683,6 +692,17 @@ impl TcpConnection {
         len: u16,
         now_ms: u64,
     ) -> bool {
+        // Test-only fault-injection: force the OOM branch to fire on
+        // the next push so the OOM scenarios can exercise the
+        // `rtx_alloc_failed` flow without manipulating the real
+        // allocator. `swap` resets it so each `set` arms one push.
+        #[cfg(test)]
+        if crate::state::FAIL_RTX_PUSH_ONCE
+            .swap(false, core::sync::atomic::Ordering::Relaxed)
+        {
+            self.rtx_alloc_failed = true;
+            return false;
+        }
         if self.rtx_queue.try_reserve(1).is_err() {
             self.rtx_alloc_failed = true;
             return false;

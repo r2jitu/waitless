@@ -3158,3 +3158,110 @@ fn rtx_ack_cumulative_drains_multiple() {
     panic!("no live connection for ports {CP} -> {SP}");
 }
 
+
+/// An `rtx_push` heap-OOM suspends retransmit coverage: the queue
+/// clears, the `rtx_alloc_failed` flag latches, subsequent sends
+/// while the flag is set don't grow the queue (they still go on the
+/// wire, since the segment data is already committed at the caller),
+/// and the flag clears only once the peer's ACKs drain the unacked
+/// window back to empty (`snd_una == snd_nxt`). Mirrors the
+/// `rtx_overflow` semantics the deleted `rtx_buf` path had.
+///
+/// `FAIL_RTX_PUSH_ONCE` is a cfg(test) fault-injection knob that
+/// forces the next `rtx_push` to take the OOM branch — the real
+/// `try_reserve` failure is hard to provoke without manipulating
+/// the global allocator.
+#[test]
+fn rtx_push_oom_suspends_coverage_until_full_drain() {
+    use core::sync::atomic::Ordering;
+    let _g = harness();
+    const SP: u16 = 9186;
+    const CP: u16 = 50186;
+    const CLIENT_ISN: u32 = 0xF860;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    let fail_before = super::diag::COUNTERS.rtx_alloc_fail.get();
+
+    // Send one batch normally so the queue has bytes the OOM path
+    // is going to discard.
+    let body1 = vec![0xA1u8; 1000];
+    let mut chain = iobuf::IOBufChain::from(body1.clone());
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(sent, 1000);
+    assert_eq!(conn_rtx_queue_bytes(CP, SP).len(), 1000);
+    assert!(!conn_rtx_alloc_failed(CP, SP));
+
+    // Arm the OOM injector and do a second send. `rtx_retain` calls
+    // `rtx_push`, which forces the OOM branch → record_rtx_alloc_fail
+    // fires, queue clears, flag latches.
+    crate::state::FAIL_RTX_PUSH_ONCE.store(true, Ordering::Relaxed);
+    let body2 = vec![0xB2u8; 500];
+    let mut chain = iobuf::IOBufChain::from(body2);
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(sent, 500, "the bytes still went on the wire");
+    assert!(conn_rtx_alloc_failed(CP, SP), "OOM latched the flag");
+    assert!(
+        conn_rtx_queue_bytes(CP, SP).is_empty(),
+        "the OOM path cleared the queue",
+    );
+    assert_eq!(
+        super::diag::COUNTERS.rtx_alloc_fail.get(),
+        fail_before + 1,
+        "the rtx_alloc_fail counter advanced",
+    );
+    assert!(
+        super::diag::LAST_RTX_ALLOC_FAIL.snapshot().1.is_some(),
+        "LAST_RTX_ALLOC_FAIL recorded the event",
+    );
+
+    // A third send while the flag is set still puts bytes on the wire
+    // but contributes nothing to the queue (rtx_retain's early return).
+    let body3 = vec![0xC3u8; 200];
+    let mut chain = iobuf::IOBufChain::from(body3);
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(sent, 200);
+    assert!(conn_rtx_queue_bytes(CP, SP).is_empty(), "queue still empty");
+    assert!(conn_rtx_alloc_failed(CP, SP), "flag still latched");
+
+    // Peer must ACK everything sent (1000 + 500 + 200) before the flag
+    // can clear. A partial ACK leaves the flag set.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1 + 1000),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert!(
+        conn_rtx_alloc_failed(CP, SP),
+        "partial ACK does not clear the flag",
+    );
+
+    // Full drain — snd_una catches snd_nxt → flag clears, backoff and
+    // RTO reset.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1 + 1700),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert!(
+        !conn_rtx_alloc_failed(CP, SP),
+        "full drain clears the flag",
+    );
+
+    // Coverage is re-engaged: the next send pushes to the queue
+    // normally.
+    let body4 = vec![0xD4u8; 300];
+    let mut chain = iobuf::IOBufChain::from(body4.clone());
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(sent, 300);
+    assert_eq!(conn_rtx_queue_bytes(CP, SP), body4);
+}
