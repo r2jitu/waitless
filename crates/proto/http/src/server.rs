@@ -352,3 +352,146 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod serve_conn_tests {
+    use super::serve_conn;
+    use crate::body::BodyReader;
+    use crate::request::Request;
+    use crate::response::Response;
+    use crate::stream::HttpStream;
+    use alloc::collections::VecDeque;
+    use alloc::rc::Rc;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use iobuf::{IOBuf, IOBufChain};
+    use waitless::runtime::RecvChunkGuard;
+
+    /// Pre-canned-chunk transport. `recv_chunk` pops the next entry
+    /// from `chunks` (`Some(bytes)` -> wrap in a guard, `None` ->
+    /// signal EOF so `serve_conn` returns via the `peer_eof` arm);
+    /// `send` appends every part to `sent`. Both fields are shared
+    /// via `Rc<RefCell<_>>` so the test can read `sent` back after
+    /// the future has consumed the stream by value.
+    struct MockStream {
+        chunks: Rc<RefCell<VecDeque<Option<Vec<u8>>>>>,
+        sent: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl HttpStream for MockStream {
+        async fn recv(&mut self, _: &mut [u8]) -> usize {
+            unreachable!("serve_conn's HEAD path is on recv_chunk; handler reads no body");
+        }
+        async fn recv_chunk(&mut self) -> Option<RecvChunkGuard<'_>> {
+            match self.chunks.borrow_mut().pop_front() {
+                Some(Some(bytes)) => Some(RecvChunkGuard::new(IOBuf::from(bytes))),
+                Some(None) | None => None,
+            }
+        }
+        async fn send(&mut self, chain: &mut IOBufChain) -> Result<(), ()> {
+            let mut sent = self.sent.borrow_mut();
+            while let Some(part) = chain.pop_front() {
+                sent.extend_from_slice(part.data());
+            }
+            Ok(())
+        }
+    }
+
+    /// Single-poll driver. Every await this test exercises resolves
+    /// Ready on first poll: `MockStream` methods are inline-Ready
+    /// `async fn`s, and `select(fut, sleep)` inside `timeout_us`
+    /// short-circuits to Ready before the sleep's waker dance fires.
+    fn block_on<F: Future>(mut fut: F) -> F::Output {
+        fn noop(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VTABLE)
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        // SAFETY: `fut` is a local that is not moved again before
+        // the poll below.
+        let fut = unsafe { Pin::new_unchecked(&mut fut) };
+        match fut.poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("future pended unexpectedly"),
+        }
+    }
+
+    async fn ok_handler(_: &Request, _: &mut BodyReader<'_, MockStream>) -> Response {
+        Response::ok(b"text/plain".as_slice(), b"OK".as_slice())
+    }
+
+    /// Engineered two-chunk pipelined burst that forces the spill arm:
+    /// chunk 1 lands a 5999-byte partial header; chunk 2 (10554 bytes)
+    /// completes that header and carries a second pipelined request,
+    /// overflowing `BUF_SIZE - 5999 = 10385` by 169 bytes. Without the
+    /// spill the second chunk would be rejected as
+    /// `header_buffer_overflow` and the second response would never
+    /// ship. With it: both responses ship; `chunk_spill_hits` ticks
+    /// exactly once.
+    #[test]
+    fn spill_carries_chunk_overflow_into_next_iteration() {
+        const BUF_SIZE: usize = 16 * 1024;
+
+        let mut part1: Vec<u8> = b"GET /a HTTP/1.1\r\nHost: x\r\n".to_vec();
+        while part1.len() < 5999 {
+            part1.extend_from_slice(b"X-A: a\r\n");
+        }
+        part1.truncate(5999);
+
+        let mut req2: Vec<u8> = b"GET /b HTTP/1.1\r\nHost: x\r\nX-Big: ".to_vec();
+        req2.extend(core::iter::repeat_n(b'a', 10500));
+        req2.extend_from_slice(b"\r\n\r\n");
+        let mut part2: Vec<u8> = b"X-End: y\r\n\r\n".to_vec();
+        part2.extend_from_slice(&req2);
+
+        let space = BUF_SIZE - part1.len();
+        assert!(part2.len() > space, "test must overflow by design");
+
+        let chunks = Rc::new(RefCell::new(VecDeque::from([
+            Some(part1),
+            Some(part2),
+            None,
+        ])));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+
+        let before_spill = crate::diag::COUNTERS.chunk_spill_hits.get();
+        let before_parsed = crate::diag::COUNTERS.requests_parsed.get();
+        let before_sent = crate::diag::COUNTERS.responses_sent.get();
+
+        let mock = MockStream {
+            chunks: Rc::clone(&chunks),
+            sent: Rc::clone(&sent),
+        };
+        let handler = Arc::new(ok_handler);
+        block_on(serve_conn(handler, mock));
+
+        assert_eq!(
+            crate::diag::COUNTERS.chunk_spill_hits.get() - before_spill,
+            1,
+            "spill arm should fire exactly once on the engineered burst",
+        );
+        assert_eq!(
+            crate::diag::COUNTERS.requests_parsed.get() - before_parsed,
+            2,
+            "both pipelined requests should parse",
+        );
+        assert_eq!(
+            crate::diag::COUNTERS.responses_sent.get() - before_sent,
+            2,
+            "both responses should ship",
+        );
+
+        let sent_bytes = sent.borrow();
+        let count = sent_bytes
+            .windows(b"HTTP/1.1 200 OK".len())
+            .filter(|w| *w == b"HTTP/1.1 200 OK")
+            .count();
+        assert_eq!(count, 2, "expected 2 200-OK response lines in sent bytes");
+    }
+}
