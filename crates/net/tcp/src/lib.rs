@@ -74,6 +74,6 @@ pub(crate) use pool::{conn_ptr, encode_handle, free_connection, pool_capacity};
 pub(crate) use send::TCP_HDR_LEN;
 #[cfg(test)]
 pub(crate) use state::{
-    FIN_RETX_MAX, PERSIST_MAX_PROBES, RTO_INITIAL_MS, RTO_MAX_MS, RTX_BUF_BYTES, TCP_ACK, TCP_FIN,
-    TCP_PSH, TCP_RST, TCP_SYN, TIME_WAIT_MS, TcpHeader,
+    FIN_RETX_MAX, PERSIST_MAX_PROBES, RTO_INITIAL_MS, RTO_MAX_MS, TCP_ACK, TCP_FIN, TCP_PSH,
+    TCP_RST, TCP_SYN, TIME_WAIT_MS, TcpHeader,
 };

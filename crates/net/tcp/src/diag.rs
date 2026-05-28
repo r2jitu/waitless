@@ -85,9 +85,10 @@ pub struct Counters {
     /// A SYN was refused because the per-conn RX ring could not be
     /// heap-allocated. Heap exhaustion — genuinely unexpected.
     pub rx_ring_oom: Counter,
-    /// A send could not grow the per-conn retransmit ring — heap
-    /// exhaustion. Retransmit coverage is suspended (`rtx_overflow`)
-    /// until the unacked window drains. Genuinely unexpected.
+    /// A send could not grow the per-conn retransmit queue — heap
+    /// exhaustion. Retransmit coverage is suspended
+    /// (`rtx_alloc_failed`) until the unacked window drains.
+    /// Genuinely unexpected.
     pub rtx_buf_oom: Counter,
 
     // ── Retransmission ───────────────────────────────────────────

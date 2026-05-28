@@ -2064,11 +2064,12 @@ fn send_window_tracks_cwnd_after_rto() {
     );
 }
 
-/// A multi-hundred-KB transfer never trips `rtx_overflow`: the send
-/// window keeps in-flight bytes at or below the 64 KiB retransmit
-/// ring, so the ring always covers `[snd_una, snd_nxt)`.
+/// A multi-hundred-KB transfer never trips the OOM coverage-suspend
+/// flag: each `async_try_send_chain` call drains some prefix and
+/// pushes one queue entry, the peer fully ACKs it, the entry drops,
+/// and the loop repeats. `rtx_alloc_failed` stays false throughout.
 #[test]
-fn large_send_never_triggers_rtx_overflow() {
+fn large_send_never_triggers_rtx_alloc_failed() {
     let _g = harness();
     const SP: u16 = 9139;
     const CP: u16 = 50139;
@@ -2085,12 +2086,8 @@ fn large_send_never_triggers_rtx_overflow() {
     loop {
         let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
         assert!(
-            sent <= RTX_BUF_BYTES,
-            "a single window never exceeds the retransmit ring",
-        );
-        assert!(
-            !conn_rtx_overflow(CP, SP),
-            "the retransmit ring never loses coverage of the unacked window",
+            !conn_rtx_alloc_failed(CP, SP),
+            "the queue never failed to allocate over the multi-hundred-KB transfer",
         );
         if sent == 0 {
             break;
@@ -2371,11 +2368,12 @@ fn tso_send_is_retransmittable_on_rto() {
 }
 
 /// A response that mixes a TSO send and a chain send keeps the
-/// retransmit ring consistent. An ACK covering only the TSO bytes
+/// retransmit queue consistent. An ACK covering only the TSO bytes
 /// advances `snd_una` past them; the RTO retransmit then resumes at
-/// the still-unacked chain bytes. Before TSO retain coverage the ring
-/// desynced — TSO bytes advanced `snd_nxt` without entering it, so
-/// `rtx_on_ack`'s `min(acked, rtx_len)` dropped live chain bytes.
+/// the still-unacked chain bytes. Before TSO retain coverage the
+/// queue desynced — TSO bytes advanced `snd_nxt` without entering
+/// it, so `rtx_on_ack`'s `min(acked, rtx_bytes_in_flight)` dropped
+/// live chain bytes.
 #[test]
 fn tso_then_chain_rtx_stays_consistent() {
     let _g = harness();
@@ -2645,8 +2643,8 @@ fn lossy_windowed_transfer_completes() {
         "every byte of the lossy transfer was ultimately delivered",
     );
     assert!(
-        !conn_rtx_overflow(CP, SP),
-        "the retransmit ring stayed consistent through the loss",
+        !conn_rtx_alloc_failed(CP, SP),
+        "the retransmit queue stayed consistent through the loss",
     );
     let (cwnd_after, _) = conn_cwnd_ssthresh(CP, SP);
     assert!(
@@ -2805,10 +2803,10 @@ fn conn_cwnd_ssthresh(client_port: u16, server_port: u16) -> (u32, u32) {
     panic!("no live connection for ports {client_port} -> {server_port}");
 }
 
-/// `rtx_overflow` of the live connection for a client/server port
-/// pair — lets a scenario assert the retransmit ring never lost
-/// coverage of the unacked window.
-fn conn_rtx_overflow(client_port: u16, server_port: u16) -> bool {
+/// `rtx_alloc_failed` of the live connection for a client/server port
+/// pair — lets a scenario assert the retransmit queue never failed
+/// to grow under load.
+fn conn_rtx_alloc_failed(client_port: u16, server_port: u16) -> bool {
     let core = 0u32;
     let cap = pool_capacity(core);
     for i in 0..cap {
@@ -2819,7 +2817,7 @@ fn conn_rtx_overflow(client_port: u16, server_port: u16) -> bool {
             && c.local_port == server_port
             && c.remote_port == client_port
         {
-            return c.rtx_overflow;
+            return c.rtx_alloc_failed;
         }
     }
     panic!("no live connection for ports {client_port} -> {server_port}");
@@ -2898,14 +2896,10 @@ fn enter_timewait(server_port: u16, client_port: u16, client_isn: u32) -> u32 {
     server_isn
 }
 
-// ---- rtx_queue scaffolding ---------------------------------------------
+// ---- rtx_queue per-entry behaviour --------------------------------------
 //
-// The rtx_queue methods on `TcpConnection` are dead code today (the
-// send / ACK / RTO paths still drive `rtx_buf` exclusively). These
-// tests pin the queue's per-entry behaviour — head-pop, partial-narrow,
-// bytes-in-flight sum, deque-allocation preserved across reset — so
-// the follow-up commits that wire the send / ACK / RTO paths through
-// the queue are swapping a proven-equivalent implementation in.
+// Pin the queue's per-entry behaviour — head-pop, partial-narrow,
+// bytes-in-flight sum, deque-allocation preserved across reset.
 //
 // Driven through a real connection slot (via `handshake`) so the
 // per-core pool, the armed-timer list, and the mock clock are all
@@ -3000,39 +2994,6 @@ fn rtx_ack_pops_and_narrows() {
     panic!("no live connection for ports {CP} -> {SP}");
 }
 
-/// Collect the live connection's `rtx_buf` bytes (the unacked window,
-/// in wire order) into a flat `Vec`. Reads `rtx_buf[rtx_head..]` with
-/// wrap, capped at `rtx_len`. The dual-write equivalence harness
-/// compares this against the rtx_queue's concatenated entry payloads.
-fn conn_rtx_buf_bytes(client_port: u16, server_port: u16) -> Vec<u8> {
-    let core = 0u32;
-    let cap = pool_capacity(core);
-    for i in 0..cap {
-        let c = unsafe { &*conn_ptr(core, i) };
-        if c.state != crate::state::TcpState::Closed
-            && c.state != crate::state::TcpState::Listen
-            && c.local_port == server_port
-            && c.remote_port == client_port
-        {
-            let Some(buf) = c.rtx_buf.as_ref() else {
-                return Vec::new();
-            };
-            let head = c.rtx_head as usize;
-            let len = c.rtx_len as usize;
-            let mut out = Vec::with_capacity(len);
-            if head + len <= crate::state::RTX_BUF_BYTES {
-                out.extend_from_slice(&buf[head..head + len]);
-            } else {
-                let first = crate::state::RTX_BUF_BYTES - head;
-                out.extend_from_slice(&buf[head..]);
-                out.extend_from_slice(&buf[..len - first]);
-            }
-            return out;
-        }
-    }
-    panic!("no live connection for ports {client_port} -> {server_port}");
-}
-
 /// Collect the live connection's `rtx_queue` bytes (the unacked
 /// window, in wire order) into a flat `Vec`. Concatenates each
 /// entry's `iobuf.data()` from front to back — the queue holds
@@ -3057,12 +3018,11 @@ fn conn_rtx_queue_bytes(client_port: u16, server_port: u16) -> Vec<u8> {
     panic!("no live connection for ports {client_port} -> {server_port}");
 }
 
-/// Equivalence harness for commit 2 (dual-write): every send pushes
-/// the same bytes onto rtx_buf and rtx_queue. After a chain send the
-/// two byte streams must match exactly, including a partial chain
-/// send where the window only admits a prefix.
+/// Each send pushes one queue entry covering the bytes drained from
+/// the chain. The queue holds the unacked bytes in wire order, ready
+/// for the RTO path.
 #[test]
-fn dual_write_send_path_chain_matches_rtx_buf() {
+fn send_path_pushes_one_entry_per_chain_call() {
     let _g = harness();
     const SP: u16 = 9183;
     const CP: u16 = 50183;
@@ -3076,7 +3036,7 @@ fn dual_write_send_path_chain_matches_rtx_buf() {
     let mut chain = iobuf::IOBufChain::from(body1.clone());
     let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
     assert_eq!(sent, body1.len());
-    assert_eq!(conn_rtx_buf_bytes(CP, SP), conn_rtx_queue_bytes(CP, SP),);
+    assert_eq!(conn_rtx_queue_bytes(CP, SP), body1);
 
     // Second send: a multi-MSS chain. Still one rtx_retain call per
     // async_try_send_chain, so one queue entry covering the batch.
@@ -3084,7 +3044,6 @@ fn dual_write_send_path_chain_matches_rtx_buf() {
     let mut chain = iobuf::IOBufChain::from(body2.clone());
     let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
     assert_eq!(sent, body2.len());
-    assert_eq!(conn_rtx_buf_bytes(CP, SP), conn_rtx_queue_bytes(CP, SP),);
 
     // Sanity: the queue's bytes match the wire order — first byte is
     // body1[0], then body2 follows.
@@ -3094,12 +3053,11 @@ fn dual_write_send_path_chain_matches_rtx_buf() {
     assert_eq!(&queue_bytes[body1.len()..], &body2[..]);
 }
 
-/// Equivalence harness for the TSO retain path — `try_send_tso` calls
-/// `rtx_on_data_sent_slice` after sealing into a TX-pool slot, and
-/// the dual-write must produce the same bytes in rtx_buf and the
-/// queue.
+/// The TSO retain path — `try_send_tso` calls `rtx_on_data_sent_slice`
+/// after sealing into a TX-pool slot — pushes a queue entry carrying
+/// the same bytes as the TSO super-segment payload.
 #[test]
-fn dual_write_send_path_tso_matches_rtx_buf() {
+fn tso_send_path_pushes_super_segment_bytes() {
     let _g = harness();
     const SP: u16 = 9184;
     const CP: u16 = 50184;
@@ -3118,16 +3076,14 @@ fn dual_write_send_path_tso_matches_rtx_buf() {
         }),
         Some(Ok(2000)),
     );
-    assert_eq!(conn_rtx_buf_bytes(CP, SP), conn_rtx_queue_bytes(CP, SP));
     assert_eq!(conn_rtx_queue_bytes(CP, SP), body);
 }
 
-/// Equivalence harness for commit 3 (dual ACK): after a peer ACK,
-/// the rtx_buf window and rtx_queue concatenation must still agree
-/// byte-for-byte. Drives a chain send, peeks the equivalence pre-ACK,
-/// then partial-ACKs and full-ACKs to exercise both ack branches.
+/// An ACK pops fully-covered entries and narrows the head entry on a
+/// partial ACK; the queue continues to hold exactly the unacked bytes
+/// in wire order.
 #[test]
-fn dual_route_ack_path_keeps_queue_in_lockstep() {
+fn ack_path_drains_queue_in_wire_order() {
     let _g = harness();
     const SP: u16 = 9185;
     const CP: u16 = 50185;
@@ -3140,11 +3096,10 @@ fn dual_route_ack_path_keeps_queue_in_lockstep() {
     let mut chain = iobuf::IOBufChain::from(body.clone());
     let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
     assert_eq!(sent, body.len());
-    assert_eq!(conn_rtx_buf_bytes(CP, SP), conn_rtx_queue_bytes(CP, SP));
     assert_eq!(conn_rtx_queue_bytes(CP, SP).len(), body.len());
 
-    // Partial ACK: the peer acknowledges the first 2000 bytes of the
-    // unacked window. Both paths drop those bytes.
+    // Partial ACK: the peer acknowledges the first 2000 bytes — the
+    // head entry narrows forward, the rest stays queued in wire order.
     deliver(&Seg {
         src_port: CP,
         dst_port: SP,
@@ -3154,11 +3109,9 @@ fn dual_route_ack_path_keeps_queue_in_lockstep() {
         window: 65535,
         payload: Vec::new(),
     });
-    assert_eq!(conn_rtx_buf_bytes(CP, SP), conn_rtx_queue_bytes(CP, SP));
     assert_eq!(conn_rtx_queue_bytes(CP, SP), body[2000..]);
 
-    // Full ACK: the peer retires the rest of the window. Both paths
-    // empty.
+    // Full ACK: the queue empties.
     deliver(&Seg {
         src_port: CP,
         dst_port: SP,
@@ -3168,7 +3121,6 @@ fn dual_route_ack_path_keeps_queue_in_lockstep() {
         window: 65535,
         payload: Vec::new(),
     });
-    assert_eq!(conn_rtx_buf_bytes(CP, SP), conn_rtx_queue_bytes(CP, SP));
     assert!(conn_rtx_queue_bytes(CP, SP).is_empty());
 }
 

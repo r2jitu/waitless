@@ -592,7 +592,7 @@ impl TlsStream {
         // send gracefully (returns `Err(())` like any other TLS send
         // failure) instead of `arch_shutdown`-ing the unikernel via
         // Rust's default alloc-error handler. Mirrors the pattern in
-        // `tcp::state::ensure_rx_ring` / `ensure_rtx_buf`.
+        // `tcp::state::ensure_rx_ring` and the queue's `try_reserve`.
         if record_scratch.is_none() {
             let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
             if v.try_reserve_exact(TLS_RECORD_LEN).is_err() {

@@ -671,8 +671,8 @@ pub fn async_try_send_chain(
     // RFC 6298: retain the just-sent `sendable` bytes so the RTO
     // timer can retransmit them if their ACK never arrives, and
     // start the timer if it is not already running. A fresh cursor
-    // re-walks the chain from the front (one extra copy into
-    // `rtx_buf`) over exactly the prefix about to be drained.
+    // re-walks the chain from the front (one copy into the queue's
+    // staging Vec) over exactly the prefix about to be drained.
     {
         let mut rtx_cursor = chain.cursor();
         c.rtx_on_data_sent(sendable, &mut rtx_cursor);

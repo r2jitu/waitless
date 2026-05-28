@@ -121,25 +121,21 @@ pub(crate) fn mss_for(local_ip: IpAddr) -> usize {
 
 // ─── RFC 6298 retransmission ─────────────────────────────────────────────────
 //
-// Every unacknowledged outbound byte is kept in a per-conn ring
-// (`rtx_buf`) alongside a millisecond RTO deadline. A periodic tick
-// (`on_tcp_tick`, driven by the net poll loop) retransmits the oldest
-// unacked data once the deadline passes and doubles the RTO each time
-// (§5.5 exponential backoff). Before this a lost *outbound* segment
-// was never resent — an RFC 9293 MUST violation, and a real
-// correctness gap on a lossy path.
+// Every unacknowledged outbound segment is kept in a per-conn IOBuf
+// queue (`rtx_queue`) alongside a millisecond RTO deadline. A
+// periodic tick (`on_tcp_tick`, driven by the net poll loop)
+// retransmits the oldest unacked entry once the deadline passes and
+// doubles the RTO each time (§5.5 exponential backoff). Before this
+// a lost *outbound* segment was never resent — an RFC 9293 MUST
+// violation, and a real correctness gap on a lossy path.
+//
+// `rtx_queue` replaced a fixed 64 KiB `rtx_buf` ring. The ring's per-
+// conn slope (64 KiB allocated on first send, held across SYN/close
+// reuse) dominated the heap cliff under concurrent keep-alive load;
+// the queue allocates per-entry on demand and frees on ACK, so peak
+// per-conn footprint scales with the active send window rather than
+// a fixed reservation.
 
-/// Per-conn retransmit-ring capacity. Sized to hold a full TCP
-/// receive window: `snd_wnd` is a `u16` (no RFC 7323 window scaling
-/// negotiated), so the peer can never advertise more than 65535
-/// bytes, and the RFC 5681 send path caps in-flight bytes at
-/// `min(cwnd, rwnd)`. A 64 KiB ring therefore always covers the
-/// whole unacked range `[snd_una, snd_nxt)` — which is what makes
-/// `rtx_overflow` from a window that outgrew the ring structurally
-/// impossible (the only residual `rtx_overflow` cause is an
-/// `ensure_rtx_buf` allocation failure). Boxed + lazy like
-/// `rx_ring`, so idle slots stay cheap.
-pub(crate) const RTX_BUF_BYTES: usize = 65536;
 /// Initial RTO before any RTT measurement (RFC 6298 §2.1), and the
 /// floor every computed RTO is clamped up to (§2.4 — round a sub-1 s
 /// estimate up to 1 s).
@@ -158,12 +154,13 @@ pub(crate) const RTX_MAX_RETRIES: u8 = 8;
 // ─── Connection-lifecycle timers ─────────────────────────────────────────────
 //
 // `close()`'s FIN occupies one sequence number but carries no payload,
-// so it is not held in the RFC 6298 data ring (`rtx_buf`). A dedicated
-// timer (`lifecycle_deadline_ms` + `fin_retx_count`) retransmits the
-// FIN in `FinWait1` (active close) and `LastAck` (passive close) until
-// the peer acknowledges it or the bounded retry count runs out. Before
-// this a single dropped FIN stranded the connection until the peer's
-// keepalive fired — invisible on a LAN, an availability bug on a WAN.
+// so it is not held in the RFC 6298 data queue (`rtx_queue`). A
+// dedicated timer (`lifecycle_deadline_ms` + `fin_retx_count`)
+// retransmits the FIN in `FinWait1` (active close) and `LastAck`
+// (passive close) until the peer acknowledges it or the bounded retry
+// count runs out. Before this a single dropped FIN stranded the
+// connection until the peer's keepalive fired — invisible on a LAN,
+// an availability bug on a WAN.
 
 /// FIN retransmissions before a half-closed connection (`FinWait1`
 /// active close / `LastAck` passive close) is forced shut — the
@@ -186,14 +183,10 @@ pub(crate) const TIME_WAIT_MS: u64 = 60_000;
 /// One entry in the per-conn retransmit queue — the payload bytes of
 /// a single outbound TCP segment plus the RFC 6298 / 9293 bookkeeping
 /// needed to retransmit it on RTO expiry. The IOBuf is owned (heap-
-/// resident), independent of any NIC-side reference; a future commit
-/// will replace this with refcount-shared storage so the same IOBuf
-/// is alive in the queue while the wire-DMA is in flight, without an
-/// insertion memcpy.
-//
-// `first_tx_ms` and `tx_count` are read by the RTO path in a follow-up
-// commit; allow them as dead until then so this can land as scaffolding.
-#[allow(dead_code)]
+/// resident), independent of any NIC-side reference; the SG-TX
+/// follow-up replaces it with refcount-shared storage so the same
+/// IOBuf is alive in the queue while the wire-DMA is in flight,
+/// without the insertion memcpy.
 pub(crate) struct RtxEntry {
     /// Owned IOBuf carrying this segment's payload bytes. `IOBuf::data()`
     /// reads the bytes to retransmit; `narrow` advances the visible
@@ -207,7 +200,10 @@ pub(crate) struct RtxEntry {
     pub(crate) len: u16,
     /// Wall-clock ms of the first transmission of these bytes.
     /// Anchors RFC 6298 RTT sampling for the head-of-queue entry
-    /// (subject to Karn's rule via `tx_count`).
+    /// (subject to Karn's rule via `tx_count`). Read by the
+    /// per-entry RTT-sampling commit that follows (currently the
+    /// `rtx_anchor_*` fields on `TcpConnection` serve this role).
+    #[allow(dead_code)]
     pub(crate) first_tx_ms: u64,
     /// Number of transmissions this entry has been through. >0 means
     /// retransmitted (Karn's rule: don't sample RTT from this entry).
@@ -300,44 +296,25 @@ pub struct TcpConnection {
     /// window, and by `free_connection` on teardown. Per-core
     /// ownership — no lock needed.
     pub(crate) send_waker: Option<Waker>,
-    /// RFC 6298 retransmit ring — the unacknowledged outbound bytes,
-    /// mirroring the wire range `[snd_una, snd_nxt)`. Heap-boxed and
-    /// lazily allocated on the first buffered send, then reused across
-    /// SYN/close cycles like `rx_ring`. `None` until the conn first
-    /// sends data.
-    pub(crate) rtx_buf: Option<Box<[u8; RTX_BUF_BYTES]>>,
-    /// Ring index of the byte at `snd_una`.
-    pub(crate) rtx_head: u16,
-    /// Bytes currently buffered. Equals `snd_nxt - snd_una` while
-    /// retransmit coverage holds; see `rtx_overflow`.
-    pub(crate) rtx_len: u16,
-    /// Set when `rtx_buf` failed to allocate: the ring cannot cover
-    /// `[snd_una, snd_nxt)`, so the RTO timer is held off until the
-    /// peer's ACKs drain the window back to empty, at which point
-    /// `rtx_on_ack` clears this and coverage resumes. The unacked
-    /// window outgrowing the ring is no longer a cause — the RFC 5681
-    /// send window bounds in-flight bytes at `min(cwnd, rwnd)`, which
-    /// the 64 KiB ring always holds; an `ensure_rtx_buf` allocation
-    /// failure is the sole residual trigger.
-    pub(crate) rtx_overflow: bool,
-    /// IOBuf-backed retransmit queue — the new path that replaces
-    /// `rtx_buf`. Each entry holds one outbound segment's payload as
-    /// an owned IOBuf; the queue mirrors the wire range
-    /// `[snd_una, snd_nxt)` one segment at a time, instead of one
-    /// flat 64 KiB ring. Allocation is preserved across SYN/close
-    /// cycles via `reset_preserving` — the entries drop (returning
-    /// their IOBufs) but the deque's capacity stays.
+    /// RFC 6298 retransmit queue — one IOBuf-backed `RtxEntry` per
+    /// outbound segment, mirroring the wire range `[snd_una, snd_nxt)`
+    /// one entry at a time. Heap-owned IOBufs; the deque's backing
+    /// allocation is preserved across SYN/close cycles via
+    /// `reset_preserving` (entries drop and their IOBufs free, but
+    /// the deque's capacity stays so the next conn does not pay a
+    /// realloc).
     pub(crate) rtx_queue: VecDeque<RtxEntry>,
     /// Cached sum of `entry.len` across `rtx_queue` — the
-    /// bytes-in-flight count the cwnd-paced send window reads. O(1)
-    /// per send/ACK instead of summing the queue.
+    /// bytes-in-flight count the cwnd-paced send window and the
+    /// timer-disarm conditional read. O(1) per send/ACK instead of
+    /// summing the queue.
     pub(crate) rtx_bytes_in_flight: u32,
-    /// Set when a `rtx_queue` push failed to grow the deque — the OOM
-    /// equivalent of the old `rtx_overflow` flag. Coverage is
-    /// suspended until ACKs drain the in-flight window; `rtx_on_ack`
-    /// clears this once `snd_una == snd_nxt`. The "window outgrew
-    /// ring" half of `rtx_overflow` is structurally impossible for the
-    /// queue (no fixed capacity), so this flag is OOM-only.
+    /// Set when a `rtx_queue` push failed to grow the deque (heap
+    /// exhaustion). Coverage is suspended until ACKs drain the
+    /// in-flight window; `rtx_on_ack` clears this once `snd_una ==
+    /// snd_nxt`. The "window outgrew ring" half of the old
+    /// `rtx_overflow` is structurally impossible for the queue (no
+    /// fixed capacity), so this flag is OOM-only.
     pub(crate) rtx_alloc_failed: bool,
     /// Current retransmission timeout, milliseconds. Doubles on each
     /// RTO expiry (§5.5); re-initialised when new data is ACK'd.
@@ -470,10 +447,6 @@ impl TcpConnection {
             generation: 0,
             recv_waker: None,
             send_waker: None,
-            rtx_buf: None,
-            rtx_head: 0,
-            rtx_len: 0,
-            rtx_overflow: false,
             rtx_queue: VecDeque::new(),
             rtx_bytes_in_flight: 0,
             rtx_alloc_failed: false,
@@ -503,28 +476,23 @@ impl TcpConnection {
 
     /// Reset to a fresh `TcpConnection` while preserving the
     /// per-slot identity (`slot_index`), the bumped generation
-    /// counter, and the lazily-allocated per-conn heap buffers
-    /// (`rx_ring`, `rtx_buf`). Re-allocating the rings on every
-    /// reset would cost a `Box::new([0; …])` per accept on the
-    /// close-conn /health hot path — preserving them across the
-    /// SYN/close cycle keeps the steady-state hot path heap-free.
-    /// Used by `alloc_connection` and `free_connection`; both call
-    /// sites used to inline the same `let preserved_… = …; *c =
-    /// new(); restore` block.
+    /// counter, and the lazily-allocated / capacity-reused per-conn
+    /// heap buffers (`rx_ring`, `rtx_queue`). Re-allocating these on
+    /// every reset would cost a `Box::new([0; …])` (or a deque
+    /// realloc) per accept on the close-conn /health hot path —
+    /// preserving them across the SYN/close cycle keeps the
+    /// steady-state hot path heap-free.
     pub(crate) fn reset_preserving(&mut self, next_gen: u16) {
         let ring = self.rx_ring.take();
-        let rtx = self.rtx_buf.take();
         // Drop the entries (their IOBufs return to the heap) but keep
         // the deque's backing allocation across the SYN/close cycle —
-        // same "reuse capacity, lose contents" shape as `rx_ring` and
-        // `rtx_buf`. `VecDeque::clear` does exactly this.
+        // same "reuse capacity, lose contents" shape as `rx_ring`.
         let mut rtx_queue = core::mem::take(&mut self.rtx_queue);
         rtx_queue.clear();
         let slot = self.slot_index;
         *self = TcpConnection::new();
         self.generation = next_gen;
         self.rx_ring = ring;
-        self.rtx_buf = rtx;
         self.rtx_queue = rtx_queue;
         self.slot_index = slot;
     }
@@ -702,15 +670,13 @@ impl TcpConnection {
     /// insertion so the queue's storage is heap-resident and
     /// independent of any NIC-side reference. Returns `false` on a
     /// `try_reserve` failure — caller then suspends coverage via
-    /// `rtx_alloc_failed = true` (the OOM equivalent of the old
-    /// `rtx_overflow` flag). Arms the RTO timer if the queue was
-    /// empty before this push (RFC 6298 §5.1) and seeds the RTT
-    /// anchor (§3) if no sample is outstanding.
+    /// `rtx_alloc_failed = true` and clears the queue. Arms the RTO
+    /// timer if the queue was empty before this push (RFC 6298 §5.1)
+    /// and seeds the RTT anchor (§3) if no sample is outstanding.
     ///
-    /// Wired into the send path: `rtx_retain` calls this after the
-    /// rtx_buf write so the queue mirrors the unacked window through
-    /// the dual-write transition. Equivalence harnesses in tests
-    /// compare the queue's bytes against the rtx_buf window per send.
+    /// Wired into the send path: `rtx_retain` calls this after
+    /// staging the bytes through a Vec so the queue mirrors the
+    /// unacked window. The send path's sole retain method.
     pub(crate) fn rtx_push(
         &mut self,
         iobuf: IOBuf,
@@ -748,8 +714,7 @@ impl TcpConnection {
     /// Returns the byte count this ACK retired from the queue.
     /// Does NOT itself touch `snd_una`, the RTO deadline, or the
     /// congestion controller — the caller (`rtx_on_ack`) folds those
-    /// in against `rtx_buf` today; commit 6 will collapse the two
-    /// paths to this method alone.
+    /// in.
     pub(crate) fn rtx_ack(&mut self, ack_num: u32, _now_ms: u64) -> usize {
         let mut acked = 0usize;
         while let Some(head) = self.rtx_queue.front_mut() {
@@ -780,27 +745,6 @@ impl TcpConnection {
             break;
         }
         acked
-    }
-
-    /// Lazy-allocate the per-conn retransmit ring on the first
-    /// buffered send. Reused across SYN/close cycles like `rx_ring`
-    /// (the pool free-list dance preserves it). Returns `false` on
-    /// OOM — the caller then suspends retransmit coverage.
-    pub(crate) fn ensure_rtx_buf(&mut self) -> bool {
-        if self.rtx_buf.is_some() {
-            return true;
-        }
-        let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-        if v.try_reserve_exact(RTX_BUF_BYTES).is_err() {
-            return false;
-        }
-        v.resize(RTX_BUF_BYTES, 0);
-        let boxed: Box<[u8]> = v.into_boxed_slice();
-        // SAFETY: just resized to RTX_BUF_BYTES, so the slice length
-        // matches the array type we cast the Box to.
-        let ptr = Box::into_raw(boxed) as *mut [u8; RTX_BUF_BYTES];
-        self.rtx_buf = Some(unsafe { Box::from_raw(ptr) });
-        true
     }
 
     /// Arm the retransmission timer `rto_ms` ahead of now.
@@ -847,88 +791,33 @@ impl TcpConnection {
     /// Shared core of the two retransmit-retain entry points
     /// (`rtx_on_data_sent` for the chain path, `rtx_on_data_sent_slice`
     /// for the TSO path). Stages `total` bytes through an owned
-    /// `Vec<u8>` via the caller's `fill` closure, then dual-writes
-    /// them into both `rtx_buf` (legacy) and `rtx_queue` (new IOBuf
-    /// path). Handles the allocation guard, the ring wrap, `rtx_len`,
-    /// the RFC 6298 §5.1 RTO timer, and the §3 RTT anchor.
-    ///
-    /// Stage-1 of the rtx_buf → IOBuf-queue migration: the queue
-    /// path runs alongside the ring so the follow-up commits (ACK,
-    /// RTO, cwnd) can switch reads to the queue one site at a time
-    /// while equivalence harnesses prove the byte streams match. The
-    /// vec is the queue's IOBuf storage at no extra alloc — once the
-    /// ring is deleted, the vec→ring copy goes away and the
-    /// staging vec becomes the only write.
+    /// `Vec<u8>` via the caller's `fill` closure, then pushes them
+    /// onto `rtx_queue` as one `RtxEntry`. The vec becomes the entry's
+    /// IOBuf storage at no extra copy. `rtx_push` arms the RFC 6298
+    /// §5.1 RTO timer if the queue was empty and seeds the §3 RTT
+    /// anchor if no sample is outstanding.
     fn rtx_retain(&mut self, total: usize, fill: impl FnOnce(&mut [u8])) {
-        if total == 0 || self.rtx_overflow {
+        if total == 0 || self.rtx_alloc_failed {
             return; // nothing to retain, or coverage already suspended
         }
-        if !self.ensure_rtx_buf() {
-            // The retransmit ring could not be allocated. Suspend
-            // retransmit coverage until `snd_una` catches `snd_nxt`;
-            // `rtx_on_ack` clears the flag once the window drains.
-            // Heap exhaustion — genuinely unexpected, so trace it.
-            crate::diag::COUNTERS.rtx_buf_oom.bump();
-            self.rtx_overflow = true;
-            self.rtx_alloc_failed = true;
-            self.rtx_head = 0;
-            self.rtx_len = 0;
-            self.rtx_deadline_ms = 0;
-            // Equivalence: clear the queue too so the two paths stay
-            // in lockstep. The queue's existing entries refer to data
-            // the rtx_buf path just discarded; keeping them around
-            // would diverge the byte streams under the dual-write
-            // harness.
-            self.rtx_queue.clear();
-            self.rtx_bytes_in_flight = 0;
-            return;
-        }
-        // A window outgrowing the ring is structurally impossible: the
-        // RFC 5681 send path caps in-flight bytes at `min(cwnd, rwnd)`,
-        // `rwnd` is a `u16` (no window scaling), and `RTX_BUF_BYTES` is
-        // 64 KiB — so `rtx_len + total` (the post-send flight size)
-        // never exceeds the ring. Assert it rather than branch on it.
-        debug_assert!(
-            self.rtx_len as usize + total <= RTX_BUF_BYTES,
-            "in-flight bytes outgrew the retransmit ring — the send \
-             window should have bounded them at min(cwnd, rwnd)",
-        );
-        // Stage into an owned Vec — the queue's eventual storage.
         let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; total];
         fill(&mut staging);
-
-        let tail = (self.rtx_head as usize + self.rtx_len as usize) % RTX_BUF_BYTES;
-        let buf = self.rtx_buf.as_mut().expect("ensure_rtx_buf succeeded");
-        if tail + total <= RTX_BUF_BYTES {
-            buf[tail..tail + total].copy_from_slice(&staging);
-        } else {
-            let first = RTX_BUF_BYTES - tail;
-            buf[tail..].copy_from_slice(&staging[..first]);
-            buf[..total - first].copy_from_slice(&staging[first..]);
-        }
-        self.rtx_len += total as u16;
-        // §5.1: start the timer if it is not already running.
-        if self.rtx_deadline_ms == 0 {
-            self.arm_rtx();
-        }
-        // RFC 6298 §3: take at most one RTT sample per RTT. Anchor on
-        // the sequence number just past this send (`snd_nxt` already
-        // advanced); the ACK covering it yields the measurement.
-        let now_ms = kernel_core::clock::now_ms();
-        if !self.rtt_anchor_active {
-            self.rtt_anchor_active = true;
-            self.rtt_anchor_seq = self.snd_nxt;
-            self.rtt_anchor_ms = now_ms;
-        }
-        // Stage-1 dual-write: push the same bytes onto rtx_queue.
         // `snd_nxt` has already advanced by `total` at the caller, so
-        // this entry covers `[snd_nxt - total, snd_nxt)`. The push's
-        // own arm / anchor-seed are idempotent against the rtx_buf
-        // path above (deadline already armed, anchor already seeded
-        // to the same `snd_nxt`).
+        // this entry covers `[snd_nxt - total, snd_nxt)`.
         let seq_start = self.snd_nxt.wrapping_sub(total as u32);
+        let now_ms = kernel_core::clock::now_ms();
         let iobuf = IOBuf::from(staging);
-        let _ = self.rtx_push(iobuf, seq_start, total as u16, now_ms);
+        if !self.rtx_push(iobuf, seq_start, total as u16, now_ms) {
+            // Heap exhaustion — genuinely unexpected, so trace it.
+            // Suspend retransmit coverage: drop any partially-tracked
+            // window and wait for the peer to ACK everything before
+            // re-engaging. `rtx_on_ack` clears the flag once
+            // `snd_una == snd_nxt`.
+            crate::diag::COUNTERS.rtx_buf_oom.bump();
+            self.rtx_queue.clear();
+            self.rtx_bytes_in_flight = 0;
+            self.rtx_deadline_ms = 0;
+        }
     }
 
     /// Retain the `total` just-sent bytes — read from a fresh cursor
@@ -954,16 +843,15 @@ impl TcpConnection {
     }
 
     /// Fold an ACK into the retransmission state: drop acknowledged
-    /// bytes from the ring and re-arm or stop the timer (RFC 6298
+    /// bytes from the queue and re-arm or stop the timer (RFC 6298
     /// §5.2 / §5.3). `old_una` is `snd_una` from *before* the caller
     /// advanced it for this ACK.
     pub(crate) fn rtx_on_ack(&mut self, old_una: u32) {
         // Resume coverage once the window has fully drained — when
-        // `rtx_overflow` is set the ring (failed to allocate) cannot
-        // be trusted, so wait for an empty window before re-engaging.
-        if self.rtx_overflow {
+        // `rtx_alloc_failed` is set the queue is incomplete, so wait
+        // for an empty window before re-engaging.
+        if self.rtx_alloc_failed {
             if self.snd_una == self.snd_nxt {
-                self.rtx_overflow = false;
                 self.rtx_alloc_failed = false;
                 self.rtx_backoff = 0;
                 self.rto_ms = RTO_INITIAL_MS;
@@ -974,11 +862,11 @@ impl TcpConnection {
         if acked == 0 {
             return; // not new data — leave the timer untouched
         }
-        // Data bytes this ACK retires from the retransmit ring.
-        // `acked` is the raw sequence advance, which also counts the
-        // SYN / FIN phantom bytes — neither is held in `rtx_buf`, so
-        // clamping to `rtx_len` strips them.
-        let drop = acked.min(self.rtx_len as usize);
+        // Data bytes this ACK retires from the queue. `acked` is the
+        // raw sequence advance, which also counts the SYN / FIN
+        // phantom bytes — neither lives in the queue, so clamping to
+        // `rtx_bytes_in_flight` strips them.
+        let drop = acked.min(self.rtx_bytes_in_flight as usize);
         // RFC 5681 §2 / §3.1: the congestion window opens only for an
         // ACK that "cumulatively acknowledges new data" — the SYN and
         // FIN flag bytes do not count. Skipping the update when no
@@ -996,12 +884,9 @@ impl TcpConnection {
             self.sample_rtt(elapsed.min(u32::MAX as u64) as u32);
             self.rtt_anchor_active = false;
         }
-        self.rtx_head = ((self.rtx_head as usize + drop) % RTX_BUF_BYTES) as u16;
-        self.rtx_len -= drop as u16;
-        // Dual-route: drop acknowledged bytes from `rtx_queue` so the
-        // queue mirrors the rtx_buf window post-ACK. The byte counts
-        // match by construction — both paths receive the same `drop`
-        // bytes of new data from this ACK.
+        // Drop acknowledged bytes from `rtx_queue` — pops fully-acked
+        // entries from the head and narrows a partially-acked head
+        // entry forward.
         let _ = self.rtx_ack(self.snd_una, now_ms);
         // New data acknowledged: the peer is making progress, so clear
         // the §5.5 backoff and reset the RTO to the current estimate
@@ -1022,60 +907,29 @@ impl TcpConnection {
     /// `snd_una`. Shared by the RFC 6298 RTO path and RFC 5681 fast
     /// retransmit; the caller owns the congestion-window adjustment
     /// and the RTO-timer bookkeeping. No-op when nothing is buffered.
+    /// Reads the wire payload directly from the queue's head IOBuf —
+    /// the SG-TX follow-up will swap the scratch copy below for a
+    /// driver descriptor pointing at the same bytes.
     fn retransmit_oldest_segment(&mut self) {
         let mss = mss_for(self.local_ip);
-        // Dual-route stage: the wire-send bytes come from `rtx_queue`'s
-        // head IOBuf. A debug_assert against `rtx_buf` confirms the
-        // two byte streams match through the migration. After commit
-        // 6 the queue is the sole source.
-        let mut scratch = [0u8; MSS_MAX];
-        let n;
-        if let Some(head) = self.rtx_queue.front_mut() {
-            n = (head.len as usize).min(mss);
-            if n == 0 {
-                return;
-            }
-            // Copy out of the head IOBuf into scratch — the underlying
-            // ring stays untouched. The copy is cheap (≤ MSS bytes,
-            // off the steady-state path) and avoids any borrow
-            // contortion to call `send_segment` while still holding a
-            // `&mut self` reference. After commit 6, the head's IOBuf
-            // bytes are passed directly to the wire without scratch.
-            scratch[..n].copy_from_slice(&head.iobuf.data()[..n]);
-            // Bump the entry's tx_count for Karn's rule. >0 marks the
-            // entry as "retransmitted"; a future RTT-sampling commit
-            // refuses to take samples from such entries.
-            head.tx_count = head.tx_count.saturating_add(1);
-        } else {
-            // Queue empty — fall back to rtx_buf so a no-data retx
-            // (impossible in practice) still works. Defensive only;
-            // gone in commit 6.
-            n = (self.rtx_len as usize).min(mss);
-            if n == 0 {
-                return;
-            }
-            let Some(buf) = self.rtx_buf.as_ref() else {
-                return;
-            };
-            let head_off = self.rtx_head as usize;
-            if head_off + n <= RTX_BUF_BYTES {
-                scratch[..n].copy_from_slice(&buf[head_off..head_off + n]);
-            } else {
-                let first = RTX_BUF_BYTES - head_off;
-                scratch[..first].copy_from_slice(&buf[head_off..]);
-                scratch[first..n].copy_from_slice(&buf[..n - first]);
-            }
+        let Some(head) = self.rtx_queue.front_mut() else {
+            return;
+        };
+        let n = (head.len as usize).min(mss);
+        if n == 0 {
+            return;
         }
-        // Equivalence: the same bytes must live at the rtx_buf head.
-        // Compare the prefix we're about to ship against rtx_buf.
-        debug_assert!({
-            if let Some(buf) = self.rtx_buf.as_ref() {
-                let buf_head = self.rtx_head as usize;
-                (0..n).all(|i| scratch[i] == buf[(buf_head + i) % RTX_BUF_BYTES])
-            } else {
-                true
-            }
-        });
+        // Copy out of the head IOBuf into a stack scratch — the
+        // bytes remain owned by the queue. ≤ MSS bytes off the
+        // steady-state path so the copy is not a hot-path cost; the
+        // SG-TX follow-up replaces it with a driver descriptor that
+        // points at `head.iobuf.data()` directly.
+        let mut scratch = [0u8; MSS_MAX];
+        scratch[..n].copy_from_slice(&head.iobuf.data()[..n]);
+        // Bump the entry's tx_count for Karn's rule. >0 marks the
+        // entry as "retransmitted"; a future RTT-sampling commit
+        // refuses to take samples from such entries.
+        head.tx_count = head.tx_count.saturating_add(1);
         send_segment(
             &SegmentMeta {
                 local_ip: self.local_ip,
