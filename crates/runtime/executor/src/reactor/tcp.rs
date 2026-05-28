@@ -911,6 +911,30 @@ impl<'a> RecvChunkGuard<'a> {
         self.iobuf.data()
     }
 
+    /// Mutable view of the chunk's bytes — the same window as
+    /// [`Self::data`], unique-access. Used by the TLS RX path to
+    /// hand the chunk's ciphertext straight to `record::open`,
+    /// which AEAD-decrypts in place (overwriting the ciphertext
+    /// with plaintext) without staging the bytes through any
+    /// intermediate buffer.
+    ///
+    /// After the call returns, the chunk's bytes are scrambled
+    /// (the AEAD ran over them); the chunk must be dropped before
+    /// any consumer expects to re-read the original ciphertext.
+    ///
+    /// Panics if the underlying IOBuf is the immutable `Static`
+    /// variant — RX chunks surfaced through `recv_chunk` are
+    /// always `Heap` / `External` / `Borrowed` (owned by the NIC
+    /// driver or a per-conn pool), never `Static`. The unwrap is
+    /// therefore total in production; a Static chunk would be a
+    /// backend bug.
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        self.iobuf
+            .data_mut()
+            .expect("RecvChunkGuard never wraps an immutable Static IOBuf")
+    }
+
     /// Take owned possession of the chunk. Zero copy when the
     /// surfaced `IOBuf` already owns its storage (`Heap`, or the
     /// NIC-RX `ExternalOwned` device buffer); one memcpy into a
@@ -1153,6 +1177,43 @@ mod tests {
         assert_eq!(guard.data(), bytes, "data() reads the chunk in place");
         let owned = guard.into_owned();
         assert_eq!(owned.data(), bytes, "owned IOBuf preserves the bytes");
+    }
+
+    /// `data_mut` on a guard wrapping a `Heap` IOBuf surfaces the
+    /// same byte window as `data` with unique-access, and an
+    /// in-place mutation through it is observable via a subsequent
+    /// `data()` read. Exercises the TLS-RX-chunk-direct shape
+    /// (`record::open` overwrites the ciphertext with plaintext in
+    /// place; no intermediate staging buffer).
+    #[test]
+    fn recv_chunk_guard_data_mut_in_place_xor() {
+        let bytes: &[u8] = b"plaintext";
+        let mut guard = RecvChunkGuard::new(IOBuf::from(bytes.to_vec()));
+        for byte in guard.data_mut() {
+            *byte ^= 0x20;
+        }
+        assert_eq!(guard.data(), b"PLAINTEXT");
+    }
+
+    /// `data_mut` on a guard wrapping a `Borrowed` view also yields
+    /// a mutable window — the variant the TLS RX path delegates to
+    /// for ciphertext-in-place decrypt when the TCP backend
+    /// surfaces a view of its own RX ring.
+    #[test]
+    fn recv_chunk_guard_data_mut_borrowed_in_place() {
+        let mut backing: alloc::vec::Vec<u8> = b"abcdefgh".to_vec();
+        let len = backing.len() as u32;
+        let ptr = core::ptr::NonNull::new(backing.as_mut_ptr()).unwrap();
+        // SAFETY: `backing` outlives `guard`; the borrow window
+        // covers the whole buffer; no other route mutates `backing`
+        // while the guard is live.
+        let mut guard = RecvChunkGuard::new(unsafe { IOBuf::borrow(ptr, len, 0, len) });
+        for byte in guard.data_mut() {
+            *byte = byte.to_ascii_uppercase();
+        }
+        assert_eq!(guard.data(), b"ABCDEFGH");
+        drop(guard);
+        assert_eq!(&backing[..], b"ABCDEFGH");
     }
 
     /// `into_owned` on a guard wrapping a `Borrowed` view copies
