@@ -51,6 +51,12 @@ pub struct BodyReader<'a, S: HttpStream> {
     total: usize,
     /// Bytes already handed to the handler via `chunk`.
     delivered: usize,
+    /// Post-body residue captured when a fresh-recv chunk straddled
+    /// the `Content-Length` boundary. `serve_conn` retrieves this
+    /// via [`into_leftover`](Self::into_leftover) and threads it
+    /// into the next outer-iteration carry so the next pipelined
+    /// request's HEAD bytes aren't dropped on the floor.
+    leftover: Option<IOBuf>,
 }
 
 impl<'a, S: HttpStream> BodyReader<'a, S> {
@@ -69,7 +75,23 @@ impl<'a, S: HttpStream> BodyReader<'a, S> {
             prebuf_consumed: 0,
             total,
             delivered: 0,
+            leftover: None,
         }
+    }
+
+    /// Consume the reader and return any post-body residue captured
+    /// from a straddling fresh-recv chunk. `serve_conn` calls this
+    /// after the handler returns and assigns the result into its
+    /// `carry` slot — that's what threads the next pipelined
+    /// request's HEAD bytes (which arrived in the same chunk as
+    /// the body-tail) forward instead of dropping them.
+    ///
+    /// Returns `None` in the common case where the body fit
+    /// entirely in `prebuf` (no stream pulls), or where the
+    /// stream-side chunks happened to align with `Content-Length`
+    /// (no straddle).
+    pub fn into_leftover(self) -> Option<IOBuf> {
+        self.leftover
     }
 
     /// Total body length (Content-Length).
@@ -109,15 +131,20 @@ impl<'a, S: HttpStream> BodyReader<'a, S> {
     /// overwritten — while the handler still holds the chunk. That
     /// is the item-F/G borrow-safety property, one layer up.
     ///
-    /// A single `recv_chunk` chunk is delivered whole; the rare case
-    /// where one straddles the `Content-Length` boundary — reachable
-    /// only when a client pipelines a follow-up request into the
-    /// tail segment of a body that overflowed the 16 KiB parse
-    /// buffer — has its delivered slice capped at the remaining body
-    /// length, and the straddling bytes are dropped. The server has
-    /// no streaming header parser yet (Phase 4), so post-large-body
-    /// pipelining is out of scope; the cap is what keeps the handler
-    /// and the `delivered` accounting correct regardless.
+    /// A single `recv_chunk` chunk is delivered whole when the
+    /// chunk's byte count is ≤ the remaining body length; the
+    /// straddling case (chunk spans the `Content-Length` boundary,
+    /// reachable when a client pipelines a follow-up request into
+    /// the tail of a body that wouldn't fit in `serve_conn`'s
+    /// outer-loop carry) splits the chunk at the boundary: the
+    /// body-side bytes are copied to a heap IOBuf and returned as
+    /// the guard; the post-body residue is detached via
+    /// [`RecvChunkGuard::into_remainder`] and stashed in
+    /// `self.leftover` for `serve_conn` to retrieve via
+    /// [`into_leftover`](Self::into_leftover) after the handler
+    /// returns. Two memcpys on the straddle path (body bytes +
+    /// residue copy for `Borrowed` transports like TLS); zero copy
+    /// on the no-straddle path.
     pub async fn chunk(&mut self) -> Option<BodyChunkGuard<'_>> {
         if self.delivered >= self.total {
             return None;
@@ -159,23 +186,37 @@ impl<'a, S: HttpStream> BodyReader<'a, S> {
             });
         }
 
-        // 2. Past the prebuf — pull a zero-copy chunk straight from
-        //    the transport. `recv_chunk` surfaces the transport's
-        //    own buffer (NIC RX buffer / TLS plaintext window).
+        // 2. Past the prebuf — pull a chunk from the transport.
+        //    Common path (chunk len ≤ want_max): pass the guard
+        //    through as `ChunkSource::Stream`, zero copy.
+        //    Straddle path (chunk len > want_max): copy body-side
+        //    bytes out, detach the residue past `want_max` into
+        //    `self.leftover` via `RecvChunkGuard::into_remainder`.
         //    `None` means peer close / EOF, or a transport with no
-        //    chunk path (NullStream / HTTP/3, whose whole body is
-        //    always in the prebuf — this branch is unreachable for
-        //    it). `take` caps the delivery at the remaining body
-        //    length; see the straddle note above.
+        //    chunk path (NullStream / HTTP/3, whose body is always
+        //    in the prebuf — this branch is unreachable for it).
         let guard = self.stream.recv_chunk().await?;
         let take = guard.data().len().min(want_max);
         if take == 0 {
             return None;
         }
         self.delivered += take;
-        Some(BodyChunkGuard {
-            src: ChunkSource::Stream { guard, len: take },
-        })
+        if take == guard.data().len() {
+            // No straddle — pass the guard through.
+            Some(BodyChunkGuard {
+                src: ChunkSource::Stream { guard, len: take },
+            })
+        } else {
+            // Straddle — split at `take`.
+            use alloc::vec::Vec;
+            let body_bytes: Vec<u8> = guard.data()[..take].to_vec();
+            self.leftover = guard
+                .into_remainder(take)
+                .expect("take <= data().len()");
+            Some(BodyChunkGuard {
+                src: ChunkSource::Owned(IOBuf::from(body_bytes)),
+            })
+        }
     }
 
     /// Drain the rest of the body, dropping every byte. Returns
@@ -228,12 +269,21 @@ enum ChunkSource<'a> {
     /// behind the [`RecvChunkGuard`](waitless::runtime::RecvChunkGuard)
     /// that `stream.recv_chunk()` surfaced (which already carries
     /// the `&'a mut` borrow). `len` is the delivered byte count —
-    /// equal to the surfaced chunk length except when a chunk
-    /// straddles the `Content-Length` boundary, where it is capped.
+    /// equal to the surfaced chunk length when the whole chunk is
+    /// body. The straddle case (chunk runs past `Content-Length`)
+    /// is handled by the `Owned` variant instead, so here `len`
+    /// always equals `guard.data().len()`.
     Stream {
         guard: waitless::runtime::RecvChunkGuard<'a>,
         len: usize,
     },
+    /// Body bytes lifted from a straddling fresh-recv chunk. The
+    /// chunk's body-side prefix was copied to a heap `IOBuf` so the
+    /// post-body residue (which belongs to the next pipelined
+    /// request) could be detached into `BodyReader.leftover` for
+    /// `serve_conn` to carry forward. One memcpy paid in this
+    /// branch only.
+    Owned(IOBuf),
 }
 
 impl<'a> BodyChunkGuard<'a> {
@@ -242,6 +292,7 @@ impl<'a> BodyChunkGuard<'a> {
         match &self.src {
             ChunkSource::Prebuf(buf, _) => buf.data(),
             ChunkSource::Stream { guard, len } => &guard.data()[..*len],
+            ChunkSource::Owned(buf) => buf.data(),
         }
     }
 
@@ -255,21 +306,15 @@ impl<'a> BodyChunkGuard<'a> {
     pub fn into_owned(self) -> IOBuf {
         match self.src {
             ChunkSource::Prebuf(buf, _) => buf.into_owned(),
-            ChunkSource::Stream { guard, len } => {
-                // Common case — the whole surfaced chunk is body
-                // bytes: hand the guard's IOBuf straight on
-                // (`into_owned` is zero copy for an owned source).
-                if len == guard.data().len() {
-                    guard.into_owned()
-                } else {
-                    // Straddle case (`len` capped below the chunk
-                    // length): only `len` bytes belong to this
-                    // body. Copy that prefix into a fresh `Heap`
-                    // IOBuf so the owned buffer never carries bytes
-                    // past the `Content-Length` boundary.
-                    IOBuf::from(guard.data()[..len].to_vec())
-                }
+            ChunkSource::Stream { guard, len: _ } => {
+                // `chunk()`'s straddle handling now routes the
+                // straddling case to the `Owned` variant, so here
+                // the whole surfaced chunk is body bytes — hand the
+                // guard's IOBuf straight on (`into_owned` is zero
+                // copy for an owned source).
+                guard.into_owned()
             }
+            ChunkSource::Owned(buf) => buf,
         }
     }
 }

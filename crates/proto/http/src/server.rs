@@ -161,10 +161,15 @@ where
 
         let want_close;
         let resp;
+        // Post-body residue captured by BodyReader when a fresh-recv
+        // chunk straddled the Content-Length boundary. None in every
+        // path that doesn't pull from the stream past the prebuf.
+        let body_leftover: Option<IOBuf>;
         if req.reject {
             crate::diag::record_reject(&req);
             resp = Response::bad_request();
             want_close = true;
+            body_leftover = None;
         } else {
             want_close = match req.header(b"Connection") {
                 Some(v) => v.eq_ignore_ascii_case(b"close"),
@@ -189,6 +194,15 @@ where
                 body_drained_ok = want_close
                     || body.is_empty()
                     || body.discard().await.is_ok();
+                // Pick up any residue BodyReader stashed when a
+                // stream-side chunk straddled the body boundary.
+                // Only meaningful when the body was fully drained;
+                // a failed drain returns immediately anyway.
+                body_leftover = if body_drained_ok {
+                    body.into_leftover()
+                } else {
+                    None
+                };
             }
             if !body_drained_ok {
                 crate::diag::COUNTERS.body_drain_failed.bump();
@@ -242,12 +256,26 @@ where
         // Advance `carry` past the body bytes that were just served
         // (BodyReader handed them to the handler from `carry`'s
         // prefix; `discard` finished anything the handler skipped).
-        // What's left is the start of the next pipelined request.
+        // What's left in carry is the start of the next pipelined
+        // request.
         if let Some(c) = carry.take() {
             let body_from_carry = content_length.min(c.data().len());
             carry = c
                 .into_remainder(body_from_carry)
                 .expect("body_from_carry <= data().len()");
+        }
+        // If the body extended past `carry` AND the straddling
+        // fresh-recv chunk carried post-body bytes (the next
+        // pipelined request's HEAD start), BodyReader stashed them
+        // — promote into `carry` so the next outer iteration sees
+        // them. Carry must be empty here: a body that needed the
+        // stream straddled because it overran `carry`'s prefix.
+        if let Some(l) = body_leftover {
+            debug_assert!(
+                carry.is_none(),
+                "body straddled stream => carry was fully drained as body prefix",
+            );
+            carry = Some(l);
         }
     }
 }
@@ -403,10 +431,6 @@ mod serve_conn_tests {
     /// chunk 1's leftover into chunk 2's parser feed walks the
     /// parser through `NeedMore` -> `Done` correctly across the
     /// outer loop boundary.
-    ///
-    /// (Body bytes spanning chunks is a known BodyReader-side
-    /// limitation; this scenario keeps the body entirely inside
-    /// chunk 1's carry so it isolates the HEAD-carry behaviour.)
     #[test]
     fn carry_threads_head_across_chunks_after_body() {
         let chunk1 =
@@ -419,5 +443,39 @@ mod serve_conn_tests {
         assert_eq!(observed[0].2, b"BODY");
         assert_eq!(observed[1].0, Method::Get);
         assert_eq!(observed[1].1, b"/b");
+    }
+
+    /// **BodyReader straddle**: the body extends past `carry` into
+    /// a fresh-recv chunk that also carries the next-pipelined
+    /// HEAD bytes. Pre-S3, `BodyReader` capped its delivered slice
+    /// at the body length and dropped the post-body residue when
+    /// the underlying `RecvChunkGuard` dropped — losing req2
+    /// entirely. With `BodyReader::into_leftover` plumbed through,
+    /// the residue is captured and serve_conn promotes it into
+    /// `carry` for the next outer iteration.
+    ///
+    /// Shape:
+    /// * chunk 1: HEAD₁ (Content-Length: 8) + first 4 body bytes
+    ///   (carry holds the 4-byte body prefix after HEAD₁ parse)
+    /// * chunk 2: rest of body (4 bytes) + complete HEAD₂
+    ///   (this is the straddling chunk — body needs 4 more bytes,
+    ///   the rest is HEAD₂)
+    /// * chunk 3: EOF.
+    #[test]
+    fn body_straddle_preserves_next_pipelined_head() {
+        let chunk1 = b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 8\r\n\r\nBODY".to_vec();
+        let chunk2 = b"TAILGET /b HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+        let (sent, observed) = drive(alloc::vec![Some(chunk1), Some(chunk2), None]);
+        assert_eq!(
+            count_ok(&sent),
+            2,
+            "both responses ship — straddle did not lose req2",
+        );
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].0, Method::Post);
+        assert_eq!(observed[0].1, b"/a");
+        assert_eq!(observed[0].2, b"BODYTAIL", "body fully reconstructed");
+        assert_eq!(observed[1].0, Method::Get);
+        assert_eq!(observed[1].1, b"/b", "next-pipelined HEAD preserved");
     }
 }
