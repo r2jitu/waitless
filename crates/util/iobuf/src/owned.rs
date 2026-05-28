@@ -1,27 +1,31 @@
-// `OwnedIOBuf` — the flat `Send`-by-derivation enum for the RX path.
+// `OwnedIOBuf` — the `Send`-by-derivation owning IOBuf.
 //
 // See the crate root for the borrowed/owned type-split rationale.
-// `OwnedIOBuf` is the cross-core RX path's type: it covers only the
-// two owning storage variants (`HeapStorage`, `ExternalOwned`), both
-// `Send`, so `OwnedIOBuf` is `Send` by auto-derivation — no
-// `unsafe impl`, no human-maintained invariant.
+// `OwnedIOBuf` covers every storage shape that is owned (or
+// statically outlives the IOBuf): heap, foreign-with-drop-callback,
+// refcounted, and static borrow. All of those are `Send`, so
+// `OwnedIOBuf` is `Send` by auto-derivation — no `unsafe impl`, no
+// human-maintained invariant.
 //
-// As of PR 2 the per-variant `(offset, len)` view lives at the top
-// of `OwnedIOBuf` rather than inside each storage struct: bytes are
-// in the storage, the visible window is on the outer type. The split
-// is the prerequisite for PR 3's `Shared(Arc<…>)` variant, where one
-// storage feeds many views via `Arc::clone`.
+// As of PR 4 `OwnedIOBuf` is the *only* tier of mutable IOBuf
+// machinery: `IOBuf` is a thin two-variant wrapper around either an
+// `OwnedIOBuf` or a `BorrowedView`-backed view, forwarding every
+// method here. Per-variant `(offset, len)` view lives at the top of
+// `OwnedIOBuf` (PR 2); refcounted backing arrived with `Shared` (PR
+// 3); `Static` joined this tier with the two-tier refactor.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 
-use crate::iobuf::{IOBuf, Inner};
+use crate::iobuf::{IOBuf, IOBufInner};
 use crate::{Chain, ExternalOwned, HeapStorage, IOBufDropFn, IOBufError, IOBufRead, SharedRegion};
 
-/// An IOBuf restricted to the two **owning** storage variants —
-/// `HeapStorage` and `ExternalOwned`. Both are `Send`, so `OwnedIOBuf`
-/// is `Send` **by auto-derivation**: no `unsafe impl`, no container
-/// invariant. `Chain<OwnedIOBuf>` is likewise `Send` for free.
+/// An IOBuf restricted to **owning** storage variants — `Heap`,
+/// `External`, `Shared`, and `Static`. All are `Send`, so
+/// `OwnedIOBuf` is `Send` **by auto-derivation**: no `unsafe impl`,
+/// no container invariant. `Chain<OwnedIOBuf>` is likewise `Send`
+/// for free.
 ///
 /// This is the type the cross-core RX path is *born* in —
 /// [`OwnedIOBuf::wrap_owned`] and [`crate::IOBufPool::alloc`] produce
@@ -30,11 +34,6 @@ use crate::{Chain, ExternalOwned, HeapStorage, IOBufDropFn, IOBufError, IOBufRea
 /// reach that path: the path's type is `OwnedIOBuf` and no
 /// constructor of `OwnedIOBuf` takes a borrow — compile-time
 /// cross-core safety, not discipline.
-///
-/// `StaticView` is deliberately excluded — not for a `Send` reason
-/// (`&'static [u8]` is `Send`) but a modelling one: a static slice
-/// is an *immortal borrow*, not owned storage, so it stays in
-/// `IOBuf` with the other non-owning view.
 ///
 /// Widening is one-way: `From<OwnedIOBuf> for IOBuf`. Nothing
 /// narrows `IOBuf -> OwnedIOBuf`.
@@ -47,15 +46,10 @@ pub struct OwnedIOBuf {
     pub(crate) len: u32,
 }
 
-/// Storage backing an [`OwnedIOBuf`] — the owning subset of
-/// `iobuf::Inner`. Bytes only; the visible window lives on
-/// `OwnedIOBuf`.
+/// Storage backing an [`OwnedIOBuf`]. Bytes only; the visible window
+/// lives on `OwnedIOBuf`.
 pub(crate) enum OwnedStorage {
-    /// Heap-owned `Box<[u8]>`. Modelled for completeness (it is one
-    /// of the two owning storage structs and keeps `From<OwnedIOBuf>`
-    /// total), but no current `OwnedIOBuf` constructor mints it — the
-    /// RX path only produces `External`. Not constructed in any build.
-    #[allow(dead_code)]
+    /// Heap-owned `Box<[u8]>`.
     Heap(HeapStorage),
     /// A foreign region owned via a drop callback.
     External(ExternalOwned),
@@ -63,6 +57,9 @@ pub(crate) enum OwnedStorage {
     /// `clone_shared()`. Multiple IOBufs share the same bytes; each
     /// carries its own `(offset, len)` view via the outer struct.
     Shared(Arc<SharedRegion>),
+    /// A `&'static [u8]` borrow. Immutable; mutators return
+    /// `IOBufError::Immutable`. Send via the `&'static` lifetime.
+    Static(&'static [u8]),
 }
 
 /// Static assertion: `OwnedIOBuf` (and a chain of them) is `Send` by
@@ -111,6 +108,17 @@ impl OwnedIOBuf {
         }
     }
 
+    /// Borrow a static-lifetime slice as an `OwnedIOBuf`. Zero
+    /// allocation, infallible, `const`. Mutators on the resulting
+    /// IOBuf return `IOBufError::Immutable`.
+    pub const fn from_static(data: &'static [u8]) -> Self {
+        OwnedIOBuf {
+            storage: OwnedStorage::Static(data),
+            offset: 0,
+            len: data.len() as u32,
+        }
+    }
+
     /// Total bytes of the underlying storage (independent of the
     /// current visible window).
     #[inline]
@@ -119,6 +127,7 @@ impl OwnedIOBuf {
             OwnedStorage::Heap(h) => h.capacity(),
             OwnedStorage::External(e) => e.capacity(),
             OwnedStorage::Shared(r) => r.capacity(),
+            OwnedStorage::Static(s) => s.len(),
         }
     }
 
@@ -137,49 +146,7 @@ impl OwnedIOBuf {
                 unsafe { core::slice::from_raw_parts(e.base().as_ptr().add(o), l) }
             }
             OwnedStorage::Shared(r) => &r.bytes()[o..o + l],
-        }
-    }
-
-    /// Promote to refcounted storage so the same bytes can back
-    /// multiple `OwnedIOBuf` views via `clone_shared`. **Move-only**
-    /// — bytes do NOT copy; the existing `HeapStorage` /
-    /// `ExternalOwned` is lifted into a fresh `Arc<SharedRegion>`.
-    /// Idempotent on a buffer that is already `Shared`.
-    ///
-    /// One small Arc allocation. The canonical caller is the TCP
-    /// rtx queue: keep a refcounted shadow of each sent segment so
-    /// a retransmit can replay without memcpy.
-    pub fn share(self) -> Self {
-        let storage = match self.storage {
-            OwnedStorage::Heap(h) => OwnedStorage::Shared(Arc::new(SharedRegion::new_heap(h))),
-            OwnedStorage::External(e) => {
-                OwnedStorage::Shared(Arc::new(SharedRegion::new_external(e)))
-            }
-            already @ OwnedStorage::Shared(_) => already,
-        };
-        OwnedIOBuf {
-            storage,
-            offset: self.offset,
-            len: self.len,
-        }
-    }
-
-    /// Cheap clone of a shareable buffer — bumps the
-    /// `Arc<SharedRegion>` strong count and carries the same view.
-    /// `Err(NotShared)` if `share()` was not called first.
-    ///
-    /// The plan's design keeps refcounting opt-in: a non-Shared
-    /// buffer (`Heap` / `External`) is exclusively owned, with no
-    /// atomics on the hot path. Callers explicitly promote with
-    /// `share()` only when they need the shadow.
-    pub fn clone_shared(&self) -> Result<Self, IOBufError> {
-        match &self.storage {
-            OwnedStorage::Shared(arc) => Ok(OwnedIOBuf {
-                storage: OwnedStorage::Shared(Arc::clone(arc)),
-                offset: self.offset,
-                len: self.len,
-            }),
-            _ => Err(IOBufError::NotShared),
+            OwnedStorage::Static(s) => &s[o..o + l],
         }
     }
 
@@ -249,6 +216,224 @@ impl OwnedIOBuf {
         self.len -= n as u32;
         Ok(())
     }
+
+    /// Promote to refcounted storage so the same bytes can back
+    /// multiple `OwnedIOBuf` views via `clone_shared`. **Move-only**
+    /// — bytes do NOT copy; the existing `HeapStorage` /
+    /// `ExternalOwned` is lifted into a fresh `Arc<SharedRegion>`.
+    /// Idempotent on a buffer that is already `Shared` or `Static`
+    /// (`Static` is already an immortal borrow — multiple views
+    /// just clone the `&'static [u8]`).
+    ///
+    /// One small Arc allocation. The canonical caller is the TCP
+    /// rtx queue: keep a refcounted shadow of each sent segment so
+    /// a retransmit can replay without memcpy.
+    pub fn share(self) -> Self {
+        let storage = match self.storage {
+            OwnedStorage::Heap(h) => OwnedStorage::Shared(Arc::new(SharedRegion::new_heap(h))),
+            OwnedStorage::External(e) => {
+                OwnedStorage::Shared(Arc::new(SharedRegion::new_external(e)))
+            }
+            already @ OwnedStorage::Shared(_) => already,
+            // Static is already an immortal borrow — any number of
+            // clones is fine, no Arc needed.
+            already @ OwnedStorage::Static(_) => already,
+        };
+        OwnedIOBuf {
+            storage,
+            offset: self.offset,
+            len: self.len,
+        }
+    }
+
+    /// Cheap clone of a shareable buffer — bumps the
+    /// `Arc<SharedRegion>` strong count (or copies the `&'static`
+    /// slice) and carries the same view. `Err(NotShared)` if
+    /// `share()` was not called first on a non-static buffer.
+    ///
+    /// The plan's design keeps refcounting opt-in: a non-Shared
+    /// buffer (`Heap` / `External`) is exclusively owned, with no
+    /// atomics on the hot path. Callers explicitly promote with
+    /// `share()` only when they need the shadow.
+    pub fn clone_shared(&self) -> Result<Self, IOBufError> {
+        match &self.storage {
+            OwnedStorage::Shared(arc) => Ok(OwnedIOBuf {
+                storage: OwnedStorage::Shared(Arc::clone(arc)),
+                offset: self.offset,
+                len: self.len,
+            }),
+            OwnedStorage::Static(s) => Ok(OwnedIOBuf {
+                storage: OwnedStorage::Static(s),
+                offset: self.offset,
+                len: self.len,
+            }),
+            _ => Err(IOBufError::NotShared),
+        }
+    }
+
+    // ---- Mutators (used by IOBuf via the two-tier wrapping) -----------
+    //
+    // These live on `OwnedIOBuf` so the per-variant dispatch is
+    // colocated with the storage data — `IOBuf` just forwards. They
+    // are `pub(crate)` because the public surface of `OwnedIOBuf` is
+    // intentionally read-only: the cross-core RX path doesn't mutate
+    // bytes through `OwnedIOBuf`, only the TX side does (through
+    // `IOBuf`).
+
+    /// CoW a `Shared` IOBuf into a fresh `Heap` IOBuf when the
+    /// `Arc<SharedRegion>` is aliased (refcount > 1). Preserves the
+    /// view's capacity layout — same `(offset, len)`, same total
+    /// capacity — so subsequent prepends/appends see the same
+    /// headroom/tailroom they would have on the original. No-op
+    /// when the variant isn't `Shared`, or when it's `Shared` and
+    /// the Arc is uniquely held (the mutator then writes in place
+    /// via `Arc::get_mut`).
+    ///
+    /// Visible bytes are copied; the headroom/tailroom of the new
+    /// heap is zero-init (those bytes are only ever overwritten by
+    /// later prepends/appends, never read).
+    fn cow_if_shared_aliased(&mut self) {
+        let needs_cow = match &mut self.storage {
+            OwnedStorage::Shared(arc) => Arc::get_mut(arc).is_none(),
+            _ => false,
+        };
+        if !needs_cow {
+            return;
+        }
+        // The previous `&mut` borrow ended at the `match` expression.
+        let (new_box, new_offset, new_len): (Box<[u8]>, u32, u32) = match &self.storage {
+            OwnedStorage::Shared(arc) => {
+                let cap = arc.capacity();
+                let o = self.offset as usize;
+                let l = self.len as usize;
+                let mut buf: alloc::vec::Vec<u8> = alloc::vec![0u8; cap];
+                buf[o..o + l].copy_from_slice(&arc.bytes()[o..o + l]);
+                (buf.into_boxed_slice(), self.offset, self.len)
+            }
+            _ => unreachable!("needs_cow ⇒ variant was Shared"),
+        };
+        self.storage = OwnedStorage::Heap(HeapStorage::new(new_box));
+        self.offset = new_offset;
+        self.len = new_len;
+    }
+
+    pub(crate) fn data_mut(&mut self) -> Option<&mut [u8]> {
+        self.cow_if_shared_aliased();
+        let o = self.offset as usize;
+        let l = self.len as usize;
+        match &mut self.storage {
+            OwnedStorage::Heap(h) => Some(&mut h.bytes_mut()[o..o + l]),
+            OwnedStorage::External(e) => {
+                // SAFETY: as in `data`, plus `&mut self` gives
+                // exclusive write access for this call.
+                Some(unsafe {
+                    core::slice::from_raw_parts_mut(e.base().as_ptr().add(o), l)
+                })
+            }
+            OwnedStorage::Shared(arc) => {
+                // `cow_if_shared_aliased` made the Arc uniquely
+                // held — `get_mut` returns `Some`.
+                let region = Arc::get_mut(arc).expect("unique after cow_if_shared_aliased");
+                Some(&mut region.bytes_mut()[o..o + l])
+            }
+            OwnedStorage::Static(_) => None,
+        }
+    }
+
+    pub(crate) fn prepend(&mut self, data: &[u8]) -> Result<(), IOBufError> {
+        let n = data.len();
+        self.cow_if_shared_aliased();
+        if n > self.offset as usize {
+            return Err(match self.storage {
+                OwnedStorage::Static(_) => IOBufError::Immutable,
+                _ => IOBufError::NoHeadroom,
+            });
+        }
+        let new_offset = self.offset - n as u32;
+        match &mut self.storage {
+            OwnedStorage::Static(_) => return Err(IOBufError::Immutable),
+            OwnedStorage::Heap(h) => {
+                h.bytes_mut()[new_offset as usize..self.offset as usize].copy_from_slice(data);
+            }
+            OwnedStorage::External(e) => {
+                // SAFETY: `new_offset..self.offset` is in-bounds
+                // (new_offset >= 0 by the check); the region is
+                // exclusively owned; `&mut self` gives exclusive
+                // write access.
+                unsafe {
+                    core::slice::from_raw_parts_mut(
+                        e.base().as_ptr().add(new_offset as usize),
+                        n,
+                    )
+                    .copy_from_slice(data);
+                }
+            }
+            OwnedStorage::Shared(arc) => {
+                let region = Arc::get_mut(arc).expect("unique after cow_if_shared_aliased");
+                region.bytes_mut()[new_offset as usize..self.offset as usize]
+                    .copy_from_slice(data);
+            }
+        }
+        self.offset = new_offset;
+        self.len += n as u32;
+        Ok(())
+    }
+
+    pub(crate) fn append_slice(&mut self, data: &[u8]) -> Result<(), IOBufError> {
+        let n = data.len();
+        self.cow_if_shared_aliased();
+        if matches!(self.storage, OwnedStorage::Static(_)) {
+            return Err(IOBufError::Immutable);
+        }
+        let end = self.offset as usize + self.len as usize;
+        if end + n > self.capacity() {
+            return Err(IOBufError::NoTailroom);
+        }
+        match &mut self.storage {
+            OwnedStorage::Static(_) => unreachable!(),
+            OwnedStorage::Heap(h) => {
+                h.bytes_mut()[end..end + n].copy_from_slice(data);
+            }
+            OwnedStorage::External(e) => {
+                // SAFETY: end..end+n in-bounds; exclusive ownership;
+                // exclusive access via `&mut self`.
+                unsafe {
+                    core::slice::from_raw_parts_mut(e.base().as_ptr().add(end), n)
+                        .copy_from_slice(data);
+                }
+            }
+            OwnedStorage::Shared(arc) => {
+                let region = Arc::get_mut(arc).expect("unique after cow_if_shared_aliased");
+                region.bytes_mut()[end..end + n].copy_from_slice(data);
+            }
+        }
+        self.len += n as u32;
+        Ok(())
+    }
+
+    pub(crate) fn extend_uninit(&mut self, n: usize) -> Result<&mut [u8], IOBufError> {
+        self.cow_if_shared_aliased();
+        if matches!(self.storage, OwnedStorage::Static(_)) {
+            return Err(IOBufError::Immutable);
+        }
+        let end = self.offset as usize + self.len as usize;
+        if end + n > self.capacity() {
+            return Err(IOBufError::NoTailroom);
+        }
+        self.len += n as u32;
+        match &mut self.storage {
+            OwnedStorage::Static(_) => unreachable!(),
+            OwnedStorage::Heap(h) => Ok(&mut h.bytes_mut()[end..end + n]),
+            OwnedStorage::External(e) => {
+                // SAFETY: end..end+n in-bounds; exclusive access.
+                Ok(unsafe { core::slice::from_raw_parts_mut(e.base().as_ptr().add(end), n) })
+            }
+            OwnedStorage::Shared(arc) => {
+                let region = Arc::get_mut(arc).expect("unique after cow_if_shared_aliased");
+                Ok(&mut region.bytes_mut()[end..end + n])
+            }
+        }
+    }
 }
 
 impl IOBufRead for OwnedIOBuf {
@@ -271,36 +456,21 @@ impl IOBufRead for OwnedIOBuf {
 }
 
 /// Widen an `OwnedIOBuf` into an `IOBuf` — the one conversion the
-/// borrowed/owned split adds. Infallible: every `OwnedIOBuf` variant
-/// is also an `IOBuf` variant, so this just re-tags the storage
-/// struct into the wider enum. Zero copy, no allocation.
+/// borrowed/owned split adds. Infallible: `IOBuf` is a thin
+/// `Owned`/`Borrowed` wrapper, and this just wraps the `OwnedIOBuf`
+/// in the `Owned` variant. Zero copy, no allocation.
 ///
 /// Exercised at the app RX API boundary — a `BodyReader` spanning
 /// RX-buffer-backed chunks (`OwnedIOBuf`) and prebuf-backed chunks
 /// (`Borrowed`) within one body holds `IOBuf`, so RX buffers widen
 /// in per-chunk as they surface. There is deliberately **no**
 /// `From<IOBuf> for OwnedIOBuf`: narrowing would have to discard or
-/// materialise a `Borrowed`/`Static` part.
+/// materialise a `Borrowed` part.
 impl From<OwnedIOBuf> for IOBuf {
     fn from(o: OwnedIOBuf) -> IOBuf {
-        let inner = match o.storage {
-            OwnedStorage::Heap(h) => Inner::Heap {
-                storage: h,
-                offset: o.offset,
-                len: o.len,
-            },
-            OwnedStorage::External(e) => Inner::External {
-                storage: e,
-                offset: o.offset,
-                len: o.len,
-            },
-            OwnedStorage::Shared(r) => Inner::Shared {
-                storage: r,
-                offset: o.offset,
-                len: o.len,
-            },
-        };
-        IOBuf { inner }
+        IOBuf {
+            inner: IOBufInner::Owned(o),
+        }
     }
 }
 
@@ -393,9 +563,9 @@ mod tests {
         );
     }
 
-    /// `clone_shared()` on a non-Shared buffer (Heap / External)
-    /// returns `Err(NotShared)`. The caller must explicitly opt-in
-    /// to refcounting via `share()` first.
+    /// `clone_shared()` on a non-Shared, non-Static buffer
+    /// (`Heap` / `External`) returns `Err(NotShared)`. The caller
+    /// must explicitly opt-in to refcounting via `share()` first.
     #[test]
     fn clone_shared_on_non_shared_errors() {
         let buf = OwnedIOBuf {
@@ -404,6 +574,17 @@ mod tests {
             len: 1,
         };
         assert!(matches!(buf.clone_shared(), Err(IOBufError::NotShared)));
+    }
+
+    /// `clone_shared()` on a Static buffer succeeds and yields a
+    /// fresh view of the same `&'static` slice — `Static` is
+    /// already an immortal borrow, no Arc needed.
+    #[test]
+    fn clone_shared_on_static_succeeds() {
+        let buf = OwnedIOBuf::from_static(b"hello world");
+        let copy = buf.clone_shared().expect("Static is shareable");
+        assert_eq!(buf.data(), b"hello world");
+        assert_eq!(copy.data(), b"hello world");
     }
 
     /// A `Shared(External)`'s drop callback fires **exactly once**

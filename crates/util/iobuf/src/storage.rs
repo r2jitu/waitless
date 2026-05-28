@@ -7,24 +7,23 @@
 // while each clone carries its own `(offset, len)` slider.
 //
 //   * `HeapStorage`   — heap-owned `Box<[u8]>`. `Send` (auto).
-//   * `StaticView`    — a `&'static [u8]` borrow. Immutable. `Send`.
-//                       Its slice IS its view: consume/trim_end slide
-//                       the slice reference (not an outer offset/len)
-//                       so a static IOBuf reports headroom = tailroom
-//                       = 0 unchanged across slides.
 //   * `ExternalOwned` — a foreign region this storage owns via a drop
 //                       callback (NIC zero-copy RX, pool slabs).
-//                       `Send` via the one `unsafe impl` in the
-//                       crate — the genuine leaf assertion.
+//                       `Send + Sync` via two localized `unsafe impl`s
+//                       in this file — the genuine leaf assertions.
+//   * `SharedRegion`  — refcounted backing wrapping either of the
+//                       above; produced by `OwnedIOBuf::share()`.
 //   * `BorrowedView`  — a non-owning view of foreign storage. The
 //                       `PhantomData<*const ()>` makes it `!Send`,
 //                       which is what taints the whole `IOBuf` enum
 //                       `!Send` and keeps per-worker borrows from
 //                       crossing workers.
 //
-// `HeapStorage` + `ExternalOwned` are the owning, `Send` pair that
-// `OwnedIOBuf` is built from; `StaticView` + `BorrowedView` are the
-// non-owning views that only `IOBuf` carries.
+// `HeapStorage`, `ExternalOwned`, and `SharedRegion` are the owning,
+// `Send` set `OwnedIOBuf` is built from; `&'static [u8]` rides
+// directly in an `OwnedStorage::Static` variant (`Send` via the
+// `'static` lifetime). `BorrowedView` is the lone non-owning view —
+// it only appears under `IOBuf`'s `Borrowed` variant.
 
 use alloc::boxed::Box;
 use core::marker::PhantomData;
@@ -80,59 +79,6 @@ impl HeapStorage {
     #[inline]
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         &mut self.storage
-    }
-}
-
-// ============================================================================
-// StaticView — a `&'static [u8]` borrow.
-// ============================================================================
-
-/// Borrowed reference to static-lifetime bytes. Immutable; no
-/// headroom / tailroom semantics. Common for HTML literal chunks,
-/// the QPACK static table, etc. `Send` (a `&'static [u8]` is an
-/// immortal borrow).
-///
-/// Unlike the other variants, `StaticView`'s slice IS its view —
-/// `consume`/`trim_end` slide the slice reference rather than an
-/// outer `(offset, len)`, keeping headroom/tailroom permanently 0
-/// (you cannot prepend or append onto a static borrow).
-pub struct StaticView {
-    data: &'static [u8],
-}
-
-impl StaticView {
-    pub(crate) const fn new(data: &'static [u8]) -> Self {
-        StaticView { data }
-    }
-
-    #[inline]
-    pub(crate) fn data(&self) -> &[u8] {
-        self.data
-    }
-
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Slide the slice forward, dropping the first `n` bytes from
-    /// the view. Returns `Err(OutOfBounds)` past the end.
-    pub(crate) fn consume(&mut self, n: usize) -> Result<(), crate::IOBufError> {
-        if n > self.data.len() {
-            return Err(crate::IOBufError::OutOfBounds);
-        }
-        self.data = &self.data[n..];
-        Ok(())
-    }
-
-    /// Shrink the slice from the back by `n` bytes. Returns
-    /// `Err(OutOfBounds)` past the end.
-    pub(crate) fn trim_end(&mut self, n: usize) -> Result<(), crate::IOBufError> {
-        if n > self.data.len() {
-            return Err(crate::IOBufError::OutOfBounds);
-        }
-        self.data = &self.data[..self.data.len() - n];
-        Ok(())
     }
 }
 

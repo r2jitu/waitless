@@ -1,66 +1,50 @@
-// `IOBuf` — the flat `!Send` enum over all four storage variants.
+// `IOBuf` — the two-tier wrapper over `OwnedIOBuf` + `BorrowedView`.
 //
-// See the crate root for the borrowed/owned type-split rationale.
-// `IOBuf` is the TX-path buffer: it mixes owned and borrowed parts,
-// and `BorrowedView`'s `PhantomData<*const ()>` propagates through
-// the enum to make the whole type `!Send + !Sync`.
+// `IOBuf` is the TX-path buffer: it mixes owned and borrowed parts.
+// As of PR 4 it is a thin enum with two variants:
 //
-// As of PR 2 each variant of `Inner` carries its own `(offset, len)`
-// view alongside the storage; the per-variant structs in `storage.rs`
-// hold bytes only. Static keeps its self-contained slide semantics
-// (no outer offset/len) — its slice is its view.
+//   * `Owned(OwnedIOBuf)` — every owning shape (heap, external,
+//     shared, static) lives inside `OwnedIOBuf`; per-variant
+//     dispatch happens there. `IOBuf::From<OwnedIOBuf>` just wraps.
+//   * `Borrowed { view, offset, len }` — the sole non-owning,
+//     `!Send` variant. Its `PhantomData<*const ()>` propagates
+//     through the enum and makes `IOBuf` `!Send + !Sync`.
+//
+// The borrow tracker (debug-mode aliasing detection) is unchanged
+// from PR 2 — it lives on `BorrowedView`.
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use core::ptr::NonNull;
 
+use crate::owned::OwnedStorage;
 use crate::{
-    BorrowedView, ExternalOwned, HeapStorage, IOBufError, IOBufRead, IOBufWriter, SharedRegion,
-    StaticView,
+    BorrowedView, HeapStorage, IOBufError, IOBufRead, IOBufWriter, OwnedIOBuf,
 };
 
-/// One byte segment. Holds heap-owned storage, a static-lifetime
-/// borrow, foreign storage owned via a drop callback, or a non-owning
-/// view of foreign storage. The `Borrowed` variant makes the whole
-/// `IOBuf` `!Send + !Sync` so per-worker borrows can't accidentally
-/// cross workers — see [`crate::OwnedIOBuf`] for the `Send` counterpart
-/// that the cross-core path uses.
+/// One byte segment. Holds an `OwnedIOBuf` (any of heap, external,
+/// shared, static) or a non-owning view of foreign storage. The
+/// `Borrowed` variant makes the whole `IOBuf` `!Send + !Sync` so
+/// per-worker borrows can't accidentally cross workers — see
+/// [`crate::OwnedIOBuf`] for the `Send` counterpart that the
+/// cross-core path uses.
 pub struct IOBuf {
-    pub(crate) inner: Inner,
+    pub(crate) inner: IOBufInner,
 }
 
-/// Storage backing an [`IOBuf`]. Private: `IOBuf`'s public surface is
-/// its methods. Each variant carries its bytes-only storage plus the
-/// visible `(offset, len)` view — except `Static`, whose slice IS its
-/// view (consume/trim_end slide the slice; headroom/tailroom = 0).
-pub(crate) enum Inner {
-    /// Heap-owned `Box<[u8]>` + view.
-    Heap {
-        storage: HeapStorage,
-        offset: u32,
-        len: u32,
-    },
-    /// A `&'static [u8]` borrow. Immutable. Slides internally.
-    Static(StaticView),
-    /// A foreign region owned via a drop callback (NIC RX, pools) + view.
-    External {
-        storage: ExternalOwned,
-        offset: u32,
-        len: u32,
-    },
-    /// A non-owning view of foreign storage + view — the `!Send` variant.
+/// Storage backing an [`IOBuf`]. Private: `IOBuf`'s public surface
+/// is its methods. Two-tier: every owning shape goes through
+/// `OwnedIOBuf` (where the per-variant dispatch lives); only the
+/// non-owning `BorrowedView` view is a separate variant.
+pub(crate) enum IOBufInner {
+    /// Every owning shape. Methods delegate straight to
+    /// `OwnedIOBuf` — its own per-variant match handles heap,
+    /// external, shared, and static.
+    Owned(OwnedIOBuf),
+    /// A non-owning view of foreign storage — the `!Send` variant.
+    /// `BorrowedView`'s `PhantomData<*const ()>` taints the whole
+    /// enum `!Send + !Sync`.
     Borrowed {
         view: BorrowedView,
-        offset: u32,
-        len: u32,
-    },
-    /// Refcounted backing — produced when an `OwnedIOBuf` was
-    /// promoted via `share()` and then widened into an `IOBuf`.
-    /// Mutators CoW into a fresh `Heap` when the Arc is aliased
-    /// (refcount > 1); when uniquely held they write in place via
-    /// `Arc::get_mut`.
-    Shared {
-        storage: Arc<SharedRegion>,
         offset: u32,
         len: u32,
     },
@@ -77,13 +61,7 @@ impl IOBuf {
         // allocator's free-list returns this memory eventually so
         // initial-zeroing keeps info-leak-class bugs away.
         let storage = alloc::vec![0u8; cap].into_boxed_slice();
-        IOBuf {
-            inner: Inner::Heap {
-                storage: HeapStorage::new(storage),
-                offset: headroom as u32,
-                len: 0,
-            },
-        }
+        IOBuf::from_heap_box(storage, headroom as u32, 0)
     }
 
     /// Zero-init-free variant of [`Self::new_with_reserved`]. Saves
@@ -107,12 +85,20 @@ impl IOBuf {
         // `Box<[u8]>` whose bytes are uninitialised; the caller's
         // contract is that no byte is read before being written.
         let storage = unsafe { Box::<[u8]>::new_uninit_slice(cap).assume_init() };
+        IOBuf::from_heap_box(storage, headroom as u32, 0)
+    }
+
+    /// Internal helper: build an `Owned(Heap)` IOBuf from a
+    /// `Box<[u8]>` + initial `(offset, len)`. Used by the public
+    /// constructors and by the borrowed→owned copy path.
+    fn from_heap_box(storage: Box<[u8]>, offset: u32, len: u32) -> Self {
+        debug_assert!(offset as usize + len as usize <= storage.len());
         IOBuf {
-            inner: Inner::Heap {
-                storage: HeapStorage::new(storage),
-                offset: headroom as u32,
-                len: 0,
-            },
+            inner: IOBufInner::Owned(OwnedIOBuf {
+                storage: OwnedStorage::Heap(HeapStorage::new(storage)),
+                offset,
+                len,
+            }),
         }
     }
 
@@ -130,7 +116,7 @@ impl IOBuf {
     /// — static borrows are immutable.
     pub const fn from_static(data: &'static [u8]) -> Self {
         IOBuf {
-            inner: Inner::Static(StaticView::new(data)),
+            inner: IOBufInner::Owned(OwnedIOBuf::from_static(data)),
         }
     }
 
@@ -157,7 +143,7 @@ impl IOBuf {
     pub unsafe fn borrow(base: NonNull<u8>, capacity: u32, offset: u32, len: u32) -> Self {
         debug_assert!(offset.saturating_add(len) <= capacity);
         IOBuf {
-            inner: Inner::Borrowed {
+            inner: IOBufInner::Borrowed {
                 view: BorrowedView::new(base, capacity),
                 offset,
                 len,
@@ -169,24 +155,8 @@ impl IOBuf {
     #[inline]
     pub fn data(&self) -> &[u8] {
         match &self.inner {
-            Inner::Heap { storage, offset, len } => {
-                let o = *offset as usize;
-                &storage.bytes()[o..o + *len as usize]
-            }
-            Inner::Static(s) => s.data(),
-            Inner::External { storage, offset, len } => {
-                // SAFETY: offset + len <= capacity (construction
-                // precondition, maintained by every mutator); the
-                // region is exclusively owned for this IOBuf's
-                // lifetime.
-                unsafe {
-                    core::slice::from_raw_parts(
-                        storage.base().as_ptr().add(*offset as usize),
-                        *len as usize,
-                    )
-                }
-            }
-            Inner::Borrowed { view, offset, len } => {
+            IOBufInner::Owned(o) => o.data(),
+            IOBufInner::Borrowed { view, offset, len } => {
                 // SAFETY: the `borrow` caller guaranteed the region
                 // is valid for this IOBuf's lifetime and not
                 // concurrently mutated; offset + len <= capacity.
@@ -197,10 +167,6 @@ impl IOBuf {
                     )
                 }
             }
-            Inner::Shared { storage, offset, len } => {
-                let o = *offset as usize;
-                &storage.bytes()[o..o + *len as usize]
-            }
         }
     }
 
@@ -208,11 +174,8 @@ impl IOBuf {
     #[inline]
     pub fn len(&self) -> usize {
         match &self.inner {
-            Inner::Heap { len, .. }
-            | Inner::External { len, .. }
-            | Inner::Borrowed { len, .. }
-            | Inner::Shared { len, .. } => *len as usize,
-            Inner::Static(s) => s.len(),
+            IOBufInner::Owned(o) => o.len(),
+            IOBufInner::Borrowed { len, .. } => *len as usize,
         }
     }
 
@@ -221,76 +184,24 @@ impl IOBuf {
         self.len() == 0
     }
 
-    /// Bytes available before the payload. `0` for static borrows.
+    /// Bytes available before the payload.
     #[inline]
     pub fn headroom(&self) -> usize {
         match &self.inner {
-            Inner::Heap { offset, .. }
-            | Inner::External { offset, .. }
-            | Inner::Borrowed { offset, .. }
-            | Inner::Shared { offset, .. } => *offset as usize,
-            Inner::Static(_) => 0,
+            IOBufInner::Owned(o) => o.headroom(),
+            IOBufInner::Borrowed { offset, .. } => *offset as usize,
         }
     }
 
-    /// Bytes available after the payload. `0` for static borrows.
+    /// Bytes available after the payload.
     #[inline]
     pub fn tailroom(&self) -> usize {
         match &self.inner {
-            Inner::Heap { storage, offset, len } => storage
-                .capacity()
-                .saturating_sub(*offset as usize + *len as usize),
-            Inner::Static(_) => 0,
-            Inner::External { storage, offset, len } => storage
-                .capacity()
-                .saturating_sub(*offset as usize + *len as usize),
-            Inner::Borrowed { view, offset, len } => view
-                .capacity()
-                .saturating_sub(*offset as usize + *len as usize),
-            Inner::Shared { storage, offset, len } => storage
+            IOBufInner::Owned(o) => o.tailroom(),
+            IOBufInner::Borrowed { view, offset, len } => view
                 .capacity()
                 .saturating_sub(*offset as usize + *len as usize),
         }
-    }
-
-    /// CoW a `Shared` IOBuf into a fresh `Heap` IOBuf when the
-    /// `Arc<SharedRegion>` is aliased (refcount > 1). Preserves the
-    /// view's capacity layout — same `(offset, len)`, same total
-    /// capacity — so subsequent prepends/appends see the same
-    /// headroom/tailroom they would have on the original. No-op
-    /// when the variant isn't `Shared`, or when it's `Shared` and
-    /// the Arc is uniquely held (the mutator then writes in place
-    /// via `Arc::get_mut`).
-    ///
-    /// Visible bytes are copied; the headroom/tailroom of the new
-    /// heap is zero-init (those bytes are only ever overwritten by
-    /// later prepends/appends, never read).
-    fn cow_if_shared_aliased(&mut self) {
-        let needs_cow = match &mut self.inner {
-            Inner::Shared { storage, .. } => Arc::get_mut(storage).is_none(),
-            _ => false,
-        };
-        if !needs_cow {
-            return;
-        }
-        // `&self.inner` reborrow: the previous `&mut` borrow ended
-        // at the `match` expression above (its result was `bool`).
-        let (new_box, new_offset, new_len): (Box<[u8]>, u32, u32) = match &self.inner {
-            Inner::Shared { storage, offset, len } => {
-                let cap = storage.capacity();
-                let o = *offset as usize;
-                let l = *len as usize;
-                let mut buf: alloc::vec::Vec<u8> = alloc::vec![0u8; cap];
-                buf[o..o + l].copy_from_slice(&storage.bytes()[o..o + l]);
-                (buf.into_boxed_slice(), *offset, *len)
-            }
-            _ => unreachable!("needs_cow ⇒ variant was Shared"),
-        };
-        self.inner = Inner::Heap {
-            storage: HeapStorage::new(new_box),
-            offset: new_offset,
-            len: new_len,
-        };
     }
 
     /// Mutable access to the visible payload. Returns `None` for
@@ -302,25 +213,9 @@ impl IOBuf {
     /// it writes in place via `Arc::get_mut`.
     #[inline]
     pub fn data_mut(&mut self) -> Option<&mut [u8]> {
-        self.cow_if_shared_aliased();
         match &mut self.inner {
-            Inner::Heap { storage, offset, len } => {
-                let o = *offset as usize;
-                let l = *len as usize;
-                Some(&mut storage.bytes_mut()[o..o + l])
-            }
-            Inner::Static(_) => None,
-            Inner::External { storage, offset, len } => {
-                // SAFETY: as in `data`, plus `&mut self` gives
-                // exclusive write access for this call.
-                Some(unsafe {
-                    core::slice::from_raw_parts_mut(
-                        storage.base().as_ptr().add(*offset as usize),
-                        *len as usize,
-                    )
-                })
-            }
-            Inner::Borrowed { view, offset, len } => {
+            IOBufInner::Owned(o) => o.data_mut(),
+            IOBufInner::Borrowed { view, offset, len } => {
                 // SAFETY: the `borrow` caller guaranteed no
                 // concurrent mutation; `&mut self` gives exclusive
                 // write access for this call.
@@ -331,15 +226,6 @@ impl IOBuf {
                     )
                 })
             }
-            Inner::Shared { storage, offset, len } => {
-                // `cow_if_shared_aliased` made the Arc uniquely
-                // held — `get_mut` returns `Some`.
-                let region =
-                    Arc::get_mut(storage).expect("unique after cow_if_shared_aliased");
-                let o = *offset as usize;
-                let l = *len as usize;
-                Some(&mut region.bytes_mut()[o..o + l])
-            }
         }
     }
 
@@ -348,47 +234,17 @@ impl IOBuf {
     /// for static borrows. On a `Shared` IOBuf, CoWs into a fresh
     /// `Heap` if the Arc is aliased (refcount > 1).
     pub fn prepend(&mut self, data: &[u8]) -> Result<(), IOBufError> {
-        let n = data.len();
-        self.cow_if_shared_aliased();
         match &mut self.inner {
-            Inner::Static(_) => Err(IOBufError::Immutable),
-            Inner::Heap { storage, offset, len } => {
-                if n > *offset as usize {
-                    return Err(IOBufError::NoHeadroom);
-                }
-                let new_offset = *offset - n as u32;
-                storage.bytes_mut()[new_offset as usize..*offset as usize].copy_from_slice(data);
-                *offset = new_offset;
-                *len += n as u32;
-                Ok(())
-            }
-            Inner::External { storage, offset, len } => {
+            IOBufInner::Owned(o) => o.prepend(data),
+            IOBufInner::Borrowed { view, offset, len } => {
+                let n = data.len();
                 if n > *offset as usize {
                     return Err(IOBufError::NoHeadroom);
                 }
                 let new_offset = *offset - n as u32;
                 // SAFETY: `new_offset..*offset` is in-bounds
-                // (new_offset >= 0 by the check); the region is
-                // exclusively owned; `&mut self` gives exclusive
-                // write access.
-                unsafe {
-                    core::slice::from_raw_parts_mut(
-                        storage.base().as_ptr().add(new_offset as usize),
-                        n,
-                    )
-                    .copy_from_slice(data);
-                }
-                *offset = new_offset;
-                *len += n as u32;
-                Ok(())
-            }
-            Inner::Borrowed { view, offset, len } => {
-                if n > *offset as usize {
-                    return Err(IOBufError::NoHeadroom);
-                }
-                let new_offset = *offset - n as u32;
-                // SAFETY: as `External` above; the `borrow` caller
-                // guaranteed no concurrent mutation.
+                // (new_offset >= 0 by the check); the `borrow`
+                // caller guaranteed no concurrent mutation.
                 unsafe {
                     core::slice::from_raw_parts_mut(
                         view.base().as_ptr().add(new_offset as usize),
@@ -400,18 +256,6 @@ impl IOBuf {
                 *len += n as u32;
                 Ok(())
             }
-            Inner::Shared { storage, offset, len } => {
-                if n > *offset as usize {
-                    return Err(IOBufError::NoHeadroom);
-                }
-                let new_offset = *offset - n as u32;
-                let region =
-                    Arc::get_mut(storage).expect("unique after cow_if_shared_aliased");
-                region.bytes_mut()[new_offset as usize..*offset as usize].copy_from_slice(data);
-                *offset = new_offset;
-                *len += n as u32;
-                Ok(())
-            }
         }
     }
 
@@ -419,54 +263,19 @@ impl IOBuf {
     /// On a `Shared` IOBuf, CoWs into a fresh `Heap` if the Arc is
     /// aliased (refcount > 1).
     pub fn append_slice(&mut self, data: &[u8]) -> Result<(), IOBufError> {
-        let n = data.len();
-        self.cow_if_shared_aliased();
         match &mut self.inner {
-            Inner::Static(_) => Err(IOBufError::Immutable),
-            Inner::Heap { storage, offset, len } => {
-                let end = *offset as usize + *len as usize;
-                if end + n > storage.capacity() {
-                    return Err(IOBufError::NoTailroom);
-                }
-                storage.bytes_mut()[end..end + n].copy_from_slice(data);
-                *len += n as u32;
-                Ok(())
-            }
-            Inner::External { storage, offset, len } => {
-                let end = *offset as usize + *len as usize;
-                if end + n > storage.capacity() {
-                    return Err(IOBufError::NoTailroom);
-                }
-                // SAFETY: end..end+n is in-bounds (check above);
-                // exclusive ownership; exclusive access via `&mut self`.
-                unsafe {
-                    core::slice::from_raw_parts_mut(storage.base().as_ptr().add(end), n)
-                        .copy_from_slice(data);
-                }
-                *len += n as u32;
-                Ok(())
-            }
-            Inner::Borrowed { view, offset, len } => {
+            IOBufInner::Owned(o) => o.append_slice(data),
+            IOBufInner::Borrowed { view, offset, len } => {
+                let n = data.len();
                 let end = *offset as usize + *len as usize;
                 if end + n > view.capacity() {
                     return Err(IOBufError::NoTailroom);
                 }
-                // SAFETY: as `External` above.
+                // SAFETY: end..end+n in-bounds; exclusive access.
                 unsafe {
                     core::slice::from_raw_parts_mut(view.base().as_ptr().add(end), n)
                         .copy_from_slice(data);
                 }
-                *len += n as u32;
-                Ok(())
-            }
-            Inner::Shared { storage, offset, len } => {
-                let end = *offset as usize + *len as usize;
-                if end + n > storage.capacity() {
-                    return Err(IOBufError::NoTailroom);
-                }
-                let region =
-                    Arc::get_mut(storage).expect("unique after cow_if_shared_aliased");
-                region.bytes_mut()[end..end + n].copy_from_slice(data);
                 *len += n as u32;
                 Ok(())
             }
@@ -479,44 +288,16 @@ impl IOBuf {
     /// On a `Shared` IOBuf, CoWs into a fresh `Heap` if the Arc is
     /// aliased (refcount > 1).
     pub fn extend_uninit(&mut self, n: usize) -> Result<&mut [u8], IOBufError> {
-        self.cow_if_shared_aliased();
         match &mut self.inner {
-            Inner::Static(_) => Err(IOBufError::Immutable),
-            Inner::Heap { storage, offset, len } => {
-                let end = *offset as usize + *len as usize;
-                if end + n > storage.capacity() {
-                    return Err(IOBufError::NoTailroom);
-                }
-                *len += n as u32;
-                Ok(&mut storage.bytes_mut()[end..end + n])
-            }
-            Inner::External { storage, offset, len } => {
-                let end = *offset as usize + *len as usize;
-                if end + n > storage.capacity() {
-                    return Err(IOBufError::NoTailroom);
-                }
-                *len += n as u32;
-                // SAFETY: end..end+n in-bounds; exclusive access.
-                Ok(unsafe { core::slice::from_raw_parts_mut(storage.base().as_ptr().add(end), n) })
-            }
-            Inner::Borrowed { view, offset, len } => {
+            IOBufInner::Owned(o) => o.extend_uninit(n),
+            IOBufInner::Borrowed { view, offset, len } => {
                 let end = *offset as usize + *len as usize;
                 if end + n > view.capacity() {
                     return Err(IOBufError::NoTailroom);
                 }
                 *len += n as u32;
-                // SAFETY: as `External` above.
+                // SAFETY: end..end+n in-bounds; exclusive access.
                 Ok(unsafe { core::slice::from_raw_parts_mut(view.base().as_ptr().add(end), n) })
-            }
-            Inner::Shared { storage, offset, len } => {
-                let end = *offset as usize + *len as usize;
-                if end + n > storage.capacity() {
-                    return Err(IOBufError::NoTailroom);
-                }
-                *len += n as u32;
-                let region =
-                    Arc::get_mut(storage).expect("unique after cow_if_shared_aliased");
-                Ok(&mut region.bytes_mut()[end..end + n])
             }
         }
     }
@@ -538,11 +319,8 @@ impl IOBuf {
     #[inline]
     pub fn consume(&mut self, n: usize) -> Result<(), IOBufError> {
         match &mut self.inner {
-            Inner::Static(s) => s.consume(n),
-            Inner::Heap { offset, len, .. }
-            | Inner::External { offset, len, .. }
-            | Inner::Borrowed { offset, len, .. }
-            | Inner::Shared { offset, len, .. } => {
+            IOBufInner::Owned(o) => o.consume(n),
+            IOBufInner::Borrowed { offset, len, .. } => {
                 if n > *len as usize {
                     return Err(IOBufError::OutOfBounds);
                 }
@@ -557,11 +335,8 @@ impl IOBuf {
     #[inline]
     pub fn trim_end(&mut self, n: usize) -> Result<(), IOBufError> {
         match &mut self.inner {
-            Inner::Static(s) => s.trim_end(n),
-            Inner::Heap { len, .. }
-            | Inner::External { len, .. }
-            | Inner::Borrowed { len, .. }
-            | Inner::Shared { len, .. } => {
+            IOBufInner::Owned(o) => o.trim_end(n),
+            IOBufInner::Borrowed { len, .. } => {
                 if n > *len as usize {
                     return Err(IOBufError::OutOfBounds);
                 }
@@ -605,23 +380,20 @@ impl IOBuf {
     /// outlives) its bytes — carrying no out-of-band lifetime
     /// contract.
     ///
-    ///   * `Heap` / `Static` / `External` — each already owns its
-    ///     storage (or `'static`-outlives it). Returned unchanged:
-    ///     **zero copy**.
+    ///   * `Owned(_)` — already owned (or static). Returned
+    ///     unchanged: **zero copy**.
     ///   * `Borrowed` — the sole non-owning variant. Its visible
-    ///     payload is copied into a freshly-allocated `Heap` buffer.
-    ///     The **only** variant that costs a copy.
+    ///     payload is copied into a freshly-allocated `Heap`-backed
+    ///     `Owned`. The **only** case that costs a copy.
     ///
     /// The escape hatch for "I hold a `Borrowed` view of inbound
     /// bytes but need owned possession of them" — e.g. a proxy
     /// handler forwarding request bytes into an outbound async
     /// `send`, where the borrowed source could be overwritten before
     /// that send completes. Materialises owned storage on demand, a
-    /// no-op when ownership already holds. It stays `IOBuf -> IOBuf`:
-    /// a cross-*time* tool, orthogonal to the borrowed/owned split's
-    /// cross-*core* `OwnedIOBuf` typing.
+    /// no-op when ownership already holds.
     pub fn into_owned(mut self) -> IOBuf {
-        if matches!(self.inner, Inner::Borrowed { .. }) {
+        if matches!(self.inner, IOBufInner::Borrowed { .. }) {
             // Copy the visible payload into owned heap storage.
             // `data()`'s borrow ends at `.to_vec()`; the subsequent
             // `self.inner` write drops the old `Borrowed`, whose
@@ -629,11 +401,11 @@ impl IOBuf {
             // tracker — symmetric with the `borrow` that minted it.
             let owned: Box<[u8]> = self.data().to_vec().into_boxed_slice();
             let len = owned.len() as u32;
-            self.inner = Inner::Heap {
-                storage: HeapStorage::new(owned),
+            self.inner = IOBufInner::Owned(OwnedIOBuf {
+                storage: OwnedStorage::Heap(HeapStorage::new(owned)),
                 offset: 0,
                 len,
-            };
+            });
         }
         self
     }
@@ -687,13 +459,7 @@ impl From<alloc::vec::Vec<u8>> for IOBuf {
         // want layer-prepend room construct via
         // `from_slice_with_headroom`.
         let len = v.len() as u32;
-        IOBuf {
-            inner: Inner::Heap {
-                storage: HeapStorage::new(v.into_boxed_slice()),
-                offset: 0,
-                len,
-            },
-        }
+        IOBuf::from_heap_box(v.into_boxed_slice(), 0, len)
     }
 }
 
@@ -704,13 +470,44 @@ impl From<alloc::string::String> for IOBuf {
 }
 
 // ============================================================================
-// Tests — IOBuf-focused, including ones that match on the private `Inner`.
+// Tests — IOBuf-focused, including ones that match on the private inner shape.
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::OwnedIOBuf;
+    use crate::owned::OwnedStorage;
+
+    /// Detect an `Owned(Heap)` IOBuf via its internal shape. Tests
+    /// that previously matched on `Inner::Heap(_)` go through this
+    /// helper post-PR-4.
+    fn is_owned_heap(buf: &IOBuf) -> bool {
+        matches!(
+            &buf.inner,
+            IOBufInner::Owned(o) if matches!(o.storage, OwnedStorage::Heap(_))
+        )
+    }
+    fn is_owned_static(buf: &IOBuf) -> bool {
+        matches!(
+            &buf.inner,
+            IOBufInner::Owned(o) if matches!(o.storage, OwnedStorage::Static(_))
+        )
+    }
+    fn is_owned_external(buf: &IOBuf) -> bool {
+        matches!(
+            &buf.inner,
+            IOBufInner::Owned(o) if matches!(o.storage, OwnedStorage::External(_))
+        )
+    }
+    fn is_owned_shared(buf: &IOBuf) -> bool {
+        matches!(
+            &buf.inner,
+            IOBufInner::Owned(o) if matches!(o.storage, OwnedStorage::Shared(_))
+        )
+    }
+    fn is_borrowed(buf: &IOBuf) -> bool {
+        matches!(&buf.inner, IOBufInner::Borrowed { .. })
+    }
 
     #[test]
     fn static_buf_basics() {
@@ -812,7 +609,8 @@ mod tests {
             // callback reconstructs the Arc from ctx and lets it drop.
             // `wrap_owned` produces an `OwnedIOBuf`; widen it to the
             // mutable `IOBuf` this test exercises.
-            let mut buf = IOBuf::from(unsafe { OwnedIOBuf::wrap_owned(ptr, 32, 5, 8, cb, ctx) });
+            let mut buf =
+                IOBuf::from(unsafe { OwnedIOBuf::wrap_owned(ptr, 32, 5, 8, cb, ctx) });
             assert_eq!(buf.data(), b"abcdefgh");
             assert_eq!(buf.headroom(), 5);
             assert_eq!(buf.tailroom(), 19);
@@ -916,7 +714,7 @@ mod tests {
         let b = IOBuf::from(alloc::vec![1u8, 2, 3, 4]);
         let ptr_before = b.data().as_ptr() as usize;
         let o = b.into_owned();
-        assert!(matches!(o.inner, Inner::Heap { .. }));
+        assert!(is_owned_heap(&o));
         assert_eq!(o.data(), &[1, 2, 3, 4]);
         assert_eq!(
             o.data().as_ptr() as usize,
@@ -928,7 +726,7 @@ mod tests {
     #[test]
     fn into_owned_static_is_noop() {
         let o = IOBuf::from_static(b"hello").into_owned();
-        assert!(matches!(o.inner, Inner::Static(_)));
+        assert!(is_owned_static(&o));
         assert_eq!(o.data(), b"hello");
     }
 
@@ -953,7 +751,7 @@ mod tests {
             // reconstructs the Arc from ctx and lets it drop.
             let b = IOBuf::from(unsafe { OwnedIOBuf::wrap_owned(ptr, 16, 0, 4, cb, ctx) });
             let o = b.into_owned();
-            assert!(matches!(o.inner, Inner::External { .. }));
+            assert!(is_owned_external(&o));
             assert_eq!(o.data(), b"data");
             assert!(!released.load(Ordering::SeqCst), "callback not yet run");
         }
@@ -996,13 +794,13 @@ mod tests {
         let ptr = core::ptr::NonNull::new(storage.as_mut_ptr()).unwrap();
         // SAFETY: storage outlives the IOBuf in this block.
         let b = unsafe { IOBuf::borrow(ptr, 32, 0, 16) };
-        assert!(matches!(b.inner, Inner::Borrowed { .. }));
+        assert!(is_borrowed(&b));
         let tail = b
             .into_remainder(8)
             .expect("in-range")
             .expect("tail is non-empty");
         assert!(
-            matches!(tail.inner, Inner::Borrowed { .. }),
+            is_borrowed(&tail),
             "into_remainder is borrow-preserving — callers wanting an owned tail follow with into_owned()",
         );
         assert_eq!(tail.data(), b"tailtail");
@@ -1023,133 +821,13 @@ mod tests {
             // SAFETY: storage outlives the borrow; the borrow ends
             // when into_owned consumes it.
             let b = unsafe { IOBuf::borrow(ptr, 32, 4, 8) };
-            assert!(matches!(b.inner, Inner::Borrowed { .. }));
+            assert!(is_borrowed(&b));
             b.into_owned()
         };
-        assert!(matches!(owned.inner, Inner::Heap { .. }));
+        assert!(is_owned_heap(&owned));
         assert_eq!(owned.data(), b"abcdefgh");
         storage[4..12].copy_from_slice(b"XXXXXXXX");
         assert_eq!(owned.data(), b"abcdefgh", "owned copy is independent");
-    }
-
-    /// `data_mut` on a uniquely-held `Shared` IOBuf writes
-    /// **in place** via `Arc::get_mut` — no CoW, no copy. The
-    /// returned slice points at the same backing bytes as the
-    /// original.
-    #[test]
-    fn data_mut_on_unique_shared_writes_in_place() {
-        let owned = crate::OwnedIOBuf {
-            storage: crate::owned::OwnedStorage::Heap(HeapStorage::new(
-                alloc::vec![1u8, 2, 3, 4].into_boxed_slice(),
-            )),
-            offset: 0,
-            len: 4,
-        };
-        let shared = owned.share();
-        let mut buf: IOBuf = shared.into();
-        assert!(matches!(buf.inner, Inner::Shared { .. }));
-        let ptr_before = buf.data().as_ptr();
-
-        let view = buf.data_mut().unwrap();
-        view[0] = 0xAA;
-        view[3] = 0xBB;
-        assert_eq!(buf.data(), &[0xAA, 2, 3, 0xBB]);
-        assert_eq!(
-            buf.data().as_ptr(),
-            ptr_before,
-            "unique Shared mutates in place — no CoW",
-        );
-        // Still a Shared variant after the in-place write.
-        assert!(matches!(buf.inner, Inner::Shared { .. }));
-    }
-
-    /// `data_mut` on an aliased `Shared` IOBuf triggers CoW: a
-    /// fresh `Heap` is allocated, visible bytes are copied, and
-    /// only the cloning IOBuf observes the mutation. The original
-    /// alias still reads the pre-CoW bytes; after the CoW drops
-    /// its Arc reference, the other alias is uniquely held again.
-    #[test]
-    fn data_mut_on_aliased_shared_cow_to_heap() {
-        let owned = crate::OwnedIOBuf {
-            storage: crate::owned::OwnedStorage::Heap(HeapStorage::new(
-                alloc::vec![1u8, 2, 3, 4].into_boxed_slice(),
-            )),
-            offset: 0,
-            len: 4,
-        };
-        // Two Arc clones of the same SharedRegion.
-        let a = owned.share();
-        let b = a.clone_shared().unwrap();
-        let shared_ptr = a.data().as_ptr();
-
-        // Widen one into IOBuf and mutate — must CoW.
-        let mut a_buf: IOBuf = a.into();
-        let view = a_buf.data_mut().unwrap();
-        view[0] = 0xFF;
-        assert_eq!(a_buf.data(), &[0xFF, 2, 3, 4]);
-        // After CoW the IOBuf is now Heap, not Shared.
-        assert!(matches!(a_buf.inner, Inner::Heap { .. }));
-        assert_ne!(
-            a_buf.data().as_ptr(),
-            shared_ptr,
-            "CoW must allocate fresh storage",
-        );
-
-        // The other alias still sees the original bytes — the CoW
-        // didn't disturb the shared region.
-        assert_eq!(b.data(), &[1u8, 2, 3, 4]);
-        assert_eq!(
-            b.data().as_ptr(),
-            shared_ptr,
-            "the other alias still reads the original Arc backing",
-        );
-
-        // Dropping a_buf's Arc reference happened in the CoW (the
-        // old Shared got replaced by Heap), so b is now uniquely
-        // held — confirm by a successful in-place mutation through
-        // an IOBuf widening of b.
-        let mut b_buf: IOBuf = b.into();
-        let view = b_buf.data_mut().unwrap();
-        view[1] = 0xEE;
-        assert_eq!(b_buf.data(), &[1u8, 0xEE, 3, 4]);
-        assert!(
-            matches!(b_buf.inner, Inner::Shared { .. }),
-            "b's Shared remained — unique-rc path, no CoW",
-        );
-    }
-
-    /// `prepend` on an aliased `Shared` CoWs into a fresh `Heap`
-    /// that preserves the original headroom layout, then writes
-    /// the prepend bytes into the (now-exclusive) headroom.
-    #[test]
-    fn prepend_on_aliased_shared_cow_to_heap() {
-        // Build an OwnedIOBuf with 8 bytes of headroom + 4 visible.
-        let backing = alloc::vec![0u8; 12].into_boxed_slice();
-        let owned = crate::OwnedIOBuf {
-            storage: crate::owned::OwnedStorage::Heap(HeapStorage::new(backing)),
-            offset: 8,
-            len: 4,
-        };
-        // Write the visible bytes directly to the storage.
-        let owned = {
-            let mut o = owned;
-            if let crate::owned::OwnedStorage::Heap(ref mut h) = o.storage {
-                h.bytes_mut()[8..12].copy_from_slice(b"body");
-            }
-            o
-        };
-        let a = owned.share();
-        let _b = a.clone_shared().unwrap();
-        let mut a_buf: IOBuf = a.into();
-        assert_eq!(a_buf.headroom(), 8);
-        assert_eq!(a_buf.data(), b"body");
-
-        // Prepend should CoW (rc > 1) and then write into the
-        // preserved 8-byte headroom of the fresh Heap.
-        a_buf.prepend(b"HEAD").unwrap();
-        assert_eq!(a_buf.data(), b"HEADbody");
-        assert_eq!(a_buf.headroom(), 4, "4 bytes of headroom remain");
-        assert!(matches!(a_buf.inner, Inner::Heap { .. }));
     }
 
     /// `From<OwnedIOBuf> for IOBuf` — the one-way widening. Building
@@ -1180,10 +858,9 @@ mod tests {
             assert_eq!(owned.headroom(), 2);
             assert_eq!(owned.tailroom(), 6);
 
-            // Widen — infallible, zero copy. The storage struct is
-            // re-tagged into `Inner::External`.
+            // Widen — infallible, zero copy.
             let widened: IOBuf = owned.into();
-            assert!(matches!(widened.inner, Inner::External { .. }));
+            assert!(is_owned_external(&widened));
             assert_eq!(widened.data(), b"owned-rx");
             assert!(
                 !released.load(Ordering::SeqCst),
@@ -1196,5 +873,121 @@ mod tests {
             released.load(Ordering::SeqCst),
             "widening preserved the drop callback"
         );
+    }
+
+    /// `data_mut` on a uniquely-held `Shared` IOBuf writes
+    /// **in place** via `Arc::get_mut` — no CoW, no copy. The
+    /// returned slice points at the same backing bytes as the
+    /// original.
+    #[test]
+    fn data_mut_on_unique_shared_writes_in_place() {
+        let owned = OwnedIOBuf {
+            storage: OwnedStorage::Heap(HeapStorage::new(
+                alloc::vec![1u8, 2, 3, 4].into_boxed_slice(),
+            )),
+            offset: 0,
+            len: 4,
+        };
+        let shared = owned.share();
+        let mut buf: IOBuf = shared.into();
+        assert!(is_owned_shared(&buf));
+        let ptr_before = buf.data().as_ptr();
+
+        let view = buf.data_mut().unwrap();
+        view[0] = 0xAA;
+        view[3] = 0xBB;
+        assert_eq!(buf.data(), &[0xAA, 2, 3, 0xBB]);
+        assert_eq!(
+            buf.data().as_ptr(),
+            ptr_before,
+            "unique Shared mutates in place — no CoW",
+        );
+        // Still a Shared variant after the in-place write.
+        assert!(is_owned_shared(&buf));
+    }
+
+    /// `data_mut` on an aliased `Shared` IOBuf triggers CoW: a
+    /// fresh `Heap` is allocated, visible bytes are copied, and
+    /// only the cloning IOBuf observes the mutation. The original
+    /// alias still reads the pre-CoW bytes; after the CoW drops
+    /// its Arc reference, the other alias is uniquely held again.
+    #[test]
+    fn data_mut_on_aliased_shared_cow_to_heap() {
+        let owned = OwnedIOBuf {
+            storage: OwnedStorage::Heap(HeapStorage::new(
+                alloc::vec![1u8, 2, 3, 4].into_boxed_slice(),
+            )),
+            offset: 0,
+            len: 4,
+        };
+        // Two Arc clones of the same SharedRegion.
+        let a = owned.share();
+        let b = a.clone_shared().unwrap();
+        let shared_ptr = a.data().as_ptr();
+
+        // Widen one into IOBuf and mutate — must CoW.
+        let mut a_buf: IOBuf = a.into();
+        let view = a_buf.data_mut().unwrap();
+        view[0] = 0xFF;
+        assert_eq!(a_buf.data(), &[0xFF, 2, 3, 4]);
+        // After CoW the IOBuf is now Heap, not Shared.
+        assert!(is_owned_heap(&a_buf));
+        assert_ne!(
+            a_buf.data().as_ptr(),
+            shared_ptr,
+            "CoW must allocate fresh storage",
+        );
+
+        // The other alias still sees the original bytes — the CoW
+        // didn't disturb the shared region.
+        assert_eq!(b.data(), &[1u8, 2, 3, 4]);
+        assert_eq!(
+            b.data().as_ptr(),
+            shared_ptr,
+            "the other alias still reads the original Arc backing",
+        );
+
+        // Dropping a_buf's Arc reference happened in the CoW (the
+        // old Shared got replaced by Heap), so b is now uniquely
+        // held — confirm by a successful in-place mutation through
+        // an IOBuf widening of b.
+        let mut b_buf: IOBuf = b.into();
+        let view = b_buf.data_mut().unwrap();
+        view[1] = 0xEE;
+        assert_eq!(b_buf.data(), &[1u8, 0xEE, 3, 4]);
+        assert!(
+            is_owned_shared(&b_buf),
+            "b's Shared remained — unique-rc path, no CoW",
+        );
+    }
+
+    /// `prepend` on an aliased `Shared` CoWs into a fresh `Heap`
+    /// that preserves the original headroom layout, then writes
+    /// the prepend bytes into the (now-exclusive) headroom.
+    #[test]
+    fn prepend_on_aliased_shared_cow_to_heap() {
+        // Build an OwnedIOBuf with 8 bytes of headroom + 4 visible.
+        let backing = alloc::vec![0u8; 12].into_boxed_slice();
+        let mut owned = OwnedIOBuf {
+            storage: OwnedStorage::Heap(HeapStorage::new(backing)),
+            offset: 8,
+            len: 4,
+        };
+        // Write the visible bytes directly to the storage.
+        if let OwnedStorage::Heap(ref mut h) = owned.storage {
+            h.bytes_mut()[8..12].copy_from_slice(b"body");
+        }
+        let a = owned.share();
+        let _b = a.clone_shared().unwrap();
+        let mut a_buf: IOBuf = a.into();
+        assert_eq!(a_buf.headroom(), 8);
+        assert_eq!(a_buf.data(), b"body");
+
+        // Prepend should CoW (rc > 1) and then write into the
+        // preserved 8-byte headroom of the fresh Heap.
+        a_buf.prepend(b"HEAD").unwrap();
+        assert_eq!(a_buf.data(), b"HEADbody");
+        assert_eq!(a_buf.headroom(), 4, "4 bytes of headroom remain");
+        assert!(is_owned_heap(&a_buf));
     }
 }

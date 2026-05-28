@@ -27,20 +27,21 @@
 // thread-safety. Rather than one `!Send` type guarded by discipline,
 // the crate splits them — see docs/iobuf-type-model.md:
 //
-//   * Each ownership variant is its own struct in `storage.rs`
-//     (`HeapStorage`, `StaticView`, `ExternalOwned`, `BorrowedView`),
-//     with its data *and* offset/len logic in one place.
-//   * `IOBuf` (in `iobuf.rs`) is a flat `!Send` enum over all four
-//     structs — the TX-path buffer, which legitimately mixes owned
-//     and borrowed parts. `BorrowedView`'s `PhantomData<*const ()>`
-//     is what makes `IOBuf` `!Send`, so a per-worker borrow can't
-//     cross workers.
-//   * `OwnedIOBuf` (in `owned.rs`) is a flat enum over
-//     `{HeapStorage, ExternalOwned}` only — the owning pair. It is
-//     `Send` *by auto-derivation* (no `unsafe impl`): both variants
-//     are `Send`. The cross-core RX path is *typed* `OwnedIOBuf` /
-//     `Chain<OwnedIOBuf>`, so a borrowed buffer physically cannot
-//     reach it — a compile error, not a human-maintained invariant.
+//   * Each storage shape is its own struct in `storage.rs`
+//     (`HeapStorage`, `ExternalOwned`, `SharedRegion`, `BorrowedView`),
+//     carrying bytes only — the visible `(offset, len)` window lives
+//     on the outer type so one storage can feed many views (Arc
+//     clones).
+//   * `OwnedIOBuf` (in `owned.rs`) is the owning, `Send`-by-derivation
+//     tier: an outer struct with `(offset, len)` and a four-variant
+//     `OwnedStorage` enum (`Heap`, `External`, `Shared`, `Static`).
+//     The cross-core RX path is *typed* `OwnedIOBuf` / `Chain<OwnedIOBuf>`,
+//     so a borrowed buffer physically cannot reach it — a compile
+//     error, not a human-maintained invariant.
+//   * `IOBuf` (in `iobuf.rs`) is a thin two-variant wrapper:
+//     `Owned(OwnedIOBuf)` for any owning shape, plus `Borrowed`
+//     for non-owning views (the sole `!Send` source). All methods
+//     forward to `OwnedIOBuf` in the owned case.
 //   * `IOBufRead` is the read surface (`data` / `len` / `headroom` /
 //     `tailroom`) shared by both and by `Chain<B>`.
 //   * Widening is one-way: `From<OwnedIOBuf> for IOBuf` (infallible).
@@ -58,18 +59,19 @@ extern crate alloc;
 mod pool;
 pub use pool::IOBufPool;
 
-// The four per-variant storage structs + the debug-mode borrow
-// tracker. `IOBuf` / `OwnedIOBuf` are flat enums over these.
+// The per-variant storage structs + the debug-mode borrow tracker.
+// `OwnedIOBuf` carries an enum over these (Heap/External/Shared/
+// Static); `IOBuf::Borrowed` carries a `BorrowedView`.
 mod storage;
-pub use storage::{BorrowedView, ExternalOwned, HeapStorage, IOBufDropFn, SharedRegion, StaticView};
+pub use storage::{BorrowedView, ExternalOwned, HeapStorage, IOBufDropFn, SharedRegion};
 
 // `Chain<B>` — a chain of `B: IOBufRead` segments — plus `Cursor`.
 mod chain;
 pub use chain::{Chain, Cursor, IOBufChain};
 
-// `IOBuf` — the flat `!Send` enum over all four storage structs
-// plus its `From<&'static …>` / `From<Vec<u8>>` / `From<String>`
-// ergonomic conversions.
+// `IOBuf` — the `!Send` two-tier wrapper (`Owned(OwnedIOBuf)` +
+// `Borrowed`) plus its `From<&'static …>` / `From<Vec<u8>>` /
+// `From<String>` ergonomic conversions.
 mod iobuf;
 pub use iobuf::IOBuf;
 
