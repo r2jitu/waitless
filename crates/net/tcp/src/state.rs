@@ -7,7 +7,6 @@
 
 use crate::send::{SegmentMeta, send_segment};
 use alloc::boxed::Box;
-use core::ptr;
 use core::task::Waker;
 use from_bytes::FromBytes;
 use iobuf::IOBuf;
@@ -183,17 +182,6 @@ pub(crate) const PERSIST_MAX_PROBES: u8 = 8;
 /// FIN still finds a TCB to re-acknowledge.
 pub(crate) const TIME_WAIT_MS: u64 = 60_000;
 
-/// Active `TcpRecv` future's destination buffer. The future
-/// registers this pointer + capacity when it parks, so a subsequent
-/// `tcp_receive` can copy payload bytes straight into the user buf
-/// — skipping the per-conn ring. Cleared by the future's `Drop`
-/// (cancel safety) and by `deliver_payload` after writing.
-#[derive(Clone, Copy)]
-pub(crate) struct RecvBufSlot {
-    pub(crate) ptr: *mut u8,
-    pub(crate) cap: u16,
-}
-
 pub struct TcpConnection {
     pub state: TcpState,
     /// Peer's IP — IPv4 or IPv6. Used as the destination of every
@@ -228,9 +216,7 @@ pub struct TcpConnection {
     /// Per-conn RX ring buffer. Heap-allocated once at
     /// `TcpConnection::alloc_storage` (lazily on first SYN that
     /// lands on a fresh slot) and reused across SYN/close cycles.
-    /// `tcp_receive` writes payload bytes here via `deliver_payload`
-    /// (when there's no active recv slot to direct-copy into) or
-    /// when direct-copy doesn't consume the entire segment.
+    /// `tcp_receive` writes payload bytes here via `deliver_payload`;
     /// `async_recv` drains via `rx_ring_pop`.
     ///
     /// Inline `[u8; RX_RING_BYTES]` would bloat the per-slot
@@ -244,21 +230,6 @@ pub struct TcpConnection {
     /// Bytes currently in `rx_ring`. Cached so the per-segment
     /// rcv_wnd calc doesn't have to (head - tail) modulo every time.
     pub(crate) rx_used: u16,
-    /// Bytes `deliver_payload` wrote directly into a parked
-    /// `TcpRecv`'s user buf via `recv_buf_slot`. Read + cleared by
-    /// `async_recv` on the very next poll (the conn knows the next
-    /// poll's `buf` is the same one whose pointer we already wrote
-    /// to, because `TcpRecv::poll` doesn't change the buf between
-    /// register and pop). Stored separately from `rx_ring` so the
-    /// fast-path bypass doesn't have to memmove anything.
-    pub(crate) direct_bytes: u16,
-    /// User buf registered by a parked `TcpRecv` future for the
-    /// direct-copy fast path. Cleared by either:
-    ///   * `TcpRecv::Drop` (the future was dropped / cancelled
-    ///     before resolving) — prevents `deliver_payload` from
-    ///     writing into freed user memory.
-    ///   * `deliver_payload` itself, after it consumes the slot.
-    pub(crate) recv_buf_slot: Option<RecvBufSlot>,
     /// Set by `set_chunk_buf_slot` when a parked `RecvChunk` future
     /// wants the next inbound payload as an owned `IOBuf` rather
     /// than copied into a user buffer. While `true`, `tcp_receive`
@@ -441,8 +412,6 @@ impl TcpConnection {
             rx_head: 0,
             rx_tail: 0,
             rx_used: 0,
-            direct_bytes: 0,
-            recv_buf_slot: None,
             chunk_wanted: false,
             pending_chunk: None,
             listener_port: 0,
@@ -575,76 +544,36 @@ impl TcpConnection {
         n
     }
 
-    /// Deliver an in-sequence TCP payload to the consumer. Fast
-    /// path: if a `TcpRecv` future has registered a destination
-    /// slot, copy as many bytes as fit straight into the user buf
-    /// (one memcpy, no ring round-trip). Slow path: fall through
-    /// to the ring. Returns total bytes consumed (direct + ring) —
-    /// `rcv_nxt` advances by this much, and the segment trim happens
-    /// at the caller.
+    /// Deliver an in-sequence TCP payload to the consumer by
+    /// pushing it into the per-conn `rx_ring`; the next `recv` /
+    /// `recv_chunk` drains the ring (or, for `recv_chunk` on a
+    /// `chunk_wanted` conn, `tcp_receive` stashes the device buffer
+    /// into `pending_chunk` before this is called). Returns the
+    /// byte count the ring absorbed — `rcv_nxt` advances by this
+    /// much, and the segment trim happens at the caller.
     pub(crate) fn deliver_payload(&mut self, payload: &[u8]) -> usize {
-        let mut written = 0;
-        if let Some(slot) = self.recv_buf_slot.take() {
-            let cap = slot.cap as usize;
-            let take = payload.len().min(cap);
-            if take > 0 {
-                // SAFETY: `slot.ptr` was registered by `TcpRecv::poll`
-                // on this core; the future's `Drop` clears it (so
-                // it can't be dangling here). `slot.cap` is the
-                // length of the user buf. Both `slot.ptr` and
-                // `payload` are non-overlapping (separate
-                // allocations).
-                unsafe {
-                    ptr::copy_nonoverlapping(payload.as_ptr(), slot.ptr, take);
-                }
-                self.direct_bytes = take as u16;
-                written += take;
-            }
-        }
-        if written < payload.len() {
-            written += self.rx_ring_push(&payload[written..]);
-        }
-        written
+        self.rx_ring_push(payload)
     }
 
-    /// Drain bytes from the ring (and any pending `direct_bytes`)
-    /// into `out`. `out` is the recv-future's user buf; if
-    /// `direct_bytes > 0` those bytes were already written there
-    /// by `deliver_payload` and we just need to consume them
-    /// counter-wise.
+    /// Drain bytes from the ring into `out`. Returns the number
+    /// of bytes written, capped at `min(rx_used, out.len())` —
+    /// any excess stays in the ring for the next `recv` call.
     pub(crate) fn rx_pop(&mut self, out: &mut [u8]) -> usize {
-        let mut written = 0;
-        // Direct-copy bytes — already in `out` (same pointer),
-        // just claim them.
-        if self.direct_bytes > 0 {
-            let n = (self.direct_bytes as usize).min(out.len());
-            written = n;
-            self.direct_bytes -= n as u16;
-            // If the user buf was smaller than direct_bytes (which
-            // would only happen if poll didn't pass through the
-            // same buf — shouldn't, but be defensive), the rest is
-            // lost. Don't try to recover; this is the cancel-safety
-            // invariant.
-        }
-        if written >= out.len() {
-            return written;
-        }
-        if self.rx_used == 0 {
-            return written;
+        if out.is_empty() || self.rx_used == 0 {
+            return 0;
         }
         let ring = match self.rx_ring.as_mut() {
             Some(r) => r,
-            None => return written,
+            None => return 0,
         };
-        let want = out.len() - written;
-        let take = want.min(self.rx_used as usize);
+        let take = out.len().min(self.rx_used as usize);
         let head = self.rx_head as usize;
         if head + take <= RX_RING_BYTES {
-            out[written..written + take].copy_from_slice(&ring[head..head + take]);
+            out[..take].copy_from_slice(&ring[head..head + take]);
         } else {
             let first = RX_RING_BYTES - head;
-            out[written..written + first].copy_from_slice(&ring[head..]);
-            out[written + first..written + take].copy_from_slice(&ring[..take - first]);
+            out[..first].copy_from_slice(&ring[head..]);
+            out[first..take].copy_from_slice(&ring[..take - first]);
         }
         self.rx_head = ((head + take) % RX_RING_BYTES) as u16;
         self.rx_used -= take as u16;
@@ -652,7 +581,7 @@ impl TcpConnection {
         // is SWS-stalled on the old sub-MSS window, tell it now —
         // otherwise it waits for its persist timer.
         self.maybe_send_window_update();
-        written + take
+        take
     }
 
     /// Receiver-side silly-window-syndrome avoidance (RFC 1122

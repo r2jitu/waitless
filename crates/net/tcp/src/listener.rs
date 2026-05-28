@@ -16,11 +16,8 @@ use core::task::Waker;
 use iobuf::IOBuf;
 
 // `send_segment` is the only `send.rs` helper the close/`Listener`
-// paths reach into — used for FIN/ACK control segments. `RecvBufSlot`
-// is the typed payload of the direct-copy slot the pub-API setter
-// constructs.
+// paths reach into — used for FIN/ACK control segments.
 use crate::send::send_segment;
-use crate::state::RecvBufSlot;
 
 // ============================================================================
 // TCP public API — handles encode (core, slot) for transparent routing.
@@ -125,14 +122,11 @@ pub fn is_readable_or_closed(handle: *mut (), generation: u16) -> bool {
     if c.generation != generation {
         return true; // stale → treat as closed
     }
-    // `direct_bytes > 0` covers the case where `deliver_payload`
-    // wrote bytes straight into the parked `TcpRecv`'s user buf
-    // and bypassed the ring entirely — `rx_used` is 0 in that
-    // shape, but the future still has bytes to claim.
-    // `pending_chunk` is the `recv_chunk` analogue: a zero-copy
-    // IOBuf stashed by `tcp_receive` that `do_recv_chunk` will
-    // hand out — also readable with `rx_used == 0`.
-    if c.rx_used() > 0 || c.direct_bytes > 0 || c.pending_chunk.is_some() {
+    // `pending_chunk` is a zero-copy IOBuf stashed by `tcp_receive`
+    // for a parked `recv_chunk` consumer — readable even when
+    // `rx_used == 0`, since `do_recv_chunk` drains it before the
+    // ring.
+    if c.rx_used() > 0 || c.pending_chunk.is_some() {
         return true;
     }
     matches!(
@@ -315,52 +309,14 @@ pub fn clear_recv_waker(handle: *mut (), generation: u16) {
     c.recv_waker = None;
 }
 
-/// Register the `&mut buf` of a parked `TcpRecv` future as the
-/// direct-copy destination for the next inbound TCP payload. Called
-/// from `TcpRecv::poll` before parking; `deliver_payload` reads this
-/// slot, writes up to `cap` bytes straight into `ptr`, increments
-/// `direct_bytes`, and clears the slot.
-///
-/// Stale `generation` is a no-op — the future will see the closed
-/// state via `is_readable_or_closed` and resolve through `do_recv`.
-pub fn set_recv_buf_slot(handle: *mut (), generation: u16, ptr: *mut u8, cap: u16) {
-    let (core, slot) = match decode_handle(handle) {
-        Some(v) => v,
-        None => return,
-    };
-    let c = unsafe { &mut *conn_ptr(core, slot) };
-    if c.generation != generation {
-        return;
-    }
-    c.recv_buf_slot = Some(RecvBufSlot { ptr, cap });
-}
-
-/// Drop the registered direct-copy slot. Called from `TcpRecv::Drop`
-/// (cancel-safety: future was dropped before waker fired) and from
-/// `TcpRecv::poll` after resolving Ready. Stale `generation` is a
-/// no-op — the conn slot is already reused for someone else and
-/// the new owner's `set_recv_buf_slot` writes will dominate.
-pub fn clear_recv_buf_slot(handle: *mut (), generation: u16) {
-    let (core, slot) = match decode_handle(handle) {
-        Some(v) => v,
-        None => return,
-    };
-    let c = unsafe { &mut *conn_ptr(core, slot) };
-    if c.generation != generation {
-        return;
-    }
-    c.recv_buf_slot = None;
-}
-
 /// Register intent to receive the next inbound payload as an owned
 /// `IOBuf` (zero copy) rather than copied into a user buffer.
 /// Called from `RecvChunk::poll` before parking; `tcp_receive`
 /// then moves the next in-sequence single-part segment straight
 /// into `pending_chunk` instead of pushing it through `rx_ring`.
 ///
-/// Unlike `set_recv_buf_slot` this carries no pointer — the
-/// consumer wants the transport's buffer, not a destination to
-/// copy into — so it is just a one-bit "deliver-as-IOBuf" request.
+/// Just a one-bit "deliver-as-IOBuf" request — the consumer wants
+/// the transport's own buffer, not a destination to copy into.
 /// Stale `generation` is a no-op; the future resolves to closed
 /// via `is_readable_or_closed` + `do_recv_chunk`.
 pub fn set_chunk_buf_slot(handle: *mut (), generation: u16) {

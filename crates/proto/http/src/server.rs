@@ -137,9 +137,7 @@ where
         // syscall heap-IOBuf on native, in-place plaintext view on
         // TLS) and memcpy its bytes into the parse buffer. Routing
         // through `recv_chunk` drops the rx_ring → user-buf step on
-        // the bare-metal TCP path (one fewer copy per recv) and is
-        // the prerequisite for retiring the `recv_buf_slot` /
-        // `direct_bytes` machinery on `TcpConnection`. See
+        // the bare-metal TCP path (one fewer copy per recv). See
         // docs/high-concurrency-perf.md "Anatomy of CPU collapse" + H2.
         let space = BUF_SIZE - buf_len;
         let chunk_fut = stream.recv_chunk();

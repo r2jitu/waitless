@@ -56,8 +56,6 @@ static BARE_TCP_BACKEND: executor::reactor::TcpBackend = executor::reactor::TcpB
     do_recv: tcp::async_recv,
     register_recv_waker: tcp::register_recv_waker,
     clear_recv_waker: tcp::clear_recv_waker,
-    set_recv_buf_slot: Some(tcp::set_recv_buf_slot),
-    clear_recv_buf_slot: Some(tcp::clear_recv_buf_slot),
     do_recv_chunk: Some(tcp::do_recv_chunk),
     set_chunk_buf_slot: Some(tcp::set_chunk_buf_slot),
     clear_chunk_buf_slot: Some(tcp::clear_chunk_buf_slot),

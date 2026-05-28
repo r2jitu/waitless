@@ -253,8 +253,6 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             c.rx_head = 0;
             c.rx_tail = 0;
             c.rx_used = 0;
-            c.direct_bytes = 0;
-            c.recv_buf_slot = None;
             c.chunk_wanted = false;
             c.pending_chunk = None;
         }
@@ -478,7 +476,6 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             let pushed = if c.chunk_wanted
                 && c.pending_chunk.is_none()
                 && c.rx_used == 0
-                && c.recv_buf_slot.is_none()
                 && segment.part_count() == 1
             {
                 let mut part = segment.pop_front().expect("part_count() == 1");
@@ -496,15 +493,13 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
                 }
             } else {
                 // Walk the chain: skip the `data_offset`-byte TCP
-                // header, then deliver each part's payload bytes.
-                // `deliver_payload` direct-copies into a parked
-                // `TcpRecv`'s user buf when one is registered
-                // (consuming the slot on the first call), with the
-                // rest into the per-conn ring. One part today — one
-                // `deliver_payload` call over `data()[data_offset..]`;
-                // item I's coalesced super-segments arrive multi-part.
-                // All synchronous on this core, so the chain's device
-                // buffers are still owned at return.
+                // header, then deliver each part's payload bytes
+                // into the per-conn `rx_ring` via `deliver_payload`.
+                // One part today — one `deliver_payload` call over
+                // `data()[data_offset..]`; item I's coalesced
+                // super-segments arrive multi-part. All synchronous
+                // on this core, so the chain's device buffers are
+                // still owned at return.
                 let mut pushed = 0usize;
                 let mut skip = data_offset;
                 for part in segment.iter() {

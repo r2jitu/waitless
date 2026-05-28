@@ -54,9 +54,9 @@ mod tests;
 // `executor::reactor::tcp` backend, `waitless_backend::bare`) compile
 // unchanged.
 pub use listener::{
-    accept_on_port, async_recv, clear_chunk_buf_slot, clear_recv_buf_slot, clear_recv_waker,
-    clear_send_waker, close, do_recv_chunk, init, is_readable_or_closed, listen_on_core,
-    register_recv_waker, register_send_waker, set_chunk_buf_slot, set_recv_buf_slot, shutdown_all,
+    accept_on_port, async_recv, clear_chunk_buf_slot, clear_recv_waker, clear_send_waker, close,
+    do_recv_chunk, init, is_readable_or_closed, listen_on_core, register_recv_waker,
+    register_send_waker, set_chunk_buf_slot, shutdown_all,
 };
 pub use receive::tcp_receive;
 pub use retransmit::{has_armed_timers, on_tcp_tick};

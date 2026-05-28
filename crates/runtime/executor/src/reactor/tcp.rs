@@ -397,21 +397,6 @@ pub struct TcpBackend {
     /// is a no-op.
     pub clear_recv_waker: fn(handle: *mut (), generation: u16),
 
-    /// Optional direct-copy fast path. When set, `TcpRecv::poll`
-    /// registers its `&mut buf` (pointer + capacity) on the conn
-    /// before parking; the next inbound TCP payload writes bytes
-    /// straight into that buffer, skipping the per-conn ring. The
-    /// future's next poll claims the byte count from the conn
-    /// (`do_recv` returns it) without copying again.
-    ///
-    /// Cancel-safety: `TcpRecv::Drop` calls `clear_recv_buf_slot`
-    /// so a future dropped before the waker fires never leaves a
-    /// dangling pointer that the next `tcp_receive` would write
-    /// into. Native backends leave both `None` — POSIX `recv()`
-    /// already copies in one shot at the syscall boundary.
-    pub set_recv_buf_slot: Option<fn(handle: *mut (), generation: u16, ptr: *mut u8, cap: u16)>,
-    pub clear_recv_buf_slot: Option<fn(handle: *mut (), generation: u16)>,
-
     /// Optional zero-copy chunk-recv path — the backing for
     /// [`TcpStream::recv_chunk`]. When set, `RecvChunk::poll`
     /// flags the conn with `set_chunk_buf_slot` before parking; the
@@ -425,13 +410,12 @@ pub struct TcpBackend {
     /// copies at the `recv()` syscall anyway) makes `recv_chunk`
     /// resolve to `None` on its first poll.
     ///
-    /// Cancel-safety mirrors `set_recv_buf_slot`: `RecvChunk::Drop`
-    /// calls `clear_chunk_buf_slot` so a future dropped before the
-    /// waker fires leaves no stale "deliver-as-IOBuf" request. The
-    /// recv-side waker hooks (`register_recv_waker` /
-    /// `clear_recv_waker`) are reused — readiness is a conn-level
-    /// signal, and a conn never has both a `recv` and a
-    /// `recv_chunk` future parked at once.
+    /// Cancel-safety: `RecvChunk::Drop` calls `clear_chunk_buf_slot`
+    /// so a future dropped before the waker fires leaves no stale
+    /// "deliver-as-IOBuf" request. The recv-side waker hooks
+    /// (`register_recv_waker` / `clear_recv_waker`) are reused —
+    /// readiness is a conn-level signal, and a conn never has both
+    /// a `recv` and a `recv_chunk` future parked at once.
     pub do_recv_chunk: Option<fn(handle: *mut (), generation: u16) -> Option<iobuf::IOBuf>>,
     pub set_chunk_buf_slot: Option<fn(handle: *mut (), generation: u16)>,
     pub clear_chunk_buf_slot: Option<fn(handle: *mut (), generation: u16)>,

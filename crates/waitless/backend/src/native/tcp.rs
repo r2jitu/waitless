@@ -530,8 +530,6 @@ pub(super) static NATIVE_TCP_BACKEND: executor::reactor::TcpBackend =
         // bare-metal-style direct-copy slot. Leave both `None` and
         // `TcpRecv::poll` falls through to `do_recv` after the
         // wake.
-        set_recv_buf_slot: None,
-        clear_recv_buf_slot: None,
         // Zero-copy chunk recv (RX items F/H). `do_recv_chunk` is
         // wired (not `None`) so `TcpStream::recv_chunk` resolves to
         // a real chunk on native — handlers get one uniform API
