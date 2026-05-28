@@ -3062,6 +3062,75 @@ fn send_path_pushes_one_entry_per_chain_call() {
     assert_eq!(&queue_bytes[body1.len()..], &body2[..]);
 }
 
+/// PR 5 acceptance: rtx queue entries **share storage** with the
+/// original chain parts — `data().as_ptr()` is identical before
+/// and after the send-path takes ownership. Demonstrates the
+/// share-based insertion path: the queue holds the same backing
+/// the chain handed in, no staging memcpy.
+#[test]
+fn rtx_queue_shares_storage_with_original_chain_parts() {
+    let _g = harness();
+    const SP: u16 = 9185;
+    const CP: u16 = 50185;
+    const CLIENT_ISN: u32 = 0xF850;
+    super::listen_on_core(0, SP);
+    let _server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+
+    // Two-part chain: distinct IOBufs so we can compare data
+    // pointers per part.
+    let body0: Vec<u8> = (0..400u32).map(|i| (i & 0xFF) as u8).collect();
+    let body1: Vec<u8> = (0..600u32).map(|i| ((i ^ 0xA5) & 0xFF) as u8).collect();
+    let mut chain = iobuf::IOBufChain::new();
+    chain.push_back(iobuf::IOBuf::from(body0.clone()));
+    chain.push_back(iobuf::IOBuf::from(body1.clone()));
+
+    // Snapshot the backing pointers *before* the send call — these
+    // are the addresses the queue should reference post-share.
+    let mut parts_iter = chain.iter();
+    let part0_ptr = parts_iter.next().unwrap().data().as_ptr() as usize;
+    let part1_ptr = parts_iter.next().unwrap().data().as_ptr() as usize;
+    drop(parts_iter);
+
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(sent, body0.len() + body1.len());
+    assert!(
+        chain.is_empty(),
+        "rtx_on_data_sent drained the full prefix into the queue",
+    );
+
+    // One rtx entry per source IOBuf, share-backed.
+    let core = 0u32;
+    let cap = pool_capacity(core);
+    let mut checked = false;
+    for i in 0..cap {
+        let c = unsafe { &*conn_ptr(core, i) };
+        if c.state != crate::state::TcpState::Closed
+            && c.state != crate::state::TcpState::Listen
+            && c.local_port == SP
+            && c.remote_port == CP
+        {
+            assert_eq!(c.rtx_queue.len(), 2, "one entry per source IOBuf");
+            let e0_ptr = c.rtx_queue[0].iobuf.data().as_ptr() as usize;
+            let e1_ptr = c.rtx_queue[1].iobuf.data().as_ptr() as usize;
+            assert_eq!(
+                e0_ptr, part0_ptr,
+                "entry 0 shares backing with original chain part 0",
+            );
+            assert_eq!(
+                e1_ptr, part1_ptr,
+                "entry 1 shares backing with original chain part 1",
+            );
+            // Queue byte content matches the originals end-to-end.
+            assert_eq!(c.rtx_queue[0].iobuf.data(), &body0[..]);
+            assert_eq!(c.rtx_queue[1].iobuf.data(), &body1[..]);
+            checked = true;
+            break;
+        }
+    }
+    assert!(checked, "no live connection for ports {CP} -> {SP}");
+}
+
 /// The TSO retain path — `try_send_tso` calls `rtx_on_data_sent_slice`
 /// after sealing into a TX-pool slot — pushes a queue entry carrying
 /// the same bytes as the TSO super-segment payload.
