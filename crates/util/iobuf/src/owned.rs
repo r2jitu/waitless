@@ -14,7 +14,6 @@
 // `OwnedIOBuf` (PR 2); refcounted backing arrived with `Shared` (PR
 // 3); `Static` joined this tier with the two-tier refactor.
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 
@@ -69,8 +68,17 @@ pub(crate) enum OwnedStorage {
 /// this fact, checked by the compiler on every build.
 const _: () = {
     const fn assert_send<T: Send>() {}
+    const fn assert_sync<T: Sync>() {}
     assert_send::<OwnedIOBuf>();
     assert_send::<Chain<OwnedIOBuf>>();
+    // `SharedRegion: Send + Sync` is what makes `Arc<SharedRegion>`
+    // — and therefore `OwnedStorage::Shared` — `Send`. A future
+    // `!Sync` field on `HeapStorage` or `ExternalOwned` would taint
+    // `SharedRegion` and break OwnedIOBuf's auto-derived `Send`;
+    // assert it here so the regression is a compile error.
+    assert_send::<SharedRegion>();
+    assert_sync::<SharedRegion>();
+    assert_send::<Arc<SharedRegion>>();
 };
 
 impl OwnedIOBuf {
@@ -301,17 +309,24 @@ impl OwnedIOBuf {
             return;
         }
         // The previous `&mut` borrow ended at the `match` expression.
-        let (new_box, new_offset, new_len): (Box<[u8]>, u32, u32) = match &self.storage {
-            OwnedStorage::Shared(arc) => {
-                let cap = arc.capacity();
-                let o = self.offset as usize;
-                let l = self.len as usize;
-                let mut buf: alloc::vec::Vec<u8> = alloc::vec![0u8; cap];
-                buf[o..o + l].copy_from_slice(&arc.bytes()[o..o + l]);
-                (buf.into_boxed_slice(), self.offset, self.len)
-            }
-            _ => unreachable!("needs_cow ⇒ variant was Shared"),
+        // `needs_cow` is only true on the Shared arm, so this `if let`
+        // always matches; the `else { unreachable }` is implicit by
+        // not having an else (the variable bindings below depend on
+        // the body running).
+        let OwnedStorage::Shared(arc) = &self.storage else {
+            unreachable!("needs_cow ⇒ variant was Shared");
         };
+        let cap = arc.capacity();
+        let o = self.offset as usize;
+        let l = self.len as usize;
+        // Zero-fill the full capacity: a subsequent prepend reads the
+        // freshly-allocated headroom byte before overwriting it
+        // (via `copy_from_slice`), so it has to be initialised. Same
+        // reason `IOBuf::new_with_reserved` zero-fills its alloc.
+        let mut buf: alloc::vec::Vec<u8> = alloc::vec![0u8; cap];
+        buf[o..o + l].copy_from_slice(&arc.bytes()[o..o + l]);
+        let new_box = buf.into_boxed_slice();
+        let (new_offset, new_len) = (self.offset, self.len);
         self.storage = OwnedStorage::Heap(HeapStorage::new(new_box));
         self.offset = new_offset;
         self.len = new_len;

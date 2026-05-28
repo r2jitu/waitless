@@ -375,6 +375,11 @@ impl IOBufChain {
     /// layout. A part that contributes only some of its bytes stays
     /// on the chain with its remainder via `consume`.
     ///
+    /// The coalesced front (slow path) carries no headroom or
+    /// tailroom — it's a tight `Vec<u8>`-backed IOBuf. A caller that
+    /// pulls a header and then layer-prepends in place needs to
+    /// `push_front` its own headroom buffer instead.
+    ///
     /// Returns `IOBufError::OutOfBounds` if the chain holds fewer
     /// than `n` total bytes. `n == 0` always succeeds and yields
     /// `&[]`.

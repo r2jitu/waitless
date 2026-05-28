@@ -87,10 +87,9 @@ pub use owned::OwnedIOBuf;
 /// The **read** surface every IOBuf-shaped buffer exposes: the
 /// visible payload, its length, and the reserved head/tail room.
 ///
-/// Implemented by `IOBuf` (`!Send`), `OwnedIOBuf` (`Send`), and the
-/// four per-variant storage structs. It is the bound a `Chain<B>` is
-/// generic over — `fn consume<B: IOBufRead>(Chain<B>)` accepts both
-/// `Chain<IOBuf>` (TX) and `Chain<OwnedIOBuf>` (cross-core RX).
+/// Implemented by `IOBuf` (`!Send`) and `OwnedIOBuf` (`Send`). It is
+/// the bound a `Chain<B>` is generic over — `fn consume<B: IOBufRead>(Chain<B>)`
+/// accepts both `Chain<IOBuf>` (TX) and `Chain<OwnedIOBuf>` (cross-core RX).
 ///
 /// Deliberately **read-only**: mutating operations (`prepend`,
 /// `append`, partial-send `consume`) are *not* here. Cross-core RX
