@@ -178,6 +178,7 @@ impl Request {
 /// `serve_conn` keeps one of these per connection and resets it
 /// to `Default::default()` after each successfully-consumed
 /// request so the next pipelined request starts a fresh scan.
+#[cfg(any(test, http_legacy_buffered_parser))]
 #[derive(Default)]
 pub struct ParserState {
     /// Bytes 0..scan_pos already scanned without finding the
@@ -187,6 +188,7 @@ pub struct ParserState {
     scan_pos: usize,
 }
 
+#[cfg(any(test, http_legacy_buffered_parser))]
 pub(crate) fn parse_request_with_state(
     data: &[u8],
     req: &mut Request,
@@ -370,6 +372,7 @@ fn host_header_port(host: &[u8]) -> Option<u16> {
 /// without finding it; this restarts there to avoid the O(N²)
 /// re-scan when a request arrives in many small recv segments.
 /// Returns the absolute index of the terminator within `data`.
+#[cfg(any(test, http_legacy_buffered_parser))]
 fn find_header_end_from(data: &[u8], start: usize) -> Option<usize> {
     let suffix = data.get(start..)?;
     suffix

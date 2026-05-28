@@ -10,12 +10,12 @@ use alloc::sync::Arc;
 use iobuf::{IOBuf, IOBufChain};
 
 use crate::body::BodyReader;
-#[cfg(not(http_streaming_parser))]
+#[cfg(http_legacy_buffered_parser)]
 use crate::request::{ParserState, parse_request_with_state};
 use crate::request::Request;
 use crate::response::{Response, write_response_into_iobuf};
 use crate::stream::HttpStream;
-#[cfg(http_streaming_parser)]
+#[cfg(not(http_legacy_buffered_parser))]
 use crate::streaming;
 
 /// Per-connection parse buffer. Sized for the request HEAD only —
@@ -26,7 +26,7 @@ use crate::streaming;
 /// sets we expect from bench / browser clients plus headroom for
 /// the leading bytes of a POST body. Buffered serve_conn only —
 /// the streaming variant carries no parse buffer.
-#[cfg(not(http_streaming_parser))]
+#[cfg(http_legacy_buffered_parser)]
 const BUF_SIZE: usize = 16 * 1024;
 
 /// Idle-connection timeout. After this long without inbound data,
@@ -85,13 +85,15 @@ where
 /// HTTP/3 in `http3`) can drive their own `HttpStream` impls
 /// through the same request/response machinery.
 ///
-/// Two implementations live behind the `http_streaming_parser` cfg
-/// flag — the buffered one (default) copies bytes into a 16 KiB
-/// inline parse buffer and runs `parse_request_with_state` on it;
-/// the streaming one (cfg-on) skips the buffer entirely and feeds
-/// chunk bytes straight into `StreamingRequestParser`. They share
-/// the same signature and handler contract.
-#[cfg(not(http_streaming_parser))]
+/// Two implementations live behind the `http_legacy_buffered_parser`
+/// cfg flag — the streaming one (default) feeds chunk bytes straight
+/// into `StreamingRequestParser`, with no per-conn parse buffer; the
+/// buffered one (cfg-on; legacy) copies bytes into a 16 KiB inline
+/// parse buffer and runs `parse_request_with_state` on it. They
+/// share the same signature and handler contract. The buffered path
+/// stays for a few releases as an opt-out escape hatch; C5 removes
+/// it.
+#[cfg(http_legacy_buffered_parser)]
 pub async fn serve_conn<S, H>(handler: Arc<H>, mut stream: S)
 where
     S: HttpStream,
@@ -383,7 +385,7 @@ where
 ///
 /// Behaviour parity with the buffered variant is the contract the
 /// equivalence harness in `streaming::equivalence` pins.
-#[cfg(http_streaming_parser)]
+#[cfg(not(http_legacy_buffered_parser))]
 pub async fn serve_conn<S, H>(handler: Arc<H>, mut stream: S)
 where
     S: HttpStream,
@@ -533,7 +535,7 @@ where
     }
 }
 
-#[cfg(all(test, not(http_streaming_parser)))]
+#[cfg(all(test, http_legacy_buffered_parser))]
 mod serve_conn_tests {
     use super::serve_conn;
     use crate::body::BodyReader;
