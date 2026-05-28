@@ -1446,19 +1446,34 @@ across all cores).
 
 ## Stack-level GCE A/B — streaming-parser stack (2026-05-27)
 
-4-way `gcp-bench --env kvm --workload get_tcp,get_tls --cores 1,2 --duration 10` against a single GCE c3-highcpu-8 spot instance, loopback. Each cell is `req/s`; `Δ vs main` is the running net change against the pre-stack tip.
+`gcp-bench --env kvm --workload get_tcp,get_tls --cores 1,2 --duration 30` against a single GCE c3-highcpu-8 spot instance, loopback.
 
-| Workload | main (`d30c8ed`) | recv-chunk (`11d9fb6`) | streaming pre-O1 (`4773d6a`) | streaming + vector (`5182eb2`) |
-|---|---:|---:|---:|---:|
-| `get_tcp` 1c | 228 936 | 229 549 (+0.3 %) | 225 137 (−1.7 %) | 228 242 (−0.3 %) |
-| `get_tcp` 2c | 347 824 | 374 509 (+7.7 %) | 359 850 (+3.5 %) | **376 093 (+8.1 %)** |
-| `get_tls` 1c | 131 694 | 131 503 (flat) | 130 172 (−1.2 %) | 130 547 (−0.9 %) |
-| `get_tls` 2c | 235 713 | 249 483 (+5.8 %) | 222 367 (−5.7 %) | **232 416 (−1.4 %)** |
+The 30 s duration matters. An initial 10 s pass surfaced what looked like a 5–7 % `get_tls` 2c regression in the streaming tip vs a recv-chunk-migration "peak" of 249 483, which triggered an optimisation round. A 30 s repeat showed that 249 k was a high outlier on a noise band that's ~10 % wide at 10 s; 30 s tightens the band to ~3 % and the gap dissolves.
+
+| Workload | recv-chunk-migration (`11d9fb6`) | streaming + all opts (`5f6d25b`) | Δ |
+|---|---:|---:|---:|
+| `get_tcp` 1c | 228 823 | 228 947 | flat |
+| `get_tcp` 2c | 357 191 | **371 950** | **+4.1 %** |
+| `get_tls` 1c | 130 706 | 130 426 | flat |
+| `get_tls` 2c | 231 985 | 228 208 | −1.6 % (within noise) |
 
 Reads:
 
-* **recv_chunk migration** is a clear 2c scaling win (+7.7 % TCP, +5.8 % TLS); 1c is bandwidth-flat as expected.
-* **Streaming-parser pre-optimization** regressed `get_tls` 2c by ~6 % vs main (~11 % vs the recv-chunk peak) — the per-byte HEAD-bytes-cap check inside the byte-by-byte parser loop was the suspect.
-* **Vectorized parser + chunk-entry cap clamp** recovers the loss: `get_tcp` 2c lands +8.1 % over main (above the recv-chunk peak); `get_tls` 2c lands within run-to-run noise of main (~11 % variance across the four 10 s 2c-TLS runs).
+* **`get_tcp` 2c**: real +4 % win on top of the recv-chunk-migration baseline — eliminating the chunk → buf memcpy is visible.
+* **`get_tcp` 1c, `get_tls` 1c**: bandwidth-flat (expected — single-core was never memcpy-bound).
+* **`get_tls` 2c**: within noise. TLS is AEAD-bound at 2 c; saving the HEAD-parse memcpy doesn't move the dial.
 
-End-state vs main: TCP +8 % at 2c, TLS flat at 2c, single-core flat — paid for with the 16 KiB inline parse buffer gone from per-conn future state and the no-delimiter DoS gap closed.
+End-state vs the pre-stack starting point: `get_tcp` 2 c improved, everything else flat, paid for with the 16 KiB inline parse buffer gone from per-conn future state and the no-delimiter DoS gap closed.
+
+### Optimisations that mattered
+
+Three rounds of optimisation produced the final numbers:
+
+1. **Vectorise the per-state scans** (commit `5182eb2`): replace byte-by-byte `match self.state` dispatch with bulk `iter().position()` + `copy_from_slice`. LLVM emits SIMD scans where the predicate is simple.
+2. **Single-byte scan predicates** (commit `8e4cdbd`): switch `Target` / `Version` / `HeaderName` / `HeaderValue` from multi-byte ORs (`b == X || b == Y`) to single-byte (`b == X`). Multi-byte ORs partially defeated LLVM's autovectoriser. Came with a small strictness shift (lone-LF no longer tolerated — RFC 9112 mandates CRLF anyway).
+3. **Skip body bookkeeping for CL=0** (commit `5f6d25b`): the GET fast path was calling `body.into_leftover()` and the carry-advance unconditionally; both are dead code when `content_length == 0`. Guarded both with `if content_length > 0`.
+
+### Lessons
+
+* **10 s benches lie**. The 2c TLS variance band was wide enough that a single 10 s run could be ~10 % off steady state. 30 s tightens to ~3 %. Future bench sessions on this stack should use ≥30 s.
+* **The "regression"** that drove rounds (2) and (3) was a measurement artefact, not a real cost. Round (1) is the optimisation that actually mattered for the recovered `get_tcp` 2 c win.
