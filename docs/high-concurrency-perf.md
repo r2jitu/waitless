@@ -618,7 +618,7 @@ magnitude. Nominal per-conn from the assignment was 98 KB. The
 |---------------------------------------------------------------|------:|
 | TCP `rx_ring` (lazy, preserved per slot)                      | 16 KB |
 | ~~TCP `rtx_buf` (lazy, preserved per slot)~~ **RETIRED — replaced by `rtx_queue`** | ~~64 KB~~ → on-demand |
-| `Box<TlsConnImpl>` (per-conn TLS state — 3×4 KB inline buffers + keys + cfg Arc) | ~12 KB |
+| ~~`Box<TlsConnImpl>` (3×inline rx/tx/pt + keys + cfg Arc)~~ **RETIRED rx_buf + pt_buf** — now 4 KB tx_buf + keys + cfg Arc | ~~~38 KB~~ → ~6 KB |
 | `TlsStream` `record_scratch` (lazy on scratch fallback; `TLS_RECORD_LEN` ≈ 16 KB) | ~16 KB |
 | **Handler future `Box`** — `serve_conn` future state:         |      |
 | &nbsp;&nbsp;`req: Request` (16-header array + 256 B path)         | ~5.5 KB |
@@ -639,7 +639,8 @@ and a small `carry: Option<IOBuf>` slot for the rare case where a
 chunk carries body bytes / next-pipelined-request bytes past the
 HEAD terminator. The Box-per-spawn still pays once per accept
 (handler future) and once per TLS conn (`Box<TlsConnImpl>` =
-~12 KB metadata + 12 KB inline rx/tx/pt).
+~5 KB metadata + 4 KB inline tx_buf; the former ~34 KB of inline
+rx/pt staging buffers retired by the streaming-RX refactor).
 
 Apply 166 KB to GCE's 3 GB heap → **ceiling ≈ 18.5 K conns**
 before fragmentation. That's exactly the 18 K end of the
@@ -661,6 +662,17 @@ conns vs the 18 K observed on the old slope. Fragmentation will
 take some of that back, but the bench above ran the new slope to
 exactly the old cliff (18 K conns) and finished with 1.62 GB heap
 and 2.83 GB available — nowhere near OOM.
+
+**Follow-on** (this branch, `tls/rx-chunk-streaming`): the TLS RX
+streaming refactor retired the 17 KB `rx_buf` + 17 KB `pt_buf` pair
+inside `TlsServer`, dropping the `Box<TlsConnImpl>` from ~38 KB to
+~5 KB. Projected slope at 18 K conns drops further from 88 KB →
+~55 KB (88 − 33). At 3 GB heap the linear projection becomes
+~55 K conns. Not re-measured at 18 K yet; the `get_tls` /
+`get_tcp` 1c/2c/4c bench on `tls/rx-chunk-streaming` showed flat
+throughput vs `main` (deltas within 5% inter-run noise), so the
+refactor pays for itself purely as a per-conn slope move with no
+throughput cost.
 
 ### H3 — Buffers preserved across conn close: **CONFIRMED with twist**
 
@@ -720,8 +732,9 @@ allocations). The instant wrk closes its conns the fragment count
 goes up 170×. The pattern:
 
   * Live alloc shape per conn: 16 KB rx_ring, on-demand rtx_queue
-    entries (≤ MSS each), ~16 KB record_scratch, ~12 KB TlsConnImpl,
-    ~33 KB future Box. Mixed sizes interleaved on the heap.
+    entries (≤ MSS each), ~16 KB record_scratch, ~5 KB TlsConnImpl
+    (post rx_buf+pt_buf retirement), ~33 KB future Box. Mixed sizes
+    interleaved on the heap.
   * On conn close the future/TLS/record_scratch free at scattered
     offsets, leaving ~16 KB-sized holes around still-live structures.
     Slot-preserved rx_ring doesn't free — it stays with the slot.
@@ -898,6 +911,20 @@ first item dwarfs everything below it.
    feeds the record reassembler in place — no per-conn ciphertext
    staging buffer. **Saved 8 KB/conn.**
 
+3b. **`TlsServer.rx_buf` + `pt_buf`: 17 KB + 17 KB inline → REMOVED.** (DONE)
+   `process_chunk` walks records directly inside the chunk's
+   mutable byte slice — AEAD decrypts in place; no `rx_buf`
+   ciphertext staging. Plaintext is queued as one owned `Vec<u8>`
+   per record (`pending_plaintext: VecDeque<Vec<u8>>`), lifted to
+   a Heap `IOBuf` at pop time (zero-copy). A lazily-allocated
+   `rx_partial: Option<Box<[u8]>>` (one max-record-sized box)
+   carries straddlers between chunks — unallocated on MSS-aligned
+   /health steady state. **Saved ~34 KB/conn at steady state**
+   plus one memcpy per inbound record (the prior rx_buf staging
+   copy is gone; the into_owned at decrypt time replaces the prior
+   pt_buf staging copy with a same-byte-volume but right-sized
+   per-record alloc instead of a fixed 17 KB inline buffer).
+
 4. **`Request` headers array: `[Header; 16]` → smaller default + grow.**
    Each `Header = 336 B`, so 16 × 336 = 5.4 KB. Browsers send
    8–12 headers; wrk sends 2–4. Cap at 8 inline + lazy `Vec`
@@ -912,11 +939,13 @@ first item dwarfs everything below it.
    underneath the per-size pools.
 
 Items 1–4 are pure parameter changes, no architectural work,
-and stack additively. 1+2+3+4 drop from 182 KB to ~99 KB / conn —
-back-of-envelope **3 GB / 99 KB ≈ 31 K conns**, moving the cliff
-past 24 K so the load-shedding doctrine (P0 #3) can take over.
-But item 0 is **5× larger** on its own and is a one-time boot
-fix, so it should land first regardless.
+and stack additively. With items 2 (rtx_queue, measured 155 → 88
+KB/conn) and 3b (rx_buf + pt_buf, projected ~33 KB additional)
+both landed, the bottom-up slope projection lands around ~55
+KB/conn — back-of-envelope **3 GB / 55 KB ≈ 55 K conns**, moving
+the cliff well past 24 K so the load-shedding doctrine (P0 #3)
+can take over. But item 0 is **5× larger** on its own and is a
+one-time boot fix, so it should land first regardless.
 
 The cliff-correlated counters that already exist in `/obs` are
 sufficient for tracking this:
