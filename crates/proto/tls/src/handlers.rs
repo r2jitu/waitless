@@ -25,7 +25,7 @@ use crate::handshake::{
     psk_ke_mode, sign_content_server_cert_verify,
 };
 use crate::record::{
-    self, HEADER_LEN, RecordError, content_type, open as record_open, seal as record_seal,
+    self, HEADER_LEN, content_type, open as record_open, seal as record_seal,
 };
 use crate::schedule::{
     HASH_LEN, KeySchedule, TrafficKey, derive_secret, empty_transcript_hash, hkdf_expand_label,
@@ -208,24 +208,18 @@ impl TlsServer {
         record: &mut [u8],
         config: &TlsServerConfig,
     ) -> Result<(), HandshakeError> {
+        debug_assert!(
+            record.len() >= record::HEADER_LEN,
+            "orchestrator only dispatches framed records",
+        );
         // Begin per-stage cycle profile. `t` threads through each
         // stage boundary via `profile::mark()` until the handshake is
         // complete.
         let t = profile::start();
         // The orchestrator already framed exactly one complete
-        // plaintext record. Parse the header and content.
-        let (ct, body, _consumed) = record::parse_plaintext(record).map_err(|e| {
-            // Truncation here would mean the orchestrator framed a
-            // shorter record than the header advertised — which is
-            // impossible given the framing pass — but map to
-            // RecordError just in case to keep the trace token
-            // stable.
-            HandshakeError::from(if matches!(e, RecordError::Truncated) {
-                RecordError::RecordTooLarge
-            } else {
-                e
-            })
-        })?;
+        // plaintext record, so `parse_plaintext` cannot return
+        // `Truncated` — anything else is a real protocol error.
+        let (ct, body, _consumed) = record::parse_plaintext(record)?;
         if ct != content_type::HANDSHAKE {
             return Err(HandshakeError::UnexpectedRecord);
         }
@@ -571,16 +565,17 @@ impl TlsServer {
         &mut self,
         record: &mut [u8],
     ) -> Result<(), HandshakeError> {
-        trace::do_client_finished_entry(record.len(), record.first().copied());
+        debug_assert!(
+            record.len() >= record::HEADER_LEN,
+            "orchestrator only dispatches framed records",
+        );
+        trace::do_client_finished_entry(record.len(), Some(record[0]));
 
         // Middlebox-compat: a plaintext CCS (0x14) record can land
         // here per RFC 8446 §D.4. Just drop it — state stays
         // WaitClientFinished and the next record will be the real
         // encrypted Finished.
         if record[0] == content_type::CHANGE_CIPHER_SPEC {
-            // Validate the framing is at least syntactically a
-            // record (5-byte header + body).
-            let _ = record::parse_plaintext(record)?;
             trace::step(b"[tls]   skipped ChangeCipherSpec\n");
             return Ok(());
         }
@@ -735,6 +730,10 @@ impl TlsServer {
     /// it and pushes a fresh Heap `IOBuf` carrying the plaintext to
     /// `pending_plaintext`.
     pub(super) fn do_app_data(&mut self, record: &mut [u8]) -> Result<(), HandshakeError> {
+        debug_assert!(
+            record.len() >= record::HEADER_LEN,
+            "orchestrator only dispatches framed records",
+        );
         let tk = self.client_ap_tk.as_mut().ok_or(HandshakeError::Internal)?;
         let (inner_type, pt, _consumed) = record_open(tk, record)?;
         match inner_type {

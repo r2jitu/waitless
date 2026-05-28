@@ -567,30 +567,29 @@ impl TlsServer {
     /// chunk immediately on return, so the scrambled bytes are
     /// never observed again.
     ///
-    /// Returns the current state on success. Transitions across
-    /// multiple records inside a single chunk are handled by the
-    /// per-record dispatch — e.g. a chunk containing
-    /// `[middlebox-CCS, ClientFinished, first app_data]` advances
-    /// `WaitClientFinished -> Established` between records 2 and 3
-    /// and decrypts record 3 with the application traffic key.
+    /// Transitions across multiple records inside a single chunk
+    /// are handled by the per-record dispatch — e.g. a chunk
+    /// containing `[middlebox-CCS, ClientFinished, first app_data]`
+    /// advances `WaitClientFinished -> Established` between records
+    /// 2 and 3 and decrypts record 3 with the application traffic
+    /// key. Callers that need the current state read
+    /// [`Self::state`] (via the inherent field — `pub(crate)`)
+    /// after the call.
     pub fn process_chunk(
         &mut self,
         cipher: &mut [u8],
         config: &TlsServerConfig,
-    ) -> Result<State, HandshakeError> {
+    ) -> Result<(), HandshakeError> {
         let entry_state = self.state;
         let result = self.process_chunk_inner(cipher, config);
         if entry_state != State::Established && self.state == State::Established {
             crate::diag::COUNTERS.handshakes_completed.bump();
         }
-        match result {
-            Ok(()) => Ok(self.state),
-            Err(e) => {
-                crate::trace::error(self.state, &e);
-                crate::diag::record_handshake_failure(self.state, &e);
-                Err(e)
-            }
+        if let Err(ref e) = result {
+            crate::trace::error(self.state, e);
+            crate::diag::record_handshake_failure(self.state, e);
         }
+        result
     }
 
     fn process_chunk_inner(

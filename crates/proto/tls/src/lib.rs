@@ -381,11 +381,7 @@ impl PooledTlsConn {
     /// `cipher` is mutated in place by record-layer AEAD `open`.
     fn process_chunk(&mut self, cipher: &mut [u8]) -> Result<(), ()> {
         let inner = &mut **self.inner;
-        inner
-            .tls
-            .process_chunk(cipher, &inner.cfg)
-            .map(|_| ())
-            .map_err(|_| ())
+        inner.tls.process_chunk(cipher, &inner.cfg).map_err(|_| ())
     }
 
     fn pop_tx(&mut self, out: &mut [u8]) -> usize {
