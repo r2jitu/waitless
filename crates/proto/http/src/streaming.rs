@@ -152,6 +152,23 @@ impl StreamingRequestParser {
     /// same request must reuse the same `Request` so the in-progress
     /// field cursors line up.
     pub(crate) fn feed(&mut self, req: &mut Request, bytes: &[u8]) -> FeedResult {
+        // Clamp the chunk view to whatever the per-request HEAD-bytes
+        // cap still allows. Each "scan-until-delimiter" state below
+        // walks `bytes[i..]` with `iter().position()` + bulk
+        // `copy_from_slice` — LLVM autovectorises the simple
+        // predicates, so a 200-byte header value collapses from
+        // 200 branches into one SIMD scan + one memcpy. The cap
+        // therefore can't be a per-byte check inside the loop
+        // (that would defeat the vectorisation); instead clamp at
+        // chunk entry. If a state runs to the end of the clamped
+        // view without hitting its delimiter AND we clamped below
+        // the original, the request blew past the cap → Overflow.
+        let original_len = bytes.len();
+        let chunk_cap = (MAX_HEAD_BYTES as usize)
+            .saturating_sub(self.prior_head_bytes as usize);
+        let bytes = &bytes[..original_len.min(chunk_cap)];
+        let chunk_was_capped = bytes.len() < original_len;
+
         // Pin the parser-side contract: every `Done { consumed }` we
         // return must satisfy `consumed <= bytes.len()`, otherwise
         // the caller's `into_remainder(consumed).expect(...)` panics
@@ -165,70 +182,102 @@ impl StreamingRequestParser {
             );
             FeedResult::Done { consumed }
         };
+
         let mut i = 0;
-        while i < bytes.len() {
-            // Per-byte HEAD-bytes cap — refuses a peer that streams
-            // bytes lacking the state-terminating delimiters (DoS
-            // foothold the old buffered parser's BUF_SIZE-full check
-            // closed structurally; the streaming parser has no
-            // backing buffer, so the cap is explicit here).
-            if self
-                .prior_head_bytes
-                .saturating_add(i as u32)
-                >= MAX_HEAD_BYTES
-            {
-                return FeedResult::Overflow;
+        loop {
+            if i >= bytes.len() {
+                // Whole (clamped) chunk consumed without reaching
+                // the HEAD terminator. Either truly need more, or
+                // we clamped below the original → Overflow.
+                self.prior_head_bytes = self.prior_head_bytes.saturating_add(i as u32);
+                if chunk_was_capped {
+                    return FeedResult::Overflow;
+                }
+                return FeedResult::NeedMore;
             }
-            let b = bytes[i];
             match self.state {
                 State::Method => {
-                    if b == b' ' {
+                    // Scan until SP. Bulk-append into method_buf
+                    // (truncate at 8 bytes; bytes past the cap are
+                    // skipped but still consumed). `decode_method`
+                    // falls to `Method::Unknown` if the accumulator
+                    // doesn't match a known verb.
+                    let span = &bytes[i..];
+                    let end = span
+                        .iter()
+                        .position(|&b| b == b' ')
+                        .unwrap_or(span.len());
+                    let dst_avail = self.method_buf.len() - self.method_buf_len as usize;
+                    let take = end.min(dst_avail);
+                    self.method_buf
+                        [self.method_buf_len as usize..self.method_buf_len as usize + take]
+                        .copy_from_slice(&span[..take]);
+                    self.method_buf_len += take as u8;
+                    i += end;
+                    if i < bytes.len() {
+                        // Hit SP — decode and transition.
                         self.decode_method(req);
                         self.state = State::Target;
-                    } else if (self.method_buf_len as usize) < self.method_buf.len() {
-                        self.method_buf[self.method_buf_len as usize] = b;
-                        self.method_buf_len += 1;
-                    }
-                    // else: silently truncate — `decode_method` will
-                    // fall to `Method::Unknown` and the handler
-                    // decides.
-                    i += 1;
-                }
-                State::Target => {
-                    if b == b' ' {
-                        self.state = State::Version;
-                    } else if req.path_len < req.path.len() {
-                        req.path[req.path_len] = b;
-                        req.path_len += 1;
-                    }
-                    // else: silently truncate at 256 bytes (matches
-                    // the buffered parser's behaviour).
-                    i += 1;
-                }
-                State::Version => {
-                    // Don't actually store HTTP version — match
-                    // buffered parser, which ignores it entirely.
-                    if b == b'\r' {
-                        self.state = State::AfterRequestLineCR;
-                    }
-                    // Tolerate lone LF as line terminator (matches
-                    // buffered parser, which skipped to '\n').
-                    else if b == b'\n' {
-                        self.state = State::HeaderLineStart;
-                    }
-                    i += 1;
-                }
-                State::AfterRequestLineCR => {
-                    // Expect \n; if we got something else, fall
-                    // through to HeaderLineStart and reprocess this
-                    // byte. Buffered parser silently tolerates lone
-                    // \r as well.
-                    self.state = State::HeaderLineStart;
-                    if b == b'\n' {
                         i += 1;
                     }
                 }
+                State::Target => {
+                    // Scan until SP / CR / LF (CR/LF here means a
+                    // malformed request line; treat as end-of-line).
+                    let span = &bytes[i..];
+                    let end = span
+                        .iter()
+                        .position(|&b| b == b' ' || b == b'\r' || b == b'\n')
+                        .unwrap_or(span.len());
+                    let dst_avail = req.path.len() - req.path_len;
+                    let take = end.min(dst_avail);
+                    req.path[req.path_len..req.path_len + take]
+                        .copy_from_slice(&span[..take]);
+                    req.path_len += take;
+                    i += end;
+                    if i < bytes.len() {
+                        let b = bytes[i];
+                        self.state = if b == b' ' {
+                            State::Version
+                        } else if b == b'\r' {
+                            State::AfterRequestLineCR
+                        } else {
+                            // lone-LF
+                            State::HeaderLineStart
+                        };
+                        i += 1;
+                    }
+                }
+                State::Version => {
+                    // Skip HTTP version token entirely (not stored)
+                    // until \r or \n.
+                    let span = &bytes[i..];
+                    let end = span
+                        .iter()
+                        .position(|&b| b == b'\r' || b == b'\n')
+                        .unwrap_or(span.len());
+                    i += end;
+                    if i < bytes.len() {
+                        let b = bytes[i];
+                        self.state = if b == b'\r' {
+                            State::AfterRequestLineCR
+                        } else {
+                            State::HeaderLineStart
+                        };
+                        i += 1;
+                    }
+                }
+                State::AfterRequestLineCR => {
+                    // Expect \n; if we got something else, transition
+                    // without consuming so HeaderLineStart reprocesses
+                    // the byte (matches buffered parser's tolerance).
+                    if bytes[i] == b'\n' {
+                        i += 1;
+                    }
+                    self.state = State::HeaderLineStart;
+                }
                 State::HeaderLineStart => {
+                    let b = bytes[i];
                     if b == b'\r' {
                         self.state = State::AfterFinalCR;
                         i += 1;
@@ -238,88 +287,107 @@ impl StreamingRequestParser {
                         return done(i + 1);
                     } else {
                         // First byte of a new header name. Start a
-                        // header slot (if 16-cap not yet reached)
-                        // and reprocess this byte under HeaderName.
+                        // header slot (if 16-cap not yet reached);
+                        // don't consume — HeaderName will read this
+                        // byte on the next loop iter.
                         if req.header_count < req.headers.len() {
                             self.current_header = Some(req.header_count as u8);
                             req.header_count += 1;
                         } else {
                             // 16-cap reached — keep parsing but
-                            // discard. `current_header = None`
-                            // routes HeaderName / HeaderValue to
-                            // no-op writes.
+                            // discard via `current_header = None`.
                             self.current_header = None;
                         }
                         self.state = State::HeaderName;
                     }
                 }
                 State::HeaderName => {
-                    if b == b':' {
-                        self.state = State::HeaderColon;
-                    } else if b == b'\r' || b == b'\n' {
-                        // Malformed header line — no colon before
-                        // CR/LF. Treat as end-of-line and move on
-                        // (matches buffered parser's tolerance:
-                        // it would skip to next \n).
+                    // Scan until `:` (or CR/LF for malformed lines).
+                    let span = &bytes[i..];
+                    let end = span
+                        .iter()
+                        .position(|&b| b == b':' || b == b'\r' || b == b'\n')
+                        .unwrap_or(span.len());
+                    if let Some(idx) = self.current_header {
+                        let h = &mut req.headers[idx as usize];
+                        let dst_avail = h.name.len() - h.name_len;
+                        let take = end.min(dst_avail);
+                        h.name[h.name_len..h.name_len + take]
+                            .copy_from_slice(&span[..take]);
+                        h.name_len += take;
+                    }
+                    i += end;
+                    if i < bytes.len() {
+                        let b = bytes[i];
+                        self.state = if b == b':' {
+                            State::HeaderColon
+                        } else if b == b'\r' {
+                            State::AfterHeaderValueCR
+                        } else {
+                            // lone-LF
+                            State::HeaderLineStart
+                        };
+                        i += 1;
+                    }
+                }
+                State::HeaderColon => {
+                    // Skip leading SP (only SP, not HTAB — matches
+                    // buffered parser; full OWS is a strictness-pass
+                    // tightening).
+                    let span = &bytes[i..];
+                    let skip = span
+                        .iter()
+                        .position(|&b| b != b' ')
+                        .unwrap_or(span.len());
+                    i += skip;
+                    if i < bytes.len() {
+                        let b = bytes[i];
+                        if b == b'\r' {
+                            self.state = State::AfterHeaderValueCR;
+                            i += 1;
+                        } else if b == b'\n' {
+                            self.state = State::HeaderLineStart;
+                            i += 1;
+                        } else {
+                            // First value byte — transition without
+                            // consuming, HeaderValue picks it up.
+                            self.state = State::HeaderValue;
+                        }
+                    }
+                }
+                State::HeaderValue => {
+                    // Scan until \r or \n.
+                    let span = &bytes[i..];
+                    let end = span
+                        .iter()
+                        .position(|&b| b == b'\r' || b == b'\n')
+                        .unwrap_or(span.len());
+                    if let Some(idx) = self.current_header {
+                        let h = &mut req.headers[idx as usize];
+                        let dst_avail = h.value.len() - h.value_len;
+                        let take = end.min(dst_avail);
+                        h.value[h.value_len..h.value_len + take]
+                            .copy_from_slice(&span[..take]);
+                        h.value_len += take;
+                    }
+                    i += end;
+                    if i < bytes.len() {
+                        let b = bytes[i];
                         self.state = if b == b'\r' {
                             State::AfterHeaderValueCR
                         } else {
                             State::HeaderLineStart
                         };
-                    } else if let Some(idx) = self.current_header {
-                        let h = &mut req.headers[idx as usize];
-                        if h.name_len < h.name.len() {
-                            h.name[h.name_len] = b;
-                            h.name_len += 1;
-                        }
-                    }
-                    i += 1;
-                }
-                State::HeaderColon => {
-                    if b == b' ' {
-                        // Skip leading SP (matches buffered parser
-                        // exactly — it skips `:` + SP, NOT HTAB).
-                        // RFC 7230 OWS = SP / HTAB, so HTAB skipping
-                        // is the more spec-correct behaviour; deferred
-                        // to the C4 strictness pass with all the
-                        // other tightenings.
                         i += 1;
-                    } else if b == b'\r' {
-                        // Empty value.
-                        self.state = State::AfterHeaderValueCR;
-                        i += 1;
-                    } else if b == b'\n' {
-                        // Lone-LF empty value.
-                        self.state = State::HeaderLineStart;
-                        i += 1;
-                    } else {
-                        // First value byte — reprocess under
-                        // HeaderValue.
-                        self.state = State::HeaderValue;
                     }
-                }
-                State::HeaderValue => {
-                    if b == b'\r' {
-                        self.state = State::AfterHeaderValueCR;
-                    } else if b == b'\n' {
-                        self.state = State::HeaderLineStart;
-                    } else if let Some(idx) = self.current_header {
-                        let h = &mut req.headers[idx as usize];
-                        if h.value_len < h.value.len() {
-                            h.value[h.value_len] = b;
-                            h.value_len += 1;
-                        }
-                    }
-                    i += 1;
                 }
                 State::AfterHeaderValueCR => {
-                    // Expect \n; if we got something else, fall
-                    // through to HeaderLineStart and reprocess
-                    // (matches buffered parser's leniency).
-                    self.state = State::HeaderLineStart;
-                    if b == b'\n' {
+                    // Expect \n; non-\n falls through to
+                    // HeaderLineStart for reprocessing.
+                    if bytes[i] == b'\n' {
                         i += 1;
                     }
+                    self.state = State::HeaderLineStart;
                 }
                 State::AfterFinalCR => {
                     // Expect \n; on \n the HEAD is complete.
@@ -327,7 +395,7 @@ impl StreamingRequestParser {
                     // HEAD and call it done (matches buffered
                     // parser's "skip past \r\n\r\n" semantics —
                     // it doesn't validate the trailing \n strictly).
-                    if b == b'\n' {
+                    if bytes[i] == b'\n' {
                         self.finish_headers(req);
                         return done(i + 1);
                     } else {
@@ -341,11 +409,6 @@ impl StreamingRequestParser {
                 }
             }
         }
-        // Whole chunk consumed without reaching the HEAD terminator
-        // — record the cumulative byte count so the next feed's cap
-        // check sees the right total.
-        self.prior_head_bytes = self.prior_head_bytes.saturating_add(i as u32);
-        FeedResult::NeedMore
     }
 
     /// Match the accumulated `method_buf` against the known verbs
