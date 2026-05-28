@@ -312,9 +312,8 @@ pub struct TcpConnection {
     /// Set when a `rtx_queue` push failed to grow the deque (heap
     /// exhaustion). Coverage is suspended until ACKs drain the
     /// in-flight window; `rtx_on_ack` clears this once `snd_una ==
-    /// snd_nxt`. The "window outgrew ring" half of the old
-    /// `rtx_overflow` is structurally impossible for the queue (no
-    /// fixed capacity), so this flag is OOM-only.
+    /// snd_nxt`. OOM-only — the queue has no fixed capacity, so
+    /// "window outgrew ring" cannot happen.
     pub(crate) rtx_alloc_failed: bool,
     /// Current retransmission timeout, milliseconds. Doubles on each
     /// RTO expiry (§5.5); re-initialised when new data is ACK'd.
@@ -689,8 +688,13 @@ impl TcpConnection {
             return false;
         }
         let was_empty = self.rtx_queue.is_empty();
+        let iobuf = iobuf.into_owned();
+        // The cached `len` must match the IOBuf's visible payload —
+        // `rtx_bytes_in_flight` (and the partial-narrow path in
+        // `rtx_ack`) assume the two are kept in sync.
+        debug_assert_eq!(iobuf.data().len(), len as usize);
         self.rtx_queue.push_back(RtxEntry {
-            iobuf: iobuf.into_owned(),
+            iobuf,
             seq_start,
             len,
             first_tx_ms: now_ms,
@@ -715,7 +719,7 @@ impl TcpConnection {
     /// Does NOT itself touch `snd_una`, the RTO deadline, or the
     /// congestion controller — the caller (`rtx_on_ack`) folds those
     /// in.
-    pub(crate) fn rtx_ack(&mut self, ack_num: u32, _now_ms: u64) -> usize {
+    pub(crate) fn rtx_ack(&mut self, ack_num: u32) -> usize {
         let mut acked = 0usize;
         while let Some(head) = self.rtx_queue.front_mut() {
             let head_end = head.seq_start.wrapping_add(head.len as u32);
@@ -858,36 +862,31 @@ impl TcpConnection {
             }
             return;
         }
-        let acked = self.snd_una.wrapping_sub(old_una) as usize;
-        if acked == 0 {
+        if self.snd_una == old_una {
             return; // not new data — leave the timer untouched
         }
-        // Data bytes this ACK retires from the queue. `acked` is the
-        // raw sequence advance, which also counts the SYN / FIN
-        // phantom bytes — neither lives in the queue, so clamping to
-        // `rtx_bytes_in_flight` strips them.
-        let drop = acked.min(self.rtx_bytes_in_flight as usize);
+        // Drop acknowledged data bytes from `rtx_queue`. The raw
+        // sequence advance includes the SYN/FIN phantom bytes — neither
+        // lives in the queue, so `rtx_ack`'s return is the *data*-byte
+        // count this ACK retired, the value RFC 5681 §2 / §3.1's
+        // "cumulatively acknowledges new data" rule is interested in.
+        let drop = self.rtx_ack(self.snd_una);
         // RFC 5681 §2 / §3.1: the congestion window opens only for an
-        // ACK that "cumulatively acknowledges new data" — the SYN and
-        // FIN flag bytes do not count. Skipping the update when no
-        // data was acked keeps the 3-way handshake ACK (which acks
-        // only the SYN) from inflating the initial window.
+        // ACK that acknowledges new *data* — the SYN/FIN flag bytes do
+        // not count. Skipping the update when no data was acked keeps
+        // the 3-way handshake ACK (which acks only the SYN) from
+        // inflating the initial window.
         if drop > 0 {
             self.cwnd_on_ack(drop as u32);
         }
         // RFC 6298 §3 (Karn): if this ACK covers the anchored byte and
         // no retransmission has invalidated the sample, fold the
         // round-trip time into the estimator.
-        let now_ms = kernel_core::clock::now_ms();
         if self.rtt_anchor_active && !seq_lt(self.snd_una, self.rtt_anchor_seq) {
-            let elapsed = now_ms.saturating_sub(self.rtt_anchor_ms);
+            let elapsed = kernel_core::clock::now_ms().saturating_sub(self.rtt_anchor_ms);
             self.sample_rtt(elapsed.min(u32::MAX as u64) as u32);
             self.rtt_anchor_active = false;
         }
-        // Drop acknowledged bytes from `rtx_queue` — pops fully-acked
-        // entries from the head and narrows a partially-acked head
-        // entry forward.
-        let _ = self.rtx_ack(self.snd_una, now_ms);
         // New data acknowledged: the peer is making progress, so clear
         // the §5.5 backoff and reset the RTO to the current estimate
         // (RFC 6298 §5.7 — a backed-off RTO holds only until a

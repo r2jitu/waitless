@@ -2913,7 +2913,6 @@ fn rtx_push_seeds_entry_and_anchor() {
     let _g = harness();
     const SP: u16 = 9180;
     const CP: u16 = 50180;
-    handshake(SP, CP, 0xF800);
     super::listen_on_core(0, SP);
     let _ = handshake(SP, CP, 0xF800);
 
@@ -2973,13 +2972,13 @@ fn rtx_ack_pops_and_narrows() {
             c.rtx_push(mk(0xB0, 200), 1100, 200, 2);
 
             // Full ACK of the head entry pops it.
-            let acked = c.rtx_ack(1100, 10);
+            let acked = c.rtx_ack(1100);
             assert_eq!(acked, 100);
             assert_eq!(c.rtx_queue.len(), 1);
             assert_eq!(c.rtx_bytes_in_flight, 200);
 
             // Partial ACK of the new head (30 of 200) narrows in place.
-            let acked = c.rtx_ack(1130, 11);
+            let acked = c.rtx_ack(1130);
             assert_eq!(acked, 30);
             assert_eq!(c.rtx_queue.len(), 1);
             assert_eq!(c.rtx_bytes_in_flight, 170);
@@ -3147,7 +3146,7 @@ fn rtx_ack_cumulative_drains_multiple() {
             c.rtx_push(iobuf::IOBuf::from(vec![0u8; 50]), 1300, 50, 3);
             // ACK retires the first two entries fully + 10 bytes of
             // the third.
-            assert_eq!(c.rtx_ack(1310, 10), 310);
+            assert_eq!(c.rtx_ack(1310), 310);
             assert_eq!(c.rtx_queue.len(), 1);
             assert_eq!(c.rtx_bytes_in_flight, 40);
             let head = c.rtx_queue.front().unwrap();
@@ -3158,3 +3157,4 @@ fn rtx_ack_cumulative_drains_multiple() {
     }
     panic!("no live connection for ports {CP} -> {SP}");
 }
+

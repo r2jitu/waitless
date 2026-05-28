@@ -395,8 +395,10 @@ pub struct RtxAllocFailRecord {
     pub core: u32,
     /// Connection state at the moment of failure.
     pub conn_state: TcpState,
-    /// `rtx_bytes_in_flight` at failure — the byte count whose
-    /// retransmit coverage is being suspended.
+    /// `rtx_bytes_in_flight` *before* the queue clear — the
+    /// already-tracked unacked window we're discarding coverage
+    /// for. Does not include the segment whose push just failed
+    /// (those bytes were never tracked in the queue).
     pub bytes_in_flight: u32,
     /// `kernel_core::clock::now_ms()` at the failure.
     pub at_ms: u64,
