@@ -112,6 +112,32 @@ pub trait IOBufRead {
     }
 }
 
+/// Trivial impl for a `&[u8]` slice — lets `Chain<&'a [u8]>` (and
+/// any other read-only chain consumer) accept raw slices alongside
+/// `IOBuf` / `OwnedIOBuf`. Headroom / tailroom are 0 (no reserved
+/// frame around a borrowed slice). Saves an `unsafe IOBuf::borrow`
+/// mint at sites that don't mix borrowed and owned parts —
+/// `TcpStream::send_bytes`, TLS send-scratch — letting the lifetime
+/// flow through the type system instead.
+impl IOBufRead for &[u8] {
+    #[inline]
+    fn data(&self) -> &[u8] {
+        self
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+    #[inline]
+    fn headroom(&self) -> usize {
+        0
+    }
+    #[inline]
+    fn tailroom(&self) -> usize {
+        0
+    }
+}
+
 // ============================================================================
 // IOBufError
 // ============================================================================
@@ -182,6 +208,26 @@ impl core::fmt::Write for IOBufWriter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `&[u8]` implements `IOBufRead`, so `Chain<&'a [u8]>` works as
+    /// a read-only chain holding raw slices. Lifetime flows through
+    /// the type system — the chain borrows for `'a`, no `unsafe
+    /// IOBuf::borrow` needed.
+    #[test]
+    fn chain_of_byte_slices_round_trips() {
+        let a = b"hello".as_slice();
+        let b = b" ".as_slice();
+        let c = b"world".as_slice();
+        let mut chain: Chain<&[u8]> = Chain::new();
+        chain.push_back(a);
+        chain.push_back(b);
+        chain.push_back(c);
+        assert_eq!(chain.total_len(), 11);
+        assert_eq!(chain.part_count(), 3);
+        let mut out = [0u8; 32];
+        let n = chain.cursor().read(&mut out);
+        assert_eq!(&out[..n], b"hello world");
+    }
 
     /// Mock-NIC RX-delivery tests for the contract the `NicOps` poll
     /// callback depends on: a driver hands up a received frame as an
