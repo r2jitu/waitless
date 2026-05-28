@@ -409,6 +409,40 @@ impl IOBuf {
         }
         self
     }
+
+    /// Promote to refcounted (`Shared`) storage, returning an IOBuf
+    /// that can be cheaply `clone_shared`'d. Forwards to
+    /// [`OwnedIOBuf::share`] in the `Owned` arm; a `Borrowed` IOBuf
+    /// is first `into_owned`'d (one heap copy of the visible bytes)
+    /// then shared. The result is always `Owned(Shared)`.
+    ///
+    /// The canonical caller is the TCP retransmit queue: keep a
+    /// refcounted shadow of each sent IOBuf so a future SG-TX
+    /// driver can hold a `clone_shared` while the queue retains
+    /// retransmit coverage.
+    pub fn share(self) -> IOBuf {
+        let owned = match self.into_owned().inner {
+            IOBufInner::Owned(o) => o,
+            IOBufInner::Borrowed { .. } => unreachable!("into_owned promotes Borrowed to Owned"),
+        };
+        IOBuf {
+            inner: IOBufInner::Owned(owned.share()),
+        }
+    }
+
+    /// Cheap clone of a `Shared` (or `Static`) IOBuf — forwards to
+    /// [`OwnedIOBuf::clone_shared`]. `Err(NotShared)` for
+    /// `Owned(Heap)` / `Owned(External)` (caller forgot to `share()`
+    /// first) and for `Borrowed` (a borrow can't be refcount-shared
+    /// without first materialising the bytes).
+    pub fn clone_shared(&self) -> Result<IOBuf, IOBufError> {
+        match &self.inner {
+            IOBufInner::Owned(o) => Ok(IOBuf {
+                inner: IOBufInner::Owned(o.clone_shared()?),
+            }),
+            IOBufInner::Borrowed { .. } => Err(IOBufError::NotShared),
+        }
+    }
 }
 
 impl IOBufRead for IOBuf {
@@ -828,6 +862,63 @@ mod tests {
         assert_eq!(owned.data(), b"abcdefgh");
         storage[4..12].copy_from_slice(b"XXXXXXXX");
         assert_eq!(owned.data(), b"abcdefgh", "owned copy is independent");
+    }
+
+    /// `IOBuf::share()` on an `Owned(Heap)` returns an `Owned(Shared)`
+    /// pointing at the same bytes — move-only, no copy. `IOBuf::
+    /// clone_shared()` then yields two views of the same backing.
+    #[test]
+    fn iobuf_share_forwards_to_owned_iobuf() {
+        let buf = IOBuf::from(alloc::vec![1u8, 2, 3, 4]);
+        let ptr_before = buf.data().as_ptr();
+        let shared = buf.share();
+        assert!(is_owned_shared(&shared));
+        assert_eq!(
+            shared.data().as_ptr(),
+            ptr_before,
+            "share() must not copy bytes — same backing pointer",
+        );
+        let clone = shared.clone_shared().expect("Shared is shareable");
+        assert_eq!(shared.data(), clone.data());
+        assert_eq!(
+            shared.data().as_ptr(),
+            clone.data().as_ptr(),
+            "clone_shared yields a second view of the same backing",
+        );
+    }
+
+    /// `IOBuf::clone_shared` rejects `Owned(Heap)` (must `share()`
+    /// first) and `Borrowed` (cannot refcount-share a borrow).
+    #[test]
+    fn iobuf_clone_shared_rejects_non_shareable() {
+        // Heap without `share()`.
+        let heap = IOBuf::from(alloc::vec![1u8, 2, 3]);
+        assert!(matches!(heap.clone_shared(), Err(IOBufError::NotShared)));
+
+        // Borrowed.
+        let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 8];
+        let ptr = core::ptr::NonNull::new(storage.as_mut_ptr()).unwrap();
+        // SAFETY: storage outlives the borrow.
+        let borrowed = unsafe { IOBuf::borrow(ptr, 8, 0, 4) };
+        assert!(matches!(borrowed.clone_shared(), Err(IOBufError::NotShared)));
+    }
+
+    /// `IOBuf::share` on a `Borrowed` IOBuf materialises owned heap
+    /// storage (the one-copy path) before promoting to `Shared`.
+    #[test]
+    fn iobuf_share_on_borrowed_materialises_and_shares() {
+        let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 16];
+        storage[..8].copy_from_slice(b"borrowed");
+        let ptr = core::ptr::NonNull::new(storage.as_mut_ptr()).unwrap();
+        // SAFETY: storage outlives the borrow; share() consumes it.
+        let borrowed = unsafe { IOBuf::borrow(ptr, 16, 0, 8) };
+        let shared = borrowed.share();
+        assert!(is_owned_shared(&shared));
+        assert_eq!(shared.data(), b"borrowed");
+        // The bytes are now owned: mutating the original `storage`
+        // doesn't disturb the shared view.
+        storage[..8].copy_from_slice(b"XXXXXXXX");
+        assert_eq!(shared.data(), b"borrowed");
     }
 
     /// `From<OwnedIOBuf> for IOBuf` — the one-way widening. Building
