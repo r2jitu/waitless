@@ -624,7 +624,6 @@ magnitude. Nominal per-conn from the assignment was 98 KB. The
 | &nbsp;&nbsp;`buf: [u8; 16384]` parse buffer                       | 16 KB |
 | &nbsp;&nbsp;`req: Request` (16-header array + 256 B path)         | ~5.5 KB |
 | &nbsp;&nbsp;`header_storage: [u8; 1024]`                         | 1 KB |
-| &nbsp;&nbsp;`TlsStream.cipher_buf: [u8; 8192]`                    | 8 KB |
 | &nbsp;&nbsp;`TlsStream.tx_scratch: [u8; 2048]`                    | 2 KB |
 | `TcpConnection` slot (in pool segment, ~600 B)                | ~1 KB |
 | Talc per-allocation headers + alignment slack                 | ~40 KB |
@@ -822,11 +821,10 @@ first item dwarfs everything below it.
    up to 48 KB/conn on idle keep-alive slots; up to 16 K → 30 K
    cliff if the bench workload tops out below 16 KB in flight.**
 
-3. **`TlsStream.cipher_buf`: 8 KB inline → 4 KB inline.**
-   Sized for "one TCP MTU's worth of inbound ciphertext per recv
-   call" (lib.rs:444). 4 KB still covers the common case (most
-   `recv` returns one MTU = ~1.4 KB), and short reads loop. **Saves
-   4 KB/conn.**
+3. **`TlsStream.cipher_buf`: 8 KB inline → REMOVED.** (DONE)
+   `pump_rx` now pulls ciphertext via `TcpStream::recv_chunk` and
+   feeds the record reassembler in place — no per-conn ciphertext
+   staging buffer. **Saved 8 KB/conn.**
 
 4. **`Request` headers array: `[Header; 16]` → smaller default + grow.**
    Each `Header = 336 B`, so 16 × 336 = 5.4 KB. Browsers send
@@ -917,11 +915,12 @@ pool, no fresh alloc. So under sustained load, site #4 is a non-issue.
 **Site #3 is the residual gap.** Every accepted TCP conn goes
 through `Box::pin(async move { body(stream).await })` at
 [`crates/runtime/executor/src/reactor/tcp.rs:665`](../crates/runtime/executor/src/reactor/tcp.rs#L665).
-That's a ~33 KB heap allocation (the future state includes
+That's a ~25 KB heap allocation (the future state includes
 `serve_conn`'s inline `[u8; 16384]` parse buffer, the
-`Request` struct, `TlsStream`'s 8 KB cipher_buf, the 2 KB
-tx_scratch, and the handler body's own captured state — see
-the "H2" breakdown above). The standard-library `Box::pin`
+`Request` struct, the 2 KB `tx_scratch`, and the handler body's
+own captured state — see the "H2" breakdown above; the 8 KB
+`TlsStream.cipher_buf` it used to include is gone — `pump_rx`
+now uses `TcpStream::recv_chunk`). The standard-library `Box::pin`
 uses the global allocator and panics on null via
 `alloc::alloc::handle_alloc_error`. With the heap exhausted,
 this panic fires, runs `#[panic_handler]`, calls

@@ -77,10 +77,10 @@ buffer moves straight through `recv_chunk` to the handler) and
 | # | Step | Site | Cost per byte | Notes |
 |---|------|------|---|---|
 | 1–4 | Same as TCP HTTP | (above) | 1–2 | Ciphertext bytes flow through |
-| 5 | TLS pump_rx into cipher_buf | [`proto/tls/src/lib.rs:513`](proto/tls/src/lib.rs#L513) | 0 (in-place pump from TcpStream::recv) | 8 KiB inline cipher_buf |
+| 5 | TLS pump_rx pulls ciphertext | [`proto/tls/src/lib.rs`](proto/tls/src/lib.rs) `pump_rx` | 0 (in-place via TcpStream::recv_chunk) | No inline cipher_buf — chunk is consumed straight into the record reassembler |
 | 6 | AEAD decrypt | TLS state machine | **1× R/W** (ChaCha20) + **1× R** (Poly1305 verify) | Plaintext lands in `pt_buf` (17 KiB after Phase 1's bump) |
-| 7 | TlsStream::recv pops plaintext | [`proto/tls/src/lib.rs:685`](proto/tls/src/lib.rs#L685) | **1× memcpy** | pt_buf → user buf (item G's `recv_chunk` is the zero-copy sibling) |
-| 8 | HTTP / BodyReader past prebuf | [`proto/http/src/lib.rs:332`](proto/http/src/lib.rs#L332) | **0** (items G + H) | `recv_chunk` hands a `Borrowed` view into `pt_buf`; the `refill` scratch is gone |
+| 7 | TlsStream::recv pops plaintext | [`proto/tls/src/lib.rs`](proto/tls/src/lib.rs) `TlsStream::recv` | **1× memcpy** | pt_buf → user buf (item G's `recv_chunk` is the zero-copy sibling) |
+| 8 | HTTP / BodyReader past prebuf | [`proto/http/src/body.rs`](proto/http/src/body.rs) `BodyReader::chunk` | **0** (items G + H) | `recv_chunk` hands a `Borrowed` view into `pt_buf`; the `refill` scratch is gone |
 
 Active per-byte memcpys on **TLS RX** guest side: the fundamental
 AEAD R/W only — items G and H removed both structural memcpys
@@ -736,9 +736,9 @@ backpressure. CPU-bound at ChaCha20-Poly1305 decrypt rate
   (a 16 KiB record spans ~11 MTU buffers) and AEAD is
   all-or-nothing (the Poly1305 tag must verify over the whole
   record before any plaintext byte is released), so the record
-  layer must reassemble first. Today reassembly copies into
-  `cipher_buf`; the zero-copy form is chain-threaded reassembly +
-  in-place AEAD across a discontiguous chain + per-fragment
+  layer must reassemble first. Today reassembly drains chunk bytes
+  into a per-record buffer; the zero-copy form is chain-threaded
+  reassembly + in-place AEAD across a discontiguous chain + per-fragment
   `narrow` + content-type/padding strip — a `proto/tls` record-layer
   rearchitecture, well past item G's scope. A single-device-buffer
   fast path (a record that fits in one MTU buffer → decrypt in
