@@ -68,6 +68,14 @@ The diminished alternatives then fall out as *variations on the golden path*
 (hardware-forced copies in GQI/DQO, the copy-into-buffer `recv`), not as
 parallel implementations.
 
+**Maturity, not just code quality.** Stack A isn't only better-factored — it's
+the production path: **IPv4 + TCP + TLS + HTTP/1.1** carries today's traffic.
+Stack B (**IPv6 + UDP + QUIC + HTTP/3**) is the differentiator still under
+construction. "Converge B onto A" is therefore doubly motivated — A is the proven
+shape *and* the shipping one. Locking the contracts now (especially the stream
+trait) is about keeping H3 from ossifying a divergent API before it's finished;
+it is **not** a claim that H3 is golden today.
+
 Much of contract 1 is **already landed** (the iobuf type model, the share-based
 RX/rtx queues, the whole zero-copy RX path A→H). The net-new work is contract 2,
 the handler half of contract 3, the backend-abstraction migrations, and a small
@@ -144,6 +152,16 @@ model (tx items A, P). **This is a TX-cost decision; it belongs to**
 2026-05-09 "chain prepend supersedes body_iobuf headroom" note). This doc only
 flags that the duplication is the same shape as the `fill_tcp`/`fill_udp` twin
 and should be decided once.
+
+The **IPv4/IPv6 wire-format fork** is the same story one layer down —
+`flow_hash_v4`/`flow_hash_v6`, `l4_pseudo_partial` v4/v6, the v4-only TX payload
+memmove, and the legacy `ipv4_send`/`ipv6_send → ethernet_send` control-plane
+frame builder (the second "put a frame on the wire" implementation, used by
+ARP/NDP). It is real duplication, but it's L3/per-frame, not an inter-layer
+contract → defer to [`tx-path-optimizations.md`](tx-path-optimizations.md) /
+[`networking.md`](networking.md). Flagged here only so the map is complete.
+**IPv4 stays** — it's the production L3 (see the thesis); the data plane must
+never reach the legacy `ethernet_send` chain, which stays control-plane-only.
 
 ### Dead-API cleanup → iobuf-type-model doc
 
