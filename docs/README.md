@@ -6,7 +6,9 @@ network stack.
 **New here?** Start with [`networking.md`](networking.md) (how the stack
 dispatches packets today) and [`stack-architecture.md`](stack-architecture.md)
 (the layer contracts and where the stack is headed), then
-[`crates.md`](crates.md) (where the code lives).
+[`crates.md`](crates.md) (where the code lives). **What's next** is in
+[`roadmap.md`](roadmap.md); **how the shipped stack was built** is in
+[`design-history.md`](design-history.md).
 
 ## Architecture & contracts
 
@@ -42,6 +44,13 @@ The perf docs route work by *cost locus* — see **[`high-concurrency-perf.md`](
 | [`benchmarking.md`](benchmarking.md) | How to run benches: `bench.py`, the GCE wrappers, the env matrix and workloads. Read first for "how do I bench?" |
 | [`crates.md`](crates.md) | The crate map: tiers, dependency layering, and the `crates/` layout. |
 | [`consuming-as-a-library.md`](consuming-as-a-library.md) | Using Waitless as a Bazel dependency — the `MODULE.bazel` / `BUILD.bazel` boilerplate an app needs. |
+
+## Roadmap & history
+
+| Doc | What it owns |
+|-----|--------------|
+| [`roadmap.md`](roadmap.md) | What's next: the current frontier, Phase 6 advanced features, and deferred/parked items. |
+| [`design-history.md`](design-history.md) | How the shipped stack was built — the phase-by-phase decisions and rationale (append-only record; formerly the root `ROADMAP.md`). |
 
 ---
 

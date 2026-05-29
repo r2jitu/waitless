@@ -459,7 +459,7 @@ deploy() {
     # path reallocated a Vec off the driver's TX-pool slot and
     # corrupted the heap (surfaced as a talc::free fault). Fixed: the
     # Handshake CRYPTO stream is now fragmented across MTU-bounded
-    # packets (proto/quic; see ROADMAP.md and the regression test
+    # packets (proto/quic; see docs/design-history.md and the regression test
     # quic_test::handshake_flight_fragments_across_mtu_datagrams).
     #
     # `create` if the rule is absent, else `update` it — so an

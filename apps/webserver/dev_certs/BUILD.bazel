@@ -2,8 +2,8 @@ package(default_visibility = ["//visibility:public"])
 
 # Pre-generated self-signed ECDSA P-256 dev cert. Loaded into unikernel
 # binaries via include_bytes!() — see README.md for the regeneration
-# story and the deferred-work entry in ROADMAP.md for the production
-# cert + RNG path.
+# story; the production cert path is in docs/design-history.md and the
+# production RNG work in docs/roadmap.md.
 exports_files([
     "dev_cert.der",
     "dev_key.der",

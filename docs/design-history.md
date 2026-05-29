@@ -1,22 +1,20 @@
-# Waitless Next-Gen Roadmap
+# Waitless Design History
 
-Waitless is a cutting-edge, lean unikernel: modern protocols only (QUIC/HTTP3, IPv6),
-cooperative multi-core, zero legacy overhead. Each feature is compile-time
-optional via Bazel deps — you pick exactly what you need.
+How the shipped Waitless network stack was built — the architecture, the
+phase-by-phase decisions, and the rationale behind them. This is an
+**append-only design record**, not current state. It was titled "Waitless
+Next-Gen Roadmap" until 2026-05-28, when the forward-looking content moved to
+[`roadmap.md`](roadmap.md).
 
-> **Status (2026-05-28): mostly shipped — this reads more as design-history than roadmap.**
-> Phases 1–5 (the async runtime, TLS 1.3, UDP/QUIC, HTTP/3, IPv6/NDP) have **shipped**;
-> only Phase 6 (vsock / eBPF / io_uring-style SQs) and a handful of "Deferred work"
-> items are still forward-looking. The phase bodies below were written as *plans* and
-> have not all been back-edited — treat them as period design records, not current
-> state. Known drift: the shipped TLS cipher is **`TLS_AES_128_GCM_SHA256`**, not the
-> ChaCha20-Poly1305 described in Phase 3b; older sections cite pre-`crates/` Bazel
+- **What's next** → [`roadmap.md`](roadmap.md) (Phase 6, deferred/parked items, the current frontier).
+- **Current state** → [`README.md`](README.md) (the docs index).
+- **Live backlogs** → [`conformance-roadmap.md`](conformance-roadmap.md) (QUIC RFC), [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md) (TCP RFC), [`rx-path-optimizations.md`](rx-path-optimizations.md) / [`tx-path-optimizations.md`](tx-path-optimizations.md) (per-byte perf).
+
+> The phase bodies below were written as *plans* during development and have not
+> all been back-edited — read them as period records. Known drift: the shipped
+> TLS cipher is **`TLS_AES_128_GCM_SHA256`** (Phase 3b's body still narrates the
+> original ChaCha20-Poly1305 choice), and older sections cite pre-`crates/` Bazel
 > labels (`//net:…`) and source paths.
->
-> For **current state** see [`docs/README.md`](docs/README.md); for **live backlogs**
-> see [`docs/conformance-roadmap.md`](docs/conformance-roadmap.md) (QUIC RFC),
-> [`docs/tcp-conformance-backlog.md`](docs/tcp-conformance-backlog.md) (TCP RFC), and
-> [`docs/rx-path-optimizations.md`](docs/rx-path-optimizations.md) / [`docs/tx-path-optimizations.md`](docs/tx-path-optimizations.md) (per-byte perf).
 
 ## Design Principles
 
@@ -837,10 +835,14 @@ IN PRODUCTION." Owning the protocol logic is also the right
 shape for QUIC, which reuses HKDF-Expand-Label with different
 labels and bypasses rustls's record layer entirely.
 
-Cipher suite shipped: `TLS_CHACHA20_POLY1305_SHA256`. KX:
-X25519 only. Server cert: ECDSA P-256 + SHA-256 (ed25519 was
-tried first but Chromium-family browsers and macOS LibreSSL
-refuse it for server auth — see commit `6cc283a`).
+Cipher suite shipped: **`TLS_AES_128_GCM_SHA256`** — this 2026-04-15
+pivot originally chose `TLS_CHACHA20_POLY1305_SHA256`, but it was
+later migrated to AES-128-GCM (the `chacha20` v0.9.1 SIMD backend
+miscompiles on `x86_64-unknown-none`, and browsers prefer AES-GCM;
+see `crates/proto/tls/src/aead.rs`). KX: X25519 only. Server cert:
+ECDSA P-256 + SHA-256 (ed25519 was tried first but Chromium-family
+browsers and macOS LibreSSL refuse it for server auth — see commit
+`6cc283a`).
 
 #### What ships
 
@@ -1034,9 +1036,11 @@ python3 scripts/bench.py --env hvf,native --cores 1,2,3 \
 
 ### 3c. QUIC implementation — roll our own on `//net:tls_server` + the async runtime
 
-**Status (2026-04-15)**: not started, gated on Phase 2f+2g (the async
-runtime foundation — see "North Star" at the top of Phase 2). Phase
-3b shipped the TLS 1.3 prereq. QUIC will be the **first real consumer
+**Status: shipped** — QUIC lives in `crates/proto/quic/`. The section
+below is the original 2026-04-15 plan and the build-vs-buy decision
+record, kept for the rationale. It was gated on Phase 2f+2g (the async
+runtime foundation — see "North Star" at the top of Phase 2); Phase
+3b shipped the TLS 1.3 prereq. QUIC became the **first real consumer
 of the async runtime** — each connection is an `async fn handle_quic(
 conn: QuicConn)` with `.await` on UDP recv, stream readable, and
 loss/pacing timers. This is exactly the design QUIC was shaped for,
@@ -1404,6 +1408,8 @@ socket bridge for TCP and UDP. End-to-end verified via
 
 Items that came up during development and were deliberately deferred
 in favour of forward progress. Each has a short "why now" trigger.
+**The still-open items are tracked forward in [`roadmap.md`](roadmap.md)**; the
+entries below marked "shipped" / "FIXED" are kept here as records.
 
 ### Production RNG
 
@@ -1839,36 +1845,20 @@ shows the 250 ms p99 the deferred-ACK code was guarding against.
 
 ## Phase 6: Advanced Features (future)
 
-### Virtio-vsock
-
-Replace virtio-net for VM<->host communication. No Ethernet/IP
-overhead. Useful for HVF / QEMU-on-macOS ultra-low-latency host
-communication.
-
-- [ ] virtio-vsock driver
-- [ ] Host communication API
-
-### eBPF packet filter
-
-Programmable packet processing in the unikernel. Run user-supplied
-eBPF programs for custom filtering/routing.
-
-- [ ] eBPF bytecode interpreter
-- [ ] Packet filter hook points
-
-### io_uring-style submission queues
-
-Replace poll-based I/O with submission/completion queues.
-Natural fit for QUIC's async nature.
-
-- [ ] Submission/completion ring buffers
-- [ ] Async I/O API
+Moved to the forward-looking roadmap → [`roadmap.md`](roadmap.md) (virtio-vsock,
+eBPF packet filter, io_uring-style submission queues). None started.
 
 ---
 
 ## Test Infrastructure
 
 ### Current state
+
+> Historical (project-start snapshot). The stack now has a broad test suite —
+> ~60 `tcp` conformance scenarios, per-crate host unit tests, and multi-core
+> integration tests. For current test strategy see
+> [`conformance-roadmap.md`](conformance-roadmap.md) (Part 1) and
+> [`benchmarking.md`](benchmarking.md). The original snapshot:
 
 - 4 HTTP smoke tests (test_native.sh, test_qemu.sh, test_vz.sh, test_iso.sh)
 - 1 benchmark script (bench.sh)
@@ -1922,46 +1912,13 @@ sh_test(name = "test", srcs = ["test.sh"], data = [":test_smp.elf"])
 | 2e. Timer wheel event-loop wiring | absorbed into 2g | Small | Async timers | 2a |
 | 2h. Perf regression tests | parked (post-QUIC) | Medium | Prevent regressions | 2a-c |
 
-**Where we are now (2026-05-22):** Phases 3c (QUIC), 4 (HTTP/3),
-and 5 (IPv6 + NDP) have all shipped — see the per-phase sections
-below. The webserver serves HTTP/1.1, HTTP/1.1-over-TLS, and
-HTTP/3 side by side; `dev.r2jitu.com` is live on GCE over gVNIC.
-Highlights:
+**Status (2026-05-22):** Phases 3c (QUIC), 4 (HTTP/3), and 5 (IPv6 + NDP)
+have all shipped — see the per-phase sections above. The webserver serves
+HTTP/1.1, HTTP/1.1-over-TLS, and HTTP/3 side by side; `dev.r2jitu.com` is live
+on GCE over gVNIC.
 
-- `//crates/runtime/executor` async executor with chunked launcher
-  table, per-worker arenas, generation-aware handles.
-- `UdpSocket::run` / `TcpListener::run` reactors on bare-metal AND
-  native, both backends sharing a single `TcpBackend` / `UdpBackend`
-  vtable.
-- `http::listen` / `listen_https` take any
-  `AsyncFn(&Request) -> Response` — handlers can `.await`.
-- QUIC + HTTP/3 as `async fn` per connection; the TLS 1.3 state
-  machine is reused for the QUIC handshake over CRYPTO frames.
-- IPv6 + NDP + SLAAC + dual-stack TCP/UDP.
-- Graceful shutdown: `drain_all_arenas` reclaims in-flight task
-  storage, `shutdown_all_tcp` emits one RST per active conn,
-  `HEAP_LEAK_CHECK ok` asserted under traffic.
-
-**What's left.** No headline phase remains; the open work is
-correctness depth and performance:
-
-- **QUIC RFC 9002** — loss recovery + congestion control: frame
-  retransmission and a congestion controller (the PTO timer, RTT
-  estimator, and loss detection already landed). See
-  `docs/conformance-roadmap.md` step 5.
-- **TCP conformance backlog** — `docs/tcp-conformance-backlog.md`.
-- **RX / TX path optimizations** — `docs/rx-path-optimizations.md`
-  (RX-offload items I/J/N/O) and `docs/tx-path-optimizations.md`
-  (conn-state / conn-future pools).
-- **2d (work stealing)** and **2h (perf regression tests)** —
-  still parked.
-
-**The thesis we're committing to**: `async fn` is the *only* execution
-model, not a layer. Tokio/smol run above Linux; Embassy is
-single-core microcontroller; Hermit targets libstd. A multi-core,
-lock-free, no_std, QUIC-first Rust runtime where the executor IS the
-kernel has no prior art. That's the differentiation bet — and it
-compounds with the architectural decisions already shipped (per-core
-lock-free queues, flow-hash connection pinning, hand-rolled TLS 1.3,
-native HVF runner). Each of those ingredients has some equivalent
-elsewhere; the combination does not.
+The current frontier (QUIC RFC 9002, TCP conformance, RX/TX perf, the
+inter-layer-contract convergence) and the open deferred/parked items now live
+in **[`roadmap.md`](roadmap.md)**. The guiding thesis — `async fn` as the
+*only* execution model, the executor **as** the kernel — is in the Design
+Principles at the top of this doc and in [`stack-architecture.md`](stack-architecture.md).

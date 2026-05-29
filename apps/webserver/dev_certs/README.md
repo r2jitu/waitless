@@ -93,7 +93,8 @@ boot. Until then, a stable checked-in dev cert:
    work straight out of a fresh checkout without `-k`.
 3. Is trivially regeneratable (`regen.sh`), so rotation is cheap.
 
-See `ROADMAP.md` → "Deferred" for the production cert / RNG work.
+See `docs/design-history.md` (production cert path) and `docs/roadmap.md`
+(production RNG) for that work.
 
 ## Host test commands
 

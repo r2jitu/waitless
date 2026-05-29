@@ -285,7 +285,7 @@ See **[docs/README.md](docs/README.md)** for the full, categorized index. Highli
 - [docs/benchmarking.md](docs/benchmarking.md) — how the performance numbers are measured
 - [docs/gvnic.md](docs/gvnic.md) — the from-scratch Google Virtual NIC driver
 - [docs/iobuf-type-model.md](docs/iobuf-type-model.md) · [rx-path](docs/rx-path-optimizations.md) · [tx-path](docs/tx-path-optimizations.md) — zero-copy datapath internals
-- [ROADMAP.md](ROADMAP.md) — design rationale + decision records (async runtime, QUIC, TLS, IPv6 — now shipped) and the forward-looking roadmap (Phase 6)
+- [docs/roadmap.md](docs/roadmap.md) — what's next (current frontier, Phase 6); [docs/design-history.md](docs/design-history.md) — design rationale + decision records for the shipped stack (async runtime, QUIC, TLS, IPv6)
 
 ## Deploying to GCE
 

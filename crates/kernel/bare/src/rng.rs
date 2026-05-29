@@ -40,7 +40,7 @@
 // been formally analysed for our targets, RDRAND alone shouldn't be
 // trusted (intel-sa-00329), and we don't reseed at runtime. For dev
 // and CI this is fine. Production reseeding + a properly audited
-// entropy collector is tracked under "Deferred work" in ROADMAP.md.
+// entropy collector is tracked under "Deferred & parked" in docs/roadmap.md.
 
 use core::cell::UnsafeCell;
 use sha2::{Digest, Sha256};

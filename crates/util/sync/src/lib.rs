@@ -107,8 +107,8 @@ impl<T> Spinlock<T> {
 /// RAII guard returned by `Spinlock::lock` / `try_lock`. Releases the
 /// lock on `Drop`. `!Send` so the lock can't escape the acquiring core.
 ///
-/// **Do not hold a `SpinlockGuard` across an `.await` point** when we
-/// add async (ROADMAP §2g). A guard dropped across a suspension would
+/// **Do not hold a `SpinlockGuard` across an `.await` point** (the async
+/// runtime is live — see docs/design-history.md §2g). A guard dropped across a suspension would
 /// release the spinlock during the suspend, another task could acquire
 /// it and progress, and the first task — which assumed the lock was
 /// still held — would wake into a broken invariant. If you need to
