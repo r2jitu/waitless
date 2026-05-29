@@ -698,27 +698,57 @@ impl TlsServer {
         // for an `External` chunk) frees only when the last queued
         // view drops, so a prompt consumer keeps the hold to
         // microseconds.
-        if !self.app_data_ranges.is_empty() {
-            // Narrow to the `Send` owning tier (total — the chunk is
-            // Owned; `.ok()` because the `Err` payload `IOBuf` has no
-            // `Debug`) and promote to refcounted storage.
-            let shared = OwnedIOBuf::try_from(chunk)
-                .ok()
-                .expect("RX chunk is Owned post-pump_rx")
-                .share();
-            for i in 0..self.app_data_ranges.len() {
-                let (off, len) = self.app_data_ranges[i];
-                let mut view = shared
-                    .clone_shared()
-                    .expect("share()'d chunk is shareable");
-                view.narrow(off as usize, len as usize)
+        match self.app_data_ranges.len() {
+            0 => {}
+            1 => {
+                // Single record — the common small-request case. There
+                // is exactly one consumer of the chunk's storage, so no
+                // sharing is needed: narrow the *owned* chunk itself to
+                // the record's plaintext range and queue it directly.
+                // Saves the per-request `Arc<SharedRegion>` allocation +
+                // clone the multi-record fan-out below pays (a heap
+                // alloc under the global allocator lock, on every
+                // request). Drop still reposts the NIC RX slot — the
+                // owned view *is* the chunk.
+                let (off, len) = self.app_data_ranges[0];
+                let mut owned = OwnedIOBuf::try_from(chunk)
+                    .ok()
+                    .expect("RX chunk is Owned post-pump_rx");
+                owned
+                    .narrow(off as usize, len as usize)
                     .map_err(|_| HandshakeError::Internal)?;
                 if self.pending_plaintext.try_reserve(1).is_err() {
                     return Err(HandshakeError::Internal);
                 }
-                self.pending_plaintext.push_back(view);
+                self.pending_plaintext.push_back(owned);
+                self.app_data_ranges.clear();
             }
-            self.app_data_ranges.clear();
+            _ => {
+                // Multiple records straddle one chunk: lift the chunk's
+                // backing into one `Arc<SharedRegion>` (1 alloc, no byte
+                // copy; `.ok()` because the `Err` payload `IOBuf` has no
+                // `Debug`); each record `clone_shared()`s + `narrow()`s
+                // to its range (1 atomic incr). The queued views keep
+                // the Arc — and thus the NIC RX slot — alive until the
+                // last one drops.
+                let shared = OwnedIOBuf::try_from(chunk)
+                    .ok()
+                    .expect("RX chunk is Owned post-pump_rx")
+                    .share();
+                for i in 0..self.app_data_ranges.len() {
+                    let (off, len) = self.app_data_ranges[i];
+                    let mut view = shared
+                        .clone_shared()
+                        .expect("share()'d chunk is shareable");
+                    view.narrow(off as usize, len as usize)
+                        .map_err(|_| HandshakeError::Internal)?;
+                    if self.pending_plaintext.try_reserve(1).is_err() {
+                        return Err(HandshakeError::Internal);
+                    }
+                    self.pending_plaintext.push_back(view);
+                }
+                self.app_data_ranges.clear();
+            }
         }
         Ok(())
     }
