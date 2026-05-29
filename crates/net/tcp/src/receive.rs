@@ -653,5 +653,36 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
         );
         c.arm_time_wait(kernel_core::clock::now_ms());
     }
+
+    // Streaming-RX liveness recovery (RFC 9293 §3.8.6.1 receiver side).
+    //
+    // A peer whose receive window we shrank to 0 stops sending and —
+    // once its data is acknowledged — emits periodic zero-window
+    // persist probes (bare ACKs, no payload). Those skip the
+    // payload-bearing ACK/window path above, so without this they go
+    // unanswered: the peer learns nothing and backs off exponentially
+    // (observed: a 256 KiB upload over the `recv_chunk` path wedging
+    // 16-conn TLS uploads to a full client timeout on GCP KVM).
+    //
+    // On any inbound segment for an Established conn:
+    //   * re-advertise the window if the app has drained the ring back
+    //     across the one-MSS SWS boundary (answers the probe directly);
+    //   * if RX data is still buffered for a consumer (ring bytes or a
+    //     stashed chunk) and a `recv_chunk`/`recv` waker is parked,
+    //     re-fire it. A consumer whose data-arrival wake was missed
+    //     (it parked just as the ring filled and no later segment
+    //     re-woke it) is thus re-kicked by the peer's probe, bounding
+    //     any stall to one persist interval instead of deadlocking.
+    //     `recv_waker.take()` keeps this idempotent — the payload path
+    //     above already consumed the waker for data-bearing segments,
+    //     so this only fires for the bare-probe case.
+    if c.state == TcpState::Established {
+        c.maybe_send_window_update();
+        if (c.rx_used() > 0 || c.pending_chunk.is_some())
+            && let Some(w) = c.recv_waker.take()
+        {
+            w.wake();
+        }
+    }
 }
 

@@ -648,7 +648,12 @@ impl TcpConnection {
     /// `rcv_wnd < mss` guard fires this at most once per ring-full
     /// episode — in steady flow `rcv_wnd` stays well above an MSS
     /// (kept fresh by data-triggered ACKs) so this is a no-op.
-    fn maybe_send_window_update(&mut self) {
+    ///
+    /// `pub(crate)` so `tcp_receive` can also fire it on an inbound
+    /// segment — including a zero-payload persist probe, which skips
+    /// the payload-bearing ACK path and would otherwise leave a
+    /// reopened window unadvertised.
+    pub(crate) fn maybe_send_window_update(&mut self) {
         if self.state != TcpState::Established {
             return;
         }
