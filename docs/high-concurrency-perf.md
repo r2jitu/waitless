@@ -23,6 +23,7 @@ their analyses.
 | [`conformance-roadmap.md`](conformance-roadmap.md) | Conformance-testing strategy + QUIC RFC backlog. |
 | [`gvnic.md`](gvnic.md) | gVNIC device behaviour, DQO vs GQI queue formats. |
 | [`iobuf-type-model.md`](iobuf-type-model.md) | The `iobuf` ownership / `Send` type model (`OwnedIOBuf`, `Chain<B>`, `IOBufRead`, the uniform drop/free contract). |
+| [`networking.md`](networking.md) | The RX/TX dispatch model as it works *today*: Tier 1 (per-core queue) vs Tier 2 (rotating distributor) scheduling. The "current reality" counterpart to `stack-architecture.md`'s proposed contracts. |
 | [`stack-architecture.md`](stack-architecture.md) | Inter-layer **contracts and stack shape**: the buffer currency, the stream trait, the handler API, NIC/reactor backend abstraction (POD-fn-pointers → traits), and the TCP/TLS/H1 ↔ UDP/QUIC/H3 convergence to one golden path. Owns layer *structure*, not per-byte cost. |
 
 The high-level rule for "where does this fix belong?":

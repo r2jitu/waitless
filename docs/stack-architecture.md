@@ -33,7 +33,7 @@ doc adds the **structure/contract locus**. The reciprocal rule:
 
 Deferral discipline: a contract change here that has a measured per-conn /
 heap-slope / saturation consequence is **named here and measured there** (the
-handoff pattern at high-concurrency-perf.md lines 1448-1454). This doc proposes
+named-item handoff pattern in high-concurrency-perf.md's "Prioritized gaps"). This doc proposes
 *shapes*; the cost docs prove *what they cost*.
 
 ## The thesis: two parallel stacks → one golden path
@@ -96,7 +96,7 @@ amount of genuine dead-code deletion. Each is routed below.
   ownership model rather than reasoning about it afresh.
 - The **share-insertion idiom** for refcounted buffers — landed on both the TCP
   rtx queue (`tcp/rtx-share`) and the TLS plaintext queue (`tls/rx-share-queue`)
-  — see high-concurrency-perf.md lines 871-876, 929-954. The primitives are
+  — see those branches' ceiling-mover entries in high-concurrency-perf.md. The primitives are
   `IOBuf::share()` / `clone_shared()` / `narrow()` / `OwnedIOBuf::try_from`. The
   refcounted-RX work below is an **extension of this idiom to Stack B**, not a
   new mechanism.
@@ -242,7 +242,7 @@ didn't fit.
 ### Respect the guard façade as the stable boundary
 
 The rx doc designed the guard to be exactly this seam. The Phase-4 "in-place TLS
-RX" follow-up (rx-path-optimizations.md lines 726-751) and the UDP IOBuf inbox
+RX decrypt" follow-up (rx-path-optimizations.md, "Out of scope / known limitations") and the UDP IOBuf inbox
 (item L, below) both keep the guard/inbox *shape* fixed and only change the
 wrapped payload (`Borrowed` → `Chain<ExternalOwned>` / refcounted slot). The
 chain-shaped `pop_plaintext` and refcounted QUIC RX recommendations here adopt
@@ -256,16 +256,16 @@ owned UDP delivery: `udp_receive(Chain<OwnedIOBuf>)`, and the reactor pushing a
 refcounted `OwnedIOBuf` (a `share()` of the device slot) into QUIC's `ConnInbox`
 instead of a copied `Vec`. **This is already owned by
 [`rx-path-optimizations.md`](rx-path-optimizations.md) item L** ("UDP datagram
-inbox — IOBuf-carrying slot", lines 442-502), which explicitly extends to the
+inbox — IOBuf-carrying slot"), which explicitly extends to the
 QUIC AEAD. This doc does not re-propose it; the stream trait above is what makes
 the *post-AEAD* delivery to h3 zero-copy on top of item L.
 
 > Slot-lifetime hazard (defer to high-conc): holding NIC RX slots alive across
 > QUIC reassembly lengthens slot lifetime, the same trade the share-queue
-> already accepted (high-concurrency-perf.md lines 948-954) and a potential
+> already accepted (high-concurrency-perf.md's `tls/rx-share-queue` entry) and a potential
 > amplifier of the H3/H4 heap-fragmentation story. Any owned-UDP work must A/B
 > the per-conn heap slope there; the CoW-on-aliased-`Shared` escape hatch
-> (lines 953-954) applies if a queue-depth cap is needed.
+> noted in that entry applies if a queue-depth cap is needed.
 
 ---
 
@@ -293,7 +293,7 @@ gone, the same handler serves plain-TCP, TLS, and QUIC with no adapter.
 The other half — making h3 **stream** its body through `BodyReader` instead of
 buffering the whole body (the 16 KiB `RECV_CAP`) and replaying it — is the
 **"HTTP/3 streaming body" follow-up already owned by**
-[`rx-path-optimizations.md`](rx-path-optimizations.md) (lines 887-890). Contract
+[`rx-path-optimizations.md`](rx-path-optimizations.md). Contract
 2 is its precondition (h3 needs a real `recv_chunk`). Cite it; don't restate it.
 
 - **Status**: [ ] not started (handler-API half). **Where**: `proto/http`,
@@ -385,9 +385,9 @@ hook; an associated `Conn` (a generational `Key { core, slot, gen }`) plus one
   gate instead of 15; removes `*mut()`/`PhantomData<*mut()>` plumbing from the
   future types. **Effort**: medium. **Risk**: medium.
   **Coordinate**: the per-accept `Box::pin` site is named in the graceful-OOM
-  gap list (high-concurrency-perf.md lines 1158-1181, the `try_box_pin` fix) —
+  gap list in high-concurrency-perf.md (item 1, the `try_box_pin` fix) —
   don't reintroduce a non-graceful `Box::pin` when restructuring the spawn path.
-  The generation-mismatch wasted-poll is Stage-2 fuel (lines 333-338); collapsing
+  The generation-mismatch wasted-poll is Stage-2 fuel (its §"Stage 2 — overload"); collapsing
   it is structurally good, but its *saturation* effect is high-conc's to measure.
 
 ---
@@ -436,7 +436,7 @@ diminished alternatives are mostly hardware-forced.
 |---|---|---|
 | NIC RX | zero-copy `wrap_owned` device buffer | GQI copy-to-slab (HW forces in-order repost; already shares `pool.rs`) |
 | NIC TX | direct-fill `TxBufHandle` | DQO bounce-copy slice send (HW stall forced it — note: DQO is the *preferred* c3+ backend yet runs the slowest TX; track in tx doc) |
-| per-driver code | shared TX-pool module (token codec + slot allocator) | gqi/dqo/virtio as thin per-format shims (see the shared-`TaggedTreiberStack` precedent, rx doc lines 1907-1952) |
+| per-driver code | shared TX-pool module (token codec + slot allocator) | gqi/dqo/virtio as thin per-format shims (see the shared-`TaggedTreiberStack` follow-up in rx-path-optimizations.md) |
 | TCP recv | `recv_chunk` (zero-copy) | `recv`/`recv_exact` as a copy adapter on the guard |
 | reactor I/O | `recv_chunk` + `send(chain)` | `send_bytes` (slice), `try_send_tso` (specialist) |
 | TLS TX | TSO encrypt-in-slot | scratch-buffer fallback (shares the `seal_chain` core) |
