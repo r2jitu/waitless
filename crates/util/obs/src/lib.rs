@@ -1,12 +1,16 @@
 // crates/util/obs — shared observability primitives.
 //
-// Two cold-path types every subsystem (QUIC, NIC, TCP, runtime,
-// kernel) uses to make failures diagnosable WITHOUT a redeploy:
+// A handful of small primitives every subsystem (QUIC, NIC, TCP,
+// runtime, kernel) uses to make failures diagnosable WITHOUT a
+// redeploy:
 //
-//   * `Counter`     — "how many times did this happen?"
-//   * `LastEvent<T>` — "what did the most recent one look like?"
+//   * `Counter`        — "how many times did this happen?"
+//   * `PerCoreCounter` — a per-core-sharded `Counter` for hot paths
+//   * `LastEvent<T>`   — "what did the most recent one look like?"
+//   * `LatencyHist`    — fixed-bucket latency distribution
 //
-// The pair exists because a bare count is a question, not an
+// `Counter` + `LastEvent` are the core pair. The pair exists
+// because a bare count is a question, not an
 // answer. The QUIC h3-over-gve bug needed three round trips —
 // add instrumentation, redeploy to GCE, reproduce — because the
 // stack *counted* idle timeouts but discarded the one fact that

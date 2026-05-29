@@ -134,8 +134,9 @@ pub(crate) fn init() -> bool {
 
     // ── Queue bring-up ──────────────────────────────────────────────────
     //
-    // Negotiated queue format — see `higher_priority` for why we
-    // prefer GQI_QPL on c3 even though DQO_RDA is offered.
+    // Negotiated queue format — see `higher_priority`: we prefer
+    // DQO_RDA on c3+ where it's offered, falling back to GQI_QPL on
+    // n2/n2d/e2 (which only advertise GQI_QPL).
     let fmt = match STATE.lock().as_ref().and_then(|s| s.queue_format) {
         Some(f) => f,
         None => return false,
