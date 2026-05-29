@@ -472,6 +472,44 @@ mod tests {
         assert_eq!(req.content_length, 5);
     }
 
+    /// Regression: a keep-alive connection reuses one parser +
+    /// `Request` across requests, calling `Request::clear()` +
+    /// `parser.reset()` between them (as `serve_conn` does). The
+    /// streaming parser APPENDS header name/value bytes
+    /// (`name_len += take`) and relies on the per-slot lengths
+    /// starting at 0. `clear()` reset `header_count` but not those
+    /// lengths, so the second request — reusing the same slots —
+    /// accumulated onto the first request's stale bytes, corrupting
+    /// every header name. `Content-Length` then failed to match,
+    /// parsed as 0, and the body was left unconsumed on the wire —
+    /// the next HEAD parse choked on the body bytes and overflowed,
+    /// wedging keep-alive uploads.
+    #[test]
+    fn keepalive_reuse_does_not_corrupt_headers() {
+        const REQ: &[u8] = b"POST /discard HTTP/1.1\r\nHost: h\r\n\
+            Content-Type: application/octet-stream\r\nContent-Length: 262144\r\n\r\n";
+        let mut p = StreamingRequestParser::new();
+        let mut req = Request::new();
+
+        // First request on the connection — fresh slots, parses fine.
+        assert!(matches!(p.feed(&mut req, REQ), FeedResult::Done { .. }));
+        assert_eq!(req.content_length, 262144, "1st request CL");
+        assert_eq!(req.header(b"Content-Length"), Some(b"262144".as_slice()));
+
+        // serve_conn's per-iteration reset for the next request.
+        req.clear();
+        p.reset();
+
+        // Second request reuses the same slots — must NOT corrupt.
+        assert!(matches!(p.feed(&mut req, REQ), FeedResult::Done { .. }));
+        assert_eq!(
+            req.content_length, 262144,
+            "2nd keep-alive request CL must not be corrupted by stale slot lengths",
+        );
+        assert_eq!(req.header(b"Content-Length"), Some(b"262144".as_slice()));
+        assert_eq!(req.header(b"Host"), Some(b"h".as_slice()));
+    }
+
     #[test]
     fn transfer_encoding_chunked_is_rejected_flag() {
         let raw = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";

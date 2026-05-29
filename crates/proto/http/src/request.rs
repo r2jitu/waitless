@@ -160,6 +160,19 @@ impl Request {
     pub(crate) fn clear(&mut self) {
         self.method = Method::Unknown;
         self.path_len = 0;
+        // Reset the per-slot name/value lengths for the slots the
+        // previous request filled. The streaming parser APPENDS into
+        // these (`name_len += take`, `value_len += take`) and relies
+        // on them starting at 0; the buffered `add_header` overwrites
+        // and does not. Without this reset a keep-alive request that
+        // reuses a slot accumulates onto the prior request's bytes —
+        // corrupting the header name so `header()` lookups miss
+        // (e.g. `Content-Length` parses as 0, leaving an upload body
+        // unconsumed and wedging the next request's HEAD parse).
+        for h in &mut self.headers[..self.header_count] {
+            h.name_len = 0;
+            h.value_len = 0;
+        }
         self.header_count = 0;
         self.content_length = 0;
         self.reject = false;
