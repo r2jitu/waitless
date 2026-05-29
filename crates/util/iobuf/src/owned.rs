@@ -786,4 +786,89 @@ mod tests {
             "Vec → OwnedIOBuf reuses the allocation",
         );
     }
+
+    /// The TLS RX share fan-out, exercised at the primitive level:
+    /// one `External` (device) buffer holding K back-to-back records
+    /// is `share()`d once, then each record becomes a
+    /// `clone_shared()` + `narrow()` view — exactly what
+    /// `TlsServer::process_chunk` does with `app_data_ranges`. Asserts
+    /// the two invariants the branch's zero-copy RX path depends on:
+    ///
+    ///   1. **Zero-copy fan-out** — every view's bytes are the right
+    ///      record sub-range AND its `data()` pointer is co-located in
+    ///      the *original* device allocation (no per-record copy).
+    ///   2. **Pinning lifecycle** — the device buffer's drop callback
+    ///      (which, on bare-metal, reposts the NIC RX buffer) fires
+    ///      **exactly once**, and only after the *last* queued view
+    ///      drops. This is the "device-buffer held until the app
+    ///      consumes all plaintext records" property — the thing that
+    ///      must be correct for the share-based RX path to be safe.
+    #[test]
+    fn share_fanout_k_records_zero_copy_and_drops_once() {
+        use core::ptr::NonNull;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let drop_count = StdArc::new(AtomicUsize::new(0));
+        unsafe fn cb(_base: NonNull<u8>, _cap: u32, ctx: *mut ()) {
+            let arc: StdArc<AtomicUsize> = unsafe { StdArc::from_raw(ctx as *const AtomicUsize) };
+            arc.fetch_add(1, Ordering::SeqCst);
+        }
+
+        // A device buffer holding three back-to-back "decrypted
+        // records" at [0..100), [100..220), [220..300).
+        const N: usize = 300;
+        let ranges = [(0usize, 100usize), (100, 120), (220, 80)];
+        let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; N];
+        for (i, b) in storage.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let base = storage.as_ptr() as usize;
+        let ptr = NonNull::new(storage.as_mut_ptr()).unwrap();
+        let ctx = StdArc::into_raw(drop_count.clone()) as *mut ();
+        // SAFETY: storage outlives every view in this test; cb reclaims
+        // the Arc exactly once at drop.
+        let chunk = unsafe { OwnedIOBuf::wrap_owned(ptr, N as u32, 0, N as u32, cb, ctx) };
+
+        // share() once (1 Arc alloc, no copy), then clone_shared() +
+        // narrow() per record — the process_chunk fan-out.
+        let shared = chunk.share();
+        let mut views: alloc::vec::Vec<OwnedIOBuf> = alloc::vec::Vec::new();
+        for &(off, len) in &ranges {
+            let mut v = shared.clone_shared().expect("shared is shareable");
+            v.narrow(off, len).unwrap();
+            views.push(v);
+        }
+        // Drop the fan-out handle; the K views keep the backing alive.
+        drop(shared);
+
+        // (1) Each view reads its record's bytes from the *original*
+        // device allocation — pointer co-located, zero copy.
+        for (i, &(off, len)) in ranges.iter().enumerate() {
+            assert_eq!(views[i].len(), len, "view {i} length");
+            assert_eq!(
+                views[i].data().as_ptr() as usize,
+                base + off,
+                "view {i} shares the device backing at +{off} (no copy)",
+            );
+            assert_eq!(
+                views[i].data()[0],
+                (off & 0xFF) as u8,
+                "view {i} reads the right record bytes",
+            );
+        }
+
+        // (2) Pinning lifecycle: the device buffer is held while any
+        // view is alive, then reposted exactly once.
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0, "buffer pinned while views live");
+        views.pop();
+        views.pop();
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0, "still pinned by the last view");
+        views.pop();
+        assert_eq!(
+            drop_count.load(Ordering::SeqCst),
+            1,
+            "device buffer reposts exactly once after the last view drops",
+        );
+    }
 }
