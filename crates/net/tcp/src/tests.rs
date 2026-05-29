@@ -3131,6 +3131,138 @@ fn rtx_queue_shares_storage_with_original_chain_parts() {
     assert!(checked, "no live connection for ports {CP} -> {SP}");
 }
 
+/// A window-limited send across a **multi-part** chain that stops
+/// mid a *later* IOBuf: the rtx loop pushes the first whole part,
+/// then splits the second. Exercises the share + clone_shared +
+/// trim_end/consume boundary path *after* a loop iteration (the
+/// single-part `send_respects_advertised_rwnd` hits the split arm
+/// but never the loop-then-split combination, and asserts neither
+/// queue nor chain post-state). Verifies byte-exactness of both
+/// the queue (the sent prefix) and the chain (the unsent tail),
+/// plus that the split is zero-copy (both views reference the
+/// original part's backing).
+#[test]
+fn rtx_split_after_loop_is_byte_exact_and_zero_copy() {
+    let _g = harness();
+    const SP: u16 = 9190;
+    const CP: u16 = 50190;
+    const CLIENT_ISN: u32 = 0xF870;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+    // Advertise a 700-byte window. A [400, 600, 800] chain then
+    // sends part0 whole (400) + 300 of part1, splitting mid-part1.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 700,
+        payload: Vec::new(),
+    });
+    let (handle, generation) = conn_handle(CP, SP);
+    clear_tx();
+
+    let body0: Vec<u8> = (0..400u32).map(|i| (i & 0xFF) as u8).collect();
+    let body1: Vec<u8> = (0..600u32).map(|i| ((i ^ 0x5A) & 0xFF) as u8).collect();
+    let body2: Vec<u8> = (0..800u32).map(|i| ((i ^ 0x3C) & 0xFF) as u8).collect();
+    let mut chain = iobuf::IOBufChain::new();
+    chain.push_back(iobuf::IOBuf::from(body0.clone()));
+    chain.push_back(iobuf::IOBuf::from(body1.clone()));
+    chain.push_back(iobuf::IOBuf::from(body2.clone()));
+    // Backing pointer of part1 *before* the send — the split must
+    // not copy it.
+    let part1_ptr = chain.iter().nth(1).unwrap().data().as_ptr() as usize;
+
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(sent, 700, "window caps the send at rwnd");
+
+    // Queue holds [snd_una, snd_nxt) = part0 (400) + part1[..300],
+    // in wire order.
+    let mut want = body0.clone();
+    want.extend_from_slice(&body1[..300]);
+    assert_eq!(conn_rtx_queue_bytes(CP, SP), want, "queue is the sent prefix, byte-exact");
+
+    // The chain now holds exactly the unsent tail: part1[300..] + part2.
+    let mut out = vec![0u8; chain.total_len()];
+    let n = chain.cursor().read(&mut out);
+    out.truncate(n);
+    let mut tail = body1[300..].to_vec();
+    tail.extend_from_slice(&body2);
+    assert_eq!(out, tail, "chain holds exactly the unsent tail");
+
+    // Zero-copy split: the chain's new front is a view 300 bytes
+    // into part1's *original* allocation — not a copy.
+    let front_ptr = chain.iter().next().unwrap().data().as_ptr() as usize;
+    assert_eq!(front_ptr, part1_ptr + 300, "chain tail shares part1's backing (no copy)");
+
+    // ...and the queue's boundary entry (the prefix) is the *start*
+    // of that same allocation.
+    let core = 0u32;
+    let cap = pool_capacity(core);
+    let mut checked = false;
+    for i in 0..cap {
+        let c = unsafe { &*conn_ptr(core, i) };
+        if c.state != crate::state::TcpState::Closed
+            && c.state != crate::state::TcpState::Listen
+            && c.local_port == SP
+            && c.remote_port == CP
+        {
+            assert_eq!(c.rtx_queue.len(), 2, "part0 whole + part1 prefix");
+            let prefix_ptr = c.rtx_queue[1].iobuf.data().as_ptr() as usize;
+            assert_eq!(prefix_ptr, part1_ptr, "queue prefix shares part1's backing (no copy)");
+            checked = true;
+            break;
+        }
+    }
+    assert!(checked, "no live connection for ports {CP} -> {SP}");
+}
+
+/// OOM on a multi-part send drains the *remaining* unpushed parts
+/// off the chain. The existing OOM test uses a single-part chain,
+/// so `drain_chain_prefix(chain, total - front_len)` runs with a
+/// zero remainder (a no-op); here the first whole-IOBuf push fails
+/// with a second part still queued, so the drain must drop that
+/// part's bytes (they're already on the wire — the chain mustn't
+/// re-emit them on the next send).
+#[test]
+fn rtx_oom_on_multipart_drains_remaining_parts() {
+    use core::sync::atomic::Ordering;
+    let _g = harness();
+    const SP: u16 = 9191;
+    const CP: u16 = 50191;
+    const CLIENT_ISN: u32 = 0xF880;
+    super::listen_on_core(0, SP);
+    let _server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+    clear_tx();
+
+    let body0 = vec![0xA0u8; 400];
+    let body1 = vec![0xB1u8; 600];
+    let mut chain = iobuf::IOBufChain::new();
+    chain.push_back(iobuf::IOBuf::from(body0));
+    chain.push_back(iobuf::IOBuf::from(body1));
+
+    // Force the OOM branch on the first push — part0 pops and fails,
+    // so the loop never reaches part1; the bailout's
+    // `drain_chain_prefix(chain, total - 400)` must drain part1 (600
+    // bytes) off the chain.
+    crate::state::FAIL_RTX_PUSH_ONCE.store(true, Ordering::Relaxed);
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(sent, 1000, "both parts went on the wire");
+    assert!(conn_rtx_alloc_failed(CP, SP), "OOM latched coverage-suspend");
+    assert!(
+        conn_rtx_queue_bytes(CP, SP).is_empty(),
+        "the OOM path cleared the queue",
+    );
+    assert!(
+        chain.is_empty(),
+        "the unpushed remainder was drained off the chain — it must \
+         not be re-emitted on the next send",
+    );
+}
+
 /// The TSO retain path — `try_send_tso` calls `rtx_on_data_sent_slice`
 /// after sealing into a TX-pool slot — pushes a queue entry carrying
 /// the same bytes as the TSO super-segment payload.

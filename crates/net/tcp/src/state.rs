@@ -680,17 +680,19 @@ impl TcpConnection {
     // ─── RFC 6298 retransmission ─────────────────────────────────────────
 
     /// Push one outbound segment's payload + bookkeeping onto the
-    /// per-conn retransmit queue. `iobuf` is `into_owned()`'d at
-    /// insertion so the queue's storage is heap-resident and
-    /// independent of any NIC-side reference. Returns `false` on a
-    /// `try_reserve` failure — caller then suspends coverage via
+    /// per-conn retransmit queue. Returns `false` on a `try_reserve`
+    /// failure — caller then suspends coverage via
     /// `rtx_alloc_failed = true` and clears the queue. Arms the RTO
     /// timer if the queue was empty before this push (RFC 6298 §5.1)
     /// and seeds the RTT anchor (§3) if no sample is outstanding.
     ///
-    /// Wired into the send path: `rtx_retain` calls this after
-    /// staging the bytes through a Vec so the queue mirrors the
-    /// unacked window. The send path's sole retain method.
+    /// `iobuf` is `into_owned()`'d defensively: the chain path
+    /// (`rtx_on_data_sent`) already hands in an `Owned(Shared)` and
+    /// the TSO path an `Owned(Heap)`, so for both the real callers
+    /// this is a no-op — but it guarantees the queue can never
+    /// retain a `Borrowed` view past its lender's lifetime. A
+    /// `Shared` entry keeps sharing its backing with the wire DMA
+    /// (the SG-TX goal); only a `Borrowed` input would be copied.
     pub(crate) fn rtx_push(
         &mut self,
         iobuf: IOBuf,
