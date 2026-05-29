@@ -1,6 +1,8 @@
 # TCP / QUIC conformance + RFC-compliance roadmap
 
-Status: in progress (steps 1-4 complete). Last updated 2026-05-22.
+Status: in progress (steps 1-4 complete). Last updated 2026-05-28
+(QUIC RFC 9002 statuses re-verified against `conn/loss.rs` /
+`streams.rs`; frame retx + congestion controller still open).
 
 The prioritized TCP gap backlog now lives in
 [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md); this doc
@@ -294,9 +296,17 @@ host-tested, and the RFC 9002 *data model* is present.
 - **Missing**: frame retransmission — `detect_loss` declares packets
   lost and drops them, but the lost CRYPTO/STREAM frames are never
   re-queued (`send_pto_probe` sends a bare PING, not the lost data),
-  so recovery still leans on client retransmits. There is no
-  congestion controller, and the PTO period has no exponential
-  backoff (`PTO * 2^pto_count`).
+  so recovery still leans on client retransmits. The blocker is on
+  the send side: `SendStream.send_offset` advances irreversibly as
+  `pop_chunk_into` ships each chunk and the head IOBuf is dropped, so
+  there is no replay-from-offset path to resend a lost STREAM frame.
+  There is no congestion controller — `SentPacket.in_flight` /
+  `byte_count` are recorded but `#[allow(dead_code)]`, reserved for it
+  (`conn/mod.rs`) — and the PTO period has no exponential backoff
+  (`PTO * 2^pto_count`). [`stack-architecture.md`](stack-architecture.md)
+  cites this gap (and the h3 content-length policy) as a correctness
+  item owned here; any `SendStream` redesign there must leave room for
+  replay-from-offset.
 - **Conformance test**: host-testable directly in `quic_test`; the
   loss-detection + RTT half already rides the clock seam. What
   remains is "wire frame retx + a controller onto the existing

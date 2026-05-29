@@ -91,7 +91,8 @@ has a `tier`:
 - **`default`** — run whenever `--workload` is omitted.
 - **`available`** — implemented but off by default; name it explicitly
   to run it (e.g. `get_tls`, `get_tls_single`, `get_tls_fresh_resume`,
-  `upload_1m_tcp`, `fanout_tcp`).
+  `upload_256k_tcp`, `upload_1m_tcp`, `upload_256k_tls`, `upload_1m_tls`,
+  `tcp_echo`, `tcp_echo_64k`, `fanout_tcp`).
 - **`todo`** — a registered stub; prints a `TODO` row, never runs.
 
 The default set: `get_tcp_single`, `get_tcp`, `get_tcp_fresh`,

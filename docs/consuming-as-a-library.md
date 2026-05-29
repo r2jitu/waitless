@@ -75,15 +75,13 @@ update its `MODULE.bazel` to match.
 
 ## What the app does NOT repeat
 
-`register_toolchains` / `register_execution_platforms` calls and the
-`crate` (crate_universe) and `hardfloat` (x86_64 hard-float sysroot)
-module extensions **accumulate across the whole module graph**. Waitless
-declares them, and an app depending on Waitless inherits them — so an
-app must *not* re-declare:
+`register_toolchains` calls and the `crate` (crate_universe) and
+`hardfloat` (x86_64 hard-float sysroot) module extensions **accumulate
+across the whole module graph**. Waitless declares them, and an app
+depending on Waitless inherits them — so an app must *not* re-declare:
 
 - the `register_toolchains(...)` lines (CC toolchains, the hard-float
   toolchain, `@rust_toolchains//:all`),
-- `register_execution_platforms(...)`,
 - the `crate.from_cargo(...)` / `crate.annotation*` block,
 - the `hardfloat.toolchain(...)` block.
 

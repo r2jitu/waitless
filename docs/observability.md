@@ -78,10 +78,10 @@ what to retain **before** the incident, because after it you cannot.
 
 ## The mechanism
 
-Three primitives live in the `obs` leaf crate
+A handful of tiny primitives live in the `obs` leaf crate
 ([`crates/util/obs`](../crates/util/obs/src/lib.rs)). They are
 deliberately tiny — the doctrine is a discipline, not a framework.
-`Counter` and
+`Counter` (and its per-core sharded sibling `PerCoreCounter`) and
 `LastEvent` serve the failure pillar; `LatencyHist` serves the
 performance pillar (see *Performance observability* below).
 
@@ -99,6 +99,20 @@ per-packet counter that shows up in a profile as cache-line
 ping-pong is the signal to shard it per-core and sum on read — but
 that is a deliberate, measured change. Hot counters never feed a
 `LastEvent`.
+
+### `PerCoreCounter<N>`
+
+The sharded form for that measured change. Each core writes to its
+own `align(64)` cell (one `PerCoreCell` per cache line, layout
+pinned by a `const` assert), so a hot per-packet or per-poll
+increment never ping-pongs a shared line; `sum()` adds the shards on
+read and `snapshot()` returns the per-core array. `N` is the shard
+width — sized from `obs::MAX_CORES` (22), the single source of truth
+the per-core stats arrays, the event-loop `MAX_CORE_STATS`, and the
+gve `MAX_QUEUE_PAIRS` all agree on; writes from a core beyond `N`
+silently no-op. The live consumers are exactly the hot counters the
+`Counter` note describes — `net::tcp::diag` hash-probe counts and
+`runtime::executor::diag` per-worker poll counts.
 
 ### `LastEvent<T>`
 
@@ -242,14 +256,14 @@ is wired into `/obs`.
 | Subsystem        | Crate                       | Notes |
 |------------------|-----------------------------|-------|
 | QUIC             | `crates/proto/quic`         | Reference implementation — see below. |
-| TCP              | `crates/net/tcp`            | `tcp::diag` — 19 counters, `LAST_RST` / `LAST_TEARDOWN` / `LAST_ACK_UNSENT`; surfaced via the `waitless_backend` seam. |
+| TCP              | `crates/net/tcp`            | `tcp::diag` — 25 counters, `LAST_RST` / `LAST_TEARDOWN` / `LAST_ACK_UNSENT` / `LAST_POOL_EXHAUSTED` / `LAST_RTX_ALLOC_FAIL`; per-core sharded hash-probe counts; surfaced via the `waitless_backend` seam. |
 | UDP              | `crates/net`                | `udp::diag` — 6 counters + `LAST_UNDELIVERABLE`; `waitless_backend` seam. |
 | NIC drivers      | `crates/drivers/{gve,virtio-net}` | Both drivers: `gve::diag` — anomaly counters + `LAST_RX_SKIP`; `virtio_net::diag` — 5 failure counters + `LAST_TX_DROP`. `NicDiagOps::obs_json` vtable entry; `nic::obs_json` dispatches to the active driver; `waitless_backend` seam. Each block self-identifies via a `"driver"` field. |
 | IP / ARP / NDP   | `crates/net/stack`          | `net_stack::diag` — L2/L3 RX-dispatch drops (`classified_drops` / `unknown_l4`) + `LAST_CLASSIFIED_DROP`; `waitless_backend` seam. |
 | TLS              | `crates/proto/tls`          | `tls::diag` — handshake-lifecycle counters + `LAST_HANDSHAKE_FAILURE`; app-reachable, no seam. |
 | HTTP/1.1         | `crates/proto/http`         | `http::diag` — 9 connection/request lifecycle counters + `LAST_REJECT` (smuggling-shaped request → `400`); app-reachable, no seam. |
 | HTTP/3           | `crates/proto/http3`        | `http3::diag` — 15 request/drop/lifecycle counters + `LAST_DROP`; `h3_drop!` / `h3_event!` gated by the `h3.log=` boot-arg; app-reachable, no seam. |
-| Async runtime    | `crates/runtime/executor`   | `executor::diag` — task-lifecycle counters + `LAST_SPAWN_FAILURE`; app-reachable via `executor::diag`, no seam. |
+| Async runtime    | `crates/runtime/executor`   | `executor::diag` — task-lifecycle counters + `LAST_SPAWN_FAILURE` + the per-worker sharded `TASKS_POLLED_PER_WORKER`; app-reachable via `executor::diag`, no seam. |
 | Kernel           | `crates/kernel`             | `kernel_bare::mm` — heap stats + `HEAP_OOM` / `LAST_OOM`; `waitless_backend` seam. Panics / exceptions stay in the `diag` ring (`/diag-panic`). |
 
 ## Reference implementation: QUIC

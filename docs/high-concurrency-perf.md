@@ -967,24 +967,39 @@ first item dwarfs everything below it.
    0.00 before and after — no leak, no regression.
 
    The bulk-record win (skipped per-record memcpy on 16 KB records)
-   could not be measured: large uploads stall before producing a
-   throughput number. A `/obs` capture during a 256 KB × 16-conn
-   upload pins the cause — the server goes ~99% idle (`core_idle_cycles`
-   climbs, `core_busy_cycles` flat), RX flatlines (`rx_bytes` +2.8 KB
-   over 16 s), and `http.responses_sent` (13) trails
+   could not be measured at the time of this write-up: large uploads
+   stalled before producing a throughput number. A `/obs` capture during
+   a 256 KB × 16-conn upload pinned the cause — the server went ~99% idle
+   (`core_idle_cycles` climbs, `core_busy_cycles` flat), RX flatlined
+   (`rx_bytes` +2.8 KB over 16 s), and `http.responses_sent` (13) trailed
    `requests_parsed` (26) with no pool exhaustion (`rx_ring_oom=0`,
-   `pool_exhausted=0`, `last_tx_drop=0`). That is a **TCP
+   `pool_exhausted=0`, `last_tx_drop=0`). That was a **TCP
    receive-window-update deadlock on large uploads over the streaming
-   `recv_chunk` path** — body-size-dependent (32 KB uploads run clean
-   at ~4.1k req/s on the same server, 256 KB / 1 MB wedge) and
-   TLS-independent (`upload_256k_tcp`, plain HTTP, stalls identically).
-   It is **not** caused by this change: the receive window is accounted
+   `recv_chunk` path** — body-size-dependent (32 KB uploads ran clean
+   at ~4.1k req/s on the same server, 256 KB / 1 MB wedged) and
+   TLS-independent (`upload_256k_tcp`, plain HTTP, stalled identically).
+   It was **not** caused by this change: the receive window is accounted
    for inside `do_recv_chunk` / `rx_pop` before the chunk IOBuf is
    handed to the TLS layer, so holding that IOBuf longer in the share
-   queue is strictly downstream of the window update. Candidate defect:
+   queue is strictly downstream of the window update.
+
+   **Fixed in `ce562ff` (`net/tcp: answer zero-window persist probes;
+   recover stalled RX consumer`).** The diagnosis above was confirmed:
    the zero-copy stash path in `do_recv_chunk` (`pending_chunk.take()`)
-   returns without the `maybe_send_window_update` that the ring-drain
-   path runs via `rx_pop` — tracked as a separate `net/tcp` fix.
+   returned without the `maybe_send_window_update` that the ring-drain
+   path runs via `rx_pop`, so once the ring filled the window stayed 0,
+   and a `recv_chunk` consumer that parked exactly as the ring filled
+   never re-woke (no later segment to re-fire its waker). The fix makes
+   `maybe_send_window_update` `pub(crate)` and, on **any** inbound
+   segment for an Established conn, (a) re-advertises the window across
+   the one-MSS SWS boundary and (b) re-fires the parked recv waker if RX
+   data is still buffered — so the peer's RFC 9293 §3.8.6.1 persist
+   probe becomes the recovery kick, bounding any stall to one persist
+   interval. Verified on GCE KVM: 20/20 sequential + 10/10 1 MiB +
+   12/12 concurrent 256 KiB TLS POSTs all 200, plain-HTTP 256 KB×16
+   upload at ~842 req/s (was a full timeout). The skipped-memcpy win
+   is now measurable on the upload workloads but was not re-benched in
+   this subsection.
 
    With throughput unmeasurable, the alloc-count + memcpy reduction
    rests on the architecture: the N per-record `(Vec alloc + memcpy)`
@@ -1516,16 +1531,21 @@ small cap shed:
      `rx_cycles` before / after rather than estimating. Cheap
      enough to try if profiling points here.
 
-7. **AES-GCM TLS cipher** _(medium, partly in
-   [`tx-path-optimizations.md`](tx-path-optimizations.md))_
-   - We negotiate only `TLS_CHACHA20_POLY1305_SHA256` (~20 cy/B
-     measured). AES-GCM-128 with AESNI is 1–3 cy/B — ~10× faster
-     bulk encrypt. Bigger payoff on `/static-*` than `/health`;
-     /health gets ~10 % rps lift since TLS is only ~10 % of the
-     poll budget there. Related: `tx-path-optimizations.md` items
-     **C + D** already fused encrypt into the TX-slot to remove
-     the post-encrypt memcpy; the cipher choice itself is the
-     remaining lever.
+7. ~~**AES-GCM TLS cipher**~~ _(✓ done — migrated to
+   `TLS_AES_128_GCM_SHA256`)_
+   - We now negotiate only `TLS_AES_128_GCM_SHA256` (0x1301), the
+     RFC 8446 §9.1 MTI suite. The prior `TLS_CHACHA20_POLY1305_SHA256`
+     (~20 cy/B measured) was replaced — AES-GCM-128 with AES-NI /
+     FEAT_AES is 1–3 cy/B (the streaming-parser A/B above measures the
+     full TLS path at 8–12 cy/B incl. framing/AEAD/copy), and AES-NI is
+     present on every deploy target (x86_64 Intel+AMD, aarch64 Apple
+     Silicon + modern ARM). See `crates/proto/tls/src/handshake/mod.rs`
+     (`cipher_suite::TLS_AES_128_GCM_SHA256`) for the rationale comment.
+     Related: `tx-path-optimizations.md` items **C + D** already fused
+     encrypt into the TX-slot to remove the post-encrypt memcpy. The
+     remaining bulk-encrypt lever now lives in the AEAD implementation
+     itself (tx-path doc), not in the cipher choice — that lever is
+     pulled.
 
 ### P2 — Bigger architectural wins
 
@@ -1542,6 +1562,11 @@ small cap shed:
      a given app. Storing them as `Box<dyn Future>` forces vtable
      dispatch on every poll. A `spawn_typed<F>` path with the
      concrete `F` lets LLVM inline the entire HTTP loop. ~5–10 %.
+     The per-conn future *shape* (the handler API and how it's
+     erased/boxed) is a stack-structure concern — see
+     [`stack-architecture.md`](stack-architecture.md)'s "One handler
+     API" contract; this item is the perf payoff once that shape is
+     pinned down.
 
 10. **SYN cookies** _(medium)_
    - Defer slot allocation until the 3-way ACK arrives — currently

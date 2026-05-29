@@ -18,6 +18,11 @@ ship them.
 > are P0 on that doc's gap list — RX coalescing is the biggest
 > remaining lever on `cycles/request` past the data-structure
 > work shipped in `bench/pareto-rig`.
+>
+> **See also:** [`stack-architecture.md`](stack-architecture.md) for
+> the inter-layer API/contracts lens (peer to this doc). It owns the
+> stream trait + `recv_chunk`-guard contract that items F/G/H build
+> on, the buffer currency, and the UDP `IOBuf` inbox of item L.
 
 Phase 1 of this work — streaming request body via `BodyReader`
 — landed 2026-05-15 (commit `820a2e6`) and is documented at the
@@ -58,11 +63,11 @@ bufs past the callback).
 |---|------|------|---|---|
 | 1 | Device DMA → driver buf | gVNIC DQO / virtio-net / gVNIC GQI | 0 | DMA into per-driver pool buffer |
 | 2 | Driver callback | [`crates/waitless/net/src/driver.rs`](crates/waitless/net/src/driver.rs), `NicOps::poll_qp` | 0 | Slice into device buf for callback duration |
-| 3 | Cross-core inbox push | [`kernel/src/percpu.rs:115`](kernel/src/percpu.rs#L115) | **1× memcpy** (only multi-core path) | Copies frame into `RxPacket.data: [u8; 1514]` |
+| 3 | Cross-core inbox push | [`kernel/src/percpu.rs:115`](kernel/src/percpu.rs#L115) | **0** (item C; was 1× on the multi-core path) | `distribute_frame` *moves* the `Chain<OwnedIOBuf>` into the target core's intrusive `RxNode` inbox — no `[u8; 1514]` frame copy |
 | 4 | TCP fast path (parked recv) | [`net/src/tcp.rs:331`](net/src/tcp.rs#L331) | **1× memcpy** | `ptr::copy_nonoverlapping` directly into user buf |
 | 4'| TCP slow path (no parked recv) | [`net/src/tcp.rs:303`](net/src/tcp.rs#L303) | **1× memcpy** (into ring) + **1× memcpy** (out at recv) | Per-conn 16 KiB byte ring |
-| 5 | HTTP parse-buf refill | [`proto/http/src/lib.rs`](proto/http/src/lib.rs) `serve_conn` | 0 (Phase 1: bytes flow through stream.recv into parse buf — same memcpy as step 4) | Headers + body prebuf land here |
-| 6 | BodyReader::chunk past prebuf | [`proto/http/src/lib.rs:332`](proto/http/src/lib.rs#L332) | **0** (item H) | `recv_chunk` surfaces the transport buffer behind a `BodyChunkGuard`; the 4 KiB `refill` scratch is gone |
+| 5 | HTTP header parse | [`proto/http/src/server.rs`](proto/http/src/server.rs) `serve_conn` + [`streaming.rs`](proto/http/src/streaming.rs) `StreamingRequestParser` | **0** | Parser reads chunk bytes in place off `recv_chunk`'s guard and writes parsed values straight into the per-conn `Request`; the 16 KiB inline parse buffer is gone. Leftover bytes ride forward in `carry: Option<IOBuf>` |
+| 6 | BodyReader::chunk past prebuf | [`proto/http/src/body.rs`](proto/http/src/body.rs) `BodyReader::chunk` | **0** (item H) | `recv_chunk` surfaces the transport buffer behind a `BodyChunkGuard`; the 4 KiB `refill` scratch is gone |
 | 7 | Handler reads body | app handler | 0 | `BodyChunkGuard::data()` — in-place view (item H) |
 
 Active per-byte memcpys on **TCP RX** guest side for body bytes
@@ -76,18 +81,20 @@ buffer moves straight through `recv_chunk` to the handler) and
 
 | # | Step | Site | Cost per byte | Notes |
 |---|------|------|---|---|
-| 1–4 | Same as TCP HTTP | (above) | 1–2 | Ciphertext bytes flow through |
-| 5 | TLS pump_rx pulls ciphertext | [`proto/tls/src/lib.rs`](proto/tls/src/lib.rs) `pump_rx` | 0 (in-place via TcpStream::recv_chunk) | No inline cipher_buf — chunk is consumed straight into the record reassembler |
-| 6 | AEAD decrypt | TLS state machine | **1× R/W** (ChaCha20) + **1× R** (Poly1305 verify) | Plaintext lands in `pt_buf` (17 KiB after Phase 1's bump) |
-| 7 | TlsStream::recv pops plaintext | [`proto/tls/src/lib.rs`](proto/tls/src/lib.rs) `TlsStream::recv` | **1× memcpy** | pt_buf → user buf (item G's `recv_chunk` is the zero-copy sibling) |
-| 8 | HTTP / BodyReader past prebuf | [`proto/http/src/body.rs`](proto/http/src/body.rs) `BodyReader::chunk` | **0** (items G + H) | `recv_chunk` hands a `Borrowed` view into `pt_buf`; the `refill` scratch is gone |
+| 1–4 | Same as TCP HTTP | (above) | 0 | Ciphertext flows through — `pump_rx` ingests via `recv_chunk` (the item-F zero-copy stash), and the cross-core push moves the chain (item C), so no guest-side ciphertext copy |
+| 5 | TLS pump_rx takes the chunk | [`proto/tls/src/lib.rs`](proto/tls/src/lib.rs) `pump_rx` | 0 (in-place via TcpStream::recv_chunk) | No inline cipher_buf / rx_buf — the recv'd chunk is `into_owned()`'d (zero-copy for the NIC-RX buffer) and handed to `process_chunk` |
+| 6 | AEAD decrypt | TLS state machine (`process_chunk`) | **1× R/W** (AES-128-GCM) + **0** (GCM tag verify is part of the same pass) | Decrypted **in place** — the chunk's ciphertext is overwritten with plaintext; no separate `pt_buf` |
+| 7 | TlsStream::recv_chunk surfaces plaintext | [`proto/tls/src/lib.rs`](proto/tls/src/lib.rs) `TlsStream::recv_chunk` | **0** | The chunk is `share()`'d and each app-data record's plaintext range is queued as a refcount-shared `Owned(Shared)` view (`pending_plaintext`); the guard `into_owned()` is a no-op |
+| 8 | HTTP / BodyReader past prebuf | [`proto/http/src/body.rs`](proto/http/src/body.rs) `BodyReader::chunk` | **0** (items G + H) | `recv_chunk` hands an `Owned(Shared)` view into the recv'd chunk's storage; the `refill` scratch is gone |
 
 Active per-byte memcpys on **TLS RX** guest side: the fundamental
-AEAD R/W only — items G and H removed both structural memcpys
-(`pt_buf`→user buf, and the BodyReader `refill`). AEAD is
-unremovable without offloading crypto to a co-processor. Note the
-TLS body path is therefore AEAD-decrypt-bound, not memcpy-bound —
-see item H's progress-log bench note.
+AEAD R/W only — items G and H removed both structural memcpys (the
+old `pt_buf`→user buf copy and the BodyReader `refill`), and the
+share-based plaintext queue (commit `5a8a74a`) since retired `pt_buf`
+entirely by decrypting in place and refcount-sharing each record's
+plaintext range. AEAD is unremovable without offloading crypto to a
+co-processor. Note the TLS body path is therefore AEAD-decrypt-bound,
+not memcpy-bound — see item H's progress-log bench note.
 
 ## Current path — QUIC / HTTP/3
 
@@ -391,8 +398,9 @@ AEAD.
 
 ### J. Enable HW GRO (RSC) on DQO_RDA queues
 - **Status**: [ ]
-- **Where**: [`crates/drivers/gve/src/lib.rs:1401`](crates/drivers/gve/src/lib.rs#L1401)
-  `build_create_rx_queue_cmd`: `cmd.set_byte(58, 1)` for DqoRda.
+- **Where**: [`crates/drivers/gve/src/init.rs`](crates/drivers/gve/src/init.rs)
+  `build_create_rx_queue_cmd`: add `cmd.set_byte(58, 1)` (the
+  `enable_rsc` byte, currently left 0) for DqoRda.
 - **What**: the one-line flip that turns RSC on. Lives in this
   plan because items A–I make it safe (multi-buf delivery
   handled, IOBufs auto-repost, pending-chain timeout prevents
@@ -701,11 +709,12 @@ escape hatch) over a pure scoped-callback API.
 of 512 bufs/qp cycles ~140× across a 100 MB body at 1460 B MSS.
 Per-conn ring is the natural backpressure point.
 
-**Large HTTPS payloads**: works. Each chunk is plaintext of one
-TLS record (≤ 16 KiB); pt_buf holds at most one record;
-"refuse to decrypt until pt_buf drained" is existing
-backpressure. CPU-bound at ChaCha20-Poly1305 decrypt rate
-(~2 GB/s).
+**Large HTTPS payloads**: works. Each chunk decrypts in place and
+its app-data records are queued as refcount-shared plaintext views
+(`pending_plaintext`); the recv'd chunk's storage (a NIC RX slot)
+is pinned only until the last queued view drops, and `pump_rx`
+refuses to pull the next chunk until `has_plaintext()` is drained —
+existing backpressure. CPU-bound at the AES-128-GCM decrypt rate.
 
 ## Out of scope / known limitations (Phase 4+)
 
@@ -723,32 +732,27 @@ backpressure. CPU-bound at ChaCha20-Poly1305 decrypt rate
   the body path is also gone — `carry` is an `IOBuf` that
   `BodyReader` reads from directly. Chunked-encoding support (item
   E) still rejects; a real implementation is separate Phase 4 work.
-- **In-place TLS RX decrypt** (zero-copy `into_owned()` on the
-  TLS path): item G's `TlsStream::recv_chunk` surfaces a
-  `Borrowed` view into `pt_buf` — `data()` is zero copy, but
-  `into_owned()` costs one memcpy (`Borrowed` → `Heap`), where
-  the TCP path's `ExternalOwned` chunk makes `into_owned()` free.
-  Closing the gap means decrypting ChaCha20-Poly1305 *in place*
-  into the device RX buffers that carried the ciphertext and
-  surfacing a `Chain<ExternalOwned>` plaintext chunk. The crypto
-  allows it — ChaCha20 is a stream cipher and the TX path already
-  seals in place — but TLS records don't align to device buffers
-  (a 16 KiB record spans ~11 MTU buffers) and AEAD is
-  all-or-nothing (the Poly1305 tag must verify over the whole
-  record before any plaintext byte is released), so the record
-  layer must reassemble first. Today reassembly drains chunk bytes
-  into a per-record buffer; the zero-copy form is chain-threaded
-  reassembly + in-place AEAD across a discontiguous chain + per-fragment
-  `narrow` + content-type/padding strip — a `proto/tls` record-layer
-  rearchitecture, well past item G's scope. A single-device-buffer
-  fast path (a record that fits in one MTU buffer → decrypt in
-  place there) is the tractable partial win. Needs **no API
-  change**: `recv_chunk` keeps returning `RecvChunkGuard`, only
-  the wrapped payload changes (`Borrowed` → `Chain<ExternalOwned>`)
-  and `into_owned()` drops from 1 copy to 0 — the guard is the
-  stable façade that makes this a non-breaking evolution. Cost to
-  weigh: a held plaintext chunk then pins ~11 NIC buffers (the
-  item-L device-pool-pressure concern).
+- **In-place TLS RX decrypt** (largely DONE — commits `0b537fd`,
+  `5a8a74a`): the in-place-decrypt + zero-copy-`into_owned()` goal
+  this item originally chased has landed. `process_chunk` now
+  AEAD-decrypts each record **in place** in the recv'd chunk (the
+  ciphertext is overwritten with plaintext), `share()`s the chunk,
+  and queues each app-data record's plaintext range as an
+  `Owned(Shared)` view (`pending_plaintext`); `TlsStream::recv_chunk`
+  surfaces that view, so `into_owned()` is already a **no-op** — the
+  `pt_buf`→user-buf copy and the `Borrowed`-into-`pt_buf` shape are
+  both gone. The guard façade held: `recv_chunk` still returns
+  `RecvChunkGuard`, only the wrapped payload changed (`Borrowed` →
+  `Owned(Shared)`), exactly the non-breaking evolution this item
+  predicted. What remains a limitation: a recv'd chunk stays pinned
+  (its NIC RX slot held) until the *last* shared record view from it
+  drops — coarser than per-record release — and a TLS record that
+  straddles two recv chunks still copies through the `rx_partial`
+  buffer (chunk-direct sharing only covers records wholly inside one
+  chunk). Surfacing a multi-buffer record's plaintext as a
+  fragment-granular `Chain` (per-fragment `narrow`, finer pinning)
+  remains a `proto/tls` record-layer refinement, but the headline
+  win (in-place AEAD, zero-copy `into_owned`) is no longer pending.
 - **Per-conn `rx_ring` as IOBufs**: the math forbids it
   (1500 conn × 11 bufs/conn-of-window = 16 500 bufs/core vs the
   4 096-buf DQO pool across all qps). Stays `Box<[u8; 16384]>`.
@@ -908,25 +912,26 @@ as a validation probe for item J (ideal RSC shape).
 Surfaced during item B's validation; deferred so they didn't
 sprawl that session.
 
-- **TCP conformance test harness.** `tcp` has no conformance
-  suite — the receiver-side window-update bug (commit `171c68e`,
-  found mid-item-B only because a QEMU upload anomaly got chased
-  into a packet capture) is exhibit A for why that's a gap. Build
-  an in-memory harness: a mock `NicOps` (the vtable is swappable
-  via `set_active_ops()`) captures TX frames into a `Vec`, and
-  `tcp_receive(src, dst, &[u8])` is already a `pub` RX entry point
-  that takes crafted segments — so a test drives scripted packets
-  in and asserts on captured output (packetdrill-in-a-unit-test).
-  *Blocker:* `tcp`'s `os:none` dep chain (`kernel` /
-  `runtime/executor`) must be made host-buildable — extend the
-  `tests_need_std` mechanism in
-  [`bazel/rules/rust.bzl`](bazel/rules/rust.bzl) (today only
-  `util/atomic_fn` uses it) and `#[cfg]`-gate the genuinely
-  bare-metal bits. First targets: a regression test for the
-  window-update fix, and a real **RTO / retransmit timer** — the
-  stack has none today (`net/src/tcp.rs` admits it in comments;
-  a lost *outbound* segment is never retransmitted, a correctness
-  gap on lossy paths, not just a perf one).
+- **TCP conformance test harness** (DONE). The harness this item
+  proposed has landed as
+  [`crates/net/tcp/src/tests.rs`](../crates/net/tcp/src/tests.rs) —
+  a packetdrill-in-a-unit-test built exactly as sketched: a mock
+  `NicOps` (swapped via `set_active_ops()`) captures TX frames into a
+  `Vec`, and scripted segments are driven into the real `tcp_receive`
+  RX entry point with assertions on the captured output. The
+  `os:none` dep-chain blocker was resolved (the crate is
+  host-buildable for `cfg(test)`); ~60 scenarios run today. The
+  receiver-side window-update bug (commit `171c68e`, found mid-item-B
+  because a QEMU upload anomaly got chased into a packet capture)
+  was its founding regression case. The **RTO / retransmit timer**
+  the item flagged as missing has since landed too —
+  [`crates/net/tcp/src/retransmit.rs`](../crates/net/tcp/src/retransmit.rs)
+  implements RFC 6298 data/FIN retransmission, RFC 9293 §3.8.6.1
+  zero-window persist probes, and the stalled-RX-consumer recovery
+  (commit `ce562ff`); a lost outbound segment is now retransmitted,
+  and the scenarios cover the rtx boundary-split / fast-retransmit
+  corners. Remaining gaps are incremental coverage, not the
+  structural hole this item named.
 
 - **Tag-based bench workload matrix.** `scripts/bench/cli.py`'s
   `WORKLOADS` is hand-enumerated, but a workload is really a point

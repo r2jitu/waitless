@@ -14,8 +14,33 @@ bring-up from what DESCRIBE_DEVICE advertises.
 
 | Format    | Where           | Buffers                                         |
 |-----------|-----------------|-------------------------------------------------|
-| `GQI_QPL` | every SKU       | Pre-registered Queue Page List; descriptors carry QPL offsets, not DMA addresses. TX is a memcpy into the QPL. |
+| `GQI_QPL` | every SKU       | Pre-registered Queue Page List; descriptors carry QPL offsets, not DMA addresses. TX fills the packet directly into its QPL slot (no separate bounce copy) and the descriptor points at that slot. |
 | `DQO_RDA` | c3 / c4+        | Raw DMA addressing, split data + completion rings. Preferred on SKUs that offer it. |
+
+The two TX paths are **not** at feature parity:
+
+- **GQI_QPL** is the full TX path: a two-pool direct-fill allocator
+  (small pool = one packet per 4 KiB QPL page; big pool = one
+  super-segment per 5-page slot), plus TSO (v4/v6) and UDP-GSO via
+  the `GVE_TXD_TSO` + `GVE_TXD_SEG` descriptor pair, plus L4-CSUM
+  offload. The device segments super-segments host-side.
+- **DQO_RDA** has no direct-fill, no TSO, and no UDP-GSO. Every
+  outbound frame goes through the slice-shaped `send_on_qp`: copy
+  into a per-ring-slot bounce buffer, emit a general-context +
+  packet descriptor pair carrying that buffer's raw DMA address.
+  `acquire_tx_buf` / `acquire_tx_tso_buf` / `acquire_tx_udp_gso_buf`
+  all return `None` in DQO mode so callers fall back to that one
+  extra memcpy per frame. L4-CSUM offload is still wired (the
+  `DQO_TX_FLAG_CSUM` bit). A DQO direct-fill landed once but stalled
+  on real c3 hardware under load and was removed; wiring DQO
+  direct-fill / TSO is a follow-up.
+
+RX mirrors this split: DQO is zero-copy — the device's RX buffer is
+lent straight up the stack (`OwnedIOBuf::wrap_owned`) and reposted
+to the buffer ring when the chain drops. GQI cannot lend its device
+QPL pages (strict in-order repost), so each frame is copied into a
+recycle-pool slab and the QPL page is reposted at the poll-batch
+boundary.
 
 `GQI_RDA` (raw-addressing GQI) and `DQO_QPL` exist in the Linux
 headers but GCE never advertises them — do not implement them.
@@ -77,8 +102,13 @@ spec there is no way to tell which bit gates which feature.
 
 Device default ring size is 1024; `MODIFY_RING` lets the driver
 shrink within `[min, max]`, which it does so a ring fits in fewer
-pages. In GQI mode each ring needs a QPL of one 4-KiB page per
-entry — `RX_RING_ENTRIES` pages of RX QPL, `TX_RING_ENTRIES` of TX.
+pages. In GQI mode the RX QPL is one 4-KiB page per ring entry
+(`RX_RING_ENTRIES` pages). The TX QPL is the two-pool split (176
+single-page small slots + 16 five-page big slots = 256 pages, which
+matches `TX_RING_ENTRIES` but isn't a per-entry mapping). In DQO
+mode there are no QPLs — the RX buffer pool and TX bounce-buffer
+pool are plain DMA-coherent allocations the descriptors address
+directly.
 
 `REGISTER_PAGE_LIST` (opcode 0x3) registers a QPL and returns a
 `page_list_id`; CREATE_*_QUEUE then references that id. In DQO mode

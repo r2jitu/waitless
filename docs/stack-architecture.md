@@ -395,14 +395,16 @@ higher layer has a legitimate need for a coarse hint.
   backpressure; QUIC CC signal; the zero-length edge stops masquerading as
   backpressure. **Effort**: low–medium. **Risk**: medium.
 
-> ⚠️ **Live bug in the blast radius.** There is a known TCP receive-window-update
-> deadlock on large uploads over the streaming `recv_chunk` path: the zero-copy
-> stash path in `do_recv_chunk` (`pending_chunk.take()`) returns without the
-> `maybe_send_window_update` that the ring-drain path runs via `rx_pop`
-> (high-concurrency-perf.md lines 964-982). Any work that touches
-> `do_recv_chunk`/`rx_pop` (this backpressure change, or the recv collapse below)
-> is in its blast radius — fold the fix in or explicitly defer, do not silently
-> refactor across it.
+> ⚠️ **Regression hazard to preserve.** A TCP receive-window-update deadlock on
+> large uploads over the streaming `recv_chunk` path was fixed in `ce562ff`: the
+> zero-copy stash path in `do_recv_chunk` (`pending_chunk.take()`) skipped the
+> `maybe_send_window_update` that the ring-drain path runs via `rx_pop`, so once
+> the ring filled the window stayed 0 and a parked `recv_chunk` consumer never
+> re-woke. The fix re-advertises the window and re-fires the recv waker on **any**
+> inbound segment for an Established conn (so the peer's persist probe becomes the
+> recovery kick). Any work that touches `do_recv_chunk`/`rx_pop` (this backpressure
+> change, or the recv collapse below) must **preserve** that recovery — don't
+> regress the window-update-and-waker-refire-on-any-segment behavior.
 
 ---
 
@@ -444,9 +446,10 @@ This removes the `chunk_wanted` gating and the dual delivery branches without
 claiming the ring path is removable.
 
 - **Status**: [ ] not started. **Where**: `net/tcp/src/{receive,listener}.rs`,
-  `runtime/executor/src/reactor/tcp.rs`. **Risk**: medium — see the
-  window-update deadlock above. **Defer**: the saturation effect to high-conc;
-  the ring-necessity argument to rx item F.
+  `runtime/executor/src/reactor/tcp.rs`. **Risk**: medium — must preserve the
+  `ce562ff` window-update/waker-refire recovery (see the regression hazard above).
+  **Defer**: the saturation effect to high-conc; the ring-necessity argument to
+  rx item F.
 
 ---
 
@@ -516,8 +519,9 @@ local to this doc; where it reuses an existing tracker item it names the item.
   (QUIC RFC 9002 backlog). Any `SendStream` redesign (contract 1) must leave room
   for replay-from-offset.
 - **h3 content-length policy** — see contract 3.
-- **TCP receive-window-update deadlock** on streamed uploads — see the
-  backpressure section; tracked in high-concurrency-perf.md lines 964-982.
+- **TCP receive-window-update deadlock** on streamed uploads — **fixed in
+  `ce562ff`**; preserve the recovery (see the regression hazard in the
+  backpressure section).
 - **TCP windows capped at 64 KiB** (no RFC 7323 scaling) — caps high-BDP
   throughput → [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md).
 

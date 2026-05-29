@@ -20,12 +20,12 @@ The `crates/` tree:
 
 ```
 crates/
-  util/        atomic-fn/  tagged-treiber/  iobuf/
+  util/        atomic-fn/  tagged-treiber/  sync/  obs/  iobuf/
   crypto/      aes-gcm/
   runtime/     platform/  worker/  executor/
   kernel/      core/  bare/
   boot/        entry, limine, mem_stubs, multiboot   (shared Bazel package)
-  drivers/     bus/  nic/  virtio-net/  gve/
+  drivers/     bus/  nic/  virtio-net/  virtio-console/  gve/
                nic/ is a shared package: targets :api (the trait) + :nic (dispatch)
   net/         tcp/  stack/                           (own dirs)
                +  shared package: types, checksum, from_bytes, ethernet,
@@ -117,6 +117,7 @@ external `@crates//:...` deps are omitted for readability.
 | Crate | Deps |
 | --- | --- |
 | `iobuf` | `tagged_treiber` |
+| `sync` | `atomic_fn` (the `Spinlock<T>` + `AtomicFn` re-export; hoisted out of `kernel_core` so sub-`kernel_core` crates share one lock) |
 | `worker` | `platform` |
 | `net_checksum` | `net_types` |
 | `ethernet` | `net_from_bytes`, `net_types` |
@@ -128,25 +129,26 @@ external `@crates//:...` deps are omitted for readability.
 | Crate | Deps |
 | --- | --- |
 | `nic_api` | `iobuf` |
-| `executor` | `net_types`, `iobuf`, `nic_api`, `platform`, `worker` |
+| `obs` | `sync` (shared observability primitives — `Counter`, `LastEvent`, `LatencyHist`. A near-leaf so even sub-`kernel_core` crates depend on it directly) |
+| `executor` | `net_types`, `iobuf`, `nic_api`, `platform`, `worker`, `obs` |
 
 ### Tier 3 — kernel core + kernel-dependent leaves
 
 | Crate | Deps |
 | --- | --- |
-| `kernel_core` | `net_types`, `iobuf`, `executor`, `worker`, `atomic_fn`, `tagged_treiber` |
+| `kernel_core` | `net_types`, `iobuf`, `executor`, `worker`, `sync`, `tagged_treiber` |
 | `nic` | `nic_api` |
 | `ethernet_send` | `ethernet`, `net_types`, `nic` |
 | `ipv4` | `net_checksum`, `net_from_bytes`, `net_types`, `kernel_core` |
-| `ndp` | `net_types`, `kernel_core` |
+| `ndp` | `net_types`, `kernel_core`, `sync` |
 | `net_classify` | `ethernet`, `ipv4`, `ipv6`, `net_types` |
 
 ### Tier 4 — bare kernel + L3 helpers
 
 | Crate | Deps |
 | --- | --- |
-| `kernel_bare` | `net_types`, `kernel_core`, `iobuf`, `executor`, `worker`, `platform`, `atomic_fn`, `tagged_treiber` |
-| `arp` | `ethernet`, `ethernet_send`, `net_from_bytes`, `net_types`, `nic`, `kernel_core`, `iobuf` |
+| `kernel_bare` | `net_types`, `kernel_core`, `executor`, `worker`, `platform`, `obs`, `sync` |
+| `arp` | `ethernet`, `ethernet_send`, `net_from_bytes`, `net_types`, `nic`, `kernel_core`, `iobuf`, `sync` |
 | `mac_resolve` | `arp`, `ndp`, `net_types` |
 | `ipv6_send` | `ethernet`, `ethernet_send`, `icmpv6`, `ipv6`, `ndp`, `net_types` |
 
@@ -154,18 +156,19 @@ external `@crates//:...` deps are omitted for readability.
 
 | Crate | Deps |
 | --- | --- |
-| `tcp` | `net_checksum`, `ethernet`, `net_from_bytes`, `ipv4`, `ipv6`, `ipv6_send`, `mac_resolve`, `net_types`, `nic`, `nic_api`, `kernel_core`, `iobuf`, `executor`, `worker` |
-| `udp` | same as `tcp` minus `kernel_core` and `worker` |
-| `dhcp` | `arp`, `ethernet`, `net_from_bytes`, `ipv4`, `net_types`, `kernel_bare`, `executor` |
-| `bus` | `kernel_bare` |
+| `tcp` | `net_checksum`, `ethernet`, `net_from_bytes`, `ipv4`, `ipv6`, `ipv6_send`, `mac_resolve`, `net_types`, `nic`, `nic_api`, `kernel_core`, `iobuf`, `executor`, `worker`, `obs` |
+| `udp` | same as `tcp` minus `worker` |
+| `dhcp` | `arp`, `ethernet`, `net_from_bytes`, `ipv4`, `net_types`, `kernel_bare`, `executor`, `sync` |
+| `bus` | `kernel_bare`, `sync` |
 
 ### Tier 6 — net stack umbrella + NIC drivers
 
 | Crate | Deps |
 | --- | --- |
-| `net_stack` | `arp`, `net_classify`, `dhcp`, `ethernet`, `ethernet_send`, `icmpv6`, `ipv4`, `ipv6`, `ipv6_send`, `ndp`, `tcp`, `net_types`, `udp`, `nic`, `kernel_bare`, `iobuf`, `executor` |
-| `gve` | `bus`, `kernel_bare`, `iobuf`, `nic_api` |
-| `virtio_net` | `bus`, `kernel_bare`, `net_checksum`, `iobuf`, `nic_api` |
+| `net_stack` | `arp`, `net_classify`, `dhcp`, `ethernet`, `ethernet_send`, `icmpv6`, `ipv4`, `ipv6`, `ipv6_send`, `ndp`, `tcp`, `net_types`, `udp`, `nic`, `kernel_bare`, `iobuf`, `executor`, `obs` |
+| `gve` | `bus`, `kernel_bare`, `iobuf`, `nic_api`, `obs`, `sync` |
+| `virtio_net` | `bus`, `kernel_bare`, `net_checksum`, `iobuf`, `nic_api`, `obs`, `sync` |
+| `virtio_console` | `bus` (VirtIO console driver, DeviceID 3; reaches `kernel_bare`'s serial layer through an `extern "C"` FFI seam rather than a Rust dep, avoiding a `console → bus → kernel_bare` cycle) |
 
 ### Tier 7 — facade plumbing
 
@@ -178,7 +181,7 @@ external `@crates//:...` deps are omitted for readability.
 
 | Crate | Deps |
 | --- | --- |
-| `waitless_backend` (`waitless/backend`) | `iobuf`, `worker`, `platform`, `executor`, `nic_api`; on `os:none` also `nic`, `kernel_bare`, `net_stack`, `tcp`, `gve` |
+| `waitless_backend` (`waitless/backend`) | `iobuf`, `worker`, `platform`, `executor`, `nic_api`; on `os:none` also `nic`, `kernel_bare`, `net_stack`, `tcp`, `udp`, `gve` |
 
 ### Tier 9 — facade
 
@@ -190,10 +193,10 @@ external `@crates//:...` deps are omitted for readability.
 
 | Crate | Tier | Deps |
 | --- | --- | --- |
-| `http` | 10 | `waitless`, `iobuf`, `worker` |
-| `tls` | 11 | `waitless`, `waitless_aes_gcm`, `http`, `iobuf`, `worker`; on `os:none` also `kernel_bare` |
-| `quic` | 12 | `waitless`, `iobuf`, `nic_api`, `executor`, `tls` |
-| `http3` | 13 | `waitless`, `http`, `quic` |
+| `http` | 10 | `waitless`, `iobuf`, `worker`, `obs` |
+| `tls` | 11 | `waitless`, `waitless_aes_gcm`, `http`, `iobuf`, `worker`, `obs`; on `os:none` also `kernel_bare` |
+| `quic` | 12 | `waitless`, `iobuf`, `nic_api`, `executor`, `tls`, `obs` |
+| `http3` | 13 | `waitless`, `http`, `quic`, `obs` |
 
 ### Tier 14 — boot entries + apps
 
@@ -207,9 +210,10 @@ to assemble the bare-metal entrypoint. Apps under `apps/` depend on
 
 `kernel_bare`'s `percpu::RxChain` carries a `ParsedL3` value, so the
 kernel must depend on something in the net domain. The rest of `net`
-depends on `kernel_core` (for `Spinlock`, the per-core IP-ID counter,
-etc.). If `net` were a single crate, `kernel_bare → net → kernel_core`
-would close into a cycle with `kernel_bare`'s `kernel_core` dependency.
+depends on `kernel_core` (for the per-core IP-ID counter, etc.; the
+`Spinlock` they share now lives in the lower `util/sync` leaf). If
+`net` were a single crate, `kernel_bare → net → kernel_core` would
+close into a cycle with `kernel_bare`'s `kernel_core` dependency.
 
 `net_types` is the cut: a zero-dep leaf containing just the wire-format
 type definitions the kernel needs. Everything else in `net` is above
@@ -220,8 +224,10 @@ type definitions the kernel needs. Everything else in `net` is above
 ### Why `kernel_core` is split from `kernel_bare`
 
 `kernel_core` is the host-testable pure-logic half: lock-free data
-structures, sync primitives, per-core types, the timer wheel, the RNG
-trait. Builds on the host; runs `rust_test` targets there.
+structures, per-core types, the timer wheel, the RNG trait. (The
+`Spinlock` / `AtomicFn` sync primitives were hoisted down to the
+`util/sync` leaf so crates below `kernel_core` can share them.) Builds
+on the host; runs `rust_test` targets there.
 
 `kernel_bare` (`crates/kernel/bare`) is the `os:none` half: MMU,
 interrupts, APIC/GIC, SMP bring-up, serial — anything that touches

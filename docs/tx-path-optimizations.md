@@ -7,9 +7,11 @@ of) commit(s); check items off as we ship them.
 
 > **See also:** [`high-concurrency-perf.md`](high-concurrency-perf.md)
 > for the high-conn cliff context — the encrypt-in-place + header-
-> fusion work shipped here (items A–D, G) already moved
-> `cycles/request` down significantly. Remaining TX-side lever
-> tracked there is the AES-GCM cipher choice.
+> fusion work shipped here (items A–C, G) already moved
+> `cycles/request` down significantly. (Item D's fused
+> copy+encrypt also shipped, then reverted on the AES-GCM
+> migration — see item D.) Remaining TX-side lever tracked there
+> is the AES-GCM cipher choice.
 
 ## Why this doc exists
 
@@ -18,8 +20,12 @@ memcpys per byte** for HTTPS-over-TCP and **5 memcpys per byte** for
 HTTPS-over-H3 (QUIC) (≈ 4.5 GB/s of memcpy traffic at 100 k rps for
 a 9 KiB shell page). Most of those are mechanical header-prepend
 memcpys that fall out of the way once the buffer is composed in
-place. The encrypt step itself is a fundamental R/W and can only be
-fused with the surrounding copy, not removed.
+place. The encrypt step itself is a fundamental R/W that can't be
+removed; for QUIC the encoder writes plaintext straight into the
+datagram and the AEAD seals it there in place (one pass), while
+the TCP TLS chain path copies into the TX-slot and then seals in
+place (two passes) — the AES-128-GCM crate exposes no fused
+copy-and-encrypt API to collapse those into one (see item D).
 
 This doc captures the inventory, splits proposals across the two
 segments the user named — *encrypt → NIC TX* and *network → browser
@@ -31,8 +37,8 @@ RX* — and tracks progress as we land them.
 |---|------|------|---|---|---|
 | 1 | Handler renders body | `body_iobuf` writer | 1× memcpy (dynamic content only) | — | Static literals are zero-copy |
 | 2 | Header build | `write_response_into_iobuf` | — | ~150 B memcpy | Into per-conn `header_storage` |
-| 3 | ~~TLS coalesce~~ | — | — | — | Folded into step 4 — `TlsStream::send` fast-fast path encrypts directly into the driver's TX-pool big-slot (item TLS-direct ✓) |
-| 4 | TLS encrypt + envelope | `seal_chain_to_in_place` | 1× R/W (ChaCha20) + 1× R (Poly1305) | — | In place; chain → TX-slot fused encrypt (item C + D + TLS-direct ✓) |
+| 3 | ~~TLS coalesce~~ | — | — | — | Folded into step 4 — `TlsStream::send_one_record` fast-fast path seals directly into the driver's TX-pool big-slot (item TLS-direct ✓) |
+| 4 | TLS encrypt + envelope | `record::seal_chain` (→ `aead::seal_chain`) | 1× copy chain→slot + 1× R/W (AES-128-GCM, GHASH-authenticated) | — | Chain bytes copied into the TX-slot, then sealed in place. **Not** a fused copy+encrypt anymore: the AES-GCM crate exposes no fused copy-and-encrypt API, so item D's single-pass `seal_chain_to` was dropped on the ChaCha20→AES-128-GCM migration (item C + TLS-direct ✓; see item D) |
 | 5 | **TCP frame build** | `try_send_tso` / `send_segment` | **0× extra memcpy** | 14 + 20 + 20 B headers + 1 cksum | Headers written into TX-slot prefix in place; payload already in slot from step 4 (TLS-direct ✓ + items A, B, G) |
 | 6 | ~~IPv4 wrap~~ | — | — | — | Folded into step 5 (item A ✓) |
 | 7 | ~~Ethernet wrap~~ | — | — | — | Folded into step 5 (item A ✓) |
@@ -42,13 +48,18 @@ RX* — and tracks progress as we land them.
 | 11 | Wire | network stack | — | — | MTU, cwnd, RTT |
 | 12 | Browser RX | TLS decrypt + HTTP parse | symmetric to ours | — | Out of our control |
 
-Active per-byte memcpys on the **TCP TX** guest side: **1**
-(the fundamental encrypt R/W + Poly1305 read-only pass — the
-chain bytes flow plaintext-from-body_scratch → ciphertext-in-
-TX-slot in a single fused pass, with no intermediate
-stack buffer or scratch → slot copy). Down from 5 before items
-A, C, B, G, and the TLS-direct-encrypt commit. Same as the
-QUIC TX path's per-byte cost.
+Active per-byte memcpys on the **TCP TX** guest side: **2** —
+the chain→TX-slot copy plus the in-place AES-128-GCM encrypt
+R/W (GHASH reads the resulting ciphertext, no extra full pass).
+There's no intermediate stack buffer or worker-scratch hop on
+the fast-fast path — the copy lands straight in the TX-slot —
+but the copy and the encrypt are now two passes, not the single
+fused pass item D once delivered (the AES-GCM crate has no fused
+copy-and-encrypt API; see item D). Down from 5 before items A,
+C, B, G, and the TLS-direct-encrypt commit. The copy re-reads
+L1-resident bytes, so the DRAM cost is closer to one R/W than
+two. Same structure as the QUIC TX path (encoder write +
+in-place seal).
 
 ## Current path — QUIC (HTTPS over H3)
 
@@ -56,8 +67,8 @@ QUIC TX path's per-byte cost.
 |---|------|------|---|---|---|
 | 1 | Handler renders body | `body_iobuf` writer | 1× memcpy (dynamic content only) | — | Same as TCP path |
 | 2 | H3 frame encode | `proto/http3/src/*` | — | small `Vec::with_capacity` per frame | HEADERS / DATA / etc. |
-| 3 | **QUIC packet encode** | `encode_one_rtt_packet` etc. (`proto/quic/src/conn.rs:2018+`) | **1× memcpy** | `Vec::with_capacity(1024)` for frames + `take_datagram_buf` (~1500 B, pooled with 62 B L2/L3/L4 headroom prefix after item Q) | Frame headers + STREAM data written into the datagram Vec; for 1-RTT packets writes directly (no temp staging Vec); Initial/Handshake still stage via temp `frames` Vec |
-| 4 | QUIC AEAD seal | within `seal_packet` | 1× R/W (ChaCha20) + 1× R (Poly1305) | — | In place over the assembled packet bytes |
+| 3 | **QUIC packet encode** | `encode_one_rtt_packet` etc. (`proto/quic/src/conn/tx.rs`) | **1× memcpy** | `Vec::with_capacity(1024)` for frames + `take_datagram_buf` (~1500 B, pooled with 62 B L2/L3/L4 headroom prefix after item Q) | Frame headers + STREAM data written into the datagram Vec; for 1-RTT packets writes directly (no temp staging Vec); Initial/Handshake still stage via temp `frames` Vec |
+| 4 | QUIC AEAD seal | within `seal_packet` (`aes128_gcm_seal`) | 1× R/W (AES-128-GCM, GHASH-authenticated) | — | In place over the assembled packet bytes — the encoder already wrote plaintext into the datagram (step 3), so no copy pass is needed here (unlike the TCP TLS chain path, which copies into the slot before sealing) |
 | 5 | `pop_packet_owned` | `proto/quic/src/endpoint.rs` | — (move) | — | `DatagramBuf` ownership transferred to the reactor; `TxSlot` variant carries a `TxBufHandle` (zero-copy ship), `Heap` variant carries a `Vec<u8>` (recycled via the conn's pool) |
 | 6 | ~~UDP wrap~~ | — (item Q ✓) | — | — | Folded into step 3 — encoder writes packet bytes directly into the framing buffer's UDP-payload region; bare-metal `send_with_l2_headroom` fills UDP/IP/Eth headers in the pre-reserved headroom |
 | 7 | ~~IPv4 wrap~~ | — | — | — | Folded into step 6 (item P ✓ and Q ✓) |
@@ -66,9 +77,15 @@ QUIC TX path's per-byte cost.
 | 10+ | Host pickup, host kernel, wire, browser | — | — | — | Same as TCP from this point on |
 
 Active per-byte memcpys on the guest side: **1** (step 3) — down
-from 5 before items A, P, Q, B2. Same as TCP after B. The
-fundamental encoder write that can't be removed without offloading
-AEAD to the NIC.
+from 5 before items A, P, Q, B2. The fundamental encoder write
+that can't be removed without offloading AEAD to the NIC; the
+AES-128-GCM seal then runs in place over those same bytes (step
+4), so no second copy. This is one pass fewer than the TCP TLS
+path, which gained a chain→slot copy when the fused
+`seal_chain_to` went away on the AES-GCM migration (see TCP
+summary above and item D) — QUIC keeps its single-pass shape
+because the encoder writes straight into the datagram and the
+AEAD seals there.
 
 ## Segment 1 — Inside the unikernel (TLS encrypt → NIC TX)
 
@@ -96,6 +113,10 @@ AEAD to the NIC.
   just need the right amount of headroom plumbed from the top.
 
 ### B. SG TX API (direct-fill from caller into the TX pool)
+> The *shape* of this NIC TX submit-surface (acquire/fill/submit
+> vs. memcpy-target) is owned by
+> [`stack-architecture.md`](stack-architecture.md); this item owns
+> the per-byte TX-cost it eliminates.
 - **Status**: [x] **landed 2026-05-08** for **TCP** (commits
   `936f03f`, `84777e2`) and for **QUIC** (B2; commits `68f985f`
   + this commit).
@@ -166,8 +187,17 @@ AEAD to the NIC.
 - **Risk**: low.
 
 ### D. Fuse copy + encrypt in scratch
-- **Status**: [x] **landed 2026-05-08** (commits `39c034e`,
-  `fef3c63`, `25858e3`)
+- **Status**: landed 2026-05-08 (commits `39c034e`, `fef3c63`,
+  `25858e3`), then **reverted on the ChaCha20 → AES-128-GCM
+  migration** — the audited `aes-gcm` crate exposes no fused
+  copy-and-encrypt API (the `apply_keystream_b2b` trick below was
+  ChaCha20-specific). The TLS chain path is back to copy-into-slot
+  + `encrypt_in_place_detached` (see `aead::seal_chain` /
+  `record::seal_chain`), so the TCP TLS summary now counts 2
+  per-byte passes again. Re-trigger only if a profile justifies
+  hand-rolling AES-CTR + GHASH as a fused pass (`aes::Aes128` +
+  `ghash::GHash`). The 2026-05-08 narrative below is the
+  historical record of the original (since-reverted) landing.
 - **Result**: -1 R/W pass per byte through dst on the TLS
   single-record fast path. Earlier deferral reasoning was
   wrong — `chacha20` 0.9 (via `cipher` 0.4.4) does expose
@@ -192,29 +222,36 @@ AEAD to the NIC.
   comparing wire bytes to the existing in-place seal.
 
 ### E. Skip `drain_tx()` no-op at top of the hot path
-- **Status**: [ ] not started
-- **Where**: `proto/http/src/lib.rs::TlsStream::send`,
-  `proto/tls/src/lib.rs::TlsConnImpl`.
+- **Status**: [ ] not started — `TlsStream::send` still calls
+  `self.drain_tx().await?` unconditionally.
+- **Where**: `proto/tls/src/lib.rs` (`TlsStream::send` and its
+  `drain_tx`).
 - **What**: Defensive `drain_tx().await?` at the top of `send` is
   a no-op when the TLS layer has no pending bytes. Track a
-  `tx_pending` flag in `TlsConnImpl` and skip the call when
-  clear.
+  `tx_pending` flag and skip the call when clear.
 - **Win**: small — one branch + zero await on the hot path.
 - **Effort**: low.
 - **Risk**: low.
 
 ### F. Drop checksums on loopback / negotiate `VIRTIO_NET_F_CSUM`
-- **Status**: [ ] not started
-- **Where**: virtio feature negotiation,
-  `net/src/{tcp,ipv4}.rs` checksum sites.
-- **What**: virtio negotiates `VIRTIO_NET_F_CSUM` to let the
-  guest hand the host an unchecksummed segment. Tier-1 NICs
-  offload checksums anyway. Skip the per-segment scan.
-- **Win**: -1 read pass per byte (TCP checksum) on the offload
-  path.
-- **Effort**: low-medium. Negotiate the feature; conditionally
-  zero out the cksum field.
-- **Risk**: low.
+- **Status**: [x] **effectively landed by the 2026-05-19 uniform
+  `send()`-side L4 checksum offload** (see progress log). virtio-net
+  negotiates `VIRTIO_NET_F_CSUM` (`init.rs`, sets `has_csum`); the
+  guest stamps only the cheap pseudo-header partial sum at the L4
+  cksum field and hands the device an otherwise-unchecksummed
+  segment via `VIRTIO_NET_HDR_F_NEEDS_CSUM` (`tx.rs`
+  `submit_tx`/`send`, gated on `csum.is_some() && has_csum`). The
+  full per-byte `internet_checksum` scan now runs only as the
+  software fallback when the device never negotiated CSUM. The TCP
+  `Current path` table's step-5 "+1 cksum" is that small partial
+  stamp, not a full per-byte read, on offload-capable NICs.
+- **Where (as landed)**: virtio-net `init.rs` feature negotiation
+  + `tx.rs` (`has_csum` / `NEEDS_CSUM`); TCP partial stamp in
+  `net/tcp/src/send.rs` (`checksum::l4_pseudo_partial`).
+- **Residual**: the original "drop checksums on loopback" angle
+  (skip even the partial when the path is host-loopback) is not
+  done and is low-value — the partial stamp is a fixed ~20-byte
+  cost, not per-payload-byte.
 
 ### P. Apply A's `fill_header` pattern to UDP TX
 - **Status**: [x] **landed 2026-05-08** (commit `1494f06`)
@@ -587,7 +624,10 @@ items until they unlock something concrete.
 1. ✓ **A + C** — TCP TX wrap memcpys + TLS seal envelope. Done.
 2. ✓ **P** — UDP TX wrap fold (mirror of A). Done.
 3. ✓ **Q** — QUIC packets into framing buffer. Done.
-4. ✓ **D** — fused copy + encrypt for TLS single-record path. Done.
+4. **D** — fused copy + encrypt for TLS single-record path.
+   Landed 2026-05-08, then **reverted on the AES-GCM migration**
+   (the `aes-gcm` crate has no fused copy-and-encrypt API). TCP
+   TLS is back to copy-into-slot + in-place seal. See item D.
 5. ✓ **B** (TCP) — direct-fill TX pool. Done.
 6. ✓ **B2** (UDP/QUIC) — extend B to QUIC. Done. QUIC encoder
    writes directly into a TX pool slot via the `DatagramBuf::TxSlot`
@@ -613,12 +653,19 @@ items until they unlock something concrete.
     when we shift focus from local benchmarks to Internet-facing
     serving.
 
-End state after step 6: **1 memcpy per byte** on the guest side
-for both TCP TLS and QUIC — just the one fundamental encrypt R/W
-pass for AEAD (or zero of the encrypt itself moves to NIC offload
-via TLS-offload, but that's its own rabbit hole).
+End state after step 6: **1 memcpy per byte on QUIC**, and **2 on
+TCP TLS** (a chain→slot copy + the in-place AES-128-GCM encrypt
+R/W). The two paths were briefly at parity when item D's fused
+copy+encrypt landed, but D was reverted on the ChaCha20 →
+AES-128-GCM migration (the audited `aes-gcm` crate has no fused
+copy-and-encrypt API), so TCP regained the copy pass. QUIC stays
+at one because its encoder writes straight into the datagram and
+the AEAD seals there. Dropping TCP back to 1 would mean
+hand-rolling fused AES-CTR + GHASH (item D) or moving the encrypt
+to NIC offload via TLS-offload — both their own rabbit holes.
 
-E and F are low-effort cleanups that can land any time.
+E is a low-effort cleanup that can land any time; F is now
+effectively covered by the 2026-05-19 uniform-checksum offload.
 
 ## Progress log
 

@@ -1,6 +1,6 @@
 # TCP RFC conformance — status and prioritized backlog
 
-Last updated 2026-05-22.
+Last updated 2026-05-28.
 
 This is the authoritative list of *pending* TCP conformance work, in
 priority order. For the conformance-testing strategy and the QUIC
@@ -19,11 +19,16 @@ implements and host-tests:
   exponential backoff, Karn's algorithm.
 - RFC 5681 — slow start, AIMD, fast retransmit / fast recovery, and
   a send path that paces against `min(cwnd, rwnd)`.
-- RFC 9293 §3.8.6.1 — zero-window persist probing.
+- RFC 9293 §3.8.6.1 — zero-window persist, both roles: as sender we
+  probe a peer's shut window (exponential backoff, give-up after
+  `PERSIST_MAX_PROBES`); as receiver we answer an inbound bare probe
+  and re-fire a stalled `recv` waker (ce562ff).
 - RFC 5961 §3.2 — strict-sequence RST acceptance.
-- RFC 1122 §4.2.2.16 — receiver silly-window-syndrome avoidance.
+- RFC 1122 §4.2.2.16 — receiver silly-window-syndrome avoidance: a
+  window-update ACK when an app drain reopens the window past one MSS,
+  fired both on the drain and on any inbound segment (ce562ff).
 
-Validation: `//crates/net/tcp:tcp_test` is a 48-scenario in-process
+Validation: `//crates/net/tcp:tcp_test` is a 60-scenario in-process
 packetdrill-style harness (scripted segments → real `tcp_receive` →
 assertions on captured TX), plus production interop (`dev.r2jitu.com`
 serves real browsers / curl / openssl).
