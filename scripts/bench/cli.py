@@ -348,10 +348,14 @@ WORKLOADS = [
     # Larger bodies — sustained-RX probes. Each overruns the 16 KiB
     # per-conn `rx_ring` many times over, so they exercise the
     # ring-fill → window-backpressure → drain → window-update cycle
-    # repeatedly (the path the `net-tcp` window-update fix hardened
-    # — pre-fix a 256 KiB upload hit the 30 s client timeout). Read
-    # the `rx=` MB/s tag rather than req/s here. `available` tier:
-    # run with `--workload upload_256k_tcp,upload_1m_tcp`.
+    # repeatedly. Two distinct bugs once wedged these: the net-tcp
+    # zero-window-update deadlock (fixed in ce562ff) and a streaming
+    # HEAD-parser slot-reset bug that, on a reused keep-alive conn,
+    # parsed the 2nd POST's Content-Length as 0 and stranded its body
+    # (fixed in dddbd86 — Request::clear() now resets per-slot
+    # name/value lengths). Read the `rx=` MB/s tag rather than req/s
+    # here. `available` tier: run with
+    # `--workload upload_256k_tcp,upload_1m_tcp`.
     {
         "name": "upload_256k_tcp",
         "type": "http_upload",

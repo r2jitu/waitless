@@ -1002,6 +1002,27 @@ first item dwarfs everything below it.
    is now measurable on the upload workloads but was not re-benched in
    this subsection.
 
+   **Follow-up (`dddbd86`): a second, independent bug also wedged
+   keep-alive uploads.** ce562ff cleared the window-update deadlock,
+   but `upload_256k_tcp` — which reuses one keep-alive connection for
+   many bodied POSTs — still timed out (0 req/s). The streaming HEAD
+   parser added in 5182eb2 *appends* header bytes (`name_len += take`)
+   and relies on the per-slot lengths starting at 0, but
+   `Request::clear()` reset only `header_count`. So the *second* POST
+   on a connection reused the first's stale slot lengths, corrupting
+   its header names — `Content-Length` then parsed as 0, the body was
+   left on the wire, and the next HEAD parse choked on the body bytes
+   (`header_buffer_overflow`). ce562ff's verification missed it because
+   its POSTs didn't reuse a keep-alive conn for multiple bodied
+   requests (request #1 on a conn is always clean). Fixed by resetting
+   `name_len`/`value_len` for the used slots in `clear()`; pinned by a
+   deterministic parser unit test + a `serve_conn` two-bodied-POST
+   test. Verified on c3/DQO (gVNIC/DQO_RDA, real GCE VM):
+   `upload_256k_tcp` 0 → 6157 req/s (1.6 GB/s), `upload_32k_tcp` →
+   44181 req/s, `header_buffer_overflow` 16 → 0. (The ~842 req/s above
+   was GCE *KVM* — nested QEMU — so the datapaths aren't directly
+   comparable.)
+
    With throughput unmeasurable, the alloc-count + memcpy reduction
    rests on the architecture: the N per-record `(Vec alloc + memcpy)`
    pairs per chunk are replaced by one Arc alloc + N atomic increments,
