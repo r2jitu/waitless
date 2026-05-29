@@ -870,10 +870,23 @@ impl TcpConnection {
                 break;
             };
             if front_len <= total {
-                // Whole IOBuf moves into the queue.
+                // Whole IOBuf moves into the queue. A whole-part entry
+                // is only ever *read* on retransmit
+                // (`retransmit_oldest_segment` copies `head.iobuf.data()`
+                // into a TX scratch) — never `clone_shared`'d — so it
+                // needs owned bytes, not refcounted `Shared` storage.
+                // Pass the raw IOBuf straight to `rtx_push`, whose
+                // `into_owned()` does the single heap copy a `Borrowed`
+                // part (e.g. the response header built in the HTTP
+                // serve loop's stack buffer) requires. The previous
+                // `iobuf.share()` did that copy *and then* wrapped it in
+                // an `Arc<SharedRegion>` — a second per-send heap
+                // allocation (2 allocs/req on the /health hot path) that
+                // nothing in the whole-part path consumes. Only the
+                // partial-boundary arm below needs `share`/`clone_shared`
+                // (to split one IOBuf across the queue and the chain).
                 let iobuf = chain.pop_front().expect("front_mut returned Some");
-                let shared = iobuf.share();
-                if !self.rtx_push(shared, seq, front_len as u16, now_ms) {
+                if !self.rtx_push(iobuf, seq, front_len as u16, now_ms) {
                     self.handle_rtx_push_oom();
                     // Bytes are on the wire — drop the remainder
                     // off `chain` so a later send call doesn't

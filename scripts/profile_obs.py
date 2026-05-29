@@ -41,6 +41,8 @@ def main():
 
     rx = d(pre, post, "tcp", "rx_cycles")
     tick = d(pre, post, "tcp", "tick_cycles")
+    send = d(pre, post, "tcp", "send_cycles")
+    send_calls = d(pre, post, "tcp", "send_calls")
 
     enc = d(pre, post, "tls", "encrypt_cycles")
     dec = d(pre, post, "tls", "decrypt_cycles")
@@ -51,9 +53,12 @@ def main():
     build = d(pre, post, "http", "build_cycles")
     http = parse + hand + build
 
-    net = busy - runtime               # NIC driver + tcp_receive + flush + drain
-    nic_drv = net - rx - tick          # net minus measured tcp stack
-    serve_resid = runtime - tls - http # recv-plumbing + send + async dispatch
+    net = busy - runtime                      # NIC driver + tcp_receive + flush + drain
+    nic_drv = net - rx - tick                 # net minus measured tcp stack
+    # send (async_try_send_chain) runs inside poll_slot, so it is a
+    # sub-component of runtime. Residual now isolates recv-plumbing +
+    # dispatch.
+    serve_resid = runtime - tls - http - send
 
     def per(x):
         return x / reqs
@@ -78,7 +83,9 @@ def main():
     print(f"       http_parse   {per(parse):>10.0f} cy/req  {ns(parse):>8.0f} ns/req  {pct(parse):5.1f}%")
     print(f"       http_handler {per(hand):>10.0f} cy/req  {ns(hand):>8.0f} ns/req  {pct(hand):5.1f}%")
     print(f"       http_build   {per(build):>10.0f} cy/req  {ns(build):>8.0f} ns/req  {pct(build):5.1f}%")
-    print(f"       serve resid* {per(serve_resid):>10.0f} cy/req  {ns(serve_resid):>8.0f} ns/req  {pct(serve_resid):5.1f}%  (recv-plumbing + send + async dispatch)")
+    sc = (send_calls / reqs) if reqs else 0
+    print(f"       tcp_send     {per(send):>10.0f} cy/req  {ns(send):>8.0f} ns/req  {pct(send):5.1f}%  (async_try_send_chain: seg build + NIC TX + rtx; {sc:.2f} calls/req)")
+    print(f"       serve resid* {per(serve_resid):>10.0f} cy/req  {ns(serve_resid):>8.0f} ns/req  {pct(serve_resid):5.1f}%  (recv-plumbing + async dispatch)")
 
 
 if __name__ == "__main__":
