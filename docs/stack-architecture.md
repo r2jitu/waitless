@@ -165,12 +165,11 @@ never reach the legacy `ethernet_send` chain, which stays control-plane-only.
 
 ### Dead-API cleanup → iobuf-type-model doc
 
-The audit found iobuf API with zero production consumers (`Chain::{pull,
-push_with_reserve, push_string, bump_total_len, iter_mut, back_mut, pop_back}`,
-`Cursor::{advance, position, next_chunk}`, `IOBufRead for &[u8]`). Deleting it is
-a clean win but belongs to the iobuf type model's ownership —
-[`iobuf-type-model.md`](iobuf-type-model.md). Listed here only so the
-cross-cutting "freeze the core, trim the edges" goal is recorded.
+The audit found several iobuf methods with zero production consumers; deleting
+them is a clean win. The authoritative inventory lives in
+[`iobuf-type-model.md`](iobuf-type-model.md)'s "Dead / latent surface" section
+(don't duplicate the list here — it drifts). Noted only so the cross-cutting
+"freeze the core, trim the edges" goal is recorded.
 
 ---
 
