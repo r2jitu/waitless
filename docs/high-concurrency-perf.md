@@ -22,6 +22,8 @@ their analyses.
 | [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md) | TCP RFC gaps (active opens, RFC 7323 window scaling, …). The intrusive-timer-list and accept-ring work below was perf-only; semantics unchanged. |
 | [`conformance-roadmap.md`](conformance-roadmap.md) | Conformance-testing strategy + QUIC RFC backlog. |
 | [`gvnic.md`](gvnic.md) | gVNIC device behaviour, DQO vs GQI queue formats. |
+| [`iobuf-type-model.md`](iobuf-type-model.md) | The `iobuf` ownership / `Send` type model (`OwnedIOBuf`, `Chain<B>`, `IOBufRead`, the uniform drop/free contract). |
+| [`stack-architecture.md`](stack-architecture.md) | Inter-layer **contracts and stack shape**: the buffer currency, the stream trait, the handler API, NIC/reactor backend abstraction (POD-fn-pointers → traits), and the TCP/TLS/H1 ↔ UDP/QUIC/H3 convergence to one golden path. Owns layer *structure*, not per-byte cost. |
 
 The high-level rule for "where does this fix belong?":
 
@@ -29,6 +31,9 @@ The high-level rule for "where does this fix belong?":
   * **per-byte / per-packet TX cost** → `tx-path-optimizations.md`
   * **per-conn data structures, per-conn scheduling, saturation
     behaviour, load shedding** → this doc
+  * **inter-layer contracts / stack shape** (buffer currency, stream
+    trait, handler API, backend abstraction, two-stacks→one-golden-path
+    convergence, API simplification) → `stack-architecture.md`
   * **RFC correctness** → `tcp-conformance-backlog.md`
 
 ## Goal
