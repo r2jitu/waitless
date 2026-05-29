@@ -29,6 +29,19 @@ pub fn bump_tasks_polled(worker_id: u32) {
     TASKS_POLLED_PER_WORKER.bump(worker_id);
 }
 
+/// Per-worker cycles spent inside `poll_slot` — i.e. the *whole*
+/// serve bucket: every ready task's `Future::poll`, which for the
+/// webserver is the `serve_conn` body (recv-plumbing, TLS, HTTP
+/// parse/handler/build, send). Brackets only the poll call, so idle
+/// `tick` spins (up to `IDLE_SPIN_BEFORE_HLT`) cost nothing here.
+/// Read against `eventloop` `busy_cycles`: `busy - runtime_cycles`
+/// is the net/NIC path (NET_POLL + tcp_receive + flush). Divide by
+/// requests for cy/req of serve. Per-stage sub-splits live in the
+/// `tls` (encrypt/decrypt) and `http` (parse/handler/build) blocks;
+/// the serve residual (runtime - tls - http) is the async-dispatch
+/// + send + recv-plumbing tax.
+pub static RUNTIME_CYCLES: PerCoreCounter<MAX_CORES> = PerCoreCounter::new();
+
 /// One counter per task-lifecycle event.
 pub struct Counters {
     /// Futures successfully placed in a worker's task arena.
@@ -118,7 +131,7 @@ pub fn write_obs_json(w: &mut dyn fmt::Write) -> fmt::Result {
     }
     w.write_str("\"tasks_polled_per_worker\":")?;
     write_tasks_polled_json(w)?;
-    w.write_str(",")?;
+    write!(w, ",\"runtime_cycles\":{},", RUNTIME_CYCLES.sum())?;
     LAST_SPAWN_FAILURE.write_json(w, "last_spawn_failure")?;
     w.write_str("}")
 }

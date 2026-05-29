@@ -55,6 +55,20 @@ pub struct Counters {
     /// `recv` returned 0 — the peer closed, or a fatal recv error.
     /// The ordinary end of a keep-alive connection.
     pub peer_eof: Counter,
+    /// Cumulative cycles in `StreamingRequestParser::feed` — the HEAD
+    /// parse cost. Per-stage profiling (cf. `RUNTIME_CYCLES`); divide
+    /// by `requests_parsed` for cy/req. Sums across cores (a single
+    /// shared atomic — per-request frequency, not per-packet, so
+    /// uncontended-enough to not perturb the measurement).
+    pub parse_cycles: Counter,
+    /// Cumulative cycles in the handler call (`(*handler)(..).await`).
+    /// For sync handlers like `/health` this is the handler body; an
+    /// awaiting handler would fold its park time in here (so this is
+    /// only a clean CPU figure for non-awaiting handlers).
+    pub handler_cycles: Counter,
+    /// Cumulative cycles building the response wire bytes
+    /// (`write_response_into_iobuf` + body-part chaining).
+    pub build_cycles: Counter,
 }
 
 impl Counters {
@@ -69,6 +83,9 @@ impl Counters {
             send_failed: Counter::new(),
             idle_timeout: Counter::new(),
             peer_eof: Counter::new(),
+            parse_cycles: Counter::new(),
+            handler_cycles: Counter::new(),
+            build_cycles: Counter::new(),
         }
     }
 }
@@ -149,7 +166,7 @@ pub fn record_reject(req: &Request) {
 }
 
 /// Counter `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 9] {
+pub fn snapshot() -> [(&'static str, u64); 12] {
     let c = &COUNTERS;
     [
         ("connections_served", c.connections_served.get()),
@@ -161,6 +178,9 @@ pub fn snapshot() -> [(&'static str, u64); 9] {
         ("send_failed", c.send_failed.get()),
         ("idle_timeout", c.idle_timeout.get()),
         ("peer_eof", c.peer_eof.get()),
+        ("parse_cycles", c.parse_cycles.get()),
+        ("handler_cycles", c.handler_cycles.get()),
+        ("build_cycles", c.build_cycles.get()),
     ]
 }
 

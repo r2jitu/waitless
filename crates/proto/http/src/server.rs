@@ -20,6 +20,41 @@ use crate::streaming;
 /// backend slot. Mirrors common HTTP/1.1 keep-alive budgets.
 const IDLE_TIMEOUT_US: u64 = 30_000_000;
 
+/// Steady-state cycle counter for the per-stage `serve_conn`
+/// profiling brackets (parse / handler / build). Same rdtsc / cntvct
+/// instruction the `tls` profiler uses; zero on unsupported targets.
+/// `http` sits above `kernel_core` via the reactor only, so we read
+/// the counter directly rather than thread a dependency.
+#[inline(always)]
+fn now_cycles() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let lo: u32;
+        let hi: u32;
+        core::arch::asm!(
+            "rdtsc",
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+        ((hi as u64) << 32) | (lo as u64)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let v: u64;
+        core::arch::asm!(
+            "mrs {0}, cntvct_el0",
+            out(reg) v,
+            options(nomem, nostack, preserves_flags),
+        );
+        v
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        0
+    }
+}
+
 // ---- Public entry points -----------------------------------------------------
 
 /// Listen for plain HTTP on `port`. The returned `TcpHandle`
@@ -112,7 +147,12 @@ where
         // iteration), then fresh `recv_chunk` calls.
         loop {
             if let Some(buf) = carry.take() {
-                match parser.feed(&mut req, buf.data()) {
+                let __p0 = now_cycles();
+                let feed_result = parser.feed(&mut req, buf.data());
+                crate::diag::COUNTERS
+                    .parse_cycles
+                    .add(now_cycles().wrapping_sub(__p0));
+                match feed_result {
                     streaming::FeedResult::Done { consumed } => {
                         carry = buf
                             .into_remainder(consumed)
@@ -130,21 +170,28 @@ where
             } else {
                 let chunk_fut = stream.recv_chunk();
                 match waitless::runtime::timeout_us(IDLE_TIMEOUT_US, chunk_fut).await {
-                    Some(Some(guard)) => match parser.feed(&mut req, guard.data()) {
-                        streaming::FeedResult::Done { consumed } => {
-                            carry = guard
-                                .into_remainder(consumed)
-                                .expect("consumed <= data().len()");
-                            break;
+                    Some(Some(guard)) => {
+                        let __p0 = now_cycles();
+                        let feed_result = parser.feed(&mut req, guard.data());
+                        crate::diag::COUNTERS
+                            .parse_cycles
+                            .add(now_cycles().wrapping_sub(__p0));
+                        match feed_result {
+                            streaming::FeedResult::Done { consumed } => {
+                                carry = guard
+                                    .into_remainder(consumed)
+                                    .expect("consumed <= data().len()");
+                                break;
+                            }
+                            streaming::FeedResult::NeedMore => {
+                                drop(guard);
+                            }
+                            streaming::FeedResult::Overflow => {
+                                crate::diag::COUNTERS.header_buffer_overflow.bump();
+                                return;
+                            }
                         }
-                        streaming::FeedResult::NeedMore => {
-                            drop(guard);
-                        }
-                        streaming::FeedResult::Overflow => {
-                            crate::diag::COUNTERS.header_buffer_overflow.bump();
-                            return;
-                        }
-                    },
+                    }
                     Some(None) => {
                         crate::diag::COUNTERS.peer_eof.bump();
                         return;
@@ -190,7 +237,11 @@ where
                     None => &[],
                 };
                 let mut body = BodyReader::new(&mut stream, prebuf, content_length);
+                let __h0 = now_cycles();
                 resp = (*handler)(&req, &mut body).await;
+                crate::diag::COUNTERS
+                    .handler_cycles
+                    .add(now_cycles().wrapping_sub(__h0));
                 body_drained_ok = want_close
                     || body.is_empty()
                     || body.discard().await.is_ok();
@@ -233,6 +284,7 @@ where
             )
         };
         let mut header = header;
+        let __b0 = now_cycles();
         write_response_into_iobuf(&mut header, &resp, !want_close);
 
         debug_assert!(out_chain.is_empty());
@@ -240,6 +292,9 @@ where
             out_chain.push_back(part);
         }
         out_chain.push_front(header);
+        crate::diag::COUNTERS
+            .build_cycles
+            .add(now_cycles().wrapping_sub(__b0));
 
         if stream.send(&mut out_chain).await.is_err() {
             crate::diag::COUNTERS.send_failed.bump();

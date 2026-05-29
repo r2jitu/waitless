@@ -346,6 +346,40 @@ fn make_waker_for(worker_id: u32, slot_idx: usize) -> Waker {
 /// wake their tasks via the `Sleep` → waker chain), then poll every
 /// ready slot in its arena. Backends call this once per event-loop
 /// iteration.
+/// Cycle counter for the `RUNTIME_CYCLES` serve-bucket bracket. The
+/// executor sits below `kernel_core`, so we read the counter directly
+/// (rdtsc / cntvct) rather than depend on it. Same instruction the
+/// `tls`/`http` profilers use; zero on unsupported targets.
+#[inline(always)]
+fn now_cycles() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let lo: u32;
+        let hi: u32;
+        core::arch::asm!(
+            "rdtsc",
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+        ((hi as u64) << 32) | (lo as u64)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let v: u64;
+        core::arch::asm!(
+            "mrs {0}, cntvct_el0",
+            out(reg) v,
+            options(nomem, nostack, preserves_flags),
+        );
+        v
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        0
+    }
+}
+
 pub fn tick(worker_id: u32) -> bool {
     if worker_id >= worker::num_workers() {
         return false;
@@ -415,7 +449,9 @@ pub fn tick(worker_id: u32) -> bool {
                 continue;
             }
             crate::diag::bump_tasks_polled(worker_id);
+            let __rt0 = now_cycles();
             poll_slot(arena, slot, worker_id, slot_idx);
+            crate::diag::RUNTIME_CYCLES.add(worker_id, now_cycles().wrapping_sub(__rt0));
         }
     }
     did_work
