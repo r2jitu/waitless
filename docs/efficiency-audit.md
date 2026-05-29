@@ -83,6 +83,27 @@ last alloc/req (→ **0 allocs/req**) and the last reducible copy. **Risk: mediu
 small per-conn ring of sealed buffers, freed on ACK). **Validate:** tcp_test rtx
 coverage; HVF functional; GCE allocs/req (expect 1→0) + send-path cy/req.
 
+> **Status (2026-05-29).**
+> - **2(b) DONE — allocs/req 1 → 0** (landed `1d46f90`). A per-conn reusable
+>   inline retransmit-retain buffer (`RtxPayload::Inline`) replaces the borrowed
+>   header/record `into_owned` copy; GCE-validated 1.00 → 0.000 on /health plain
+>   and TLS. (Implemented as a copy-into-reusable-buffer rather than
+>   `clone_shared`, but same net effect: no per-request heap alloc.)
+> - **2(a) BLOCKED on gve — the direct-fill seal can't reduce the copies on the
+>   GCE deploy.** It was implemented and GCE-tested: `direct_fill_sends = 0`
+>   because **gve does not expose a regular direct-fill TX slot**
+>   (`nic::acquire_tx_buf` returns `None` — gve's regular sends use the
+>   stack-staged `build_and_send_frame` fallback; only the *TSO big-pool* slot is
+>   exposed, and TSO drops sub-MSS frames). So sealing a small record straight
+>   into a wire slot isn't possible on gve, and the sub-MSS scratch copies
+>   persist. The slot-based attempt was reverted (clean no-op, not worth dead
+>   code). Reducing these copies on gve would need either a *seal-into-the-
+>   stack-frame* variant of `build_and_send_frame` (saves ~1 copy — below the
+>   ~15–20% run-to-run noise, so low value), or a NIC/queue format that exposes
+>   `acquire_tx_buf` (gve DQO_RDA in principle, "not advertised in our deploy
+>   path"). Deferred as low-value until one of those holds. Note: the copies are
+>   below-noise for throughput anyway (the win was the alloc/lock-acq, now done).
+
 ### Tier 2 — mem/connection (matters at 50K+ idle keep-alive conns)
 
 > Prereq: **ceiling-mover #0** in `high-concurrency-perf.md` — unlock the other
