@@ -156,11 +156,28 @@ impl ExternalOwned {
         self.capacity as usize
     }
 
-    /// Start of the foreign region. Outer-type methods compute
-    /// `base.add(offset)` for the visible window.
+    /// Read-only view of the entire foreign region. The visible
+    /// `(offset, len)` window lives on the outer type, which indexes
+    /// into this. The sole `unsafe` slice-formation for the
+    /// `External` shape — every reader (`OwnedIOBuf`, `SharedRegion`)
+    /// goes through here rather than re-deriving the raw pointer.
     #[inline]
-    pub(crate) fn base(&self) -> NonNull<u8> {
-        self.base
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: `base..base+capacity` is a valid, exclusively-owned
+        // byte region for this IOBuf's lifetime (the `wrap_owned`
+        // construction precondition).
+        unsafe { core::slice::from_raw_parts(self.base.as_ptr(), self.capacity as usize) }
+    }
+
+    /// Mutable view of the entire foreign region. `&mut self` gives
+    /// exclusive access for the call; the region is exclusively
+    /// owned. The sole `unsafe` mutable-slice-formation for the
+    /// `External` shape.
+    #[inline]
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as `bytes()`, plus `&mut self` gives exclusive
+        // write access for this call.
+        unsafe { core::slice::from_raw_parts_mut(self.base.as_ptr(), self.capacity as usize) }
     }
 }
 
@@ -224,11 +241,26 @@ impl BorrowedView {
         self.capacity as usize
     }
 
-    /// Start of the borrowed region. Outer-type methods compute
-    /// `base.add(offset)` for the visible window.
+    /// Read-only view of the entire borrowed region. The visible
+    /// `(offset, len)` window lives on the outer `IOBuf`, which
+    /// indexes into this. The sole `unsafe` slice-formation for the
+    /// `Borrowed` shape.
     #[inline]
-    pub(crate) fn base(&self) -> NonNull<u8> {
-        self.base
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: the `borrow` caller guaranteed `base..base+capacity`
+        // is valid for this IOBuf's lifetime and not concurrently
+        // mutated.
+        unsafe { core::slice::from_raw_parts(self.base.as_ptr(), self.capacity as usize) }
+    }
+
+    /// Mutable view of the entire borrowed region. `&mut self` gives
+    /// exclusive access for the call; the `borrow` caller guaranteed
+    /// no other route mutates the region concurrently.
+    #[inline]
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as `bytes()`, plus `&mut self` gives exclusive
+        // write access for this call.
+        unsafe { core::slice::from_raw_parts_mut(self.base.as_ptr(), self.capacity as usize) }
     }
 }
 
@@ -292,18 +324,13 @@ impl SharedRegion {
     }
 
     /// Read-only view of the entire backing region. Concurrent
-    /// readers across `Arc` clones go through here.
+    /// readers across `Arc` clones go through here. Delegates to the
+    /// backing struct's `bytes()` — no `unsafe` of its own.
     #[inline]
     pub(crate) fn bytes(&self) -> &[u8] {
         match &self.inner {
             SharedInner::Heap(h) => h.bytes(),
-            SharedInner::External(e) => {
-                // SAFETY: `base..base+capacity` is the foreign
-                // region the `wrap_owned` caller guaranteed valid
-                // for the IOBuf's lifetime; the `Arc<SharedRegion>`
-                // refcount keeps that lifetime alive across clones.
-                unsafe { core::slice::from_raw_parts(e.base().as_ptr(), e.capacity()) }
-            }
+            SharedInner::External(e) => e.bytes(),
         }
     }
 
@@ -316,11 +343,7 @@ impl SharedRegion {
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         match &mut self.inner {
             SharedInner::Heap(h) => h.bytes_mut(),
-            SharedInner::External(e) => {
-                // SAFETY: as `bytes()`, plus `&mut self` ⇒ Arc is
-                // uniquely held ⇒ no concurrent reader exists.
-                unsafe { core::slice::from_raw_parts_mut(e.base().as_ptr(), e.capacity()) }
-            }
+            SharedInner::External(e) => e.bytes_mut(),
         }
     }
 }

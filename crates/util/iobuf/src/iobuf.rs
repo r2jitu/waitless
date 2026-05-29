@@ -157,15 +157,8 @@ impl IOBuf {
         match &self.inner {
             IOBufInner::Owned(o) => o.data(),
             IOBufInner::Borrowed { view, offset, len } => {
-                // SAFETY: the `borrow` caller guaranteed the region
-                // is valid for this IOBuf's lifetime and not
-                // concurrently mutated; offset + len <= capacity.
-                unsafe {
-                    core::slice::from_raw_parts(
-                        view.base().as_ptr().add(*offset as usize),
-                        *len as usize,
-                    )
-                }
+                let o = *offset as usize;
+                &view.bytes()[o..o + *len as usize]
             }
         }
     }
@@ -216,15 +209,8 @@ impl IOBuf {
         match &mut self.inner {
             IOBufInner::Owned(o) => o.data_mut(),
             IOBufInner::Borrowed { view, offset, len } => {
-                // SAFETY: the `borrow` caller guaranteed no
-                // concurrent mutation; `&mut self` gives exclusive
-                // write access for this call.
-                Some(unsafe {
-                    core::slice::from_raw_parts_mut(
-                        view.base().as_ptr().add(*offset as usize),
-                        *len as usize,
-                    )
-                })
+                let o = *offset as usize;
+                Some(&mut view.bytes_mut()[o..o + *len as usize])
             }
         }
     }
@@ -242,16 +228,7 @@ impl IOBuf {
                     return Err(IOBufError::NoHeadroom);
                 }
                 let new_offset = *offset - n as u32;
-                // SAFETY: `new_offset..*offset` is in-bounds
-                // (new_offset >= 0 by the check); the `borrow`
-                // caller guaranteed no concurrent mutation.
-                unsafe {
-                    core::slice::from_raw_parts_mut(
-                        view.base().as_ptr().add(new_offset as usize),
-                        n,
-                    )
-                    .copy_from_slice(data);
-                }
+                view.bytes_mut()[new_offset as usize..*offset as usize].copy_from_slice(data);
                 *offset = new_offset;
                 *len += n as u32;
                 Ok(())
@@ -271,11 +248,7 @@ impl IOBuf {
                 if end + n > view.capacity() {
                     return Err(IOBufError::NoTailroom);
                 }
-                // SAFETY: end..end+n in-bounds; exclusive access.
-                unsafe {
-                    core::slice::from_raw_parts_mut(view.base().as_ptr().add(end), n)
-                        .copy_from_slice(data);
-                }
+                view.bytes_mut()[end..end + n].copy_from_slice(data);
                 *len += n as u32;
                 Ok(())
             }
@@ -296,8 +269,7 @@ impl IOBuf {
                     return Err(IOBufError::NoTailroom);
                 }
                 *len += n as u32;
-                // SAFETY: end..end+n in-bounds; exclusive access.
-                Ok(unsafe { core::slice::from_raw_parts_mut(view.base().as_ptr().add(end), n) })
+                Ok(&mut view.bytes_mut()[end..end + n])
             }
         }
     }

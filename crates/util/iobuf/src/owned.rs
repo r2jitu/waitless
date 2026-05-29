@@ -61,6 +61,39 @@ pub(crate) enum OwnedStorage {
     Static(&'static [u8]),
 }
 
+impl OwnedStorage {
+    /// The entire backing region (capacity bytes), independent of
+    /// any `(offset, len)` view. Every read path indexes into this,
+    /// so the four shapes share one accessor — no per-variant
+    /// arithmetic at the call sites.
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        match self {
+            OwnedStorage::Heap(h) => h.bytes(),
+            OwnedStorage::External(e) => e.bytes(),
+            OwnedStorage::Shared(r) => r.bytes(),
+            OwnedStorage::Static(s) => s,
+        }
+    }
+
+    /// Mutable backing region, or `None` for the immutable `Static`
+    /// shape. For `Shared` the caller MUST have run
+    /// [`OwnedIOBuf::cow_if_shared_aliased`] first — `Arc::get_mut`
+    /// then yields the unique reference (the `expect` documents that
+    /// precondition).
+    #[inline]
+    fn bytes_mut(&mut self) -> Option<&mut [u8]> {
+        match self {
+            OwnedStorage::Heap(h) => Some(h.bytes_mut()),
+            OwnedStorage::External(e) => Some(e.bytes_mut()),
+            OwnedStorage::Shared(arc) => {
+                Some(Arc::get_mut(arc).expect("unique after cow_if_shared_aliased").bytes_mut())
+            }
+            OwnedStorage::Static(_) => None,
+        }
+    }
+}
+
 /// Static assertion: `OwnedIOBuf` (and a chain of them) is `Send` by
 /// auto-derivation. If a future change reintroduced a `!Send` field
 /// — a raw pointer, a `PhantomData<*const ()>` — this stops
@@ -144,18 +177,7 @@ impl OwnedIOBuf {
     pub fn data(&self) -> &[u8] {
         let o = self.offset as usize;
         let l = self.len as usize;
-        match &self.storage {
-            OwnedStorage::Heap(h) => &h.bytes()[o..o + l],
-            OwnedStorage::External(e) => {
-                // SAFETY: `base + offset .. base + offset + len` is
-                // in-bounds (offset + len <= capacity, construction
-                // precondition); the region is exclusively owned by
-                // this IOBuf for its lifetime.
-                unsafe { core::slice::from_raw_parts(e.base().as_ptr().add(o), l) }
-            }
-            OwnedStorage::Shared(r) => &r.bytes()[o..o + l],
-            OwnedStorage::Static(s) => &s[o..o + l],
-        }
+        &self.storage.bytes()[o..o + l]
     }
 
     /// Visible payload length.
@@ -336,59 +358,28 @@ impl OwnedIOBuf {
         self.cow_if_shared_aliased();
         let o = self.offset as usize;
         let l = self.len as usize;
-        match &mut self.storage {
-            OwnedStorage::Heap(h) => Some(&mut h.bytes_mut()[o..o + l]),
-            OwnedStorage::External(e) => {
-                // SAFETY: as in `data`, plus `&mut self` gives
-                // exclusive write access for this call.
-                Some(unsafe {
-                    core::slice::from_raw_parts_mut(e.base().as_ptr().add(o), l)
-                })
-            }
-            OwnedStorage::Shared(arc) => {
-                // `cow_if_shared_aliased` made the Arc uniquely
-                // held — `get_mut` returns `Some`.
-                let region = Arc::get_mut(arc).expect("unique after cow_if_shared_aliased");
-                Some(&mut region.bytes_mut()[o..o + l])
-            }
-            OwnedStorage::Static(_) => None,
-        }
+        // `bytes_mut()` is `None` only for `Static` (immutable);
+        // `Shared` is unique post-CoW.
+        Some(&mut self.storage.bytes_mut()?[o..o + l])
     }
 
     pub(crate) fn prepend(&mut self, data: &[u8]) -> Result<(), IOBufError> {
         let n = data.len();
         self.cow_if_shared_aliased();
+        // Static rejects up front; otherwise the headroom bound is
+        // what can fail.
+        if matches!(self.storage, OwnedStorage::Static(_)) {
+            return Err(IOBufError::Immutable);
+        }
         if n > self.offset as usize {
-            return Err(match self.storage {
-                OwnedStorage::Static(_) => IOBufError::Immutable,
-                _ => IOBufError::NoHeadroom,
-            });
+            return Err(IOBufError::NoHeadroom);
         }
         let new_offset = self.offset - n as u32;
-        match &mut self.storage {
-            OwnedStorage::Static(_) => return Err(IOBufError::Immutable),
-            OwnedStorage::Heap(h) => {
-                h.bytes_mut()[new_offset as usize..self.offset as usize].copy_from_slice(data);
-            }
-            OwnedStorage::External(e) => {
-                // SAFETY: `new_offset..self.offset` is in-bounds
-                // (new_offset >= 0 by the check); the region is
-                // exclusively owned; `&mut self` gives exclusive
-                // write access.
-                unsafe {
-                    core::slice::from_raw_parts_mut(
-                        e.base().as_ptr().add(new_offset as usize),
-                        n,
-                    )
-                    .copy_from_slice(data);
-                }
-            }
-            OwnedStorage::Shared(arc) => {
-                let region = Arc::get_mut(arc).expect("unique after cow_if_shared_aliased");
-                region.bytes_mut()[new_offset as usize..self.offset as usize]
-                    .copy_from_slice(data);
-            }
-        }
+        let old_offset = self.offset as usize;
+        self.storage
+            .bytes_mut()
+            .expect("non-Static checked above")[new_offset as usize..old_offset]
+            .copy_from_slice(data);
         self.offset = new_offset;
         self.len += n as u32;
         Ok(())
@@ -404,24 +395,10 @@ impl OwnedIOBuf {
         if end + n > self.capacity() {
             return Err(IOBufError::NoTailroom);
         }
-        match &mut self.storage {
-            OwnedStorage::Static(_) => unreachable!(),
-            OwnedStorage::Heap(h) => {
-                h.bytes_mut()[end..end + n].copy_from_slice(data);
-            }
-            OwnedStorage::External(e) => {
-                // SAFETY: end..end+n in-bounds; exclusive ownership;
-                // exclusive access via `&mut self`.
-                unsafe {
-                    core::slice::from_raw_parts_mut(e.base().as_ptr().add(end), n)
-                        .copy_from_slice(data);
-                }
-            }
-            OwnedStorage::Shared(arc) => {
-                let region = Arc::get_mut(arc).expect("unique after cow_if_shared_aliased");
-                region.bytes_mut()[end..end + n].copy_from_slice(data);
-            }
-        }
+        self.storage
+            .bytes_mut()
+            .expect("non-Static checked above")[end..end + n]
+            .copy_from_slice(data);
         self.len += n as u32;
         Ok(())
     }
@@ -436,18 +413,7 @@ impl OwnedIOBuf {
             return Err(IOBufError::NoTailroom);
         }
         self.len += n as u32;
-        match &mut self.storage {
-            OwnedStorage::Static(_) => unreachable!(),
-            OwnedStorage::Heap(h) => Ok(&mut h.bytes_mut()[end..end + n]),
-            OwnedStorage::External(e) => {
-                // SAFETY: end..end+n in-bounds; exclusive access.
-                Ok(unsafe { core::slice::from_raw_parts_mut(e.base().as_ptr().add(end), n) })
-            }
-            OwnedStorage::Shared(arc) => {
-                let region = Arc::get_mut(arc).expect("unique after cow_if_shared_aliased");
-                Ok(&mut region.bytes_mut()[end..end + n])
-            }
-        }
+        Ok(&mut self.storage.bytes_mut().expect("non-Static checked above")[end..end + n])
     }
 }
 
