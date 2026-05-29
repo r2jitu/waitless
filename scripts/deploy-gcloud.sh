@@ -76,13 +76,16 @@ ZONE="${WAITLESS_GCE_ZONE:-us-west1-c}"
 # Region the zone sits in (us-west1-c -> us-west1) — where regional
 # resources such as the reserved static address live.
 REGION="${ZONE%-*}"
-# c3-highcpu-8 by default: 8 vCPU room for multi-core bench scaling.
-# (Both c3 and n2 negotiate `GqiQpl` from the gVNIC device on the
-# GCE images we've tested — DQO_RDA is on the c3 menu in principle
-# but isn't advertised in our deploy path.) Override with
-# `WAITLESS_GCE_MACHINE=n2-highcpu-8` to bench the older NIC class
-# on the same gve driver.
-MACHINE_TYPE="${WAITLESS_GCE_MACHINE:-c3-highcpu-8}"
+# c3-highcpu-4 by default: a 4-vCPU waitless instance already sustains
+# ~1.17M plain / ~729K TLS rps on /health (see docs/benchmark-results.md),
+# so 4 vCPU is the cheapest shape that hits the throughput target — and
+# a single 8-vCPU load generator can't even saturate it. Use
+# `WAITLESS_GCE_MACHINE=c3-highcpu-8` for multi-core scaling studies, or
+# `n2-highcpu-8` to bench the older GQI NIC class on the same gve driver.
+# (Both c3 and n2 negotiate `GqiQpl` from the gVNIC device on the GCE
+# images we've tested — DQO_RDA is on the c3 menu in principle but isn't
+# advertised in our deploy path.)
+MACHINE_TYPE="${WAITLESS_GCE_MACHINE:-c3-highcpu-4}"
 BUCKET="${WAITLESS_GCS_BUCKET:-${NAME}-images}"
 
 # Single-slot deploy: the image / tarball / workdir all use stable
@@ -387,11 +390,12 @@ deploy() {
     # for A/B comparison only.
     #
     # QUEUE_COUNT: number of RX+TX queue pairs to request from the
-    # vNIC backend. Should match the guest's vCPU count so each
-    # core owns a queue pair under Tier 1. Default 8 to match the
-    # default c3-highcpu-8 machine type (and the upper limit gVNIC
-    # honours per instance); override for other sizes.
-    local qc="${QUEUE_COUNT:-8}"
+    # vNIC backend. Should match the guest's vCPU count so each core
+    # owns a queue pair under Tier 1 — so default it to the vCPU count
+    # parsed from MACHINE_TYPE (`c3-highcpu-4` -> 4). gVNIC rejects a
+    # queue-count above the instance's vCPU count, so a fixed 8 broke
+    # sub-8-vCPU shapes; override with QUEUE_COUNT for special cases.
+    local qc="${QUEUE_COUNT:-${MACHINE_TYPE##*-}}"
     local nic_args
     if [[ "${LEGACY_VIRTIO_NIC:-}" == "1" ]]; then
         echo "    (using legacy virtio-net, queue-count=${qc} — RX pins to qp0 on GCE)"
@@ -598,7 +602,7 @@ deploy_bluegreen() {
 
     # Launch the target on an *ephemeral* external IP — the static IP
     # stays with the live instance until cutover.
-    local qc="${QUEUE_COUNT:-8}"
+    local qc="${QUEUE_COUNT:-${MACHINE_TYPE##*-}}"
     local nic_args
     if [[ "${LEGACY_VIRTIO_NIC:-}" == "1" ]]; then
         nic_args="queue-count=${qc}"
