@@ -2944,7 +2944,7 @@ fn rtx_push_seeds_entry_and_anchor() {
             assert_eq!(c.rtx_bytes_in_flight, 100);
             let head = c.rtx_queue.front().unwrap();
             assert_eq!(head.seq_start, 1000);
-            assert_eq!(head.len, 100);
+            assert_eq!(head.payload.len(), 100);
             assert_eq!(head.first_tx_ms, 42);
             assert_eq!(head.tx_count, 1);
             assert!(c.rtt_anchor_active);
@@ -2993,7 +2993,7 @@ fn rtx_ack_pops_and_narrows() {
             assert_eq!(c.rtx_queue.len(), 1);
             assert_eq!(c.rtx_bytes_in_flight, 170);
             assert_eq!(c.rtx_queue.front().unwrap().seq_start, 1130);
-            assert_eq!(c.rtx_queue.front().unwrap().len, 170);
+            assert_eq!(c.rtx_queue.front().unwrap().payload.len(), 170);
             assert_eq!(c.rtx_entry_bytes(0).len(), 170);
             assert_eq!(c.rtx_entry_bytes(0)[0], 0xB0u8.wrapping_add(30));
             return;
@@ -3441,7 +3441,7 @@ fn rtx_ack_cumulative_drains_multiple() {
             assert_eq!(c.rtx_bytes_in_flight, 40);
             let head = c.rtx_queue.front().unwrap();
             assert_eq!(head.seq_start, 1310);
-            assert_eq!(head.len, 40);
+            assert_eq!(head.payload.len(), 40);
             return;
         }
     }

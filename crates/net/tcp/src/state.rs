@@ -212,11 +212,27 @@ pub(crate) enum RtxPayload {
     /// Bytes copied into the connection's reusable `rtx_inline` buffer
     /// at `[off, off+len)` — the alloc-free retain path for small
     /// borrowed parts (the HTTP response header / sub-MSS TLS record),
-    /// which would otherwise cost one heap alloc per request.
-    /// **Single-occupant**: at most one `Inline` entry is live at a
-    /// time (guarded by `TcpConnection::rtx_inline_busy`); a second
-    /// concurrent small part falls back to `Buf`.
-    Inline { off: u16 },
+    /// which would otherwise cost one heap alloc per request. Carries
+    /// its own `len` (there's no IOBuf to derive it from); partial-ACK
+    /// advances `off` and shrinks `len`. **Single-occupant**: at most
+    /// one `Inline` entry is live at a time (guarded by
+    /// `TcpConnection::rtx_inline_busy`); a second concurrent small
+    /// part falls back to `Buf`.
+    Inline { off: u16, len: u16 },
+}
+
+impl RtxPayload {
+    /// The entry's current payload length (≤ MSS). For `Buf` this is
+    /// the IOBuf's visible length (the single source of truth — no
+    /// cached copy to keep in sync); for `Inline` it's the stored
+    /// `len`. Both shrink as partial-ACKs consume the head.
+    #[inline]
+    pub(crate) fn len(&self) -> u16 {
+        match self {
+            RtxPayload::Buf(iobuf) => iobuf.data().len() as u16,
+            RtxPayload::Inline { len, .. } => *len,
+        }
+    }
 }
 
 /// One entry in the per-conn retransmit queue — the payload bytes of
@@ -232,9 +248,6 @@ pub(crate) struct RtxEntry {
     /// First sequence number this entry covers (snd_una when this
     /// was the head of in-flight).
     pub(crate) seq_start: u32,
-    /// Payload byte count — `iobuf.data().len()` post-narrow. Caches
-    /// the length so the cwnd-paced bytes-in-flight sum is O(1).
-    pub(crate) len: u16,
     /// Wall-clock ms of the first transmission of these bytes.
     /// Anchors RFC 6298 RTT sampling for the head-of-queue entry
     /// (subject to Karn's rule via `tx_count`). Read by the
@@ -787,9 +800,10 @@ impl TcpConnection {
             return false;
         }
         let was_empty = self.rtx_queue.is_empty();
-        // The cached `len` must match the IOBuf's visible payload —
-        // `rtx_bytes_in_flight` (and the partial-narrow path in
-        // `rtx_ack`) assume the two are kept in sync.
+        // `len` is the segment's wire length; for the `Buf` path it must
+        // match the IOBuf's visible payload (which then *is* the length —
+        // see `RtxPayload::len`); for the `Inline` path it's the count
+        // copied in. The debug-assert catches a caller mismatch.
         debug_assert_eq!(iobuf.data().len(), len as usize);
         // Alloc-free retain fast path: a small *borrowed* payload (the
         // HTTP response header / sub-MSS TLS record) would otherwise
@@ -807,14 +821,13 @@ impl TcpConnection {
             let buf = self.rtx_inline.as_mut().expect("ensure_rtx_inline succeeded");
             buf[..len as usize].copy_from_slice(&iobuf.data()[..len as usize]);
             self.rtx_inline_busy = true;
-            RtxPayload::Inline { off: 0 }
+            RtxPayload::Inline { off: 0, len }
         } else {
             RtxPayload::Buf(iobuf.into_owned())
         };
         self.rtx_queue.push_back(RtxEntry {
             payload,
             seq_start,
-            len,
             first_tx_ms: now_ms,
             tx_count: 1,
         });
@@ -840,10 +853,10 @@ impl TcpConnection {
     pub(crate) fn rtx_ack(&mut self, ack_num: u32) -> usize {
         let mut acked = 0usize;
         while let Some(head) = self.rtx_queue.front_mut() {
-            let head_end = head.seq_start.wrapping_add(head.len as u32);
+            let head_len = head.payload.len();
+            let head_end = head.seq_start.wrapping_add(head_len as u32);
             // Fully acked: `ack_num` covers the whole entry.
             if !seq_lt(ack_num, head_end) {
-                let head_len = head.len;
                 // Last use of `head` — capture whether it owns the
                 // single-occupant inline buffer before dropping it.
                 let was_inline = matches!(head.payload, RtxPayload::Inline { .. });
@@ -863,19 +876,20 @@ impl TcpConnection {
             // strictly past `seq_start`).
             if seq_lt(head.seq_start, ack_num) {
                 let consumed = ack_num.wrapping_sub(head.seq_start) as usize;
-                // Advance the visible window past the acked prefix —
-                // zero copy either way (an IOBuf offset bump, or the
-                // inline buffer's read offset).
+                // Advance the visible window past the acked prefix — zero
+                // copy either way. `Buf` shrinks via `IOBuf::consume`
+                // (its `data().len()` then *is* the new length); `Inline`
+                // bumps `off` and shrinks its own `len`.
                 let advanced = match &mut head.payload {
                     RtxPayload::Buf(iobuf) => iobuf.consume(consumed).is_ok(),
-                    RtxPayload::Inline { off } => {
+                    RtxPayload::Inline { off, len } => {
                         *off = off.saturating_add(consumed as u16);
+                        *len = len.saturating_sub(consumed as u16);
                         true
                     }
                 };
                 if advanced {
                     head.seq_start = ack_num;
-                    head.len = head.len.saturating_sub(consumed as u16);
                     self.rtx_bytes_in_flight =
                         self.rtx_bytes_in_flight.saturating_sub(consumed as u32);
                     acked += consumed;
@@ -895,10 +909,10 @@ impl TcpConnection {
         let e = &self.rtx_queue[idx];
         match &e.payload {
             RtxPayload::Buf(iobuf) => iobuf.data(),
-            RtxPayload::Inline { off } => {
+            RtxPayload::Inline { off, len } => {
                 let off = *off as usize;
                 &self.rtx_inline.as_ref().expect("Inline implies rtx_inline")
-                    [off..off + e.len as usize]
+                    [off..off + *len as usize]
             }
         }
     }
@@ -1156,7 +1170,7 @@ impl TcpConnection {
             let Some(head) = self.rtx_queue.front_mut() else {
                 return;
             };
-            let nn = (head.len as usize).min(mss);
+            let nn = (head.payload.len() as usize).min(mss);
             if nn == 0 {
                 return;
             }
@@ -1167,7 +1181,7 @@ impl TcpConnection {
                     scratch[..n].copy_from_slice(&iobuf.data()[..n]);
                     inline_off = None;
                 }
-                RtxPayload::Inline { off } => {
+                RtxPayload::Inline { off, .. } => {
                     inline_off = Some(*off as usize);
                 }
             }
