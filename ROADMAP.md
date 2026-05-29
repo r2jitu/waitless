@@ -4,6 +4,20 @@ Waitless is a cutting-edge, lean unikernel: modern protocols only (QUIC/HTTP3, I
 cooperative multi-core, zero legacy overhead. Each feature is compile-time
 optional via Bazel deps — you pick exactly what you need.
 
+> **Status (2026-05-28): mostly shipped — this reads more as design-history than roadmap.**
+> Phases 1–5 (the async runtime, TLS 1.3, UDP/QUIC, HTTP/3, IPv6/NDP) have **shipped**;
+> only Phase 6 (vsock / eBPF / io_uring-style SQs) and a handful of "Deferred work"
+> items are still forward-looking. The phase bodies below were written as *plans* and
+> have not all been back-edited — treat them as period design records, not current
+> state. Known drift: the shipped TLS cipher is **`TLS_AES_128_GCM_SHA256`**, not the
+> ChaCha20-Poly1305 described in Phase 3b; older sections cite pre-`crates/` Bazel
+> labels (`//net:…`) and source paths.
+>
+> For **current state** see [`docs/README.md`](docs/README.md); for **live backlogs**
+> see [`docs/conformance-roadmap.md`](docs/conformance-roadmap.md) (QUIC RFC),
+> [`docs/tcp-conformance-backlog.md`](docs/tcp-conformance-backlog.md) (TCP RFC), and
+> [`docs/rx-path-optimizations.md`](docs/rx-path-optimizations.md) / [`docs/tx-path-optimizations.md`](docs/tx-path-optimizations.md) (per-byte perf).
+
 ## Design Principles
 
 - **The executor IS the kernel**: `async fn` is the *only* execution

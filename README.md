@@ -276,13 +276,16 @@ waitless/
 
 ## Documentation
 
+See **[docs/README.md](docs/README.md)** for the full, categorized index. Highlights:
+
 - [docs/crates.md](docs/crates.md) — crate taxonomy and the kernel↔userspace facade boundary
+- [docs/stack-architecture.md](docs/stack-architecture.md) — inter-layer contracts and the one-golden-path direction
 - [docs/networking.md](docs/networking.md) — the network stack, end to end
 - [docs/consuming-as-a-library.md](docs/consuming-as-a-library.md) — building an app against Waitless
 - [docs/benchmarking.md](docs/benchmarking.md) — how the performance numbers are measured
 - [docs/gvnic.md](docs/gvnic.md) — the from-scratch Google Virtual NIC driver
 - [docs/iobuf-type-model.md](docs/iobuf-type-model.md) · [rx-path](docs/rx-path-optimizations.md) · [tx-path](docs/tx-path-optimizations.md) — zero-copy datapath internals
-- [ROADMAP.md](ROADMAP.md) — where Waitless is headed: QUIC/HTTP3, IPv6, the async runtime
+- [ROADMAP.md](ROADMAP.md) — design rationale + decision records (async runtime, QUIC, TLS, IPv6 — now shipped) and the forward-looking roadmap (Phase 6)
 
 ## Deploying to GCE
 
