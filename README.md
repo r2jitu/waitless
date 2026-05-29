@@ -64,6 +64,14 @@ its mature in-tree `gve` driver** (thousands of lines, years of tuning);
 [`crates/drivers/gve/`](crates/drivers/gve/)**. Linux should win on driver
 maturity alone. It doesn't.
 
+> These figures are an **earlier `n2-highcpu-4` (GQI NIC)** run comparing the
+> *same app* on Waitless vs native Linux/POSIX. For the current, sharper
+> comparison — Waitless vs **tokio-hyper** on `c3` / gVNIC — see
+> [below](#and-vs-a-real-async-server-tokio-hyper) and
+> [docs/benchmark-results.md](docs/benchmark-results.md). Note: absolute GCE
+> throughput carries **~15–20 % run-to-run variance** on SPOT hardware; treat
+> single-run absolutes as indicative and lean on the ratios.
+
 | Workload            | Native Linux | **Waitless** | Δ |
 |---------------------|-------------:|-------------:|:-:|
 | `/health`      c128 |    278,000   |  **499,000** | **+79 %**  |
@@ -92,14 +100,16 @@ serving a byte-identical `/health`, each measured at its own CPU-bound ceiling:
 
 | Workload | **Waitless** | tokio-hyper | Speedup |
 |----------|-------------:|------------:|:-------:|
-| HTTP/1.1 plain  | **≈ 1,170,000** rps* | 398,000 rps | **≈ 2.9×** |
-| HTTPS / TLS 1.3 | **729,000** rps      | 338,000 rps | **≈ 2.2×** |
+| HTTP/1.1 plain  | **≈ 1.0–1.2 M** rps* | ≈ 398 K rps | **≈ 2.5–3×** |
+| HTTPS / TLS 1.3 | **≈ 610–730 K** rps  | ≈ 338 K rps | **≈ 1.8–2.2×** |
 
-\* lower bound (Waitless was still loadgen-limited). At 200 connections — where
-neither saturates — Waitless's TLS p50 is **270 µs vs tokio-hyper's 587 µs**.
-The reason is stark: profiled at saturation, tokio-hyper burns **~61 % of its
-CPU in the kernel** (syscalls, the in-kernel TCP/IP stack, packet copies);
-Waitless has no kernel to call. Full numbers, methodology, and caveats in
+\* lower bound (Waitless was still loadgen-limited). The ranges are real
+SPOT-placement variance (~15–20 % run-to-run); the **~2× ratio** is the robust
+part. At 200 connections — where neither saturates — Waitless's TLS p50 is
+**270 µs vs tokio-hyper's 587 µs**. The reason is stark: profiled at saturation,
+tokio-hyper burns **~61 % of its CPU in the kernel** (syscalls, the in-kernel
+TCP/IP stack, packet copies); Waitless has no kernel to call. Full numbers,
+methodology, and caveats in
 [docs/benchmark-results.md](docs/benchmark-results.md).
 
 ## Build Configurations
