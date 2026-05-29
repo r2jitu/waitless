@@ -291,12 +291,28 @@ pub struct TlsServer {
     // record, parses, and either replies or asks for the next.
     //
     // Stored as `Vec<u8>` rather than `IOBuf` because `IOBuf` is
-    // `!Send` (the `Borrowed` variant propagates a non-Send
-    // marker through the enum), and `TlsServer` types end up in a
+    // `!Send` (the `Borrowed` variant propagates a non-Send marker
+    // through the enum), and `TlsServer` types end up in a
     // `WorkerLocal` that the type-system demands be `Sync<T:Send>`
     // — even though by construction one TlsConnImpl never crosses
     // worker threads. Vec<u8> sidesteps the constraint without
     // costing a copy.
+    //
+    // Open follow-up: with `OwnedIOBuf` (the `Send`-by-derivation
+    // owning tier added by the iobuf-two-tier work) and `IOBuf::
+    // share()` / `clone_shared()` (TCP rtx queue's PR-5 share-
+    // insertion), this could become `VecDeque<OwnedIOBuf>`. The
+    // chunk would be `share()`'d once in `pump_rx`; each decrypted
+    // record's plaintext range would be `clone_shared()` + narrowed
+    // and pushed to the queue. Per-record cost goes from
+    // `Vec alloc + memcpy` to one atomic increment — wash on the
+    // /health record size (60 B), measurable win on bulk uploads
+    // (16 KB records). Requires either an `IOBuf → OwnedIOBuf`
+    // extraction helper on iobuf or a contract change on
+    // `process_chunk(&mut [u8])` → `process_chunk(IOBuf)`; the
+    // per-conn slope cost shown by `tls/rx-chunk-streaming`'s
+    // 1c/2c/4c bench is below noise, so this is a deferred
+    // architectural cleanup, not a perf urgency.
     pub(crate) pending_plaintext: VecDeque<Vec<u8>>,
 
     // Key schedule + transcript

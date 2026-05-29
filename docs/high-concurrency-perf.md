@@ -925,6 +925,24 @@ first item dwarfs everything below it.
    pt_buf staging copy with a same-byte-volume but right-sized
    per-record alloc instead of a fixed 17 KB inline buffer).
 
+   **Deferred follow-up — share-based queue (PR-5 idiom):**
+   With `IOBuf::share()` + `clone_shared()` now landed (TCP rtx
+   queue PR-5), the natural next step is `VecDeque<Vec<u8>>` →
+   `VecDeque<OwnedIOBuf>` carrying refcount-shared narrowed views
+   into the chunk's storage. Per-record cost moves from
+   `Vec alloc + memcpy` to one atomic increment — wash on /health
+   (60 B records), but a real win on bulk-upload workloads
+   (16 KB records skip the staging copy entirely; only the AEAD
+   pass touches the bytes). Requires either an `IOBuf →
+   OwnedIOBuf` extraction helper in iobuf (small) or a contract
+   change on `process_chunk(&mut [u8])` → `process_chunk(IOBuf)`,
+   plus a careful share/decrypt ordering to avoid CoW (decrypt
+   while Arc is uniquely held, then `clone_shared()` per record).
+   `tls/rx-chunk-streaming` 1c/2c/4c bench on GCE KVM shows the
+   current `Vec<u8>` design has no measurable throughput cost vs
+   `main`, so this is a deferred architectural cleanup, not a
+   perf urgency.
+
 4. **`Request` headers array: `[Header; 16]` → smaller default + grow.**
    Each `Header = 336 B`, so 16 × 336 = 5.4 KB. Browsers send
    8–12 headers; wrk sends 2–4. Cap at 8 inline + lazy `Vec`
