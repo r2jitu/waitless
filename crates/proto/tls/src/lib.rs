@@ -376,12 +376,15 @@ impl Drop for PooledTlsConn {
 }
 
 impl PooledTlsConn {
-    /// Consume one TCP chunk worth of ciphertext, walking complete
-    /// records and dispatching each to the right state handler.
-    /// `cipher` is mutated in place by record-layer AEAD `open`.
-    fn process_chunk(&mut self, cipher: &mut [u8]) -> Result<(), ()> {
+    /// Consume one owned TCP chunk worth of ciphertext, walking
+    /// complete records and dispatching each to the right state
+    /// handler. The chunk's bytes are AEAD-decrypted in place by
+    /// record-layer `open`; the chunk is then `share()`'d so each
+    /// decrypted app-data record can be queued as a refcount-shared
+    /// view (see `TlsServer::process_chunk`).
+    fn process_chunk(&mut self, chunk: IOBuf) -> Result<(), ()> {
         let inner = &mut **self.inner;
-        inner.tls.process_chunk(cipher, &inner.cfg).map_err(|_| ())
+        inner.tls.process_chunk(chunk, &inner.cfg).map_err(|_| ())
     }
 
     fn pop_tx(&mut self, out: &mut [u8]) -> usize {
@@ -480,15 +483,18 @@ impl TlsStream {
     ///      step (preserves NST / alert ordering — they must hit
     ///      the wire before we block waiting for more peer bytes).
     ///   2. Read fresh ciphertext from TCP as one chunk.
-    ///   3. Hand the chunk's bytes to `process_chunk`, which walks
-    ///      complete records and dispatches each to the
-    ///      state-appropriate handler. Decryption is in place — the
-    ///      chunk's ciphertext is overwritten with plaintext as
-    ///      records are consumed; any straddler is copied into the
-    ///      TLS layer's `rx_partial` for next chunk.
-    ///   4. Drop the chunk guard (NIC slot returns to the pool —
-    ///      plaintext is already owned by the per-conn pending
-    ///      queue).
+    ///   3. Take owned possession of the chunk (`into_owned` —
+    ///      zero-copy for the NIC-RX buffer) and hand it to
+    ///      `process_chunk`, which walks complete records and
+    ///      dispatches each to the state-appropriate handler.
+    ///      Decryption is in place — the chunk's ciphertext is
+    ///      overwritten with plaintext as records are consumed; any
+    ///      straddler is copied into the TLS layer's `rx_partial` for
+    ///      next chunk. After framing, the chunk is `share()`'d and
+    ///      each app-data record is queued as a refcount-shared view.
+    ///   4. The chunk's storage (a NIC RX slot) stays alive only as
+    ///      long as a queued view references it; it returns to the
+    ///      pool once the consumer drains the plaintext.
     ///   5. Drain anything `process_chunk` produced (handshake
     ///      reply, NewSessionTicket, alert, ...).
     ///
@@ -504,17 +510,20 @@ impl TlsStream {
     async fn pump_rx(&mut self) -> Result<(), ()> {
         self.drain_tx().await?;
         {
-            let Some(mut guard) = self.tcp.recv_chunk().await else {
+            let Some(guard) = self.tcp.recv_chunk().await else {
                 return Err(());
             };
-            // Hand the chunk's bytes straight to the AEAD via
-            // process_chunk — records are decrypted in place inside
-            // the chunk's own storage; no staging copy through any
-            // intermediate TLS RX buffer.
-            self.tls.process_chunk(guard.data_mut())?;
-            // Guard drops here — NIC RX slot returns immediately;
-            // any decrypted plaintext is already owned by the
-            // pending-plaintext queue as Heap IOBufs.
+            // Take owned possession of the chunk: zero-copy for the
+            // NIC-RX `External`/`Heap` buffer the backend surfaces,
+            // one copy only for a `Borrowed` view. `process_chunk`
+            // then decrypts records in place and `share()`s the chunk
+            // so each app-data record's plaintext range can be queued
+            // as a refcount-shared view — no staging copy. The chunk's
+            // storage (a NIC RX slot) stays alive until the last
+            // queued view drops, so the slot returns once the consumer
+            // has drained the plaintext via `pop_plaintext`.
+            let chunk = guard.into_owned();
+            self.tls.process_chunk(chunk)?;
         }
         self.drain_tx().await
     }
@@ -604,11 +613,13 @@ impl TlsStream {
 }
 
 impl http::HttpStream for TlsStream {
-    /// Resolve a `RecvChunkGuard` over a `Heap` `IOBuf` carrying
-    /// one decrypted plaintext record. The IOBuf was minted at
-    /// AEAD-decrypt time (`do_app_data` → `into_owned`'d off the
-    /// chunk's in-place plaintext), so the underlying NIC RX slot
-    /// has long since returned to the pool.
+    /// Resolve a `RecvChunkGuard` over an `IOBuf` carrying one
+    /// decrypted plaintext record. For a chunk-direct record the
+    /// IOBuf is an `Owned(Shared)` view refcount-sharing the recv'd
+    /// chunk's storage (so the NIC RX slot is held until this guard —
+    /// and any owned tail the consumer carries forward — drops); for
+    /// the rare rx_partial straddler it's an `Owned(Heap)` copy.
+    /// Either way `into_owned()` on the guard is a no-op.
     ///
     /// Resolves to `Some(guard)` once a record's worth of plaintext
     /// is available, or `None` on peer close / decrypt error / any
@@ -617,7 +628,8 @@ impl http::HttpStream for TlsStream {
     /// handshake to completion before any guard is returned.
     ///
     /// `guard.data()` reads the plaintext in place (zero copy);
-    /// `guard.into_owned()` is a no-op (the IOBuf is already Heap).
+    /// `guard.into_owned()` is a no-op (the IOBuf already owns —
+    /// `Shared` or `Heap` — its bytes).
     async fn recv_chunk(&mut self) -> Option<waitless::runtime::RecvChunkGuard<'_>> {
         // Drive the conn until a plaintext record is queued.
         // Handshake records produce none, so early iterations just

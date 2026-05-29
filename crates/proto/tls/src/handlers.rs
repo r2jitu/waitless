@@ -11,10 +11,12 @@
 //
 // Handlers take a `record: &mut [u8]` of the exact bytes of one
 // complete TLS record (header + body — encrypted or plaintext per
-// state), AEAD-decrypt them in place when needed, push any
-// decrypted application plaintext to `pending_plaintext` as an
-// owned Heap IOBuf, and emit sealed handshake records into
-// `tx_buf`. No direct I/O.
+// state), AEAD-decrypt them in place when needed, and emit sealed
+// handshake records into `tx_buf`. `do_app_data` records each
+// decrypted application-data plaintext range for the orchestrator's
+// share-based fan-out into `pending_plaintext` (or, for an
+// rx_partial straddler, copies it out as an owned buffer). No
+// direct I/O.
 
 use iobuf::OwnedIOBuf;
 use p256::ecdsa::{Signature as EcdsaSignature, signature::Signer};
@@ -726,42 +728,85 @@ impl TlsServer {
     }
 
     /// Once established, decrypt one incoming application_data
-    /// record and enqueue its plaintext for the app. The chunk
-    /// orchestrator frames the record; this handler only AEAD-opens
-    /// it and pushes a fresh Heap `IOBuf` carrying the plaintext to
-    /// `pending_plaintext`.
-    pub(super) fn do_app_data(&mut self, record: &mut [u8]) -> Result<(), HandshakeError> {
+    /// record (AEAD-open in place) and queue its plaintext for the
+    /// app. The chunk orchestrator frames the record; this handler
+    /// only opens it and records where the plaintext landed.
+    ///
+    /// `base_off` distinguishes the two RX sources:
+    ///   * `Some(off)` — a record framed directly off the incoming
+    ///     chunk (`off` = its offset within the chunk's visible
+    ///     window). We remember the plaintext's chunk-relative
+    ///     `(offset, len)` in `app_data_ranges`; the orchestrator's
+    ///     post-framing fan-out turns it into a `clone_shared()` +
+    ///     `narrow()` view — no per-record alloc or copy.
+    ///   * `None` — a record completed from the `rx_partial` straddle
+    ///     box. Its bytes don't share the chunk's storage, so we copy
+    ///     the plaintext into a fresh owned heap buffer and push it
+    ///     straight to `pending_plaintext` (one alloc + memcpy; rare,
+    ///     bounded to one record per chunk transition).
+    pub(super) fn do_app_data(
+        &mut self,
+        record: &mut [u8],
+        base_off: Option<usize>,
+    ) -> Result<(), HandshakeError> {
         debug_assert!(
             record.len() >= record::HEADER_LEN,
             "orchestrator only dispatches framed records",
         );
+        // Capture the record's base pointer before `record_open`
+        // borrows it mutably — used to compute the decrypted
+        // plaintext's offset within the record (and thus the chunk).
+        let rec_base = record.as_ptr() as usize;
         let tk = self.client_ap_tk.as_mut().ok_or(HandshakeError::Internal)?;
         let (inner_type, pt, _consumed) = record_open(tk, record)?;
         match inner_type {
             content_type::APPLICATION_DATA => {
-                // Lift the plaintext slice (borrow into `record`) to
-                // an owned Heap IOBuf so the chunk's storage can be
-                // released back to the NIC pool the moment
-                // process_chunk returns. Empty records are legal
-                // (RFC 8446 §5.4 anti-traffic-analysis padding may
-                // produce zero-length content) but uninteresting to
-                // surface as a "chunk" — the consumer's reader would
-                // see them as a false zero-byte EOF. Drop silently.
+                // Empty records are legal (RFC 8446 §5.4
+                // anti-traffic-analysis padding may produce
+                // zero-length content) but uninteresting to surface
+                // as a "chunk" — the consumer's reader would see them
+                // as a false zero-byte EOF. Drop silently.
                 if pt.is_empty() {
                     return Ok(());
                 }
-                let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-                if v.try_reserve_exact(pt.len()).is_err() {
-                    return Err(HandshakeError::Internal);
+                match base_off {
+                    Some(off) => {
+                        // Chunk-direct: record the plaintext's
+                        // chunk-relative (offset, len). `pt` is a
+                        // sub-slice of `record`, which starts at `off`
+                        // within the chunk window, so the
+                        // chunk-relative offset is `off + (pt -
+                        // record)`. The bytes stay put (decrypted in
+                        // place); the share fan-out narrows a view to
+                        // them after framing completes.
+                        let pt_off = off + (pt.as_ptr() as usize - rec_base);
+                        let pt_len = pt.len();
+                        // Drop the pt borrow into `record` before
+                        // mutating self below.
+                        let _ = pt;
+                        if self.app_data_ranges.try_reserve(1).is_err() {
+                            return Err(HandshakeError::Internal);
+                        }
+                        self.app_data_ranges.push((pt_off as u32, pt_len as u32));
+                    }
+                    None => {
+                        // Straddler: copy the plaintext out — it lives
+                        // in the rx_partial box, not the chunk.
+                        let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                        if v.try_reserve_exact(pt.len()).is_err() {
+                            return Err(HandshakeError::Internal);
+                        }
+                        v.extend_from_slice(pt);
+                        // Drop the pt borrow into `record` before
+                        // mutating self below (push_back may grow the
+                        // deque).
+                        let _ = pt;
+                        if self.pending_plaintext.try_reserve(1).is_err() {
+                            return Err(HandshakeError::Internal);
+                        }
+                        self.pending_plaintext.push_back(OwnedIOBuf::from(v));
+                    }
                 }
-                v.extend_from_slice(pt);
-                // Drop the pt borrow into `record` before mutating
-                // self below (push_back may grow the deque).
-                let _ = pt;
-                if self.pending_plaintext.try_reserve(1).is_err() {
-                    return Err(HandshakeError::Internal);
-                }
-                self.pending_plaintext.push_back(OwnedIOBuf::from(v));
                 Ok(())
             }
             content_type::ALERT => {

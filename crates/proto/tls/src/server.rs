@@ -14,6 +14,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use core::ptr::{self, addr_of_mut};
 
 use iobuf::{IOBuf, OwnedIOBuf};
@@ -244,9 +245,10 @@ pub enum State {
 ///
 /// ```ignore
 /// // On each tick:
-/// let mut chunk = tcp.recv_chunk().await?;
-/// tls.process_chunk(chunk.data_mut(), &cfg)?;
-/// drop(chunk);   // NIC slot returns; plaintext is in pending_plaintext.
+/// let chunk = tcp.recv_chunk().await?.into_owned();
+/// tls.process_chunk(chunk, &cfg)?;
+/// // `process_chunk` consumed the chunk; app-data plaintext is now
+/// // in pending_plaintext as refcount-shared views into its storage.
 /// loop {
 ///     let n_tx = tls.pop_tx(&mut tx_tmp);
 ///     if n_tx > 0 { tcp.send(&tx_tmp[..n_tx]); continue; }
@@ -299,6 +301,21 @@ pub struct TlsServer {
     // bound while still owning (or refcount-sharing) its bytes — no
     // copy at the consumer boundary.
     pub(crate) pending_plaintext: VecDeque<OwnedIOBuf>,
+
+    // Scratch for the share-based plaintext fan-out. Holds the
+    // chunk-relative `(offset, len)` of every application-data record
+    // decrypted during the current `process_chunk` call. `do_app_data`
+    // appends to it as it walks the chunk (while the chunk is held
+    // exclusively, refcount = 1, so the in-place AEAD doesn't CoW);
+    // the orchestrator drains it immediately after framing, turning
+    // each pair into a `clone_shared()` + `narrow()` view pushed to
+    // `pending_plaintext`. Empty between calls (cleared at the top of
+    // `process_chunk_inner` and after the fan-out). Only chunk-direct
+    // records use it — the rx_partial straddler can't share the
+    // chunk's storage, so it copies its plaintext out and pushes
+    // straight to `pending_plaintext`. The `Vec`'s capacity stays
+    // warm across calls and across `reset()`.
+    pub(crate) app_data_ranges: Vec<(u32, u32)>,
 
     // Key schedule + transcript
     pub(crate) transcript: Transcript,
@@ -391,6 +408,7 @@ impl TlsServer {
             ptr::write_bytes(addr_of_mut!((*this).tx_buf) as *mut u8, 0, TX_BUF_LEN);
 
             addr_of_mut!((*this).pending_plaintext).write(VecDeque::new());
+            addr_of_mut!((*this).app_data_ranges).write(Vec::new());
 
             // Sub-objects with their own constructors. These return
             // by value but are small (Transcript ≈ SHA-256 state ~
@@ -445,6 +463,7 @@ impl TlsServer {
         self.tx_len = 0;
         self.tx_pos = 0;
         self.pending_plaintext.clear();
+        self.app_data_ranges.clear();
         self.transcript = Transcript::new();
         self.schedule = KeySchedule::new_without_psk();
         self.ephemeral = Some(X25519ServerKey::from_seed(x25519_seed));
@@ -555,18 +574,24 @@ impl TlsServer {
         record::seal_chain(tk, content_type::APPLICATION_DATA, src_chain, dst).map_err(|e| e.into())
     }
 
-    /// Consume one inbound TCP chunk: walk record headers in
-    /// `cipher` (and any partial record carried over from the
-    /// previous chunk), dispatch each complete record to the
+    /// Consume one inbound TCP chunk: walk record headers in the
+    /// chunk's byte window (and any partial record carried over from
+    /// the previous chunk), dispatch each complete record to the
     /// state-appropriate handler, and stash any straddler in
     /// `rx_partial` for the next call.
     ///
-    /// `cipher` is borrowed mutably because record-layer AEAD
-    /// `open` decrypts in place — the chunk's ciphertext bytes are
-    /// overwritten with plaintext as records are consumed. The
-    /// caller (`TlsStream::pump_rx`) drops the underlying NIC RX
-    /// chunk immediately on return, so the scrambled bytes are
-    /// never observed again.
+    /// `chunk` is consumed by value — the orchestrator needs to own
+    /// it for the duration of the call. Record-layer AEAD `open`
+    /// decrypts in place via `chunk.data_mut()` (the chunk's
+    /// ciphertext bytes are overwritten with plaintext as records are
+    /// consumed). After framing, the chunk is `share()`'d once and
+    /// each decrypted application-data record's plaintext range is
+    /// handed to `pending_plaintext` as a refcount-shared `narrow()`
+    /// view — no per-record copy. The chunk's storage therefore
+    /// stays alive (Arc-shared) until the last queued view drops; the
+    /// original ciphertext is unreadable after the call by
+    /// construction (the AEAD scrambled it and nothing holds the
+    /// pre-decrypt bytes).
     ///
     /// Transitions across multiple records inside a single chunk
     /// are handled by the per-record dispatch — e.g. a chunk
@@ -578,11 +603,11 @@ impl TlsServer {
     /// after the call.
     pub fn process_chunk(
         &mut self,
-        cipher: &mut [u8],
+        chunk: IOBuf,
         config: &TlsServerConfig,
     ) -> Result<(), HandshakeError> {
         let entry_state = self.state;
-        let result = self.process_chunk_inner(cipher, config);
+        let result = self.process_chunk_inner(chunk, config);
         if entry_state != State::Established && self.state == State::Established {
             crate::diag::COUNTERS.handshakes_completed.bump();
         }
@@ -595,50 +620,105 @@ impl TlsServer {
 
     fn process_chunk_inner(
         &mut self,
-        cipher: &mut [u8],
+        mut chunk: IOBuf,
         config: &TlsServerConfig,
     ) -> Result<(), HandshakeError> {
-        // Phase 1: complete any partial record carried from the
-        // previous chunk. If still incomplete after consuming part
-        // of `cipher`, return — wait for more.
-        let cursor = self.complete_partial(cipher, config)?;
-        if self.rx_partial_len > 0 {
-            // Still straddled — `complete_partial` consumed the
-            // whole remaining slice into rx_partial.
-            debug_assert_eq!(cursor, cipher.len());
-            return Ok(());
+        // Scratch from any prior chunk must not leak in — its
+        // (offset, len) pairs are relative to *that* chunk's window.
+        self.app_data_ranges.clear();
+
+        {
+            // Mutable byte window for the framing + in-place AEAD
+            // loop. The chunk is Owned post-`pump_rx`
+            // (`guard.into_owned()`), so `data_mut` never hits the
+            // immutable `Static` arm; the refcount is 1 here (we
+            // haven't shared yet) so a `Shared`-input edge can't CoW.
+            let cipher = chunk
+                .data_mut()
+                .expect("RX chunk is Owned post-pump_rx");
+
+            // Phase 1: complete any partial record carried from the
+            // previous chunk. If still incomplete after consuming
+            // part of `cipher`, the whole slice is absorbed into
+            // rx_partial and we fall through with no records framed.
+            let cursor = self.complete_partial(cipher, config)?;
+            if self.rx_partial_len == 0 {
+                // Phase 2: walk `cipher[cursor..]` record-by-record.
+                let mut off = cursor;
+                while off < cipher.len() {
+                    // Closed / Failed terminate the walk — trailing
+                    // bytes are dropped (the conn is being torn down).
+                    // `break` (not `return`) so any app-data records
+                    // decrypted earlier in this chunk still reach the
+                    // share fan-out below.
+                    if matches!(self.state, State::Closed | State::Failed) {
+                        break;
+                    }
+
+                    let remaining = &cipher[off..];
+                    if remaining.len() < record::HEADER_LEN {
+                        // Header straddles into the next chunk.
+                        self.save_to_partial(remaining)?;
+                        break;
+                    }
+                    let len_field =
+                        u16::from_be_bytes([remaining[3], remaining[4]]) as usize;
+                    let total = record::HEADER_LEN + len_field;
+                    if total > MAX_RECORD_TOTAL {
+                        return Err(RecordError::RecordTooLarge.into());
+                    }
+                    if remaining.len() < total {
+                        // Body straddles — stash and wait.
+                        self.save_to_partial(remaining)?;
+                        break;
+                    }
+                    // Complete record — dispatch to the state
+                    // handler. `Some(off)` tells `do_app_data` this
+                    // record's offset within `cipher`, so it can
+                    // record a chunk-relative plaintext range for the
+                    // share fan-out instead of copying the bytes out.
+                    self.dispatch_record(&mut cipher[off..off + total], Some(off), config)?;
+                    off += total;
+                }
+            } else {
+                // Still straddled — `complete_partial` consumed the
+                // whole remaining slice into rx_partial.
+                debug_assert_eq!(cursor, cipher.len());
+            }
         }
 
-        // Phase 2: walk `cipher[cursor..]` record-by-record.
-        let mut off = cursor;
-        while off < cipher.len() {
-            // Closed / Failed terminate early — any trailing bytes
-            // are dropped on the floor (the conn is being torn
-            // down).
-            if matches!(self.state, State::Closed | State::Failed) {
-                return Ok(());
+        // Phase 3: hand each decrypted application-data record a
+        // refcount-shared view into the (now-decrypted) chunk
+        // storage. `share()` lifts the chunk's backing into one
+        // `Arc<SharedRegion>` (1 alloc, no byte copy); each record
+        // then `clone_shared()`s + `narrow()`s to its plaintext range
+        // (1 atomic incr — no per-record alloc or memcpy). Dropping
+        // `shared` at the end of the block leaves the queued views
+        // holding the Arc alive; the chunk's storage (a NIC RX slot
+        // for an `External` chunk) frees only when the last queued
+        // view drops, so a prompt consumer keeps the hold to
+        // microseconds.
+        if !self.app_data_ranges.is_empty() {
+            // Narrow to the `Send` owning tier (total — the chunk is
+            // Owned; `.ok()` because the `Err` payload `IOBuf` has no
+            // `Debug`) and promote to refcounted storage.
+            let shared = OwnedIOBuf::try_from(chunk)
+                .ok()
+                .expect("RX chunk is Owned post-pump_rx")
+                .share();
+            for i in 0..self.app_data_ranges.len() {
+                let (off, len) = self.app_data_ranges[i];
+                let mut view = shared
+                    .clone_shared()
+                    .expect("share()'d chunk is shareable");
+                view.narrow(off as usize, len as usize)
+                    .map_err(|_| HandshakeError::Internal)?;
+                if self.pending_plaintext.try_reserve(1).is_err() {
+                    return Err(HandshakeError::Internal);
+                }
+                self.pending_plaintext.push_back(view);
             }
-
-            let remaining = &cipher[off..];
-            if remaining.len() < record::HEADER_LEN {
-                // Header straddles into the next chunk.
-                self.save_to_partial(remaining)?;
-                return Ok(());
-            }
-            let len_field =
-                u16::from_be_bytes([remaining[3], remaining[4]]) as usize;
-            let total = record::HEADER_LEN + len_field;
-            if total > MAX_RECORD_TOTAL {
-                return Err(RecordError::RecordTooLarge.into());
-            }
-            if remaining.len() < total {
-                // Body straddles — stash and wait.
-                self.save_to_partial(remaining)?;
-                return Ok(());
-            }
-            // Complete record — dispatch to the state handler.
-            self.dispatch_record(&mut cipher[off..off + total], config)?;
-            off += total;
+            self.app_data_ranges.clear();
         }
         Ok(())
     }
@@ -706,7 +786,10 @@ impl TlsServer {
             .rx_partial
             .take()
             .expect("present from invariant above");
-        let dispatch_result = self.dispatch_record(&mut owned[..total], config);
+        // `None`: the straddler's bytes live in the rx_partial box,
+        // not the incoming chunk, so `do_app_data` can't share the
+        // chunk's storage — it copies the plaintext out instead.
+        let dispatch_result = self.dispatch_record(&mut owned[..total], None, config);
         self.rx_partial = Some(owned);
         dispatch_result?;
         Ok(cursor)
@@ -743,15 +826,24 @@ impl TlsServer {
 
     /// Dispatch one complete record (already framed by the
     /// orchestrator) to the state-appropriate handler.
+    ///
+    /// `base_off` is `Some(off)` for a record framed directly off the
+    /// incoming chunk — `off` is its offset within the chunk's
+    /// visible window, which `do_app_data` uses to record a
+    /// chunk-relative plaintext range for the share fan-out. It's
+    /// `None` for a record completed from the `rx_partial` straddle
+    /// box, whose bytes don't share the chunk's storage. Only
+    /// `do_app_data` reads it; the handshake handlers ignore it.
     fn dispatch_record(
         &mut self,
         record: &mut [u8],
+        base_off: Option<usize>,
         config: &TlsServerConfig,
     ) -> Result<(), HandshakeError> {
         match self.state {
             State::WaitClientHello => self.do_client_hello(record, config),
             State::WaitClientFinished => self.do_client_finished(record),
-            State::Established => self.do_app_data(record),
+            State::Established => self.do_app_data(record, base_off),
             State::Closed | State::Failed => Ok(()),
         }
     }
