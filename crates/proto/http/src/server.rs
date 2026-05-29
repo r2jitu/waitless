@@ -481,4 +481,30 @@ mod serve_conn_tests {
         assert_eq!(observed[1].0, Method::Get);
         assert_eq!(observed[1].1, b"/b", "next-pipelined HEAD preserved");
     }
+
+    /// **Keep-alive reuse with a body on BOTH requests.** Every other
+    /// test above pairs a bodied request with a body-less GET, so none
+    /// exercised a second request that actually declares a
+    /// `Content-Length`. That gap hid the `Request::clear()` per-slot
+    /// reset bug: the streaming parser appends header bytes
+    /// (`name_len += take`) and relied on the slots starting at 0, but
+    /// `clear()` only reset `header_count`. So the second POST reused
+    /// request 1's stale slot lengths, corrupted its header names,
+    /// `Content-Length` parsed as 0, its body was left unconsumed, and
+    /// the next HEAD parse choked on the body bytes — wedging
+    /// keep-alive uploads. Two separate chunks (non-pipelined, like the
+    /// real upload bench): each request must be parsed fresh and its
+    /// body delivered in full.
+    #[test]
+    fn keepalive_second_bodied_request_body_not_dropped() {
+        let req = b"POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+        let (sent, observed) = drive(alloc::vec![Some(req.to_vec()), Some(req.to_vec()), None]);
+        assert_eq!(count_ok(&sent), 2, "both keep-alive POSTs must get a 200");
+        assert_eq!(observed.len(), 2, "handler must run for both requests");
+        assert_eq!(observed[0].2, b"hello", "request 1 body");
+        assert_eq!(
+            observed[1].2, b"hello",
+            "request 2 body must not be dropped (stale-slot Content-Length=0 regression)",
+        );
+    }
 }
