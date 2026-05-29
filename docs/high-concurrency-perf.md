@@ -914,9 +914,10 @@ first item dwarfs everything below it.
 3b. **`TlsServer.rx_buf` + `pt_buf`: 17 KB + 17 KB inline → REMOVED.** (DONE)
    `process_chunk` walks records directly inside the chunk's
    mutable byte slice — AEAD decrypts in place; no `rx_buf`
-   ciphertext staging. Plaintext is queued as one owned `Vec<u8>`
-   per record (`pending_plaintext: VecDeque<Vec<u8>>`), lifted to
-   a Heap `IOBuf` at pop time (zero-copy). A lazily-allocated
+   ciphertext staging. Plaintext was initially queued as one owned
+   `Vec<u8>` per record (`pending_plaintext: VecDeque<Vec<u8>>`),
+   lifted to a Heap `IOBuf` at pop time — since superseded by the
+   share-based queue below (`VecDeque<OwnedIOBuf>`). A lazily-allocated
    `rx_partial: Option<Box<[u8]>>` (one max-record-sized box)
    carries straddlers between chunks — unallocated on MSS-aligned
    /health steady state. **Saved ~34 KB/conn at steady state**
@@ -925,23 +926,65 @@ first item dwarfs everything below it.
    pt_buf staging copy with a same-byte-volume but right-sized
    per-record alloc instead of a fixed 17 KB inline buffer).
 
-   **Deferred follow-up — share-based queue (PR-5 idiom):**
-   With `IOBuf::share()` + `clone_shared()` now landed (TCP rtx
-   queue PR-5), the natural next step is `VecDeque<Vec<u8>>` →
-   `VecDeque<OwnedIOBuf>` carrying refcount-shared narrowed views
-   into the chunk's storage. Per-record cost moves from
-   `Vec alloc + memcpy` to one atomic increment — wash on /health
-   (60 B records), but a real win on bulk-upload workloads
-   (16 KB records skip the staging copy entirely; only the AEAD
-   pass touches the bytes). Requires either an `IOBuf →
-   OwnedIOBuf` extraction helper in iobuf (small) or a contract
-   change on `process_chunk(&mut [u8])` → `process_chunk(IOBuf)`,
-   plus a careful share/decrypt ordering to avoid CoW (decrypt
-   while Arc is uniquely held, then `clone_shared()` per record).
-   `tls/rx-chunk-streaming` 1c/2c/4c bench on GCE KVM shows the
-   current `Vec<u8>` design has no measurable throughput cost vs
-   `main`, so this is a deferred architectural cleanup, not a
-   perf urgency.
+   **Share-based plaintext queue (DONE — branch `tls/rx-share-queue`):**
+   `pending_plaintext` is now `VecDeque<OwnedIOBuf>`. `process_chunk`
+   takes the chunk by value (`IOBuf`), decrypts every record in place
+   while it holds the chunk exclusively (refcount = 1, so the in-place
+   AEAD can't CoW), then `share()`s the chunk once and hands each
+   decrypted application-data record a `clone_shared()` + `narrow()`
+   view scoped to its plaintext range. Per-record cost drops from
+   `Vec alloc + memcpy` to one atomic increment; steady-state cost per
+   chunk is 1 Arc alloc + N atomic incr/decr, zero memcpy on the
+   plaintext path. This mirrors the rtx queue's share-insertion idiom
+   (`rtx_on_data_sent` → `IOBuf::share` per chain part): the RX
+   plaintext queue is now a refcounted shadow of the chunk's storage
+   just as the rtx queue is of each sent segment. The enabling iobuf
+   primitive is `OwnedIOBuf::try_from(IOBuf)` — fallible narrowing
+   into the `Send` owning tier. The rx_partial straddler keeps its
+   alloc+memcpy (its bytes live in the straddle box, not the chunk, so
+   they can't share the chunk's storage); it's rare and bounded to one
+   record per chunk transition.
+
+   Trade-off: the chunk's storage (a NIC RX slot for an `External`
+   chunk) now stays alive until the last queued view drops, rather
+   than freeing the moment the plaintext was copied out. For prompt
+   consumers (/health, drain-immediately) the hold is microseconds; a
+   slowly-streamed body holds the slot for the body's lifetime. The
+   existing `data_mut`-on-aliased-`Shared` CoW is a ready escape hatch
+   if a queue-depth cap is ever needed.
+
+   Bench A/B (GCE KVM, c3-highcpu-8, vs base `tls/rx-chunk-streaming`):
+   `get_tls` — keep-alive HTTPS, which RX-decrypts the request HEAD
+   through the changed `process_chunk` + queue path on every request —
+   is flat within run-to-run noise: 129.4k→131.2k (1c),
+   233.4k→231.1k (2c), 236.1k→235.4k (4c) req/s; TLS cy/B unchanged
+   (8.2/9.3/12.4 ≈ 8.4/9.2/12.3). `allocs/iter` (net heap growth) is
+   0.00 before and after — no leak, no regression.
+
+   The bulk-record win (skipped per-record memcpy on 16 KB records)
+   could not be measured: large uploads stall before producing a
+   throughput number. A `/obs` capture during a 256 KB × 16-conn
+   upload pins the cause — the server goes ~99% idle (`core_idle_cycles`
+   climbs, `core_busy_cycles` flat), RX flatlines (`rx_bytes` +2.8 KB
+   over 16 s), and `http.responses_sent` (13) trails
+   `requests_parsed` (26) with no pool exhaustion (`rx_ring_oom=0`,
+   `pool_exhausted=0`, `last_tx_drop=0`). That is a **TCP
+   receive-window-update deadlock on large uploads over the streaming
+   `recv_chunk` path** — body-size-dependent (32 KB uploads run clean
+   at ~4.1k req/s on the same server, 256 KB / 1 MB wedge) and
+   TLS-independent (`upload_256k_tcp`, plain HTTP, stalls identically).
+   It is **not** caused by this change: the receive window is accounted
+   for inside `do_recv_chunk` / `rx_pop` before the chunk IOBuf is
+   handed to the TLS layer, so holding that IOBuf longer in the share
+   queue is strictly downstream of the window update. Candidate defect:
+   the zero-copy stash path in `do_recv_chunk` (`pending_chunk.take()`)
+   returns without the `maybe_send_window_update` that the ring-drain
+   path runs via `rx_pop` — tracked as a separate `net/tcp` fix.
+
+   With throughput unmeasurable, the alloc-count + memcpy reduction
+   rests on the architecture: the N per-record `(Vec alloc + memcpy)`
+   pairs per chunk are replaced by one Arc alloc + N atomic increments,
+   with zero memcpy on the plaintext path.
 
 4. **`Request` headers array: `[Header; 16]` → smaller default + grow.**
    Each `Header = 336 B`, so 16 × 336 = 5.4 KB. Browsers send
