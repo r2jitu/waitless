@@ -83,6 +83,25 @@ because the per-packet overhead gap widens as the connection count grows.
 Reproduce with `scripts/bench.py`; see [docs/benchmarking.md](docs/benchmarking.md)
 for the full methodology.
 
+### …and vs a real async server (tokio-hyper)
+
+Beating a minimal Linux bench server is one thing; the sharper comparison is
+against **tokio-hyper** — same language, same async model, same TLS lineage,
+the only difference being Linux vs bare metal. On a 4-vCPU GCE `c3` VM (gVNIC),
+serving a byte-identical `/health`, each measured at its own CPU-bound ceiling:
+
+| Workload | **Waitless** | tokio-hyper | Speedup |
+|----------|-------------:|------------:|:-------:|
+| HTTP/1.1 plain  | **≈ 1,170,000** rps* | 398,000 rps | **≈ 2.9×** |
+| HTTPS / TLS 1.3 | **729,000** rps      | 338,000 rps | **≈ 2.2×** |
+
+\* lower bound (Waitless was still loadgen-limited). At 200 connections — where
+neither saturates — Waitless's TLS p50 is **270 µs vs tokio-hyper's 587 µs**.
+The reason is stark: profiled at saturation, tokio-hyper burns **~61 % of its
+CPU in the kernel** (syscalls, the in-kernel TCP/IP stack, packet copies);
+Waitless has no kernel to call. Full numbers, methodology, and caveats in
+[docs/benchmark-results.md](docs/benchmark-results.md).
+
 ## Build Configurations
 
 `waitless_binary(name, app)` generates one runnable target per runner — pick

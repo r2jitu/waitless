@@ -42,6 +42,7 @@ The perf docs route work by *cost locus* — see **[`high-concurrency-perf.md`](
 | Doc | What it owns |
 |-----|--------------|
 | [`benchmarking.md`](benchmarking.md) | How to run benches: `bench.py`, the GCE wrappers, the env matrix and workloads. Read first for "how do I bench?" |
+| [`benchmark-results.md`](benchmark-results.md) | Published results: Waitless vs **tokio-hyper** on GCE c3/gVNIC (≈ 2–3× throughput, ~2× lower latency) and *why* (tokio-hyper's ~61 % kernel/syscall time). The "show me the numbers" doc. |
 | [`crates.md`](crates.md) | The crate map: tiers, dependency layering, and the `crates/` layout. |
 | [`consuming-as-a-library.md`](consuming-as-a-library.md) | Using Waitless as a Bazel dependency — the `MODULE.bazel` / `BUILD.bazel` boilerplate an app needs. |
 

@@ -92,7 +92,19 @@ debugging.
 
 ## Measurements (May 2026)
 
-### 2026-05-29 re-measurement: the 32K cliff is gone (a flat throughput gap remains)
+### 2026-05-29 re-measurement: the 32K cliff is gone
+
+> **⚠️ SUPERSEDED (later same day) — the "trails tokio 1.7×" reading below was
+> itself a loadgen artifact.** The single `kvm-vm` load generator caps at
+> ~580 K TLS rps and **cannot saturate Waitless** (tokio-hyper, being slower,
+> *does* saturate at one loadgen — which is why its 570 K looked like a real
+> ceiling and Waitless's 333 K did not). A controlled, two-loadgen,
+> `/obs`-ground-truthed re-measurement found **Waitless at ~729 K TLS @ 4 vCPU
+> and ~991 K TLS @ 8 vCPU — *beating* tokio-hyper ~2×, not trailing it.** See
+> [`benchmark-results.md`](benchmark-results.md). Keep the table below as a
+> record of the cliff-elimination (still valid), but ignore its tokio/nginx
+> *comparison* — those peers were measured at saturation while Waitless was
+> loadgen-limited.
 
 After the May-28 per-conn-slope work (TLS RX share-queue + `rtx_queue`,
 ~182 → ~55 KB/conn — see "Recommended ceiling-movers"), the 32K throughput
