@@ -372,6 +372,36 @@ WORKLOADS = [
         "tier": "available",
         "desc": "POST /discard 1 MiB body (16 conn × cpus, plain HTTP)",
     },
+    # TLS counterparts of the large bulk-RX probes. The body splits
+    # into many full 16 KiB TLS records, so these are the workloads
+    # the share-based plaintext queue (`pending_plaintext:
+    # VecDeque<OwnedIOBuf>`) most affects: each inbound record is
+    # decrypted in place and queued as a refcount-shared `narrow()`
+    # view, skipping the per-record alloc + memcpy the old `Vec<u8>`
+    # path paid. `upload_256k_tls` ⊖ `upload_256k_tcp` isolates the
+    # TLS bulk-decrypt cost at fixed body size; read the `rx=` MB/s
+    # tag. `available` tier: run with
+    # `--workload upload_256k_tls,upload_1m_tls`.
+    {
+        "name": "upload_256k_tls",
+        "type": "http_upload",
+        "endpoint": "/discard",
+        "msg_size": 262144,
+        "conns_per_core": 16,
+        "tls": True,
+        "tier": "available",
+        "desc": "POST /discard 256 KiB body (16 conn × cpus, over TLS)",
+    },
+    {
+        "name": "upload_1m_tls",
+        "type": "http_upload",
+        "endpoint": "/discard",
+        "msg_size": 1048576,
+        "conns_per_core": 16,
+        "tls": True,
+        "tier": "available",
+        "desc": "POST /discard 1 MiB body (16 conn × cpus, over TLS)",
+    },
     # ── Bulk TX — GET /static-64k ────────────────────────────────────
     #
     # Plain-HTTP companion to `download_64k_tls`. Same body, no TLS
