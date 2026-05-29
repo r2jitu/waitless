@@ -12,6 +12,36 @@ use crate::state::{
 use core::ptr;
 use types::{IpAddr, MacAddr, htonl, htons};
 
+/// Drop-guard bracketing `async_try_send_chain` in a cycle counter,
+/// mirroring `receive::RxGuard`. Fires on every exit (the `Ok(0)`
+/// backpressure returns included) so `send_cycles / send_calls` is
+/// the true per-call cost. `SEND_CYCLES`/`SEND_CALLS` are per-core
+/// single-writer stores. Splits the serve `runtime` residual:
+/// response-send vs recv-plumbing + dispatch.
+struct SendGuard {
+    core: u32,
+    start: u64,
+}
+
+impl SendGuard {
+    #[inline]
+    fn new(core: u32) -> Self {
+        Self {
+            core,
+            start: kernel_core::clock::now_cycles(),
+        }
+    }
+}
+
+impl Drop for SendGuard {
+    #[inline]
+    fn drop(&mut self) {
+        let elapsed = kernel_core::clock::now_cycles().wrapping_sub(self.start);
+        crate::diag::SEND_CYCLES.add(self.core, elapsed);
+        crate::diag::SEND_CALLS.add(self.core, 1);
+    }
+}
+
 // ─── Unified TCP-frame builder ───────────────────────────────────────────────
 //
 // Build the full Ethernet+IP+TCP+payload frame in one stack buffer
@@ -550,6 +580,7 @@ pub fn async_try_send_chain(
 ) -> Result<usize, executor::reactor::TcpSendError> {
     use executor::reactor::TcpSendError;
     let (core, slot) = decode_handle(handle).ok_or(TcpSendError::Closed)?;
+    let _send_guard = SendGuard::new(core);
     // SAFETY: per-core ownership; the worker that registered this
     // backend is the one polling its `TcpSendChain`.
     let c = unsafe { &mut *conn_ptr(core, slot) };

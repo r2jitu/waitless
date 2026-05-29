@@ -201,6 +201,18 @@ pub static RX_CALLS: obs::PerCoreCounter<{ obs::MAX_CORES }> = obs::PerCoreCount
 /// tick or by `tick_armed_seen` for cost per walked slot.
 pub static TICK_CYCLES: obs::PerCoreCounter<{ obs::MAX_CORES }> = obs::PerCoreCounter::new();
 
+/// Cycles spent inside `async_try_send_chain` — the windowed TCP
+/// send path the HTTP response (plain) and the sub-MSS TLS record
+/// fallback both drive (segment/TSO build + NIC TX submit + the
+/// RFC 6298 rtx-queue `share`). Splits the serve `runtime` residual:
+/// `send_cycles / requests` is the response-send cost; the rest of
+/// the residual is recv_chunk plumbing + async dispatch.
+pub static SEND_CYCLES: obs::PerCoreCounter<{ obs::MAX_CORES }> = obs::PerCoreCounter::new();
+
+/// `async_try_send_chain` invocations (includes `Ok(0)` backpressure
+/// calls, which do no send work). Per-core sharded.
+pub static SEND_CALLS: obs::PerCoreCounter<{ obs::MAX_CORES }> = obs::PerCoreCounter::new();
+
 /// Most recent RST received from a peer — the context the bare
 /// `rst_received` count discards.
 pub static LAST_RST: LastEvent<RstRecord> = LastEvent::new();
@@ -563,12 +575,14 @@ pub fn snapshot() -> [(&'static str, u64); 25] {
 /// live on the `Counters` struct. Same `(name, value)` shape as
 /// [`snapshot`]; same render path — one place to read the counter
 /// list, one ordering invariant the diff tools rely on.
-pub fn per_core_snapshot() -> [(&'static str, u64); 4] {
+pub fn per_core_snapshot() -> [(&'static str, u64); 6] {
     [
         ("hash_find_probes", HASH_FIND_PROBES.sum()),
         ("rx_calls", RX_CALLS.sum()),
         ("rx_cycles", RX_CYCLES.sum()),
         ("tick_cycles", TICK_CYCLES.sum()),
+        ("send_calls", SEND_CALLS.sum()),
+        ("send_cycles", SEND_CYCLES.sum()),
     ]
 }
 
