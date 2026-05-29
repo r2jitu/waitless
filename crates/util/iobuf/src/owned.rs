@@ -445,12 +445,57 @@ impl IOBufRead for OwnedIOBuf {
 /// RX-buffer-backed chunks (`OwnedIOBuf`) and prebuf-backed chunks
 /// (`Borrowed`) within one body holds `IOBuf`, so RX buffers widen
 /// in per-chunk as they surface. There is deliberately **no**
-/// `From<IOBuf> for OwnedIOBuf`: narrowing would have to discard or
-/// materialise a `Borrowed` part.
+/// *infallible* `From<IOBuf> for OwnedIOBuf`: narrowing a `Borrowed`
+/// part would have to discard or silently materialise it. The
+/// fallible `TryFrom<IOBuf>` below is the sanctioned narrowing — it
+/// errors on `Borrowed` instead of guessing.
 impl From<OwnedIOBuf> for IOBuf {
     fn from(o: OwnedIOBuf) -> IOBuf {
         IOBuf {
             inner: IOBufInner::Owned(o),
+        }
+    }
+}
+
+/// Narrow an `IOBuf` back down to its owning tier — the *fallible*
+/// counterpart to the `From<OwnedIOBuf>` widening above. Succeeds for
+/// every `Owned(_)` shape (heap, external, shared, static), returning
+/// the inner `OwnedIOBuf` with **zero copy**; fails for the sole
+/// non-owning `Borrowed` variant, handing the original `IOBuf` back
+/// untouched in the `Err` so the caller can fall back (e.g.
+/// `into_owned()` to materialise the bytes first).
+///
+/// This is the one narrowing the two-tier split admits, and only
+/// because it can't silently drop a borrow: making a `Borrowed` view
+/// `Send` would require copying its bytes, which this conversion
+/// refuses to do behind the caller's back. The TLS RX share path is
+/// the canonical caller — every chunk it shares was `into_owned()`'d
+/// in `pump_rx` first, so the conversion is total there and the
+/// `Err` arm is unreachable by construction.
+impl TryFrom<IOBuf> for OwnedIOBuf {
+    type Error = IOBuf;
+
+    fn try_from(buf: IOBuf) -> Result<OwnedIOBuf, IOBuf> {
+        match buf.inner {
+            IOBufInner::Owned(o) => Ok(o),
+            inner @ IOBufInner::Borrowed { .. } => Err(IOBuf { inner }),
+        }
+    }
+}
+
+/// Build a `Heap`-backed `OwnedIOBuf` from a `Vec<u8>`, reusing the
+/// allocation (`Vec::into_boxed_slice` is no-copy when `len ==
+/// capacity`). Headroom = tailroom = 0. Mirrors `From<Vec<u8>> for
+/// IOBuf`; the TLS RX straddler path uses it to push a
+/// freshly-decrypted plaintext copy as an owning queue entry without
+/// round-tripping through `IOBuf`.
+impl From<alloc::vec::Vec<u8>> for OwnedIOBuf {
+    fn from(v: alloc::vec::Vec<u8>) -> OwnedIOBuf {
+        let len = v.len() as u32;
+        OwnedIOBuf {
+            storage: OwnedStorage::Heap(HeapStorage::new(v.into_boxed_slice())),
+            offset: 0,
+            len,
         }
     }
 }
@@ -650,5 +695,95 @@ mod tests {
         // The drop callback ran with the *original* capacity (20),
         // not the narrowed 8 — the whole device buffer reposts.
         assert_eq!(cap_at_drop.load(Ordering::SeqCst), 20);
+    }
+
+    /// `TryFrom<IOBuf>` on an `Owned(Heap)` IOBuf succeeds, yielding
+    /// the inner `OwnedIOBuf` with bytes intact and **zero copy**
+    /// (same backing pointer).
+    #[test]
+    fn try_from_iobuf_heap_ok() {
+        let buf = IOBuf::from(alloc::vec![1u8, 2, 3, 4]);
+        let ptr_before = buf.data().as_ptr();
+        // `.ok().expect(..)` rather than `.expect(..)`: the `Err`
+        // payload is `IOBuf`, which doesn't impl `Debug`.
+        let owned = OwnedIOBuf::try_from(buf).ok().expect("Owned(Heap) narrows");
+        assert!(matches!(owned.storage, OwnedStorage::Heap(_)));
+        assert_eq!(owned.data(), &[1, 2, 3, 4]);
+        assert_eq!(
+            owned.data().as_ptr(),
+            ptr_before,
+            "narrowing must not reallocate",
+        );
+    }
+
+    /// `TryFrom<IOBuf>` on a `Borrowed` IOBuf fails, returning the
+    /// original `IOBuf` untouched in the `Err`.
+    #[test]
+    fn try_from_iobuf_borrowed_err_returns_original() {
+        let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 16];
+        storage[..8].copy_from_slice(b"borrowed");
+        let ptr = NonNull::new(storage.as_mut_ptr()).unwrap();
+        // SAFETY: storage outlives the borrow.
+        let buf = unsafe { IOBuf::borrow(ptr, 16, 0, 8) };
+        // `.err().expect(..)` rather than `.expect_err(..)`: the `Ok`
+        // payload is `OwnedIOBuf`, which doesn't impl `Debug`.
+        let back = OwnedIOBuf::try_from(buf)
+            .err()
+            .expect("Borrowed cannot narrow");
+        assert_eq!(back.data(), b"borrowed", "Err returns the IOBuf intact");
+    }
+
+    /// `TryFrom<IOBuf>` succeeds for the `Static`, `Shared`, and
+    /// `External` owning shapes too — every `Owned(_)` variant
+    /// narrows.
+    #[test]
+    fn try_from_iobuf_static_shared_external_ok() {
+        // Static. (`.ok().expect(..)` throughout — `Err` is `IOBuf`,
+        // which doesn't impl `Debug`.)
+        let s = OwnedIOBuf::try_from(IOBuf::from_static(b"static"))
+            .ok()
+            .expect("Static narrows");
+        assert!(matches!(s.storage, OwnedStorage::Static(_)));
+        assert_eq!(s.data(), b"static");
+
+        // Shared (Heap → share()).
+        let shared_iobuf = IOBuf::from(alloc::vec![5u8, 6, 7]).share();
+        let sh = OwnedIOBuf::try_from(shared_iobuf)
+            .ok()
+            .expect("Shared narrows");
+        assert!(matches!(sh.storage, OwnedStorage::Shared(_)));
+        assert_eq!(sh.data(), &[5, 6, 7]);
+
+        // External (wrap_owned → widen → narrow back).
+        unsafe fn cb(_b: NonNull<u8>, _c: u32, _ctx: *mut ()) {}
+        let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 8];
+        storage[..4].copy_from_slice(b"extn");
+        let ptr = NonNull::new(storage.as_mut_ptr()).unwrap();
+        // SAFETY: storage outlives the IOBuf in this test; cb is a no-op.
+        let ext_iobuf: IOBuf =
+            unsafe { OwnedIOBuf::wrap_owned(ptr, 8, 0, 4, cb, core::ptr::null_mut()) }.into();
+        let ext = OwnedIOBuf::try_from(ext_iobuf)
+            .ok()
+            .expect("External narrows");
+        assert!(matches!(ext.storage, OwnedStorage::External(_)));
+        assert_eq!(ext.data(), b"extn");
+    }
+
+    /// `From<Vec<u8>>` builds a `Heap` `OwnedIOBuf` reusing the Vec's
+    /// allocation (no copy) with the full visible payload.
+    #[test]
+    fn from_vec_builds_heap_owned() {
+        let v = alloc::vec![9u8, 8, 7, 6];
+        let ptr_before = v.as_ptr();
+        let owned = OwnedIOBuf::from(v);
+        assert!(matches!(owned.storage, OwnedStorage::Heap(_)));
+        assert_eq!(owned.data(), &[9, 8, 7, 6]);
+        assert_eq!(owned.headroom(), 0);
+        assert_eq!(owned.tailroom(), 0);
+        assert_eq!(
+            owned.data().as_ptr(),
+            ptr_before,
+            "Vec → OwnedIOBuf reuses the allocation",
+        );
     }
 }
