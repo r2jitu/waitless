@@ -195,18 +195,40 @@ pub(crate) const TIME_WAIT_MS: u64 = 60_000;
 pub(crate) static FAIL_RTX_PUSH_ONCE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Capacity of the per-conn reusable retransmit-retain buffer
+/// (`TcpConnection::rtx_inline`). Sized to hold one small response's
+/// retained part — an HTTP/1.1 response header (~150 B) or a sub-MSS
+/// TLS record (~256 B) — with headroom; larger borrowed parts fall
+/// back to an owned `Buf`. 512 B/conn, lazily allocated.
+const RTX_INLINE_CAP: usize = 512;
+
+/// Where a retransmit entry's payload bytes live.
+pub(crate) enum RtxPayload {
+    /// Owned/shared IOBuf (large or fallback sends). `data()` reads the
+    /// bytes; `consume()` advances the window on partial-ACK. This is
+    /// the original representation; a `Borrowed` input is `into_owned`'d
+    /// (one heap alloc+copy) before landing here.
+    Buf(IOBuf),
+    /// Bytes copied into the connection's reusable `rtx_inline` buffer
+    /// at `[off, off+len)` — the alloc-free retain path for small
+    /// borrowed parts (the HTTP response header / sub-MSS TLS record),
+    /// which would otherwise cost one heap alloc per request.
+    /// **Single-occupant**: at most one `Inline` entry is live at a
+    /// time (guarded by `TcpConnection::rtx_inline_busy`); a second
+    /// concurrent small part falls back to `Buf`.
+    Inline { off: u16 },
+}
+
 /// One entry in the per-conn retransmit queue — the payload bytes of
 /// a single outbound TCP segment plus the RFC 6298 / 9293 bookkeeping
-/// needed to retransmit it on RTO expiry. The IOBuf is owned (heap-
-/// resident), independent of any NIC-side reference; the SG-TX
-/// follow-up replaces it with refcount-shared storage so the same
-/// IOBuf is alive in the queue while the wire-DMA is in flight,
-/// without the insertion memcpy.
+/// needed to retransmit it on RTO expiry. Payload is either an owned
+/// `Buf` IOBuf or an offset into the conn's reusable `rtx_inline`
+/// buffer (see `RtxPayload`); the SG-TX follow-up would replace `Buf`
+/// with refcount-shared storage alive during the wire-DMA.
 pub(crate) struct RtxEntry {
-    /// Owned IOBuf carrying this segment's payload bytes. `IOBuf::data()`
-    /// reads the bytes to retransmit; `narrow` advances the visible
-    /// window on a partial-ACK of the head entry.
-    pub(crate) iobuf: IOBuf,
+    /// Where this entry's payload bytes live (read by
+    /// `retransmit_oldest_segment`; window-advanced on partial-ACK).
+    pub(crate) payload: RtxPayload,
     /// First sequence number this entry covers (snd_una when this
     /// was the head of in-flight).
     pub(crate) seq_start: u32,
@@ -330,6 +352,20 @@ pub struct TcpConnection {
     /// snd_nxt`. OOM-only — the queue has no fixed capacity, so
     /// "window outgrew ring" cannot happen.
     pub(crate) rtx_alloc_failed: bool,
+    /// Reusable per-conn retransmit-retain buffer for small borrowed
+    /// payloads (the HTTP response header / sub-MSS TLS record).
+    /// Lazily allocated on first small send, then reused for the life
+    /// of the connection — so the steady-state keep-alive path retains
+    /// for retransmit with **zero per-request heap allocations**
+    /// (previously one `into_owned` copy per response). Holds one
+    /// `RtxPayload::Inline` entry's bytes at a time; preserved across
+    /// `reset_preserving` like `rx_ring`. `None` until first use.
+    pub(crate) rtx_inline: Option<Box<[u8; RTX_INLINE_CAP]>>,
+    /// True while an `RtxPayload::Inline` entry owns `rtx_inline`
+    /// (single-occupant guard). Cleared when that entry is fully ACK'd
+    /// or the queue is cleared; a second concurrent small part while
+    /// busy falls back to an owned `Buf`.
+    pub(crate) rtx_inline_busy: bool,
     /// Current retransmission timeout, milliseconds. Doubles on each
     /// RTO expiry (§5.5); re-initialised when new data is ACK'd.
     pub(crate) rto_ms: u32,
@@ -464,6 +500,8 @@ impl TcpConnection {
             rtx_queue: VecDeque::new(),
             rtx_bytes_in_flight: 0,
             rtx_alloc_failed: false,
+            rtx_inline: None,
+            rtx_inline_busy: false,
             rto_ms: RTO_INITIAL_MS,
             rtx_deadline_ms: 0,
             rtx_backoff: 0,
@@ -498,6 +536,11 @@ impl TcpConnection {
     /// steady-state hot path heap-free.
     pub(crate) fn reset_preserving(&mut self, next_gen: u16) {
         let ring = self.rx_ring.take();
+        // Preserve the reusable retransmit-retain buffer too (its
+        // contents are stale but `rtx_inline_busy` resets to false via
+        // `new()`, so the next conn reuses the allocation without a
+        // realloc — same as `rx_ring`).
+        let inline = self.rtx_inline.take();
         // Drop the entries (their IOBufs return to the heap) but keep
         // the deque's backing allocation across the SYN/close cycle —
         // same "reuse capacity, lose contents" shape as `rx_ring`.
@@ -508,6 +551,7 @@ impl TcpConnection {
         self.generation = next_gen;
         self.rx_ring = ring;
         self.rtx_queue = rtx_queue;
+        self.rtx_inline = inline;
         self.slot_index = slot;
     }
 
@@ -542,6 +586,28 @@ impl TcpConnection {
         // Box<[u8]>; we cast to Box<[u8; RX_RING_BYTES]>.
         let ptr = Box::into_raw(boxed) as *mut [u8; RX_RING_BYTES];
         self.rx_ring = Some(unsafe { Box::from_raw(ptr) });
+        true
+    }
+
+    /// Lazy-allocate the reusable retransmit-retain buffer on the first
+    /// small borrowed send. Reused for the conn's life (preserved
+    /// across `reset_preserving`), so the per-request retain is alloc-
+    /// free thereafter. Returns false on OOM — the caller then falls
+    /// back to an owned `Buf` (`into_owned`).
+    fn ensure_rtx_inline(&mut self) -> bool {
+        if self.rtx_inline.is_some() {
+            return true;
+        }
+        let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        if v.try_reserve_exact(RTX_INLINE_CAP).is_err() {
+            return false;
+        }
+        v.resize(RTX_INLINE_CAP, 0);
+        let boxed: Box<[u8]> = v.into_boxed_slice();
+        // SAFETY: resized to exactly RTX_INLINE_CAP, so the slice length
+        // matches the array; cast Box<[u8]> -> Box<[u8; RTX_INLINE_CAP]>.
+        let ptr = Box::into_raw(boxed) as *mut [u8; RTX_INLINE_CAP];
+        self.rtx_inline = Some(unsafe { Box::from_raw(ptr) });
         true
     }
 
@@ -721,13 +787,32 @@ impl TcpConnection {
             return false;
         }
         let was_empty = self.rtx_queue.is_empty();
-        let iobuf = iobuf.into_owned();
         // The cached `len` must match the IOBuf's visible payload —
         // `rtx_bytes_in_flight` (and the partial-narrow path in
         // `rtx_ack`) assume the two are kept in sync.
         debug_assert_eq!(iobuf.data().len(), len as usize);
+        // Alloc-free retain fast path: a small *borrowed* payload (the
+        // HTTP response header / sub-MSS TLS record) would otherwise
+        // cost one `into_owned` heap alloc+copy per request. Copy it
+        // into the reusable per-conn `rtx_inline` buffer instead, when
+        // that buffer is free (single-occupant) and large enough.
+        // Already-owned inputs (Heap/Static/Shared — e.g. the static
+        // body part) skip this: `into_owned` is a no-op for them so
+        // there's no alloc to save, and `Buf` keeps any zero-copy share.
+        let payload = if iobuf.is_borrowed()
+            && (len as usize) <= RTX_INLINE_CAP
+            && !self.rtx_inline_busy
+            && self.ensure_rtx_inline()
+        {
+            let buf = self.rtx_inline.as_mut().expect("ensure_rtx_inline succeeded");
+            buf[..len as usize].copy_from_slice(&iobuf.data()[..len as usize]);
+            self.rtx_inline_busy = true;
+            RtxPayload::Inline { off: 0 }
+        } else {
+            RtxPayload::Buf(iobuf.into_owned())
+        };
         self.rtx_queue.push_back(RtxEntry {
-            iobuf,
+            payload,
             seq_start,
             len,
             first_tx_ms: now_ms,
@@ -758,10 +843,19 @@ impl TcpConnection {
             let head_end = head.seq_start.wrapping_add(head.len as u32);
             // Fully acked: `ack_num` covers the whole entry.
             if !seq_lt(ack_num, head_end) {
-                acked += head.len as usize;
+                let head_len = head.len;
+                // Last use of `head` — capture whether it owns the
+                // single-occupant inline buffer before dropping it.
+                let was_inline = matches!(head.payload, RtxPayload::Inline { .. });
+                acked += head_len as usize;
                 self.rtx_bytes_in_flight =
-                    self.rtx_bytes_in_flight.saturating_sub(head.len as u32);
+                    self.rtx_bytes_in_flight.saturating_sub(head_len as u32);
                 self.rtx_queue.pop_front();
+                if was_inline {
+                    // The reusable retain buffer is free for the next
+                    // small send.
+                    self.rtx_inline_busy = false;
+                }
                 continue;
             }
             // Partial ack: `ack_num` is strictly inside the head entry
@@ -769,9 +863,17 @@ impl TcpConnection {
             // strictly past `seq_start`).
             if seq_lt(head.seq_start, ack_num) {
                 let consumed = ack_num.wrapping_sub(head.seq_start) as usize;
-                // `consume` advances the IOBuf's visible window past
-                // the acked prefix — zero copy, just an offset bump.
-                if head.iobuf.consume(consumed).is_ok() {
+                // Advance the visible window past the acked prefix —
+                // zero copy either way (an IOBuf offset bump, or the
+                // inline buffer's read offset).
+                let advanced = match &mut head.payload {
+                    RtxPayload::Buf(iobuf) => iobuf.consume(consumed).is_ok(),
+                    RtxPayload::Inline { off } => {
+                        *off = off.saturating_add(consumed as u16);
+                        true
+                    }
+                };
+                if advanced {
                     head.seq_start = ack_num;
                     head.len = head.len.saturating_sub(consumed as u16);
                     self.rtx_bytes_in_flight =
@@ -782,6 +884,23 @@ impl TcpConnection {
             break;
         }
         acked
+    }
+
+    /// Test-only accessor for a retransmit entry's live payload bytes,
+    /// abstracting over `Buf` (the IOBuf) and `Inline` (a window into
+    /// `rtx_inline`). The returned slice borrows `self`. Mirrors what
+    /// `retransmit_oldest_segment` would put on the wire.
+    #[cfg(test)]
+    pub(crate) fn rtx_entry_bytes(&self, idx: usize) -> &[u8] {
+        let e = &self.rtx_queue[idx];
+        match &e.payload {
+            RtxPayload::Buf(iobuf) => iobuf.data(),
+            RtxPayload::Inline { off } => {
+                let off = *off as usize;
+                &self.rtx_inline.as_ref().expect("Inline implies rtx_inline")
+                    [off..off + e.len as usize]
+            }
+        }
     }
 
     /// Arm the retransmission timer `rto_ms` ahead of now.
@@ -927,6 +1046,9 @@ impl TcpConnection {
     fn handle_rtx_push_oom(&mut self) {
         crate::diag::record_rtx_alloc_fail(self.state, self.rtx_bytes_in_flight);
         self.rtx_queue.clear();
+        // The cleared queue no longer holds the inline entry (if any),
+        // so the reusable retain buffer is free again.
+        self.rtx_inline_busy = false;
         self.rtx_bytes_in_flight = 0;
         self.rtx_deadline_ms = 0;
     }
@@ -1019,24 +1141,44 @@ impl TcpConnection {
     /// driver descriptor pointing at the same bytes.
     fn retransmit_oldest_segment(&mut self) {
         let mss = mss_for(self.local_ip);
-        let Some(head) = self.rtx_queue.front_mut() else {
-            return;
-        };
-        let n = (head.len as usize).min(mss);
-        if n == 0 {
-            return;
-        }
-        // Copy out of the head IOBuf into a stack scratch — the
-        // bytes remain owned by the queue. ≤ MSS bytes off the
-        // steady-state path so the copy is not a hot-path cost; the
-        // SG-TX follow-up replaces it with a driver descriptor that
-        // points at `head.iobuf.data()` directly.
+        // Copy ≤ MSS of the head entry's payload into a stack scratch —
+        // the bytes remain owned by the queue (an IOBuf for `Buf`, the
+        // reusable `rtx_inline` buffer for `Inline`). Off the steady-
+        // state path, so the copy is not a hot-path cost. The `Buf`
+        // bytes are read inside the `front_mut` borrow; `Inline` reads
+        // `rtx_inline` after the borrow ends (disjoint field). Also
+        // bumps `tx_count` for Karn's rule (>0 = retransmitted, so a
+        // future RTT-sampling commit refuses samples from this entry).
         let mut scratch = [0u8; MSS_MAX];
-        scratch[..n].copy_from_slice(&head.iobuf.data()[..n]);
-        // Bump the entry's tx_count for Karn's rule. >0 marks the
-        // entry as "retransmitted"; a future RTT-sampling commit
-        // refuses to take samples from such entries.
-        head.tx_count = head.tx_count.saturating_add(1);
+        let n;
+        let inline_off;
+        {
+            let Some(head) = self.rtx_queue.front_mut() else {
+                return;
+            };
+            let nn = (head.len as usize).min(mss);
+            if nn == 0 {
+                return;
+            }
+            n = nn;
+            head.tx_count = head.tx_count.saturating_add(1);
+            match &head.payload {
+                RtxPayload::Buf(iobuf) => {
+                    scratch[..n].copy_from_slice(&iobuf.data()[..n]);
+                    inline_off = None;
+                }
+                RtxPayload::Inline { off } => {
+                    inline_off = Some(*off as usize);
+                }
+            }
+        }
+        if let Some(off) = inline_off {
+            let buf = self
+                .rtx_inline
+                .as_ref()
+                .expect("Inline entry implies rtx_inline is allocated");
+            scratch[..n].copy_from_slice(&buf[off..off + n]);
+        }
         send_segment(
             &SegmentMeta {
                 local_ip: self.local_ip,

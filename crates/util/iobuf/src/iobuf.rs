@@ -382,6 +382,16 @@ impl IOBuf {
         self
     }
 
+    /// `true` if this IOBuf is a non-owning `Borrowed` view — the sole
+    /// case `into_owned()` would heap-copy. Callers that want to retain
+    /// the bytes can use this to choose a copy-into-reusable-storage
+    /// path (e.g. the TCP retransmit inline buffer) over a fresh alloc,
+    /// and leave already-`Owned` inputs (Heap/Static/Shared) untouched.
+    #[inline]
+    pub fn is_borrowed(&self) -> bool {
+        matches!(self.inner, IOBufInner::Borrowed { .. })
+    }
+
     /// Promote to refcounted (`Shared`) storage, returning an IOBuf
     /// that can be cheaply `clone_shared`'d. Forwards to
     /// [`OwnedIOBuf::share`] in the `Owned` arm; a `Borrowed` IOBuf
