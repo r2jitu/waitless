@@ -848,13 +848,26 @@ first item dwarfs everything below it.
    IOBufs allocated per send and freed per ACK. Peak per-conn
    footprint scales with the live send window (≤ MSS × in-flight
    segments ≈ ~1.8 KB at a 64 KiB cwnd) rather than the fixed
-   64 KiB reservation. The SG-TX follow-up will swap the
-   `into_owned()` at insertion for refcount-shared storage so the
-   same IOBuf is alive in the queue while the wire-DMA is in flight,
-   eliminating the staging memcpy.
+   64 KiB reservation.
+
+   **Update (2026-05-28, `tcp/rtx-share`):** the share-insertion
+   step the SG-TX note below anticipated has **landed**.
+   `rtx_on_data_sent` now `IOBuf::share()`s each sent chain part
+   into refcount-shared (`Shared(Arc<…>)`) storage and stores that
+   in the queue — replacing the `into_owned()`-into-a-staging-`Vec`
+   path with a move. The full SG-TX win (the wire DMA reading
+   straight from the queue's `Shared` buffer, no TX-frame copy at
+   all) still needs scatter-gather descriptors in the driver and
+   is not done; what landed eliminates the *staging* memcpy and
+   sets up the queue entries as `Shared` Arcs ready for that DMA.
 
    **Measured (2026-05-28, GCE c3-highcpu-8, `https://…/health`
-   wrk -c 18000 -d 30s, peak `/obs` poll):**
+   wrk -c 18000 -d 30s, peak `/obs` poll). NOTE: measured at the
+   `tcp/rtx-iobuf-queue` tip — i.e. PRE share-insertion, with the
+   staging `Vec` still in place. The heap/conn figures are
+   unaffected by share-insertion (the queue holds the same bytes
+   either way); the alloc-count caveat below is what changed and
+   is pending a re-measure.**
 
    | branch                                  | peak heap | live_conns | bytes/conn | req/s   |
    |-----------------------------------------|----------:|-----------:|-----------:|--------:|
@@ -867,11 +880,18 @@ first item dwarfs everything below it.
    3 GB / 88 KB ≈ 34 K-conn cliff vs the 18 K cliff at 155 KB/conn —
    the rest of the items below now bound the next cliff move.
 
-   Caveat: `heap_total_allocation_count` jumped 88× (110 K → 9.8 M
-   over 30 s) — the per-send `Vec<u8>` staging in `rtx_retain` is
-   the new alloc-pressure source. Throughput stays flat because
-   talc handles the small `Vec` well; the SG-TX follow-up retires
-   the staging vec anyway.
+   Caveat (pre-share-insertion measurement):
+   `heap_total_allocation_count` jumped 88× (110 K → 9.8 M over
+   30 s) — the per-send `Vec<u8>` staging in the old `rtx_retain`
+   was the alloc-pressure source. The landed share-insertion
+   retires that staging `Vec` on the chain path: each non-`Static`
+   sent part now costs one `Arc` allocation (a `/health` response
+   is mostly `Static` literals → those parts are free; only a
+   rendered/`Heap` body part allocs). Net alloc-count direction
+   is plausibly *down* (no per-send `Vec`; `Static` parts free),
+   but this is **unmeasured** — a re-run of the 18 K-conn bench on
+   `tcp/rtx-share` is the open follow-up to refresh this caveat
+   and confirm the alloc-count moved the right way.
 
 3. **`TlsStream.cipher_buf`: 8 KB inline → REMOVED.** (DONE)
    `pump_rx` now pulls ciphertext via `TcpStream::recv_chunk` and
