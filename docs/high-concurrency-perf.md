@@ -92,6 +92,52 @@ debugging.
 
 ## Measurements (May 2026)
 
+### 2026-05-29 re-measurement: the 32K cliff is gone (a flat throughput gap remains)
+
+After the May-28 per-conn-slope work (TLS RX share-queue + `rtx_queue`,
+~182 → ~55 KB/conn — see "Recommended ceiling-movers"), the 32K throughput
+cliff in the headline below **no longer reproduces**. Current HEAD on
+`waitless-webserver` (c3-highcpu-8 + gVNIC); `pareto-bench.sh` driving wrk from
+`kvm-vm` vs the same nginx / tokio-hyper peers.
+
+**Firm result — TLS-over-TCP (`health-tls`), `wrk -t8 -d30s` (server-bound):**
+
+| conns | **waitless** | nginx | tokio-hyper |
+|-------|--------------|-------|-------------|
+|  8 K  | 335 K (p99 4350) | 362 K (3260) | 559 K (3660) |
+| 16 K  | 335 K (4550)     | 362 K (3460) | 572 K (2960) |
+| 32 K  | 333 K (4710)     | ~360 K¹      | 570 K (2960) |
+| 50 K  | 332 K (4820)     | 359 K (3700) | 608 K (2850) |
+
+¹ one nginx cell failed to parse; nginx is flat at ~360 K.
+
+**Read:**
+
+  * **The cliff is eliminated** — the win. waitless is *dead-flat* at ~333 K rps
+    from 8 K to 50 K conns (the headline below cliffed to 44 K rps at 32 K).
+    Scaling is now Linux-class: no collapse, flat tail to 50 K.
+  * **Throughput still trails, flatly.** waitless ~333 K vs nginx ~360 K
+    (≈ 8 % behind) vs tokio-hyper ~570–608 K (≈ 1.7×). The gap is the *same at
+    every conn count* — a per-request CPU-cost difference, **not** a
+    high-concurrency cliff. The loadgen can drive > 570 K (it drove tokio there),
+    so 333 K / 360 K are real *server* ceilings, not loadgen caps.
+  * **Plain TCP** (raw `wrk -t8 -c8000`): waitless ~510 K rps — roughly
+    nginx-class, behind tokio.
+
+> ⚠️ A first pass with the harness's default `-t`/conns-÷-10000 threading capped
+> all three at ~300 K for conns ≤ 32 K (loadgen-bound) and made waitless look like
+> it *beat* nginx — that was a loadgen artifact. The `-t8` numbers above are the
+> ones to trust. `pareto-bench.sh` now takes `PARETO_THREADS=8` to pin threads.
+
+**Next:** the remaining gap is per-request throughput, not scaling. Levers are
+the P1/P2 items below — softirq-style inline handler for `/health-TLS`
+(est. 2–3×), concrete handler future (drop `Box<dyn Future>`), per-poll cycle
+reduction. Caveat: single 30 s run/cell, no repeats yet.
+
+> ⚠️ **The headline table below predates this (2026-05-23/24, pre-slope-work).**
+> Its "44 K (cliff)" / "dead" rows at 32–40 K are the *before* picture, kept for
+> the before/after contrast — they no longer reproduce on current HEAD.
+
 ### Headline: waitless vs Linux peers on c3+gVNIC
 
 Same hardware (`c3-highcpu-8` + gVNIC), same workload

@@ -218,7 +218,7 @@ for wl in "${WL_LIST[@]}"; do
     url="$(workload_url "$wl")"
     [ -z "$url" ] && { echo "skip: unknown workload '$wl'" >&2; continue; }
     for conns in "${CONN_LIST[@]}"; do
-        threads=$(threads_for_conns "$conns")
+        threads=${PARETO_THREADS:-$(threads_for_conns "$conns")}
         echo -n "  [$wl c=$conns t=$threads] " >&2
 
         # Warm up: discard a $WARMUP-second run. Then the measurement.
