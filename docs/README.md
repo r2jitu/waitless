@@ -25,6 +25,7 @@ The perf docs route work by *cost locus* — see **[`high-concurrency-perf.md`](
 | Doc | What it owns |
 |-----|--------------|
 | [`high-concurrency-perf.md`](high-concurrency-perf.md) | The 10 K+ concurrent-conn cliff: saturation behaviour, heap/OOM analysis, load shedding, per-conn data structures. Hosts the perf-doc routing taxonomy. |
+| [`efficiency-audit.md`](efficiency-audit.md) | Cross-cutting audit of the four efficiency axes — mem/conn, allocs/req, copies/req, cross-core sync — with a prioritized plan. Synthesis across the rx/tx trackers + the per-core slab + the sub-MSS TX nexus; the "what to optimize next and why" doc. |
 | [`rx-path-optimizations.md`](rx-path-optimizations.md) | Per-byte / per-frame **RX** cost: memcpy reduction, IOBuf zero-copy, HW GRO/RSC. (Items A–O + progress log.) |
 | [`tx-path-optimizations.md`](tx-path-optimizations.md) | Per-byte / per-frame **TX** cost: encrypt-in-place, TSO, header fusion, UDP-GSO. (Items A–R + progress log.) |
 | [`observability.md`](observability.md) | The `/obs` instrumentation doctrine and primitives (`Counter`, `PerCoreCounter`, `LastEvent`, `LatencyHist`). |

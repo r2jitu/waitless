@@ -516,6 +516,19 @@ AEAD seals there.
 Measured: **/diagnostics over HTTPS/1.1 = 11 allocs**, **over H3 =
 19 allocs** for a cold-conn first request. Decomposition:
 
+> ⚠️ **Stale (2026-05-29 efficiency audit — see
+> [`efficiency-audit.md`](efficiency-audit.md) for the verified current state).**
+> The table below predates several changes: `rx_buf` (#4) and `pt_buf` (#6) were
+> **removed** from `TlsServer` (only `tx_buf` remains), so the "11 allocs" cold
+> figure is too high; the conn-future path is now `reactor/tcp.rs`, not
+> `net/tcp.rs`. More importantly, the **steady-state keep-alive** figure is what
+> matters and is now **1 alloc/req** (the borrowed-header `into_owned` retain in
+> `tcp/state.rs` `rtx_push`; commit `e284d00` removed a second). The
+> sub-MSS `/health` response takes a **3-memcpy scratch-seal fallback** (it
+> misses the TSO direct-encrypt path) — the audit's #1 TX reduction target. Treat
+> the audit as authoritative for current alloc/copy counts; this table is kept as
+> the cold-first-request history.
+
 | # | Alloc | Site | Per-… |
 |---|-------|------|------|
 | 1 | `Box::pin(async move {...})` (conn future) | `runtime/executor/src/net/tcp.rs:475` | conn-accept |
