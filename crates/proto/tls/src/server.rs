@@ -14,10 +14,9 @@
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
-use alloc::vec::Vec;
 use core::ptr::{self, addr_of_mut};
 
-use iobuf::IOBuf;
+use iobuf::{IOBuf, OwnedIOBuf};
 use p256::ecdsa::SigningKey;
 
 use crate::handshake::ParseError;
@@ -284,36 +283,22 @@ pub struct TlsServer {
     pub(crate) tx_pos: usize, // how many bytes we've handed out via pop_tx()
 
     // Decrypted application data records waiting for the app.
-    // One owned byte buffer per record; consumer drains from the
-    // front via `pop_plaintext` which lifts the head to a Heap
-    // `IOBuf` (zero-copy: `IOBuf::from(Vec<u8>)` reuses the
-    // allocation). Typical depth is 0 or 1 — the consumer pulls a
-    // record, parses, and either replies or asks for the next.
+    // One `OwnedIOBuf` per record; the consumer drains from the
+    // front via `pop_plaintext`, which widens the head to an `IOBuf`
+    // (`From<OwnedIOBuf>` — zero copy). Typical depth is 0 or 1: the
+    // consumer pulls a record, parses, and either replies or asks
+    // for the next.
     //
-    // Stored as `Vec<u8>` rather than `IOBuf` because `IOBuf` is
-    // `!Send` (the `Borrowed` variant propagates a non-Send marker
-    // through the enum), and `TlsServer` types end up in a
-    // `WorkerLocal` that the type-system demands be `Sync<T:Send>`
-    // — even though by construction one TlsConnImpl never crosses
-    // worker threads. Vec<u8> sidesteps the constraint without
-    // costing a copy.
-    //
-    // Open follow-up: with `OwnedIOBuf` (the `Send`-by-derivation
-    // owning tier added by the iobuf-two-tier work) and `IOBuf::
-    // share()` / `clone_shared()` (TCP rtx queue's PR-5 share-
-    // insertion), this could become `VecDeque<OwnedIOBuf>`. The
-    // chunk would be `share()`'d once in `pump_rx`; each decrypted
-    // record's plaintext range would be `clone_shared()` + narrowed
-    // and pushed to the queue. Per-record cost goes from
-    // `Vec alloc + memcpy` to one atomic increment — wash on the
-    // /health record size (60 B), measurable win on bulk uploads
-    // (16 KB records). Requires either an `IOBuf → OwnedIOBuf`
-    // extraction helper on iobuf or a contract change on
-    // `process_chunk(&mut [u8])` → `process_chunk(IOBuf)`; the
-    // per-conn slope cost shown by `tls/rx-chunk-streaming`'s
-    // 1c/2c/4c bench is below noise, so this is a deferred
-    // architectural cleanup, not a perf urgency.
-    pub(crate) pending_plaintext: VecDeque<Vec<u8>>,
+    // `OwnedIOBuf` (not `IOBuf`) because `IOBuf` is `!Send` — its
+    // `Borrowed` variant propagates a non-Send marker through the
+    // enum — and `TlsServer` lands in a `WorkerLocal` that the type
+    // system demands be `Sync<T: Send>`, even though by construction
+    // one `TlsConnImpl` never crosses worker threads. `OwnedIOBuf`
+    // is `Send` by auto-derivation (every owning storage shape is
+    // Send) and carries no out-of-band lifetime, so it satisfies the
+    // bound while still owning (or refcount-sharing) its bytes — no
+    // copy at the consumer boundary.
+    pub(crate) pending_plaintext: VecDeque<OwnedIOBuf>,
 
     // Key schedule + transcript
     pub(crate) transcript: Transcript,
@@ -491,16 +476,16 @@ impl TlsServer {
         !self.pending_plaintext.is_empty()
     }
 
-    /// Pop the next decrypted plaintext record as a `Heap` IOBuf.
-    /// Returns `None` when the queue is empty. The byte buffer was
-    /// owned at AEAD-decrypt time (`do_app_data` copied the
-    /// in-place plaintext into a fresh `Vec`), so the NIC RX slot
-    /// it came from has long since returned to the pool — callers
-    /// can hold the IOBuf indefinitely without back-pressuring the
-    /// NIC.
+    /// Pop the next decrypted plaintext record, widened to an
+    /// `IOBuf`. Returns `None` when the queue is empty.
     ///
-    /// Zero copy: `IOBuf::from(Vec<u8>)` reuses the existing heap
-    /// allocation (`Vec::into_boxed_slice` when `len == capacity`).
+    /// Zero copy: the head `OwnedIOBuf` widens via `From<OwnedIOBuf>`
+    /// (a plain enum-wrap, no allocation). For chunk-direct records
+    /// the returned IOBuf is an `Owned(Shared)` view refcount-sharing
+    /// the recv'd chunk's storage; for the rare rx_partial straddler
+    /// it's an `Owned(Heap)` copy. Either way the IOBuf owns (or
+    /// shares ownership of) its bytes, so callers can hold it without
+    /// a dangling borrow.
     pub fn pop_plaintext(&mut self) -> Option<IOBuf> {
         self.pending_plaintext.pop_front().map(IOBuf::from)
     }

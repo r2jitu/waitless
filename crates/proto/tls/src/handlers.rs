@@ -16,6 +16,7 @@
 // owned Heap IOBuf, and emit sealed handshake records into
 // `tx_buf`. No direct I/O.
 
+use iobuf::OwnedIOBuf;
 use p256::ecdsa::{Signature as EcdsaSignature, signature::Signer};
 
 use crate::handshake::{
@@ -760,7 +761,7 @@ impl TlsServer {
                 if self.pending_plaintext.try_reserve(1).is_err() {
                     return Err(HandshakeError::Internal);
                 }
-                self.pending_plaintext.push_back(v);
+                self.pending_plaintext.push_back(OwnedIOBuf::from(v));
                 Ok(())
             }
             content_type::ALERT => {
