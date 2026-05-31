@@ -430,47 +430,36 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
   but `csum_tx_offload` returns false — enabling it regressed
   health_max −19/−32%, so it's off pending a descriptor-encoding
   debug. Small-packet win only. *Where:* `lib.rs` `csum_tx_offload`.
-- `[~]` **T7. gve MSI-X + NAPI (park-until-interrupt).** Device
-  supports it (verified); we're polling-only. **Low-load latency /
-  power only** — NAPI exists to avoid IRQs under load, which our spin
-  window already approximates, so this is *not* a saturated-throughput
-  lever. Prework landed (x86_64 LAPIC timer-bounded HLT + adaptive
-  spin window, commit `kernel/idle:`); MSI-X RX wiring itself deferred.
-  **Measured dead-end on the actual target (e2-small):** the goal was
-  to stop idle-spinning on a shared burstable host, but on GCE
-  e2-small KVM **HLT does not block the vCPU** — it traps (~1–2 µs
-  VMEXIT) and re-enters immediately, so an idle core stays **90–95 %
-  busy** no matter what we do. Live `/obs` delta (no traffic, 2 cores):
-  idle 5–9 %, ~45 K idle-enters/s/core, ~1–2 µs slept per HLT, LAPIC
-  timer (vector 0xF0) fires only ~12/s — i.e. <0.02 % of HLTs ever
-  reach the 1 ms bound. The LAPIC timer *does* deliver on e2 (earlier
-  "never delivers" note was wrong; `apic_irr`/`isr`=0, not x2APIC),
-  but it's moot because HLT returns first. **MWAIT is also out** — a
-  boot CPUID probe (deployed to e2) shows `MONITOR` masked
-  (`CPUID.01H:ECX[3]=0`, leaf 05H all-zero) and no KVM PV-idle feature
-  (`4000_0001H:EAX=0x10000ab`: clocksource/steal-time/pv-unhalt only),
-  so all three guest-side idle levers are exhausted *by measurement*.
-  Likely cause: GCE treats HLT as yield-not-block on the burstable
-  shared-core e2 shape, so a busy-polling guest is always runnable.
-  Two independent walls compound: gve is **polling-by-design**
-  (`idle: None` → `idle_cb` returns immediately, never even reaching
-  HLT), *and* e2 HLT is a near-NOP.
-  **Landed as an opt-in (`idle_yield` cfg, default OFF; deploy with
-  `WAITLESS_IDLE_YIELD=1`):** when enabled, a genuinely-idle polling
-  core (gve) issues a timer-bounded HLT in `idle_cb` instead of pure
-  busy-spinning. Two distinct payoffs: (1) on hosts where HLT *blocks*
-  it is a real idle-CPU drop (qemu-TCG: ~5 %); (2) on a shared/
-  oversubscribed host each HLT is a VMEXIT scheduling point the
-  hypervisor can use to run co-tenants — the "don't busy-spin on a
-  shared host" win, whose benefit is *contention-dependent* (an
-  uncontended e2 bench shows no CPU% change since HLT re-enters in
-  ~1–2 µs; a contended host lets KVM deschedule us during the VMEXIT).
-  Safe to leave OFF by default and safe to turn ON: `idle_cb` is only
-  reached after the event loop spins a full idle window, so under
-  saturation it is never entered and the c3 throughput headline is
-  unaffected by construction. Full MSI-X RX wiring (wake *on packet*
-  rather than re-poll every 1 ms) stays deferred — latency/power only.
-  See [[reference_idle_cpu_spin]].
+- `[x]` **T7 (idle path). gve idle-yield — e2-small idles at 99.3 %.**
+  Goal: stop busy-spinning on a shared burstable host. **Done and
+  measured on real e2-small.** A polling NIC (gve, `idle: None`, no RX
+  IRQ) used to busy-spin an idle core at ~100 %. Now, once a core is
+  *sustained*-idle (`idle_rounds >= DEEP_IDLE_ROUNDS`, entry.rs
+  `idle_cb`), it issues the timer-bounded HLT — and the vCPU **actually
+  sleeps**: live `/obs` delta, no traffic, 2 cores = **99.3 % idle,
+  ~1010 HLT-wakeups/s, ~1.02 ms slept per HLT** (the 1 ms LAPIC timer).
+  Stable across a stop/start (fresh host placement) and load-responsive
+  (drops under load, returns to 99 % when quiet).
+  **The key was the HLT *pattern*, not a capability.** An earlier
+  prototype that HLT'd *unconditionally* (every idle commit, high
+  frequency) measured only ~5 % idle / ~1–2 µs per HLT — which looked
+  like "HLT doesn't block on e2". It was actually KVM's *adaptive
+  halt-polling*: a high-frequency HLT stream keeps the poll window open
+  (host busy-polls, never deschedules). Gating the HLT to fire only
+  after the core has been busy-idle for a while resets that into the
+  block regime, so KVM deschedules the vCPU on HLT and it sleeps the
+  full 1 ms. (Earlier notes claiming a hard "platform wall / HLT is a
+  NOP / MWAIT masked so it's hopeless" were wrong about the conclusion —
+  MWAIT *is* masked, but plain HLT blocks fine given the right pattern.)
+  **Default ON, safe by construction:** `idle_cb` is only reached after
+  the event loop spins a full idle window with no work, and
+  `idle_rounds` resets on any work, so under saturation the HLT path is
+  never entered and the c3 throughput headline is untouched. Cost: the
+  first packet after *sustained* idle waits up to the 1 ms re-poll
+  (gve has no RX IRQ to wake sooner) — negligible for a website, and
+  full MSI-X RX (wake *on packet*) is the remaining deferred item to
+  erase even that. Verified: both arches build, all host + qemu-x86_64
+  + HVF tests pass, qemu-TCG idle ~5 %. See [[reference_idle_cpu_spin]].
 - `[ ]` **T8. 4 KiB RX buffers on DQO** (`BUFFER_SIZES` id=10
   advertises 4096; FreeBSD has `allow_4k_rx_buffers`). Lets more RSC
   coalesces stay single-descriptor, reducing T4 stitching pressure.

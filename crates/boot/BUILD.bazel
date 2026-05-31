@@ -43,18 +43,6 @@ rust_library(
         ],
     }),
     crate_root = "src/entry.rs",
-    # `idle_yield` is an opt-in cfg for shared/oversubscribed hosts: it
-    # makes a polling NIC (gve, no RX IRQ) issue a timer-bounded HLT
-    # when the event loop has gone genuinely idle, instead of pure
-    # busy-spinning. Each HLT is a VMEXIT — a scheduling point the
-    # hypervisor can use to run co-tenants — and a real sleep on hosts
-    # where HLT blocks. OFF by default: on a saturated benchmark host
-    # the busy-poll is load-bearing and the idle path is never reached,
-    # so the default is unchanged. Enable per-build with
-    # `--@rules_rust+//rust/settings:extra_rustc_flag=--cfg=idle_yield`
-    # (the deploy script's WAITLESS_IDLE_YIELD=1 sets it). Declared here
-    # so `#[cfg(idle_yield)]` doesn't trip rustc's check-cfg lint.
-    rustc_flags = ["--check-cfg=cfg(idle_yield)"],
     target_compatible_with = _WAITLESS_ONLY,
     deps = [
         "//crates/drivers/bus",

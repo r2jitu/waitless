@@ -92,7 +92,11 @@ pub fn core_stats_snapshot(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64, 
 type PollFn = fn(u32) -> bool;
 type VoidFn = fn();
 type BoolFn = fn() -> bool;
-type IdleFn = fn(u32);
+/// Idle hook: `(core_id, idle_rounds)`. `idle_rounds` is the count of
+/// consecutive idle commits with no intervening work (0 right after
+/// work), letting the hook distinguish a brief inter-request lull from
+/// sustained idle and escalate (e.g. busy-poll → HLT) accordingly.
+type IdleFn = fn(u32, u32);
 
 /// Registered callbacks. Each `AtomicFn<F>` publishes a typed function
 /// pointer with `Release` ordering on store / `Acquire` on load, so any
@@ -477,7 +481,7 @@ pub fn run(core_id: u32) -> ! {
                 let cycles_per_ms = crate::time::cycles_per_us().saturating_mul(1000);
                 crate::cpu::idle_until_cycles(cycles_per_ms);
             } else if let Some(f) = IDLE.load() {
-                f(core_id);
+                f(core_id, idle_rounds);
             } else {
                 crate::cpu::idle_bounded();
             }

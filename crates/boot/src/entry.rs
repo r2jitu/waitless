@@ -721,27 +721,44 @@ fn boot_args() -> &'static str {
 ///   We use WFI and not WFE: WFE wakes from any SEV (including spurious ones),
 ///   which starved the host-side TCP proxy thread on Apple hypervisors.
 ///   `wake_cores()` sends SGI so WFI wakes correctly.
-fn idle_cb(core_id: u32) {
+/// Consecutive idle rounds (event-loop idle commits with no intervening
+/// work) after which a polling NIC switches from busy-poll to a
+/// timer-bounded HLT. The event loop only reaches `idle_cb` after a full
+/// idle spin window, and `idle_rounds` resets on *any* work, so this is
+/// only crossed during genuinely sustained idle — never under load. High
+/// enough that a lightly-loaded server with sub-window traffic gaps keeps
+/// busy-polling (no added latency); low enough that a truly idle core
+/// stops monopolizing its vCPU within a few ms. Only the x86_64 polling
+/// path (gve) consumes it; aarch64 idle uses the GIC/yield-register path.
+#[cfg(target_arch = "x86_64")]
+const DEEP_IDLE_ROUNDS: u32 = 32;
+
+fn idle_cb(core_id: u32, idle_rounds: u32) {
     // No wake-up source → busy-poll. (Happens when the transport
     // doesn't expose any IRQ path: a polling NIC like gve `idle: None`,
     // aarch64 without GIC configured, legacy PCI without an IRQ line.)
     //
     // This `idle_cb` is only ever reached *after* the event loop has
     // spun a full (adaptive) idle window with no work, so under load it
-    // is never entered — the busy-poll spin stays hot and the default
-    // here (return → keep spinning) preserves the saturated-throughput
-    // path. With the opt-in `idle_yield` cfg, a genuinely-idle polling
-    // core instead issues a timer-bounded HLT: each HLT is a VMEXIT the
-    // hypervisor can use to schedule co-tenants (good citizen on
-    // shared/oversubscribed shapes), and a real sleep on hosts where
-    // HLT blocks. The ~1 ms timer re-polls RX, so no RX IRQ is needed;
-    // guarded on `timer_available()` so a host without the timer can't
-    // sleep forever. See reference_idle_cpu_spin / docs/gvnic.md T7.
+    // is never entered — the busy-poll spin stays hot and returning here
+    // (→ keep spinning) preserves the saturated-throughput path. Once a
+    // core is *sustained*-idle (`idle_rounds >= DEEP_IDLE_ROUNDS`) a
+    // polling NIC instead issues a timer-bounded HLT: each HLT is a
+    // VMEXIT the hypervisor can use to schedule co-tenants (good citizen
+    // on shared/oversubscribed shapes like e2-small), and a real sleep
+    // on hosts where HLT blocks (qemu-TCG idle ~5%). The ~1 ms timer
+    // re-polls RX, so no RX IRQ is needed; guarded on `timer_available()`
+    // so a host without the timer can't sleep forever. On e2 HLT is a
+    // near-NOP so CPU% doesn't drop (platform wall, see docs/gvnic.md
+    // T7), but the VMEXITs still hand the host scheduling points. See
+    // reference_idle_cpu_spin.
     if !nic::irq_idle_supported() {
-        #[cfg(all(idle_yield, target_arch = "x86_64"))]
-        if kernel_bare::x86_64::apic::timer_available() {
+        #[cfg(target_arch = "x86_64")]
+        if idle_rounds >= DEEP_IDLE_ROUNDS && kernel_bare::x86_64::apic::timer_available() {
             kernel_bare::cpu::idle_bounded();
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = idle_rounds;
         return;
     }
     if core_id == 0 || kernel_bare::percpu::num_cores() <= 1 {
