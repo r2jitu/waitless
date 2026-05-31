@@ -459,7 +459,7 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
   (gve has no RX IRQ to wake sooner) — negligible for a website. Verified:
   both arches build, all host + qemu-x86_64 + HVF tests pass, qemu-TCG
   idle ~5 %. See [[reference_idle_cpu_spin]].
-- `[x]` **T7 (MSI-X RX wake-on-packet) — GQI done, DQO deferred.** Erase
+- `[x]` **T7 (MSI-X RX wake-on-packet) — DONE, both formats.** Erase
   the ~1 ms re-poll above: a deeply-idle core arms its RX notification
   block's MSI-X + IRQ doorbell (gve/src/irq.rs, via `nic::arm_rx_idle`
   from the same deep-idle gate) so the timer-bounded HLT wakes the
@@ -469,37 +469,25 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
   gate, so a busy core never arms — the saturated path is interrupt-free
   by construction (the device config was already MSI-X-ready: base_idx=0,
   mgmt vector last per upstream, so no change to `CONFIGURE_DEVICE_RESOURCES`).
-  **GCE-validated.** GQI (e2/n2, incl. the e2 website host): wake-on-packet
-  fires — 99 % idle preserved, 20/20 served after idle, ~2 IRQ/req, no
-  storm, no doorbell corruption. Verified clean on LAN (co-located VM):
-  GQI ~3 ms p50.
-  **DQO (c3/c4) is GATED OFF** (timer-only idle, byte-identical to pre-T7)
-  — in two stages: (1) the interrupt **storm is FIXED** — DQO's ITR needs
-  the coalescing interval set via *update mode* (bits 3-4 = 0), not
-  `GVE_ITR_NO_UPDATE` (3<<3, which the device ignores, so the earlier
-  disable was a no-op): arm = `ENABLE | ((us>>1 & 0xFFF)<<5)`, disable =
-  `0` (per `gve_dqo.h` `gve_setup_itr_interval_dqo`); measured 742→2.8
-  IRQ/req. (2) BUT a **fundamental, DQO-specific regression remains** that a
-  second investigation could not crack remotely. Symptom: the server
-  **works until the first deep-idle arm, then goes non-responsive** (deploy
-  health-check passes while cores are busy; `/health` then times out once
-  cores idle + arm the DQO MSI-X). RX frames *are* still received+counted
-  but responses don't complete (client retransmit storm). So **taking a DQO
-  MSI-X interrupt disrupts the RX→response path** — device-level, not the
-  arm/disarm mechanism. RULED OUT (each a c3 deploy): per-fire ITR write
-  (rewrote to ITR-set-once + MSI-X-table-mask arm/disarm — still broke,
-  ~426 ms / 9-of-20-fail); steering (verified `topo.apic_ids[qp]` IS core
-  qp's APIC id, smp.rs); multi-queue (`QUEUE_COUNT=1` was *worse*, 0/20);
-  missing CREATE_RX_QUEUE irq field (none — only `ntfy_id`). Measurements
-  were further confounded by a concurrent session on the same instance +
-  c3 SPOT preemption + flaky LAN-probe SSH. The saturated c3 benchmark is
-  unaffected regardless (never idles → never arms). The correct ITR
-  encoding is preserved (gated) in `irq.rs` for the eventual un-gate.
-  **Follow-up needs ON-BOX debugging** (remote deploy+/obs is insufficient):
-  packet-capture on a clean non-spot/non-shared instance to see if
-  responses leave the NIC; trace the DQO TX/completion path with a RX MSI-X
-  armed; diff the exact upstream `gve_napi_poll_dqo` completion/PBA
-  handshake for a per-interrupt step we omit. Obs: `/obs` `nic.counters.rx_irq`.
+  **GCE-validated both formats:** GQI (e2/n2) and DQO (c3) each show 99 %
+  idle preserved, 20/20 served after idle, ~2 IRQ/req, no storm, clean
+  latency (~115-170 ms WAN, matching pre-T7). The IRQ-doorbell encoding
+  differs by format (GQI `GVE_IRQ_*` big-endian; DQO `GVE_ITR_*`
+  little-endian) but **both disable via the same `GVE_IRQ_MASK` bit-30
+  mask** — the gap that took DQO so long. The DQO storm was first fixed by
+  setting the ITR coalescing interval via update mode (`ENABLE | ((us>>1 &
+  0xFFF)<<5)`, not `GVE_ITR_NO_UPDATE`); but a far worse regression then
+  surfaced — the server worked until the first deep-idle arm, then went
+  non-responsive (RX frames received, responses lost to a retransmit
+  storm). Root cause, found by diffing **FreeBSD `gve_mask_all_queue_irqs`**:
+  we were disabling the DQO interrupt by writing `0` (which re-evaluates
+  the whole ITR register — enable+interval+update-mode — and disrupts the
+  queue's RX→response path), where the correct disable is `GVE_IRQ_MASK`
+  (bit 30), the universal mask bit FreeBSD writes for *both* formats.
+  Ruled out along the way (each a c3 deploy): irq_db_index collision
+  (logged the layout — distinct), steering (`topo.apic_ids[qp]` IS core
+  qp's APIC id, smp.rs), multi-queue (GQI on n2-4core is clean → the bug
+  was DQO-format-specific). Obs: `/obs` `nic.counters.rx_irq`.
   See [[reference_idle_cpu_spin]].
 - `[ ]` **T8. 4 KiB RX buffers on DQO** (`BUFFER_SIZES` id=10
   advertises 4096; FreeBSD has `allow_4k_rx_buffers`). Lets more RSC

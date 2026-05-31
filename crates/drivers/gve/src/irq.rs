@@ -171,15 +171,19 @@ mod x86 {
         }
     }
 
-    /// Disable the RX block's IRQ doorbell (in the ISR) so it fires once
-    /// per arm. DQO: write 0 — update mode (bits 3-4 = 0) with the enable
-    /// bit clear actually disables (unlike `NO_UPDATE`, which is ignored).
-    /// GQI: set the mask bit.
+    /// Disable (mask) the RX block's IRQ doorbell in the ISR so it fires
+    /// once per arm. Both formats use the **same** mask bit `GVE_IRQ_MASK`
+    /// (bit 30) — verified vs FreeBSD `gve_mask_all_queue_irqs`, which
+    /// writes `GVE_IRQ_MASK` for GQI *and* DQO. (Writing `0` to a DQO ITR
+    /// doorbell does NOT cleanly mask — it re-evaluates the whole register
+    /// (enable+interval+update-mode) and disrupts the queue's RX→response
+    /// path; the dedicated mask bit just suppresses delivery.) Only the
+    /// endianness differs: GQI big-endian, DQO little-endian.
     #[inline]
     fn irq_disable(off: u32) {
         let bar2 = BAR2_VA.load(Ordering::Acquire);
         if QUEUE_FORMAT_DQO.load(Ordering::Relaxed) {
-            crate::dqo::doorbell_write_le(bar2, off, 0);
+            crate::dqo::doorbell_write_le(bar2, off, GVE_IRQ_MASK);
         } else {
             crate::gqi::doorbell_write(bar2, off, GVE_IRQ_MASK);
         }
@@ -230,22 +234,6 @@ mod x86 {
     }
 
     pub(crate) fn enable_irq() {
-        // DQO is GATED OFF pending a latency fix. The interrupt STORM is
-        // solved — `irq_enable`/`irq_disable` use the correct ITR encoding
-        // (set the coalescing interval on arm; write 0 to disable, since
-        // `NO_UPDATE` is ignored), measured 742→2.8 IRQ/req. But DQO MSI-X
-        // still shows a severe DQO-specific latency regression: ~729 ms
-        // p50 (LAN, co-located) on c3 vs GQI's clean ~3 ms, with no NIC
-        // drops and correct steering (the disable hits the right block).
-        // Root cause unresolved (likely an ITR/PBA or interval-update
-        // side-effect on the RX path) and needs on-box debugging. GQI
-        // (e2/n2 — the idle target, incl. the e2 website host) is clean
-        // and stays enabled. The saturated c3 path is unaffected either
-        // way (never idles → never arms). See docs/gvnic.md T7.
-        if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
-            log(b"[gvnic] MSI-X RX deferred on DQO (latency regression); timer-only idle\n");
-            return;
-        }
         let idx = match pci::find_device(PCI_VENDOR_GVE, PCI_DEVICE_GVE) {
             Some(i) => i,
             None => return,
