@@ -318,15 +318,34 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
   `/health` TLS -t8 = **450,803 rps**, neutral (hot path unaffected).
   rps stays bandwidth-bound (~2.2 GB/s egress on one loadgen) — the
   win is latency + zero failed requests, not rps.
-  *Residual / follow-up:* the `/static-64k` c4000 p99 ~2 s tail is
+  *Residual:* the `/static-64k` c4000 p99 ~2 s tail is
   egress-saturation queueing under 4000 conns (no drops, no RTO) — we
-  traded the drop+RTO cliff for bounded back-pressured queueing. A
-  sub-RTT **TX-completion waker** (wake parked send-wakers from the
-  event loop after `tx_drain` frees ring space, instead of waiting for
-  the ACK) would refill the ring faster on high-BDP / high-churn paths
-  and tighten that tail; not needed to remove the cliff on GCE's
-  low-RTT fabric. *Status:* done, landed on main.
-  ([[reference_tx_async_spin_measured]])
+  traded the drop+RTO cliff for bounded back-pressured queueing.
+  *Status:* done, landed on main. ([[reference_tx_async_spin_measured]])
+  *Sub-RTT TX-refill — TRIED + REVERTED (do not re-attempt as a plain
+  yield).* The TX ring already drains every event-loop iteration
+  (`poll_qp_inner`→`tx_drain` runs before `executor::tick`), so the
+  obvious next step was: on a full ring with an open window, have the
+  send future **yield** (self-wake → re-polled next tick, after the
+  reap) instead of waiting for the ACK. No interrupts needed — TX is
+  already polled. Implemented via `TcpBackend::send_should_yield`
+  (`usable_window()>0` ⇒ ring-blocked ⇒ yield; else park on ACK) and
+  validated on c3-highcpu-8 — **net negative, reverted:** it tightened
+  *medium*-response tails (`/static-64k` c1000 p99 1.43 s → **77 ms**;
+  c4000 ~2.0 s → ~540 ms) but **regressed large responses 42×**
+  (`/static-1m` c1000 p99 22 ms → **932 ms**) and flattened the 64k
+  distribution (p50 0.5 ms → 100 ms). Cause: a 1 MB response is ~715
+  frames through a 128-slot ring, so "wake every ring-blocked sender
+  each tick" is a thundering herd *and* round-robins large transfers
+  into starvation — whereas TCP's ACK-clock already paces each conn by
+  its `cwnd` and pipelines bursts. On GCE's low RTT, ACK-pacing is
+  near-optimal and strictly more balanced; the poll-driven refill only
+  helps when ACK arrival is the bottleneck (high BDP), which this
+  fabric isn't. A *work-conserving* variant (wake exactly N senders for
+  N freed slots, FIFO) would kill the herd but still wouldn't beat
+  cwnd-clocked pacing for large transfers — so the whole direction is
+  parked. Reverted before merge; ACK-paced back-pressure (above) is the
+  shipped behaviour.
 
 ### Tier 2 — throughput offloads (after T1)
 
