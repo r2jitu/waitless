@@ -445,3 +445,112 @@ pub extern "C" fn init() {
 pub fn enable_bus_mastering(slot: u8) {
     enable_bus_mastering_inner(slot);
 }
+
+// ============================================================================
+// MSI-X — generic capability programming
+// ============================================================================
+//
+// The virtio transport (`bus::virtio`) has its own `vpci_msix_*` helpers
+// bound to `VirtioPciDevice`; these are the transport-agnostic versions
+// for drivers (gve) that talk to `bus::pci` directly. MSI-X is a standard
+// PCI capability (ID 0x11): a table of 16-byte entries in a BAR, each
+// `{ msg_addr_lo, msg_addr_hi, msg_data, vector_ctrl }`, gated by an
+// Enable bit in the capability's Message Control word.
+
+/// PCI MSI-X capability ID.
+const PCI_CAP_ID_MSIX: u8 = 0x11;
+/// PCI Status register bit 4: capabilities list present.
+const PCI_STATUS_CAP_LIST: u32 = 1 << 4;
+
+/// Parsed MSI-X capability for a device.
+#[derive(Clone, Copy)]
+pub struct MsixCap {
+    /// Config-space offset of the capability header.
+    pub cap_off: u8,
+    /// Number of table entries (Message Control TableSize field + 1).
+    pub table_size: u16,
+    /// BAR index (BIR) holding the MSI-X table.
+    pub table_bar: u8,
+    /// Byte offset of the table within that BAR.
+    pub table_offset: u32,
+}
+
+/// Walk the PCI capability list and return the MSI-X capability, if the
+/// device exposes one. Reads config space via dword-aligned reads (the
+/// capability headers are dword-aligned in practice).
+pub fn find_msix_cap(dev: &PciDevice) -> Option<MsixCap> {
+    // Capabilities present?
+    let status = read_config(dev.bus, dev.slot, dev.func, 0x04);
+    if (status & PCI_STATUS_CAP_LIST) == 0 {
+        return None;
+    }
+    // Capability pointer at config 0x34 (low byte).
+    let mut ptr = (read_config(dev.bus, dev.slot, dev.func, 0x34) & 0xFF) as u8;
+    // Bounded walk (cap chain can't exceed config space; cap of 48 is
+    // far more than any real device's chain — a malformed loop bails).
+    for _ in 0..48 {
+        if ptr == 0 || ptr == 0xFF {
+            break;
+        }
+        let hdr = read_config(dev.bus, dev.slot, dev.func, ptr & 0xFC);
+        // dword at `ptr`: [id:8][next:8][msg_ctrl:16] (ptr is dword-aligned).
+        let id = (hdr & 0xFF) as u8;
+        let next = ((hdr >> 8) & 0xFF) as u8;
+        if id == PCI_CAP_ID_MSIX {
+            let msg_ctrl = ((hdr >> 16) & 0xFFFF) as u16;
+            let table_size = (msg_ctrl & 0x7FF) + 1;
+            let toff = read_config(dev.bus, dev.slot, dev.func, ptr.wrapping_add(4) & 0xFC);
+            return Some(MsixCap {
+                cap_off: ptr,
+                table_size,
+                table_bar: (toff & 0x7) as u8,
+                table_offset: toff & !0x7,
+            });
+        }
+        ptr = next;
+    }
+    None
+}
+
+/// Enable (or disable) MSI-X in the capability's Message Control word.
+/// Sets the Enable bit (15) and clears the Function-Mask bit (14) so
+/// per-entry masks govern delivery. Message Control is the upper 16
+/// bits of the dword at `cap_off`.
+pub fn msix_enable(dev: &PciDevice, cap_off: u8, enable: bool) {
+    let word = read_config(dev.bus, dev.slot, dev.func, cap_off & 0xFC);
+    let mc = ((word >> 16) & 0xFFFF) as u16;
+    let new_mc: u16 = if enable {
+        (mc | 0x8000) & !0x4000
+    } else {
+        mc & !0x8000
+    };
+    let new_word = (word & 0x0000_FFFF) | ((new_mc as u32) << 16);
+    write_config(dev.bus, dev.slot, dev.func, cap_off & 0xFC, new_word);
+}
+
+/// Program one MSI-X table entry at `table_va` (the mapped VA of the
+/// table). Entry layout (16 bytes): `+0` addr_lo, `+4` addr_hi, `+8`
+/// data, `+12` vector control (bit 0 = mask). Writing the mask bit last
+/// unmasks only after addr/data are committed.
+///
+/// # Safety
+/// `table_va` must be the mapped MSI-X table base and `entry` within the
+/// device's advertised table size.
+pub unsafe fn msix_write_entry(table_va: u64, entry: u16, addr: u64, data: u32, masked: bool) {
+    let slot = table_va + (entry as u64) * 16;
+    unsafe {
+        mmio_write32(slot, addr as u32);
+        mmio_write32(slot + 4, (addr >> 32) as u32);
+        mmio_write32(slot + 8, data);
+        mmio_write32(slot + 12, if masked { 1 } else { 0 });
+    }
+}
+
+/// Build an x86 MSI message address for fixed, edge-triggered delivery
+/// to the given LAPIC. Intel SDM Vol.3 §10.11.1: bits 31:20 = 0xFEE,
+/// bits 19:12 = destination APIC ID.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn msix_msg_addr(apic_id: u32) -> u64 {
+    0xFEE0_0000u64 | ((apic_id as u64) << 12)
+}

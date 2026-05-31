@@ -373,6 +373,24 @@ pub struct NicOps {
     /// dispatcher treats `irq_idle_supported` as `false`.
     pub idle: Option<&'static NicIdleOps>,
 
+    /// Lightweight "arm RX interrupt ahead of a sustained-idle sleep"
+    /// hook for *polling* drivers (those that keep `idle: None` so their
+    /// busy-poll-under-load path is untouched). Called by the event
+    /// loop's sustained-idle gate just before it commits to a
+    /// timer-bounded HLT: the driver unmasks the calling core's RX
+    /// interrupt so the HLT wakes on a packet instead of only the timer
+    /// backstop, and returns `true` if RX work is *already* pending (the
+    /// caller then skips the sleep and re-polls). `None` = driver has no
+    /// interrupt-arming surface; the gate just sleeps on the timer.
+    ///
+    /// Distinct from [`idle`]: that reroutes the whole idle path through
+    /// `wait_for_events` (abandoning the sustained-idle gate); this is an
+    /// arm-only add-on so a polling driver gains wake-on-packet without
+    /// changing its load-path behaviour. The interrupt is armed only from
+    /// the deep-idle gate, so a busy core never arms it (zero hot-path
+    /// cost).
+    pub arm_rx_idle: Option<fn() -> bool>,
+
     /// Per-queue diagnostics. `None` = driver doesn't expose them;
     /// dispatcher returns zero arrays.
     pub diag: Option<&'static NicDiagOps>,
@@ -601,6 +619,7 @@ static NULL_OPS: NicOps = NicOps {
     flush_tx_kick_if_dirty: null_false,
     poke_interrupt_status: null_void,
     idle: None,
+    arm_rx_idle: None,
     diag: None,
 };
 

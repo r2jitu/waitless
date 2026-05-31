@@ -192,6 +192,7 @@ static MOCK_OPS: NicOps = NicOps {
     flush_tx_kick_if_dirty: no,
     poke_interrupt_status: unit,
     idle: None,
+    arm_rx_idle: None,
     diag: None,
 };
 
@@ -220,6 +221,7 @@ static MOCK_OPS_TSO: NicOps = NicOps {
     flush_tx_kick_if_dirty: no,
     poke_interrupt_status: unit,
     idle: None,
+    arm_rx_idle: None,
     diag: None,
 };
 

@@ -755,7 +755,15 @@ fn idle_cb(core_id: u32, idle_rounds: u32) {
     if !nic::irq_idle_supported() {
         #[cfg(target_arch = "x86_64")]
         if idle_rounds >= DEEP_IDLE_ROUNDS && kernel_bare::x86_64::apic::timer_available() {
-            kernel_bare::cpu::idle_bounded();
+            // Arm this core's RX interrupt (for a polling driver that
+            // supports it — gve via MSI-X) so the timer-bounded HLT wakes
+            // on a packet instead of only the ~1 ms timer backstop. If a
+            // packet already landed, skip the sleep and re-poll. Returns
+            // false (→ timer-only idle, today's behaviour) when the driver
+            // has no interrupt-arming surface.
+            if !nic::arm_rx_idle() {
+                kernel_bare::cpu::idle_bounded();
+            }
         }
         #[cfg(not(target_arch = "x86_64"))]
         let _ = idle_rounds;

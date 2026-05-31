@@ -245,6 +245,16 @@ pub fn rearm_rx_napi(core_id: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Arm the calling core's RX interrupt ahead of a sustained-idle sleep
+/// (polling drivers only — see [`nic_api::NicOps::arm_rx_idle`]). Returns
+/// `true` if RX work is already pending (caller skips the sleep). Returns
+/// `false` when the driver has no such surface, so a polling driver
+/// without interrupt support transparently falls back to a timer-only
+/// idle.
+pub fn arm_rx_idle() -> bool {
+    active_ops().arm_rx_idle.map(|f| f()).unwrap_or(false)
+}
+
 // ---- Diagnostics (/obs `nic` block) ---------------------------------------
 
 pub fn rx_counts() -> [u64; DIAG_QP_CAP] {

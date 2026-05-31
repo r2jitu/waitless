@@ -675,6 +675,7 @@ static GVE_OPS: NicOps = NicOps {
     flush_tx_kick_if_dirty: tx::flush_tx_kick_if_dirty,
     poke_interrupt_status: noop,
     idle: None,
+    arm_rx_idle: None,
     diag: Some(&GVE_DIAG_OPS),
 };
 
