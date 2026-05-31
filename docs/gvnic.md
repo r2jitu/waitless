@@ -479,15 +479,27 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
   `GVE_ITR_NO_UPDATE` (3<<3, which the device ignores, so the earlier
   disable was a no-op): arm = `ENABLE | ((us>>1 & 0xFFF)<<5)`, disable =
   `0` (per `gve_dqo.h` `gve_setup_itr_interval_dqo`); measured 742→2.8
-  IRQ/req. (2) BUT a **separate, DQO-specific latency regression remains**:
-  ~729 ms p50 on c3 (LAN) vs GQI's ~3 ms, no NIC drops, correct steering
-  (the disable hits the right block — hence the fixed storm). Root cause
-  unresolved (likely an ITR/PBA or interval-update side-effect on the RX
-  path); needs on-box debugging. The saturated c3 benchmark is unaffected
-  regardless (never idles → never arms). The correct ITR encoding is in
-  `irq_enable`/`irq_disable` (gated) for the eventual un-gate.
-  **Follow-up:** root-cause the DQO MSI-X latency regression, then drop the
-  `enable_irq` DQO early-return. Observability: `/obs` `nic.counters.rx_irq`.
+  IRQ/req. (2) BUT a **fundamental, DQO-specific regression remains** that a
+  second investigation could not crack remotely. Symptom: the server
+  **works until the first deep-idle arm, then goes non-responsive** (deploy
+  health-check passes while cores are busy; `/health` then times out once
+  cores idle + arm the DQO MSI-X). RX frames *are* still received+counted
+  but responses don't complete (client retransmit storm). So **taking a DQO
+  MSI-X interrupt disrupts the RX→response path** — device-level, not the
+  arm/disarm mechanism. RULED OUT (each a c3 deploy): per-fire ITR write
+  (rewrote to ITR-set-once + MSI-X-table-mask arm/disarm — still broke,
+  ~426 ms / 9-of-20-fail); steering (verified `topo.apic_ids[qp]` IS core
+  qp's APIC id, smp.rs); multi-queue (`QUEUE_COUNT=1` was *worse*, 0/20);
+  missing CREATE_RX_QUEUE irq field (none — only `ntfy_id`). Measurements
+  were further confounded by a concurrent session on the same instance +
+  c3 SPOT preemption + flaky LAN-probe SSH. The saturated c3 benchmark is
+  unaffected regardless (never idles → never arms). The correct ITR
+  encoding is preserved (gated) in `irq.rs` for the eventual un-gate.
+  **Follow-up needs ON-BOX debugging** (remote deploy+/obs is insufficient):
+  packet-capture on a clean non-spot/non-shared instance to see if
+  responses leave the NIC; trace the DQO TX/completion path with a RX MSI-X
+  armed; diff the exact upstream `gve_napi_poll_dqo` completion/PBA
+  handshake for a per-interrupt step we omit. Obs: `/obs` `nic.counters.rx_irq`.
   See [[reference_idle_cpu_spin]].
 - `[ ]` **T8. 4 KiB RX buffers on DQO** (`BUFFER_SIZES` id=10
   advertises 4096; FreeBSD has `allow_4k_rx_buffers`). Lets more RSC
