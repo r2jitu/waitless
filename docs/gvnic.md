@@ -40,12 +40,14 @@ The two TX paths are **not** at feature parity:
   > **This is the gap, and it's closable.** Upstream Linux and
   > FreeBSD both run DQO TX *fully zero-copy with scatter-gather* on
   > this exact device — the bounce buffer is our simplification, not
-  > a hardware requirement, and the c3 stall is an implementation
-  > bug, not a hardware wall. The DQO TX path is also lossy under
-  > large-body load today: it **drops** on a full ring (no async
-  > back-pressure), measured ~0.5%/segment on `/static-64k` →
-  > RTO-driven p99 cliffs of 6.7–8.0 s. `/health` (small) sees 0
-  > drops. See [§Upstream driver reference](#upstream-driver-reference-verified-2026-05-30)
+  > a hardware requirement, and the c3 stall was an implementation
+  > bug (RE-on-every-descriptor + a completion field-decode), not a
+  > hardware wall. The large-body drop-on-full-ring that drove
+  > RTO-cliff p99s of 6.7–8.0 s is **fixed** (T2): the TX path now
+  > back-pressures — it sends only what the ring takes, leaves the
+  > rest queued, and resumes on the ACK that retires the in-flight
+  > burst (`tx_ring_full_drops` → 0, `/static-1m` p99 → ~22 ms). See
+  > [§Upstream driver reference](#upstream-driver-reference-verified-2026-05-30)
   > and [§Optimization roadmap](#optimization-roadmap-trackable).
 
 RX mirrors this split: DQO is zero-copy — the device's RX buffer is
@@ -284,40 +286,47 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
   **gated on T2**: large bodies still hit the ring-full drop (see T2).
   *Status:* done, landed on main.
 
-- `[ ]` **T2. DQO TX back-pressure (stop dropping on a full ring).**
-  *What:* when the TX ring is full, stop the send and wake on TX
-  completion, instead of the silent `let _ = send_on_qp` drop +
-  `snd_nxt` advancing over un-sent bytes. *Why:* **now the top lever**
-  — with T1 landed, the large-response win is entirely gated here.
-  *Measured on c3-highcpu-8 (gVNIC DQO), raw output, post-T1:*
-  `/static-64k` TLS c4000 = **33,179 rps**, `tx_ring_full_drops`
-  **+103,027**, p99 **7.49 s**, 84 timeouts. `/static-1m` TLS c1000
-  = **2,349 rps**, drops **+27,719**, p99 **8.27 s**, 119 timeouts.
-  The ring is 256 descriptors = 128 packets/qp; a 64 KB response is
-  ~45 frames and 1 MB is ~715, so a single large response overruns it
-  and the overflow is dropped → RTO. This is **latency** (and, here,
-  throughput) recovery for large responses, not a `/health` win.
-  *Hooks identified (verified against code):* (1) `nic::send` is
-  fire-and-forget today; `dqo::send_on_qp` already returns
-  `false`+counts on ring-full — thread that boolean up through
-  `build_and_send_frame` so the per-MSS loop in
-  `async_try_send_chain` (`send.rs:658+`) stops on the first failed
-  frame and advances `snd_nxt` only by bytes actually on the wire,
-  leaving the remainder in the chain. (2) The reactor's
-  `TcpSendChain::poll` (`reactor/tcp.rs:1109`) already parks the send
-  waker on `Ok(0)` and re-probes — return `Ok(0)` on ring-full so it
-  parks. (3) The wake: send wakers are per-conn (`c.send_waker`),
-  woken today only from the ACK path (`receive.rs:447`). Add a
-  poll-driven TX-writable wake — after the event loop drains TX
-  completions (`tx_drain` frees ring space), wake the send wakers of
-  conns parked on ring-full (the driver has no conn registry, so this
-  is event-loop-driven, not a driver→TCP call). Distinguish ring-full
-  park from window-closed park so the persist timer isn't mis-armed
-  (`snd_wnd != 0` on ring-full). *Verify:* `/static-1m` TLS p99 drops
-  from seconds to ms; `tx_ring_full_drops` → ~0; `/static-64k`/`1m`
-  rps recovers. *Status:* design + hooks pinned
-  ([[reference_tx_async_spin_measured]]); spans drivers/nic +
-  net/tcp + runtime/executor with wake-race care — its own pass.
+- `[x]` **T2. DQO TX back-pressure (stop dropping on a full ring).**
+  *What:* stop the silent `let _ = send_on_qp` drop on a full TX ring;
+  send only what the ring takes, leave the rest queued, and resume on
+  the ACK that retires the in-flight burst.
+  *Why:* with T1 landed this was the top lever — the large-response
+  cliff was entirely here. Pre-T2 on c3-highcpu-8 (raw): `/static-64k`
+  TLS c4000 = 33,179 rps, `tx_ring_full_drops` **+103,027**, p99
+  **7.49 s**, 84 timeouts; `/static-1m` c1000 = 2,349 rps, **+27,719**
+  drops, p99 **8.27 s**, 119 timeouts. Ring = 256 desc = 128 pkt/qp; a
+  64 KB response ≈ 45 frames, 1 MB ≈ 715 — one response overran it and
+  the overflow dropped → RTO.
+  *Implementation (no new wake plumbing needed):* `nic::has_direct_fill()`
+  distinguishes `acquire_tx_buf`'s two `None` cases (no direct-fill vs
+  ring-full). `build_and_send_frame` returns `bool`, returning `false`
+  on a full direct-fill ring **without** running `fill` so the chain
+  cursor stays un-read. `send_segment_from_cursor` → `bool`;
+  `send_per_mss_fallback`/`send_super_segment_from_cursor` →
+  bytes-actually-sent; `async_try_send_chain` advances `snd_nxt` + the
+  rtx queue by that `actually_sent` and returns `Ok(actually_sent)`.
+  `Ok(0)` parks the reactor's `TcpSendChain` (existing); since the
+  in-flight burst is now really on the wire (not dropped), the peer
+  ACKs it and the existing `tcp_receive` `usable_window()>0` wake
+  re-polls the send within an RTT once the ring has drained —
+  RTT-clocked bursts instead of an RTO cliff.
+  *Verified on c3-highcpu-8 (gVNIC DQO), raw `wrk`/`/obs` output:*
+  **cliff eliminated** — `/static-1m` TLS c1000 p99 **8.27 s →
+  22.24 ms** (370×); `/static-64k` c4000 p99 **7.49 s → ~2.0 s**;
+  `tx_ring_full_drops` **0**, **0 timeouts** (were 84/119), and only
+  **2** total `data_retransmits` (`rtx_giveups=0`) → no wire loss.
+  `/health` TLS -t8 = **450,803 rps**, neutral (hot path unaffected).
+  rps stays bandwidth-bound (~2.2 GB/s egress on one loadgen) — the
+  win is latency + zero failed requests, not rps.
+  *Residual / follow-up:* the `/static-64k` c4000 p99 ~2 s tail is
+  egress-saturation queueing under 4000 conns (no drops, no RTO) — we
+  traded the drop+RTO cliff for bounded back-pressured queueing. A
+  sub-RTT **TX-completion waker** (wake parked send-wakers from the
+  event loop after `tx_drain` frees ring space, instead of waiting for
+  the ACK) would refill the ring faster on high-BDP / high-churn paths
+  and tighten that tail; not needed to remove the cliff on GCE's
+  low-RTT fabric. *Status:* done, landed on main.
+  ([[reference_tx_async_spin_measured]])
 
 ### Tier 2 — throughput offloads (after T1)
 
