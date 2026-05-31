@@ -7,6 +7,59 @@ are code-grounded (file:line in the source); the perf trackers
 [`tx-path-optimizations.md`](tx-path-optimizations.md), and
 [`high-concurrency-perf.md`](high-concurrency-perf.md) hold the per-item history.
 
+## Update (2026-05-30) — measured: the central thesis was wrong
+
+This audit was written from static code reading. A per-core magazine
+allocator was then built to attack the "heap lock = #1 lever" thesis below,
+and origin/main was profiled on GCE. **Both the magazine A/B and the
+per-stage CPU decomposition falsify the thesis.** The numbers below are raw
+`scripts/profile_obs.py` output over `/obs` deltas on **c3-highcpu-8 + gVNIC,
+TLS `/health` keep-alive** (use [`obswin.sh`](../scripts/bench/obswin.sh) +
+[`twolg.sh`](../scripts/bench/twolg.sh) to reproduce).
+
+**The heap lock is not the bottleneck.** A per-core magazine front-end made
+the hot allocs 99.95% lock-free on the contended gve-8c path it was built
+for, and bought **~0 throughput** (gve-8c OFF 576K vs ON 570K/565K). The
+"+67% `tcp_send` tax at 8c" is real micro-overhead but not throughput-
+limiting. Magazine kept default-OFF; not landing.
+
+**The architecture is already shared-nothing, and it scales.** Under TRUE
+saturation (2× loadgen, ~950K rps TLS, 28.7M reqs, **idle 0%**): all 8 cores
+99.7–99.8% busy, perfectly balanced, **1.0 rx_call/req + 1.0 send_call/req**,
+zero visible cross-core contention. So 0-allocs/req is *not* the lever — the
+serve path that contains the alloc is a small slice:
+
+| stage (saturated, 24,192 cy/req total) | share |
+|---|---|
+| **NIC driver** (gVNIC RX/TX poll+flush) | **38.9%** |
+| async-dispatch residual (recv-plumbing + future poll) | 22.1% |
+| TLS (encrypt 9.5 + decrypt 7.1) | 16.6% |
+| http parse/handler/build | 9.7% |
+| **tcp_send (incl. the 1 alloc)** | **6.0%** |
+| tcp_receive + tcp_tick | 6.7% |
+
+**The NIC poll busy-spins.** event-loop loops/req: 30.9 under-loaded
+(96.8% return no RX frame) → 9.4 saturated (89.3% empty). At half-load the
+cores are still pinned 99.8% busy on empty polls — "idle 0%" means the poll
+loop never sleeps, *not* that all cycles are useful work.
+
+**Re-prioritized levers** (this supersedes "two levers, one nexus" below):
+1. **NIC poll discipline** — stop busy-spinning empty polls (adaptive /
+   event-driven poll, sleep-with-doorbell-wake). Reclaims wasted cycles at
+   sub-saturation; cuts latency + power.
+2. **async-dispatch residual (~22%) + gVNIC driver (~39%)** under saturation
+   — structural (softirq-inline / async-flatten / driver batching), matching
+   the `reference_tls_perf_levers` conclusion that this needs a big
+   structural lever, not micro-opts.
+3. **Stop the allocs/copies/heap-lock micro-work** — Tier-1 below targets a
+   slice measured at <10% of cycles. Allocs/req=0 already landed (`1d46f90`)
+   and is fine to keep, but it is not a throughput lever.
+
+Everything below is the original 2026-05-28 static audit, kept for the
+code-grounded findings (RX zero-copy, the sub-MSS TX fallback, mem/conn
+slopes) — but read its "highest impact" / "heap lock" framing as **corrected
+by this block**.
+
 ## Current state
 
 | Axis | Current (golden path) | Optimal? | Gap |
@@ -14,7 +67,7 @@ are code-grounded (file:line in the source); the perf trackers
 | **Mem / connection** | ~31 KB idle / ~50 KB active established TLS conn (rx_ring 16 KB + handler future ~9.5 KB + `TlsConnImpl` ~5.3 KB; +record_scratch 16 KB lazy when active) | Close, but rx_ring + header arrays are oversized for small requests | ~16 KB/conn reclaimable |
 | **Allocs / request** | **1 alloc + 1 free** — the response header's `into_owned()` copy in `rtx_push` (RFC 6298 retain of the borrowed header) | No — reachable **0/req** | 1 alloc, and it's heap-lock-contended (~1,245 cy) |
 | **Copies / request** | **RX: 0 structural** (zero-copy `pending_chunk` move + in-place AEAD decrypt + in-place parse). **TX: 3 structural** (+1 inherent header format) | RX optimal; TX not — sub-MSS misses the TSO direct-encrypt path | 2–3 TX copies removable |
-| **Cross-core sync** | Per-core sharded executor + conns; accept handoff and ACK→send-waker wake are **same-core**. The **one** true contention point is the global heap spinlock | No — the heap lock | The +67% send-path tax at 8c and sub-linear scaling |
+| **Cross-core sync** | Per-core sharded executor + conns; accept handoff and ACK→send-waker wake are **same-core**. ⚠️ *Claimed the global heap spinlock was the one true contention point — **falsified**, see the 2026-05-30 update: GCE-measured shared-nothing, 8 cores 99.8% balanced, no cross-core contention.* | **Yes, already** | The +67% send tax is real micro-overhead but not throughput-limiting (magazine A/B flat) |
 
 **What's already optimal (do not re-touch):** RX is essentially zero-copy on the
 golden path; the `rtx_queue` `VecDeque` migration (155→88 KB/conn) is done; the
@@ -25,6 +78,11 @@ HVF-runner-only). On c3/gVNIC we run Tier 1 (per-core RX queues) — the Tier-2
 `RX_LOCK`/distributor/`RxInbox` only fires on single-queue GQI (n2/e2).
 
 ## The synthesis — two levers, one nexus
+
+> ⚠️ **Superseded by the 2026-05-30 update.** The "per-core slab is the #1
+> lever" claim below was the hypothesis the magazine was built to test; it
+> was measured FALSE (flat throughput, heap lock not the bottleneck). Kept
+> verbatim as the pre-measurement reasoning.
 
 Three of the four axes converge:
 
@@ -58,6 +116,15 @@ very high connection counts.
 ## Prioritized plan
 
 ### Tier 1 — cross-dimension levers (highest impact)
+
+> **1. — DONE, NEGATIVE RESULT (2026-05-30).** The magazine was built, boot-
+> fixed, thrash-fixed, and validated correct (gve-8c hit-rate 99.95%, no
+> thrash) — but bought **~0 throughput** (gve-8c OFF 576K vs ON 570K/565K).
+> The expected "+67% tax removed → tokio gap 1.7×→2.3–2.5×" did **not**
+> materialise because the heap lock was never the throughput bottleneck (see
+> the 2026-05-30 update). Kept default-OFF on `bool_flag`; not landing on
+> main. The branch `perf/tls-beat-tokio` (cd35f87) preserves it for
+> reference. Original plan text follows.
 
 **1. Per-core slab / magazine allocator front-end.** *Axes: cross-core sync #1,
 allocs/req.* Per-core, per-size-class free-lists serve the hot path lock-free;
