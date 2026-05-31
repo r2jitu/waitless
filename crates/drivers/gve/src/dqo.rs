@@ -92,6 +92,20 @@ pub static DQO_TX_MISS_COMPL: core::sync::atomic::AtomicU64 = core::sync::atomic
 pub static DQO_TX_REINJECT_COMPL: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Count of frames `send_on_qp` rejected because the TX ring was
+/// within 2 descriptors of full — the masked-tail == head "device
+/// sees an empty ring" hazard guard (see the drop site in
+/// `send_on_qp`). Unlike virtio/GQI, the DQO path does NOT spin to
+/// wait for a free slot: it returns `false` and the frame is
+/// recovered by TCP RTO retransmit. So a non-zero value means
+/// latency stalls under TX saturation (one RTO per drop), NOT data
+/// loss. This is a COLD-site counter (only bumped when actually
+/// dropping); it deliberately avoids the per-send/per-completion hot
+/// path, where a shared-cache-line atomic costs ~30% TX throughput
+/// (see `DQO_TX_MISS_COMPL` note above).
+pub static DQO_TX_RING_FULL_DROPS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Count of RX completion descriptors we saw with a valid generation
 /// (device has written this slot) but that we did NOT deliver to the
 /// callback because one of: `buf_id` out of range, EOP bit clear, or
@@ -404,6 +418,7 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8], csum: nic_api::CsumOffload) -> 
         // Capping `in_flight` at `ring_entries - 2` guarantees the
         // masked tail and head always differ.
         if in_flight + 2 > ring_entries - 2 {
+            DQO_TX_RING_FULL_DROPS.fetch_add(1, Ordering::Relaxed);
             return false;
         }
     }
