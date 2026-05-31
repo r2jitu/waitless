@@ -54,28 +54,37 @@ pub(crate) fn submit_tx_udp_gso(
     gqi::submit_tx_udp_gso_inner(handle, frame_len, hdr_len, csum_start, gso_size);
 }
 
-/// Public direct-fill TX entry — picks the calling worker's qp,
-/// scans for a free slot, returns a handle into the per-slot
-/// QPL page (GQI_QPL only).
+/// Public direct-fill TX entry — picks the calling worker's qp and
+/// returns a handle into the per-slot send buffer the caller fills
+/// in place (no scratch→buffer memcpy).
 ///
-/// On DQO_RDA returns `None` so callers fall through to the
-/// slice-shaped `send_on_qp_dqo` path (one extra memcpy per
-/// frame). A DQO direct-fill landed once but always stalled on
-/// real c3 hardware under load, so it was removed; everything
-/// goes through `send_on_qp_dqo` until that's diagnosed.
+/// * GQI_QPL: a slot from the two-pool QPL allocator.
+/// * DQO_RDA: the next ring slot's bounce buffer
+///   ([`dqo::acquire_tx_buf`]). The descriptor emission is the same
+///   proven (general-ctx, pkt) pair the slice path uses — RE spaced
+///   ≥ 32 descriptors, `tx_head`-driven `done_cnt`. The original DQO
+///   direct-fill stall was an RE-on-every-descriptor +
+///   completion-decode bug, both long fixed in that shared path.
+///
+/// Returns `None` when the ring/pool is full; the caller
+/// (`build_and_send_frame`) falls back to the slice `send`.
 pub(crate) fn acquire_tx_buf() -> Option<nic_api::TxBufHandle> {
+    let qp = current_qp()?;
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
-        return None;
+        return dqo::acquire_tx_buf(qp);
     }
-    gqi::acquire_tx_buf_for_qp(current_qp()?)
+    gqi::acquire_tx_buf_for_qp(qp)
 }
 
 /// Public submit — paired with [`acquire_tx_buf`]. Consumes the
-/// handle (slot returns to pool on device completion). GQI_QPL
-/// only: callers never get a real handle in DQO mode (acquire
-/// returns None), so there's no DQO branch.
+/// handle; the slot is freed/recycled on device completion.
+/// Dispatches on the negotiated queue format, mirroring `send`.
 pub(crate) fn submit_tx(handle: nic_api::TxBufHandle, frame_len: usize, csum: nic_api::CsumOffload) {
-    gqi::submit_tx_inner(handle, frame_len, csum);
+    if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
+        dqo::submit_tx(handle, frame_len, csum);
+    } else {
+        gqi::submit_tx_inner(handle, frame_len, csum);
+    }
 }
 
 /// Public TSO acquire — picks the calling worker's qp and returns

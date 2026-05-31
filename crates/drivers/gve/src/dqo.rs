@@ -370,77 +370,81 @@ fn build_pkt_desc(buf_addr: u64, flags: u8, compl_tag: u16, buf_size: u16) -> u1
 
 // ---- TX send path ----------------------------------------------------------
 
-/// Slice-shaped send: copy `data` into the next ring's bounce buffer,
-/// emit a (general-ctx, pkt) descriptor pair, advance fill_cnt,
-/// doorbell unless deferred. `csum` enables the device's L4 CSUM
-/// offload for the packet descriptor; `tx_path_hash` fills the
-/// general-context descriptor's flow-hash.
-pub(crate) fn send_on_qp(qp: usize, data: &[u8], csum: nic_api::CsumOffload) -> bool {
-    if qp >= MAX_QUEUE_PAIRS || data.is_empty() || data.len() > (RX_BUFFER_SIZE as usize) {
-        return false;
-    }
-    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
-    if tx_ptr.is_null() {
-        return false;
-    }
-    let tx = unsafe { &*tx_ptr };
-    let bar2_va = BAR2_VA.load(Ordering::Acquire);
-
-    // Drain only when we're getting close to a full ring. Linux's
-    // gve_tx_dqo drains only from NAPI poll, not per-send; the
-    // event loop's `poll_qp_inner` keeps `done_cnt` fresh in the
-    // common case. Per-send drain was costing significant cycles
-    // on the fresh-conn hot path (touching the completion ring's
-    // DMA-coherent cache line on every send).
+/// Reserve room for one more packet (a general-ctx + pkt descriptor
+/// pair) and return the `fill_cnt` to emit at, or `None` if the ring
+/// is within the masked-tail headroom of full.
+///
+/// Drains the completion ring only when we're getting close to a full
+/// ring. Linux's `gve_tx_dqo` drains only from NAPI poll, not
+/// per-send; the event loop's `poll_qp_inner` keeps `done_cnt` fresh
+/// in the common case. Per-send drain was costing significant cycles
+/// on the fresh-conn hot path (touching the completion ring's
+/// DMA-coherent cache line on every send).
+///
+/// The headroom check rejects with one packet (2 descriptors) of
+/// slack — the TX ring must never fill *completely*. The doorbell
+/// carries the masked producer position `fill_cnt & mask`; with a
+/// full ring `fill_cnt - done == ring_entries`, so
+/// `fill_cnt & mask == done & mask` — the masked tail collides with
+/// the device's head, and the device reads tail == head as "ring
+/// empty" and stops servicing the queue entirely. That stall is
+/// permanent (the driver then can't send to un-stick it) and silently
+/// drops every egress packet, SYN-ACKs included. It's the same
+/// masked-position hazard the RX ring already avoids by leaving its
+/// last slot empty (see `post_initial_rx_for_qp`). Capping `in_flight`
+/// at `ring_entries - 2` guarantees the masked tail and head always
+/// differ.
+///
+/// On `None` the caller bumps `DQO_TX_RING_FULL_DROPS` (slice path) or
+/// returns to the slice fallback (direct-fill `acquire_tx_buf`).
+#[inline]
+fn tx_reserve(tx: &TxQueue) -> Option<u32> {
     let fill_cnt = tx.fill_cnt.load(Ordering::Relaxed);
     let mut done_cnt = tx.done_cnt.load(Ordering::Relaxed);
     let mut in_flight = fill_cnt.wrapping_sub(done_cnt);
     // Each packet emits 2 descriptors (general context + pkt).
     let ring_entries = tx.ring_entries as u32;
     if in_flight + 64 > ring_entries {
-        // Approaching full — drain to make sure done_cnt is current
-        // before we reject the send.
         tx_drain(tx);
         done_cnt = tx.done_cnt.load(Ordering::Relaxed);
         in_flight = fill_cnt.wrapping_sub(done_cnt);
-        // Reject with one packet (2 descriptors) of headroom — the
-        // TX ring must never fill *completely*. The doorbell carries
-        // the masked producer position `fill_cnt & mask`; with a
-        // full ring `fill_cnt - done == ring_entries`, so
-        // `fill_cnt & mask == done & mask` — the masked tail
-        // collides with the device's head, and the device reads
-        // tail == head as "ring empty" and stops servicing the
-        // queue entirely. That stall is permanent (the driver then
-        // can't send to un-stick it) and silently drops every
-        // egress packet, SYN-ACKs included. It's the same
-        // masked-position hazard the RX ring already avoids by
-        // leaving its last slot empty (see `post_initial_rx_for_qp`).
-        // Capping `in_flight` at `ring_entries - 2` guarantees the
-        // masked tail and head always differ.
         if in_flight + 2 > ring_entries - 2 {
-            DQO_TX_RING_FULL_DROPS.fetch_add(1, Ordering::Relaxed);
-            return false;
+            return None;
         }
     }
+    Some(fill_cnt)
+}
 
+/// Emit the (general-ctx, pkt) descriptor pair for one packet whose
+/// bytes already live in the per-slot bounce buffer at the pkt-desc
+/// ring position (DMA address `buf_phys`), advance `fill_cnt` by 2,
+/// and doorbell unless deferred. `frame` is the packet bytes — used
+/// for the flow path-hash and the descriptor `buf_size`; it must be
+/// the same bytes the device will DMA from `buf_phys`.
+///
+/// Shared by the slice path (`send_on_qp`, after its memcpy into the
+/// bounce buffer) and the direct-fill path (`submit_tx`, where the
+/// caller filled the slot in place). `buf_phys` must be the bounce
+/// buffer for `slot == (fill_cnt + 1) & mask` (the pkt-desc position)
+/// — both callers derive it that way, and this fn re-derives the same
+/// `pkt_idx` for the ring write and completion tag, so they coincide.
+#[inline]
+fn emit_ctx_pkt(
+    tx: &TxQueue,
+    bar2_va: u64,
+    fill_cnt: u32,
+    buf_phys: u64,
+    frame: &[u8],
+    csum: nic_api::CsumOffload,
+) {
     let mask = (tx.ring_entries - 1) as u32;
     let ctx_idx = (fill_cnt & mask) as usize;
     let pkt_idx = (fill_cnt.wrapping_add(1) & mask) as usize;
-    let slot = pkt_idx;
-
-    // Per-slot bounce buffer: send copies the packet here so the
-    // descriptor can hand the device a stable DMA address.
-    let buf_offset = (slot as u32) * (RX_BUFFER_SIZE as u32);
-    let buf_va = (tx.qpl_base_va + buf_offset as u64) as *mut u8;
-    let buf_phys = tx.qpl_base_phys + buf_offset as u64;
-    unsafe {
-        ptr::copy_nonoverlapping(data.as_ptr(), buf_va, data.len());
-    }
 
     // Flow-hash for Andromeda's per-flow fast path. The CSUM-offload
     // decision is the caller's `csum` hint, applied to the packet
     // descriptor below.
-    let path_hash = tx_path_hash(data);
+    let path_hash = tx_path_hash(frame);
 
     // Build the 16-byte general context descriptor as a single u128
     // so the store hits memory atomically. Layout per gve_desc_dqo.h:
@@ -470,7 +474,7 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8], csum: nic_api::CsumOffload) -> 
         flags |= DQO_TX_FLAG_REPORT_EVENT;
         tx.last_re_at_fill.store(fill_cnt, Ordering::Relaxed);
     }
-    let pkt_val: u128 = build_pkt_desc(buf_phys, flags, slot as u16, data.len() as u16);
+    let pkt_val: u128 = build_pkt_desc(buf_phys, flags, pkt_idx as u16, frame.len() as u16);
     let pkt_ptr = (tx.ring_va as *mut u128).wrapping_add(pkt_idx);
     unsafe {
         ptr::write_volatile(pkt_ptr, pkt_val);
@@ -479,6 +483,7 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8], csum: nic_api::CsumOffload) -> 
     let new_fill = fill_cnt.wrapping_add(2);
     tx.fill_cnt.store(new_fill, Ordering::Release);
 
+    let done_cnt = tx.done_cnt.load(Ordering::Relaxed);
     let near_full = new_fill.wrapping_sub(done_cnt) >= (tx.ring_entries as u32) - 16;
     if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
         // `doorbell_write_le` includes the `sfence` that drains the
@@ -488,7 +493,140 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8], csum: nic_api::CsumOffload) -> 
         doorbell_write_le(bar2_va, tx.db_offset, new_fill & mask);
         tx.last_kicked.store(new_fill, Ordering::Relaxed);
     }
+}
+
+/// Per-slot bounce buffer for the pkt descriptor at `fill_cnt + 1`.
+/// Returns `(slot, va, phys)`. The bounce pool mirrors the ring slot
+/// 1:1 (`DQO_TX_POOL_BUFS == TX_RING_ENTRIES`), so the slot index ==
+/// the pkt-desc ring position and reuse is implicit as `fill_cnt`
+/// cycles past it (gated below `ring_entries - 2` so the device has
+/// long finished DMA-reading that buffer before we wrap onto it).
+#[inline]
+fn pkt_bounce_buf(tx: &TxQueue, fill_cnt: u32) -> (usize, u64, u64) {
+    let mask = (tx.ring_entries - 1) as u32;
+    let slot = (fill_cnt.wrapping_add(1) & mask) as usize;
+    let buf_offset = (slot as u32) * (RX_BUFFER_SIZE as u32);
+    (
+        slot,
+        tx.qpl_base_va + buf_offset as u64,
+        tx.qpl_base_phys + buf_offset as u64,
+    )
+}
+
+/// Slice-shaped send: copy `data` into the next ring's bounce buffer,
+/// emit a (general-ctx, pkt) descriptor pair, advance fill_cnt,
+/// doorbell unless deferred. `csum` enables the device's L4 CSUM
+/// offload for the packet descriptor; `tx_path_hash` fills the
+/// general-context descriptor's flow-hash.
+///
+/// This is the fallback for callers that build the frame elsewhere
+/// (e.g. control segments, or any path that didn't take the
+/// direct-fill `acquire_tx_buf` route). It carries one extra memcpy
+/// vs direct-fill — the scratch→bounce copy below.
+pub(crate) fn send_on_qp(qp: usize, data: &[u8], csum: nic_api::CsumOffload) -> bool {
+    if qp >= MAX_QUEUE_PAIRS || data.is_empty() || data.len() > (RX_BUFFER_SIZE as usize) {
+        return false;
+    }
+    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+    if tx_ptr.is_null() {
+        return false;
+    }
+    let tx = unsafe { &*tx_ptr };
+    let bar2_va = BAR2_VA.load(Ordering::Acquire);
+
+    let fill_cnt = match tx_reserve(tx) {
+        Some(f) => f,
+        None => {
+            DQO_TX_RING_FULL_DROPS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    };
+
+    let (_slot, buf_va, buf_phys) = pkt_bounce_buf(tx, fill_cnt);
+    unsafe {
+        ptr::copy_nonoverlapping(data.as_ptr(), buf_va as *mut u8, data.len());
+    }
+    emit_ctx_pkt(tx, bar2_va, fill_cnt, buf_phys, data, csum);
     true
+}
+
+/// DQO direct-fill acquire. Reserve the next packet's bounce-buffer
+/// slot and hand the caller a writable view of it so the upper layer
+/// (TCP `build_and_send_frame`) assembles the L2 frame directly in
+/// the DMA buffer — eliminating the scratch→bounce memcpy the slice
+/// `send_on_qp` path pays. Returns `None` when the ring is within the
+/// masked-tail headroom of full so the caller falls back to the slice
+/// path (which then drops + counts if still full).
+///
+/// Does NOT advance `fill_cnt`: the matching [`submit_tx`] recomputes
+/// the slot from the (unchanged) `fill_cnt` and emits the descriptor
+/// pair. Acquire+submit must be paired synchronously on the qp's
+/// owning core — Tier 1 pins one core per qp, exactly the contract
+/// GQI's direct-fill path already documents. A dropped (unsubmitted)
+/// handle is a no-op: `fill_cnt` never moved, so the next acquire
+/// returns the same slot (`release_noop`).
+///
+/// Buffer lifetime is identical to the slice path: the bounce buffer
+/// is driver-owned and reused only when `fill_cnt` cycles back onto
+/// its ring position, well after the device has DMA-read and
+/// completed it (the `tx_reserve` headroom guarantees this). So
+/// direct-fill adds no new lifetime hazard over the proven slice
+/// path — it just fills the same buffer in place.
+pub(crate) fn acquire_tx_buf(qp: usize) -> Option<nic_api::TxBufHandle> {
+    if qp >= MAX_QUEUE_PAIRS {
+        return None;
+    }
+    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+    if tx_ptr.is_null() {
+        return None;
+    }
+    let tx = unsafe { &*tx_ptr };
+    let fill_cnt = tx_reserve(tx)?;
+    let (_slot, buf_va, _buf_phys) = pkt_bounce_buf(tx, fill_cnt);
+    Some(nic_api::TxBufHandle {
+        data_ptr: buf_va as *mut u8,
+        data_cap: RX_BUFFER_SIZE as u32,
+        driver_token: qp as u64,
+        release_fn: release_noop,
+    })
+}
+
+/// No-op release for a dropped (unsubmitted) DQO direct-fill handle.
+/// `acquire_tx_buf` doesn't advance `fill_cnt`, so dropping a handle
+/// leaves the ring untouched and the next acquire returns the same
+/// slot — there's nothing to free.
+fn release_noop(_token: u64) {}
+
+/// DQO direct-fill submit. The caller filled the bounce buffer that
+/// [`acquire_tx_buf`] handed back; emit the (ctx, pkt) descriptor
+/// pair pointing at it. Recomputes the slot from the current
+/// `fill_cnt` — unchanged since acquire under the synchronous-pairing
+/// contract, so it addresses exactly the buffer the caller wrote.
+pub(crate) fn submit_tx(handle: nic_api::TxBufHandle, frame_len: usize, csum: nic_api::CsumOffload) {
+    let qp = handle.driver_token as usize;
+    // The slot is going in-flight, not idle — skip the drop's
+    // `release_noop` (a no-op anyway; mem::forget keeps the intent
+    // explicit and matches GQI's `submit_tx_inner`).
+    core::mem::forget(handle);
+    if qp >= MAX_QUEUE_PAIRS || frame_len == 0 || frame_len > RX_BUFFER_SIZE as usize {
+        return;
+    }
+    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+    if tx_ptr.is_null() {
+        return;
+    }
+    let tx = unsafe { &*tx_ptr };
+    let bar2_va = BAR2_VA.load(Ordering::Acquire);
+
+    let fill_cnt = tx.fill_cnt.load(Ordering::Relaxed);
+    let (_slot, buf_va, buf_phys) = pkt_bounce_buf(tx, fill_cnt);
+    // SAFETY: the bounce buffer at this slot was just filled by the
+    // caller via the handle's `data_mut()`; the device DMAs the same
+    // `frame_len` bytes from `buf_phys`. Reading them back here for
+    // the flow path-hash is sound (driver-owned DMA-coherent memory,
+    // `frame_len <= RX_BUFFER_SIZE` checked above).
+    let frame = unsafe { core::slice::from_raw_parts(buf_va as *const u8, frame_len) };
+    emit_ctx_pkt(tx, bar2_va, fill_cnt, buf_phys, frame, csum);
 }
 
 // ---- RX post / poll --------------------------------------------------------

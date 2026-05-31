@@ -636,9 +636,11 @@ static GVE_OPS: NicOps = NicOps {
     name: "gve",
     probe,
     send: tx::send,
-    // Direct-fill TX: GQI_QPL implemented; DQO_RDA returns None
-    // and callers fall back to the slice-shaped `send` (one extra
-    // memcpy per frame). Wiring DQO direct-fill is a follow-up.
+    // Direct-fill TX: both formats fill the device send buffer in
+    // place (no scratch→buffer memcpy). GQI_QPL uses its two-pool
+    // QPL allocator; DQO_RDA hands back the next ring slot's bounce
+    // buffer and emits the same proven (ctx, pkt) descriptor pair as
+    // its slice path. Callers fall back to slice `send` when full.
     acquire_tx_buf: Some(tx::acquire_tx_buf),
     submit_tx: Some(tx::submit_tx),
     // TSO v4 / v6 via GQI's `GVE_TXD_TSO` + `GVE_TXD_SEG` desc
