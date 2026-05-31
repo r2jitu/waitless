@@ -346,6 +346,27 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
   cwnd-clocked pacing for large transfers — so the whole direction is
   parked. Reverted before merge; ACK-paced back-pressure (above) is the
   shipped behaviour.
+  *High-RTT check (the colocated bench can't see it) — settled the
+  whole TX-ring-refill direction with data.* Real clients are 10–100s
+  of ms away; colocated GCE RTT is ~0.1 ms, so per-conn BDP ≪ ring and
+  the bench is blind to RTT effects. Induced one-way delay on the
+  loadgen (`tc netem`) and measured single-conn `/static-1m`: throughput
+  collapses **5,753 Mbps (≈0 RTT) → 18 Mbps (25 ms) → 8.6 Mbps (50 ms)**,
+  scaling as `1/RTT`, and is **per-connection** (`-c4` ≈ 4×). But the
+  yield build measured **byte-identical** at every RTT (2.25 / 1.08
+  rps) — the sub-RTT refill changed *nothing*. Reason: the 128-pkt ring
+  is *larger* than `cwnd` for most of a 1 MB transfer (slow-start ramps
+  10→20→40→80→160 pkts over RTTs), so the conn is **window-limited,
+  parking on ACK correctly** — never ring-limited, so `send_should_yield`
+  never fires. **The high-RTT collapse is TCP congestion control
+  (slow-start / cwnd growth), not the TX ring** — so SPSC frame queues,
+  TX-completion wakers, and deeper rings (all of which target the ring)
+  provably can't help it (measured). It also looks ~3× below textbook
+  slow-start (8.6 vs ~26 Mbps for 1 MB/50 ms) — *that* gap, if real, is
+  the lever for distant clients and lives in congestion control (IW,
+  slow-start growth, idle-restart, delayed-ACK interaction), a separate
+  subsystem from anything gve. Tools: `tc netem delay Nms` on the
+  loadgen `ens3`, `wrk -t1 -c1 /static-1m`.
 
 ### Tier 2 — throughput offloads (after T1)
 
