@@ -456,10 +456,32 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
   `idle_rounds` resets on any work, so under saturation the HLT path is
   never entered and the c3 throughput headline is untouched. Cost: the
   first packet after *sustained* idle waits up to the 1 ms re-poll
-  (gve has no RX IRQ to wake sooner) — negligible for a website, and
-  full MSI-X RX (wake *on packet*) is the remaining deferred item to
-  erase even that. Verified: both arches build, all host + qemu-x86_64
-  + HVF tests pass, qemu-TCG idle ~5 %. See [[reference_idle_cpu_spin]].
+  (gve has no RX IRQ to wake sooner) — negligible for a website. Verified:
+  both arches build, all host + qemu-x86_64 + HVF tests pass, qemu-TCG
+  idle ~5 %. See [[reference_idle_cpu_spin]].
+- `[x]` **T7 (MSI-X RX wake-on-packet) — GQI done, DQO deferred.** Erase
+  the ~1 ms re-poll above: a deeply-idle core arms its RX notification
+  block's MSI-X + IRQ doorbell (gve/src/irq.rs, via `nic::arm_rx_idle`
+  from the same deep-idle gate) so the timer-bounded HLT wakes the
+  instant a packet lands. gve stays `idle: None`; this only adds
+  wake-on-packet to the gate, so the busy-poll/throughput path is
+  unchanged. Entries are programmed **masked** and unmasked only from the
+  gate, so a busy core never arms — the saturated path is interrupt-free
+  by construction (the device config was already MSI-X-ready: base_idx=0,
+  mgmt vector last per upstream, so no change to `CONFIGURE_DEVICE_RESOURCES`).
+  **GCE-validated.** GQI (e2/n2, incl. the e2 website host): wake-on-packet
+  fires — 99 % idle preserved, 20/20 served after idle, ~2 IRQ/req, no
+  storm, no doorbell corruption. **DQO (c3/c4) is GATED OFF** (timer-only
+  idle, byte-identical to pre-T7): DQO's ITR has no per-fire disable that
+  takes effect (`GVE_ITR_NO_UPDATE` is ignored) — its only Linux-style
+  anti-storm is a coalescing *interval* kept armed for continuous NAPI,
+  which doesn't fit the arm-once/fire-once model and caused a ~742 IRQ/req
+  storm under sporadic traffic (c3 latency 95 ms→6.5 s). The saturated c3
+  benchmark is unaffected regardless (never idles → never arms); c3
+  re-validated gated: 12/12 served, tight 93–102 ms, 0 IRQs. **Follow-up:**
+  DQO ITR coalescing-interval setup + the correct disable/PBA handshake
+  (`gve_dqo.h` GVE_ITR_*), then un-gate `irq::enable_irq` for DQO.
+  Observability: `/obs` `nic.counters.rx_irq`. See [[reference_idle_cpu_spin]].
 - `[ ]` **T8. 4 KiB RX buffers on DQO** (`BUFFER_SIZES` id=10
   advertises 4096; FreeBSD has `allow_4k_rx_buffers`). Lets more RSC
   coalesces stay single-descriptor, reducing T4 stitching pressure.
