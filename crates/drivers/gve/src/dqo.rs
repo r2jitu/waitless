@@ -522,6 +522,38 @@ fn tx_reserve(tx: &TxQueue) -> Option<u32> {
     tx_reserve_n(tx, 2)
 }
 
+/// `DQO_TX_FLAG_REPORT_EVENT` if at least `DQO_TX_RE_INTERVAL`
+/// descriptors have passed since the last RE-flagged one (advancing
+/// the marker), else 0. Set on one packet descriptor per interval so
+/// the device keeps emitting DESC completions (which drive `done_cnt`)
+/// — flagging *every* descriptor instead stalls the queue under load.
+#[inline]
+fn re_flag(tx: &TxQueue, fill_pos: u32) -> u8 {
+    if fill_pos.wrapping_sub(tx.last_re_at_fill.load(Ordering::Relaxed)) >= DQO_TX_RE_INTERVAL {
+        tx.last_re_at_fill.store(fill_pos, Ordering::Relaxed);
+        DQO_TX_FLAG_REPORT_EVENT
+    } else {
+        0
+    }
+}
+
+/// Publish `new_fill` as the producer position and ring the TX
+/// doorbell, unless deferred-kick is on and the ring isn't near full.
+/// `doorbell_write_le`'s `sfence` drains the store buffer so the
+/// descriptors are PCIe-visible before the device sees the advanced
+/// tail. Shared by every DQO emit path (standard + TSO).
+#[inline]
+fn dqo_kick(tx: &TxQueue, bar2_va: u64, new_fill: u32) {
+    tx.fill_cnt.store(new_fill, Ordering::Release);
+    let done_cnt = tx.done_cnt.load(Ordering::Relaxed);
+    let near_full = new_fill.wrapping_sub(done_cnt) >= (tx.ring_entries as u32) - 16;
+    if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
+        let mask = (tx.ring_entries - 1) as u32;
+        doorbell_write_le(bar2_va, tx.db_offset, new_fill & mask);
+        tx.last_kicked.store(new_fill, Ordering::Relaxed);
+    }
+}
+
 /// Emit the (general-ctx, pkt) descriptor pair for one packet whose
 /// bytes already live in the per-slot bounce buffer at the pkt-desc
 /// ring position (DMA address `buf_phys`), advance `fill_cnt` by 2,
@@ -571,15 +603,9 @@ fn emit_ctx_pkt(
 
     // Packet descriptor. RE every 32nd descriptor per the device's
     // GVE_TX_MIN_RE_INTERVAL.
-    let last_re = tx.last_re_at_fill.load(Ordering::Relaxed);
-    let want_re = fill_cnt.wrapping_sub(last_re) >= DQO_TX_RE_INTERVAL;
-    let mut flags = DQO_TX_DTYPE_PKT | DQO_TX_FLAG_EOP;
+    let mut flags = DQO_TX_DTYPE_PKT | DQO_TX_FLAG_EOP | re_flag(tx, fill_cnt);
     if csum.is_some() {
         flags |= DQO_TX_FLAG_CSUM;
-    }
-    if want_re {
-        flags |= DQO_TX_FLAG_REPORT_EVENT;
-        tx.last_re_at_fill.store(fill_cnt, Ordering::Relaxed);
     }
     let pkt_val: u128 = build_pkt_desc(buf_phys, flags, pkt_idx as u16, frame.len() as u16);
     let pkt_ptr = (tx.ring_va as *mut u128).wrapping_add(pkt_idx);
@@ -587,19 +613,7 @@ fn emit_ctx_pkt(
         ptr::write_volatile(pkt_ptr, pkt_val);
     }
 
-    let new_fill = fill_cnt.wrapping_add(2);
-    tx.fill_cnt.store(new_fill, Ordering::Release);
-
-    let done_cnt = tx.done_cnt.load(Ordering::Relaxed);
-    let near_full = new_fill.wrapping_sub(done_cnt) >= (tx.ring_entries as u32) - 16;
-    if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
-        // `doorbell_write_le` includes the `sfence` that drains the
-        // CPU store buffer before the BAR2 write — required because
-        // PCIe DMA reads snoop L1/L2/L3 but not the store buffer.
-        // See `host_dma_fence` for the full story.
-        doorbell_write_le(bar2_va, tx.db_offset, new_fill & mask);
-        tx.last_kicked.store(new_fill, Ordering::Relaxed);
-    }
+    dqo_kick(tx, bar2_va, fill_cnt.wrapping_add(2));
 }
 
 /// `(va, phys)` of the per-slot bounce buffer for the pkt descriptor
@@ -915,20 +929,11 @@ fn emit_tso_descs(
     while remaining > 0 {
         let chunk = remaining.min(GVE_TX_MAX_BUF_SIZE_DQO as usize);
         let is_last = chunk == remaining;
-        // The device computes each emitted segment's L4 checksum.
+        // The device computes each emitted segment's L4 checksum. EOP +
+        // an RE flag (per the 32-desc interval) go on the last desc.
         let mut flags = DQO_TX_DTYPE_PKT | DQO_TX_FLAG_CSUM;
         if is_last {
-            flags |= DQO_TX_FLAG_EOP;
-            // RE on the last descriptor when the 32-desc interval has
-            // elapsed, so `done_cnt` keeps advancing (same discipline
-            // as `emit_ctx_pkt`).
-            let this_fill = fill_cnt.wrapping_add(desc_off);
-            if this_fill.wrapping_sub(tx.last_re_at_fill.load(Ordering::Relaxed))
-                >= DQO_TX_RE_INTERVAL
-            {
-                flags |= DQO_TX_FLAG_REPORT_EVENT;
-                tx.last_re_at_fill.store(this_fill, Ordering::Relaxed);
-            }
+            flags |= DQO_TX_FLAG_EOP | re_flag(tx, fill_cnt.wrapping_add(desc_off));
         }
         let pkt_val = build_pkt_desc(addr, flags, compl_tag, chunk as u16);
         record_tx_desc(qp as u8, tx_desc_kind::SEG, &pkt_val.to_le_bytes());
@@ -942,16 +947,8 @@ fn emit_tso_descs(
         desc_off += 1;
     }
 
-    let new_fill = fill_cnt.wrapping_add(desc_off);
-    tx.fill_cnt.store(new_fill, Ordering::Release);
     DQO_TX_TSO_SENT.fetch_add(1, Ordering::Relaxed);
-
-    let done_cnt = tx.done_cnt.load(Ordering::Relaxed);
-    let near_full = new_fill.wrapping_sub(done_cnt) >= (tx.ring_entries as u32) - 16;
-    if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
-        doorbell_write_le(bar2_va, tx.db_offset, new_fill & mask);
-        tx.last_kicked.store(new_fill, Ordering::Relaxed);
-    }
+    dqo_kick(tx, bar2_va, fill_cnt.wrapping_add(desc_off));
 }
 
 // ---- RX post / poll --------------------------------------------------------
