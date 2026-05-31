@@ -471,17 +471,24 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
   mgmt vector last per upstream, so no change to `CONFIGURE_DEVICE_RESOURCES`).
   **GCE-validated.** GQI (e2/n2, incl. the e2 website host): wake-on-packet
   fires — 99 % idle preserved, 20/20 served after idle, ~2 IRQ/req, no
-  storm, no doorbell corruption. **DQO (c3/c4) is GATED OFF** (timer-only
-  idle, byte-identical to pre-T7): DQO's ITR has no per-fire disable that
-  takes effect (`GVE_ITR_NO_UPDATE` is ignored) — its only Linux-style
-  anti-storm is a coalescing *interval* kept armed for continuous NAPI,
-  which doesn't fit the arm-once/fire-once model and caused a ~742 IRQ/req
-  storm under sporadic traffic (c3 latency 95 ms→6.5 s). The saturated c3
-  benchmark is unaffected regardless (never idles → never arms); c3
-  re-validated gated: 12/12 served, tight 93–102 ms, 0 IRQs. **Follow-up:**
-  DQO ITR coalescing-interval setup + the correct disable/PBA handshake
-  (`gve_dqo.h` GVE_ITR_*), then un-gate `irq::enable_irq` for DQO.
-  Observability: `/obs` `nic.counters.rx_irq`. See [[reference_idle_cpu_spin]].
+  storm, no doorbell corruption. Verified clean on LAN (co-located VM):
+  GQI ~3 ms p50.
+  **DQO (c3/c4) is GATED OFF** (timer-only idle, byte-identical to pre-T7)
+  — in two stages: (1) the interrupt **storm is FIXED** — DQO's ITR needs
+  the coalescing interval set via *update mode* (bits 3-4 = 0), not
+  `GVE_ITR_NO_UPDATE` (3<<3, which the device ignores, so the earlier
+  disable was a no-op): arm = `ENABLE | ((us>>1 & 0xFFF)<<5)`, disable =
+  `0` (per `gve_dqo.h` `gve_setup_itr_interval_dqo`); measured 742→2.8
+  IRQ/req. (2) BUT a **separate, DQO-specific latency regression remains**:
+  ~729 ms p50 on c3 (LAN) vs GQI's ~3 ms, no NIC drops, correct steering
+  (the disable hits the right block — hence the fixed storm). Root cause
+  unresolved (likely an ITR/PBA or interval-update side-effect on the RX
+  path); needs on-box debugging. The saturated c3 benchmark is unaffected
+  regardless (never idles → never arms). The correct ITR encoding is in
+  `irq_enable`/`irq_disable` (gated) for the eventual un-gate.
+  **Follow-up:** root-cause the DQO MSI-X latency regression, then drop the
+  `enable_irq` DQO early-return. Observability: `/obs` `nic.counters.rx_irq`.
+  See [[reference_idle_cpu_spin]].
 - `[ ]` **T8. 4 KiB RX buffers on DQO** (`BUFFER_SIZES` id=10
   advertises 4096; FreeBSD has `allow_4k_rx_buffers`). Lets more RSC
   coalesces stay single-descriptor, reducing T4 stitching pressure.
