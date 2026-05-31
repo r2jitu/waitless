@@ -723,9 +723,25 @@ fn boot_args() -> &'static str {
 ///   `wake_cores()` sends SGI so WFI wakes correctly.
 fn idle_cb(core_id: u32) {
     // No wake-up source → busy-poll. (Happens when the transport
-    // doesn't expose any IRQ path: aarch64 without GIC configured,
-    // legacy PCI without an IRQ line, etc.)
+    // doesn't expose any IRQ path: a polling NIC like gve `idle: None`,
+    // aarch64 without GIC configured, legacy PCI without an IRQ line.)
+    //
+    // This `idle_cb` is only ever reached *after* the event loop has
+    // spun a full (adaptive) idle window with no work, so under load it
+    // is never entered — the busy-poll spin stays hot and the default
+    // here (return → keep spinning) preserves the saturated-throughput
+    // path. With the opt-in `idle_yield` cfg, a genuinely-idle polling
+    // core instead issues a timer-bounded HLT: each HLT is a VMEXIT the
+    // hypervisor can use to schedule co-tenants (good citizen on
+    // shared/oversubscribed shapes), and a real sleep on hosts where
+    // HLT blocks. The ~1 ms timer re-polls RX, so no RX IRQ is needed;
+    // guarded on `timer_available()` so a host without the timer can't
+    // sleep forever. See reference_idle_cpu_spin / docs/gvnic.md T7.
     if !nic::irq_idle_supported() {
+        #[cfg(all(idle_yield, target_arch = "x86_64"))]
+        if kernel_bare::x86_64::apic::timer_available() {
+            kernel_bare::cpu::idle_bounded();
+        }
         return;
     }
     if core_id == 0 || kernel_bare::percpu::num_cores() <= 1 {

@@ -454,12 +454,23 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
   shared-core e2 shape, so a busy-polling guest is always runnable.
   Two independent walls compound: gve is **polling-by-design**
   (`idle: None` → `idle_cb` returns immediately, never even reaching
-  HLT), *and* e2 HLT is a near-NOP. So T7 (route gve through HLT) helps
-  only on hosts where HLT actually blocks (verified on local qemu-TCG:
-  idle drops to ~5 %); it cannot reduce e2-small CPU%. Routing gve idle
-  through a timer-bounded HLT was prototyped + measured on e2 and
-  reverted (no CPU% win; risks the c3 throughput headline via mid-gap
-  1 ms sleeps near saturation). See [[reference_idle_cpu_spin]].
+  HLT), *and* e2 HLT is a near-NOP.
+  **Landed as an opt-in (`idle_yield` cfg, default OFF; deploy with
+  `WAITLESS_IDLE_YIELD=1`):** when enabled, a genuinely-idle polling
+  core (gve) issues a timer-bounded HLT in `idle_cb` instead of pure
+  busy-spinning. Two distinct payoffs: (1) on hosts where HLT *blocks*
+  it is a real idle-CPU drop (qemu-TCG: ~5 %); (2) on a shared/
+  oversubscribed host each HLT is a VMEXIT scheduling point the
+  hypervisor can use to run co-tenants — the "don't busy-spin on a
+  shared host" win, whose benefit is *contention-dependent* (an
+  uncontended e2 bench shows no CPU% change since HLT re-enters in
+  ~1–2 µs; a contended host lets KVM deschedule us during the VMEXIT).
+  Safe to leave OFF by default and safe to turn ON: `idle_cb` is only
+  reached after the event loop spins a full idle window, so under
+  saturation it is never entered and the c3 throughput headline is
+  unaffected by construction. Full MSI-X RX wiring (wake *on packet*
+  rather than re-poll every 1 ms) stays deferred — latency/power only.
+  See [[reference_idle_cpu_spin]].
 - `[ ]` **T8. 4 KiB RX buffers on DQO** (`BUFFER_SIZES` id=10
   advertises 4096; FreeBSD has `allow_4k_rx_buffers`). Lets more RSC
   coalesces stay single-descriptor, reducing T4 stitching pressure.

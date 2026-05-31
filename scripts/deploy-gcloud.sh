@@ -50,6 +50,10 @@
 #   WAITLESS_BAZEL_DEFINES — extra flags appended to the ISO build,
 #     e.g. `--define tls_cert=prod` to bake in the production TLS
 #     cert. `scripts/renew-and-deploy.sh` sets this.
+#   WAITLESS_IDLE_YIELD — set to 1 to compile in the `idle_yield` cfg:
+#     a polling NIC (gve) issues a timer-bounded HLT when genuinely
+#     idle instead of busy-spinning. Good-citizen knob for shared /
+#     oversubscribed shapes (e2-small). Off by default. See gvnic T7.
 #   WAITLESS_ZERO_DOWNTIME — set to 1 to make `deploy` a blue/green
 #     deploy: build + boot the new image as a second instance,
 #     health-check it, then move WAITLESS_GCE_ADDRESS across and
@@ -227,8 +231,17 @@ build_disk() {
     #
     # WAITLESS_BAZEL_DEFINES carries optional extra flags (e.g.
     # `--define tls_cert=prod`); unquoted so multi-word values split.
+    # WAITLESS_IDLE_YIELD=1 compiles in the `idle_yield` cfg so a
+    # polling NIC (gve) issues a timer-bounded HLT when genuinely idle
+    # instead of busy-spinning — a good-citizen knob for shared /
+    # oversubscribed shapes (e2-small). Off by default; the saturated
+    # throughput path never reaches the idle branch, so it's safe to
+    # leave on for a low-traffic site. See docs/gvnic.md T7.
+    local idle_yield_flag=""
+    [ "${WAITLESS_IDLE_YIELD:-0}" = "1" ] &&
+        idle_yield_flag="--@rules_rust//:extra_rustc_flag=--cfg=idle_yield"
     # shellcheck disable=SC2086
-    bazel build "$BUILD_TARGET" ${WAITLESS_BAZEL_DEFINES:-}
+    bazel build "$BUILD_TARGET" $idle_yield_flag ${WAITLESS_BAZEL_DEFINES:-}
     local iso="$DEPLOY_REPO/$(_iso_path_for "$BUILD_TARGET")"
     [ -f "$iso" ] || {
         echo "ERROR: ISO not produced: $iso" >&2
