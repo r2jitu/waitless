@@ -495,19 +495,18 @@ fn emit_ctx_pkt(
     }
 }
 
-/// Per-slot bounce buffer for the pkt descriptor at `fill_cnt + 1`.
-/// Returns `(slot, va, phys)`. The bounce pool mirrors the ring slot
-/// 1:1 (`DQO_TX_POOL_BUFS == TX_RING_ENTRIES`), so the slot index ==
-/// the pkt-desc ring position and reuse is implicit as `fill_cnt`
-/// cycles past it (gated below `ring_entries - 2` so the device has
-/// long finished DMA-reading that buffer before we wrap onto it).
+/// `(va, phys)` of the per-slot bounce buffer for the pkt descriptor
+/// at `fill_cnt + 1`. The bounce pool mirrors the ring slot 1:1
+/// (`DQO_TX_POOL_BUFS == TX_RING_ENTRIES`), so the slot index == the
+/// pkt-desc ring position and reuse is implicit as `fill_cnt` cycles
+/// past it (gated below `ring_entries - 2` so the device has long
+/// finished DMA-reading that buffer before we wrap onto it).
 #[inline]
-fn pkt_bounce_buf(tx: &TxQueue, fill_cnt: u32) -> (usize, u64, u64) {
+fn pkt_bounce_buf(tx: &TxQueue, fill_cnt: u32) -> (u64, u64) {
     let mask = (tx.ring_entries - 1) as u32;
-    let slot = (fill_cnt.wrapping_add(1) & mask) as usize;
-    let buf_offset = (slot as u32) * (RX_BUFFER_SIZE as u32);
+    let slot = (fill_cnt.wrapping_add(1) & mask) as u32;
+    let buf_offset = slot * (RX_BUFFER_SIZE as u32);
     (
-        slot,
         tx.qpl_base_va + buf_offset as u64,
         tx.qpl_base_phys + buf_offset as u64,
     )
@@ -542,7 +541,7 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8], csum: nic_api::CsumOffload) -> 
         }
     };
 
-    let (_slot, buf_va, buf_phys) = pkt_bounce_buf(tx, fill_cnt);
+    let (buf_va, buf_phys) = pkt_bounce_buf(tx, fill_cnt);
     unsafe {
         ptr::copy_nonoverlapping(data.as_ptr(), buf_va as *mut u8, data.len());
     }
@@ -582,7 +581,7 @@ pub(crate) fn acquire_tx_buf(qp: usize) -> Option<nic_api::TxBufHandle> {
     }
     let tx = unsafe { &*tx_ptr };
     let fill_cnt = tx_reserve(tx)?;
-    let (_slot, buf_va, _buf_phys) = pkt_bounce_buf(tx, fill_cnt);
+    let (buf_va, _buf_phys) = pkt_bounce_buf(tx, fill_cnt);
     Some(nic_api::TxBufHandle {
         data_ptr: buf_va as *mut u8,
         data_cap: RX_BUFFER_SIZE as u32,
@@ -619,7 +618,7 @@ pub(crate) fn submit_tx(handle: nic_api::TxBufHandle, frame_len: usize, csum: ni
     let bar2_va = BAR2_VA.load(Ordering::Acquire);
 
     let fill_cnt = tx.fill_cnt.load(Ordering::Relaxed);
-    let (_slot, buf_va, buf_phys) = pkt_bounce_buf(tx, fill_cnt);
+    let (buf_va, buf_phys) = pkt_bounce_buf(tx, fill_cnt);
     // SAFETY: the bounce buffer at this slot was just filled by the
     // caller via the handle's `data_mut()`; the device DMAs the same
     // `frame_len` bytes from `buf_phys`. Reading them back here for

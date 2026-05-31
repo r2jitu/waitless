@@ -697,27 +697,23 @@ pub fn async_try_send_chain(
     // stays queued in `chain` and `snd_nxt` only advances by what
     // reached the wire, so a later poll resends from the right place
     // instead of dropping + relying on RTO recovery (the old cliff).
+    // Pick a send strategy; each returns the prefix the driver
+    // actually took. On a healthy ring that's `sendable`; it's *less*
+    // when the TX ring fills mid-send (gve DQO back-pressure) — the
+    // unsent tail stays queued in `chain` and `snd_nxt` advances only
+    // by what reached the wire, so a later poll resends from the right
+    // place instead of dropping + relying on RTO recovery (the old
+    // cliff). The per-MSS path is shared with the TSO big-pool-full
+    // fallback (`send_per_mss_fallback`).
     let actually_sent = if nic::tso_available()
         && sendable > mss
         && payload_offset(c.local_ip) + sendable <= TSO_FRAME_BUF_LEN
     {
-        let n = send_super_segment_from_cursor(&meta, &mut cursor, sendable);
-        c.snd_nxt = c.snd_nxt.wrapping_add(n as u32);
-        n
+        send_super_segment_from_cursor(&meta, &mut cursor, sendable)
     } else {
-        let mut sent = 0usize;
-        let mut chunk_meta = meta;
-        while sent < sendable {
-            let chunk = (sendable - sent).min(mss);
-            if !send_segment_from_cursor(&chunk_meta, &mut cursor, chunk) {
-                break; // full TX ring / MAC miss — stop, leave the rest queued
-            }
-            chunk_meta.seq = chunk_meta.seq.wrapping_add(chunk as u32);
-            c.snd_nxt = c.snd_nxt.wrapping_add(chunk as u32);
-            sent += chunk;
-        }
-        sent
+        send_per_mss_fallback(&meta, &mut cursor, sendable)
     };
+    c.snd_nxt = c.snd_nxt.wrapping_add(actually_sent as u32);
 
     // Release the cursor's borrow on the chain. `Cursor` doesn't impl
     // Drop (so clippy gripes about `drop(cursor)`), but binding into
