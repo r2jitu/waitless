@@ -445,9 +445,14 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
   timer (vector 0xF0) fires only ~12/s — i.e. <0.02 % of HLTs ever
   reach the 1 ms bound. The LAPIC timer *does* deliver on e2 (earlier
   "never delivers" note was wrong; `apic_irr`/`isr`=0, not x2APIC),
-  but it's moot because HLT returns first. Stock Linux idles fine on
-  e2, so this is a guest-setup subtlety we can't crack from inside the
-  guest. Two independent walls compound: gve is **polling-by-design**
+  but it's moot because HLT returns first. **MWAIT is also out** — a
+  boot CPUID probe (deployed to e2) shows `MONITOR` masked
+  (`CPUID.01H:ECX[3]=0`, leaf 05H all-zero) and no KVM PV-idle feature
+  (`4000_0001H:EAX=0x10000ab`: clocksource/steal-time/pv-unhalt only),
+  so all three guest-side idle levers are exhausted *by measurement*.
+  Likely cause: GCE treats HLT as yield-not-block on the burstable
+  shared-core e2 shape, so a busy-polling guest is always runnable.
+  Two independent walls compound: gve is **polling-by-design**
   (`idle: None` → `idle_cb` returns immediately, never even reaching
   HLT), *and* e2 HLT is a near-NOP. So T7 (route gve through HLT) helps
   only on hosts where HLT actually blocks (verified on local qemu-TCG:
