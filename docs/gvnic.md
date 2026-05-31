@@ -24,14 +24,16 @@ The two TX paths are **not** at feature parity:
   super-segment per 5-page slot), plus TSO (v4/v6) and UDP-GSO via
   the `GVE_TXD_TSO` + `GVE_TXD_SEG` descriptor pair, plus L4-CSUM
   offload. The device segments super-segments host-side.
-- **DQO_RDA** has direct-fill (single-segment) but no TSO and no
-  UDP-GSO. `acquire_tx_buf` hands the caller the next ring slot's
-  bounce buffer to fill in place (no scratch→bounce memcpy); `submit_tx`
-  emits the general-context + packet descriptor pair carrying that
-  buffer's raw DMA address. `acquire_tx_tso_buf` /
-  `acquire_tx_udp_gso_buf` still return `None` in DQO mode so the
-  large-response / QUIC paths fall back to the per-MSS / per-datagram
-  loop. L4-CSUM offload is wired (the `DQO_TX_FLAG_CSUM` bit). The
+- **DQO_RDA** has direct-fill and TSO; UDP-GSO is still GQI-only.
+  `acquire_tx_buf` hands the caller the next ring slot's bounce buffer
+  to fill in place (no scratch→bounce memcpy); `submit_tx` emits the
+  general-context + packet descriptor pair carrying that buffer's raw
+  DMA address. `acquire_tx_tso_buf` / `submit_tx_tso` emit a
+  TSO-context (dtype 0x5) + general-context + scatter-gather packet
+  descriptors so the device segments a super-segment host-side (T3,
+  hardware-validated). `acquire_tx_udp_gso_buf` still returns `None` in
+  DQO mode so the QUIC path falls back to the per-datagram loop (T5).
+  L4-CSUM offload is wired (the `DQO_TX_FLAG_CSUM` bit). The
   earlier DQO direct-fill stall was root-caused (RE-on-every-descriptor
   + a TX-completion field-decode bug, both long since fixed in the
   slice path) and direct-fill re-landed reusing that proven emission —
@@ -370,16 +372,34 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
 
 ### Tier 2 — throughput offloads (after T1)
 
-- `[!]` **T3. DQO TSO (TCP segmentation offload).**
-  *What:* emit the TSO context descriptor (dtype `0x5`) + multi-desc
-  SG packet so the device segments host-side, as GQI already does.
-  *Why:* big win on large TLS responses (fewer descriptors + frames
-  per byte); GQI TSO gave +25% on a 9 KiB body (HVF). Nothing for
-  sub-MSS `/health`. *Where:* new DQO TSO path in `dqo.rs`; wire
-  `acquire_tx_tso_buf` / `submit_tx_tso` (currently `None` on DQO).
-  *Verify:* `/static-64k`/`/static-1m` TLS throughput on c3; TSO
-  descriptor counter > 0. *Status:* blocked on T1 (needs working
-  SG/direct-fill first).
+- `[x]` **T3. DQO TSO (TCP segmentation offload).**
+  *What:* the device segments a super-segment host-side from a
+  TSO-context descriptor (dtype `0x5`) + general-context descriptor +
+  scatter-gather packet descriptors, instead of the driver framing
+  ~11 per-MSS packets for a 16 KiB TLS record. Built on T1's
+  direct-fill; mirrors the GQI TSO path.
+  *Implementation:* `dqo::build_tso_ctx_desc` / `acquire_tx_tso_buf` /
+  `submit_tx_tso` / `emit_tso_descs`; a ≈20 KiB-slot TSO big-pool
+  appended to the DQO TX bounce alloc (reusing `TxQueue::big_slot_used`);
+  big slots reclaimed by `compl_tag` (≥ `TX_RING_ENTRIES`) on the PKT
+  completion in `tx_drain`. Descriptor format verified against verbatim
+  upstream (`gve_desc_dqo.h` + `gve_tx_dqo.c`).
+  *Verified on c3-highcpu-8 (gVNIC DQO), raw output:* **correct +
+  hardware-validated.** `/static-1m`×3 returns the full 1,048,576 B,
+  `/static-64k` returns 65,536 B (no silent drops); `DQO_TX_TSO_SENT`
+  climbs to 2.8 M on `/static-1m` and `+1` on `/health` (sub-MSS skips
+  TSO, as designed); 0 ring-full drops / 0 timeouts. `/diag-gve`
+  readback decodes byte-perfect — TSO-ctx `tso_total_len=16406`
+  (one TLS record), `mss=1460`, `header_len=54`, `cmd_dtype=0x25`; SG
+  pkt descs `16383` (no EOP) + `77` (EOP), shared `compl_tag`,
+  `addr += 16383`. *Throughput:* neutral vs T2 (`/static-1m` 2.4K rps
+  p99 25 ms; `/static-64k` 35 K rps; `/health` 463 K) — **egress-
+  bandwidth-capped** (~2 GB/s/8-vCPU on c3; cores idle-spin at
+  `rt/loop≈0.004`, not request-saturated), so TSO's real win (cuts a
+  64 KB response from ~90 descriptors to ~16, offloads per-segment
+  framing+csum) shows as freed CPU, not rps, below the egress ceiling.
+  Would manifest as rps only on a request-saturated (multi-loadgen /
+  higher-egress) host. *Status:* done, landed on main.
 
 - `[ ]` **T4. DQO RX RSC (HW-GRO) = items I→J, in order.**
   *What:* (I) multi-buffer RX chain accumulation — stitch non-EOP
