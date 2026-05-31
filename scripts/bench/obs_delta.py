@@ -22,17 +22,25 @@ with open(sys.argv[2]) as f:
     post = json.load(f)
 
 
-def delta_block(name, keys=None):
-    p, q = pre.get(name, {}), post.get(name, {})
-    print(f"  [{name}]")
+def _diff_into(p, q, keys=None, prefix=""):
     for k in keys or sorted(set(p.keys()) | set(q.keys())):
         v1, v2 = p.get(k, 0), q.get(k, 0)
-        if isinstance(v2, (int, float)) and isinstance(v1, (int, float)):
+        # gve nests its driver counters under nic["counters"]; recurse
+        # one level so e.g. tx_ring_full_drops shows up in the delta.
+        if isinstance(v2, dict) or isinstance(v1, dict):
+            _diff_into(v1 if isinstance(v1, dict) else {},
+                       v2 if isinstance(v2, dict) else {}, prefix=k + ".")
+        elif isinstance(v2, (int, float)) and isinstance(v1, (int, float)):
             d = v2 - v1
             if d != 0:
-                print(f"    {k:35s} {v1:>12} -> {v2:>12}  Δ={d:+d}")
+                print(f"    {prefix}{k:35s} {v1:>12} -> {v2:>12}  Δ={d:+d}")
         elif isinstance(v2, list) and v2 != v1:
-            print(f"    {k:35s} {v1} -> {v2}")
+            print(f"    {prefix}{k:35s} {v1} -> {v2}")
+
+
+def delta_block(name, keys=None):
+    print(f"  [{name}]")
+    _diff_into(pre.get(name, {}), post.get(name, {}), keys)
 
 
 delta_block("runtime")
@@ -40,7 +48,18 @@ delta_block("tcp")
 delta_block("http")
 delta_block(
     "nic",
-    ["rx_frames", "tx_packets", "num_queue_pairs", "rx_max_min_ratio_x100"],
+    [
+        "rx_frames",
+        "tx_packets",
+        "tx_bytes",
+        "tx_small_full_spins",
+        "tx_big_full_returns",
+        "num_queue_pairs",
+        "rx_max_min_ratio_x100",
+        # gve renders DQO/GQI driver counters (tx_ring_full_drops,
+        # tx_miss_compl, tx_reinject_compl, …) under this sub-dict.
+        "counters",
+    ],
 )
 tp, tq = pre.get("tls", {}), post.get("tls", {})
 db = tq.get("encrypt_bytes", 0) - tp.get("encrypt_bytes", 0)

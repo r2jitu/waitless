@@ -37,10 +37,12 @@ UNI_IP="$(gcloud compute instances describe "$UNI" --zone="$ZONE" \
     --format='value(networkInterfaces[0].networkIP)')"
 
 case "$WORKLOAD" in
-health)        URL="http://$UNI_IP/health" ;;
-health-tls)    URL="https://$UNI_IP/health" ;;
-static64k)     URL="http://$UNI_IP/static-64k" ;;
-static64k-tls) URL="https://$UNI_IP/static-64k" ;;
+health)         URL="http://$UNI_IP/health" ;;
+health-tls)     URL="https://$UNI_IP/health" ;;
+static64k)      URL="http://$UNI_IP/static-64k" ;;
+static64k-tls)  URL="https://$UNI_IP/static-64k" ;;
+static256k-tls) URL="https://$UNI_IP/static-256k" ;;
+static1m-tls)   URL="https://$UNI_IP/static-1m" ;;
 *) echo "unknown workload: $WORKLOAD" >&2; exit 1 ;;
 esac
 
