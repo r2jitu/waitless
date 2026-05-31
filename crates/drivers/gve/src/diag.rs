@@ -316,13 +316,14 @@ pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
     write!(
         w,
         "{{\"driver\":\"gve\",\"tx_miss_compl\":{},\"tx_reinject_compl\":{},\
-         \"tx_ring_full_drops\":{},\
+         \"tx_ring_full_drops\":{},\"tx_tso_sent\":{},\
          \"rx_compl_skipped\":{},\"rx_buf_reposts\":{},\"gqi_recycle_exhausted\":{},\
          \"tx_packets\":{},\"tx_bytes\":{},\"rx_bytes\":{},\"tx_small_full_spins\":{},\
          \"tx_big_full_returns\":{},",
         crate::dqo::DQO_TX_MISS_COMPL.load(Ordering::Relaxed),
         crate::dqo::DQO_TX_REINJECT_COMPL.load(Ordering::Relaxed),
         crate::dqo::DQO_TX_RING_FULL_DROPS.load(Ordering::Relaxed),
+        crate::dqo::DQO_TX_TSO_SENT.load(Ordering::Relaxed),
         crate::dqo::DQO_RX_COMPL_SKIPPED.load(Ordering::Relaxed),
         sum(&RX_BUF_REPOST_COUNT),
         sum(&GQI_RECYCLE_POOL_EXHAUSTED),

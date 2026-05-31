@@ -17,7 +17,7 @@ use iobuf::{Chain, IOBufDropFn, OwnedIOBuf};
 
 use crate::{
     BAR2_VA, DEFERRED_KICK, MAX_QUEUE_PAIRS, RX_BUF_REPOST_COUNT, RX_BUFFER_SIZE, RX_BYTES_PER_QP,
-    RX_QUEUES, RxQueue, TX_QUEUES, TxQueue,
+    RX_QUEUES, RxQueue, TX_QUEUES, TxQueue, record_tx_desc, tx_desc_kind,
 };
 
 // ---- DQO_RDA descriptor formats -------------------------------------------
@@ -51,6 +51,45 @@ const DQO_TX_FLAG_REPORT_EVENT: u8 = 1 << 7;
 /// arriving and the per-qp ring saturates at fill_cnt - done_cnt
 /// = ring_entries.
 pub(crate) const DQO_TX_RE_INTERVAL: u32 = 32;
+
+/// TSO context descriptor type — `GVE_TX_TSO_CTX_DESC_DTYPE_DQO`
+/// (`gve_desc_dqo.h`). Goes in byte 8 of the 16-byte descriptor
+/// (`cmd_dtype.dtype`, low 5 bits), OR'd with the `tso` bit.
+const DQO_TX_DTYPE_TSO_CTX: u8 = 0x5;
+/// `cmd_dtype.tso` — bit 5 of the cmd_dtype byte (after the 5-bit
+/// dtype). Set on the TSO context descriptor to request segmentation.
+const DQO_TX_TSO_CTX_TSO_BIT: u8 = 1 << 5;
+/// `GVE_TX_MAX_BUF_SIZE_DQO` = (16 KiB − 1). The 14-bit `buf_size`
+/// field caps one packet data descriptor at this many bytes; a buffer
+/// longer than this is split across multiple data descriptors
+/// (scatter-gather), `end_of_packet` set only on the last.
+pub(crate) const GVE_TX_MAX_BUF_SIZE_DQO: u32 = (16 * 1024) - 1;
+
+/// DQO TSO big-segment bounce pool. A TSO super-segment (one TLS
+/// record ≈ 16 KiB + headers) doesn't fit a 2 KiB per-ring-slot
+/// bounce buffer, so DQO grows the TX bounce allocation by a second
+/// pool of `DQO_TX_BIG_SLOTS` slots of `DQO_TX_BIG_SLOT_SIZE` each,
+/// appended right after the small per-slot pool. Sizes mirror GQI's
+/// big pool (`TX_BIG_POOL_SLOTS` / `TX_BIG_SLOT_SIZE`) and reuse the
+/// `TxQueue::big_slot_used` allocator bitmap — GQI and DQO never run
+/// at once (one negotiated format per boot).
+pub(crate) const DQO_TX_BIG_SLOTS: u32 = crate::TX_BIG_POOL_SLOTS;
+pub(crate) const DQO_TX_BIG_SLOT_SIZE: u32 = crate::TX_BIG_SLOT_SIZE;
+/// Byte offset of the big pool within the TX bounce allocation — it
+/// starts immediately after the small pool (`DQO_TX_POOL_BUFS`
+/// buffers of `RX_BUFFER_SIZE`).
+pub(crate) const DQO_TX_BIG_POOL_OFFSET: u32 = DQO_TX_POOL_BUFS * (RX_BUFFER_SIZE as u32);
+/// `compl_tag` base for big-pool slots. Small (slice / direct-fill)
+/// sends use `compl_tag = pkt_idx` (< `TX_RING_ENTRIES`) and are
+/// reclaimed by the slot==ring-idx convention; big-pool TSO sends use
+/// `compl_tag = DQO_TX_BIG_COMPL_TAG_BASE + big_slot` so `tx_drain`
+/// can free the exact big slot when its PKT completion arrives.
+const DQO_TX_BIG_COMPL_TAG_BASE: u16 = crate::TX_RING_ENTRIES;
+/// Max ring descriptors one TSO submission can consume: TSO-ctx +
+/// general-ctx + up to 2 packet data descriptors (a ~16.5 KiB
+/// super-segment spans two ≤16383-byte chunks). `acquire_tx_tso_buf`
+/// reserves this much ring headroom up front.
+const DQO_TX_TSO_MAX_DESCS: u32 = 4;
 
 /// DQO TX completion descriptor — 8 bytes (device-written).
 ///   0..2   header                         bits[10:0]=id, [13:11]=type,
@@ -91,6 +130,14 @@ const GVE_ALT_MISS_COMPL_BIT: u16 = 1 << 15;
 pub static DQO_TX_MISS_COMPL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static DQO_TX_REINJECT_COMPL: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+/// Count of TSO super-segments submitted via `submit_tx_tso` (one per
+/// big-pool TSO send, NOT per emitted wire segment). A cold counter —
+/// TSO sends are large-response-only, far rarer than the per-packet
+/// hot path, so the single relaxed increment is well off the critical
+/// chain. Surfaced via `/obs` so a c3 run can confirm the DQO TSO path
+/// is actually being exercised (> 0 on `/static-*`, 0 on `/health`).
+pub static DQO_TX_TSO_SENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Count of frames `send_on_qp` rejected because the TX ring was
 /// within 2 descriptors of full — the masked-tail == head "device
@@ -229,6 +276,21 @@ pub(crate) fn tx_drain(tx: &TxQueue) {
                 if tag & GVE_ALT_MISS_COMPL_BIT != 0 {
                     DQO_TX_MISS_COMPL.fetch_add(1, Ordering::Relaxed);
                 }
+                // Big-pool TSO slots are the one case that needs the
+                // compl_tag for reclaim: standard sends ride the
+                // slot==ring_idx convention (tag < TX_RING_ENTRIES,
+                // ignored here), but a TSO super-segment lives in a
+                // big-pool slot decoupled from any ring position, so
+                // free it when its packet completes. The branch is
+                // free for the small-packet hot path (a compare, no
+                // atomic) — only big-slot completions touch `_used`.
+                let ctag = tag & !GVE_ALT_MISS_COMPL_BIT;
+                if ctag >= DQO_TX_BIG_COMPL_TAG_BASE {
+                    let big_slot = (ctag - DQO_TX_BIG_COMPL_TAG_BASE) as usize;
+                    if big_slot < DQO_TX_BIG_SLOTS as usize {
+                        tx.big_slot_used[big_slot].store(false, Ordering::Release);
+                    }
+                }
             }
             DQO_TX_COMPL_TYPE_MISS => {
                 DQO_TX_MISS_COMPL.fetch_add(1, Ordering::Relaxed);
@@ -238,9 +300,9 @@ pub(crate) fn tx_drain(tx: &TxQueue) {
             }
             _ => {}
         }
-        // PKT / MISS / REINJECTION completions: not used for slot
-        // reuse (slot==ring_idx convention); only MISS / REINJECT
-        // counted as diagnostic.
+        // Standard PKT/MISS/REINJECT completions don't drive slot reuse
+        // (slot==ring_idx convention); MISS/REINJECT are diagnostic and
+        // big-pool TSO slots are freed by `compl_tag` above.
         head = head.wrapping_add(1);
         if (head & cmask) == 0 {
             cur_gen ^= 1;
@@ -355,6 +417,40 @@ fn build_ctx_desc(path_hash: u16) -> u128 {
     u128::from_le_bytes(bytes)
 }
 
+/// Pack a DQO TSO context descriptor into a 16-byte u128. Matches
+/// `struct gve_tx_tso_context_desc_dqo` (`gve_desc_dqo.h`, `__packed`):
+///
+///   bytes 0..3   `tso_total_len:24` (LE) — L4 payload bytes across
+///                all segments (`frame_len - header_len`); byte 3 is
+///                `flex10` (metadata, 0 for us — the path hash rides
+///                the general-ctx desc that follows).
+///   bytes 4..6   `mss:14` (LE) + `reserved:2` — the segment size the
+///                device cuts the payload into.
+///   byte  6      `header_len` — bytes of L2+L3+L4 template the device
+///                replicates in front of each segment.
+///   byte  7      `flex11` (0)
+///   byte  8      `cmd_dtype`: `dtype` (low 5 bits) = 0x5, `tso` = bit 5.
+///   byte  9      `cmd_dtype.reserved2` (0)
+///   bytes 10..16 `flex0,flex5,flex6,flex7,flex8,flex9` (metadata, 0).
+///
+/// Layout verified against the verbatim upstream struct; the
+/// general-context sibling (same `cmd_dtype` at byte 8) matches our
+/// proven `build_ctx_desc`, which anchors the byte offsets.
+#[inline]
+fn build_tso_ctx_desc(tso_total_len: u32, mss: u16, header_len: u8) -> u128 {
+    let mut bytes = [0u8; 16];
+    let tl = tso_total_len & 0x00FF_FFFF; // 24-bit; byte 3 (flex10) stays 0
+    bytes[0] = (tl & 0xff) as u8;
+    bytes[1] = ((tl >> 8) & 0xff) as u8;
+    bytes[2] = ((tl >> 16) & 0xff) as u8;
+    let m = mss & 0x3FFF;
+    bytes[4] = (m & 0xff) as u8;
+    bytes[5] = ((m >> 8) & 0x3f) as u8; // top 2 bits are `reserved` = 0
+    bytes[6] = header_len;
+    bytes[8] = DQO_TX_DTYPE_TSO_CTX | DQO_TX_TSO_CTX_TSO_BIT;
+    u128::from_le_bytes(bytes)
+}
+
 /// Pack a DQO TX packet descriptor into a 16-byte u128. Matches
 /// `struct gve_tx_pkt_desc_dqo`. Single u128 store is atomic on x86
 /// when 16-byte-aligned (which our ring descriptors are).
@@ -397,22 +493,33 @@ fn build_pkt_desc(buf_addr: u64, flags: u8, compl_tag: u16, buf_size: u16) -> u1
 ///
 /// On `None` the caller bumps `DQO_TX_RING_FULL_DROPS` (slice path) or
 /// returns to the slice fallback (direct-fill `acquire_tx_buf`).
+///
+/// `n_descs` is how many ring descriptors the caller is about to emit
+/// (2 for a standard packet's ctx+pkt pair; up to `DQO_TX_TSO_MAX_DESCS`
+/// for a TSO super-segment). The headroom check keeps `in_flight`
+/// strictly below `ring_entries - 1` so the masked tail never collides
+/// with the device head.
 #[inline]
-fn tx_reserve(tx: &TxQueue) -> Option<u32> {
+fn tx_reserve_n(tx: &TxQueue, n_descs: u32) -> Option<u32> {
     let fill_cnt = tx.fill_cnt.load(Ordering::Relaxed);
     let mut done_cnt = tx.done_cnt.load(Ordering::Relaxed);
     let mut in_flight = fill_cnt.wrapping_sub(done_cnt);
-    // Each packet emits 2 descriptors (general context + pkt).
     let ring_entries = tx.ring_entries as u32;
     if in_flight + 64 > ring_entries {
         tx_drain(tx);
         done_cnt = tx.done_cnt.load(Ordering::Relaxed);
         in_flight = fill_cnt.wrapping_sub(done_cnt);
-        if in_flight + 2 > ring_entries - 2 {
+        if in_flight + n_descs > ring_entries - 2 {
             return None;
         }
     }
     Some(fill_cnt)
+}
+
+/// Reserve room for one standard packet (general-ctx + pkt pair).
+#[inline]
+fn tx_reserve(tx: &TxQueue) -> Option<u32> {
+    tx_reserve_n(tx, 2)
 }
 
 /// Emit the (general-ctx, pkt) descriptor pair for one packet whose
@@ -626,6 +733,225 @@ pub(crate) fn submit_tx(handle: nic_api::TxBufHandle, frame_len: usize, csum: ni
     // `frame_len <= RX_BUFFER_SIZE` checked above).
     let frame = unsafe { core::slice::from_raw_parts(buf_va as *const u8, frame_len) };
     emit_ctx_pkt(tx, bar2_va, fill_cnt, buf_phys, frame, csum);
+}
+
+// ---- TSO (TCP segmentation offload) ----------------------------------------
+
+/// `(va, phys)` of DQO big-pool TSO slot `big_slot`. The big pool is
+/// appended after the small per-ring-slot bounce pool in the same TX
+/// bounce allocation (see `DQO_TX_BIG_POOL_OFFSET`).
+#[inline]
+fn big_slot_addr(tx: &TxQueue, big_slot: usize) -> (u64, u64) {
+    let off = DQO_TX_BIG_POOL_OFFSET + (big_slot as u32) * DQO_TX_BIG_SLOT_SIZE;
+    (tx.qpl_base_va + off as u64, tx.qpl_base_phys + off as u64)
+}
+
+/// Encode `(qp, big_slot)` into a TSO handle's `driver_token`. Bit 63
+/// marks the big pool — distinct from the small-pool direct-fill token
+/// (`= qp`), though they also flow through type-distinct handles
+/// (`TxTsoBufHandle` vs `TxBufHandle`) and separate submit fns.
+#[inline]
+fn encode_tso_token(qp: usize, big_slot: usize) -> u64 {
+    (1u64 << 63) | (((qp as u64) & 0xFFFF) << 32) | (big_slot as u64 & 0xFFFF)
+}
+
+#[inline]
+fn decode_tso_token(token: u64) -> (usize, usize) {
+    (((token >> 32) & 0xFFFF) as usize, (token & 0xFFFF) as usize)
+}
+
+/// Release a dropped (unsubmitted, or validation-rejected) TSO handle:
+/// free its big-pool slot. On the success path `submit_tx_tso`
+/// `mem::forget`s the handle instead, so the slot stays claimed until
+/// its TX completion frees it (`tx_drain`, by `compl_tag`).
+fn release_big_slot(token: u64) {
+    let (qp, big_slot) = decode_tso_token(token);
+    if qp >= MAX_QUEUE_PAIRS {
+        return;
+    }
+    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+    if tx_ptr.is_null() {
+        return;
+    }
+    let tx = unsafe { &*tx_ptr };
+    if big_slot < DQO_TX_BIG_SLOTS as usize {
+        tx.big_slot_used[big_slot].store(false, Ordering::Release);
+    }
+}
+
+/// DQO TSO acquire. Reserve ring headroom for the (TSO-ctx,
+/// general-ctx, ≤2 pkt) descriptor burst and claim a big-pool slot
+/// (≈20 KiB) for the caller to assemble one TSO super-segment into
+/// (header + up to one TLS record of payload). Returns `None` when the
+/// ring lacks headroom or the big pool is saturated — the caller
+/// (`send_super_segment_from_cursor` / `try_send_tso`) then falls back
+/// to the per-MSS path. Doesn't spin: TSO is best-effort batching.
+///
+/// Does NOT advance `fill_cnt`; `submit_tx_tso` emits the descriptors.
+/// Acquire+submit pair synchronously on the qp's owning core (Tier 1),
+/// same contract as the standard direct-fill path.
+pub(crate) fn acquire_tx_tso_buf(qp: usize) -> Option<nic_api::TxTsoBufHandle> {
+    if qp >= MAX_QUEUE_PAIRS {
+        return None;
+    }
+    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+    if tx_ptr.is_null() {
+        return None;
+    }
+    let tx = unsafe { &*tx_ptr };
+    tx_reserve_n(tx, DQO_TX_TSO_MAX_DESCS)?;
+    for slot in 0..(DQO_TX_BIG_SLOTS as usize) {
+        if !tx.big_slot_used[slot].load(Ordering::Acquire) {
+            tx.big_slot_used[slot].store(true, Ordering::Relaxed);
+            let (va, _phys) = big_slot_addr(tx, slot);
+            return Some(nic_api::TxTsoBufHandle(nic_api::TxBufHandle {
+                data_ptr: va as *mut u8,
+                data_cap: DQO_TX_BIG_SLOT_SIZE,
+                driver_token: encode_tso_token(qp, slot),
+                release_fn: release_big_slot,
+            }));
+        }
+    }
+    None
+}
+
+/// DQO TSO submit. The caller filled the big-pool slot with one
+/// super-segment `[L2|L3|L4 headers][payload]` of `frame_len` bytes
+/// (`hdr_len` of header). Emit the descriptor burst the device needs
+/// to segment it host-side into `gso_size`-byte chunks:
+///
+///   1. TSO context desc (`tso_total_len = frame_len - hdr_len`,
+///      `mss = gso_size`, `header_len = hdr_len`).
+///   2. General context desc (carries the 4-tuple path hash).
+///   3. One or more packet data descs covering the whole buffer,
+///      split at `GVE_TX_MAX_BUF_SIZE_DQO` (scatter-gather),
+///      `end_of_packet` only on the last, `checksum_offload_enable`
+///      set (the device computes each segment's L4 checksum).
+///
+/// `csum_start` is unused on DQO: unlike GQI's descriptor (explicit
+/// l4 offsets), the DQO device parses the headers itself, bounded by
+/// `header_len` from the TSO ctx. The caller still zeroes the template
+/// L4 checksum field so the device fills it per segment.
+///
+/// On any validation failure `handle` is dropped → `release_big_slot`
+/// frees the slot; on success the handle is `mem::forget`-ed and the
+/// slot is freed later when its PKT completion arrives (`tx_drain`),
+/// since the device DMA-reads the slot until then.
+pub(crate) fn submit_tx_tso(
+    handle: nic_api::TxTsoBufHandle,
+    frame_len: usize,
+    hdr_len: u16,
+    _csum_start: u16,
+    gso_size: u16,
+) {
+    let (qp, big_slot) = decode_tso_token(handle.0.driver_token);
+    if qp >= MAX_QUEUE_PAIRS || big_slot >= DQO_TX_BIG_SLOTS as usize {
+        return; // drop frees the slot
+    }
+    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+    if tx_ptr.is_null() {
+        return; // drop frees the slot
+    }
+    let tx = unsafe { &*tx_ptr };
+    if frame_len == 0
+        || frame_len > DQO_TX_BIG_SLOT_SIZE as usize
+        || hdr_len as usize >= frame_len
+        || gso_size == 0
+    {
+        return; // drop frees the slot
+    }
+    let bar2_va = BAR2_VA.load(Ordering::Acquire);
+    let (buf_va, buf_phys) = big_slot_addr(tx, big_slot);
+    // SAFETY: the caller filled `frame_len` bytes of this big slot via
+    // the handle's `data_mut()`; the device DMAs the same bytes. We
+    // read them here only for the flow path-hash.
+    let frame = unsafe { core::slice::from_raw_parts(buf_va as *const u8, frame_len) };
+    emit_tso_descs(tx, qp, bar2_va, big_slot, buf_phys, frame, hdr_len, gso_size);
+    // Slot is in-flight; the PKT completion (compl_tag) frees it.
+    core::mem::forget(handle);
+}
+
+/// Emit the TSO descriptor burst (TSO-ctx, general-ctx, SG pkt descs)
+/// for a super-segment already in big-pool slot `big_slot` at DMA
+/// address `buf_phys`, advance `fill_cnt`, doorbell unless deferred.
+fn emit_tso_descs(
+    tx: &TxQueue,
+    qp: usize,
+    bar2_va: u64,
+    big_slot: usize,
+    buf_phys: u64,
+    frame: &[u8],
+    hdr_len: u16,
+    gso_size: u16,
+) {
+    let mask = (tx.ring_entries - 1) as u32;
+    let fill_cnt = tx.fill_cnt.load(Ordering::Relaxed);
+    let frame_len = frame.len();
+    let compl_tag = DQO_TX_BIG_COMPL_TAG_BASE + big_slot as u16;
+    let tso_total_len = (frame_len - hdr_len as usize) as u32;
+
+    // desc 0: TSO context. Capture it for `/diag-gve` — the byte-exact
+    // TSO-ctx layout is the one thing on this path the device silently
+    // drops if wrong, and serial is gated on GCE, so this is how we
+    // read back what we wrote on a live c3.
+    let tso_val = build_tso_ctx_desc(tso_total_len, gso_size, hdr_len as u8);
+    record_tx_desc(qp as u8, tx_desc_kind::TSO, &tso_val.to_le_bytes());
+    let tso_ptr = (tx.ring_va as *mut u128).wrapping_add((fill_cnt & mask) as usize);
+    unsafe {
+        ptr::write_volatile(tso_ptr, tso_val);
+    }
+    // desc 1: general context (flow path hash).
+    let gctx_val = build_ctx_desc(tx_path_hash(frame));
+    let gctx_ptr = (tx.ring_va as *mut u128).wrapping_add((fill_cnt.wrapping_add(1) & mask) as usize);
+    unsafe {
+        ptr::write_volatile(gctx_ptr, gctx_val);
+    }
+
+    // desc 2..: packet data descriptors covering the whole buffer,
+    // scatter-gather split at GVE_TX_MAX_BUF_SIZE_DQO, EOP on the last.
+    let mut desc_off = 2u32;
+    let mut remaining = frame_len;
+    let mut addr = buf_phys;
+    while remaining > 0 {
+        let chunk = remaining.min(GVE_TX_MAX_BUF_SIZE_DQO as usize);
+        let is_last = chunk == remaining;
+        // The device computes each emitted segment's L4 checksum.
+        let mut flags = DQO_TX_DTYPE_PKT | DQO_TX_FLAG_CSUM;
+        if is_last {
+            flags |= DQO_TX_FLAG_EOP;
+            // RE on the last descriptor when the 32-desc interval has
+            // elapsed, so `done_cnt` keeps advancing (same discipline
+            // as `emit_ctx_pkt`).
+            let this_fill = fill_cnt.wrapping_add(desc_off);
+            if this_fill.wrapping_sub(tx.last_re_at_fill.load(Ordering::Relaxed))
+                >= DQO_TX_RE_INTERVAL
+            {
+                flags |= DQO_TX_FLAG_REPORT_EVENT;
+                tx.last_re_at_fill.store(this_fill, Ordering::Relaxed);
+            }
+        }
+        let pkt_val = build_pkt_desc(addr, flags, compl_tag, chunk as u16);
+        record_tx_desc(qp as u8, tx_desc_kind::SEG, &pkt_val.to_le_bytes());
+        let pkt_ptr =
+            (tx.ring_va as *mut u128).wrapping_add((fill_cnt.wrapping_add(desc_off) & mask) as usize);
+        unsafe {
+            ptr::write_volatile(pkt_ptr, pkt_val);
+        }
+        addr += chunk as u64;
+        remaining -= chunk;
+        desc_off += 1;
+    }
+
+    let new_fill = fill_cnt.wrapping_add(desc_off);
+    tx.fill_cnt.store(new_fill, Ordering::Release);
+    DQO_TX_TSO_SENT.fetch_add(1, Ordering::Relaxed);
+
+    let done_cnt = tx.done_cnt.load(Ordering::Relaxed);
+    let near_full = new_fill.wrapping_sub(done_cnt) >= (tx.ring_entries as u32) - 16;
+    if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
+        doorbell_write_le(bar2_va, tx.db_offset, new_fill & mask);
+        tx.last_kicked.store(new_fill, Ordering::Relaxed);
+    }
 }
 
 // ---- RX post / poll --------------------------------------------------------

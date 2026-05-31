@@ -33,10 +33,14 @@ pub(crate) fn current_qp() -> Option<usize> {
 }
 
 pub(crate) fn acquire_tx_udp_gso_buf() -> Option<nic_api::TxUdpGsoBufHandle> {
-    // Share the big pool with TSO — same slot shape (16 KiB), same
-    // pool_id encoding. We just rewrap as the type-distinct handle
-    // so the API surface routes UDP-GSO slots through
-    // `submit_tx_udp_gso` (different descriptor bytes vs TSO).
+    // DQO UDP-GSO is not implemented yet (T5); `submit_tx_udp_gso`
+    // below is a no-op on DQO, so don't hand out a (TSO) big slot that
+    // would just be claimed and dropped. GQI shares the big pool with
+    // TSO — same slot shape, rewrapped as the type-distinct handle so
+    // the API surface routes it through `submit_tx_udp_gso`.
+    if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
+        return None;
+    }
     let tso = acquire_tx_tso_buf()?;
     Some(nic_api::TxUdpGsoBufHandle(tso.0))
 }
@@ -87,18 +91,27 @@ pub(crate) fn submit_tx(handle: nic_api::TxBufHandle, frame_len: usize, csum: ni
     }
 }
 
-/// Public TSO acquire — picks the calling worker's qp and returns
-/// a 16 KiB big-pool handle (or `None` on DQO / pool saturation).
+/// Public TSO acquire — picks the calling worker's qp and returns a
+/// big-pool handle for one TSO super-segment (or `None` on pool
+/// saturation, so the caller falls back to the per-MSS path).
+///
+/// * GQI_QPL: a 16 KiB QPL big-pool slot.
+/// * DQO_RDA: a ≈20 KiB big-segment bounce slot
+///   ([`dqo::acquire_tx_tso_buf`]); `submit_tx_tso` emits the
+///   TSO-ctx + general-ctx + scatter-gather packet descriptors.
 pub(crate) fn acquire_tx_tso_buf() -> Option<nic_api::TxTsoBufHandle> {
+    let qp = current_qp()?;
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
-        return None;
+        return dqo::acquire_tx_tso_buf(qp);
     }
-    gqi::acquire_tx_tso_buf_for_qp(current_qp()?)
+    gqi::acquire_tx_tso_buf_for_qp(qp)
 }
 
-/// Public TSO submit — paired with [`acquire_tx_tso_buf`]. Emits
-/// 1 TSO + 1 SEG descriptor; the device segments the payload into
-/// `gso_size`-byte chunks with TCP/IP headers fixed up per segment.
+/// Public TSO submit — paired with [`acquire_tx_tso_buf`]. The device
+/// segments the super-segment into `gso_size`-byte chunks host-side,
+/// fixing up L3/L4 headers and checksums per segment. Dispatches on
+/// the negotiated queue format (GQI: TSO+SEG desc pair; DQO: TSO-ctx +
+/// general-ctx + SG packet descs).
 pub(crate) fn submit_tx_tso(
     handle: nic_api::TxTsoBufHandle,
     frame_len: usize,
@@ -106,14 +119,11 @@ pub(crate) fn submit_tx_tso(
     csum_start: u16,
     gso_size: u16,
 ) {
-    // GQI_QPL only — `acquire_tx_tso_buf` returns None on DQO so
-    // we never get a real big-pool handle in DQO mode. Just in
-    // case (e.g. a saved handle), drop it cleanly.
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
-        // Dropping `handle` releases the slot via release_fn.
-        return;
+        dqo::submit_tx_tso(handle, frame_len, hdr_len, csum_start, gso_size);
+    } else {
+        gqi::submit_tx_tso_inner(handle, frame_len, hdr_len, csum_start, gso_size);
     }
-    gqi::submit_tx_tso_inner(handle, frame_len, hdr_len, csum_start, gso_size);
 }
 
 /// Flush the deferred TX kick for the given queue pair. Returns

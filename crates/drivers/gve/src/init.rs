@@ -778,10 +778,14 @@ fn alloc_tx_resources(fmt: QueueFormat) -> Option<TxAlloc> {
             alloc_contig(TX_QPL_PAGES as usize)
         }
         QueueFormat::DqoRda => {
-            // TX bounce-buffer pool: one packet buffer per ring slot.
-            // send() copies the packet here so the descriptor can
-            // hand the device a stable DMA address.
-            let bytes = dqo::DQO_TX_POOL_BUFS * (RX_BUFFER_SIZE as u32);
+            // TX bounce-buffer pool: one packet buffer per ring slot
+            // (standard sends copy/direct-fill here), followed by the
+            // TSO big-segment pool (one ≈20 KiB slot per concurrent
+            // super-segment) appended at `DQO_TX_BIG_POOL_OFFSET`. The
+            // descriptors hand the device stable DMA addresses into
+            // this region.
+            let bytes = dqo::DQO_TX_POOL_BUFS * (RX_BUFFER_SIZE as u32)
+                + dqo::DQO_TX_BIG_SLOTS * dqo::DQO_TX_BIG_SLOT_SIZE;
             let pages = bytes.div_ceil(PAGE_SIZE);
             alloc_contig(pages as usize)
         }

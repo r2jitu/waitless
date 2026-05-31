@@ -643,12 +643,13 @@ static GVE_OPS: NicOps = NicOps {
     // its slice path. Callers fall back to slice `send` when full.
     acquire_tx_buf: Some(tx::acquire_tx_buf),
     submit_tx: Some(tx::submit_tx),
-    // TSO v4 / v6 via GQI's `GVE_TXD_TSO` + `GVE_TXD_SEG` desc
-    // pair (per Linux's `gve_tx_fill_pkt_desc` / `_seg_desc`).
-    // The device segments super-segments host-side using the
-    // `mss` field on the SEG desc; CSUM is wired alongside via
-    // `GVE_TXF_L4CSUM`. Big-pool slots are 16 KiB so a typical
-    // 10× MSS super-segment lands in one slot.
+    // TSO v4 / v6 on both formats — the device segments a
+    // super-segment host-side and fixes up L3/L4 headers + checksums
+    // per segment. GQI: `GVE_TXD_TSO` + `GVE_TXD_SEG` desc pair (mss
+    // on the SEG desc). DQO: TSO-ctx (dtype 0x5) + general-ctx +
+    // scatter-gather packet descs, per `gve_tx_dqo.c` (see
+    // `dqo::submit_tx_tso`). Both use ≈16–20 KiB big-pool slots so a
+    // ~10× MSS super-segment lands in one slot.
     tso_available: || true,
     acquire_tx_tso_buf: Some(tx::acquire_tx_tso_buf),
     submit_tx_tso: Some(tx::submit_tx_tso),
