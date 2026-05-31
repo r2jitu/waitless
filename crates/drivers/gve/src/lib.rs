@@ -56,6 +56,7 @@ mod diag;
 pub mod dqo;
 mod gqi;
 mod init;
+mod irq;
 mod rx;
 mod tx;
 
@@ -356,6 +357,12 @@ pub(crate) static BAR0: AtomicU64 = AtomicU64::new(0);
 pub(crate) static BAR2_VA: AtomicU64 = AtomicU64::new(0);
 // DMA counter array VA (device writes TX completion counts here).
 pub(crate) static COUNTER_ARRAY_VA: AtomicU64 = AtomicU64::new(0);
+// IRQ-db array VA. The device populates this DMA array at
+// CONFIGURE_DEVICE_RESOURCES with each notification block's BAR2
+// IRQ-doorbell register index (big-endian, one per IRQ_DB_STRIDE bytes).
+// Read back by `irq::enable_irq` to find each RX block's doorbell. 0
+// until configured. See gve/src/irq.rs (T7 wake-on-packet idle).
+pub(crate) static IRQ_DB_VA: AtomicU64 = AtomicU64::new(0);
 // Active queue pair count. Published once init is done so
 // `num_queue_pairs()` can read it without taking STATE.
 pub(crate) static NUM_QP: AtomicU16 = AtomicU16::new(0);
@@ -669,13 +676,17 @@ static GVE_OPS: NicOps = NicOps {
     poll_qp: rx::poll_qp,
     get_mac,
     num_queue_pairs,
-    enable_irq: noop,
+    enable_irq: irq::enable_irq,
     enable_deferred_tx_kick: tx::enable_deferred_tx_kick,
     flush_tx_staging: tx::flush_all_tx_kicks,
     flush_tx_kick_if_dirty: tx::flush_tx_kick_if_dirty,
     poke_interrupt_status: noop,
+    // gve stays `idle: None` (polling): the proven sustained-idle gate in
+    // `idle_cb` keeps its busy-poll-under-load path and the measured
+    // 99.3% e2 idle. `arm_rx_idle` layers MSI-X wake-on-packet onto that
+    // gate without rerouting the idle path. See gve/src/irq.rs (T7).
     idle: None,
-    arm_rx_idle: None,
+    arm_rx_idle: Some(irq::arm_rx_idle),
     diag: Some(&GVE_DIAG_OPS),
 };
 

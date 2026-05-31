@@ -319,7 +319,7 @@ pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
          \"tx_ring_full_drops\":{},\"tx_tso_sent\":{},\
          \"rx_compl_skipped\":{},\"rx_buf_reposts\":{},\"gqi_recycle_exhausted\":{},\
          \"tx_packets\":{},\"tx_bytes\":{},\"rx_bytes\":{},\"tx_small_full_spins\":{},\
-         \"tx_big_full_returns\":{},",
+         \"tx_big_full_returns\":{},\"rx_irq\":{},",
         crate::dqo::DQO_TX_MISS_COMPL.load(Ordering::Relaxed),
         crate::dqo::DQO_TX_REINJECT_COMPL.load(Ordering::Relaxed),
         crate::dqo::DQO_TX_RING_FULL_DROPS.load(Ordering::Relaxed),
@@ -332,6 +332,10 @@ pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
         sum(&RX_BYTES_PER_QP),
         TX_SMALL_FULL_SPINS.get(),
         TX_BIG_FULL_RETURNS.get(),
+        // RX MSI-X interrupts handled (T7 wake-on-packet idle). Nonzero
+        // confirms the IRQ path fires; 0 on a busy server (never arms)
+        // or an MSI-X-less boot (timer-only idle).
+        crate::irq::rx_irq_count(),
     )?;
     LAST_RX_SKIP.write_json(w, "last_rx_skip")?;
     w.write_str("}")

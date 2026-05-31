@@ -546,6 +546,22 @@ pub unsafe fn msix_write_entry(table_va: u64, entry: u16, addr: u64, data: u32, 
     }
 }
 
+/// Set just the mask bit (vector control, entry offset +12) of an
+/// already-programmed MSI-X table entry, without disturbing its
+/// address/data. Lets a driver keep an entry masked until the moment it
+/// arms the interrupt (matching Linux's `IRQF_NO_AUTOEN` gate) so an
+/// idle-only interrupt never fires while the device is busy.
+///
+/// # Safety
+/// `table_va` must be the mapped MSI-X table base and `entry` within the
+/// device's advertised table size.
+pub unsafe fn msix_set_mask(table_va: u64, entry: u16, masked: bool) {
+    let slot = table_va + (entry as u64) * 16;
+    unsafe {
+        mmio_write32(slot + 12, if masked { 1 } else { 0 });
+    }
+}
+
 /// Build an x86 MSI message address for fixed, edge-triggered delivery
 /// to the given LAPIC. Intel SDM Vol.3 §10.11.1: bits 31:20 = 0xFEE,
 /// bits 19:12 = destination APIC ID.

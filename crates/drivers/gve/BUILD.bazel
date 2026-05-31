@@ -12,6 +12,7 @@ rust_library(
         "src/dqo.rs",
         "src/gqi.rs",
         "src/init.rs",
+        "src/irq.rs",
         "src/lib.rs",
         "src/rx.rs",
         "src/tx.rs",

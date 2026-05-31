@@ -547,6 +547,12 @@ fn configure_device_resources(bar2_va: u64, num_qp: u32, fmt: QueueFormat) -> bo
     // across cores.
     BAR2_VA.store(bar2_va, Ordering::Release);
     COUNTER_ARRAY_VA.store(counter_va, Ordering::Release);
+    // The device populated the irq-db array during the command above
+    // (one BAR2 IRQ-doorbell index per notification block). Publish its
+    // VA so `irq::enable_irq` can read those indices back when wiring
+    // MSI-X for wake-on-packet idle (T7). Kept even in polling-only
+    // boots — `enable_irq` is a no-op cost when MSI-X can't be set up.
+    crate::IRQ_DB_VA.store(irq_db_va, Ordering::Release);
     log(b"[gvnic] device resources configured\n");
     true
 }
