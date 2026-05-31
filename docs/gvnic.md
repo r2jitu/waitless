@@ -430,11 +430,31 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
   but `csum_tx_offload` returns false — enabling it regressed
   health_max −19/−32%, so it's off pending a descriptor-encoding
   debug. Small-packet win only. *Where:* `lib.rs` `csum_tx_offload`.
-- `[ ]` **T7. gve MSI-X + NAPI (park-until-interrupt).** Device
+- `[~]` **T7. gve MSI-X + NAPI (park-until-interrupt).** Device
   supports it (verified); we're polling-only. **Low-load latency /
   power only** — NAPI exists to avoid IRQs under load, which our spin
   window already approximates, so this is *not* a saturated-throughput
-  lever. Do only if idle-power/tail-latency becomes a goal.
+  lever. Prework landed (x86_64 LAPIC timer-bounded HLT + adaptive
+  spin window, commit `kernel/idle:`); MSI-X RX wiring itself deferred.
+  **Measured dead-end on the actual target (e2-small):** the goal was
+  to stop idle-spinning on a shared burstable host, but on GCE
+  e2-small KVM **HLT does not block the vCPU** — it traps (~1–2 µs
+  VMEXIT) and re-enters immediately, so an idle core stays **90–95 %
+  busy** no matter what we do. Live `/obs` delta (no traffic, 2 cores):
+  idle 5–9 %, ~45 K idle-enters/s/core, ~1–2 µs slept per HLT, LAPIC
+  timer (vector 0xF0) fires only ~12/s — i.e. <0.02 % of HLTs ever
+  reach the 1 ms bound. The LAPIC timer *does* deliver on e2 (earlier
+  "never delivers" note was wrong; `apic_irr`/`isr`=0, not x2APIC),
+  but it's moot because HLT returns first. Stock Linux idles fine on
+  e2, so this is a guest-setup subtlety we can't crack from inside the
+  guest. Two independent walls compound: gve is **polling-by-design**
+  (`idle: None` → `idle_cb` returns immediately, never even reaching
+  HLT), *and* e2 HLT is a near-NOP. So T7 (route gve through HLT) helps
+  only on hosts where HLT actually blocks (verified on local qemu-TCG:
+  idle drops to ~5 %); it cannot reduce e2-small CPU%. Routing gve idle
+  through a timer-bounded HLT was prototyped + measured on e2 and
+  reverted (no CPU% win; risks the c3 throughput headline via mid-gap
+  1 ms sleeps near saturation). See [[reference_idle_cpu_spin]].
 - `[ ]` **T8. 4 KiB RX buffers on DQO** (`BUFFER_SIZES` id=10
   advertises 4096; FreeBSD has `allow_4k_rx_buffers`). Lets more RSC
   coalesces stay single-descriptor, reducing T4 stitching pressure.
