@@ -70,14 +70,22 @@ pub fn unmask_irq() {
 ///     networking even without a GIC, which matches QEMU-without-
 ///     GIC guests.
 ///
-/// x86_64: `sti; hlt; cli` — the atomic idle pattern. HLT is
-/// interruptible, no explicit timer needed.
+/// x86_64: arm a one-shot ~1 ms LAPIC TSC-deadline timer, then
+/// `sti; hlt; cli`. Without the armed timer a bare `sti; hlt` returns
+/// near-instantly on shared GCE shapes (the vCPU isn't truly idled),
+/// leaving the core busy-spinning; the timer guarantees a bounded
+/// sleep so an idle core actually yields. Wakes on the timer or any
+/// earlier interrupt. Falls back to bare `sti; hlt` if the CPU lacks
+/// TSC-deadline (arm/disarm become no-ops). See reference_idle_cpu_spin.
 #[inline]
 pub fn idle_bounded() {
     #[cfg(target_arch = "x86_64")]
     unsafe {
+        let q = crate::time::cycles_per_us().saturating_mul(1000).max(1);
+        crate::x86_64::apic::arm_timer_cycles(q);
         // SAFETY: privileged but sound on the current CPU.
         core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+        crate::x86_64::apic::disarm_timer();
     }
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -122,18 +130,26 @@ pub fn idle_unbounded() {
 /// advertised, because the yield path only wakes on host-driven IO
 /// and an async task waiting on a `Sleep` future has no such signal.
 ///
-/// x86_64: no per-idle timer is wired up yet (no LAPIC oneshot
-/// configured), so this busy-spins until `cycles` TSC ticks elapse.
-/// Correct but not power-efficient — the proper fix is a one-shot
-/// LAPIC timer + handler, tracked in the roadmap.
+/// x86_64: arm the one-shot LAPIC TSC-deadline timer for `cycles`, then
+/// `sti; hlt; cli` — a real sleep until the timer or an earlier IRQ.
+/// Falls back to a `pause` busy-spin to the deadline only when the CPU
+/// lacks TSC-deadline (correct, not power-efficient).
 #[inline]
 pub fn idle_until_cycles(cycles: u64) {
     #[cfg(target_arch = "x86_64")]
     {
-        let deadline = crate::time::now_cycles().saturating_add(cycles);
-        while crate::time::now_cycles() < deadline {
+        if crate::x86_64::apic::timer_available() {
+            crate::x86_64::apic::arm_timer_cycles(cycles);
             unsafe {
-                core::arch::asm!("pause", options(nomem, nostack));
+                core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+            }
+            crate::x86_64::apic::disarm_timer();
+        } else {
+            let deadline = crate::time::now_cycles().saturating_add(cycles);
+            while crate::time::now_cycles() < deadline {
+                unsafe {
+                    core::arch::asm!("pause", options(nomem, nostack));
+                }
             }
         }
     }

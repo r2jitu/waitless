@@ -224,6 +224,11 @@ pub fn run(core_id: u32) -> ! {
     // a short window before we commit to HLT/WFI, so back-to-back
     // interactive requests don't eat an IRQ round-trip each.
     let mut idle_streak: u32 = 0;
+    // Consecutive HLT rounds with no work in between. Drives the
+    // adaptive (exponential) shrink of the spin window: 0 right after
+    // work (full window), growing as the core stays idle. Reset on
+    // any `did_work`.
+    let mut idle_rounds: u32 = 0;
 
     // Cycle-counter snapshot from the start of the *current* loop
     // iteration. Busy cycles (loop body) and idle cycles (HLT/WFI)
@@ -292,7 +297,24 @@ pub fn run(core_id: u32) -> ! {
     // poll mode through their natural inter-batch gaps. Idle
     // workloads still halt within 2 ms; the extra busy-spin is
     // bounded.
+    //
+    // ADAPTIVE: this is the spin window for an *active* core (one that
+    // recently did work). The longer a core stays idle (consecutive
+    // HLTs with no work in between), the more we shrink the window —
+    // halving it per idle round down to `SPIN_FLOOR` — so a genuinely
+    // idle core HLTs almost immediately and stops burning CPU (the
+    // dominant idle cost on shared GCE shapes like e2-small, where a
+    // pegged vCPU exhausts CPU-burst credits). `did_work` resets the
+    // round counter, so the instant traffic resumes the full window is
+    // back: no throughput/latency regression under load. See
+    // reference_idle_cpu_spin.
     const IDLE_SPIN_BEFORE_HLT: u32 = 10_000;
+    // Floor for the adaptive spin window once a core is deeply idle.
+    // Small enough that idle CPU is near-zero (the timer-bounded HLT
+    // then dominates each idle cycle), with a few iterations of slack
+    // so a just-missed packet is still caught without an IRQ/HLT
+    // round-trip.
+    const SPIN_FLOOR: u32 = 16;
 
     loop {
         if loops & 63 == 0 && is_shutdown() {
@@ -389,18 +411,23 @@ pub fn run(core_id: u32) -> ! {
         // 5. Idle if no work
         if did_work {
             idle_streak = 0;
+            idle_rounds = 0;
         } else {
             idle_count += 1;
             idle_streak += 1;
 
-            // Busy-poll for a short window before committing to HLT.
-            // A pure "did_work==false → HLT" policy pays one IRQ
-            // round-trip per request on interactive TCP (SYN, then
-            // ACK, then GET, …) which costs several microseconds each
-            // and caps per-core throughput. Spinning for a brief
-            // window after the queue empties catches follow-up packets
-            // without leaving poll mode.
-            if idle_streak < IDLE_SPIN_BEFORE_HLT {
+            // Busy-poll for a window before committing to HLT. A pure
+            // "did_work==false → HLT" policy pays one IRQ round-trip
+            // per request on interactive TCP (SYN, then ACK, then GET,
+            // …) which costs several microseconds each and caps
+            // per-core throughput. Spinning briefly after the queue
+            // empties catches follow-up packets without leaving poll
+            // mode. The window shrinks exponentially the longer the
+            // core has been idle (one halving per idle HLT round, down
+            // to SPIN_FLOOR), so a sustained-idle core HLTs almost
+            // immediately while an active one keeps the full window.
+            let spin_window = (IDLE_SPIN_BEFORE_HLT >> idle_rounds.min(16)).max(SPIN_FLOOR);
+            if idle_streak < spin_window {
                 continue;
             }
 
@@ -417,12 +444,16 @@ pub fn run(core_id: u32) -> ! {
                 && arm(core_id)
             {
                 idle_streak = 0;
+                idle_rounds = 0;
                 continue;
             }
 
             // Sleep until interrupt. WFI/HLT yields the CPU to the
             // host; the hypervisor resumes us when an interrupt fires.
+            // Count this as an idle round so the spin window shrinks
+            // if we keep coming back here with no work.
             idle_streak = 0;
+            idle_rounds = idle_rounds.saturating_add(1);
             // Charge cycles spent in the iteration *up to* the sleep
             // as busy, then time the sleep itself as idle. This is
             // the only place the cycle counter is read on the hot

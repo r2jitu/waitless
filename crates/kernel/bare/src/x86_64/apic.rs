@@ -48,6 +48,11 @@ struct ApicRegs {
     _r5: [ApicReg<u32>; 2],  // 0x330..0x350
     lvt_lint0: ApicReg<u32>, // 0x350
     lvt_lint1: ApicReg<u32>, // 0x360
+    lvt_error: ApicReg<u32>, // 0x370
+    initial_count: ApicReg<u32>, // 0x380
+    current_count: ApicReg<u32>, // 0x390
+    _r6: [ApicReg<u32>; 4],  // 0x3A0..0x3E0
+    divide_config: ApicReg<u32>, // 0x3E0
 }
 
 // Compile-time layout assertions — every named register lands at the
@@ -62,6 +67,10 @@ const _: () = assert!(core::mem::offset_of!(ApicRegs, icr_hi) == 0x310);
 const _: () = assert!(core::mem::offset_of!(ApicRegs, lvt_timer) == 0x320);
 const _: () = assert!(core::mem::offset_of!(ApicRegs, lvt_lint0) == 0x350);
 const _: () = assert!(core::mem::offset_of!(ApicRegs, lvt_lint1) == 0x360);
+const _: () = assert!(core::mem::offset_of!(ApicRegs, lvt_error) == 0x370);
+const _: () = assert!(core::mem::offset_of!(ApicRegs, initial_count) == 0x380);
+const _: () = assert!(core::mem::offset_of!(ApicRegs, current_count) == 0x390);
+const _: () = assert!(core::mem::offset_of!(ApicRegs, divide_config) == 0x3E0);
 
 /// Spurious interrupt vector (must be 0xXF per Intel spec).
 const SPURIOUS_VECTOR: u32 = 0xFF;
@@ -129,6 +138,145 @@ pub fn eoi() {
     lapic().eoi.write(0);
 }
 
+// ── LAPIC timer (TSC-deadline one-shot, for bounded idle) ──────────────────
+//
+// We use TSC-deadline mode (LVT timer mode 0b10): arming is a single MSR
+// write of an absolute TSC value, which fires once when the TSC reaches it
+// and then auto-disarms. No bus-frequency calibration (the classic
+// initial-count timer would need it); we reuse the TSC rate the kernel
+// already calibrates (`crate::time::cycles_per_us`). The event-loop idle
+// path arms a short deadline before `hlt` so an idle core sleeps for a
+// bounded interval and then re-polls, instead of busy-spinning — the
+// dominant idle-CPU cost on shared GCE shapes (e2-small). See
+// reference_idle_cpu_spin.
+
+/// IA32_TSC_DEADLINE MSR. Writing a nonzero absolute TSC value arms the
+/// LAPIC timer to fire once when `rdtsc()` reaches it; writing 0 disarms.
+const IA32_TSC_DEADLINE_MSR: u32 = 0x6E0;
+/// IDT vector for the LAPIC timer interrupt. Above the virtio/gve MSI-X
+/// range (0x60..) and below the spurious vector (0xFF).
+pub const TIMER_VECTOR: u8 = 0xF0;
+/// LVT timer mode field (bits 18:17): 0b10 = TSC-deadline.
+const LVT_TIMER_TSC_DEADLINE: u32 = 0b10 << 17;
+
+/// Whether the LAPIC timer is usable for bounded idle (TSC-deadline or
+/// the calibrated classic one-shot). Set once during `timer_init()`;
+/// read by `arm_timer_cycles`. When false the idle path falls back to
+/// its prior behaviour (no bounded-sleep timer).
+static TIMER_AVAILABLE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Calibrated LAPIC-timer ticks per microsecond, for the *classic*
+/// (initial-count) one-shot path. `0` means "TSC-deadline mode" (no
+/// classic count needed) — the two modes are distinguished by this.
+/// GCE e2-small's KVM does NOT expose TSC-deadline (CPUID.01H:ECX[24]
+/// clear), so the classic path is what actually runs there.
+static APIC_TICKS_PER_US: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Classic timer LVT mode: one-shot (bits 18:17 = 0b00), so writing
+/// `initial_count` arms a single fire.
+const LVT_TIMER_ONESHOT: u32 = 0;
+/// `divide_config` value for divide-by-1 (bits [3,1,0] = 0b1011).
+const DIVIDE_BY_1: u32 = 0b1011;
+
+/// True once the LAPIC timer is usable for bounded idle.
+#[inline]
+pub fn timer_available() -> bool {
+    TIMER_AVAILABLE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Configure this core's LAPIC timer LVT (TSC-deadline if CPUID
+/// advertises it, else a TSC-calibrated classic one-shot), pointed at
+/// [`TIMER_VECTOR`] and unmasked (disarmed until `arm_timer_cycles`).
+/// Idempotent; safe to call per-core. Records availability from CPUID.
+fn timer_init() {
+    let l = lapic();
+    let tsc_deadline = unsafe { core::arch::x86_64::__cpuid(1).ecx } & (1 << 24) != 0;
+    if tsc_deadline {
+        // Disarm before switching mode (Intel SDM: write 0 to the
+        // deadline MSR when changing timer mode).
+        unsafe { wrmsr(IA32_TSC_DEADLINE_MSR, 0) };
+        l.lvt_timer
+            .write(LVT_TIMER_TSC_DEADLINE | TIMER_VECTOR as u32);
+        APIC_TICKS_PER_US.store(0, core::sync::atomic::Ordering::Relaxed); // 0 = TSC-deadline
+        TIMER_AVAILABLE.store(true, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+
+    // Classic one-shot LAPIC timer (the path that actually runs on
+    // GCE shapes without TSC-deadline). Calibrate the timer's tick
+    // rate against the already-calibrated TSC (boot order:
+    // `cycles_per_us` runs before `apic::init`), then leave the LVT in
+    // one-shot mode, unmasked, disarmed (count 0). Per-core, but the
+    // rate is identical across cores so a later writer just overwrites
+    // the same value.
+    let per_us = crate::time::cycles_per_us();
+    if per_us == 0 {
+        l.lvt_timer.write(0x10000); // can't calibrate → stay masked
+        return;
+    }
+    l.divide_config.write(DIVIDE_BY_1);
+    l.lvt_timer.write(0x10000); // masked during calibration
+    l.initial_count.write(u32::MAX);
+    let t0 = crate::time::now_cycles();
+    let cal_cycles = per_us.saturating_mul(2000); // 2 ms calibration
+    while crate::time::now_cycles().wrapping_sub(t0) < cal_cycles {
+        core::hint::spin_loop();
+    }
+    let elapsed_apic = u32::MAX - l.current_count.read();
+    l.initial_count.write(0); // stop counting
+    let apic_per_us = ((elapsed_apic as u64) / 2000).max(1);
+    APIC_TICKS_PER_US.store(apic_per_us, core::sync::atomic::Ordering::Relaxed);
+    // One-shot mode, unmasked, pointed at the timer vector. Disarmed
+    // (count already 0) until `arm_timer_cycles` writes initial_count.
+    l.lvt_timer.write(LVT_TIMER_ONESHOT | TIMER_VECTOR as u32);
+    TIMER_AVAILABLE.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Arm the LAPIC timer to fire once `cycles` TSC ticks from now
+/// (TSC-deadline). No-op if TSC-deadline isn't available. The fire
+/// auto-disarms the timer; the [`TIMER_VECTOR`] ISR just sends EOI.
+#[inline]
+pub fn arm_timer_cycles(cycles: u64) {
+    if !timer_available() {
+        return;
+    }
+    let apic_per_us = APIC_TICKS_PER_US.load(core::sync::atomic::Ordering::Relaxed);
+    if apic_per_us == 0 {
+        // TSC-deadline mode.
+        let deadline = crate::time::now_cycles().wrapping_add(cycles.max(1));
+        unsafe { wrmsr(IA32_TSC_DEADLINE_MSR, deadline) };
+    } else {
+        // Classic mode: convert the requested TSC-cycle interval to
+        // APIC ticks and arm the one-shot by writing initial_count.
+        let per_us_tsc = crate::time::cycles_per_us();
+        let us = if per_us_tsc > 0 { cycles / per_us_tsc } else { 0 };
+        let count = us
+            .saturating_mul(apic_per_us)
+            .clamp(1, u32::MAX as u64) as u32;
+        lapic().initial_count.write(count);
+    }
+}
+
+/// Disarm the LAPIC timer (clear any pending deadline).
+#[inline]
+pub fn disarm_timer() {
+    if !timer_available() {
+        return;
+    }
+    if APIC_TICKS_PER_US.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        unsafe { wrmsr(IA32_TSC_DEADLINE_MSR, 0) }; // TSC-deadline
+    } else {
+        lapic().initial_count.write(0); // classic one-shot
+    }
+}
+
+/// ISR for the LAPIC timer vector — the deadline already auto-disarmed,
+/// so just acknowledge. Its only job is to wake the core from `hlt`.
+unsafe extern "C" fn timer_isr(_frame: *mut super::idt::InterruptFrame) {
+    eoi();
+}
+
 /// Initialize the Local APIC on the current core (BSP or AP).
 ///
 /// # Safety
@@ -157,8 +305,12 @@ pub unsafe fn init() {
     l.lvt_lint0.write(0x00000700); // delivery mode 111 = ExtINT
     // LINT1 = NMI, edge-triggered, unmasked
     l.lvt_lint1.write(0x00000400); // delivery mode 100 = NMI
-    // Timer = masked (not used yet)
-    l.lvt_timer.write(0x10000);
+    // Timer = one-shot for bounded idle (sets the LVT + records
+    // availability). Disarmed until `arm_timer_cycles`, so no interrupt
+    // fires until the idle path arms it. Register the ISR first; the
+    // IDT is already loaded by this point in boot.
+    super::idt::register_handler(TIMER_VECTOR, timer_isr);
+    timer_init();
 
     // Silent on success — the boot banner's `platform:` and `cpu:`
     // lines already cover the diagnostic surface. Keep `id` / `ver`
@@ -186,6 +338,9 @@ pub unsafe fn init_ap() {
     let l = lapic();
     l.svr.write(0x100 | SPURIOUS_VECTOR);
     l.tpr.write(0);
+    // Per-core LVT config for the bounded-idle timer (ISR already
+    // registered in the shared IDT by the BSP's `init`).
+    timer_init();
 }
 
 /// Send an IPI (Inter-Processor Interrupt) to a specific APIC ID.
