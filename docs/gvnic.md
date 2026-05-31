@@ -24,15 +24,18 @@ The two TX paths are **not** at feature parity:
   super-segment per 5-page slot), plus TSO (v4/v6) and UDP-GSO via
   the `GVE_TXD_TSO` + `GVE_TXD_SEG` descriptor pair, plus L4-CSUM
   offload. The device segments super-segments host-side.
-- **DQO_RDA** currently has no direct-fill, no TSO, and no UDP-GSO.
-  Every outbound frame goes through the slice-shaped `send_on_qp`:
-  copy into a per-ring-slot bounce buffer, emit a general-context +
-  packet descriptor pair carrying that buffer's raw DMA address.
-  `acquire_tx_buf` / `acquire_tx_tso_buf` / `acquire_tx_udp_gso_buf`
-  all return `None` in DQO mode so callers fall back to that one
-  extra memcpy per frame. L4-CSUM offload is still wired (the
-  `DQO_TX_FLAG_CSUM` bit). A DQO direct-fill landed once but stalled
-  on real c3 hardware under load and was removed.
+- **DQO_RDA** has direct-fill (single-segment) but no TSO and no
+  UDP-GSO. `acquire_tx_buf` hands the caller the next ring slot's
+  bounce buffer to fill in place (no scratch→bounce memcpy); `submit_tx`
+  emits the general-context + packet descriptor pair carrying that
+  buffer's raw DMA address. `acquire_tx_tso_buf` /
+  `acquire_tx_udp_gso_buf` still return `None` in DQO mode so the
+  large-response / QUIC paths fall back to the per-MSS / per-datagram
+  loop. L4-CSUM offload is wired (the `DQO_TX_FLAG_CSUM` bit). The
+  earlier DQO direct-fill stall was root-caused (RE-on-every-descriptor
+  + a TX-completion field-decode bug, both long since fixed in the
+  slice path) and direct-fill re-landed reusing that proven emission —
+  validated stall-free on c3 (see T1 below).
 
   > **This is the gap, and it's closable.** Upstream Linux and
   > FreeBSD both run DQO TX *fully zero-copy with scatter-gather* on
@@ -249,33 +252,72 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
 
 ### Tier 1 — measured correctness gaps (do first)
 
-- `[!]` **T1. Diagnose the DQO TX stall, then land direct-fill.**
-  *What:* root-cause why DQO `acquire_tx_buf` direct-fill stalled on
-  c3 under load, re-enable it, kill the per-frame bounce memcpy.
-  *Why:* removes 1 copy/frame (payload-size-scaling: big on
-  `/static-*`, marginal on `/health`); unblocks T2/T3.
-  *Where:* `dqo.rs` `send_on_qp` (the copy at the bounce-buffer
-  write), `tx.rs:66` (`acquire_tx_buf` returns `None` on DQO).
-  *Method:* diff our descriptor emission against `gve_tx_dqo.c`
-  line-by-line; capture live descriptors via the `/diag-gve`
-  endpoint on a c3 under load; check ctx/pkt ordering, RE-interval
-  spacing (≥32), completion-tag reuse, and the `ring_entries-2`
-  masked-tail headroom. *Verify:* `/static-64k` + `/static-1m` TLS
-  on c3, `DQO_TX_RING_FULL_DROPS` stays ~0 and p99 has no RTO cliff;
-  `/health` neutral. *Status:* blocked on the diagnosis above.
+- `[x]` **T1. Diagnose the DQO TX stall, then land direct-fill.**
+  *What:* root-caused the stall and re-landed `acquire_tx_buf`
+  direct-fill, killing the per-frame bounce memcpy.
+  *Diagnosis (git archaeology, commits `1a1915d`→`f7711a4`→`abc6fac`):*
+  the original direct-fill stall was **not** a hardware limit and
+  **not** unique to direct-fill — it was two bugs in the shared DQO TX
+  code, both **already fixed** in today's slice path: (1) the
+  TX-completion drain decoded the generation bit / type from the
+  *reserved* byte, so `done_cnt` never advanced and the qp froze once
+  `fill_cnt - done_cnt` hit `ring_entries` (masked by sub-ring-depth
+  traffic; saturated under parallel load) — fixed to byte-0
+  bit-7/bits-0..3; (2) `report_event` was set on **every** descriptor,
+  violating `GVE_TX_MIN_RE_INTERVAL = 32` so the device stopped
+  emitting completions under load — fixed to RE every 32 descriptors.
+  Plus the general-context (DTYPE 0x4) descriptor the device requires
+  was added. The slice path embodying all three is the stable c3
+  golden path, so its descriptor emission is proven correct.
+  *Implementation:* extracted the slice path's capacity gate
+  (`tx_reserve`) and descriptor emission (`emit_ctx_pkt`) into shared
+  helpers; `dqo::acquire_tx_buf`/`submit_tx` fill the same per-slot
+  bounce buffer in place and emit the identical (ctx, pkt) pair.
+  Buffer lifetime, slot==pkt_idx convention, RE spacing, and the
+  `ring_entries-2` masked-tail headroom are unchanged — no new hazard.
+  *Verified on c3-highcpu-8 (gVNIC DQO), raw `wrk`/`/obs` output:*
+  **no stall** — `/health` TLS c4000 -t8 = **467,960 rps**, 0 socket
+  errors, 8 cores balanced (rx_max/min 1.12×); `/health` plain
+  = **851,229 rps**. `/health` neutral vs the prior plateau (~454K)
+  as predicted — direct-fill removes a memcpy but `/health` is at
+  irreducible per-frame work. The `/static-*` win it unblocks is
+  **gated on T2**: large bodies still hit the ring-full drop (see T2).
+  *Status:* done, landed on main.
 
 - `[ ]` **T2. DQO TX back-pressure (stop dropping on a full ring).**
-  *What:* when the TX ring is full, async-yield + retain the chain
-  and wake on TX completion, instead of the silent
-  `let _ = send_on_qp` drop. *Why:* large-body sends currently drop
-  ~0.5%/segment → RTO-driven p99 cliffs of 6.7–8.0 s (measured via
-  `DQO_TX_RING_FULL_DROPS`, landed `f2e5a1c`). This is a **latency**
-  fix for large responses, not a throughput or `/health` win.
-  *Where:* `tx.rs:~190` (the dropping send site), the TX-completion
-  drain, the executor TX-ready waker. *Verify:* `/static-1m` TLS
-  p99 drops from seconds to ms; drop counter → 0. *Status:* design
-  exists ([[reference_tx_async_spin_measured]]); needs the
-  completion-waker plumbing. Pairs naturally with T1.
+  *What:* when the TX ring is full, stop the send and wake on TX
+  completion, instead of the silent `let _ = send_on_qp` drop +
+  `snd_nxt` advancing over un-sent bytes. *Why:* **now the top lever**
+  — with T1 landed, the large-response win is entirely gated here.
+  *Measured on c3-highcpu-8 (gVNIC DQO), raw output, post-T1:*
+  `/static-64k` TLS c4000 = **33,179 rps**, `tx_ring_full_drops`
+  **+103,027**, p99 **7.49 s**, 84 timeouts. `/static-1m` TLS c1000
+  = **2,349 rps**, drops **+27,719**, p99 **8.27 s**, 119 timeouts.
+  The ring is 256 descriptors = 128 packets/qp; a 64 KB response is
+  ~45 frames and 1 MB is ~715, so a single large response overruns it
+  and the overflow is dropped → RTO. This is **latency** (and, here,
+  throughput) recovery for large responses, not a `/health` win.
+  *Hooks identified (verified against code):* (1) `nic::send` is
+  fire-and-forget today; `dqo::send_on_qp` already returns
+  `false`+counts on ring-full — thread that boolean up through
+  `build_and_send_frame` so the per-MSS loop in
+  `async_try_send_chain` (`send.rs:658+`) stops on the first failed
+  frame and advances `snd_nxt` only by bytes actually on the wire,
+  leaving the remainder in the chain. (2) The reactor's
+  `TcpSendChain::poll` (`reactor/tcp.rs:1109`) already parks the send
+  waker on `Ok(0)` and re-probes — return `Ok(0)` on ring-full so it
+  parks. (3) The wake: send wakers are per-conn (`c.send_waker`),
+  woken today only from the ACK path (`receive.rs:447`). Add a
+  poll-driven TX-writable wake — after the event loop drains TX
+  completions (`tx_drain` frees ring space), wake the send wakers of
+  conns parked on ring-full (the driver has no conn registry, so this
+  is event-loop-driven, not a driver→TCP call). Distinguish ring-full
+  park from window-closed park so the persist timer isn't mis-armed
+  (`snd_wnd != 0` on ring-full). *Verify:* `/static-1m` TLS p99 drops
+  from seconds to ms; `tx_ring_full_drops` → ~0; `/static-64k`/`1m`
+  rps recovers. *Status:* design + hooks pinned
+  ([[reference_tx_async_spin_measured]]); spans drivers/nic +
+  net/tcp + runtime/executor with wake-race care — its own pass.
 
 ### Tier 2 — throughput offloads (after T1)
 
