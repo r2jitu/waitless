@@ -186,15 +186,24 @@ unsafe fn fill_tcp_frame_headers(
 /// driver (via `submit_tx`, or the `send` fallback) as the L4
 /// checksum-offload descriptor.
 ///
-/// Falls back to a stack-staged frame + slice-shaped `send` when
-/// the driver doesn't expose direct-fill (`acquire_tx_buf == None`)
-/// — the gve driver's DQO_RDA path surfaces this today.
+/// Returns `true` when the frame was handed to the driver (on the
+/// wire / queued on the TX ring), `false` when the driver supports
+/// direct-fill but its TX ring is full right now — the caller's
+/// back-pressure signal (T2). A driver without direct-fill always
+/// returns `true` via the slice fallback (best-effort; no per-frame
+/// back-pressure on that path).
+///
+/// When it returns `false`, `fill` is **not** invoked — so a cursor
+/// the closure would have read stays un-advanced and the unsent
+/// bytes remain available for the next attempt. This is what lets the
+/// data-send loop stop cleanly on a full ring without losing its
+/// place or double-counting `snd_nxt`.
 ///
 /// `fill` writes `frame_len` bytes starting at the head of the
 /// passed `&mut [u8]` (≥ `FRAME_BUF_LEN` bytes). Caller is
 /// responsible for ensuring `frame_len <= FRAME_BUF_LEN`.
 #[inline]
-fn build_and_send_frame<F>(frame_len: usize, tcp_hdr_off: u16, fill: F)
+fn build_and_send_frame<F>(frame_len: usize, tcp_hdr_off: u16, fill: F) -> bool
 where
     F: FnOnce(&mut [u8]),
 {
@@ -215,13 +224,22 @@ where
         // full slot.
         fill(&mut handle.data_mut()[..frame_len]);
         nic::submit_tx(handle, frame_len, csum);
-        return;
+        return true;
     }
-    // Slice-shaped fallback: stage the frame on the stack and hand
-    // it to the driver's `send` with the same `csum` descriptor as
-    // the `submit_tx` path above — the driver finishes the checksum
-    // either way (device offload, or a software pass). The gve
-    // DQO_RDA path takes this branch for every frame.
+    // `acquire_tx_buf` returned `None`. If the driver implements
+    // direct-fill, that means its TX ring is full right now — signal
+    // back-pressure (without invoking `fill`) so the data-send loop
+    // stops and the reactor parks; an ACK-clocked re-poll resumes it
+    // once the ring drains. (Dropping silently here was the gve DQO
+    // ring-full → RTO-cliff behaviour T2 fixes.)
+    if nic::has_direct_fill() {
+        return false;
+    }
+    // Slice-shaped fallback for a driver without direct-fill: stage
+    // the frame on the stack and hand it to `send` with the same
+    // `csum` descriptor — the driver finishes the checksum either way
+    // (device offload, or a software pass). Best-effort, no
+    // back-pressure signal on this path.
     let mut buf = core::mem::MaybeUninit::<[u8; FRAME_BUF_LEN]>::uninit();
     let p = buf.as_mut_ptr() as *mut u8;
     // SAFETY: `from_raw_parts_mut` over uninit memory is fine
@@ -234,6 +252,7 @@ where
         let frame_const = core::slice::from_raw_parts(p, frame_len);
         nic::send(frame_const, csum);
     }
+    true
 }
 
 /// Build and ship a TCP segment whose payload comes from `payload`
@@ -276,14 +295,20 @@ pub(crate) fn send_segment(meta: &SegmentMeta, payload: &[u8]) {
 /// Caller must have verified `nic::tso_available()`
 /// before reaching this. Falls back to the per-MSS loop in
 /// `async_try_send_chain` when not available.
+///
+/// Returns the number of payload bytes put on the wire — `payload_len`
+/// on the TSO-slot fast path (one atomic super-segment), the per-MSS
+/// fallback's actual byte count when the big pool is unavailable
+/// (which may be `< payload_len` if the TX ring fills mid-loop), or
+/// `0` on a MAC-resolution miss.
 fn send_super_segment_from_cursor(
     meta: &SegmentMeta,
     cursor: &mut iobuf::Cursor<'_>,
     payload_len: usize,
-) {
+) -> usize {
     let dst_mac = match mac_resolve::resolve(meta.dst_ip) {
         Some(m) => m,
-        None => return,
+        None => return 0,
     };
 
     let payload_off = payload_offset(meta.local_ip);
@@ -294,8 +319,7 @@ fn send_super_segment_from_cursor(
     // Falls back to per-MSS when the big pool is full or TSO
     // isn't supported on this driver.
     let Some(mut handle) = nic::acquire_tx_tso_buf() else {
-        send_per_mss_fallback(meta, cursor, payload_len);
-        return;
+        return send_per_mss_fallback(meta, cursor, payload_len);
     };
     let cap = handle.data_cap() as usize;
     debug_assert!(frame_len <= cap);
@@ -332,6 +356,8 @@ fn send_super_segment_from_cursor(
     let hdr_len = (payload_off) as u16;
     let csum_start = (tcp_off) as u16;
     nic::submit_tx_tso(handle, frame_len, hdr_len, csum_start, mss as u16);
+    // One atomic super-segment — the whole payload is on the wire.
+    payload_len
 }
 
 /// Try to send a single TCP TSO super-segment whose payload is
@@ -479,34 +505,50 @@ pub fn try_send_tso(
 }
 
 /// Per-MSS fallback path — used when [`send_super_segment_from_cursor`]
-/// can't acquire a TX-pool slot. Loops `send_segment_from_cursor`
-/// over the cursor as the original (pre-TSO) path did.
+/// can't acquire a TX-pool slot (always the case on gve DQO, which has
+/// no TSO slot). Loops `send_segment_from_cursor` over the cursor.
+///
+/// Returns the number of payload bytes actually put on the wire. Stops
+/// at the first segment the driver couldn't take (full TX ring, or a
+/// MAC miss) and reports the prefix sent so far, leaving the remainder
+/// for the caller to retry — `send_segment_from_cursor` leaves the
+/// cursor un-read for the failed segment, so no bytes are lost or
+/// double-sent. Does not touch `snd_nxt`; the caller advances it by
+/// the returned count.
 fn send_per_mss_fallback(
     meta: &SegmentMeta,
     cursor: &mut iobuf::Cursor<'_>,
     payload_len: usize,
-) {
+) -> usize {
     let mss = mss_for(meta.local_ip);
     let mut sent = 0usize;
     let mut chunk_meta = *meta;
     while sent < payload_len {
         let chunk = (payload_len - sent).min(mss);
-        send_segment_from_cursor(&chunk_meta, cursor, chunk);
+        if !send_segment_from_cursor(&chunk_meta, cursor, chunk) {
+            break; // full TX ring / MAC miss — stop, report the prefix
+        }
         chunk_meta.seq = chunk_meta.seq.wrapping_add(chunk as u32);
         sent += chunk;
     }
+    sent
 }
 
 /// Build and ship a TCP segment whose payload is read from a chain
 /// cursor. Used by the data-send hot path (`async_try_send_chain`).
+///
+/// Returns `true` when the segment reached the driver, `false` on a
+/// MAC-resolution miss or a full TX ring (back-pressure) — in both
+/// `false` cases the cursor is left un-read, so the data-send loop
+/// can stop and retry these bytes later without losing its place.
 fn send_segment_from_cursor(
     meta: &SegmentMeta,
     cursor: &mut iobuf::Cursor<'_>,
     payload_len: usize,
-) {
+) -> bool {
     let dst_mac = match mac_resolve::resolve(meta.dst_ip) {
         Some(m) => m,
-        None => return, // ARP/NDP miss; TCP retransmit will retry
+        None => return false, // ARP/NDP miss; retry on next poll
     };
 
     let payload_off = payload_offset(meta.local_ip);
@@ -531,7 +573,7 @@ fn send_segment_from_cursor(
             let _ = n;
         }
         fill_tcp_frame_headers(frame, meta, dst_mac, payload_len);
-    });
+    })
 }
 
 pub(crate) fn send_rst(
@@ -649,39 +691,53 @@ pub fn async_try_send_chain(
         flags: TCP_ACK | TCP_PSH,
         window: c.rx_free() as u16,
     };
-    if nic::tso_available()
+    // `actually_sent` is the prefix the driver actually took. It
+    // equals `sendable` on a healthy ring; it is *less* when the TX
+    // ring filled mid-send (gve DQO back-pressure) — the unsent tail
+    // stays queued in `chain` and `snd_nxt` only advances by what
+    // reached the wire, so a later poll resends from the right place
+    // instead of dropping + relying on RTO recovery (the old cliff).
+    let actually_sent = if nic::tso_available()
         && sendable > mss
         && payload_offset(c.local_ip) + sendable <= TSO_FRAME_BUF_LEN
     {
-        send_super_segment_from_cursor(&meta, &mut cursor, sendable);
-        c.snd_nxt = c.snd_nxt.wrapping_add(sendable as u32);
+        let n = send_super_segment_from_cursor(&meta, &mut cursor, sendable);
+        c.snd_nxt = c.snd_nxt.wrapping_add(n as u32);
+        n
     } else {
         let mut sent = 0usize;
         let mut chunk_meta = meta;
         while sent < sendable {
             let chunk = (sendable - sent).min(mss);
-            send_segment_from_cursor(&chunk_meta, &mut cursor, chunk);
+            if !send_segment_from_cursor(&chunk_meta, &mut cursor, chunk) {
+                break; // full TX ring / MAC miss — stop, leave the rest queued
+            }
             chunk_meta.seq = chunk_meta.seq.wrapping_add(chunk as u32);
             c.snd_nxt = c.snd_nxt.wrapping_add(chunk as u32);
             sent += chunk;
         }
-    }
+        sent
+    };
 
-    // Bytes are on the wire — release the cursor's borrow on the
-    // chain. `Cursor` doesn't impl Drop (so clippy gripes about
-    // `drop(cursor)`), but binding into `_` moves it and ends the
-    // borrow at the same point.
+    // Release the cursor's borrow on the chain. `Cursor` doesn't impl
+    // Drop (so clippy gripes about `drop(cursor)`), but binding into
+    // `_` moves it and ends the borrow at the same point.
     let _ = cursor;
     // RFC 6298: take ownership of the sent prefix into the
     // retransmit queue. Each chain part is `IOBuf::share`'d into
     // refcounted storage and stored as its own `RtxEntry`; the
-    // boundary part (when `sendable` doesn't align to an IOBuf
+    // boundary part (when `actually_sent` doesn't align to an IOBuf
     // edge) is split via `clone_shared` so the queue and the
     // chain each carry their own view. After this call the
     // chain's front is the unsent tail — no follow-up
     // `chain_drain_prefix` is needed. Drops of fully-consumed
     // parts (no longer in chain or queue) fire front-to-back —
     // `External` callbacks recycle NIC descriptors as they leave.
-    c.rtx_on_data_sent(chain, sendable);
-    Ok(sendable)
+    // `actually_sent == 0` (ring full at entry) is a no-op here and
+    // returns `Ok(0)`, which parks the reactor's `TcpSendChain`; the
+    // ACK that retires the in-flight burst re-opens `usable_window`
+    // and wakes it (`tcp_receive`), resuming the send once the ring
+    // has drained — RTT-clocked back-pressure instead of a drop.
+    c.rtx_on_data_sent(chain, actually_sent);
+    Ok(actually_sent)
 }

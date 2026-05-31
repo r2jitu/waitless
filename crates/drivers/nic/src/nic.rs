@@ -93,6 +93,17 @@ pub fn acquire_tx_buf() -> Option<nic_api::TxBufHandle> {
     f()
 }
 
+/// Whether the active driver implements the direct-fill TX path at
+/// all. Lets a caller distinguish [`acquire_tx_buf`]'s two `None`
+/// cases: the driver has no direct-fill surface (→ use the slice
+/// [`send`] path), versus the driver has it but its TX ring is full
+/// right now (→ apply back-pressure and retry later). When this is
+/// `true`, a `None` from `acquire_tx_buf` means "ring full".
+#[inline]
+pub fn has_direct_fill() -> bool {
+    active_ops().acquire_tx_buf.is_some()
+}
+
 /// Submit a previously-acquired TX buffer with `frame_len` bytes of
 /// frame data at the head of `handle.data_mut()`. Consumes the
 /// handle. `csum` is the optional L4-checksum-offload hint — pass
