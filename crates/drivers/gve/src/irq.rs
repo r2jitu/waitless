@@ -81,11 +81,32 @@ mod x86 {
     const GVE_IRQ_ACK: u32 = 1 << 31;
     const GVE_IRQ_MASK: u32 = 1 << 30;
     const GVE_IRQ_EVENT: u32 = 1 << 29;
-    // DQO irq-doorbell (ITR) bits (little-endian; `gve_dqo.h`).
-    // `NO_UPDATE | ENABLE` re-enables delivery without touching the ITR
-    // interval — the same value Linux writes from its NAPI poll.
+    // DQO irq-doorbell (ITR) encoding (little-endian; `gve_dqo.h`). The
+    // doorbell word is `[enable:bit0][clear_pba:bit1][update_mode:bits3-4]
+    // [interval:bits5-16]`. Bits 3-4 = 0b00 means "apply this write"
+    // (update the interval + enable per bit 0); 0b11 (`NO_UPDATE`) means
+    // "ignore the interval/enable, leave as-is" — which is why writing
+    // `NO_UPDATE` alone can neither set the rate nor disable. The interval
+    // counts in 2 µs units (Linux halves usecs). Matching
+    // `gve_setup_itr_interval_dqo`:
+    //   arm    = ENABLE | ((us>>1 & MASK) << SHIFT)   (set rate + enable)
+    //   disable = 0                                    (update mode, enable 0)
     const GVE_ITR_ENABLE_BIT_DQO: u32 = 1 << 0;
-    const GVE_ITR_NO_UPDATE_DQO: u32 = 3 << 3;
+    const GVE_ITR_INTERVAL_DQO_SHIFT: u32 = 5;
+    const GVE_ITR_INTERVAL_DQO_MASK: u32 = (1 << 12) - 1;
+    /// RX interrupt rate limit (µs) — same as Linux's
+    /// `GVE_RX_IRQ_RATELIMIT_US_DQO`. A coalescing-interval backstop: the
+    /// device won't re-fire faster than this even if the per-fire disable
+    /// (below) somehow misses, so a mis-step can't storm the way an
+    /// interval-0 ITR did (~742 IRQ/req).
+    const GVE_RX_IRQ_RATELIMIT_US_DQO: u32 = 20;
+    /// DQO doorbell value to arm: enable + set the coalescing interval.
+    #[inline]
+    fn dqo_itr_arm() -> u32 {
+        GVE_ITR_ENABLE_BIT_DQO
+            | (((GVE_RX_IRQ_RATELIMIT_US_DQO >> 1) & GVE_ITR_INTERVAL_DQO_MASK)
+                << GVE_ITR_INTERVAL_DQO_SHIFT)
+    }
     // IDT vector base for gve RX MSI-X. Above the LAPIC timer (0xF0 is
     // the timer; we stay below it) and the PIC/APIC range, below the
     // spurious vector. gve and virtio-net never coexist (one NIC binds),
@@ -135,34 +156,49 @@ mod x86 {
         if core < num_qp { core as usize } else { 0 }
     }
 
-    /// Unmask (enable) the RX block's IRQ doorbell — format-specific
-    /// encoding + endianness. After this, a fresh RX completion raises
-    /// the block's MSI-X message.
+    /// Enable the RX block's IRQ doorbell — format-specific encoding +
+    /// endianness. After this, a fresh RX completion raises the block's
+    /// MSI-X message. DQO sets a coalescing interval (update mode) rather
+    /// than `NO_UPDATE`, so the rate is actually programmed (interval 0
+    /// stormed); GQI acks + enables event delivery.
     #[inline]
     fn irq_enable(off: u32) {
         let bar2 = BAR2_VA.load(Ordering::Acquire);
         if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
-            crate::dqo::doorbell_write_le(bar2, off, GVE_ITR_NO_UPDATE_DQO | GVE_ITR_ENABLE_BIT_DQO);
+            crate::dqo::doorbell_write_le(bar2, off, dqo_itr_arm());
         } else {
             crate::gqi::doorbell_write(bar2, off, GVE_IRQ_ACK | GVE_IRQ_EVENT);
         }
     }
 
-    /// ISR for gve RX MSI-X vectors (GQI only — DQO is gated off in
-    /// `enable_irq`, so this never runs for DQO). Each vector is steered
+    /// Disable the RX block's IRQ doorbell (in the ISR) so it fires once
+    /// per arm. DQO: write 0 — update mode (bits 3-4 = 0) with the enable
+    /// bit clear actually disables (unlike `NO_UPDATE`, which is ignored).
+    /// GQI: set the mask bit.
+    #[inline]
+    fn irq_disable(off: u32) {
+        let bar2 = BAR2_VA.load(Ordering::Acquire);
+        if QUEUE_FORMAT_DQO.load(Ordering::Relaxed) {
+            crate::dqo::doorbell_write_le(bar2, off, 0);
+        } else {
+            crate::gqi::doorbell_write(bar2, off, GVE_IRQ_MASK);
+        }
+    }
+
+    /// ISR for gve RX MSI-X vectors (both formats). Each vector is steered
     /// to the core that polls its queue, so the wake lands on the right
-    /// core; the frame is drained by the event loop's next poll. We mask
-    /// the block's IRQ here so it fires exactly once per arm — GQI's event
-    /// interrupt isn't one-shot and would otherwise re-fire until masked
-    /// — and re-arm on the next idle via `arm_rx_idle`. APIC EOI is sent
-    /// by the IDT dispatcher (vector ≥ 48).
+    /// core; the frame is drained by the event loop's next poll. We
+    /// disable the block's IRQ here so it fires exactly once per arm —
+    /// neither format is one-shot (GQI's event re-fires until masked; DQO
+    /// re-fires per completion at its ITR rate) — and re-arm on the next
+    /// idle via `arm_rx_idle`. APIC EOI is sent by the IDT dispatcher
+    /// (vector ≥ 48).
     unsafe extern "C" fn gve_rx_isr(_frame: *mut kernel_bare::x86_64::idt::InterruptFrame) {
         RX_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
         let qp = qp_for_core();
         let off = RX_IRQ_DB_OFF[qp].load(Ordering::Relaxed);
         if off != 0 {
-            let bar2 = BAR2_VA.load(Ordering::Acquire);
-            crate::gqi::doorbell_write(bar2, off, GVE_IRQ_MASK);
+            irq_disable(off);
         }
     }
 
@@ -194,21 +230,20 @@ mod x86 {
     }
 
     pub(crate) fn enable_irq() {
-        // DQO interrupt-coalescing is deferred. Our model is
-        // arm-on-idle / fire-once / disable / re-arm, but DQO's ITR has
-        // no per-fire disable that takes effect — `GVE_ITR_NO_UPDATE` is
-        // ignored, and the only Linux-style anti-storm is a coalescing
-        // *interval* (≈20 µs rate limit) kept armed for continuous NAPI.
-        // Without an interval the ITR re-fires per completion → a storm
-        // under sporadic traffic (measured ~742 IRQs/req on c3). Until
-        // the DQO ITR interval/disable handshake is implemented, skip
-        // MSI-X setup on DQO entirely: those cores fall back to the
-        // proven timer-bounded idle (byte-identical to pre-T7), and the
-        // saturated c3 path is untouched regardless (it never idles).
-        // GQI (the e2/n2 idle target) has a clean per-fire mask and is
-        // validated. See docs/gvnic.md T7.
+        // DQO is GATED OFF pending a latency fix. The interrupt STORM is
+        // solved — `irq_enable`/`irq_disable` use the correct ITR encoding
+        // (set the coalescing interval on arm; write 0 to disable, since
+        // `NO_UPDATE` is ignored), measured 742→2.8 IRQ/req. But DQO MSI-X
+        // still shows a severe DQO-specific latency regression: ~729 ms
+        // p50 (LAN, co-located) on c3 vs GQI's clean ~3 ms, with no NIC
+        // drops and correct steering (the disable hits the right block).
+        // Root cause unresolved (likely an ITR/PBA or interval-update
+        // side-effect on the RX path) and needs on-box debugging. GQI
+        // (e2/n2 — the idle target, incl. the e2 website host) is clean
+        // and stays enabled. The saturated c3 path is unaffected either
+        // way (never idles → never arms). See docs/gvnic.md T7.
         if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
-            log(b"[gvnic] MSI-X RX deferred on DQO (ITR coalescing); timer-only idle\n");
+            log(b"[gvnic] MSI-X RX deferred on DQO (latency regression); timer-only idle\n");
             return;
         }
         let idx = match pci::find_device(PCI_VENDOR_GVE, PCI_DEVICE_GVE) {
