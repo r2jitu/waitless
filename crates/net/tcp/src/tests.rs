@@ -2944,7 +2944,7 @@ fn rtx_push_seeds_entry_and_anchor() {
             assert_eq!(c.rtx_bytes_in_flight, 100);
             let head = c.rtx_queue.front().unwrap();
             assert_eq!(head.seq_start, 1000);
-            assert_eq!(head.payload.len(), 100);
+            assert_eq!(head.len, 100);
             assert_eq!(head.first_tx_ms, 42);
             assert_eq!(head.tx_count, 1);
             assert!(c.rtt_anchor_active);
@@ -2992,90 +2992,11 @@ fn rtx_ack_pops_and_narrows() {
             assert_eq!(acked, 30);
             assert_eq!(c.rtx_queue.len(), 1);
             assert_eq!(c.rtx_bytes_in_flight, 170);
-            assert_eq!(c.rtx_queue.front().unwrap().seq_start, 1130);
-            assert_eq!(c.rtx_queue.front().unwrap().payload.len(), 170);
-            assert_eq!(c.rtx_entry_bytes(0).len(), 170);
-            assert_eq!(c.rtx_entry_bytes(0)[0], 0xB0u8.wrapping_add(30));
-            return;
-        }
-    }
-    panic!("no live connection for ports {CP} -> {SP}");
-}
-
-/// The reusable inline retain buffer holds a small *borrowed* payload
-/// without a per-push heap alloc (`RtxPayload::Inline`): it carries the
-/// correct retransmit bytes, a second concurrent small part falls back
-/// to `Buf`, partial-ACK advances the window inside the buffer, and a
-/// full-ACK frees it for reuse by the next small send.
-#[test]
-fn rtx_inline_retain_borrowed() {
-    let _g = harness();
-    const SP: u16 = 9182;
-    const CP: u16 = 50182;
-    super::listen_on_core(0, SP);
-    handshake(SP, CP, 0xF820);
-
-    // Build a small BORROWED IOBuf over `src` — the case `into_owned`
-    // would heap-copy and the inline path elides.
-    fn borrow_of(src: &[u8]) -> iobuf::IOBuf {
-        unsafe {
-            iobuf::IOBuf::borrow(
-                core::ptr::NonNull::new_unchecked(src.as_ptr() as *mut u8),
-                src.len() as u32,
-                0,
-                src.len() as u32,
-            )
-        }
-    }
-
-    let core = 0u32;
-    let cap = pool_capacity(core);
-    for i in 0..cap {
-        let c = unsafe { &mut *conn_ptr(core, i) };
-        if c.state != crate::state::TcpState::Closed
-            && c.state != crate::state::TcpState::Listen
-            && c.local_port == SP
-            && c.remote_port == CP
-        {
-            let src0: Vec<u8> = (0..120u32).map(|n| 0xC0u8.wrapping_add(n as u8)).collect();
-            let b0 = borrow_of(&src0);
-            assert!(b0.is_borrowed());
-            assert!(c.rtx_push(b0, 2000, 120, 1));
-            // Went inline: single-occupant busy + correct retransmit bytes.
-            assert!(c.rtx_inline_busy, "small borrowed push uses the inline buffer");
-            assert_eq!(c.rtx_queue.len(), 1);
-            assert_eq!(c.rtx_entry_bytes(0), &src0[..]);
-
-            // A second small borrowed push while busy falls back to an
-            // owned `Buf` — it must not corrupt the in-flight inline entry.
-            let src1: Vec<u8> = (0..80u32).map(|n| 0x10u8.wrapping_add(n as u8)).collect();
-            assert!(c.rtx_push(borrow_of(&src1), 2120, 80, 2));
-            assert_eq!(c.rtx_queue.len(), 2);
-            assert_eq!(c.rtx_entry_bytes(0), &src0[..], "inline entry intact");
-            assert_eq!(c.rtx_entry_bytes(1), &src1[..], "fallback Buf entry");
-
-            // Partial-ACK the inline head (40 of 120) — window advances
-            // inside the inline buffer; bytes stay correct; still busy.
-            assert_eq!(c.rtx_ack(2040), 40);
-            assert!(c.rtx_inline_busy);
-            assert_eq!(c.rtx_entry_bytes(0), &src0[40..]);
-
-            // Full-ACK the inline entry → freed; the fallback Buf remains.
-            assert_eq!(c.rtx_ack(2120), 80);
-            assert!(!c.rtx_inline_busy, "inline buffer freed on full ACK");
-            assert_eq!(c.rtx_queue.len(), 1);
-            assert_eq!(c.rtx_entry_bytes(0), &src1[..]);
-
-            // A new small borrowed send REUSES the inline buffer (0 alloc).
-            let src2: Vec<u8> = (0..50u32).map(|n| 0x90u8.wrapping_add(n as u8)).collect();
-            assert!(c.rtx_push(borrow_of(&src2), 2200, 50, 3));
-            assert!(c.rtx_inline_busy, "inline buffer reused after free");
-            assert_eq!(c.rtx_entry_bytes(1), &src2[..]);
-
-            // An oversized borrowed payload falls back to `Buf` (exceeds CAP).
-            let big: Vec<u8> = vec![0x77u8; 1024];
-            assert!(c.rtx_push(borrow_of(&big), 2250, 1024, 4));
-            assert_eq!(c.rtx_entry_bytes(2), &big[..]);
+            let head = c.rtx_queue.front().unwrap();
+            assert_eq!(head.seq_start, 1130);
+            assert_eq!(head.len, 170);
+            assert_eq!(head.iobuf.data().len(), 170);
+            assert_eq!(head.iobuf.data()[0], 0xB0u8.wrapping_add(30));
             return;
         }
     }
@@ -3097,8 +3018,8 @@ fn conn_rtx_queue_bytes(client_port: u16, server_port: u16) -> Vec<u8> {
             && c.remote_port == client_port
         {
             let mut out = Vec::new();
-            for idx in 0..c.rtx_queue.len() {
-                out.extend_from_slice(c.rtx_entry_bytes(idx));
+            for entry in c.rtx_queue.iter() {
+                out.extend_from_slice(entry.iobuf.data());
             }
             return out;
         }
@@ -3190,8 +3111,8 @@ fn rtx_queue_shares_storage_with_original_chain_parts() {
             && c.remote_port == CP
         {
             assert_eq!(c.rtx_queue.len(), 2, "one entry per source IOBuf");
-            let e0_ptr = c.rtx_entry_bytes(0).as_ptr() as usize;
-            let e1_ptr = c.rtx_entry_bytes(1).as_ptr() as usize;
+            let e0_ptr = c.rtx_queue[0].iobuf.data().as_ptr() as usize;
+            let e1_ptr = c.rtx_queue[1].iobuf.data().as_ptr() as usize;
             assert_eq!(
                 e0_ptr, part0_ptr,
                 "entry 0 shares backing with original chain part 0",
@@ -3201,8 +3122,8 @@ fn rtx_queue_shares_storage_with_original_chain_parts() {
                 "entry 1 shares backing with original chain part 1",
             );
             // Queue byte content matches the originals end-to-end.
-            assert_eq!(c.rtx_entry_bytes(0), &body0[..]);
-            assert_eq!(c.rtx_entry_bytes(1), &body1[..]);
+            assert_eq!(c.rtx_queue[0].iobuf.data(), &body0[..]);
+            assert_eq!(c.rtx_queue[1].iobuf.data(), &body1[..]);
             checked = true;
             break;
         }
@@ -3289,7 +3210,7 @@ fn rtx_split_after_loop_is_byte_exact_and_zero_copy() {
             && c.remote_port == CP
         {
             assert_eq!(c.rtx_queue.len(), 2, "part0 whole + part1 prefix");
-            let prefix_ptr = c.rtx_entry_bytes(1).as_ptr() as usize;
+            let prefix_ptr = c.rtx_queue[1].iobuf.data().as_ptr() as usize;
             assert_eq!(prefix_ptr, part1_ptr, "queue prefix shares part1's backing (no copy)");
             checked = true;
             break;
@@ -3441,7 +3362,7 @@ fn rtx_ack_cumulative_drains_multiple() {
             assert_eq!(c.rtx_bytes_in_flight, 40);
             let head = c.rtx_queue.front().unwrap();
             assert_eq!(head.seq_start, 1310);
-            assert_eq!(head.payload.len(), 40);
+            assert_eq!(head.len, 40);
             return;
         }
     }
