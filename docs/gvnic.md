@@ -24,16 +24,26 @@ The two TX paths are **not** at feature parity:
   super-segment per 5-page slot), plus TSO (v4/v6) and UDP-GSO via
   the `GVE_TXD_TSO` + `GVE_TXD_SEG` descriptor pair, plus L4-CSUM
   offload. The device segments super-segments host-side.
-- **DQO_RDA** has no direct-fill, no TSO, and no UDP-GSO. Every
-  outbound frame goes through the slice-shaped `send_on_qp`: copy
-  into a per-ring-slot bounce buffer, emit a general-context +
+- **DQO_RDA** currently has no direct-fill, no TSO, and no UDP-GSO.
+  Every outbound frame goes through the slice-shaped `send_on_qp`:
+  copy into a per-ring-slot bounce buffer, emit a general-context +
   packet descriptor pair carrying that buffer's raw DMA address.
   `acquire_tx_buf` / `acquire_tx_tso_buf` / `acquire_tx_udp_gso_buf`
   all return `None` in DQO mode so callers fall back to that one
   extra memcpy per frame. L4-CSUM offload is still wired (the
   `DQO_TX_FLAG_CSUM` bit). A DQO direct-fill landed once but stalled
-  on real c3 hardware under load and was removed; wiring DQO
-  direct-fill / TSO is a follow-up.
+  on real c3 hardware under load and was removed.
+
+  > **This is the gap, and it's closable.** Upstream Linux and
+  > FreeBSD both run DQO TX *fully zero-copy with scatter-gather* on
+  > this exact device — the bounce buffer is our simplification, not
+  > a hardware requirement, and the c3 stall is an implementation
+  > bug, not a hardware wall. The DQO TX path is also lossy under
+  > large-body load today: it **drops** on a full ring (no async
+  > back-pressure), measured ~0.5%/segment on `/static-64k` →
+  > RTO-driven p99 cliffs of 6.7–8.0 s. `/health` (small) sees 0
+  > drops. See [§Upstream driver reference](#upstream-driver-reference-verified-2026-05-30)
+  > and [§Optimization roadmap](#optimization-roadmap-trackable).
 
 RX mirrors this split: DQO is zero-copy — the device's RX buffer is
 lent straight up the stack (`OwnedIOBuf::wrap_owned`) and reposted
@@ -191,3 +201,147 @@ gcloud compute instances create NAME \
 The image must carry `--guest-os-features=GVNIC`;
 [scripts/deploy-gcloud.sh](../scripts/deploy-gcloud.sh) applies it
 unconditionally (virtio-net instances just ignore it).
+
+## Upstream driver reference (verified 2026-05-30)
+
+The two authoritative gVNIC drivers are Google's own. Our descriptor
+formats and constants were checked **byte-for-byte** against them and
+match; the items below are facts we confirmed, not folklore. When in
+doubt about device behaviour, read these first — they are the spec.
+
+- **Linux (in-tree):** `drivers/net/ethernet/google/gve/` — esp.
+  `gve_desc_dqo.h`, `gve_tx_dqo.c`, `gve_rx_dqo.c`, `gve_adminq.h`,
+  `gve_main.c`. <https://github.com/torvalds/linux/tree/master/drivers/net/ethernet/google/gve>
+- **FreeBSD:** `sys/dev/gve/` and Google's out-of-tree
+  [compute-virtual-ethernet-freebsd](https://github.com/GoogleCloudPlatform/compute-virtual-ethernet-freebsd);
+  the [`gve(4)` man page](https://man.freebsd.org/cgi/man.cgi?query=gve&sektion=4&format=html)
+  is a concise feature summary.
+
+What upstream proves (both OSes agree):
+
+| Claim | Upstream evidence | Our status |
+|---|---|---|
+| DQO TX desc = 16 B; `dtype` 0–4 = `0xC`, `end_of_packet` b5, `checksum_offload` b6, `report_event` b7; `buf_size` 14-bit (max 16383); ctx dtype `0x4`, TSO ctx `0x5`; `GVE_TX_MIN_RE_INTERVAL = 32` | `gve_desc_dqo.h` (exact match) | ✅ ours is faithful |
+| **DQO TX is scatter-gather**: a packet spans up to `GVE_TX_MAX_DATA_DESCS = 10` data descriptors; `end_of_packet` set only on the last | `gve_tx_dqo.c` loops `for i in nr_frags`, `is_eop = i==nr_frags-1`; FreeBSD `cur_eop = eop && cur_len==len` | ❌ we emit 1 bounce desc/pkt, always EOP |
+| **DQO TX is truly zero-copy**: the no-copy path DMA-maps the packet's *own* memory (`dma_map_single`/`skb_frag_dma_map`; FreeBSD `bus_dmamap_load_mbuf_sg`). The bounce copy runs **only** when `tx->dqo.qpl` is set | `gve_tx_add_skb_no_copy_dqo` vs `_copy_dqo`; FreeBSD man: *"RDA … does not expect [packets] to be copied into or out of a fixed bounce buffer"* | ❌ we always bounce-copy (a simplification) |
+| Buffer lifetime tracked by `pending_packets[completion_tag]`: hold the DMA map / skb until the matching TX completion arrives, then unmap+free | `gve_alloc_pending_packet` / `gve_handle_packet_completion` / `gve_unmap_packet`; FreeBSD `pending_pkts[compl_tag]` | ◑ analog exists: our rtx `share()`/`clone_shared` retains until ACK (⊇ TX completion) |
+| **DQO RX RSC (HW-GRO)** emits coalesced super-frames as **multi-buffer** packets: RX compl desc carries `rsc`, `rsc_seg_len`, `header_len`; `end_of_packet` only on the last buffer; "HW-GRO only coalesces TCP" | `gve_rx_dqo.c` `gve_rx_complete_rsc` + multi-buf loop (`if (!end_of_packet) continue;`) | ❌ our RX drops non-EOP frags → `enable_rsc=1` alone is a no-op |
+| `enable_rsc` is a real per-queue field in `CREATE_RX_QUEUE` (not a feature-mask) | `gve_adminq.h` `struct gve_adminq_create_rx_queue { … u8 enable_rsc; }` | ✅ we set it; needs the multi-buf RX path to do anything |
+| The device supports **MSI-X + per-queue NAPI** (mgmt vector + per-queue `gve_intr_dqo` → `napi_schedule_irqoff`) | `gve_main.c` `pci_enable_msix_range`, `request_irq` | ❌ we are polling-only (`idle: None`) — our choice, not a HW limit |
+| FreeBSD also ships **software LRO**, TSO, RX/TX csum, RSS, jumbo, and a `hw.gve.allow_4k_rx_buffers` tunable (4 KiB RX bufs, DQO only) | `gve(4)` man page | reference for feature scope |
+
+Two corrections to earlier folklore this verification overturned:
+1. "DQO has no scatter-gather / the bounce buffer is required" — **false.** SG + zero-copy are native; we just haven't wired them.
+2. "the c3 DQO direct-fill stall might be a hardware limit" — **false.** Upstream runs no-copy SG TX in production on this device; our stall is a diagnosable driver bug (suspects: descriptor/ctx ordering, RE-interval spacing, completion-tag handling, masked-tail headroom).
+
+## Optimization roadmap (trackable)
+
+Goal: bring DQO (the c3/c4+ golden-path NIC) to feature + performance
+parity with upstream, and close the measured gaps. **Scope honestly**
+— per the GCE per-stage profile the saturated `/health` bottleneck is
+per-frame driver work at ~1 frame/req; most items below are
+**bulk-transfer or large-response** wins, *not* `/health` wins. Each
+item lists: what · why · where · expected impact · how to verify ·
+status.
+
+Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
+`[x]` done · `[!]` blocked on diagnosis.
+
+### Tier 1 — measured correctness gaps (do first)
+
+- `[!]` **T1. Diagnose the DQO TX stall, then land direct-fill.**
+  *What:* root-cause why DQO `acquire_tx_buf` direct-fill stalled on
+  c3 under load, re-enable it, kill the per-frame bounce memcpy.
+  *Why:* removes 1 copy/frame (payload-size-scaling: big on
+  `/static-*`, marginal on `/health`); unblocks T2/T3.
+  *Where:* `dqo.rs` `send_on_qp` (the copy at the bounce-buffer
+  write), `tx.rs:66` (`acquire_tx_buf` returns `None` on DQO).
+  *Method:* diff our descriptor emission against `gve_tx_dqo.c`
+  line-by-line; capture live descriptors via the `/diag-gve`
+  endpoint on a c3 under load; check ctx/pkt ordering, RE-interval
+  spacing (≥32), completion-tag reuse, and the `ring_entries-2`
+  masked-tail headroom. *Verify:* `/static-64k` + `/static-1m` TLS
+  on c3, `DQO_TX_RING_FULL_DROPS` stays ~0 and p99 has no RTO cliff;
+  `/health` neutral. *Status:* blocked on the diagnosis above.
+
+- `[ ]` **T2. DQO TX back-pressure (stop dropping on a full ring).**
+  *What:* when the TX ring is full, async-yield + retain the chain
+  and wake on TX completion, instead of the silent
+  `let _ = send_on_qp` drop. *Why:* large-body sends currently drop
+  ~0.5%/segment → RTO-driven p99 cliffs of 6.7–8.0 s (measured via
+  `DQO_TX_RING_FULL_DROPS`, landed `f2e5a1c`). This is a **latency**
+  fix for large responses, not a throughput or `/health` win.
+  *Where:* `tx.rs:~190` (the dropping send site), the TX-completion
+  drain, the executor TX-ready waker. *Verify:* `/static-1m` TLS
+  p99 drops from seconds to ms; drop counter → 0. *Status:* design
+  exists ([[reference_tx_async_spin_measured]]); needs the
+  completion-waker plumbing. Pairs naturally with T1.
+
+### Tier 2 — throughput offloads (after T1)
+
+- `[!]` **T3. DQO TSO (TCP segmentation offload).**
+  *What:* emit the TSO context descriptor (dtype `0x5`) + multi-desc
+  SG packet so the device segments host-side, as GQI already does.
+  *Why:* big win on large TLS responses (fewer descriptors + frames
+  per byte); GQI TSO gave +25% on a 9 KiB body (HVF). Nothing for
+  sub-MSS `/health`. *Where:* new DQO TSO path in `dqo.rs`; wire
+  `acquire_tx_tso_buf` / `submit_tx_tso` (currently `None` on DQO).
+  *Verify:* `/static-64k`/`/static-1m` TLS throughput on c3; TSO
+  descriptor counter > 0. *Status:* blocked on T1 (needs working
+  SG/direct-fill first).
+
+- `[ ]` **T4. DQO RX RSC (HW-GRO) = items I→J, in order.**
+  *What:* (I) multi-buffer RX chain accumulation — stitch non-EOP
+  fragment completions into one chain, deliver on EOP, with a
+  ~100 ms stuck-chain timeout; **then** (J) set `enable_rsc=1` in
+  `CREATE_RX_QUEUE`. *Why:* coalesces N RX segments → 1 → fewer
+  per-frame cycles on **bulk receive / uploads** (TCP only). Does
+  **not** touch `/health` (nothing to coalesce on a tiny request).
+  *Where:* `dqo.rs` `poll_qp_inner` (the `(status & EOP)` filter
+  that drops fragments today), `init.rs` `build_create_rx_queue_cmd`
+  (the `enable_rsc` byte). *Verify:* `upload_32k_tcp` / a bulk-RX
+  workload on c3; `dqo_rx_compl_skipped` → 0 with RSC on; +10–30%
+  per the pre-RSC reasoning. *Status:* J alone is a measured no-op
+  (−99.9% upload!) without I — **I must land first**
+  ([[reference_gve_rsc_investigation]]). ~80 LOC + the timeout.
+
+- `[ ]` **T5. DQO UDP-GSO (QUIC/H3 TX).**
+  *What:* mirror GQI's UDP-GSO for DQO (currently the DQO branch is
+  a no-op stub). *Why:* one GSO send vs ~10 per-MSS sends on QUIC/H3
+  bulk — +20–50% on `h3_*`/`udp_peak`. Nothing for TCP/`/health`.
+  *Where:* `tx.rs:51` (`submit_tx_udp_gso` early-returns on DQO),
+  `dqo.rs`. *Verify:* `h3_health_max` / `udp_peak` on c3. *Status:*
+  blocked on T1; GQI is the reference impl.
+
+### Tier 3 — lower priority / scoped-small
+
+- `[ ]` **T6. DQO csum-offload re-enable.** Wired (`DQO_TX_FLAG_CSUM`)
+  but `csum_tx_offload` returns false — enabling it regressed
+  health_max −19/−32%, so it's off pending a descriptor-encoding
+  debug. Small-packet win only. *Where:* `lib.rs` `csum_tx_offload`.
+- `[ ]` **T7. gve MSI-X + NAPI (park-until-interrupt).** Device
+  supports it (verified); we're polling-only. **Low-load latency /
+  power only** — NAPI exists to avoid IRQs under load, which our spin
+  window already approximates, so this is *not* a saturated-throughput
+  lever. Do only if idle-power/tail-latency becomes a goal.
+- `[ ]` **T8. 4 KiB RX buffers on DQO** (`BUFFER_SIZES` id=10
+  advertises 4096; FreeBSD has `allow_4k_rx_buffers`). Lets more RSC
+  coalesces stay single-descriptor, reducing T4 stitching pressure.
+  Cheap; do alongside T4.
+
+### What is NOT a lever (ruled out, don't re-litigate)
+
+- **`/health` throughput micro-opts.** Allocation removal (magazine,
+  rtx-inline), idle-poll tuning, and RX/TX batching are all already
+  done or measured-flat; the saturated `/health` 39% NIC residual is
+  irreducible per-frame DMA/descriptor work at 1 frame/req. The
+  remaining levers above are bulk/large-response, not `/health`.
+- **`GQI_RDA` / `DQO_QPL`.** GCE never advertises them.
+
+> **Honest expectation-setting.** Every confirmed lever here is
+> bulk-transfer (T3/T4/T5/T8), large-response latency (T1/T2), or
+> low-load power (T7). The headline `/health` rps number is already
+> at a well-tuned plateau and these will not move it. They make the
+> *large-response and bulk-upload/QUIC* paths competitive with a
+> Linux gVNIC host — which is the right next frontier now that the
+> small-request path is saturated on irreducible work.
