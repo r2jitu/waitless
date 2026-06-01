@@ -966,9 +966,18 @@ fn build_create_tx_queue_cmd(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) -> Admi
 ///   u32  queue_page_list_id              — GQI only; 0 in DQO_RDA
 ///   u16  rx_ring_size
 ///   u16  packet_buffer_size
-///   u16  rx_buff_ring_size               — DQO only; 0 in GQI
-///   u8   enable_rsc
-///   u8[5] padding
+///   u16  rx_buff_ring_size               — DQO only; 0 in GQI   (off 56)
+///   u8   enable_rsc                       — DQO HW-GRO          (off 58)
+///   u8   padding1                                              (off 59)
+///   u16  header_buffer_size              — 0 = header-split OFF (off 60)
+///   u8[2] padding2                                             (off 62)
+///
+/// Layout verified byte-for-byte against upstream
+/// `struct gve_adminq_create_rx_queue` (56-byte body; our +8 header).
+/// We leave `header_buffer_size = 0`: RSC does NOT require header-split
+/// (upstream: "HW-GRO packets have complete TCP/IP headers in frag[0]
+/// when split is disabled"), and our multi-buf RX accumulator (item I)
+/// reassembles the coalesced super-frame from frag[0] onward.
 fn build_create_rx_queue_cmd(
     qp: u32,
     alloc: &RxAlloc,
@@ -1010,6 +1019,15 @@ fn build_create_rx_queue_cmd(
     cmd.put_be16(54, RX_BUFFER_SIZE);
     if matches!(fmt, QueueFormat::DqoRda) {
         cmd.put_be16(56, RX_RING_ENTRIES);
+        // enable_rsc (T4 item J): DQO HW-GRO. The device coalesces
+        // consecutive in-order TCP segments into multi-buffer
+        // super-frames (EOP only on the last buffer), which our item-I
+        // RX accumulator (`dqo::poll_qp_inner`) stitches into one chain.
+        // The only create-queue field RSC needs; header-split stays off
+        // (header_buffer_size at off 60 = 0). RSC is a receive/upload
+        // throughput lever (fewer per-frame cycles on bulk RX); it does
+        // not touch the serve/TX path.
+        cmd.put_u8(58, 1);
     }
     cmd
 }

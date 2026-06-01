@@ -87,6 +87,10 @@ impl AdminqCommand {
         crate::put_be64(&mut self.bytes, offset, v);
     }
 
+    pub(crate) fn put_u8(&mut self, offset: usize, v: u8) {
+        self.bytes[offset] = v;
+    }
+
     /// Write a single byte at `offset`. Used for fields that are
     /// inherently 1-byte (queue_format, RSS hash algorithm, …).
     pub(crate) fn set_byte(&mut self, offset: usize, v: u8) {
