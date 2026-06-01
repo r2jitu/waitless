@@ -44,16 +44,26 @@ coexist, selected per-connection by ALPN.
   `proto/tls` keeps **no `http`/`http2` dep** (sans-io state machine only);
   it exposes `AlpnProtocol` + `is_established`/`is_terminated`/
   `negotiated_alpn` so the listener can drive the handshake and branch
-  without reaching into TLS internals. There is **no `https` crate** —
-  "HTTPS" spans two transports, so a site calls `http2::listen` (TCP) +
-  `http3::listen` (QUIC, advertised via `Alt-Svc`). `http2`'s protocol
-  half (`serve_conn`) stays generic over `http::HttpStream`; only `listen`
+  without reaching into TLS internals. `http2`'s protocol half
+  (`serve_conn`) stays generic over `http::HttpStream`; only `listen`
   pulls TLS/TCP.
 
   *(History: a first cut put the listener in `proto/tls`, then in a
-  separate `proto/https` crate; both were superseded — `tls` shouldn't
-  depend on HTTP, and there's no honest "https" name that excludes h3.
-  Folding the listener into `http2` is the resolution.)*
+  `proto/https` crate scoped to TCP/TLS; both were superseded — `tls`
+  shouldn't depend on HTTP, and a TCP-only crate named "https" wrongly
+  excludes h3. Folding the listener into `http2` is the resolution.)*
+- **`proto/https` is the optional all-transports facade.** Since `http2`
+  (TCP) and `http3` (QUIC) are the two HTTPS transports, "serve all of
+  HTTPS in one call" is a composition: `https::serve(port, service, cert,
+  key)` binds both + wires `Alt-Svc` + degrades gracefully if the UDP/QUIC
+  bind fails. It takes one handler via the `https::Service` trait, whose
+  **stream-generic `handle<S>` method** is what lets a single value drive
+  both transports (the TCP path monomorphizes `handle::<TlsStream>`, the
+  QUIC path `handle::<NullStream>`) — a plain `async fn` can't, since one
+  value can't be two stream-monomorphizations at once. The facade is
+  buildable today (no `ByteStream`/Contract-3 unification needed); the
+  `Service` trait's generic method *is* the polymorphism mechanism. The
+  webserver app routes all of HTTPS through one `https::serve`.
 - ALPN selection is **server-preference** (`h2` over `http/1.1`); a client
   that offers no `h2` still gets `http/1.1` — the fallback the golden path
   depends on.

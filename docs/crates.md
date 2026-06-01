@@ -31,7 +31,7 @@ crates/
                +  shared package: types, checksum, from_bytes, ethernet,
                   ethernet_send, arp, ipv4, ipv6, icmpv6, ndp, mac_resolve,
                   ipv6_send, classify, udp, dhcp
-  proto/       tls/  quic/  http/  http2/  http3/  field-huffman/
+  proto/       tls/  quic/  http/  http2/  http3/  https/  field-huffman/
   waitless/    macros/  net/  backend/        (waitless is the facade and
                                                 the parent of its
                                                 three satellites)
@@ -189,7 +189,7 @@ external `@crates//:...` deps are omitted for readability.
 | --- | --- |
 | `waitless` | `waitless_backend`, `waitless_net`, `executor`, `worker`; on `os:none` also `kernel_bare`; proc-macro `waitless_macros` |
 
-### Tiers 10–13 — userspace network protocols
+### Tiers 10–14 — userspace network protocols + the HTTPS facade
 
 | Crate | Tier | Deps |
 | --- | --- | --- |
@@ -199,6 +199,7 @@ external `@crates//:...` deps are omitted for readability.
 | `http2` | 12 | `waitless`, `http`, `tls`, `field-huffman`, `worker`, `iobuf`, `obs` |
 | `quic` | 12 | `waitless`, `iobuf`, `nic_api`, `executor`, `tls`, `obs` |
 | `http3` | 13 | `waitless`, `http`, `quic`, `field-huffman`, `obs` |
+| `https` | 14 | `http`, `http2`, `http3` — the all-transports facade |
 
 `http`, `http2`, `http3` are each "the HTTP server for that version over
 its transport": plaintext TCP, TLS/TCP, and QUIC/UDP. The naming follows
@@ -208,17 +209,21 @@ necessarily also serves HTTP/1.1 (the mandatory ALPN fallback), so it
 depends on `http`. Its protocol half (`serve_conn`) stays generic over
 `http::HttpStream`; only its `listen` (the `TlsStream` adapter) pulls
 `tls`/`worker`/`iobuf`. `tls` and `quic` stay pure transports — neither
-depends on an HTTP crate. There is deliberately **no `https` crate**:
-"HTTPS" spans two transports (`http2` over TCP, `http3` over QUIC), so a
-site serving it calls both `http2::listen` and `http3::listen` (the
-latter advertised via `Alt-Svc`).
+depends on an HTTP crate.
 
-### Tier 14 — boot entries + apps
+`https` is **not** a transport layer — it's the optional **facade** that
+composes the two HTTPS transports: `https::serve` brings up `http2::listen`
+(TCP) + `http3::listen` (QUIC) + `Alt-Svc` in one call over a single
+`https::Service` handler (whose stream-generic `handle` method is what lets
+one value drive both transports). The per-transport `listen` entry points
+stay public for finer control (e.g. TCP-only, no QUIC).
+
+### Tier 15 — boot entries + apps
 
 `crates/boot/entry` consumes the kernel, drivers, net stack, and `waitless`
 to assemble the bare-metal entrypoint. Apps under `apps/` depend on
-`waitless` plus the protocols they choose (`http`, `http2`, `http3`;
-`tls` directly only for crypto KATs / diagnostics).
+`waitless` plus the protocols/facade they choose (`http`, `https`, …;
+`http2`/`http3`/`tls` directly only for their `diag` blocks or crypto KATs).
 
 ## Three architectural cuts worth understanding
 

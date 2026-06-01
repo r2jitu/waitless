@@ -1,0 +1,27 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# The all-transports HTTPS facade: `https::serve` brings up h1.1 + h2
+# over TLS/TCP (//crates/proto/http2) AND h3 over QUIC/UDP
+# (//crates/proto/http3) in one call, with automatic Alt-Svc. One
+# handler serves every transport via the stream-generic `Service`
+# trait. This is the composition layer — the per-transport `listen`
+# entry points stay available for finer control.
+rust_library(
+    name = "https",
+    srcs = ["src/lib.rs"],
+    crate_name = "https",
+    deps = [
+        "//crates/proto/http",
+        "//crates/proto/http2",
+        "//crates/proto/http3",
+    ],
+)
+
+rust_test(
+    name = "https_test",
+    size = "small",
+    crate = ":https",
+)
