@@ -1,31 +1,18 @@
-// crates/proto/https — the HTTPS server: TLS-over-TCP + HTTP-version dispatch.
+// crates/proto/http2/src/listen.rs — the HTTP/2-over-TLS listener.
 //
-// This is the composition layer that turns the sans-io `proto/tls`
-// state machine into a working HTTPS listener and picks the HTTP
-// version per connection by ALPN:
+// `http2::listen` is the TLS/TCP HTTP server. "h2" is, by RFC 7540
+// §3.1-3.3, HTTP/2-*over-TLS* (the cleartext variant is "h2c", a
+// non-goal here), so the HTTP/2 server is inherently an HTTPS server —
+// and, because ALPN mandates an HTTP/1.1 fallback, it necessarily also
+// serves h1.1. This module owns the `TlsStream: http::HttpStream`
+// adapter, the per-worker conn pool, and the per-connection dispatch:
+// drive the TLS handshake, read the negotiated ALPN, then run this
+// crate's `serve_conn` (h2) or `http::serve_conn` (h1.1).
 //
-//   * binds TCP, accepts, runs the TLS 1.3 handshake (`proto/tls`),
-//   * exposes the decrypted byte stream as `TlsStream: http::HttpStream`,
-//   * dispatches each connection to `http::serve_conn` (HTTP/1.1) or
-//     `http2::serve_conn` (HTTP/2) on the negotiated ALPN.
-//
-// Keeping the listener + the `HttpStream` adapter here — rather than in
-// `proto/tls` — lets `proto/tls` stay a *pure* TLS crate with no
-// `http` / `http2` dependency, mirroring how `proto/http3` is its own
-// opt-in listener over `proto/quic`. The HTTP application crates
-// (`http`, `http2`) stay transport-agnostic and never depend on a
-// transport; this crate is the single place that wires a concrete
-// transport (TLS/TCP) to them. An HTTPS server that wants only HTTP/1.1
-// is then a matter of which serve loops this crate composes — no flag
-// buried in the TLS code.
-//
-// The listen family: `http::listen` is plain HTTP/1.1 over TCP;
-// `https::listen` is HTTP/1.1 + HTTP/2 over TLS/TCP (ALPN-selected);
-// `http3::listen` is HTTP/3 over QUIC/UDP.
-
-#![cfg_attr(not(test), no_std)]
-
-extern crate alloc;
+// Mirrors `proto/http3` (which bundles its QUIC listener with the h3
+// protocol): `http`, `http2`, `http3` are each "the server for that
+// HTTP version over its transport" — plaintext TCP, TLS/TCP, QUIC/UDP
+// respectively.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -36,12 +23,13 @@ use core::ptr::addr_of_mut;
 
 use worker::{CurrentWorker, WorkerLocal};
 
+use http::{BodyReader, HttpStream, Request, Response};
 use iobuf::{IOBuf, IOBufChain};
 use tls::record;
 use tls::server::{AlpnProtocol, TlsServer};
 use tls::TlsServerConfig;
 
-// ---- Public HTTPS entry point ------------------------------------------------
+// ---- Public entry point ------------------------------------------------------
 
 /// Error from [`listen`]: either the cert / key pair didn't parse,
 /// or the underlying TCP bind failed.
@@ -53,20 +41,18 @@ pub enum ListenError {
     Bind(waitless::runtime::TcpBindError),
 }
 
-/// One-call HTTPS listener. Parses the DER `cert_chain` (leaf first,
-/// then intermediates) + `key_der`, binds TCP on `port`, accepts each
-/// connection, wraps it in a `TlsStream`, runs the TLS handshake, and
-/// drives either the HTTP/1.1 or the HTTP/2 serve loop on top depending
-/// on the ALPN the client negotiated.
+/// One-call HTTP/2-over-TLS listener. Parses the DER `cert_chain`
+/// (leaf first, then intermediates) + `key_der`, binds TCP on `port`,
+/// accepts each connection, runs the TLS 1.3 handshake, and serves it
+/// with HTTP/2 or HTTP/1.1 depending on the ALPN the client negotiated.
 ///
-/// HTTP/1.1 is the golden path and the ALPN fallback; `h2` is additive
-/// (server-preferred when offered, never replacing 1.1). The same
-/// `handler` serves both versions — it's generic over the byte stream
-/// via `http::HttpStream`, so no per-version adapter is needed.
+/// "h2" means HTTP/2 over TLS; clients that don't offer h2 are served
+/// HTTP/1.1 — the mandatory ALPN fallback, and the golden path. The
+/// same `handler` serves both versions (it's generic over the byte
+/// stream via `http::HttpStream`, so no per-version adapter is needed).
 ///
-/// Apps that want to advertise an HTTP/3 endpoint via `Alt-Svc`
-/// emit it themselves per-response — read `req.host_port()` and
-/// add the header via `Response::with_header(b"Alt-Svc", ...)`.
+/// For HTTP/3 (over QUIC/UDP), call `http3::listen` separately;
+/// `Alt-Svc` advertising it is emitted per-response by the app.
 pub fn listen<H>(
     port: u16,
     handler: H,
@@ -74,10 +60,7 @@ pub fn listen<H>(
     key_der: &'static [u8],
 ) -> Result<(), ListenError>
 where
-    H: for<'a, 'b> AsyncFn(
-            &'a http::Request,
-            &'a mut http::BodyReader<'b, TlsStream>,
-        ) -> http::Response
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, TlsStream>) -> Response
         + Send
         + Sync
         + 'static,
@@ -103,7 +86,7 @@ where
             // it. A failed handshake just drops the connection.
             match stream.drive_handshake().await {
                 Ok(AlpnProtocol::H2) => {
-                    http2::serve_conn(handler, stream).await;
+                    crate::serve_conn(handler, stream).await;
                 }
                 Ok(_) => {
                     http::serve_conn(handler, stream).await;
@@ -142,10 +125,10 @@ fn build_tls_conn(
 //
 // Recycles `Box<TlsConnImpl>` instances across accept/close cycles
 // instead of paying ~7 chunky heap allocs per accept (TlsConnImpl
-// + 3 × 4 KiB rx/tx/pt buffers + handshake state). On accept we
-// pop a freed instance, `TlsServer::reset` it with a fresh ephemeral
-// seed, and reuse its buffers; on close, the wrapper's `Drop` pushes
-// the inner box back to the pool.
+// + rx/tx/pt buffers + handshake state). On accept we pop a freed
+// instance, `TlsServer::reset` it with a fresh ephemeral seed, and
+// reuse its buffers; on close, the wrapper's `Drop` pushes the inner
+// box back to the pool.
 //
 // Per-worker storage. Tier 1 multi-queue assigns each conn task to
 // exactly one worker, and that worker owns the conn for its lifetime
@@ -153,8 +136,7 @@ fn build_tls_conn(
 // lock-free pool ops on the steady-state path. The `Arc<TlsConnPool>`
 // is shared across the listener and every `PooledTlsConn` it issues;
 // when the listener + every live conn drop, the Arc count hits zero,
-// the pool drops, and all retained `Box<TlsConnImpl>` go with it — no
-// separate shutdown-drain hook needed.
+// the pool drops, and all retained `Box<TlsConnImpl>` go with it.
 
 const POOL_CAP: usize = 16;
 
@@ -526,7 +508,7 @@ impl TlsStream {
     }
 }
 
-impl http::HttpStream for TlsStream {
+impl HttpStream for TlsStream {
     /// Resolve a `RecvChunkGuard` over an `IOBuf` carrying one
     /// decrypted plaintext record. For a chunk-direct record the
     /// IOBuf is an `Owned(Shared)` view refcount-sharing the recv'd

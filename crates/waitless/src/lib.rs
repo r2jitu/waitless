@@ -70,7 +70,8 @@ static LISTENERS: Bag = Bag(core::cell::UnsafeCell::new(alloc::vec::Vec::new()))
 
 /// Internal: take ownership of a listener handle so it lives for
 /// the rest of the process. Called by `tcp_listen` / `udp_listen` /
-/// `http::listen` / `https::listen` after a successful bind.
+/// `http::listen` / `http2::listen` / `http3::listen` after a
+/// successful bind.
 #[doc(hidden)]
 pub fn _retain<T: 'static>(handle: T) {
     // SAFETY: boot-CPU-only writer; see `unsafe impl Sync for Bag`.

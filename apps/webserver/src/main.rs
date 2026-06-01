@@ -196,7 +196,7 @@ async fn init() {
     if h3_up {
         install_alt_svc_for_h3(HTTPS_PORT);
     }
-    match https::listen(
+    match http2::listen(
         HTTPS_PORT,
         handle_request_https,
         TLS_CERT_CHAIN,

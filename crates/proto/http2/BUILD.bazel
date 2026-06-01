@@ -3,14 +3,16 @@ load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# Server-role HTTP/2 (RFC 7540 + HPACK RFC 7541).
+# The HTTP/2 server (RFC 7540 + HPACK RFC 7541).
 #
-# Rides the shared `//crates/proto/http` core (Request / Response /
-# BodyReader / handler API) and is generic over the byte stream, so it
-# carries NO transport dependency — `proto/tls` dispatches into
-# `serve_conn` when ALPN selects "h2", while plain-H1.1 consumers never
-# pull a transport in. The RFC 7541 Huffman table is shared with
-# `proto/http3` via `//crates/proto/field-huffman`.
+# "h2" is HTTP/2-over-TLS, so this crate is the TLS/TCP HTTPS server:
+# `http2::listen` runs the TLS handshake (via //crates/proto/tls), reads
+# the negotiated ALPN, and serves h2 or — for the mandatory fallback —
+# HTTP/1.1 (//crates/proto/http). The protocol half (`serve_conn`) stays
+# generic over `http::HttpStream`, so only the listener pulls TLS/TCP.
+# Parallels //crates/proto/http3 (which bundles its QUIC listener). The
+# RFC 7541 Huffman table is shared with proto/http3 via
+# //crates/proto/field-huffman.
 rust_library(
     name = "http2",
     srcs = [
@@ -18,6 +20,7 @@ rust_library(
         "src/frame.rs",
         "src/hpack.rs",
         "src/lib.rs",
+        "src/listen.rs",
         "src/server.rs",
         "src/static_table.rs",
     ],
@@ -28,6 +31,10 @@ rust_library(
         # RFC 7541 Huffman (shared with proto/http3 — HPACK == QPACK table).
         "//crates/proto/field-huffman",
         "//crates/proto/http",
+        # The TLS state machine the listener drives (listen.rs only).
+        "//crates/proto/tls",
+        "//crates/runtime/worker",
+        "//crates/util/iobuf",
         "//crates/waitless",
     ],
 )

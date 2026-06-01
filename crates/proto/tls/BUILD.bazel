@@ -9,9 +9,9 @@ package(default_visibility = ["//visibility:public"])
 # `aead`, `handshake`, `record`) plus the per-conn server state machine.
 # Transport- and HTTP-agnostic — NO `http`/`http2` dep. //crates/proto/quic
 # depends on `schedule` / `aead` / `handshake` for its
-# TLS-over-CRYPTO-frames driver; //crates/proto/https drives this state
-# machine over TCP and owns the `listen` / `HttpStream` adapter + the
-# ALPN dispatch to the HTTP serve loops.
+# TLS-over-CRYPTO-frames driver; //crates/proto/http2 drives this state
+# machine over TCP (its `http2::listen` is the TLS/TCP HTTPS server) and
+# owns the `HttpStream` adapter + the ALPN dispatch to the serve loops.
 #
 # To enable diagnostic tracing add `--cfg=tls_debug` to rustc_flags
 # below. When unset, the trace module compiles to no-op stubs with

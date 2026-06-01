@@ -6,7 +6,8 @@
 // server state machine. This crate is **transport- and HTTP-agnostic**:
 // it has no `http` / `http2` dependency. The HTTPS *listener* — the
 // `HttpStream` adapter over TCP and the ALPN dispatch to the HTTP serve
-// loops — lives one layer up in `//crates/proto/https`, mirroring how
+// loops — lives one layer up in `//crates/proto/http2` (whose
+// `http2::listen` is the TLS/TCP HTTPS server), mirroring how
 // `//crates/proto/http3` is its own listener over `//crates/proto/quic`.
 // `//crates/proto/quic` reuses the sans-io modules (`schedule`, `aead`,
 // `handshake`) but skips `record` (TCP-specific) and substitutes its own
@@ -35,15 +36,15 @@
 //
 // Public surface (re-exported through this module's root):
 //   * `TlsServerConfig` — typed cert + key bundle (used by the
-//     `https` listener and the QUIC handshake driver).
-//   * `AlpnProtocol` — the negotiated ALPN, read by the `https`
+//     `http2` listener and the QUIC handshake driver).
+//   * `AlpnProtocol` — the negotiated ALPN, read by the `http2`
 //     dispatch.
 //   * `preinit` — one-shot crypto-primitive warmup.
 //   * `tls_profile_report` / `tls_profile_reset` — diagnostics.
 //   * `TlsError` — cert/key parse failure.
 //
 // Sans-io modules (`schedule`, `aead`, `handshake`) are also `pub`
-// so `//crates/proto/quic` and `//crates/proto/https` can reach into
+// so `//crates/proto/quic` and `//crates/proto/http2` can reach into
 // them without going through a higher-level wrapper.
 
 // Stays no_std in production; flips to std only under `--test`
@@ -54,7 +55,7 @@ extern crate alloc;
 
 // Sans-io TLS primitives (formerly //crates/net:tls{,_crypto,_handshake,_record}).
 // Pub because //crates/proto/quic reaches into `schedule`, `aead`, `handshake`
-// for the TLS-handshake-over-CRYPTO-frames driver, and //crates/proto/https
+// for the TLS-handshake-over-CRYPTO-frames driver, and //crates/proto/http2
 // reaches into `record` (record sizes) + `server` (the state machine).
 // `record` stays pub for symmetry; it's TCP-only but the wider audience
 // doesn't pay any cost — LTO drops it from QUIC binaries.
@@ -66,7 +67,7 @@ pub mod schedule;
 
 // TLS-over-TCP server state machine. (`//crates/proto/quic` lives in its
 // own crate now and depends on this one for the sans-io TLS bits;
-// `//crates/proto/https` drives this state machine over a TcpStream.)
+// `//crates/proto/http2` drives this state machine over a TcpStream.)
 pub mod server;
 
 // Submodules of the server stack. `pub` so `//crates/proto/quic` can reuse
