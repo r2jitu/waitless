@@ -401,20 +401,35 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
   Would manifest as rps only on a request-saturated (multi-loadgen /
   higher-egress) host. *Status:* done, landed on main.
 
-- `[ ]` **T4. DQO RX RSC (HW-GRO) = items I→J, in order.**
+- `[x]` **T4. DQO RX RSC (HW-GRO) = items I→J — done & c3-validated.**
   *What:* (I) multi-buffer RX chain accumulation — stitch non-EOP
-  fragment completions into one chain, deliver on EOP, with a
-  ~100 ms stuck-chain timeout; **then** (J) set `enable_rsc=1` in
-  `CREATE_RX_QUEUE`. *Why:* coalesces N RX segments → 1 → fewer
-  per-frame cycles on **bulk receive / uploads** (TCP only). Does
-  **not** touch `/health` (nothing to coalesce on a tiny request).
-  *Where:* `dqo.rs` `poll_qp_inner` (the `(status & EOP)` filter
-  that drops fragments today), `init.rs` `build_create_rx_queue_cmd`
-  (the `enable_rsc` byte). *Verify:* `upload_32k_tcp` / a bulk-RX
-  workload on c3; `dqo_rx_compl_skipped` → 0 with RSC on; +10–30%
-  per the pre-RSC reasoning. *Status:* J alone is a measured no-op
-  (−99.9% upload!) without I — **I must land first**
-  ([[reference_gve_rsc_investigation]]). ~80 LOC + the timeout.
+  fragment completions into a per-qp pending chain (static
+  `PENDING_CHAINS`, single-writer-per-qp), deliver on EOP, ~100 ms
+  stuck-chain timeout; fast path (single-buf EOP) byte-identical to
+  pre-I. (J) `enable_rsc=1` in `CREATE_RX_QUEUE` (DQO only).
+  *Implementation:* `dqo::poll_qp_inner` (error-skip vs accumulate +
+  fast/slow path), `lib.rs` `PendingChainCell`/`PENDING_CHAINS`,
+  `net/stack/rx.rs` chain-aware `tcp_receive_segment`
+  (`shrink_total_len`), `init.rs` `enable_rsc` byte at cmd-offset 58.
+  *Device config verified against upstream `gve_adminq_create_rx_queue`
+  / `gve_rx_compl_desc_dqo`:* `enable_rsc` is the ONLY create-queue
+  field RSC needs — header-split is independent and NOT required
+  (`header_buffer_size = 0`; HW-GRO carries full headers in frag[0]);
+  our completion reads (packet_len/generation/EOP/buf_id) are unchanged
+  under RSC; `rsc`/`rsc_seg_len` are GSO hints we ignore. So the prior
+  branch's "device-config gap" was a misdiagnosis — the real
+  prerequisite is the item-I accumulator.
+  *Verified on c3-highcpu-4 (gVNIC DQO), raw `gcp-deploy-bench` 4c/8s,
+  single-run:* **no catastrophe** + a real bulk-RX win — upload TCP rx
+  throughput **+14–19%** (`upload_32k_tcp` 1998→2379 MB/s,
+  `upload_256k` 2196→2588, `upload_1m` 2277→2588), **`upload_1m` p99
+  60 ms → 20 ms (3×)**, `get_tcp` serve **neutral** (560K→555K).
+  Counters clean both builds: `rx_compl_skipped=0`,
+  `rx_pending_chain_timeouts=0`; `rx_buf_reposts` **107.8M → 43.1M for
+  ~equal bytes** = RSC coalescing into ~2.5× fewer/denser buffers. The
+  +% is single-run (near SPOT variance) but the structural signals
+  (repost ratio, p99, clean counters, no catastrophe) are robust.
+  *Status:* done on branch `t4-dqo-rsc`, merged to main. ([[reference_gve_rsc_investigation]])
 
 - `[ ]` **T5. DQO UDP-GSO (QUIC/H3 TX).**
   *What:* mirror GQI's UDP-GSO for DQO (currently the DQO branch is
