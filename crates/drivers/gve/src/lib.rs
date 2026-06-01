@@ -78,10 +78,37 @@ pub(crate) use diag::{
 };
 
 use bus::{log, mmio_read32, mmio_write32};
+use core::cell::UnsafeCell;
 use core::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
 };
+use iobuf::{Chain, OwnedIOBuf};
 use sync::Spinlock;
+
+// ---- DQO multi-buf RX pending-chain storage (item I) -----------------------
+//
+// Per-qp slot for the in-progress coalesced super-segment that
+// `dqo::poll_qp_inner` accumulates across non-EOP RX completions and
+// emits on EOP. Kept in a static array indexed by qp rather than in
+// `RxQueue` itself so `RxQueue` stays auto-`Sync` (atomic-only fields);
+// the `unsafe impl Sync` lives on this newtype, scoped to exactly the
+// one field that needs lock-free interior mutability. Mirrors
+// virtio-net's `NetCell` pattern.
+//
+// SAFETY invariant (mirrored at the `dqo::poll_qp_inner` access sites):
+// `poll_qp_inner(qp)` is the only reader/writer of `PENDING_CHAINS[qp]`,
+// and it never runs on two cores concurrently for the same qp — Tier 1
+// pins each qp to its owning core, and the BSP-polls-all-qps boot
+// window is single-threaded. Drop callbacks (`dqo::dqo_repost`) run on
+// the consumer core but never touch this slot. So a single `&mut` into
+// the slot per poll cycle is sound.
+pub(crate) struct PendingChainCell(pub(crate) UnsafeCell<Option<Chain<OwnedIOBuf>>>);
+// SAFETY: single-writer-per-qp via the polling discipline above; the
+// cell never escapes a single `poll_qp_inner` invocation.
+unsafe impl Sync for PendingChainCell {}
+
+pub(crate) static PENDING_CHAINS: [PendingChainCell; MAX_QUEUE_PAIRS] =
+    [const { PendingChainCell(UnsafeCell::new(None)) }; MAX_QUEUE_PAIRS];
 
 // ---- PCI identity ----------------------------------------------------------
 
@@ -322,6 +349,16 @@ pub(crate) struct RxQueue {
     /// clonable `Arc` handle, so each issued slab keeps the pool's
     /// backing region alive on its own.
     pub(crate) rx_pool: Option<iobuf::IOBufPool>,
+    /// Wall-clock ms (`kernel_bare::clock::now_ms`) at which the
+    /// current pending RX chain (see [`PENDING_CHAINS`]) started
+    /// accumulating — set when the first non-EOP fragment of a frame
+    /// is appended; meaningless while the slot is `None`. Read at the
+    /// top of every `poll_qp_inner` to drop a chain whose EOP never
+    /// arrived (`dqo::PENDING_CHAIN_TIMEOUT_MS`); the IOBuf parts'
+    /// drop callbacks auto-repost their device buffers. Lives on
+    /// `RxQueue` (not alongside `PENDING_CHAINS`) because a plain
+    /// `AtomicU64` keeps `RxQueue` auto-`Sync`.
+    pub(crate) pending_chain_started_ms: AtomicU64,
 }
 
 /// The two queue formats we actually support. GCE today advertises

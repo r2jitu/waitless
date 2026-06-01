@@ -183,15 +183,16 @@ pub(crate) fn deliver(parsed: types::ParsedL3, chain: Chain<OwnedIOBuf>) {
 /// moving, and the `OwnedIOBuf`'s drop callback still reposts the
 /// *whole* device buffer.
 ///
-/// One-part chain today, so this narrows the entire frame down to
-/// exactly the TCP segment. A future RSC super-segment (item I) is
-/// multi-part — part 0 holds the headers + first payload chunk,
-/// parts 1..N the payload continuation. `narrow` then only
-/// `consume`s the header bytes off part 0 (the segment outruns part
-/// 0, so there is no tail to trim), and `tcp_receive` walks every
-/// part — but item I must additionally refresh the chain's cached
-/// `total_len` (via `Chain::shrink_total_len`), which a `Single`-repr
-/// chain computes live and so does not need today.
+/// Single- and multi-part chains alike: a non-coalesced frame is one
+/// part and the narrow trims the whole frame down to its TCP segment;
+/// an RSC super-segment (RX items I + J) is multi-part — part 0 holds
+/// the headers + first payload chunk, parts 1..N the payload
+/// continuation. `narrow` only `consume`s the header bytes off part 0
+/// in that case (the segment outruns part 0, so there's no tail to
+/// trim), and `tcp_receive` walks every part. The `shrink_total_len`
+/// after the narrow refreshes the chain's cached `total_len` — a no-op
+/// for the `Single`-repr (which derives it live) and the load-bearing
+/// fix for `Many`.
 fn tcp_receive_segment(
     src: types::IpAddr,
     dst: types::IpAddr,
@@ -199,26 +200,21 @@ fn tcp_receive_segment(
     l4_off: usize,
     l4_len: usize,
 ) {
-    // Single-part invariant (see fn doc): `narrow` mutates part 0 via
-    // `front_mut`, which bypasses a `Many` chain's cached `total_len`
-    // — so a multi-part chain would reach `tcp_receive` with a stale
-    // length. Tripwire for item I, which is what first produces
-    // multi-part RSC chains: it must narrow chain-aware (refresh
-    // `total_len`). Compiled out in release; never trips today.
-    debug_assert_eq!(
-        chain.part_count(),
-        1,
-        "multi-part RX chain in tcp_receive_segment: RSC (item I) must \
-         refresh the chain's cached total_len after the part-0 narrow",
-    );
     let Some(part0) = chain.front_mut() else {
         return;
     };
+    let before = part0.len();
     if part0.narrow(l4_off, l4_len).is_err() {
         // Unreachable: `l4_off + l4_len` is the end of `pkt.payload`,
         // a sub-slice of part 0, in-bounds by construction.
         // Defensive — `chain` drops here, reposting.
         return;
     }
+    // `narrow` mutated part 0 via `front_mut`, which bypasses a `Many`
+    // chain's cached `total_len`; subtract the bytes it trimmed off
+    // part 0 so a multi-part RSC chain reaches `tcp_receive` with the
+    // correct length. No-op for `Single`/`Empty`.
+    let trimmed = before - part0.len();
+    chain.shrink_total_len(trimmed);
     tcp::tcp_receive(src, dst, chain);
 }

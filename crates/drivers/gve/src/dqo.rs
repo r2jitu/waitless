@@ -16,8 +16,8 @@ use bus::mmio_write32;
 use iobuf::{Chain, IOBufDropFn, OwnedIOBuf};
 
 use crate::{
-    BAR2_VA, DEFERRED_KICK, MAX_QUEUE_PAIRS, RX_BUF_REPOST_COUNT, RX_BUFFER_SIZE, RX_BYTES_PER_QP,
-    RX_QUEUES, RxQueue, TX_QUEUES, TxQueue, record_tx_desc, tx_desc_kind,
+    BAR2_VA, DEFERRED_KICK, MAX_QUEUE_PAIRS, PENDING_CHAINS, RX_BUF_REPOST_COUNT, RX_BUFFER_SIZE,
+    RX_BYTES_PER_QP, RX_QUEUES, RxQueue, TX_QUEUES, TxQueue, record_tx_desc, tx_desc_kind,
 };
 
 // ---- DQO_RDA descriptor formats -------------------------------------------
@@ -154,19 +154,37 @@ pub static DQO_TX_RING_FULL_DROPS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 /// Count of RX completion descriptors we saw with a valid generation
-/// (device has written this slot) but that we did NOT deliver to the
-/// callback because one of: `buf_id` out of range, EOP bit clear, or
-/// `pkt_len == 0`. Non-zero means the device is emitting completions
-/// for malformed/error packets and the upper stack never sees them.
-/// Diagnostic for distinguishing in-driver drops vs NIC/fabric drops.
+/// (device has written this slot) but that we did NOT deliver because
+/// one of: `buf_id` out of range or `pkt_len == 0`. With item I the
+/// EOP-clear case is no longer a skip — non-EOP fragments accumulate
+/// into the qp's pending chain. Non-zero now means the device is
+/// emitting completions for malformed / zero-length packets and the
+/// upper stack never sees them — a diagnostic for distinguishing
+/// in-driver drops vs NIC/fabric drops.
 pub static DQO_RX_COMPL_SKIPPED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 /// Snapshot of the status byte (offset 8) of the most-recently-seen
-/// skipped completion descriptor. Lets us tell whether skipped
-/// descs are "EOP clear" (fragmented?), "RX error" (bit-pattern in
-/// reserved bits), or some other anomaly without re-flashing.
+/// skipped completion descriptor. Lets us tell whether skipped descs
+/// are an "RX error" (bit-pattern in reserved bits), zero length, or
+/// some other anomaly without re-flashing.
 pub static DQO_RX_LAST_SKIP_STATUS: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(0);
+/// Count of pending RX chains (item I) dropped because the EOP
+/// fragment never arrived within [`PENDING_CHAIN_TIMEOUT_MS`]. The
+/// in-flight frame is discarded; the accumulated `OwnedIOBuf` parts
+/// auto-repost their device buffers via their drop callbacks. Non-zero
+/// means the device started a multi-buf frame and stopped before the
+/// EOP — never seen on a healthy queue.
+pub static DQO_RX_PENDING_CHAIN_TIMEOUTS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Max wall-clock age of a pending RX chain (`kernel_bare::clock::now_ms`)
+/// before `poll_qp_inner` drops it as stuck. 100 ms — orders of
+/// magnitude above any real inter-fragment gap on a coalesced
+/// super-segment (whose buffers arrive back-to-back), yet short enough
+/// that a wedged chain pins its buffers only briefly before they
+/// recycle to the data ring.
+pub(crate) const PENDING_CHAIN_TIMEOUT_MS: u64 = 100;
 
 /// DQO RX buffer descriptor — 32 bytes (driver-written, points to a
 /// device-readable packet buffer).
@@ -1070,13 +1088,40 @@ pub(crate) fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, mut callback
     }
     let rx = unsafe { &*rx_ptr };
 
+    // Pending-chain timeout (item I). A multi-buf frame whose EOP never
+    // arrives would pin its accumulated device buffers indefinitely;
+    // drop the chain (its IOBuf parts auto-repost via `dqo_repost`)
+    // once it's been stuck longer than the timeout.
+    //
+    // SAFETY: `PENDING_CHAINS[qp]` is only accessed from
+    // `poll_qp_inner(qp)`, which runs on a single core at a time (see
+    // `PendingChainCell` in lib.rs). The `&mut` borrow is bounded to
+    // this block, released before the per-completion loop reacquires.
+    {
+        let pending: &mut Option<Chain<OwnedIOBuf>> =
+            unsafe { &mut *PENDING_CHAINS[qp].0.get() };
+        if pending.is_some() {
+            let started = rx.pending_chain_started_ms.load(Ordering::Relaxed);
+            let now = kernel_bare::clock::now_ms();
+            if now.wrapping_sub(started) > PENDING_CHAIN_TIMEOUT_MS {
+                pending.take();
+                DQO_RX_PENDING_CHAIN_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     let mask = (rx.ring_entries - 1) as u32;
     let mut cons = rx.cons_cnt.load(Ordering::Relaxed);
     let mut cur_gen = rx.expected_seq.load(Ordering::Relaxed);
+    // `delivered` (full chains emitted) no longer matches 1:1 with
+    // completions consumed now that one frame may span several non-EOP
+    // fragments; bound the loop on raw completions (`processed`) so the
+    // poll's wall-clock stays bounded even while mid-frame.
+    let mut processed: u32 = 0;
     let mut delivered: u32 = 0;
     const MAX_BATCH: u32 = 64;
 
-    while delivered < MAX_BATCH {
+    while processed < MAX_BATCH {
         let idx = (cons & mask) as usize;
         let desc_ptr = (rx.compl_va as *const u8).wrapping_add(idx * DQO_RX_COMPL_SIZE);
         // Read pkt_word + len + gen + bq_id as a single aligned u16
@@ -1105,30 +1150,34 @@ pub(crate) fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, mut callback
         // pkt_word above.
         let buf_id = unsafe { ptr::read_volatile(desc_ptr.add(12) as *const u16) } as u32;
 
-        let deliver =
-            buf_id < DQO_RX_POOL_BUFS && (status & DQO_RX_COMPL_STATUS_EOP) != 0 && pkt_len > 0;
-        if deliver {
+        let eop = (status & DQO_RX_COMPL_STATUS_EOP) != 0;
+        // Genuine error completion (bad buf_id or zero length) — skip
+        // without wrapping. A non-EOP completion is no longer a skip:
+        // those are valid mid-frame fragments now (item I).
+        if buf_id >= DQO_RX_POOL_BUFS || pkt_len == 0 {
+            DQO_RX_COMPL_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            DQO_RX_LAST_SKIP_STATUS.store(status, Ordering::Relaxed);
+            // Observability doctrine: retain the qp + a timestamp
+            // alongside the status byte (`docs/observability.md`).
+            crate::diag::record_rx_skip(qp as u8, status);
+        } else {
             let buf_va = rx.qpl_base_va + (buf_id as u64) * (RX_BUFFER_SIZE as u64);
             if qp < RX_BYTES_PER_QP.len() {
                 RX_BYTES_PER_QP[qp].fetch_add(pkt_len as u64, Ordering::Relaxed);
             }
-            // Wrap the device's RX buffer as an owned, one-part
-            // IOBufChain. DQO_RDA descriptors carry raw DMA
-            // addresses, so the device buffer can be lent straight
-            // up the stack with no copy. `dqo_repost` puts buf_id
-            // back on the data ring when the chain's IOBuf drops —
-            // the slice-shaped path's explicit inline repost now
-            // lives entirely in that drop callback, so it fires
-            // wherever (and on whichever core) the chain is
-            // released.
+            // Wrap the device's RX buffer as an owned IOBuf. DQO_RDA
+            // descriptors carry raw DMA addresses, so the device buffer
+            // can be lent straight up the stack with no copy.
+            // `dqo_repost` puts buf_id back on the data ring when the
+            // IOBuf drops — wherever (and on whichever core) the chain
+            // is released.
             //
-            // SAFETY: `buf_va` is the DMA-coherent buffer for
-            // buf_id (non-null, posted at init); `pkt_len <=
-            // RX_BUFFER_SIZE` is enforced by the device's
-            // descriptor length field, so `0 + pkt_len <=
-            // capacity`. `dqo_repost` is sound to invoke once at
-            // drop and panic-safe; `(qp, buf_id)` packed in `ctx`
-            // survives the cross-core move `ExternalOwned` allows.
+            // SAFETY: `buf_va` is the DMA-coherent buffer for buf_id
+            // (non-null, posted at init); `pkt_len <= RX_BUFFER_SIZE`
+            // is enforced by the device's descriptor length field.
+            // `dqo_repost` is sound to invoke once at drop and
+            // panic-safe; `(qp, buf_id)` packed in `ctx` survives the
+            // cross-core move `ExternalOwned` allows.
             let ctx = (((qp & 0xFFFF) << 16) | (buf_id as usize & 0xFFFF)) as *mut ();
             let owned = unsafe {
                 OwnedIOBuf::wrap_owned(
@@ -1140,20 +1189,56 @@ pub(crate) fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, mut callback
                     ctx,
                 )
             };
-            callback(Chain::from(owned));
-            delivered += 1;
-        } else {
-            DQO_RX_COMPL_SKIPPED.fetch_add(1, Ordering::Relaxed);
-            DQO_RX_LAST_SKIP_STATUS.store(status, Ordering::Relaxed);
-            // Observability doctrine: retain the qp + a timestamp
-            // alongside the status byte (`docs/observability.md`).
-            crate::diag::record_rx_skip(qp as u8, status);
+
+            // Fast path: single-buf EOP frame on an empty cell — the
+            // overwhelming shape with RSC off (item J not yet flipped),
+            // and still the majority with RSC on (non-coalesced flows).
+            // Skip the cell store/take dance: emit the one-part chain
+            // straight to the callback — byte-identical to the
+            // pre-item-I path.
+            //
+            // SAFETY (read-only): the borrow lives across one
+            // `is_none()` call, doesn't escape, and overlaps no other
+            // borrow into the cell (single-writer-per-qp; the slow-path
+            // `&mut` below only runs in the mutually-exclusive `else`).
+            let cell_empty = unsafe { (*PENDING_CHAINS[qp].0.get()).is_none() };
+            if eop && cell_empty {
+                callback(Chain::from(owned));
+                delivered += 1;
+            } else {
+                // Slow path: an in-flight chain exists, or this is a
+                // mid-chain non-EOP fragment. Append; on EOP take + emit.
+                //
+                // SAFETY (mutating): same single-writer-per-qp invariant
+                // as the timeout block above. The `&mut` borrow is
+                // scoped to this block so it ends before `callback` runs.
+                let to_emit = {
+                    let pending: &mut Option<Chain<OwnedIOBuf>> =
+                        unsafe { &mut *PENDING_CHAINS[qp].0.get() };
+                    match pending.as_mut() {
+                        Some(chain) => chain.push_back(owned),
+                        None => {
+                            // First fragment of a new multi-buf frame —
+                            // start the timeout clock.
+                            rx.pending_chain_started_ms
+                                .store(kernel_bare::clock::now_ms(), Ordering::Relaxed);
+                            *pending = Some(Chain::from(owned));
+                        }
+                    }
+                    if eop { pending.take() } else { None }
+                };
+                if let Some(chain) = to_emit {
+                    callback(chain);
+                    delivered += 1;
+                }
+            }
         }
 
         cons = cons.wrapping_add(1);
         if (cons & mask) == 0 {
             cur_gen ^= 1;
         }
+        processed += 1;
     }
 
     rx.cons_cnt.store(cons, Ordering::Release);
