@@ -439,33 +439,10 @@ pub const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
 /// notifications for this queue. Standard virtio spec §2.7.13.
 pub const VIRTQ_USED_F_NO_NOTIFY: u16 = 1;
 
-// Feature bits
-/// Driver handles packets with partial checksum (host computes for us).
-/// Required as a prerequisite for `VIRTIO_NET_F_HOST_TSO4`.
-pub const VIRTIO_NET_F_CSUM: u32 = 1 << 0;
-pub const VIRTIO_NET_F_MAC: u32 = 1 << 5;
-/// Device can handle TCPv4 GSO from the driver — we hand it a single
-/// super-segment with `gso_type=TCPV4` + `gso_size=MSS`, the device
-/// segments it host-side. Saves the per-MSS frame-build loop on TX.
-pub const VIRTIO_NET_F_HOST_TSO4: u32 = 1 << 11;
-pub const VIRTIO_NET_F_MRG_RXBUF: u32 = 1 << 15;
-/// Guest-side RX-offload feature bits the virtio-net RX path does
-/// **not** implement, and so must clear from the negotiated set.
-///
-/// `poll_qp` delivers every received frame as a single
-/// ≤`BUFFER_SIZE` (2 KiB) descriptor and never reads the
-/// virtio-net header's `num_buffers`/`gso_type`. Negotiating
-/// `GUEST_TSO4` (bit 7) lets a tap+vhost-net backend GRO-coalesce
-/// inbound TCP into >MTU super-frames; `MRG_RXBUF` (bit 15) lets a
-/// single frame span several descriptors. Either shreds large
-/// inbound TCP, so both — plus `GUEST_CSUM`/`TSO6`/`ECN`/`UFO` —
-/// are masked off. Bits: GUEST_CSUM(1) GUEST_TSO4(7) GUEST_TSO6(8)
-/// GUEST_ECN(9) GUEST_UFO(10) MRG_RXBUF(15).
-pub const VIRTIO_NET_RX_OFFLOAD_MASK: u32 =
-    (1 << 1) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 15);
-pub const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
-pub const VIRTIO_NET_F_MQ: u32 = 1 << 22;
-pub const VIRTIO_NET_F_CTRL_VQ: u32 = 1 << 17;
+// Transport feature bits. The virtio-net *device* feature bits
+// (`VIRTIO_NET_F_*` / `VIRTIO_NET_RX_OFFLOAD_MASK`) live in the
+// virtio-net crate — the transport negotiates features generically and
+// doesn't interpret device-class semantics.
 pub const VIRTIO_RING_F_EVENT_IDX: u32 = 1 << 29;
 /// Vendor extension: device exposes per-queue used_idx at config offset 0x110.
 /// When set, get_used() reads used_idx via MMIO trap instead of from shared

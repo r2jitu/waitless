@@ -4,13 +4,20 @@
 
 use core::ptr;
 
+// virtio-net device feature bits (defined in this crate, not the bus
+// transport). MAC/MRG_RXBUF/STATUS are used only by the aarch64 MMIO path.
+use crate::{
+    VIRTIO_NET_F_CSUM, VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_HOST_TSO4, VIRTIO_NET_F_MQ,
+    VIRTIO_NET_RX_OFFLOAD_MASK,
+};
+#[cfg(target_arch = "aarch64")]
+use crate::{VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_STATUS};
 use bus::virtio::{
     STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, STATUS_FEATURES_OK,
-    VIRTIO_NET_F_CSUM, VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_HOST_TSO4, VIRTIO_NET_F_MQ,
-    VIRTIO_NET_RX_OFFLOAD_MASK, VIRTIO_RING_F_EVENT_IDX, Virtqueue, vpci_device, vpci_enable_queue,
-    vpci_find, vpci_get_queue_notify_off, vpci_get_queue_size, vpci_get_status,
-    vpci_queue_notify_addr, vpci_read_dev_cfg8, vpci_read_dev_cfg16, vpci_read_features, vpci_reset,
-    vpci_select_queue, vpci_set_queue_addrs, vpci_set_status, vpci_write_features,
+    VIRTIO_RING_F_EVENT_IDX, Virtqueue, vpci_device, vpci_enable_queue, vpci_find,
+    vpci_get_queue_notify_off, vpci_get_queue_size, vpci_get_status, vpci_queue_notify_addr,
+    vpci_read_dev_cfg8, vpci_read_dev_cfg16, vpci_read_features, vpci_reset, vpci_select_queue,
+    vpci_set_queue_addrs, vpci_set_status, vpci_write_features,
 };
 // MMIO transport symbols — used only by the aarch64 `init_mmio` path.
 #[cfg(target_arch = "aarch64")]
@@ -18,7 +25,6 @@ use bus::virtio::{
     MMIO_BASE, MMIO_DEVICE_CONFIG, MMIO_DEVICE_FEATURES_SEL, MMIO_DEVICE_ID,
     MMIO_DRIVER_FEATURES_SEL, MMIO_GUEST_FEATURES, MMIO_GUEST_PAGE_SIZE, MMIO_HOST_FEATURES,
     MMIO_MAGIC, MMIO_MAGIC_VALUE, MMIO_STATUS, MMIO_VERSION, VIRTIO_F_USED_IDX_MMIO,
-    VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_STATUS,
 };
 use bus::log;
 // virtio register I/O — used only by the aarch64 `init_mmio` path.

@@ -67,6 +67,31 @@ pub(crate) const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
 /// Virtio flags values.
 pub(crate) const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
 
+// virtio-net *device* feature bits (virtio spec §5.1.3). These are
+// device-class knowledge, so they live here (with the header constants
+// above) rather than in the transport `bus` crate, which negotiates
+// features generically and never interprets them.
+/// Driver handles packets with partial checksum (host computes for us).
+/// Prerequisite for `VIRTIO_NET_F_HOST_TSO4`.
+pub(crate) const VIRTIO_NET_F_CSUM: u32 = 1 << 0;
+pub(crate) const VIRTIO_NET_F_MAC: u32 = 1 << 5;
+/// Device segments a driver-supplied TCPv4 GSO super-segment host-side
+/// (`gso_type=TCPV4` + `gso_size=MSS`) — saves the per-MSS TX loop.
+pub(crate) const VIRTIO_NET_F_HOST_TSO4: u32 = 1 << 11;
+pub(crate) const VIRTIO_NET_F_MRG_RXBUF: u32 = 1 << 15;
+pub(crate) const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
+pub(crate) const VIRTIO_NET_F_CTRL_VQ: u32 = 1 << 17;
+pub(crate) const VIRTIO_NET_F_MQ: u32 = 1 << 22;
+/// Guest-side RX-offload feature bits the RX path does **not**
+/// implement and must clear from the negotiated set: `poll_qp` delivers
+/// each frame as a single ≤`BUFFER_SIZE` descriptor and never reads the
+/// header's `num_buffers`/`gso_type`, so `GUEST_TSO4`(7)/`MRG_RXBUF`(15)
+/// — which coalesce/span inbound TCP across buffers — plus
+/// `GUEST_CSUM`(1)/`TSO6`(8)/`ECN`(9)/`UFO`(10) would shred large
+/// inbound TCP. Masked off.
+pub(crate) const VIRTIO_NET_RX_OFFLOAD_MASK: u32 =
+    (1 << 1) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 15);
+
 /// Public diagnostic API (`net_rx_counts` / `net_rx_used_cursors`)
 /// returns fixed-size arrays of this length. The actual queue-pair
 /// storage is heap-allocated and uncapped — this only bounds what
