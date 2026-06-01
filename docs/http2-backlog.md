@@ -31,27 +31,32 @@ coexist, selected per-connection by ALPN.
   table is identical. `http3/src/huffman.rs` is now a thin re-export so
   existing `crate::huffman::…` call sites are unchanged. The static tables
   differ (HPACK 61 entries vs QPACK 99) and stay per-crate.
-- **The listener + ALPN dispatch live in a new `crates/proto/https`
-  crate, not in `proto/tls`.** The first cut buried the dispatch in
-  `proto/tls` (the backlog's original `"h2" → http2::serve_conn` at
-  `proto/tls/src/lib.rs`), but that made `tls` depend on `http`/`http2`
-  — and there's no h3-style opt-out when h2 is welded into the TLS crate.
-  Instead, `proto/tls` is now **pure TLS** (sans-io state machine +
-  record/handshake/AEAD; *no* `http`/`http2`/`worker` deps), and the new
-  `proto/https` crate owns the `TlsStream: HttpStream` adapter, the
-  per-worker conn pool, `https::listen`, and the dispatch:
-  `drive_handshake` → read `AlpnProtocol` (set in `tls`'s
-  `do_client_hello`) → `H2` ⇒ `http2::serve_conn`, else
-  `http::serve_conn`. This mirrors `proto/http3` being its own listener
-  over `proto/quic` — the composition of {transport, HTTP versions} lives
-  one layer above the pure protocol crates. The listen family reads
-  cleanly: `http::listen` (H1.1/TCP), `https::listen` (H1.1+H2/TLS, ALPN),
-  `http3::listen` (H3/QUIC).
+- **The listener lives in `proto/http2` (`http2::listen`), and `proto/tls`
+  is pure TLS.** Naming follows the ALPN tokens: `h2` *is* HTTP/2-over-TLS
+  (RFC 7540 §3.1; cleartext is `h2c`, a non-goal), so the HTTP/2 server is
+  an HTTPS server — and, because ALPN mandates an HTTP/1.1 fallback, it
+  necessarily serves h1.1 too. So `http2` owns the `TlsStream: HttpStream`
+  adapter, the conn pool, and `http2::listen`, which drives the handshake,
+  reads the negotiated `AlpnProtocol`, then runs `serve_conn` (h2) or
+  `http::serve_conn` (h1.1). This parallels `proto/http3` (which bundles
+  its QUIC listener): `http` / `http2` / `http3` are each "the server for
+  that HTTP version over its transport" (plaintext TCP, TLS/TCP, QUIC/UDP).
+  `proto/tls` keeps **no `http`/`http2` dep** (sans-io state machine only);
+  it exposes `AlpnProtocol` + `is_established`/`is_terminated`/
+  `negotiated_alpn` so the listener can drive the handshake and branch
+  without reaching into TLS internals. There is **no `https` crate** —
+  "HTTPS" spans two transports, so a site calls `http2::listen` (TCP) +
+  `http3::listen` (QUIC, advertised via `Alt-Svc`). `http2`'s protocol
+  half (`serve_conn`) stays generic over `http::HttpStream`; only `listen`
+  pulls TLS/TCP.
+
+  *(History: a first cut put the listener in `proto/tls`, then in a
+  separate `proto/https` crate; both were superseded — `tls` shouldn't
+  depend on HTTP, and there's no honest "https" name that excludes h3.
+  Folding the listener into `http2` is the resolution.)*
 - ALPN selection is **server-preference** (`h2` over `http/1.1`); a client
   that offers no `h2` still gets `http/1.1` — the fallback the golden path
-  depends on. `tls` exposes the negotiated `AlpnProtocol` + `is_established`
-  / `is_terminated` so the `https` dispatch can drive the handshake and
-  branch without reaching into TLS internals.
+  depends on.
 
 ## Reuse map (don't reinvent)
 
