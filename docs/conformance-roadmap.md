@@ -4,9 +4,13 @@ Status: in progress (steps 1-4 complete). Last updated 2026-05-28
 (QUIC RFC 9002 statuses re-verified against `conn/loss.rs` /
 `streams.rs`; frame retx + congestion controller still open).
 
-The prioritized TCP gap backlog now lives in
-[`tcp-conformance-backlog.md`](tcp-conformance-backlog.md); this doc
-keeps the conformance-testing strategy and the QUIC roadmap.
+This doc keeps the conformance-testing **strategy** and the **QUIC
+transport** roadmap (RFC 9000/9001/9002). The per-protocol gap backlogs
+live in their own files:
+[`tcp-conformance-backlog.md`](tcp-conformance-backlog.md) (TCP +
+Linux-parity), [`tls-backlog.md`](tls-backlog.md) (TLS 1.3),
+[`http2-backlog.md`](http2-backlog.md) (HTTP/2, not started), and
+[`http3-backlog.md`](http3-backlog.md) (HTTP/3 + QPACK app layer).
 
 ## Purpose
 
@@ -272,7 +276,10 @@ are tracked, prioritized, in
 ## Part 3 — QUIC RFC roadmap
 
 QUIC is in markedly better shape than TCP: built sans-io, already
-host-tested, and the RFC 9002 *data model* is present.
+host-tested, and the RFC 9002 *data model* is present. This part covers
+the **transport** (RFC 9000/9001/9002); the **HTTP/3 application layer**
+on top (RFC 9114 framing + RFC 9204 QPACK) is tracked in
+[`http3-backlog.md`](http3-backlog.md).
 
 ### RFC 9000 — QUIC transport
 

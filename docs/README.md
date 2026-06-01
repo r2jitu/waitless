@@ -33,10 +33,16 @@ The perf docs route work by *cost locus* — see **[`high-concurrency-perf.md`](
 
 ## Conformance
 
+One backlog per protocol the server speaks; `conformance-roadmap.md` is the
+shared strategy + QUIC-transport roadmap that ties them together.
+
 | Doc | What it owns |
 |-----|--------------|
-| [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md) | TCP RFC gaps (SACK, out-of-order reassembly, MSS clamp, …), the **performance-parity-with-Linux** inventory (Reno-vs-CUBIC/BBR, ABC, pacing, RACK-TLP, buffer autotuning), and what's been closed (window scaling ✅). |
-| [`conformance-roadmap.md`](conformance-roadmap.md) | Conformance-testing strategy + the QUIC RFC 9000/9002 backlog. |
+| [`conformance-roadmap.md`](conformance-roadmap.md) | Conformance-testing strategy (the in-process harness pattern), the sequencing, and the **QUIC transport** roadmap (RFC 9000/9001/9002). |
+| [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md) | **TCP** RFC gaps (SACK, out-of-order reassembly, MSS clamp, …), the **performance-parity-with-Linux** inventory (Reno-vs-CUBIC/BBR, ABC, pacing, RACK-TLP, buffer autotuning), and what's been closed (window scaling ✅, ABC ✅). |
+| [`tls-backlog.md`](tls-backlog.md) | **TLS 1.3** gaps (HelloRetryRequest, key update, ticket-key rotation, cipher/curve breadth, production RNG, 0-RTT-deferred) — consolidated from scattered comments. |
+| [`http2-backlog.md`](http2-backlog.md) | **HTTP/2** — build plan + the hardening/DoS/conformance tail. Not started; the build companion (crate decision, reuse map, multiplexing design). |
+| [`http3-backlog.md`](http3-backlog.md) | **HTTP/3** (RFC 9114) + **QPACK** (RFC 9204) app-layer gaps (QPACK dynamic table, SETTINGS, error codes/GOAWAY, request-mapping conformance). |
 
 ## Reference & how-to
 
