@@ -316,7 +316,12 @@ host-tested, and the RFC 9002 *data model* is present.
   (`PTO * 2^pto_count`). [`stack-architecture.md`](stack-architecture.md)
   cites this gap (and the h3 content-length policy) as a correctness
   item owned here; any `SendStream` redesign there must leave room for
-  replay-from-offset.
+  replay-from-offset. **Build the controller as the shared TCP+QUIC
+  congestion core**, not QUIC-only: the same CUBIC/BBR + pacer serve
+  TCP's L1/L3 Linux-parity gaps, and TCP's RFC 5681 controller is the
+  reference to extract from — see *Transport reliability* in
+  [`stack-architecture.md`](stack-architecture.md). Conversely QUIC's
+  threshold loss detector is already the RACK model TCP's L4 wants.
 - **Conformance test**: host-testable directly in `quic_test`; the
   loss-detection + RTT half already rides the clock seam. What
   remains is "wire frame retx + a controller onto the existing

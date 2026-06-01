@@ -281,16 +281,22 @@ compliant — but they are the reason a mature kernel out-performs a
 hand-rolled stack on adverse (WAN, lossy, high-BDP) paths, and they are
 exactly what a `tokio-hyper`/`nginx`/any-Linux server gets *for free* by
 riding the kernel. They belong here so the "gaps vs Linux" picture is
-complete rather than implicit. (Window scaling — T6 — *was* on this list
-and is now done; it's the only one closed so far.)
+complete rather than implicit. (Window scaling — T6 — and ABC — L2 —
+*were* on this list and are now done; the rest remain.)
 
 Why it matters for our benchmark story: on low-RTT LAN/datacenter paths
 (where [`benchmark-results.md`](benchmark-results.md) measures) congestion
 control barely engages and our no-syscall architecture wins ~2×. On
 high-RTT or lossy paths these gaps bind, and the comparison narrows or
-inverts — Linux's CC/loss-recovery is decades deep. Measured locally:
-single-connection high-RTT throughput ran ~3× below the slow-start
-textbook, traced to the missing ABC below.
+inverts — Linux's CC/loss-recovery is decades deep.
+
+**Build these as the shared TCP+QUIC congestion core, not twice.** L1
+(CUBIC/BBR) and L3 (pacing) are also what QUIC's unbuilt RFC 9002
+congestion controller needs, and L4 (RACK-TLP) is the loss detector QUIC
+*already* has — so the right move when these come up is to extract one
+controller + pacer both transports drive. The plan lives in
+[`stack-architecture.md`](stack-architecture.md) → *Transport reliability
+— one congestion-control / loss-recovery / pacing core*.
 
 ### L1 — Congestion control is Reno only (no CUBIC / BBR)
 
@@ -304,9 +310,11 @@ Reno's `cwnd ÷ 2` per loss + linear reopen badly underfills a fat pipe;
 CUBIC reopens cubically, BBR ignores loss as a signal entirely. The gap
 widens with bandwidth × RTT.
 
-**Fix.** The L4 vtable seam (see roadmap "Lift `tcp` above `executor`")
-is meant to let a CC algorithm be swapped in; CUBIC is the pragmatic
-first target. **Effort: L.**
+**Fix.** Extract the shared `CongestionControl` trait (see
+[`stack-architecture.md`](stack-architecture.md) → Transport reliability)
+behind the roadmap's "Lift `tcp` above `executor`" seam, then write CUBIC
+once for both TCP and QUIC; CUBIC is the pragmatic first algorithm.
+**Effort: L.**
 
 ### L2 — Appropriate Byte Counting (ABC, RFC 3465) — ✅ done
 

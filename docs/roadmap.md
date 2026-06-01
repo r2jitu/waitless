@@ -22,6 +22,9 @@ depth and performance**, not new subsystems:
 - **QUIC loss recovery + congestion control (RFC 9002)** — the PTO timer, RTT
   estimator, and loss detection landed; **frame retransmission** and a
   **congestion controller** remain → [`conformance-roadmap.md`](conformance-roadmap.md) step 5.
+  The controller should be built as the **shared TCP+QUIC congestion core** (same
+  CUBIC/BBR + pacer serve TCP's Linux-parity gaps) → [`stack-architecture.md`](stack-architecture.md)
+  *Transport reliability*.
 - **TCP conformance + Linux performance parity** — window scaling (RFC 7323) ✅ shipped & GCE-validated; SACK, out-of-order reassembly, and the Linux-parity gaps (Reno→CUBIC/BBR, ABC, pacing, RACK-TLP) remain → [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md).
 - **RX/TX datapath** — RX offload (HW GRO/RSC), conn-state / conn-future pools, owned-UDP zero-copy → [`rx-path-optimizations.md`](rx-path-optimizations.md) / [`tx-path-optimizations.md`](tx-path-optimizations.md).
 - **Inter-layer contracts** — converging the TCP/TLS/HTTP-1.1 and UDP/QUIC/HTTP-3 stacks onto one golden path (the `ByteStream` trait, the owned buffer currency, the NIC/reactor vtable→trait migrations) → [`stack-architecture.md`](stack-architecture.md).
@@ -67,7 +70,7 @@ path, session resumption, the h3-on-gve fix, bare-metal TCP corners) — live in
 - **Real wall-clock time source** — only monotonic ticks today; ~30 lines for absolute time. *Trigger: cert validity windows / ticket lifetimes / QUIC key-update guidance.*
 - **TLS panic-strategy host unit tests** — crates with `-Cpanic=abort` deps can't host-test; coverage currently lives in bare-metal integration tests. *Trigger: when an integration test catches something a host unit test would have caught faster.*
 - **Cooperative-drain shutdown** — today's shutdown force-aborts in-flight handlers (peer sees RST mid-response); add a bounded cooperative drain phase. *Trigger: long-running RPCs, or QUIC clean CONNECTION_CLOSE.*
-- **Lift `tcp` / `udp` above `executor`** — make L4 an app-space library (swap in smoltcp / custom congestion control). The vtable seam already exists; "lift, don't refactor." Closely tied to the NIC/reactor backend-trait migration in [`stack-architecture.md`](stack-architecture.md). *Trigger: QUIC wants to share `tcp`'s per-core scaffolding, or a consumer wants to swap L4.*
+- **Lift `tcp` / `udp` above `executor`** — make L4 an app-space library (swap in smoltcp / custom congestion control). The vtable seam already exists; "lift, don't refactor." Closely tied to the NIC/reactor backend-trait migration and the **shared TCP+QUIC congestion core** (the `CongestionControl` trait that lets CUBIC/BBR + pacing be written once) in [`stack-architecture.md`](stack-architecture.md). *Trigger: QUIC wants to share `tcp`'s per-core scaffolding or needs its RFC 9002 controller, or a consumer wants to swap L4.*
 - **Hermit pivot option** — target `x86_64-unknown-hermit` + build-std to unlock libstd (quinn-proto unchanged). Spiked (~16 syscalls, ~1–2 days of shim); parked in favour of the own-QUIC path. *Trigger: an ecosystem wall that requires std, or the own-QUIC work stalls.*
 - **macOS delayed-ACK regression check** — immediate-ACK shipped (fixed a GCP KVM handshake stall); only re-add a timer-based ACK coalescer if the macOS ~250 ms keep-alive p99 resurfaces. *Trigger: HVF `health_max` shows that p99.*
 - **Work stealing (2d)** and **perf regression tests (2h)** — parked Phase-2 items → see `design-history.md` Phase 2.
