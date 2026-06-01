@@ -5,7 +5,7 @@ use core::ptr;
 use kernel_bare::mmu::map_device_range;
 
 use crate::pci::{
-    enable_bus_mastering_inner, find_device, pci_device, read_bar64, read_config, write_config,
+    enable_bus_mastering_inner, find_device, pci_device, read_bar64, read_config,
 };
 use crate::{
     dsb_ld, dsb_st, mmio_read8, mmio_read16, mmio_read32, mmio_write8, mmio_write16, mmio_write32,
@@ -355,17 +355,10 @@ pub fn vpci_msix_enable(dev: &VirtioPciDevice, enable: bool) {
     if dev.msix_cap_off == 0 {
         return;
     }
-    let pci = pci_device(dev.pci_idx);
-    let cap = dev.msix_cap_off;
-    let word = read_config(pci.bus, pci.slot, pci.func, cap);
-    let mc = ((word >> 16) & 0xFFFF) as u16;
-    let new_mc: u16 = if enable {
-        (mc | 0x8000) & !0x4000 // set Enable, clear FuncMask
-    } else {
-        mc & !0x8000
-    };
-    let new_word = (word & 0x0000_FFFF) | ((new_mc as u32) << 16);
-    write_config(pci.bus, pci.slot, pci.func, cap, new_word);
+    // Adapt the virtio-PCI device to the generic PCI MSI-X helper — one
+    // source of truth for the message-control Enable/FuncMask
+    // manipulation (the gve path uses the same `pci::msix_enable`).
+    crate::pci::msix_enable(&pci_device(dev.pci_idx), dev.msix_cap_off, enable);
 }
 
 /// Program one MSI-X table entry: address, data, and mask bit.
@@ -380,13 +373,10 @@ pub fn vpci_msix_write_entry(
     if dev.msix_table == 0 || entry >= dev.msix_table_size {
         return;
     }
-    let slot = dev.msix_table + (entry as u64) * 16;
-    unsafe {
-        mmio_write32(slot, addr as u32);
-        mmio_write32(slot + 4, (addr >> 32) as u32);
-        mmio_write32(slot + 8, data);
-        mmio_write32(slot + 12, if masked { 1 } else { 0 });
-    }
+    // SAFETY: bounds-checked above; `dev.msix_table` is the mapped table
+    // base discovered at probe. Delegate to the generic PCI helper (same
+    // entry-write the gve path uses).
+    unsafe { crate::pci::msix_write_entry(dev.msix_table, entry, addr, data, masked) };
 }
 
 // ============================================================================
