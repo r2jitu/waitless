@@ -346,9 +346,9 @@ pub(crate) fn quic_stats_response() -> Response {
 pub(crate) fn obs_response() -> Response {
     // 16 KiB covers all subsystem blocks (QUIC counters + snapshots
     // + latency histograms, plus tcp / udp / nic / tls / http /
-    // http3 / runtime / kernel / net), the NIC per-qp distribution
-    // arrays, and the per-core event-loop block, with margin. Slow
-    // path, so the reservation is free.
+    // http2 / http3 / runtime / kernel / net), the NIC per-qp
+    // distribution arrays, and the per-core event-loop block, with
+    // margin. Slow path, so the reservation is free.
     let mut body = http::body_iobuf(16384);
     {
         let mut w = body.writer();
@@ -364,6 +364,8 @@ pub(crate) fn obs_response() -> Response {
         let _ = tls::diag::write_obs_json(&mut w);
         let _ = w.write_str(",\"http\":");
         let _ = http::diag::write_obs_json(&mut w);
+        let _ = w.write_str(",\"http2\":");
+        let _ = http2::diag::write_obs_json(&mut w);
         let _ = w.write_str(",\"http3\":");
         let _ = http3::diag::write_obs_json(&mut w);
         let _ = w.write_str(",\"runtime\":");

@@ -1,34 +1,57 @@
 # HTTP/2 — build plan + hardening backlog
 
-Last updated 2026-05-31. **Status: not started.** HTTP/2 is not yet
-implemented; this doc is the build companion (what to remix, what to
-scope into the first session) and the tracker for the conformance /
-interop / security tail that the build will generate.
+Last updated 2026-06-01. **Status: happy path landed.** Server-role
+HTTP/2 is implemented in `crates/proto/http2` and selected by ALPN over
+the existing TLS/TCP path; real `curl --http2` and browsers negotiate
+`h2` and multiplex the test page's assets (validated by the HVF
+integration test: `test_h2_curl_get`, `test_h2_curl_multiplexed_pages`,
+`test_https_alpn_prefers_h2`, `test_https_alpn_http11_fallback`). HTTP/1.1
+remains the golden path and the ALPN fallback; H3 is untouched. The
+remaining P1–P2 conformance / interop tail (and the deferred DoS
+rate-limits) is tracked below.
 
 For *why* H2 (the first-visit/TCP-path multiplexing win, the H3 fallback
 that keeps multiplexing) and *how it relates to H1.1/H3* see the strategic
 notes in [`roadmap.md`](roadmap.md). H2 does **not** supersede H1.1 — they
 coexist, selected per-connection by ALPN.
 
-## Crate structure (decided)
+## Crate structure (built)
 
-- New crate **`crates/proto/http2`**, mirroring `proto/http3`. Depends on
-  `proto/http` (the transport-agnostic shared HTTP core — Request /
-  Response / BodyReader / handler API) and is **generic over the byte
-  stream**, so it needs *no* tls/tcp dep (exactly like `proto/http`'s
-  `serve_conn`).
-- **Do not merge** h1/h2/h3 into one `http` lib: it would have to depend
-  on `proto/quic` (for h3) and all transports, so every consumer of plain
-  H1.1 would transitively pull QUIC/UDP — undoing the transport
-  separation. The shared semantics are already shared via `proto/http`
-  *without* that coupling.
-- Extract `proto/http3/src/huffman.rs` into a small shared leaf crate
-  (e.g. `proto/field-huffman`); both `http2` (HPACK) and `http3` (QPACK)
-  depend on it — the RFC 7541 Huffman table is identical. The static
-  tables differ (HPACK 61 entries vs QPACK 99) and stay per-crate.
-- `proto/tls` gains a dep on `proto/http2` and dispatches on the
-  negotiated ALPN at `proto/tls/src/lib.rs` (the `http::serve_conn` call):
-  `"h2"` → `http2::serve_conn`, else `http::serve_conn`.
+- New crate **`crates/proto/http2`** (`lib.rs` / `frame.rs` / `hpack.rs`
+  / `static_table.rs` / `server.rs` / `diag.rs`), mirroring `proto/http3`.
+  Depends on `proto/http` (the transport-agnostic shared HTTP core) and is
+  **generic over the byte stream** (`http::HttpStream`), so it carries
+  *no* tls/tcp/quic dep — exactly like `proto/http`'s `serve_conn`.
+- **Did not merge** h1/h2/h3 into one `http` lib (it would pull
+  `proto/quic` + all transports into every plain-H1.1 consumer). The
+  shared semantics ride `proto/http` without that coupling.
+- Extracted `proto/http3/src/huffman.rs` into the shared leaf crate
+  **`crates/proto/field-huffman`** (`crate_name = field_huffman`); both
+  `http2` (HPACK) and `http3` (QPACK) depend on it — the RFC 7541 Huffman
+  table is identical. `http3/src/huffman.rs` is now a thin re-export so
+  existing `crate::huffman::…` call sites are unchanged. The static tables
+  differ (HPACK 61 entries vs QPACK 99) and stay per-crate.
+- **The listener + ALPN dispatch live in a new `crates/proto/https`
+  crate, not in `proto/tls`.** The first cut buried the dispatch in
+  `proto/tls` (the backlog's original `"h2" → http2::serve_conn` at
+  `proto/tls/src/lib.rs`), but that made `tls` depend on `http`/`http2`
+  — and there's no h3-style opt-out when h2 is welded into the TLS crate.
+  Instead, `proto/tls` is now **pure TLS** (sans-io state machine +
+  record/handshake/AEAD; *no* `http`/`http2`/`worker` deps), and the new
+  `proto/https` crate owns the `TlsStream: HttpStream` adapter, the
+  per-worker conn pool, `https::listen`, and the dispatch:
+  `drive_handshake` → read `AlpnProtocol` (set in `tls`'s
+  `do_client_hello`) → `H2` ⇒ `http2::serve_conn`, else
+  `http::serve_conn`. This mirrors `proto/http3` being its own listener
+  over `proto/quic` — the composition of {transport, HTTP versions} lives
+  one layer above the pure protocol crates. The listen family reads
+  cleanly: `http::listen` (H1.1/TCP), `https::listen` (H1.1+H2/TLS, ALPN),
+  `http3::listen` (H3/QUIC).
+- ALPN selection is **server-preference** (`h2` over `http/1.1`); a client
+  that offers no `h2` still gets `http/1.1` — the fallback the golden path
+  depends on. `tls` exposes the negotiated `AlpnProtocol` + `is_established`
+  / `is_terminated` so the `https` dispatch can drive the handshake and
+  branch without reaching into TLS internals.
 
 ## Reuse map (don't reinvent)
 
@@ -40,57 +63,119 @@ coexist, selected per-connection by ALPN.
 | ALPN negotiation | `proto/tls/src/handlers.rs` (~line 249) — already negotiates ALPN, selects `http/1.1` today; add `"h2"` and surface the choice to the serve dispatch |
 | Per-conn async task + multiplexing pattern | the h3 server's stream-dispatch shape (`proto/http3/src/server.rs`) |
 
-## Build scope — first session (happy path)
+## Build scope — first session (happy path) — DONE
 
 A working server-role H2 that real `curl --http2` and a browser use:
 
-- **HPACK** encode/decode (reuse shared Huffman; static table; a basic
-  dynamic table). The decoder is correctness-critical.
-- **Frame codec**: SETTINGS, HEADERS, DATA, WINDOW_UPDATE, RST_STREAM,
-  GOAWAY, PING (parse CONTINUATION).
-- **Connection preface** + SETTINGS exchange.
-- **Multiplexing serve loop over one stream**: per-stream state, **connection-
-  and stream-level flow control** (this is the hard part QUIC gave H3 for
-  free), interleaved responses, N concurrent streams mapped onto the
-  executor.
-- Wire each stream's request + body to the `proto/http` handler API
-  (`BodyReader` over DATA frames + the stream's flow-control window).
-- **ALPN dispatch** in `proto/tls`.
+- [x] **HPACK** encode/decode (`hpack.rs`): shared Huffman, 61-entry
+  static table, full dynamic-table **decoder** (insert / evict /
+  size-update — the correctness-critical half, exercised by the RFC 7541
+  §C.3 first/second-request vectors); stateless **encoder** (static-indexed
+  + literal-without-indexing, H=0, names lowercased — never uses a dynamic
+  table, the same simplification QPACK makes).
+- [x] **Frame codec** (`frame.rs`): the 9-byte header + SETTINGS, HEADERS,
+  DATA, WINDOW_UPDATE, RST_STREAM, GOAWAY, PING, PRIORITY (parse-and-ignore),
+  CONTINUATION assembly.
+- [x] **Connection preface** + SETTINGS exchange (server SETTINGS first,
+  client 24-byte magic validated, SETTINGS ACK).
+- [x] **Multiplexing serve loop** (`server.rs`): per-stream assembly,
+  **connection- and stream-level flow control** (the `min(stream_window,
+  conn_window)` discipline, stacked on TCP's own window), responses
+  interleaved by a single cooperative writer (`next_output_frame` draining
+  the out-queue + WINDOW_UPDATE-driven re-flush — the design favoured over
+  a task per stream).
+- [x] Wire each stream's request + body to the `proto/http` handler API.
+  Request bodies are **buffered** before dispatch and served via a prebuf
+  `BodyReader` (matching the h3 server); streaming request bodies through
+  `BodyReader` over live DATA frames is a tail item (see H2-10).
+- [x] **ALPN dispatch** in `proto/tls`.
 
 ## Hardening backlog (the tail — track here as found)
 
 ### Security / DoS — required before any public deploy (P0)
 
 HTTP/2's framing opens DoS vectors that H1.1 doesn't have; a public
-server **must** bound them. None are noted elsewhere yet.
+server **must** bound them. The cheap caps that fell out of the build
+landed this session; the rate-limit-flood guard is still open.
 
-- **H2-1 — Rapid Reset (CVE-2023-44487).** A client opens streams and
-  immediately RST_STREAMs them, forcing unbounded server work per RTT.
-  Cap the rate of resets / concurrent-stream churn; count canceled
-  streams against `SETTINGS_MAX_CONCURRENT_STREAMS`.
-- **H2-2 — HPACK bomb / decompression ratio.** A small compressed header
-  block can expand hugely. Bound decoded header-list size
-  (`SETTINGS_MAX_HEADER_LIST_SIZE`) and total dynamic-table memory.
+- [x] **H2-1 — Rapid Reset (CVE-2023-44487).** Cumulative RST_STREAM
+  count per connection; past `RST_FLOOD_CAP` (200) the connection is torn
+  down with `GOAWAY(ENHANCE_YOUR_CALM)`. *Partial* — a cumulative cap, not
+  yet a rate/ratio over time; revisit alongside H2-3.
+- [x] **H2-2 — HPACK bomb / decompression ratio.** The decoder enforces
+  `SETTINGS_MAX_HEADER_LIST_SIZE` (64 KiB) on the decompressed list and
+  bounds the dynamic table at the advertised `SETTINGS_HEADER_TABLE_SIZE`
+  (4 KiB).
 - **H2-3 — Frame floods.** SETTINGS flood, PING flood, empty-DATA flood,
-  WINDOW_UPDATE flood, 0-length-HEADERS flood. Rate-limit / cap
-  outstanding control frames; bound per-connection memory.
-- **H2-4 — `MAX_CONCURRENT_STREAMS` enforcement.** Advertise and enforce
-  a sane cap so one connection can't exhaust per-conn memory.
+  WINDOW_UPDATE flood, 0-length-HEADERS flood. **Still open:** no
+  rate-limit on control frames yet (we ACK/answer each as it arrives).
+  Bound outstanding control frames / per-RTT churn. The CONTINUATION-flood
+  half is covered by `HEADER_BLOCK_CAP` (see H2-5).
+- [x] **H2-4 — `MAX_CONCURRENT_STREAMS` enforcement.** Advertised (100)
+  and enforced — a new stream past `active_count()` (pending bodies +
+  in-flight responses) is refused with `RST_STREAM(REFUSED_STREAM)`.
 
 ### Conformance / interop (P1–P2)
 
-- **H2-5 — CONTINUATION handling.** Header blocks split across
-  CONTINUATION frames; the "CONTINUATION flood" (CVE-2024-27316) is a
-  related DoS — bound total header-block bytes before completion.
-- **H2-6 — Full SETTINGS surface.** Honor peer `INITIAL_WINDOW_SIZE`,
-  `MAX_FRAME_SIZE`, `HEADER_TABLE_SIZE`, `MAX_HEADER_LIST_SIZE`; apply
-  `INITIAL_WINDOW_SIZE` retroactively to open streams (the tricky one).
-- **H2-7 — HPACK dynamic-table eviction subtleties** — size accounting
-  (entry overhead = 32 bytes/entry, RFC 7541 §4.1), eviction on resize.
-- **H2-8 — Error handling completeness** — connection vs stream errors,
-  the right `GOAWAY` / `RST_STREAM` error codes (RFC 7540 §7), `last-
-  stream-id` on GOAWAY for clean drain.
+- [x] **H2-5 — CONTINUATION handling.** Header blocks split across
+  CONTINUATION frames are assembled (`header_asm`), interleaving is
+  rejected (only CONTINUATION on the same stream may follow a HEADERS
+  without END_HEADERS), and the "CONTINUATION flood" (CVE-2024-27316) is
+  bounded by `HEADER_BLOCK_CAP` (64 KiB) on the accumulated block.
+- **H2-6 — Full SETTINGS surface.** *Partial.* We honor peer
+  `INITIAL_WINDOW_SIZE` (for new streams), `MAX_FRAME_SIZE` (caps DATA we
+  emit), and validate `ENABLE_PUSH`/`MAX_FRAME_SIZE` ranges. **Still open:**
+  applying a mid-connection `INITIAL_WINDOW_SIZE` change **retroactively**
+  to already-open streams' send windows (RFC 7540 §6.9.2 — the tricky
+  one; peers send it before opening streams in practice, so it's low-risk
+  but non-conformant). `HEADER_TABLE_SIZE`/`MAX_HEADER_LIST_SIZE` from the
+  peer bound *our* encoder, which uses no dynamic table and emits tiny
+  header blocks, so nothing to honor there.
+- [x] **H2-7 — HPACK dynamic-table eviction.** Entry overhead = 32 B/entry
+  (RFC 7541 §4.1), eviction on insert and on size-update, table-clear when
+  a single entry exceeds the max — implemented + unit-tested.
+- **H2-8 — Error handling completeness.** *Partial.* Connection errors
+  emit `GOAWAY(code, last-stream-id)`; stream errors emit `RST_STREAM` with
+  a code (PROTOCOL_ERROR / REFUSED_STREAM / FLOW_CONTROL_ERROR /
+  ENHANCE_YOUR_CALM). **Open:** a full audit of RFC 7540 §7 code choices,
+  graceful two-GOAWAY drain, and malformed-request edge cases (we do a
+  minimal pseudo-header check — response pseudo / unknown pseudo →
+  RST_STREAM — but not the full §8.1.2 validation).
 - **H2-9 — h2spec.** Run the h2spec conformance suite; track failures here.
+  Not yet run.
+
+### Tail items discovered during the build
+
+- **H2-10 — Streaming request bodies.** Request DATA frames are buffered
+  whole (capped at `MAX_BODY` = 256 KiB; larger → `RST_STREAM`) and handed
+  to the handler via a prebuf `BodyReader`, mirroring the h3 server. A body
+  past the cap is rejected rather than streamed. Streaming through
+  `BodyReader` over live DATA frames (so an arbitrarily large upload flows
+  without buffering) needs the same `recv_chunk`-style plumbing the h3
+  streaming-body follow-up wants — defer with it.
+- **H2-11 — Zero-copy DATA framing.** `next_output_frame` copies each
+  outbound DATA frame's payload out of the response `IOBufChain` into a
+  fresh `Vec` (bounded by `MAX_FRAME_SIZE` per frame). Correct and
+  modest-cost on the happy path, but it forfeits the zero-copy TX the H1.1
+  path has. Frame each DATA directly from the chain's IOBufs (a header
+  IOBuf + a narrowed body view) once the perf matters. One `stream.send`
+  per frame is also a batching opportunity.
+- **H2-12 — Pre-dispatch WINDOW_UPDATE.** A WINDOW_UPDATE that arrives for
+  a stream before its response is queued (no `StreamOut` yet) is dropped.
+  Harmless for the request/response shape (clients grow the window in
+  response to our DATA), but it should be stashed and applied at dispatch.
+- **H2-13 — True concurrent handlers.** Handlers run **inline** when a
+  stream completes — correct multiplexing at the frame layer (many streams
+  on one connection, interleaved responses), but a slow handler stalls the
+  whole connection rather than yielding to sibling streams. The single
+  cooperative writer is in place; running handlers concurrently on the
+  executor (and feeding their outputs into the same writer) is the next
+  step toward the backlog's "N streams mapped onto the executor".
+- **H2-14 — Connection receive-window enforcement.** We replenish the
+  connection/stream receive windows (WINDOW_UPDATE crediting consumed
+  bytes) but don't strictly track-and-reject a peer that overruns our
+  advertised window. A conformant peer never does; strict enforcement is a
+  hardening item.
 
 ### Deferred by design / non-goals
 

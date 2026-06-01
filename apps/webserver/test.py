@@ -209,30 +209,132 @@ class WebserverServiceTest(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertIn(b"Not Found", body)
 
-    def test_https_alpn_http11(self) -> None:
-        """ClientHello with ALPN `h2,http/1.1` must get
-        EncryptedExtensions echoing `http/1.1`. Without the echo,
-        modern Chrome refuses to fall back to a no-ALPN ServerHello
-        and surfaces ERR_SSL_PROTOCOL_ERROR — even though Python's
-        `ssl` module and openssl tolerate the omission and proceed
-        on HTTP/1.1 anyway. Hardcoded `b"http/1.1"` here is the
-        only protocol our HTTPS path supports; the H3/QUIC stack
-        echoes `h3` independently in `waitless-quic`."""
-        if not DEV_CERT.is_file():
-            self.skipTest("dev_cert.pem missing from runfiles")
+    def _alpn_select(self, offered: list[str]) -> str | None:
+        """Run a TLS handshake offering `offered` and return the
+        protocol the server selected via ALPN (or None)."""
         ctx = ssl.create_default_context(cafile=str(DEV_CERT))
-        ctx.set_alpn_protocols(["h2", "http/1.1"])
+        ctx.set_alpn_protocols(offered)
         sock = socket.create_connection(("127.0.0.1", TLS_PORT), timeout=5.0)
         try:
             with ctx.wrap_socket(sock, server_hostname="waitless.local") as ssock:
-                self.assertEqual(
-                    ssock.selected_alpn_protocol(),
-                    "http/1.1",
-                    "server didn't echo http/1.1 ALPN — "
-                    "Chrome will reject this with ERR_SSL_PROTOCOL_ERROR",
-                )
+                return ssock.selected_alpn_protocol()
         finally:
             sock.close()
+
+    def test_https_alpn_prefers_h2(self) -> None:
+        """A ClientHello offering `h2,http/1.1` must negotiate `h2`
+        (server preference). The server echoes the selected name in
+        EncryptedExtensions; modern Chrome rejects a missing-ALPN
+        ServerHello with ERR_SSL_PROTOCOL_ERROR, so the echo must be
+        present. Python's `ssl` does the negotiation but doesn't speak
+        h2 itself — this checks the negotiated string only."""
+        if not DEV_CERT.is_file():
+            self.skipTest("dev_cert.pem missing from runfiles")
+        self.assertEqual(
+            self._alpn_select(["h2", "http/1.1"]),
+            "h2",
+            "server should prefer h2 when the client offers it",
+        )
+
+    def test_https_alpn_http11_fallback(self) -> None:
+        """A client offering only `http/1.1` (no h2) must still get
+        `http/1.1` — the fallback the golden path depends on must stay
+        intact now that h2 is additive."""
+        if not DEV_CERT.is_file():
+            self.skipTest("dev_cert.pem missing from runfiles")
+        self.assertEqual(
+            self._alpn_select(["http/1.1"]),
+            "http/1.1",
+            "http/1.1-only clients must still negotiate http/1.1",
+        )
+
+    def test_h2_curl_get(self) -> None:
+        """End-to-end HTTP/2: `curl --http2` negotiates h2 via ALPN and
+        gets a real response over the multiplexed connection. Exercises
+        the full new stack — TLS ALPN dispatch → HPACK decode → frame
+        codec → flow-controlled response framing → HPACK encode. Skips
+        if the local curl lacks HTTP/2 support."""
+        if not DEV_CERT.is_file():
+            self.skipTest("dev_cert.pem missing from runfiles")
+        try:
+            ver = subprocess.run(
+                ["curl", "-V"], capture_output=True, timeout=10
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest("curl not available")
+        if b"HTTP2" not in ver and b"http2" not in ver:
+            self.skipTest("local curl lacks HTTP/2 support")
+        # `--http2` over TLS uses ALPN; `-w` prints the negotiated
+        # version curl actually used so we can assert on it.
+        proc = subprocess.run(
+            [
+                "curl",
+                "-s",
+                "--http2",
+                "--cacert",
+                str(DEV_CERT),
+                "--resolve",
+                f"waitless.local:{TLS_PORT}:127.0.0.1",
+                "-o",
+                "-",
+                "-w",
+                "\n__HTTP_VERSION__:%{http_version}\n",
+                f"https://waitless.local:{TLS_PORT}/health",
+            ],
+            capture_output=True,
+            timeout=15,
+        )
+        out = proc.stdout
+        self.assertIn(
+            b"__HTTP_VERSION__:2",
+            out,
+            f"curl didn't use HTTP/2 (stderr={proc.stderr[:200]!r}, out={out[:200]!r})",
+        )
+        self.assertIn(b"status", out, f"missing /health body over h2: {out[:200]!r}")
+
+    def test_h2_curl_multiplexed_pages(self) -> None:
+        """Fetch several shell pages over a single h2 connection in one
+        curl invocation (`--http2` + multiple URLs reuse the connection
+        and multiplex the streams). Each must return a full HTML body —
+        guards response framing / HPACK encode / interleaving across
+        streams on the same connection."""
+        if not DEV_CERT.is_file():
+            self.skipTest("dev_cert.pem missing from runfiles")
+        try:
+            ver = subprocess.run(
+                ["curl", "-V"], capture_output=True, timeout=10
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest("curl not available")
+        if b"HTTP2" not in ver and b"http2" not in ver:
+            self.skipTest("local curl lacks HTTP/2 support")
+        urls = [f"https://waitless.local:{TLS_PORT}{p}" for p, _, _ in self.SHELL_PAGES]
+        proc = subprocess.run(
+            [
+                "curl",
+                "-s",
+                "--http2",
+                "--cacert",
+                str(DEV_CERT),
+                "--resolve",
+                f"waitless.local:{TLS_PORT}:127.0.0.1",
+                "--parallel",
+                "--parallel-immediate",
+                *urls,
+            ],
+            capture_output=True,
+            timeout=20,
+        )
+        out = proc.stdout
+        n_doctype = out.count(b"<!DOCTYPE html>")
+        n_close = out.count(b"</html>")
+        self.assertEqual(
+            n_doctype,
+            len(urls),
+            f"expected {len(urls)} full HTML pages over h2, got {n_doctype} "
+            f"(stderr={proc.stderr[:200]!r})",
+        )
+        self.assertEqual(n_close, len(urls), "some h2 page bodies were truncated")
 
     def test_https_session_resumption(self) -> None:
         """Verify TLS 1.3 session resumption end-to-end.

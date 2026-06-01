@@ -31,7 +31,7 @@ crates/
                +  shared package: types, checksum, from_bytes, ethernet,
                   ethernet_send, arp, ipv4, ipv6, icmpv6, ndp, mac_resolve,
                   ipv6_send, classify, udp, dhcp
-  proto/       tls/  quic/  http/  http3/
+  proto/       tls/  quic/  http/  http2/  http3/  https/  field-huffman/
   waitless/    macros/  net/  backend/        (waitless is the facade and
                                                 the parent of its
                                                 three satellites)
@@ -193,16 +193,26 @@ external `@crates//:...` deps are omitted for readability.
 
 | Crate | Tier | Deps |
 | --- | --- | --- |
+| `field-huffman` | leaf | `alloc` only — the shared RFC 7541 Huffman codec used by both `http2` (HPACK) and `http3` (QPACK) |
 | `http` | 10 | `waitless`, `iobuf`, `worker`, `obs` |
-| `tls` | 11 | `waitless`, `waitless_aes_gcm`, `http`, `iobuf`, `worker`, `obs`; on `os:none` also `kernel_bare` |
+| `tls` | 11 | `waitless`, `waitless_aes_gcm`, `iobuf`, `obs`; on `os:none` also `kernel_bare` — **pure TLS, no `http`/`http2` dep** |
+| `http2` | 11 | `waitless`, `http`, `field-huffman`, `obs` |
 | `quic` | 12 | `waitless`, `iobuf`, `nic_api`, `executor`, `tls`, `obs` |
-| `http3` | 13 | `waitless`, `http`, `quic`, `obs` |
+| `http3` | 13 | `waitless`, `http`, `quic`, `field-huffman`, `obs` |
+| `https` | 13 | `waitless`, `http`, `http2`, `tls`, `iobuf`, `worker` — the HTTPS server: TLS-over-TCP + ALPN dispatch to H1.1/H2 |
+
+`https` is the composition layer: it owns the `TlsStream: HttpStream`
+adapter and `https::listen`, picking `http::serve_conn` vs
+`http2::serve_conn` per connection by ALPN. Keeping it separate is what
+lets `tls` stay a pure protocol crate (the same reason `http3` is its own
+listener over `quic` rather than folding into `tls`).
 
 ### Tier 14 — boot entries + apps
 
 `crates/boot/entry` consumes the kernel, drivers, net stack, and `waitless`
 to assemble the bare-metal entrypoint. Apps under `apps/` depend on
-`waitless` plus the protocols they choose (`http`, `tls`, `quic`, `http3`).
+`waitless` plus the protocols they choose (`http`, `https`, `quic`,
+`http3`; `tls` directly only for crypto KATs / diagnostics).
 
 ## Three architectural cuts worth understanding
 
