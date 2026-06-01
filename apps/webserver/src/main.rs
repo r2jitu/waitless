@@ -171,133 +171,37 @@ async fn init() {
     http::listen(HTTP_PORT, handle_request).expect("http bind");
     waitless::println!("listen tcp://:{} (http)", HTTP_PORT);
 
-    let h3_up = match http3::listen(
-        HTTPS_PORT,
-        handle_request_h3,
-        TLS_CERT_CHAIN,
-        TLS_KEY_PKCS8_DER,
-    ) {
-        Ok(()) => {
-            waitless::println!("listen udp://:{} (h3, TLS_AES_128_GCM_SHA256)", HTTPS_PORT);
-            true
-        }
-        Err(_) => {
-            waitless::println!("[WARN] h3 disabled (cert/key invalid or bind failed)");
-            false
-        }
-    };
-
-    // Alt-Svc advertisement is app-side: when h3 is up we attach
-    // `Alt-Svc: h3=":<port>"; ma=86400` to every HTTPS response
-    // inside `handle_request_https`. The cached value is
-    // installed once here at boot — see `install_alt_svc_for_h3`.
-    // Apps that don't run h3 leave the cache pointer null and
-    // pay nothing per HTTPS response.
-    if h3_up {
-        install_alt_svc_for_h3(HTTPS_PORT);
-    }
-    match http2::listen(
-        HTTPS_PORT,
-        handle_request_https,
-        TLS_CERT_CHAIN,
-        TLS_KEY_PKCS8_DER,
-    ) {
+    // One call brings up all of HTTPS: h1.1 + h2 over TLS/TCP and h3
+    // over QUIC/UDP on the same port, with the `Alt-Svc` h3
+    // advertisement wired automatically. `Site` routes every transport
+    // through the shared `handle_request`. h3 is best-effort inside
+    // `serve` — the TCP server still comes up if the UDP bind fails.
+    match https::serve(HTTPS_PORT, Site, TLS_CERT_CHAIN, TLS_KEY_PKCS8_DER) {
         Ok(()) => waitless::println!(
-            "listen tcp://:{} (https h1.1+h2, TLS_AES_128_GCM_SHA256)",
+            "listen :{} (https — h1.1+h2/TLS + h3/QUIC, TLS_AES_128_GCM_SHA256)",
             HTTPS_PORT
         ),
         Err(_) => waitless::println!("[WARN] https disabled (cert/key invalid)"),
     }
 }
 
-/// `Alt-Svc` value cached as `&'static [u8]` once at boot when
-/// the H3 listener comes up. Pre-migration the per-response
-/// `format_alt_svc_value(req.host_port())` was allocating a
-/// fresh `Vec<u8>` AND reparsing the Host header AND a fresh
-/// `Bytes::Owned` per HTTPS request — measurable on
-/// `health_tls_max`. Lifting it to a one-shot install at boot
-/// turns the per-request work into a single Acquire load + a
-/// `Cow::Borrowed` construction.
-///
-/// Null when the H3 listener didn't come up (cert/key invalid,
-/// UDP bind failed, etc.) — `handle_request_https` checks for
-/// null and skips the header. The pre-existing `H3_UP` atomic
-/// flag is gone; this pointer-or-null serves both purposes.
-///
-/// The pointer-len pair is published with Release / read with
-/// Acquire to pair with `install_alt_svc_for_h3`'s store.
-static ALT_SVC_PTR: core::sync::atomic::AtomicPtr<u8> =
-    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-static ALT_SVC_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Routes every HTTPS transport — h1.1 + h2 over TLS, h3 over QUIC —
+/// through the shared `handle_request`. The `https::Service` trait's
+/// generic `handle` is what lets one value serve all transports: the
+/// TCP path monomorphizes it over `TlsStream`, the QUIC path over
+/// `NullStream`. The `Alt-Svc` header advertising h3 is added by
+/// `https::serve`, so the handler itself stays transport-oblivious.
+#[derive(Clone, Copy)]
+struct Site;
 
-fn install_alt_svc_for_h3(port: u16) {
-    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(32);
-    buf.extend_from_slice(b"h3=\":");
-    let mut tmp = [0u8; 5];
-    let mut n = port;
-    let mut len = 0usize;
-    if n == 0 {
-        tmp[0] = b'0';
-        len = 1;
-    } else {
-        while n > 0 {
-            tmp[len] = b'0' + (n % 10) as u8;
-            n /= 10;
-            len += 1;
-        }
-        tmp[..len].reverse();
+impl https::Service for Site {
+    async fn handle<S: http::HttpStream>(
+        &self,
+        req: &Request,
+        body: &mut http::BodyReader<'_, S>,
+    ) -> Response {
+        handle_request(req, body).await
     }
-    buf.extend_from_slice(&tmp[..len]);
-    buf.extend_from_slice(b"\"; ma=86400");
-    let leaked: &'static [u8] = alloc::boxed::Box::leak(buf.into_boxed_slice());
-    ALT_SVC_LEN.store(leaked.len(), core::sync::atomic::Ordering::Relaxed);
-    ALT_SVC_PTR.store(
-        leaked.as_ptr() as *mut u8,
-        core::sync::atomic::Ordering::Release,
-    );
-}
-
-#[inline]
-fn alt_svc_value() -> Option<&'static [u8]> {
-    let ptr = ALT_SVC_PTR.load(core::sync::atomic::Ordering::Acquire);
-    if ptr.is_null() {
-        return None;
-    }
-    let len = ALT_SVC_LEN.load(core::sync::atomic::Ordering::Relaxed);
-    // SAFETY: `ptr` was published from a `Box::leak` of a
-    // `Box<[u8]>`, which has 'static lifetime. The Acquire load
-    // pairs with the Release store in `install_alt_svc_for_h3`.
-    // Length matches the slice length at install time and isn't
-    // mutated after.
-    Some(unsafe { core::slice::from_raw_parts(ptr, len) })
-}
-
-/// HTTPS-specific dispatch. Calls into the shared
-/// `handle_request` (used by both HTTPS and H3 paths) and, when
-/// the H3 listener is up, layers a cached `Alt-Svc` header onto
-/// the response.
-async fn handle_request_https<S: http::HttpStream>(
-    req: &Request,
-    body: &mut http::BodyReader<'_, S>,
-) -> Response {
-    let resp = handle_request(req, body).await;
-    match alt_svc_value() {
-        Some(v) => resp.with_header(&b"Alt-Svc"[..], v),
-        None => resp,
-    }
-}
-
-/// H3-side request dispatch. Takes an owned `Request` (h3's
-/// signature, since the QUIC stream is moved into the per-request
-/// future) and the buffered body. The `user_handler_polled`
-/// diag-counter bump matches the `user_handler_invoked` counter
-/// the H3 server records BEFORE `handler(...).await`; a gap
-/// between them means the future was constructed but never
-/// polled, which would be a runtime/scheduler bug rather than
-/// handler-internal work.
-async fn handle_request_h3(req: Request, body: &mut http::BufferedBody<'_>) -> Response {
-    http3::diag::COUNTERS.user_handler_polled.bump();
-    handle_request(&req, body).await
 }
 
 // ---- Listener bodies --------------------------------------------------------

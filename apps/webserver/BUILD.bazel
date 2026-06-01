@@ -77,10 +77,12 @@ rust_library(
     },
     deps = [
         "//crates/proto/http",
-        # The HTTP/2-over-TLS server (h2 + h1.1 fallback). Also surfaces
-        # the http2::diag block in /obs.
+        # http2 / http3 are reached transitively via `https::serve`; the
+        # direct deps are for their `diag` blocks in /obs.
         "//crates/proto/http2",
         "//crates/proto/http3",
+        # The all-transports HTTPS facade (https::serve over h2 + h3).
+        "//crates/proto/https",
         "//crates/proto/quic",
         # tls is still a direct dep for the boot-time AEAD KAT and the
         # `tls_profile_*` diagnostics endpoints.
