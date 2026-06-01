@@ -330,6 +330,20 @@ Congestion avoidance is unchanged (still the RFC 5681 `SMSS²/cwnd`
 approximation — the byte-counting CA accumulator is a separate, lower-
 value follow-up; the cold-transfer gap is entirely slow start).
 
+**GCE-validated.** A controlled single-build-line A/B on e2-small (deploy
+ABC, measure; revert *only* the `min(2·SMSS)` → `min(SMSS)` line, redeploy,
+measure — same `tc netem` path, 12 cold fresh-connection trials, median):
+
+| RTT | object | ABC | baseline | gain |
+|---|---|--:|--:|:-:|
+| 25 ms | `/static-256k` | 8.16 | 6.77 Mbps | +20 % |
+| 25 ms | `/static-1m` | 20.29 | 15.50 Mbps | +31 % |
+| 50 ms | `/static-256k` | 4.14 | 3.45 Mbps | +20 % |
+| 50 ms | `/static-1m` | 10.67 | 7.91 Mbps | +35 % |
+
+Matches the ~28 % theory (≈7 vs ≈9 slow-start RTTs for 1 MB); the larger
+`/static-1m` gain confirms the ramp compounds over more RTTs.
+
 ### L3 — No packet pacing
 
 **What.** The send path bursts a full `cwnd`/window worth of segments
