@@ -23,8 +23,7 @@ use core::ptr::addr_of_mut;
 
 use worker::{CurrentWorker, WorkerLocal};
 
-use http::{BodyReader, HttpStream, Request, Response};
-use iobuf::{IOBuf, IOBufChain};
+use http::{BodyReader, HttpStream, IOBuf, IOBufChain, Request, Response};
 use tls::record;
 use tls::server::{AlpnProtocol, TlsServer};
 use tls::TlsServerConfig;
@@ -51,8 +50,10 @@ pub enum ListenError {
 /// same `handler` serves both versions (it's generic over the byte
 /// stream via `http::HttpStream`, so no per-version adapter is needed).
 ///
-/// For HTTP/3 (over QUIC/UDP), call `http3::listen` separately;
-/// `Alt-Svc` advertising it is emitted per-response by the app.
+/// This is the TCP/TLS half only. To also serve HTTP/3 over QUIC/UDP
+/// (with `Alt-Svc` wired automatically), use the `https::serve` facade
+/// — or call `http3::listen` yourself and advertise `Alt-Svc` per
+/// response.
 pub fn listen<H>(
     port: u16,
     handler: H,

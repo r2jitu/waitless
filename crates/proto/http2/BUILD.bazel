@@ -34,7 +34,6 @@ rust_library(
         # The TLS state machine the listener drives (listen.rs only).
         "//crates/proto/tls",
         "//crates/runtime/worker",
-        "//crates/util/iobuf",
         "//crates/waitless",
     ],
 )

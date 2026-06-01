@@ -80,14 +80,6 @@ pub struct Counters {
     /// `user_handler_returned` is "stuck inside the QUIC send
     /// path" (flush_outbound, sock.send_to, etc.).
     pub write_response_completed: Counter,
-    /// First poll of the user handler future entered the closure
-    /// body (bumped synchronously inside the future before any
-    /// await). A gap from `user_handler_invoked` means the
-    /// handler future was constructed but never actually polled
-    /// — i.e. the handle_conn task is suspended somewhere
-    /// between `handler(req)` and the first `.await` poll of
-    /// the resulting future.
-    pub user_handler_polled: Counter,
 }
 
 impl Counters {
@@ -107,7 +99,6 @@ impl Counters {
             user_handler_invoked: Counter::new(),
             user_handler_returned: Counter::new(),
             write_response_completed: Counter::new(),
-            user_handler_polled: Counter::new(),
         }
     }
 }
@@ -201,7 +192,7 @@ pub fn should_log_event() -> bool {
 }
 
 /// Counter `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 15] {
+pub fn snapshot() -> [(&'static str, u64); 14] {
     let c = &COUNTERS;
     [
         ("requests_received", c.requests_received.get()),
@@ -218,7 +209,6 @@ pub fn snapshot() -> [(&'static str, u64); 15] {
         ("user_handler_invoked", c.user_handler_invoked.get()),
         ("user_handler_returned", c.user_handler_returned.get()),
         ("write_response_completed", c.write_response_completed.get()),
-        ("user_handler_polled", c.user_handler_polled.get()),
     ]
 }
 
