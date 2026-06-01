@@ -116,26 +116,37 @@ unsafe fn fill_tcp_frame_headers(
     meta: &SegmentMeta,
     dst_mac: MacAddr,
     payload_len: usize,
+    options: &[u8],
 ) {
     let tcp_off = match meta.local_ip {
         IpAddr::V4(_) => ETH_HDR_LEN + IPV4_HDR_LEN,
         IpAddr::V6(_) => ETH_HDR_LEN + IPV6_HDR_LEN,
     };
-    let tcp_seg_len = TCP_HDR_LEN + payload_len;
+    // `options` must be 4-byte aligned (the caller pads with NOPs). The
+    // payload — if any — sits *after* the options, so the segment length
+    // and data-offset both grow by the option bytes.
+    let opt_len = options.len();
+    let tcp_seg_len = TCP_HDR_LEN + opt_len + payload_len;
 
     // ── TCP header ───────────────────────────────────────────────────
-    // SAFETY: frame[tcp_off..tcp_off+TCP_HDR_LEN] is in-bounds (caller
-    // sized the buffer). `TcpHeader` is `repr(C)` POD bytes.
+    // SAFETY: frame[tcp_off..tcp_off+TCP_HDR_LEN+opt_len] is in-bounds
+    // (caller sized the buffer). `TcpHeader` is `repr(C)` POD bytes; the
+    // raw pointer doesn't borrow `frame`, so the option-write slice below
+    // (a disjoint range) is sound.
     let tcp_hdr = unsafe { &mut *(frame.as_mut_ptr().add(tcp_off) as *mut TcpHeader) };
     tcp_hdr.src_port = htons(meta.src_port);
     tcp_hdr.dst_port = htons(meta.dst_port);
     tcp_hdr.seq = htonl(meta.seq);
     tcp_hdr.ack = htonl(meta.ack);
-    tcp_hdr.data_offset = 0x50;
+    // Data-offset (high nibble) = header words = (20 + opt_len) / 4.
+    tcp_hdr.data_offset = (((TCP_HDR_LEN + opt_len) / 4) as u8) << 4;
     tcp_hdr.flags = meta.flags;
     tcp_hdr.window = htons(meta.window);
     tcp_hdr.checksum = 0;
     tcp_hdr.urgent = 0;
+    if opt_len > 0 {
+        frame[tcp_off + TCP_HDR_LEN..tcp_off + TCP_HDR_LEN + opt_len].copy_from_slice(options);
+    }
     // Stamp the pseudo-header partial sum at the TCP checksum
     // field; the driver finishes it — device CSUM offload, or a
     // software pass when the device never negotiated it.
@@ -259,12 +270,24 @@ where
 /// (a contiguous byte slice). Used by control-path callers (SYN,
 /// SYN-ACK, ACK-only, FIN, RST) and by tests.
 pub(crate) fn send_segment(meta: &SegmentMeta, payload: &[u8]) {
+    send_segment_opts(meta, payload, &[]);
+}
+
+/// As [`send_segment`] but with a TCP `options` blob (4-byte aligned)
+/// between the 20-byte header and the payload. Used for the SYN-ACK's
+/// RFC 7323 Window-Scale option. The data offset, segment length, and
+/// checksum all account for the option bytes.
+pub(crate) fn send_segment_opts(meta: &SegmentMeta, payload: &[u8], options: &[u8]) {
     let dst_mac = match mac_resolve::resolve(meta.dst_ip) {
         Some(m) => m,
         None => return, // ARP/NDP miss; TCP retransmit will retry
     };
 
-    let payload_off = payload_offset(meta.local_ip);
+    // `payload_offset` assumes a 20-byte header; the options sit there,
+    // pushing the payload `opt_len` bytes further in.
+    let opt_off = payload_offset(meta.local_ip);
+    let opt_len = options.len();
+    let payload_off = opt_off + opt_len;
     let payload_len = payload.len().min(MSS_MAX);
     let frame_len = payload_off + payload_len;
     // TCP header offset within the frame = ETH + IP. Used by the
@@ -275,7 +298,7 @@ pub(crate) fn send_segment(meta: &SegmentMeta, payload: &[u8]) {
     } as u16;
 
     build_and_send_frame(frame_len, tcp_off, |frame| unsafe {
-        // Copy payload into the frame's payload slot.
+        // Copy payload into the frame's payload slot (after the options).
         if payload_len > 0 {
             ptr::copy_nonoverlapping(
                 payload.as_ptr(),
@@ -283,7 +306,7 @@ pub(crate) fn send_segment(meta: &SegmentMeta, payload: &[u8]) {
                 payload_len,
             );
         }
-        fill_tcp_frame_headers(frame, meta, dst_mac, payload_len);
+        fill_tcp_frame_headers(frame, meta, dst_mac, payload_len, options);
     });
 }
 
@@ -337,7 +360,7 @@ fn send_super_segment_from_cursor(
     // payload_off + payload_len]` above; the header-fill below
     // writes the rest.
     unsafe {
-        fill_tcp_frame_headers(frame, meta, dst_mac, payload_len);
+        fill_tcp_frame_headers(frame, meta, dst_mac, payload_len, &[]);
     }
     // Zero the TCP checksum: with VIRTIO_NET_F_NEEDS_CSUM set,
     // the device computes the per-segment TCP checksum (the
@@ -472,7 +495,7 @@ pub fn try_send_tso(
         window: c.rx_free() as u16,
     };
     unsafe {
-        fill_tcp_frame_headers(frame, &meta, dst_mac, payload_len);
+        fill_tcp_frame_headers(frame, &meta, dst_mac, payload_len, &[]);
     }
     // Zero the TCP checksum: NEEDS_CSUM tells the device to
     // compute it per emitted segment. Same convention as
@@ -572,7 +595,7 @@ fn send_segment_from_cursor(
             debug_assert_eq!(n, payload_len);
             let _ = n;
         }
-        fill_tcp_frame_headers(frame, meta, dst_mac, payload_len);
+        fill_tcp_frame_headers(frame, meta, dst_mac, payload_len, &[]);
     })
 }
 

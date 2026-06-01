@@ -243,9 +243,22 @@ pub struct TcpConnection {
     /// the far end's free buffer space, and the receiver-side half
     /// of the RFC 5681 send window `min(cwnd, rwnd)`. Refreshed from
     /// `SEG.WND` only when the `snd_wl1`/`snd_wl2` check accepts the
-    /// segment. A raw `u16` (no RFC 7323 window scaling), so it
-    /// never exceeds 65535.
-    pub(crate) snd_wnd: u16,
+    /// segment. `u32`: with RFC 7323 window scaling the peer's window
+    /// (`SEG.WND << snd_wscale`) can far exceed 65535 — the whole point
+    /// of scaling, since a 64 KiB cap throttles a high-RTT download to
+    /// 64 KiB/RTT (~20 Mbit/s at 25 ms).
+    pub(crate) snd_wnd: u32,
+    /// RFC 7323 window scale for the *peer's* advertised window. When
+    /// `wscale_ok`, an inbound `SEG.WND` is left-shifted by this to get
+    /// the real `snd_wnd`. Parsed from the SYN's Window-Scale option,
+    /// capped at 14. 0 (with `wscale_ok == false`) when the peer didn't
+    /// offer scaling — then `snd_wnd` is the raw 16-bit field.
+    pub(crate) snd_wscale: u8,
+    /// True once both ends negotiated window scaling (the peer sent a
+    /// WS option in its SYN and we echoed one in the SYN-ACK). Gates the
+    /// `snd_wnd` left-shift; per RFC 7323 the SYN/SYN-ACK windows
+    /// themselves are always unscaled.
+    pub(crate) wscale_ok: bool,
     /// RFC 9293 SND.WL1 — the `SEG.SEQ` of the segment that last
     /// updated `snd_wnd`. Guards against a reordered segment
     /// installing a stale window.
@@ -446,6 +459,8 @@ impl TcpConnection {
             snd_nxt: 0,
             snd_una: 0,
             snd_wnd: 0,
+            snd_wscale: 0,
+            wscale_ok: false,
             snd_wl1: 0,
             snd_wl2: 0,
             rcv_nxt: 0,
@@ -1204,7 +1219,7 @@ impl TcpConnection {
     #[inline]
     pub(crate) fn usable_window(&self) -> u32 {
         self.cwnd
-            .min(self.snd_wnd as u32)
+            .min(self.snd_wnd)
             .saturating_sub(self.flight())
     }
 

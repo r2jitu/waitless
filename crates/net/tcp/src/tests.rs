@@ -323,6 +323,28 @@ impl Seg {
         b.extend_from_slice(&self.payload);
         b
     }
+
+    /// Encode with a TCP `opts` blob between the 20-byte fixed header
+    /// and the payload. `opts` must be 4-byte aligned (pad with NOPs);
+    /// the data-offset field is set to `(20 + opts.len()) / 4` words.
+    /// Used to inject a SYN carrying an RFC 7323 Window-Scale option.
+    fn encode_opts(&self, opts: &[u8]) -> Vec<u8> {
+        assert_eq!(opts.len() % 4, 0, "TCP options must be 4-byte aligned");
+        let data_off_words = (TCP_HDR_LEN + opts.len()) / 4;
+        let mut b = Vec::with_capacity(TCP_HDR_LEN + opts.len() + self.payload.len());
+        b.extend_from_slice(&self.src_port.to_be_bytes());
+        b.extend_from_slice(&self.dst_port.to_be_bytes());
+        b.extend_from_slice(&self.seq.to_be_bytes());
+        b.extend_from_slice(&self.ack.to_be_bytes());
+        b.push((data_off_words as u8) << 4);
+        b.push(self.flags);
+        b.extend_from_slice(&self.window.to_be_bytes());
+        b.extend_from_slice(&[0, 0]); // checksum
+        b.extend_from_slice(&[0, 0]); // urgent pointer
+        b.extend_from_slice(opts);
+        b.extend_from_slice(&self.payload);
+        b
+    }
 }
 
 /// Drop callback for `make_chain` — reclaims the `Box<[u8]>` whose
@@ -363,6 +385,21 @@ fn v4(o: [u8; 4]) -> IpAddr {
 /// Drive one scripted segment from `CLIENT_IP` to `SERVER_IP`.
 fn deliver(seg: &Seg) {
     tcp_receive(v4(CLIENT_IP), v4(SERVER_IP), make_chain(&seg.encode()));
+}
+
+/// As [`deliver`] but with a TCP options blob (4-byte aligned) — used
+/// to inject a SYN carrying an RFC 7323 Window-Scale option.
+fn deliver_opts(seg: &Seg, opts: &[u8]) {
+    tcp_receive(v4(CLIENT_IP), v4(SERVER_IP), make_chain(&seg.encode_opts(opts)));
+}
+
+/// Extract the TCP options blob (bytes `[20, data_offset)`) from a
+/// captured `[Eth | IPv4 | TCP]` frame — empty when the header is the
+/// bare 20 bytes.
+fn tcp_options(frame: &[u8]) -> Vec<u8> {
+    let tcp = &frame[34..];
+    let data_off = ((tcp[12] >> 4) as usize) * 4;
+    tcp[TCP_HDR_LEN..data_off].to_vec()
 }
 
 /// Host-order view of a captured frame's TCP header. Returned by
@@ -1751,6 +1788,146 @@ fn usable_window_arithmetic() {
     assert_eq!(c.usable_window(), 0, "an over-shrunk window saturates at 0");
 }
 
+/// RFC 7323: a SYN carrying a Window-Scale option is answered with a
+/// SYN-ACK that echoes one (advertising our `rcv_wscale = 0`), and the
+/// connection records the peer's shift so later window updates scale.
+#[test]
+fn window_scale_negotiated_from_syn() {
+    let _g = harness();
+    const SP: u16 = 9301;
+    const CP: u16 = 50301;
+    const CLIENT_ISN: u32 = 0x7000;
+    super::listen_on_core(0, SP);
+
+    // SYN with a Window-Scale option: NOP, kind=3, len=3, shift=7.
+    deliver_opts(
+        &Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN,
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            payload: Vec::new(),
+        },
+        &[1, 3, 3, 7],
+    );
+
+    let synack = &tx()[0];
+    assert_eq!(tcp_hdr(synack).flags, TCP_SYN | TCP_ACK, "SYN|ACK expected");
+    let opts = tcp_options(synack);
+    assert!(
+        opts.windows(3).any(|w| w == [3, 3, 0]),
+        "SYN-ACK must echo a Window-Scale option (kind=3, len=3, shift=0), got {opts:?}",
+    );
+
+    let (_, wscale_ok, snd_wscale) = conn_window(CP, SP);
+    assert!(wscale_ok, "scaling negotiated once both ends offered WS");
+    assert_eq!(snd_wscale, 7, "peer's advertised shift is recorded");
+}
+
+/// Post-handshake, the peer's advertised window is left-shifted by the
+/// negotiated scale — lifting `snd_wnd` past the 64 KiB the 16-bit
+/// field alone could express (the whole point of RFC 7323: a 64 KiB
+/// cap throttles a high-RTT download to 64 KiB/RTT).
+#[test]
+fn window_update_is_scaled_after_negotiation() {
+    let _g = harness();
+    const SP: u16 = 9302;
+    const CP: u16 = 50302;
+    const CLIENT_ISN: u32 = 0x8000;
+    super::listen_on_core(0, SP);
+
+    // Handshake WITH window scaling (shift 7 → ×128).
+    deliver_opts(
+        &Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN,
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            payload: Vec::new(),
+        },
+        &[1, 3, 3, 7],
+    );
+    let server_isn = tcp_hdr(&tx()[0]).seq;
+    // The 3-way ACK advertises window=4096; scaled ×128 = 524288.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 4096,
+        payload: Vec::new(),
+    });
+
+    let (snd_wnd, _, _) = conn_window(CP, SP);
+    assert_eq!(snd_wnd, 4096 << 7, "post-handshake window is scaled by the shift");
+    assert!(snd_wnd > 65535, "scaling lifts the window past the 16-bit ceiling");
+}
+
+/// RFC 7323 §2.2: window scaling needs *both* ends to offer it. A SYN
+/// with no Window-Scale option leaves scaling disabled — the SYN-ACK
+/// carries no WS option and later windows stay raw 16-bit values.
+#[test]
+fn no_window_scale_when_peer_does_not_offer() {
+    let _g = harness();
+    const SP: u16 = 9303;
+    const CP: u16 = 50303;
+    const CLIENT_ISN: u32 = 0x9000;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN); // plain SYN, no options
+
+    assert!(
+        tcp_options(&tx()[0]).is_empty(),
+        "no WS echo in the SYN-ACK when the peer never offered scaling",
+    );
+    let (_, wscale_ok, snd_wscale) = conn_window(CP, SP);
+    assert!(!wscale_ok, "scaling stays disabled");
+    assert_eq!(snd_wscale, 0);
+
+    // A later window update is taken verbatim — not shifted.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 8192,
+        payload: Vec::new(),
+    });
+    let (snd_wnd, _, _) = conn_window(CP, SP);
+    assert_eq!(snd_wnd, 8192, "unscaled window taken at face value");
+}
+
+/// RFC 7323 §2.3: a shift count above 14 is clamped to 14 — exercised
+/// end-to-end through the SYN parse and the recorded `snd_wscale`.
+#[test]
+fn window_scale_shift_capped_at_14() {
+    let _g = harness();
+    const SP: u16 = 9304;
+    const CP: u16 = 50304;
+    const CLIENT_ISN: u32 = 0xA000;
+    super::listen_on_core(0, SP);
+    deliver_opts(
+        &Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN,
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            payload: Vec::new(),
+        },
+        &[1, 3, 3, 30], // absurd shift — must clamp
+    );
+    let (_, wscale_ok, snd_wscale) = conn_window(CP, SP);
+    assert!(wscale_ok);
+    assert_eq!(snd_wscale, 14, "shift clamped to the RFC 7323 maximum of 14");
+}
+
 /// A fresh `Established` connection opens at the RFC 6928 initial
 /// window (IW10 = 10·SMSS) — and exactly that. The 3-way handshake
 /// ACK acknowledges the SYN's sequence number, but the SYN is not
@@ -2844,6 +3021,26 @@ fn conn_snd_una(client_port: u16, server_port: u16) -> u32 {
             && c.remote_port == client_port
         {
             return c.snd_una;
+        }
+    }
+    panic!("no live connection for ports {client_port} -> {server_port}");
+}
+
+/// `(snd_wnd, wscale_ok, snd_wscale)` of the live connection — lets a
+/// window-scaling scenario assert the negotiated state and the scaled
+/// peer window.
+fn conn_window(client_port: u16, server_port: u16) -> (u32, bool, u8) {
+    let core = 0u32;
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        // SAFETY: single worker, test-serialised by `TEST_LOCK`.
+        let c = unsafe { &*conn_ptr(core, i) };
+        if c.state != TcpState::Closed
+            && c.state != TcpState::Listen
+            && c.local_port == server_port
+            && c.remote_port == client_port
+        {
+            return (c.snd_wnd, c.wscale_ok, c.snd_wscale);
         }
     }
     panic!("no live connection for ports {client_port} -> {server_port}");
