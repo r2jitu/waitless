@@ -10,12 +10,17 @@
 # we run a full first-party host build of crates + apps + tests
 # before letting the push leave the machine.
 #
-# The unikernel cross-compile is not run here — that build takes
-# 20+ s cold even when cached, and a host build with the clippy
-# aspect catches almost every regression in practice (cfg-gated
-# `target_os = "none"` code is a small fraction of the tree).
-# Run `bazel build //apps/webserver:webserver_hvf` manually for
-# unikernel coverage when you're touching kernel/boot/driver code.
+# The host build above SKIPS the os:none kernel/boot/driver crates:
+# they're `target_compatible_with = @platforms//:incompatible` on the
+# host platform, so clippy never runs on bare-metal-only code there —
+# that gap let `unnecessary_cast` (gve) and `doc_lazy_continuation`
+# (boot/entry.rs, x86-gated) land on a branch, breaking the IDE's
+# clippy-aspect discover build at reload time. So we also run a
+# clippy-only pass under each unikernel target. `clippy_checks` alone
+# skips the expensive cross-compile + link (the 20+ s the full build
+# costs), and arch-gated `cfg(target_arch = ...)` code is only linted
+# under its own config — hence both arches. Cached it is sub-second;
+# cold it is a few seconds per arch (clippy, not codegen).
 #
 # Active once git is pointed at this directory:
 #     git config core.hooksPath scripts/git-hooks
@@ -28,3 +33,8 @@ cd "$(git rev-parse --show-toplevel)"
 
 echo "==> pre-push: bazel build //crates/... //apps/... //tests/... (includes clippy)"
 bazel build //crates/... //apps/... //tests/...
+
+for cfg in aarch64-waitless x86_64-waitless; do
+    echo "==> pre-push: ${cfg} clippy //crates/... //apps/... (bare-metal coverage)"
+    bazel build --config="${cfg}" --output_groups=clippy_checks //crates/... //apps/...
+done
