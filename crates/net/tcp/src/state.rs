@@ -1223,17 +1223,28 @@ impl TcpConnection {
             .saturating_sub(self.flight())
     }
 
-    /// Fold an ACK of `acked` new bytes into the congestion window
-    /// (RFC 5681 §3.1). Slow start (`cwnd < ssthresh`) opens the
-    /// window by one SMSS per ACK — exponential per RTT. Congestion
-    /// avoidance adds `SMSS·SMSS/cwnd` per ACK, the standard
+    /// Fold an ACK of `acked` new bytes into the congestion window.
+    /// Slow start (`cwnd < ssthresh`) grows the window by the *bytes*
+    /// this ACK acknowledged (RFC 3465 Appropriate Byte Counting),
+    /// capped at `2·SMSS` per ACK — exponential, ~2×/RTT. Congestion
+    /// avoidance adds `SMSS·SMSS/cwnd` per ACK, the standard RFC 5681
     /// approximation of one SMSS per RTT — linear.
     pub(crate) fn cwnd_on_ack(&mut self, acked: u32) {
         let smss = mss_for(self.local_ip) as u32;
         if self.cwnd < self.ssthresh {
-            // Slow start: one SMSS per ACK, capped at the bytes the
-            // ACK actually covers (RFC 5681's `min(N, SMSS)`).
-            self.cwnd = self.cwnd.saturating_add(acked.min(smss));
+            // Slow start, RFC 3465 Appropriate Byte Counting: open
+            // `cwnd` by the *bytes* this ACK covered, not a flat one
+            // SMSS per ACK. The old "count ACKs" rule (`min(acked,
+            // SMSS)`) under delayed-ACK receivers — one ACK per two
+            // segments, the internet norm — grew `cwnd` only ~1.5×/RTT
+            // instead of the 2× slow start intends, the dominant limit
+            // on a cold high-RTT transfer (measured ~3× below textbook).
+            // Byte counting restores the full doubling regardless of how
+            // the receiver batches ACKs. The increment is capped at
+            // `L=2·SMSS` per ACK (RFC 3465 §2.3) to bound the burst a
+            // single stretch-ACK or post-idle ACK can release — we don't
+            // pace, so this cap is the burst guard.
+            self.cwnd = self.cwnd.saturating_add(acked.min(2 * smss));
         } else {
             // Congestion avoidance: ~one SMSS per RTT. `max(1)` keeps
             // the window opening when integer division would floor

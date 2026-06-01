@@ -946,11 +946,13 @@ fn rtt_estimator_tracks_rfc6298() {
 
 // ---- RFC 5681 congestion control — pure controller arithmetic ---------
 
-/// RFC 5681 §3.1 slow start: each ACK opens `cwnd` by one SMSS — so
-/// the window doubles over each RTT's worth of ACKs (exponential).
-/// The initial window itself is the RFC 6928 IW10 (`congestion_init`).
+/// RFC 3465 Appropriate Byte Counting in slow start: each ACK opens
+/// `cwnd` by the *bytes* it acknowledged (not a flat one SMSS per ACK),
+/// capped at 2·SMSS — so the window doubles over each RTT even when a
+/// delayed-ACK receiver sends one ACK per two segments. The initial
+/// window itself is the RFC 6928 IW10 (`congestion_init`).
 #[test]
-fn slow_start_grows_cwnd_one_segment_per_ack() {
+fn slow_start_grows_cwnd_by_bytes_acked_abc() {
     // The controller arithmetic is pure — exercise it on a bare TCB.
     let mut c = TcpConnection::new();
     c.congestion_init();
@@ -959,14 +961,30 @@ fn slow_start_grows_cwnd_one_segment_per_ack() {
     assert_eq!(c.cwnd, 14600, "the initial window is the RFC 6928 IW10 (10·SMSS)");
     assert!(c.cwnd < c.ssthresh, "a fresh connection opens in slow start");
 
+    // An ACK of one segment opens the window by one segment.
     let before = c.cwnd;
     c.cwnd_on_ack(smss);
-    assert_eq!(c.cwnd, before + smss, "slow start adds one SMSS per ACK");
+    assert_eq!(c.cwnd, before + smss, "one segment acked → one SMSS");
 
     // A partial ACK opens the window by only the bytes it covers.
     let before = c.cwnd;
     c.cwnd_on_ack(500);
-    assert_eq!(c.cwnd, before + 500, "the increment is capped at bytes acked");
+    assert_eq!(c.cwnd, before + 500, "the increment is the bytes acked");
+
+    // ABC: a delayed ACK covering two segments opens `cwnd` by two SMSS
+    // — restoring the full 2×/RTT that the old "one SMSS per ACK" rule
+    // lost to delayed ACKs (one ACK per two segments).
+    let before = c.cwnd;
+    c.cwnd_on_ack(2 * smss);
+    assert_eq!(c.cwnd, before + 2 * smss, "two segments acked → two SMSS (ABC)");
+
+    // The per-ACK increase is capped at L = 2·SMSS (RFC 3465 §2.3): a
+    // single stretch-ACK / post-idle ACK covering more than two segments
+    // can't release an unbounded burst (we don't pace, so this is the
+    // burst guard).
+    let before = c.cwnd;
+    c.cwnd_on_ack(10 * smss);
+    assert_eq!(c.cwnd, before + 2 * smss, "stretch-ACK increment capped at 2·SMSS");
 }
 
 /// RFC 5681 §3.1: at `cwnd == ssthresh` the controller switches from

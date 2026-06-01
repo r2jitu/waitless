@@ -19,9 +19,10 @@ implements and host-tests:
   exponential backoff, Karn's algorithm.
 - RFC 5681 — slow start, AIMD, fast retransmit / fast recovery, and
   a send path that paces against `min(cwnd, rwnd)`. The initial window
-  is RFC 6928 IW10. (This is the Reno-family baseline; the performance
-  features Linux layers on top — CUBIC/BBR, ABC, pacing, RACK-TLP — are
-  inventoried under *Performance parity with the Linux TCP stack*.)
+  is RFC 6928 IW10, and slow start byte-counts per RFC 3465 (ABC). (This
+  is the Reno-family baseline; the further performance features Linux
+  layers on top — CUBIC/BBR, packet pacing, RACK-TLP — are inventoried
+  under *Performance parity with the Linux TCP stack*.)
 - RFC 7323 — Window Scale: `snd_wnd` is `u32`, the peer's scale shift is
   parsed from its SYN and applied to every post-handshake window update,
   and the SYN-ACK echoes a Window-Scale option (we advertise
@@ -307,20 +308,27 @@ widens with bandwidth × RTT.
 is meant to let a CC algorithm be swapped in; CUBIC is the pragmatic
 first target. **Effort: L.**
 
-### L2 — No Appropriate Byte Counting (ABC, RFC 3465)
+### L2 — Appropriate Byte Counting (ABC, RFC 3465) — ✅ done
 
-**What.** `cwnd_on_ack` grows `cwnd` by `min(acked, SMSS)` *per ACK*.
-With the delayed-ACK receivers that dominate the internet (1 ACK per 2
-segments), that is one SMSS per *two* segments → slow start grows
-~1.5×/RTT instead of 2×/RTT. Linux uses ABC (count *bytes* acked, not
-ACKs), restoring the full 2×.
+**Status — done and merged.** `cwnd_on_ack`'s slow-start branch now
+grows `cwnd` by the *bytes* the ACK acknowledged, capped at `L = 2·SMSS`
+per ACK (RFC 3465 §2.3), instead of the old flat `min(acked, SMSS)`.
 
-**Triggers when.** Every cold transfer to a delayed-ACK client — this is
-the measured "~3× below textbook" on cold single-conn high-RTT downloads
-(the slow-start ramp, not `rwnd`, is what bounds those).
+**What it fixed.** The old "count ACKs" rule grew `cwnd` by one SMSS per
+ACK; under the delayed-ACK receivers that dominate the internet (1 ACK
+per 2 segments) that is one SMSS per *two* segments → slow start grew
+~1.5×/RTT instead of the 2× it intends — the measured "~3× below
+textbook" on cold single-conn high-RTT downloads (the slow-start ramp,
+not `rwnd`, bounds those). Byte counting restores the full 2× regardless
+of how the receiver batches ACKs; the `2·SMSS` cap bounds the burst a
+stretch-/post-idle ACK can release (we don't pace — L3 — so this cap is
+the burst guard).
 
-**Fix.** In slow start, grow by `acked` (byte-counted), capped per
-RFC 3465 (≤ 2·SMSS/ACK) to bound burst. Small, high-leverage. **Effort: S.**
+**Test.** `slow_start_grows_cwnd_by_bytes_acked_abc` asserts a 2-segment
+ACK opens `cwnd` by 2·SMSS and a stretch-ACK is capped at 2·SMSS.
+Congestion avoidance is unchanged (still the RFC 5681 `SMSS²/cwnd`
+approximation — the byte-counting CA accumulator is a separate, lower-
+value follow-up; the cold-transfer gap is entirely slow start).
 
 ### L3 — No packet pacing
 
@@ -412,8 +420,8 @@ Dependency-ordered, test-first per item:
 5. **T3** (out-of-order reassembly) — the big one; unblocks T7/T8.
 6. **T8** (ACK out-of-window segments) — falls out of T3.
 7. **T7** (SACK / RFC 6675).
-8. **L2** (ABC) — small, the highest-leverage Linux-parity win (closes
-   the measured ~3× cold-transfer slow-start gap).
+8. ✅ **L2** (ABC) — done; closed the measured ~3× cold-transfer
+   slow-start gap (slow start now byte-counts, capped at 2·SMSS).
 9. **L1 / L3 / L4** (CUBIC, pacing, RACK-TLP) — the deeper CC/loss-recovery
    parity work; gated on the L4 vtable seam and SACK (T7).
 10. **T9–T13**, **L5**, Timestamps/PAWS — checklist, as priorities allow.
