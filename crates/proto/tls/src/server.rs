@@ -6,7 +6,14 @@
 // Supports exactly:
 //   - TLS 1.3, TLS_AES_128_GCM_SHA256, X25519
 //   - ECDSA P-256 + SHA-256 server cert
-// No client auth, no resumption, no 0-RTT, no key update, no ALPN.
+//   - 1-RTT session resumption: a NewSessionTicket is issued after
+//     every handshake (`emit_session_ticket`), and a returning
+//     ClientHello carrying a matching PSK (`try_resume`) skips the
+//     Certificate/CertVerify flight — the resumption latency win.
+// No client auth, no key update, no ALPN. 0-RTT *early data* over TCP
+// is not advertised — the NewSessionTicket carries no `early_data`
+// extension, so resumption is 1-RTT only (the replay-sensitive 0-RTT
+// path is deferred; see `replay.rs` / the QUIC roadmap's Phase E).
 //
 // References: RFC 8446 §2 (flow), §4.1.3 (ServerHello),
 // §4.3.1 (EncryptedExtensions), §4.4.2-4 (Certificate chain),
