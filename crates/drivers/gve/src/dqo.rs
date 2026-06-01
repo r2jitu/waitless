@@ -1093,20 +1093,22 @@ pub(crate) fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, mut callback
     // drop the chain (its IOBuf parts auto-repost via `dqo_repost`)
     // once it's been stuck longer than the timeout.
     //
-    // SAFETY: `PENDING_CHAINS[qp]` is only accessed from
-    // `poll_qp_inner(qp)`, which runs on a single core at a time (see
-    // `PendingChainCell` in lib.rs). The `&mut` borrow is bounded to
-    // this block, released before the per-completion loop reacquires.
-    {
-        let pending: &mut Option<Chain<OwnedIOBuf>> =
-            unsafe { &mut *PENDING_CHAINS[qp].0.get() };
-        if pending.is_some() {
-            let started = rx.pending_chain_started_ms.load(Ordering::Relaxed);
-            let now = kernel_bare::clock::now_ms();
-            if now.wrapping_sub(started) > PENDING_CHAIN_TIMEOUT_MS {
-                pending.take();
-                DQO_RX_PENDING_CHAIN_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-            }
+    // SAFETY: `PENDING_CHAINS[qp]` is logically single-writer-per-qp
+    // under steady per-core polling (see `PendingChainCell` in lib.rs).
+    // Probe `is_some()` through a *shared* read and form the `&mut`
+    // (for `.take()`) only when a chain is actually pending — so the
+    // brief boot→steady poll-handoff window (the BSP finishing its
+    // all-queue boot poll just as an AP starts polling the same qp —
+    // the same window the per-queue cursor atomics already share) does
+    // only concurrent shared reads here, never an overlapping `&mut`. A
+    // chain is only ever pending under steady per-core polling, never
+    // during that boot handoff (boot traffic has nothing for RSC to
+    // coalesce), so the `.take()` `&mut` is unreachable in the window.
+    if unsafe { (*PENDING_CHAINS[qp].0.get()).is_some() } {
+        let started = rx.pending_chain_started_ms.load(Ordering::Relaxed);
+        if kernel_bare::clock::now_ms().wrapping_sub(started) > PENDING_CHAIN_TIMEOUT_MS {
+            unsafe { (*PENDING_CHAINS[qp].0.get()).take() };
+            DQO_RX_PENDING_CHAIN_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
         }
     }
 
