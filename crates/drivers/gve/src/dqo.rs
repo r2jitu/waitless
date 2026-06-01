@@ -625,7 +625,7 @@ fn emit_ctx_pkt(
 #[inline]
 fn pkt_bounce_buf(tx: &TxQueue, fill_cnt: u32) -> (u64, u64) {
     let mask = (tx.ring_entries - 1) as u32;
-    let slot = (fill_cnt.wrapping_add(1) & mask) as u32;
+    let slot = fill_cnt.wrapping_add(1) & mask;
     let buf_offset = slot * (RX_BUFFER_SIZE as u32);
     (
         tx.qpl_base_va + buf_offset as u64,
@@ -888,6 +888,7 @@ pub(crate) fn submit_tx_tso(
 /// Emit the TSO descriptor burst (TSO-ctx, general-ctx, SG pkt descs)
 /// for a super-segment already in big-pool slot `big_slot` at DMA
 /// address `buf_phys`, advance `fill_cnt`, doorbell unless deferred.
+#[allow(clippy::too_many_arguments)]
 fn emit_tso_descs(
     tx: &TxQueue,
     qp: usize,

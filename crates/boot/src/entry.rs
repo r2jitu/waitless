@@ -714,13 +714,6 @@ fn boot_args() -> &'static str {
     kernel_bare::x86_64::boot_args::boot_args()
 }
 
-/// Event loop idle callback. Core-aware:
-/// - Core 0: arm VirtIO RX notifications + yield/WFI (wakes on data or interrupt)
-/// - Other cores: yield/WFI (wakes when the IO thread or distributor sends data)
-///   On the HVF runner, yield MMIO parks the thread at zero CPU cost.
-///   We use WFI and not WFE: WFE wakes from any SEV (including spurious ones),
-///   which starved the host-side TCP proxy thread on Apple hypervisors.
-///   `wake_cores()` sends SGI so WFI wakes correctly.
 /// Consecutive idle rounds (event-loop idle commits with no intervening
 /// work) after which a polling NIC switches from busy-poll to a
 /// timer-bounded HLT. The event loop only reaches `idle_cb` after a full
@@ -733,6 +726,13 @@ fn boot_args() -> &'static str {
 #[cfg(target_arch = "x86_64")]
 const DEEP_IDLE_ROUNDS: u32 = 32;
 
+/// Event loop idle callback. Core-aware:
+/// - Core 0: arm VirtIO RX notifications + yield/WFI (wakes on data or interrupt)
+/// - Other cores: yield/WFI (wakes when the IO thread or distributor sends data)
+///   On the HVF runner, yield MMIO parks the thread at zero CPU cost.
+///   We use WFI and not WFE: WFE wakes from any SEV (including spurious ones),
+///   which starved the host-side TCP proxy thread on Apple hypervisors.
+///   `wake_cores()` sends SGI so WFI wakes correctly.
 fn idle_cb(core_id: u32, idle_rounds: u32) {
     // No wake-up source → busy-poll. (Happens when the transport
     // doesn't expose any IRQ path: a polling NIC like gve `idle: None`,
