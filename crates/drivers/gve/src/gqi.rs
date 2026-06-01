@@ -18,6 +18,10 @@ use core::ptr;
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use bus::mmio_write32;
+use nic_api::{
+    TX_POOL_ID_BIG as POOL_ID_BIG, TX_POOL_ID_SMALL as POOL_ID_SMALL,
+    decode_tx_token as decode_token, encode_tx_token as encode_token,
+};
 use iobuf::{Chain, OwnedIOBuf};
 
 use crate::{
@@ -100,9 +104,6 @@ const TX_MAX_PKT_LEN: usize = 2048;
 /// will only build super-segments up to its own configured cap.
 const TX_MAX_TSO_LEN: usize = TX_BIG_SLOT_SIZE as usize - 256;
 
-const POOL_ID_SMALL: u8 = 0;
-const POOL_ID_BIG: u8 = 1;
-
 // ---- Doorbell ---------------------------------------------------------------
 
 /// GQI doorbell write. Big-endian on the wire — Linux's
@@ -119,27 +120,6 @@ pub(crate) fn doorbell_write(bar2_va: u64, offset: u32, value: u32) {
     unsafe {
         mmio_write32(bar2_va + offset as u64, value.to_be());
     }
-}
-
-// ---- Token encoding for direct-fill TX slots ------------------------------
-
-/// Encode `(qp, slot, pool_id)` into the opaque `driver_token` of
-/// a [`nic_api::TxBufHandle`]. Layout:
-///   * bit  63    : pool_id (0 = small, 1 = big)
-///   * bits 32..62: qp index
-///   * bits  0..32: slot index (within the pool)
-#[inline]
-fn encode_token(qp: usize, slot: usize, pool: u8) -> u64 {
-    let pool_bit = ((pool & 1) as u64) << 63;
-    pool_bit | (((qp as u64) & 0x7FFF_FFFF) << 32) | (slot as u64 & 0xFFFF_FFFF)
-}
-
-#[inline]
-fn decode_token(token: u64) -> (usize, usize, u8) {
-    let pool = ((token >> 63) & 1) as u8;
-    let qp = ((token >> 32) & 0x7FFF_FFFF) as usize;
-    let slot = (token & 0xFFFF_FFFF) as usize;
-    (qp, slot, pool)
 }
 
 /// Drop callback for an unsubmitted handle: returns the slot to

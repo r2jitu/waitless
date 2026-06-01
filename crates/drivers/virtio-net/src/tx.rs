@@ -5,6 +5,10 @@
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use kernel_bare::mm::virt_to_phys;
+use nic_api::{
+    TX_POOL_ID_BIG as POOL_ID_BIG, TX_POOL_ID_SMALL as POOL_ID_SMALL,
+    decode_tx_token as decode_token, encode_tx_token as encode_token,
+};
 
 use crate::diag::{
     TX_BIG_ACQUIRES, TX_BIG_FULL_RETURNS, TX_BYTES_PER_QP, TX_PACKETS_PER_QP, TX_SMALL_ACQUIRES,
@@ -143,31 +147,6 @@ pub(crate) fn send(data: &[u8], csum: nic_api::CsumOffload) {
 // `tx_pool_used` scanning. Tier 2 (shared qp + multi-core) returns
 // `None` from `acquire_tx_buf` — the caller falls back to the
 // legacy `send(&[u8])` + per-core staging path.
-
-/// Pool ID embedded in `TxBufHandle::driver_token` so `release_fn`
-/// and `submit_tx*` know which pool's `_used` array to update and
-/// which slot array to index. Only two pools today (small + big),
-/// so one bit of the token is sufficient.
-const POOL_ID_SMALL: u8 = 0;
-const POOL_ID_BIG: u8 = 1;
-
-/// Encode `(qp, slot, pool_id)` into a single u64 token. Layout:
-///   * bit 63    — pool ID (0 = small, 1 = big)
-///   * bits 32-62 — qp index
-///   * bits 0-31 — slot index within pool
-#[inline]
-fn encode_token(qp: usize, slot: usize, pool: u8) -> u64 {
-    let pool_bit = ((pool & 1) as u64) << 63;
-    pool_bit | (((qp as u64) & 0x7FFF_FFFF) << 32) | (slot as u64 & 0xFFFF_FFFF)
-}
-
-#[inline]
-fn decode_token(token: u64) -> (usize, usize, u8) {
-    let pool = ((token >> 63) & 1) as u8;
-    let qp = ((token >> 32) & 0x7FFF_FFFF) as usize;
-    let slot = (token & 0xFFFF_FFFF) as usize;
-    (qp, slot, pool)
-}
 
 /// Drop callback for an unsubmitted `TxBufHandle`: returns the
 /// slot to the pool. Called by `TxBufHandle::drop` when a caller
