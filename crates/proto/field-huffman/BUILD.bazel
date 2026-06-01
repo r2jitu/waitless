@@ -1,0 +1,22 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Shared RFC 7541 Appendix B Huffman code (decode side). The field-
+# compression Huffman table is byte-identical for HPACK (HTTP/2) and
+# QPACK (HTTP/3), so `//crates/proto/http2` and `//crates/proto/http3`
+# both depend on this one leaf crate rather than each carrying a copy.
+# No deps beyond `alloc`.
+rust_library(
+    name = "field-huffman",
+    srcs = ["src/lib.rs"],
+    crate_name = "field_huffman",
+    crate_root = "src/lib.rs",
+)
+
+rust_test(
+    name = "field_huffman_test",
+    size = "small",
+    crate = ":field-huffman",
+)

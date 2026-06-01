@@ -24,6 +24,8 @@ rust_library(
     deps = [
         # obs::{Counter, LastEvent} — observability primitives.
         "//crates/util/obs",
+        # RFC 7541 Huffman (shared with proto/http2 — HPACK == QPACK table).
+        "//crates/proto/field-huffman",
         "//crates/proto/http",
         "//crates/proto/quic",
         "//crates/waitless",
