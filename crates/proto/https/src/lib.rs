@@ -67,11 +67,22 @@ pub trait Service: Send + Sync + 'static {
     ) -> impl core::future::Future<Output = Response>;
 }
 
+/// Outcome of a successful [`serve`]. The TCP/TLS server is always up
+/// (otherwise `serve` returns `Err`); `h3` reports whether the QUIC/UDP
+/// listener *also* came up, so the caller can log it.
+#[derive(Debug, Clone, Copy)]
+pub struct Served {
+    /// `true` when h3 (QUIC/UDP) bound and is being advertised via
+    /// `Alt-Svc`; `false` when the UDP bind failed (TCP still serving,
+    /// just without an h3 upgrade offer).
+    pub h3: bool,
+}
+
 /// Failure from [`serve`]. Only the TCP/TLS half is fatal — h3 is
-/// best-effort, so a QUIC bind failure is swallowed (the site still
-/// serves over TCP, just without advertising h3).
+/// best-effort, and its bind failure is reported via [`Served::h3`]
+/// rather than as an error.
 #[derive(Debug)]
-pub enum Error {
+pub enum ServeError {
     /// The HTTP/1.1 + h2 listener (the required half) failed to bind.
     Tcp(http2::ListenError),
 }
@@ -85,7 +96,7 @@ pub fn serve<Sv: Service>(
     service: Sv,
     cert_chain: &'static [&'static [u8]],
     key_der: &'static [u8],
-) -> Result<(), Error> {
+) -> Result<Served, ServeError> {
     let service = Arc::new(service);
 
     // Bring up h3 (QUIC/UDP) first, best-effort — its success gates the
@@ -121,9 +132,9 @@ pub fn serve<Sv: Service>(
         cert_chain,
         key_der,
     )
-    .map_err(Error::Tcp)?;
+    .map_err(ServeError::Tcp)?;
 
-    Ok(())
+    Ok(Served { h3: h3_up })
 }
 
 /// Build the `Alt-Svc: h3=":<port>"; ma=86400` value as a leaked

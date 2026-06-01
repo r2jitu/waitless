@@ -177,10 +177,16 @@ async fn init() {
     // through the shared `handle_request`. h3 is best-effort inside
     // `serve` — the TCP server still comes up if the UDP bind fails.
     match https::serve(HTTPS_PORT, Site, TLS_CERT_CHAIN, TLS_KEY_PKCS8_DER) {
-        Ok(()) => waitless::println!(
-            "listen :{} (https — h1.1+h2/TLS + h3/QUIC, TLS_AES_128_GCM_SHA256)",
-            HTTPS_PORT
-        ),
+        Ok(served) => {
+            waitless::println!(
+                "listen :{} (https — h1.1+h2/TLS{}, TLS_AES_128_GCM_SHA256)",
+                HTTPS_PORT,
+                if served.h3 { " + h3/QUIC" } else { "" },
+            );
+            if !served.h3 {
+                waitless::println!("[WARN] h3 disabled (QUIC/UDP bind failed)");
+            }
+        }
         Err(_) => waitless::println!("[WARN] https disabled (cert/key invalid)"),
     }
 }
