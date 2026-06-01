@@ -47,7 +47,11 @@
 //                 switch on send/submit, deferred-kick flush helpers.
 //   * `rx.rs`   — RX dispatch: poll / poll_qp, the DQO/GQI mode switch
 //                 on the drain path.
-//   * `adminq.rs` / `dqo.rs` / `gqi.rs` / `diag.rs` — unchanged.
+//   * `adminq.rs` — admin-queue command submit/execute.
+//   * `dqo.rs` / `gqi.rs` — the two format-specific TX/RX datapaths
+//                 (DQO_RDA / GQI_QPL).
+//   * `irq.rs` — MSI-X RX wake-on-packet (deep-idle path).
+//   * `diag.rs` — `/obs` counters + per-qp diagnostics.
 
 #![no_std]
 
@@ -498,7 +502,7 @@ pub(crate) const RX_RING_ENTRIES: u16 = 512;
 pub(crate) const RX_BUFFER_SIZE: u16 = 2048;
 /// 2-byte padding the device inserts before the Ethernet frame so
 /// the IP header lands 4-byte-aligned in the RX buffer.
-pub(crate) const _GVE_RX_PAD: u16 = 2;
+pub(crate) const GVE_RX_PAD: u16 = 2;
 
 /// TX QPL layout — split into two pools that share the same
 /// pre-registered, contiguous range of pages.

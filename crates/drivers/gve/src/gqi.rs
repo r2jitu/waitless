@@ -25,7 +25,7 @@ use nic_api::{
 use iobuf::{Chain, OwnedIOBuf};
 
 use crate::{
-    _GVE_RX_PAD, BAR2_VA, COUNTER_ARRAY_VA, DEFERRED_KICK, GQI_RECYCLE_POOL_EXHAUSTED,
+    GVE_RX_PAD, BAR2_VA, COUNTER_ARRAY_VA, DEFERRED_KICK, GQI_RECYCLE_POOL_EXHAUSTED,
     MAX_QUEUE_PAIRS, PAGE_SIZE, RX_BUF_REPOST_COUNT, RX_BYTES_PER_QP, RX_QUEUES, TX_BIG_ACQUIRES,
     TX_BIG_FULL_RETURNS, TX_BIG_POOL_QPL_OFFSET, TX_BIG_POOL_SLOTS, TX_BIG_SLOT_SIZE,
     TX_BYTES_PER_QP, TX_PACKETS_PER_QP, TX_QUEUES, TX_SMALL_ACQUIRES, TX_SMALL_FULL_SPINS,
@@ -83,12 +83,12 @@ const RX_DESC_LEN_OFF: usize = 60;
 const RX_DESC_FLAGS_SEQ_OFF: usize = 62;
 
 /// Start-of-frame offset inside each 4 KiB RX page. The device
-/// prepends `_GVE_RX_PAD = 2` bytes of padding before the Ethernet
+/// prepends `GVE_RX_PAD = 2` bytes of padding before the Ethernet
 /// header so IPv4 header bytes land 4-byte aligned. The *actual*
 /// offset the device writes into `hdr_off` is scaled by 64 — with
 /// one packet per page there's only one valid value
-/// (hdr_off = 0, actual start = `_GVE_RX_PAD`).
-const RX_DATA_OFFSET_IN_PAGE: usize = _GVE_RX_PAD as usize;
+/// (hdr_off = 0, actual start = `GVE_RX_PAD`).
+const RX_DATA_OFFSET_IN_PAGE: usize = GVE_RX_PAD as usize;
 
 /// TX descriptor size (gve_tx_pkt_desc, packed, 16 bytes).
 const TX_DESC_SIZE: usize = 16;
@@ -119,6 +119,22 @@ pub(crate) fn doorbell_write(bar2_va: u64, offset: u32, value: u32) {
     crate::host_dma_fence();
     unsafe {
         mmio_write32(bar2_va + offset as u64, value.to_be());
+    }
+}
+
+/// Publish `new_fill` as the producer position and ring the GQI TX
+/// doorbell, unless deferred-kick is on and the ring isn't near full.
+/// `doorbell_write`'s `host_dma_fence` makes the descriptors
+/// device-visible before the advanced tail. Shared by every GQI emit
+/// path (standard / TSO / UDP-GSO); the DQO analog is `dqo::dqo_kick`.
+#[inline]
+fn gqi_kick(tx: &TxQueue, bar2_va: u64, new_fill: u32) {
+    tx.fill_cnt.store(new_fill, Ordering::Release);
+    let near_full =
+        new_fill.wrapping_sub(tx.done_cnt.load(Ordering::Relaxed)) >= (tx.ring_entries as u32) - 16;
+    if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
+        doorbell_write(bar2_va, tx.db_offset, new_fill);
+        tx.last_kicked.store(new_fill, Ordering::Relaxed);
     }
 }
 
@@ -435,14 +451,7 @@ pub(crate) fn submit_tx_inner(
     record_tx_desc(qp as u8, tx_desc_kind::STD, &desc);
 
     let new_fill = fill_cnt.wrapping_add(1);
-    tx.fill_cnt.store(new_fill, Ordering::Release);
-
-    let near_full =
-        new_fill.wrapping_sub(tx.done_cnt.load(Ordering::Relaxed)) >= (tx.ring_entries as u32) - 16;
-    if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
-        doorbell_write(bar2_va, tx.db_offset, new_fill);
-        tx.last_kicked.store(new_fill, Ordering::Relaxed);
-    }
+    gqi_kick(tx, bar2_va, new_fill);
 
     // Per-qp TX packet count for load-distribution diagnostics.
     if qp < TX_PACKETS_PER_QP.len() {
@@ -560,14 +569,7 @@ pub(crate) fn submit_tx_tso_inner(
     record_tx_desc(qp as u8, tx_desc_kind::SEG, &desc1);
 
     let new_fill = fill_cnt.wrapping_add(2);
-    tx.fill_cnt.store(new_fill, Ordering::Release);
-
-    let near_full =
-        new_fill.wrapping_sub(tx.done_cnt.load(Ordering::Relaxed)) >= (tx.ring_entries as u32) - 16;
-    if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
-        doorbell_write(bar2_va, tx.db_offset, new_fill);
-        tx.last_kicked.store(new_fill, Ordering::Relaxed);
-    }
+    gqi_kick(tx, bar2_va, new_fill);
 
     // One super-segment carries many MSS-sized packets on the wire,
     // but to the driver it's one TX submission. Count it as one
@@ -665,14 +667,7 @@ pub(crate) fn submit_tx_udp_gso_inner(
     record_tx_desc(qp as u8, tx_desc_kind::SEG, &desc1);
 
     let new_fill = fill_cnt.wrapping_add(2);
-    tx.fill_cnt.store(new_fill, Ordering::Release);
-
-    let near_full =
-        new_fill.wrapping_sub(tx.done_cnt.load(Ordering::Relaxed)) >= (tx.ring_entries as u32) - 16;
-    if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
-        doorbell_write(bar2_va, tx.db_offset, new_fill);
-        tx.last_kicked.store(new_fill, Ordering::Relaxed);
-    }
+    gqi_kick(tx, bar2_va, new_fill);
 
     if qp < TX_PACKETS_PER_QP.len() {
         TX_PACKETS_PER_QP[qp].fetch_add(1, Ordering::Relaxed);
