@@ -1,0 +1,39 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Server-role HTTP/2 (RFC 7540 + HPACK RFC 7541).
+#
+# Rides the shared `//crates/proto/http` core (Request / Response /
+# BodyReader / handler API) and is generic over the byte stream, so it
+# carries NO transport dependency — `proto/tls` dispatches into
+# `serve_conn` when ALPN selects "h2", while plain-H1.1 consumers never
+# pull a transport in. The RFC 7541 Huffman table is shared with
+# `proto/http3` via `//crates/proto/field-huffman`.
+rust_library(
+    name = "http2",
+    srcs = [
+        "src/diag.rs",
+        "src/frame.rs",
+        "src/hpack.rs",
+        "src/lib.rs",
+        "src/server.rs",
+        "src/static_table.rs",
+    ],
+    crate_name = "http2",
+    deps = [
+        # obs::{Counter, LastEvent} — observability primitives.
+        "//crates/util/obs",
+        # RFC 7541 Huffman (shared with proto/http3 — HPACK == QPACK table).
+        "//crates/proto/field-huffman",
+        "//crates/proto/http",
+        "//crates/waitless",
+    ],
+)
+
+rust_test(
+    name = "http2_test",
+    size = "small",
+    crate = ":http2",
+)
