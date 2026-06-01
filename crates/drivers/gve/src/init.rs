@@ -15,7 +15,7 @@
 // command (opcode + status + 56 bytes of per-command data).
 
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use bus::{log, pci};
 use iobuf::IOBufPool;
@@ -1125,7 +1125,6 @@ fn finalize_rx_queue(qp: u32, alloc: &RxAlloc, fmt: QueueFormat) {
             cons_cnt: AtomicU32::new(0),
             expected_seq: AtomicU8::new(initial_seq),
             rx_pool,
-            pending_chain_started_ms: AtomicU64::new(0),
         });
         let ptr = s.rx[qp as usize].as_ref().unwrap() as *const RxQueue as *mut RxQueue;
         RX_QUEUES[qp as usize].store(ptr, Ordering::Release);

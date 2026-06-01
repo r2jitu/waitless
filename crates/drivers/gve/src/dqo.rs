@@ -1088,26 +1088,20 @@ pub(crate) fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, mut callback
     }
     let rx = unsafe { &*rx_ptr };
 
-    // Pending-chain timeout (item I). A multi-buf frame whose EOP never
-    // arrives would pin its accumulated device buffers indefinitely;
-    // drop the chain (its IOBuf parts auto-repost via `dqo_repost`)
-    // once it's been stuck longer than the timeout.
-    //
-    // SAFETY: `PENDING_CHAINS[qp]` is logically single-writer-per-qp
-    // under steady per-core polling (see `PendingChainCell` in lib.rs).
-    // Probe `is_some()` through a *shared* read and form the `&mut`
-    // (for `.take()`) only when a chain is actually pending — so the
-    // brief boot→steady poll-handoff window (the BSP finishing its
-    // all-queue boot poll just as an AP starts polling the same qp —
-    // the same window the per-queue cursor atomics already share) does
-    // only concurrent shared reads here, never an overlapping `&mut`. A
-    // chain is only ever pending under steady per-core polling, never
-    // during that boot handoff (boot traffic has nothing for RSC to
-    // coalesce), so the `.take()` `&mut` is unreachable in the window.
-    if unsafe { (*PENDING_CHAINS[qp].0.get()).is_some() } {
-        let started = rx.pending_chain_started_ms.load(Ordering::Relaxed);
-        if kernel_bare::clock::now_ms().wrapping_sub(started) > PENDING_CHAIN_TIMEOUT_MS {
-            unsafe { (*PENDING_CHAINS[qp].0.get()).take() };
+    // Drop a multi-buf frame whose EOP never arrived (item I) so its
+    // device buffers recycle (the chain's IOBuf parts auto-repost via
+    // `dqo_repost` on drop). Probe `is_pending()` through a *shared*
+    // read and form the `&mut` (`drop_stale`) only when a chain is
+    // actually pending — steady per-core polling only — so the brief
+    // boot→steady poll-handoff window (the BSP finishing its all-queue
+    // boot poll just as an AP starts on the same qp, the same window the
+    // per-queue cursor atomics already share) does only concurrent
+    // shared reads here, never an overlapping `&mut`. A chain is only
+    // pending under steady per-core polling (boot traffic has nothing
+    // for RSC to coalesce), so the `&mut` is unreachable in the window.
+    if unsafe { (*PENDING_CHAINS[qp].0.get()).is_pending() } {
+        let now = kernel_bare::clock::now_ms();
+        if unsafe { (*PENDING_CHAINS[qp].0.get()).drop_stale(now, PENDING_CHAIN_TIMEOUT_MS) } {
             DQO_RX_PENDING_CHAIN_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1192,43 +1186,26 @@ pub(crate) fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, mut callback
                 )
             };
 
-            // Fast path: single-buf EOP frame on an empty cell — the
-            // overwhelming shape with RSC off (item J not yet flipped),
-            // and still the majority with RSC on (non-coalesced flows).
-            // Skip the cell store/take dance: emit the one-part chain
-            // straight to the callback — byte-identical to the
-            // pre-item-I path.
-            //
-            // SAFETY (read-only): the borrow lives across one
-            // `is_none()` call, doesn't escape, and overlaps no other
-            // borrow into the cell (single-writer-per-qp; the slow-path
-            // `&mut` below only runs in the mutually-exclusive `else`).
-            let cell_empty = unsafe { (*PENDING_CHAINS[qp].0.get()).is_none() };
+            // Fast path: single-buf EOP frame on an empty coalescer —
+            // the overwhelming shape with RSC off and still the majority
+            // with RSC on (non-coalesced flows). Emit the one-part chain
+            // straight to the callback — byte-identical to the pre-item-I
+            // path. SAFETY (read-only): the `is_pending()` borrow lives
+            // across one call, doesn't escape, and overlaps no `&mut`
+            // (single-writer-per-qp; the slow-path `&mut` runs only in
+            // the mutually-exclusive `else`) — boot-handoff-safe.
+            let cell_empty = unsafe { !(*PENDING_CHAINS[qp].0.get()).is_pending() };
             if eop && cell_empty {
                 callback(Chain::from(owned));
                 delivered += 1;
             } else {
-                // Slow path: an in-flight chain exists, or this is a
-                // mid-chain non-EOP fragment. Append; on EOP take + emit.
-                //
-                // SAFETY (mutating): same single-writer-per-qp invariant
-                // as the timeout block above. The `&mut` borrow is
-                // scoped to this block so it ends before `callback` runs.
-                let to_emit = {
-                    let pending: &mut Option<Chain<OwnedIOBuf>> =
-                        unsafe { &mut *PENDING_CHAINS[qp].0.get() };
-                    match pending.as_mut() {
-                        Some(chain) => chain.push_back(owned),
-                        None => {
-                            // First fragment of a new multi-buf frame —
-                            // start the timeout clock.
-                            rx.pending_chain_started_ms
-                                .store(kernel_bare::clock::now_ms(), Ordering::Relaxed);
-                            *pending = Some(Chain::from(owned));
-                        }
-                    }
-                    if eop { pending.take() } else { None }
-                };
+                // Slow path (coalescing): fold the fragment into the
+                // per-qp `RxCoalescer`; it returns the assembled chain on
+                // EOP, else accumulates. SAFETY (mutating): same
+                // single-writer-per-qp invariant as the timeout block —
+                // reached only under steady per-core polling.
+                let now = kernel_bare::clock::now_ms();
+                let to_emit = unsafe { (*PENDING_CHAINS[qp].0.get()).accumulate(owned, eop, now) };
                 if let Some(chain) = to_emit {
                     callback(chain);
                     delivered += 1;

@@ -1,0 +1,23 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Multi-buffer RX chain accumulator (HW-GRO / RSC coalesced
+# super-frames, or any multi-descriptor RX). A pure `core`-only leaf
+# over `iobuf` — the driver owns the device I/O, the per-queue cell +
+# its single-writer discipline, and the clock; this owns only the
+# state machine, so it host-unit-tests in isolation (the driver crate,
+# with its os:none deps, can't). First user: gve DQO.
+rust_library(
+    name = "rx-coalesce",
+    srcs = ["src/lib.rs"],
+    crate_name = "rx_coalesce",
+    deps = ["//crates/util/iobuf"],
+)
+
+# Inline #[cfg(test)] unit tests (accumulate / EOP-emit / timeout).
+rust_test(
+    name = "rx_coalesce_test",
+    crate = ":rx-coalesce",
+)
