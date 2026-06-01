@@ -58,35 +58,6 @@ pub struct TxBufHandle {
 // share it (which would defeat the "exclusive write" property).
 unsafe impl Send for TxBufHandle {}
 
-/// Pool identifier packed into a [`TxBufHandle::driver_token`]: a
-/// driver's TX slots split into a "small" pool (MTU frames) and a
-/// "big" pool (TSO/GSO super-segments). Shared by every driver that
-/// uses the `(qp, slot, pool)` token layout below.
-pub const TX_POOL_ID_SMALL: u8 = 0;
-pub const TX_POOL_ID_BIG: u8 = 1;
-
-/// Pack `(qp, slot, pool)` into the opaque `driver_token` of a
-/// [`TxBufHandle`]. Layout: bit 63 = pool, bits 32..62 = qp, bits
-/// 0..31 = slot. Inverse is [`decode_tx_token`]. For drivers whose
-/// TX pools are an `AtomicBool` free-bitmap keyed by `(qp, slot)` —
-/// gve-GQI and virtio-net, which had grown byte-identical copies of
-/// this codec. (gve-DQO uses a bare `qp` token instead and does not
-/// call this.)
-#[inline]
-pub fn encode_tx_token(qp: usize, slot: usize, pool: u8) -> u64 {
-    let pool_bit = ((pool & 1) as u64) << 63;
-    pool_bit | (((qp as u64) & 0x7FFF_FFFF) << 32) | (slot as u64 & 0xFFFF_FFFF)
-}
-
-/// Inverse of [`encode_tx_token`] → `(qp, slot, pool)`.
-#[inline]
-pub fn decode_tx_token(token: u64) -> (usize, usize, u8) {
-    let pool = ((token >> 63) & 1) as u8;
-    let qp = ((token >> 32) & 0x7FFF_FFFF) as usize;
-    let slot = (token & 0xFFFF_FFFF) as usize;
-    (qp, slot, pool)
-}
-
 /// L4 checksum-offload hint passed to [`NicOps::submit_tx`]. When
 /// `start != 0`, the driver tells the device to compute the
 /// per-segment L4 checksum host-side. Saves the guest CPU one

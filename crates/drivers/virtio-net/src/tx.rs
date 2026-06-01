@@ -5,10 +5,7 @@
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use kernel_bare::mm::virt_to_phys;
-use nic_api::{
-    TX_POOL_ID_BIG as POOL_ID_BIG, TX_POOL_ID_SMALL as POOL_ID_SMALL,
-    decode_tx_token as decode_token, encode_tx_token as encode_token,
-};
+use tx_pool::{POOL_ID_BIG, POOL_ID_SMALL, claim_first_free, decode_token, encode_token};
 
 use crate::diag::{
     TX_BIG_ACQUIRES, TX_BIG_FULL_RETURNS, TX_BYTES_PER_QP, TX_PACKETS_PER_QP, TX_SMALL_ACQUIRES,
@@ -202,27 +199,30 @@ pub(crate) fn acquire_tx_buf() -> Option<nic_api::TxBufHandle> {
     // TX_LOCK on Tier 2 (single shared qp).
     let mut local_iters: u64 = 0;
     loop {
-        for slot in 0..TX_POOL_SMALL_SIZE {
-            local_iters += 1;
-            unsafe {
-                if !(*wpool(worker)).small_used[slot].load(Ordering::Acquire) {
-                    (*wpool(worker)).small_used[slot].store(true, Ordering::Relaxed);
-                    // Diagnostics: bump aggregate scan-depth + acquire
-                    // counts. One write each per successful acquire
-                    // — `local_iters / acquires` (read-side) is the
-                    // average scan depth. Relaxed ordering: counters
-                    // never gate any other read.
-                    TX_SMALL_SCAN_ITERS.add(local_iters);
-                    TX_SMALL_ACQUIRES.bump();
-                    let buf = &mut (*wpool(worker)).small[slot];
-                    return Some(nic_api::TxBufHandle {
-                        data_ptr: buf.data.as_mut_ptr(),
-                        data_cap: MAX_ETH_FRAME_SMALL as u32,
-                        driver_token: encode_token(worker, slot, POOL_ID_SMALL),
-                        release_fn: release_tx_slot,
-                    });
-                }
-            }
+        // SAFETY: single-writer-per-worker — only this worker claims
+        // from its own pool (`claim_first_free`'s required invariant);
+        // the slice is formed from the live `wpool(worker)` pointer.
+        // Bind the array reference explicitly first so the `[..]` slice
+        // isn't an implicit autoref through the raw-pointer deref.
+        let (got, scanned) = unsafe {
+            let small_used = &(*wpool(worker)).small_used;
+            claim_first_free(&small_used[..TX_POOL_SMALL_SIZE])
+        };
+        local_iters += scanned as u64;
+        if let Some(slot) = got {
+            // Diagnostics: bump aggregate scan-depth + acquire counts.
+            // One write each per successful acquire — `local_iters /
+            // acquires` (read-side) is the average scan depth. Relaxed
+            // ordering: counters never gate any other read.
+            TX_SMALL_SCAN_ITERS.add(local_iters);
+            TX_SMALL_ACQUIRES.bump();
+            let buf = unsafe { &mut (*wpool(worker)).small[slot] };
+            return Some(nic_api::TxBufHandle {
+                data_ptr: buf.data.as_mut_ptr(),
+                data_cap: MAX_ETH_FRAME_SMALL as u32,
+                driver_token: encode_token(worker, slot, POOL_ID_SMALL),
+                release_fn: release_tx_slot,
+            });
         }
         // All slots busy — flush deferred kicks so the host can
         // process the pending TX batch and produce completions,

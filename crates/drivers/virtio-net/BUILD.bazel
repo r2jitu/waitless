@@ -20,6 +20,7 @@ rust_library(
         "//crates/util/obs",
         "//crates/drivers/bus",
         "//crates/drivers/nic:api",
+        "//crates/drivers/tx-pool",
         "//crates/kernel/bare",
         "//crates/net:checksum",
         "//crates/util/iobuf",

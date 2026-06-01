@@ -22,6 +22,7 @@ rust_library(
     deps = [
         "//crates/drivers/bus",
         "//crates/drivers/nic:api",
+        "//crates/drivers/tx-pool",
         "//crates/kernel/bare",
         "//crates/util/iobuf",
         "//crates/util/obs",

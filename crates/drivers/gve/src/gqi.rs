@@ -18,10 +18,7 @@ use core::ptr;
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use bus::mmio_write32;
-use nic_api::{
-    TX_POOL_ID_BIG as POOL_ID_BIG, TX_POOL_ID_SMALL as POOL_ID_SMALL,
-    decode_tx_token as decode_token, encode_tx_token as encode_token,
-};
+use tx_pool::{POOL_ID_BIG, POOL_ID_SMALL, claim_first_free, decode_token, encode_token};
 use iobuf::{Chain, OwnedIOBuf};
 
 use crate::{
@@ -282,25 +279,24 @@ pub(crate) fn acquire_tx_buf_for_qp(qp: usize) -> Option<nic_api::TxBufHandle> {
         let fill = tx.fill_cnt.load(Ordering::Relaxed);
         let done = tx.done_cnt.load(Ordering::Relaxed);
         if fill.wrapping_sub(done) < tx.ring_entries as u32 {
-            for slot in 0..(TX_SMALL_POOL_SLOTS as usize) {
-                local_iters += 1;
-                if !tx.small_slot_used[slot].load(Ordering::Acquire) {
-                    tx.small_slot_used[slot].store(true, Ordering::Relaxed);
-                    // Diag: record cumulative scan-iters + acquire
-                    // count so the reader can compute the average
-                    // scan depth. Single relaxed atomic each — off
-                    // the per-packet hot path's critical chain.
-                    TX_SMALL_SCAN_ITERS.add(local_iters);
-                    TX_SMALL_ACQUIRES.bump();
-                    let qpl_offset = (slot as u32) * PAGE_SIZE;
-                    let data_ptr = (tx.qpl_base_va + qpl_offset as u64) as *mut u8;
-                    return Some(nic_api::TxBufHandle {
-                        data_ptr,
-                        data_cap: TX_MAX_PKT_LEN as u32,
-                        driver_token: encode_token(qp, slot, POOL_ID_SMALL),
-                        release_fn: release_tx_slot,
-                    });
-                }
+            let (got, scanned) =
+                claim_first_free(&tx.small_slot_used[..TX_SMALL_POOL_SLOTS as usize]);
+            local_iters += scanned as u64;
+            if let Some(slot) = got {
+                // Diag: record cumulative scan-iters + acquire count so
+                // the reader can compute the average scan depth. Single
+                // relaxed atomic each — off the per-packet hot path's
+                // critical chain.
+                TX_SMALL_SCAN_ITERS.add(local_iters);
+                TX_SMALL_ACQUIRES.bump();
+                let qpl_offset = (slot as u32) * PAGE_SIZE;
+                let data_ptr = (tx.qpl_base_va + qpl_offset as u64) as *mut u8;
+                return Some(nic_api::TxBufHandle {
+                    data_ptr,
+                    data_cap: TX_MAX_PKT_LEN as u32,
+                    driver_token: encode_token(qp, slot, POOL_ID_SMALL),
+                    release_fn: release_tx_slot,
+                });
             }
         }
         // No capacity. Force any deferred kick so the host sees

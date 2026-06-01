@@ -1,0 +1,23 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Shared TX slot-pool primitives (token codec + lock-free
+# free-bitmap claim) for NIC drivers whose TX buffers are a two-tier
+# `AtomicBool` pool keyed by (qp/worker, slot, pool) — gve-GQI and
+# virtio-net. A pure `core`-only leaf with no deps, so it sits below
+# both drivers without dragging anything in. Distinct from `nic_api`
+# (the opaque-handle contract) because this is the implementation
+# helper for one pool *pattern*, not part of the NIC interface.
+rust_library(
+    name = "tx-pool",
+    srcs = ["src/lib.rs"],
+    crate_name = "tx_pool",
+)
+
+# Inline #[cfg(test)] unit tests (token round-trip, claim/scan-depth).
+rust_test(
+    name = "tx_pool_test",
+    crate = ":tx-pool",
+)
