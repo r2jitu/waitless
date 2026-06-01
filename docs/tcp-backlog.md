@@ -1,10 +1,12 @@
-# TCP RFC conformance — status and prioritized backlog
+# TCP backlog — RFC conformance + Linux performance parity
 
 Last updated 2026-05-31.
 
-This is the authoritative list of *pending* TCP conformance work, in
-priority order. For the conformance-testing strategy and the QUIC
-roadmap see [`conformance-roadmap.md`](conformance-roadmap.md).
+The authoritative TCP work queue: *pending* RFC-conformance gaps (T-items)
+and the performance features Linux's kernel TCP has that ours doesn't
+(L-items), in priority order. The per-RFC *status* view (Have/Missing/test
+coverage) and the conformance-testing strategy + QUIC roadmap live in
+[`conformance-roadmap.md`](conformance-roadmap.md); this is the work queue.
 
 ## Current state
 

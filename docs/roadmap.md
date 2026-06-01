@@ -8,7 +8,7 @@ state is indexed in [`README.md`](README.md).
 Granular live work lives in the backlog trackers, not here:
 
 - QUIC RFC 9000/9002 — [`conformance-roadmap.md`](conformance-roadmap.md)
-- TCP RFC gaps — [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md)
+- TCP RFC gaps — [`tcp-backlog.md`](tcp-backlog.md)
 - Per-byte RX/TX cost — [`rx-path-optimizations.md`](rx-path-optimizations.md) / [`tx-path-optimizations.md`](tx-path-optimizations.md)
 - Inter-layer API contracts / the two-stacks → one-golden-path direction — [`stack-architecture.md`](stack-architecture.md)
 
@@ -25,7 +25,7 @@ depth and performance**, not new subsystems:
   The controller should be built as the **shared TCP+QUIC congestion core** (same
   CUBIC/BBR + pacer serve TCP's Linux-parity gaps) → [`stack-architecture.md`](stack-architecture.md)
   *Transport reliability*.
-- **TCP conformance + Linux performance parity** — window scaling (RFC 7323) ✅ shipped & GCE-validated; SACK, out-of-order reassembly, and the Linux-parity gaps (Reno→CUBIC/BBR, ABC, pacing, RACK-TLP) remain → [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md).
+- **TCP conformance + Linux performance parity** — window scaling (RFC 7323) ✅ shipped & GCE-validated; SACK, out-of-order reassembly, and the Linux-parity gaps (Reno→CUBIC/BBR, ABC, pacing, RACK-TLP) remain → [`tcp-backlog.md`](tcp-backlog.md).
 - **RX/TX datapath** — RX offload (HW GRO/RSC), conn-state / conn-future pools, owned-UDP zero-copy → [`rx-path-optimizations.md`](rx-path-optimizations.md) / [`tx-path-optimizations.md`](tx-path-optimizations.md).
 - **Inter-layer contracts** — converging the TCP/TLS/HTTP-1.1 and UDP/QUIC/HTTP-3 stacks onto one golden path (the `ByteStream` trait, the owned buffer currency, the NIC/reactor vtable→trait migrations) → [`stack-architecture.md`](stack-architecture.md).
 

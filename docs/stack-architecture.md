@@ -28,7 +28,7 @@ doc adds the **structure/contract locus**. The reciprocal rule:
 | per-byte / per-frame TX cost | [`tx-path-optimizations.md`](tx-path-optimizations.md) |
 | per-conn data structures, scheduling, saturation, load shedding | [`high-concurrency-perf.md`](high-concurrency-perf.md) |
 | the iobuf ownership/`Send` type model | [`iobuf-type-model.md`](iobuf-type-model.md) |
-| RFC correctness (TCP / QUIC) | [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md), [`conformance-roadmap.md`](conformance-roadmap.md) |
+| RFC correctness (TCP / QUIC) | [`tcp-backlog.md`](tcp-backlog.md), [`conformance-roadmap.md`](conformance-roadmap.md) |
 | **inter-layer contracts: buffer currency, stream trait, handler API, NIC/reactor backend abstraction, two-stacks→one-golden-path convergence, API simplification** | **this doc** |
 
 Deferral discipline: a contract change here that has a measured per-conn /
@@ -444,7 +444,7 @@ share is planned now. State today:
   tracked as RFC 9002 step 5 ([`conformance-roadmap.md`](conformance-roadmap.md)).
 - There is **no shared CC code**; the two crates are independent.
 
-Three of the [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md)
+Three of the [`tcp-backlog.md`](tcp-backlog.md)
 Linux-parity items (L1 CUBIC/BBR, L3 pacing, L4 RACK-TLP) are the TCP half of
 exactly this work.
 
@@ -639,7 +639,7 @@ where it reuses an existing tracker item it names the item.
   RFC 3465 ABC have **shipped** (the 64 KiB/RTT cap and the delayed-ACK
   slow-start penalty are gone); what remains is CUBIC/BBR, pacing, and RACK-TLP,
   which should be built as the **shared TCP+QUIC congestion core** above →
-  [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md) (L1–L5).
+  [`tcp-backlog.md`](tcp-backlog.md) (L1–L5).
 
 ## Explicitly out of scope (defer to siblings)
 

@@ -19,7 +19,7 @@ their analyses.
 | [`rx-path-optimizations.md`](rx-path-optimizations.md) | Per-byte / per-frame RX cost. Memcpy reduction, IOBuf zero-copy, **HW GRO / RSC** (items I–O — directly owns P0 #2 below). |
 | [`tx-path-optimizations.md`](tx-path-optimizations.md) | Per-byte / per-frame TX cost. Encrypt-in-place, TSO, header-fusion (items A–G). Already trimmed cycles/poll significantly; further wins here would also lift the saturation point. |
 | [`observability.md`](observability.md) | The `Counter` / `LastEvent` / `LatencyHist` primitives and the `/obs` exposure rules. The instrumentation we added (`accept_iterations`, `tick_armed_seen`, `tasks_polled_per_worker`, etc.) follows this doctrine, and the per-core `PerCoreCounter` shard variant introduced here implements the doctrine's "shard hot counters per-core" note. |
-| [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md) | TCP RFC gaps (active opens, RFC 7323 window scaling, …). The intrusive-timer-list and accept-ring work below was perf-only; semantics unchanged. |
+| [`tcp-backlog.md`](tcp-backlog.md) | TCP RFC gaps (active opens, RFC 7323 window scaling, …). The intrusive-timer-list and accept-ring work below was perf-only; semantics unchanged. |
 | [`conformance-roadmap.md`](conformance-roadmap.md) | Conformance-testing strategy + QUIC RFC backlog. |
 | [`gvnic.md`](gvnic.md) | gVNIC device behaviour, DQO vs GQI queue formats. |
 | [`iobuf-type-model.md`](iobuf-type-model.md) | The `iobuf` ownership / `Send` type model (`OwnedIOBuf`, `Chain<B>`, `IOBufRead`, the uniform drop/free contract). |
@@ -35,7 +35,7 @@ The high-level rule for "where does this fix belong?":
   * **inter-layer contracts / stack shape** (buffer currency, stream
     trait, handler API, backend abstraction, two-stacks→one-golden-path
     convergence, API simplification) → `stack-architecture.md`
-  * **RFC correctness** → `tcp-conformance-backlog.md`
+  * **RFC correctness** → `tcp-backlog.md`
 
 ## Goal
 

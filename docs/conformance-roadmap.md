@@ -1,16 +1,19 @@
-# TCP / QUIC conformance + RFC-compliance roadmap
+# Conformance — test strategy + RFC status/roadmap (TCP & QUIC)
 
-Status: in progress (steps 1-4 complete). Last updated 2026-05-28
-(QUIC RFC 9002 statuses re-verified against `conn/loss.rs` /
-`streams.rs`; frame retx + congestion controller still open).
+Status: in progress (steps 1-4 complete). Last updated 2026-05-31
+(TCP window scaling + ABC shipped — see [`tcp-backlog.md`](tcp-backlog.md);
+QUIC RFC 9002 frame retx + congestion controller still open).
 
-This doc keeps the conformance-testing **strategy** and the **QUIC
-transport** roadmap (RFC 9000/9001/9002). The per-protocol gap backlogs
-live in their own files:
-[`tcp-conformance-backlog.md`](tcp-conformance-backlog.md) (TCP +
+This doc keeps the conformance-testing **strategy** (the in-process
+harness pattern), the **sequencing**, and the per-RFC **status** view
+(Have/Missing/test coverage) for the TCP and QUIC engines — Part 2 (TCP)
+and Part 3 (QUIC transport, RFC 9000/9001/9002). The prioritized
+**work-queue backlogs** live per-protocol in their own files:
+[`tcp-backlog.md`](tcp-backlog.md) (TCP +
 Linux-parity), [`tls-backlog.md`](tls-backlog.md) (TLS 1.3),
 [`http2-backlog.md`](http2-backlog.md) (HTTP/2, not started), and
-[`http3-backlog.md`](http3-backlog.md) (HTTP/3 + QPACK app layer).
+[`http3-backlog.md`](http3-backlog.md) (HTTP/3 + QPACK app layer). Status
+view here; work queue there.
 
 ## Purpose
 
@@ -70,7 +73,7 @@ Landed:
 What remains: QUIC loss recovery + congestion (step 5) and the
 feature-breadth items (SACK, Timestamps/PAWS, and the Linux
 performance-parity gaps) — steps 6 onward. Window scaling (RFC 7323) is
-done. See [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md).
+done. See [`tcp-backlog.md`](tcp-backlog.md).
 
 ## Part 1 — Conformance-test strategy
 
@@ -162,7 +165,7 @@ optional feature.
   acceptance check, per-core connection pool.
 - **Missing**: the MSS option is never sent or parsed, the ACK field
   is not range-checked, and a SYN on a synchronized connection is
-  mishandled — see `tcp-conformance-backlog.md` (T1, T2, T4). No
+  mishandled — see `tcp-backlog.md` (T1, T2, T4). No
   delayed-ACK coalescing (we ACK immediately — correct, just not
   optimal). Zero-window persist is now implemented; the TIME-WAIT /
   FIN-WAIT timeouts are closed too — see the lifecycle-corners note.
@@ -225,7 +228,7 @@ optional feature.
   baseline only — the performance features Linux layers on top (CUBIC/BBR,
   ABC, pacing, RACK-TLP) are real gaps on adverse paths, inventoried under
   *Performance parity with the Linux TCP stack* in
-  [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md).
+  [`tcp-backlog.md`](tcp-backlog.md).
 - **Conformance test**: done — pure controller-arithmetic scenarios
   plus harness scenarios for the windowed send path (cwnd cap,
   closed-window stall + ACK-driven resume, rwnd cap, slow-start
@@ -271,7 +274,7 @@ The TIME-WAIT timer and the zero-window persist timer are done. The
 remaining smaller items — MSS-option handling, ACK-field validation,
 ECN (RFC 3168), Nagle (RFC 9293 §3.7.4), a delayed-ACK coalescer —
 are tracked, prioritized, in
-[`tcp-conformance-backlog.md`](tcp-conformance-backlog.md).
+[`tcp-backlog.md`](tcp-backlog.md).
 
 ## Part 3 — QUIC RFC roadmap
 

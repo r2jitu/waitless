@@ -135,7 +135,7 @@ why it's ~2× and not ~1.06×.
   pacing and RTO/3-dup-ACK recovery only. Those gaps — the cost side of
   the no-kernel architecture — are inventoried under *Performance parity
   with the Linux TCP stack* in
-  [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md). This page
+  [`tcp-backlog.md`](tcp-backlog.md). This page
   measures the regime where we win; it is not a WAN claim.
 - **Plain-HTTP Waitless figures are lower bounds** — we could not fully saturate
   Waitless's plain path within the GCE vCPU quota (two load generators).
