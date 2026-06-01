@@ -126,6 +126,17 @@ why it's ~2× and not ~1.06×.
 - **Small-response keep-alive `/health`** — this measures per-request
   *overhead*, the regime where the syscall tax dominates. Bulk transfer or
   compute-heavy handlers spend their time elsewhere and will narrow the gap.
+- **Low-RTT LAN/datacenter path** — these runs are co-located VMs on one
+  VPC (sub-millisecond RTT), where TCP congestion control barely engages
+  and our no-syscall architecture wins ~2×. On a **high-RTT or lossy WAN
+  path the comparison narrows or inverts**: tokio-hyper inherits the Linux
+  kernel's mature CC and loss recovery (CUBIC/BBR, packet pacing,
+  RACK-TLP, ABC), whereas our hand-rolled stack is RFC 5681 Reno with no
+  pacing and RTO/3-dup-ACK recovery only. Those gaps — the cost side of
+  the no-kernel architecture — are inventoried under *Performance parity
+  with the Linux TCP stack* in
+  [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md). This page
+  measures the regime where we win; it is not a WAN claim.
 - **Plain-HTTP Waitless figures are lower bounds** — we could not fully saturate
   Waitless's plain path within the GCE vCPU quota (two load generators).
 - **8-vCPU figures are single runs**; the tokio-hyper 8-vCPU number is

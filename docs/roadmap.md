@@ -22,7 +22,7 @@ depth and performance**, not new subsystems:
 - **QUIC loss recovery + congestion control (RFC 9002)** — the PTO timer, RTT
   estimator, and loss detection landed; **frame retransmission** and a
   **congestion controller** remain → [`conformance-roadmap.md`](conformance-roadmap.md) step 5.
-- **TCP conformance** — window scaling (RFC 7323), SACK, … → [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md).
+- **TCP conformance + Linux performance parity** — window scaling (RFC 7323) ✅ shipped & GCE-validated; SACK, out-of-order reassembly, and the Linux-parity gaps (Reno→CUBIC/BBR, ABC, pacing, RACK-TLP) remain → [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md).
 - **RX/TX datapath** — RX offload (HW GRO/RSC), conn-state / conn-future pools, owned-UDP zero-copy → [`rx-path-optimizations.md`](rx-path-optimizations.md) / [`tx-path-optimizations.md`](tx-path-optimizations.md).
 - **Inter-layer contracts** — converging the TCP/TLS/HTTP-1.1 and UDP/QUIC/HTTP-3 stacks onto one golden path (the `ByteStream` trait, the owned buffer currency, the NIC/reactor vtable→trait migrations) → [`stack-architecture.md`](stack-architecture.md).
 

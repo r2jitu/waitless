@@ -35,7 +35,7 @@ The perf docs route work by *cost locus* — see **[`high-concurrency-perf.md`](
 
 | Doc | What it owns |
 |-----|--------------|
-| [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md) | TCP RFC gaps (window scaling, SACK, active opens, …) and what's been closed. |
+| [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md) | TCP RFC gaps (SACK, out-of-order reassembly, MSS clamp, …), the **performance-parity-with-Linux** inventory (Reno-vs-CUBIC/BBR, ABC, pacing, RACK-TLP, buffer autotuning), and what's been closed (window scaling ✅). |
 | [`conformance-roadmap.md`](conformance-roadmap.md) | Conformance-testing strategy + the QUIC RFC 9000/9002 backlog. |
 
 ## Reference & how-to

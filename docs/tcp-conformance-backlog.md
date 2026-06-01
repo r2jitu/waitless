@@ -1,6 +1,6 @@
 # TCP RFC conformance — status and prioritized backlog
 
-Last updated 2026-05-28.
+Last updated 2026-05-31.
 
 This is the authoritative list of *pending* TCP conformance work, in
 priority order. For the conformance-testing strategy and the QUIC
@@ -18,7 +18,17 @@ implements and host-tests:
 - RFC 6298 — RTO retransmission, the SRTT/RTTVAR estimator,
   exponential backoff, Karn's algorithm.
 - RFC 5681 — slow start, AIMD, fast retransmit / fast recovery, and
-  a send path that paces against `min(cwnd, rwnd)`.
+  a send path that paces against `min(cwnd, rwnd)`. The initial window
+  is RFC 6928 IW10. (This is the Reno-family baseline; the performance
+  features Linux layers on top — CUBIC/BBR, ABC, pacing, RACK-TLP — are
+  inventoried under *Performance parity with the Linux TCP stack*.)
+- RFC 7323 — Window Scale: `snd_wnd` is `u32`, the peer's scale shift is
+  parsed from its SYN and applied to every post-handshake window update,
+  and the SYN-ACK echoes a Window-Scale option (we advertise
+  `rcv_wscale = 0` — our 16 KiB RX ring needs none, so our *own* receive
+  window stays ≤ 64 KiB by choice; the win is download-side). Lifts the
+  64 KiB/RTT send ceiling — GCE-validated ~4–5× on sustained high-RTT
+  downloads. Timestamps + PAWS are *not* done (see T6).
 - RFC 9293 §3.8.6.1 — zero-window persist, both roles: as sender we
   probe a peer's shut window (exponential backoff, give-up after
   `PERSIST_MAX_PROBES`); as receiver we answer an inbound bare probe
@@ -28,7 +38,7 @@ implements and host-tests:
   window-update ACK when an app drain reopens the window past one MSS,
   fired both on the drain and on any inbound segment (ce562ff).
 
-Validation: `//crates/net/tcp:tcp_test` is a 60-scenario in-process
+Validation: `//crates/net/tcp:tcp_test` is a 68-scenario in-process
 packetdrill-style harness (scripted segments → real `tcp_receive` →
 assertions on captured TX), plus production interop (`dev.r2jitu.com`
 serves real browsers / curl / openssl).
@@ -181,23 +191,39 @@ challenge-ACK rate.
 
 ## P2 — performance ceilings / feature breadth
 
-### T6 — Window scaling + timestamps (RFC 7323)
+### T6 — Window scaling ✅ done; Timestamps + PAWS still pending (RFC 7323)
 
-**What.** `rcv_wnd` / `snd_wnd` are `u16`; no `Window Scale` or
-`Timestamps` option, no PAWS.
+**Status — Window Scale: done and merged (`bd89169`).** `snd_wnd` is now
+`u32`; the peer's scale shift is parsed from its SYN (`parse_window_scale`,
+clamped at 14 per §2.3) and applied to every post-handshake window update;
+the SYN-ACK echoes a Window-Scale option only when the peer offered one,
+advertising `rcv_wscale = 0` (our 16 KiB RX ring needs no scaling, so our
+*own* receive window stays ≤ 64 KiB by design — a server mostly sends).
+Four `tcp_test` scenarios cover negotiation, the scaled update, the
+no-offer path, and the §2.3 clamp. **GCE-validated:** `ss` confirms
+`wscale:0,7` on the wire; a sustained 20 MB keep-alive transfer over
+`tc netem` ran **18.9 → 81.9 Mbps at 25 ms (4.3×)** and **9.5 → 46.2 Mbps
+at 50 ms (4.9×)**, with window-scaling-off sitting exactly on the
+64 KiB/RTT cap. (A *cold* single 1 MB transfer improved only ~12–28 % —
+slow-start/`cwnd` is the binding limit there, not `rwnd`; see *ABC* and
+*initial window* under Linux-parity. So window scaling is the lever for
+sustained / warm-connection transfers, not cold small ones.)
 
-**Triggers when.** High bandwidth-delay-product paths. The 64 KiB
-window caps a single connection's throughput at `64 KiB / RTT` — e.g.
-~1.3 MB/s at a 50 ms WAN RTT, regardless of link speed.
+**Pending — Timestamps + PAWS.** No `Timestamps` option, so no RTTM
+sample per ACK and no Protect-Against-Wrapped-Sequences. Lower priority
+than the loss/CC items: it improves RTT estimation and guards seq wrap
+on very-high-bandwidth long-lived flows.
 
-**Fix.** Widen `rcv_wnd`/`snd_wnd` to `u32` (the queue's
-`rtx_bytes_in_flight` is already `u32`, so the retx-coverage path
-takes no fixed-size cap with it); negotiate and apply the scale
-shift; add Timestamps + PAWS. Cross-cutting — touches all window
-arithmetic. **Effort: L.**
+**Triggers when.** PAWS matters on >1 Gbps long-lived single flows where
+the 32-bit sequence space can wrap within 2×MSL; Timestamps sharpen the
+RTO on paths with variable RTT.
 
-**Test.** Assert the options are echoed on the SYN-ACK and that a
-post-scale window past 64 KiB is honored.
+**Fix.** Add the `Timestamps` SYN option + per-segment TSval/TSecr, feed
+TSecr into the RTT estimator, and add the PAWS drop check.
+`rcv_wnd` stays `u16` (we advertise `rcv_wscale = 0`). **Effort: M.**
+
+**Test.** Assert Timestamps are echoed; a wrapped-sequence old segment is
+dropped by PAWS; the RTT estimator consumes TSecr.
 
 ### T7 — SACK (RFC 2018) + RFC 6675 loss recovery
 
@@ -244,6 +270,105 @@ to T3. **Effort: S.**
 
 ---
 
+## Performance parity with the Linux TCP stack
+
+The items above are mostly *RFC conformance* — correctness clauses we
+don't yet meet. This section is different: it inventories **performance
+features the Linux kernel TCP stack implements that ours does not**.
+None of these are conformance bugs — our stack is RFC 5681 / RFC 6298
+compliant — but they are the reason a mature kernel out-performs a
+hand-rolled stack on adverse (WAN, lossy, high-BDP) paths, and they are
+exactly what a `tokio-hyper`/`nginx`/any-Linux server gets *for free* by
+riding the kernel. They belong here so the "gaps vs Linux" picture is
+complete rather than implicit. (Window scaling — T6 — *was* on this list
+and is now done; it's the only one closed so far.)
+
+Why it matters for our benchmark story: on low-RTT LAN/datacenter paths
+(where [`benchmark-results.md`](benchmark-results.md) measures) congestion
+control barely engages and our no-syscall architecture wins ~2×. On
+high-RTT or lossy paths these gaps bind, and the comparison narrows or
+inverts — Linux's CC/loss-recovery is decades deep. Measured locally:
+single-connection high-RTT throughput ran ~3× below the slow-start
+textbook, traced to the missing ABC below.
+
+### L1 — Congestion control is Reno only (no CUBIC / BBR)
+
+**What.** Our controller is classic RFC 5681 Reno: slow start + AIMD
+(halve on loss, +1 MSS/RTT in avoidance). Linux defaults to **CUBIC**
+(cubic window growth — far more aggressive recovery on high-BDP paths)
+and ships **BBR** (model-based, rate/RTT estimation, loss-agnostic).
+
+**Triggers when.** High-BDP paths and any path with non-congestive loss.
+Reno's `cwnd ÷ 2` per loss + linear reopen badly underfills a fat pipe;
+CUBIC reopens cubically, BBR ignores loss as a signal entirely. The gap
+widens with bandwidth × RTT.
+
+**Fix.** The L4 vtable seam (see roadmap "Lift `tcp` above `executor`")
+is meant to let a CC algorithm be swapped in; CUBIC is the pragmatic
+first target. **Effort: L.**
+
+### L2 — No Appropriate Byte Counting (ABC, RFC 3465)
+
+**What.** `cwnd_on_ack` grows `cwnd` by `min(acked, SMSS)` *per ACK*.
+With the delayed-ACK receivers that dominate the internet (1 ACK per 2
+segments), that is one SMSS per *two* segments → slow start grows
+~1.5×/RTT instead of 2×/RTT. Linux uses ABC (count *bytes* acked, not
+ACKs), restoring the full 2×.
+
+**Triggers when.** Every cold transfer to a delayed-ACK client — this is
+the measured "~3× below textbook" on cold single-conn high-RTT downloads
+(the slow-start ramp, not `rwnd`, is what bounds those).
+
+**Fix.** In slow start, grow by `acked` (byte-counted), capped per
+RFC 3465 (≤ 2·SMSS/ACK) to bound burst. Small, high-leverage. **Effort: S.**
+
+### L3 — No packet pacing
+
+**What.** The send path bursts a full `cwnd`/window worth of segments
+back-to-back. Linux paces — spreads a window over the RTT (fq qdisc;
+mandatory under BBR).
+
+**Triggers when.** Bursts overrun shallow bottleneck buffers → loss.
+This is the safety machinery that lets Linux servers run a large initial
+window (Google IW32, Cloudflare ~30) without burst-loss — and the reason
+we *don't* raise our IW past 10 (see roadmap / the IW trade-off):
+un-paced, a larger IW is a burst-loss bet against constrained clients.
+
+**Fix.** A per-conn pacing timer / token bucket gating `async_try_send_chain`.
+Pairs with BBR (L1). **Effort: M.**
+
+### L4 — Loss recovery is RTO + 3-dup-ACK only (no RACK-TLP, no SACK)
+
+**What.** We detect loss via 3 duplicate ACKs (fast retransmit) or the
+RTO. No SACK (T7), no **RACK-TLP** (RFC 8985 — time-based loss detection
++ Tail Loss Probe), which is Linux's default loss detector since 4.18.
+
+**Triggers when.** Tail loss (the last segments of a response) and
+multi-hole loss. Without TLP a lost tail waits a full RTO (~200 ms+)
+instead of a probe-timeout (~2·RTT); without SACK, multi-hole recovery
+re-sends more than the holes. Both punish exactly the small-response
+HTTP pattern this server is built for, on a lossy path.
+
+**Fix.** RACK-TLP needs per-segment send timestamps (the retransmit ring
+can carry them); SACK is T7 (needs the T3 reassembly queue). **Effort: L.**
+
+### L5 — No receive/send buffer autotuning
+
+**What.** The per-conn RX ring is a fixed 16 KiB and we advertise
+`rcv_wscale = 0`, so our *receive* window is hard-capped at ≤ 64 KiB.
+Linux autotunes `tcp_rmem`/`tcp_wmem` per connection (up to megabytes)
+from the measured BDP.
+
+**Triggers when.** Large *uploads* to us over a high-BDP path — the
+client is throttled to 64 KiB/RTT inbound. Deliberate today (a server
+mostly sends; large uploads are rare), but it's the symmetric twin of
+the send-side cap T6 just removed, and worth recording as a known limit.
+
+**Fix.** A growable RX ring + non-zero `rcv_wscale` advertised in the
+SYN-ACK. Only worth it if upload-heavy workloads appear. **Effort: M.**
+
+---
+
 ## Test & assurance backlog
 
 The harness proves the scenarios we wrote pass; it does not measure
@@ -271,22 +396,27 @@ Not pending — explicitly out of scope:
 - **Client-side TCP** — active open, `SYN-SENT`. The stack is
   server-role; conformance targets the server role only.
 - **Exotic options** — TCP-AO, MPTCP, TCP Fast Open.
-- **The full Linux packetdrill corpus** — most of it assumes window
-  scaling / SACK / timestamps.
+- **The full Linux packetdrill corpus** — most of it assumes SACK /
+  timestamps (window scaling we now have).
 
 ## Suggested sequence
 
 Dependency-ordered, test-first per item:
 
 1. ✅ **T1** (ACK validation) — done.
-2. **T2** (MSS option + clamp) — removes the sub-1500-MTU blackhole.
-3. **T4 + T5** (SYN-on-sync + RFC 5961 challenge ACKs) — one coherent
+2. ✅ **T6 window scaling** (RFC 7323 Window Scale) — done & GCE-validated.
+   Timestamps + PAWS remain (the rest of T6).
+3. **T2** (MSS option + clamp) — removes the sub-1500-MTU blackhole.
+4. **T4 + T5** (SYN-on-sync + RFC 5961 challenge ACKs) — one coherent
    hardening change.
-4. **T3** (out-of-order reassembly) — the big one; unblocks T7/T8.
-5. **T8** (ACK out-of-window segments) — falls out of T3.
-6. **T6** (window scaling + timestamps).
+5. **T3** (out-of-order reassembly) — the big one; unblocks T7/T8.
+6. **T8** (ACK out-of-window segments) — falls out of T3.
 7. **T7** (SACK / RFC 6675).
-8. **T9–T13** — checklist, as priorities allow.
+8. **L2** (ABC) — small, the highest-leverage Linux-parity win (closes
+   the measured ~3× cold-transfer slow-start gap).
+9. **L1 / L3 / L4** (CUBIC, pacing, RACK-TLP) — the deeper CC/loss-recovery
+   parity work; gated on the L4 vtable seam and SACK (T7).
+10. **T9–T13**, **L5**, Timestamps/PAWS — checklist, as priorities allow.
 
 Test-infrastructure items (fuzzing, traceability matrix, deeper
 assertions) are worth interleaving — they make every step above

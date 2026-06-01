@@ -64,7 +64,9 @@ Landed:
   `//crates/net:classify_test`.
 
 What remains: QUIC loss recovery + congestion (step 5) and the
-feature-breadth items (window scaling, SACK) — steps 6 onward.
+feature-breadth items (SACK, Timestamps/PAWS, and the Linux
+performance-parity gaps) — steps 6 onward. Window scaling (RFC 7323) is
+done. See [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md).
 
 ## Part 1 — Conformance-test strategy
 
@@ -78,10 +80,10 @@ independent reasons:
   over gRPC). This is a bare-metal unikernel with no syscalls — neither
   harness has anything to attach to. That is why the in-process
   harness exists.
-- **Missing features.** Every general suite assumes window scaling,
-  SACK, TCP timestamps, and RFC-standard RTO. The stack has none of
-  those, so the Linux packetdrill corpus would fail on absent features
-  rather than real bugs.
+- **Missing features.** Every general suite assumes SACK, TCP
+  timestamps, and RFC-standard RTO (window scaling we now have). The
+  stack still lacks most of those, so the Linux packetdrill corpus would
+  fail on absent features rather than real bugs.
 
 The conclusion: we write our own scenarios. We can still borrow
 mature *assets* — see below.
@@ -109,8 +111,8 @@ packetdrill `.pkt` script language feeding the harness. Benefits — a
 documented DSL, readable scripts, and the ability to *cherry-pick*
 individual corpus scripts that are feature-agnostic (basic handshake,
 RST, FIN, simple duplicate-data). The bulk of the Linux corpus stays
-out of scope; scripts that need window scaling / SACK / timestamps do
-not apply until those features land.
+out of scope; scripts that need SACK / timestamps do not apply until
+those features land (window-scaling scripts now do).
 
 ### Black-box axis (secondary, for QUIC)
 
@@ -206,7 +208,7 @@ optional feature.
 ### RFC 5681 — congestion control
 
 - **Have**: the full mechanism. `cwnd`/`ssthresh` on the TCB, opened
-  at the 3·SMSS initial window; slow start, congestion avoidance,
+  at the RFC 6928 IW10 initial window; slow start, congestion avoidance,
   RTO collapse, three-dup-ACK fast retransmit / fast recovery — and
   the send path now paces transmission against `min(cwnd, rwnd)`:
   `async_try_send_chain` (and the TSO fast path) cap in-flight bytes
@@ -215,7 +217,11 @@ optional feature.
   RFC 9293 SND.WL1/WL2 rule; a zero-window stall is recovered by the
   §3.8.6.1 persist timer. The former "controller computed but
   ignored" gap is closed.
-- **Missing**: nothing material for the server role.
+- **Missing**: nothing for RFC 5681 *conformance*. But this is the Reno
+  baseline only — the performance features Linux layers on top (CUBIC/BBR,
+  ABC, pacing, RACK-TLP) are real gaps on adverse paths, inventoried under
+  *Performance parity with the Linux TCP stack* in
+  [`tcp-conformance-backlog.md`](tcp-conformance-backlog.md).
 - **Conformance test**: done — pure controller-arithmetic scenarios
   plus harness scenarios for the windowed send path (cwnd cap,
   closed-window stall + ACK-driven resume, rwnd cap, slow-start
@@ -233,14 +239,18 @@ optional feature.
 
 ### RFC 7323 — window scaling + timestamps
 
-- **Have**: nothing. `rcv_wnd` is a `u16`; no scale option, no
-  timestamp option.
-- **Missing**: the `Window Scale` and `Timestamps` SYN options, the
-  scale shift applied to all window arithmetic, and PAWS.
-- **Conformance test**: assert the options are echoed on the SYN-ACK
-  and that windows past 64 KiB are interpreted with the negotiated
-  shift. Note `rcv_wnd: u16` must widen first — a small but
-  cross-cutting change.
+- **Have**: Window Scale (done, `bd89169`). `snd_wnd` is `u32`; the
+  peer's scale shift is parsed from its SYN and applied to every
+  post-handshake window update; the SYN-ACK echoes a Window-Scale
+  option advertising `rcv_wscale = 0`. GCE-validated ~4–5× on sustained
+  high-RTT downloads.
+- **Missing**: the `Timestamps` SYN option (TSval/TSecr) and PAWS.
+  `rcv_wnd` stays `u16` by design — we advertise `rcv_wscale = 0`, so
+  our own receive window is ≤ 64 KiB (a server mostly sends; the
+  symmetric upload-side limit is tracked as L5 in the backlog).
+- **Conformance test**: window-scaling negotiation, the scaled update,
+  the no-offer path, and the §2.3 shift clamp are covered by four
+  `tcp_test` scenarios. Timestamps/PAWS tests pending the feature.
 
 ### RFC 5961 — blind in-window attack hardening
 
