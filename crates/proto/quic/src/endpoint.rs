@@ -322,7 +322,7 @@ impl QuicConn {
 
 /// Start a per-worker QUIC server bound to `port`. `cert_chain`
 /// (DER, leaf first then intermediates) and `key_pkcs8_der` are the
-/// same blobs `tls::listen` accepts — typically `include_bytes!`'d
+/// same blobs `https::listen` accepts — typically `include_bytes!`'d
 /// at compile time. `handler` runs once per accepted connection as
 /// `async fn(QuicConn) -> ()`.
 ///

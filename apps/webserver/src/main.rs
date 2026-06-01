@@ -196,14 +196,14 @@ async fn init() {
     if h3_up {
         install_alt_svc_for_h3(HTTPS_PORT);
     }
-    match tls::listen(
+    match https::listen(
         HTTPS_PORT,
         handle_request_https,
         TLS_CERT_CHAIN,
         TLS_KEY_PKCS8_DER,
     ) {
         Ok(()) => waitless::println!(
-            "listen tcp://:{} (https, TLS_AES_128_GCM_SHA256)",
+            "listen tcp://:{} (https h1.1+h2, TLS_AES_128_GCM_SHA256)",
             HTTPS_PORT
         ),
         Err(_) => waitless::println!("[WARN] https disabled (cert/key invalid)"),

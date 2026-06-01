@@ -222,6 +222,21 @@ impl From<RecordError> for HandshakeError {
 // State
 // ============================================================================
 
+/// Application protocol negotiated via ALPN (RFC 7301) during the
+/// handshake. The TLS-over-TCP path offers `http/1.1` and `h2`; the
+/// dispatch in `lib.rs` reads this once the handshake is `Established`
+/// to pick the HTTP version. (HTTP/3 over QUIC negotiates `h3`
+/// separately in `proto/quic`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlpnProtocol {
+    /// Client offered no ALPN, or none we support — default to HTTP/1.1.
+    None,
+    /// `http/1.1` — the golden path and the ALPN fallback.
+    Http11,
+    /// `h2` — HTTP/2 over TLS.
+    H2,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     /// Before any bytes have arrived.
@@ -339,6 +354,11 @@ pub struct TlsServer {
     // compute server Finished and then derive the master secret.
     pub(crate) server_hs_secret: Option<[u8; HASH_LEN]>,
     pub(crate) client_hs_secret: Option<[u8; HASH_LEN]>,
+
+    // ALPN protocol selected from the ClientHello (RFC 7301). Set in
+    // `do_client_hello`; read by the post-handshake dispatch in
+    // `lib.rs` to choose HTTP/1.1 vs HTTP/2.
+    pub(crate) negotiated_alpn: AlpnProtocol,
 }
 
 impl Drop for TlsServer {
@@ -431,6 +451,7 @@ impl TlsServer {
             addr_of_mut!((*this).server_ap_tk).write(None);
             addr_of_mut!((*this).server_hs_secret).write(None);
             addr_of_mut!((*this).client_hs_secret).write(None);
+            addr_of_mut!((*this).negotiated_alpn).write(AlpnProtocol::None);
         }
     }
 
@@ -478,6 +499,7 @@ impl TlsServer {
         self.server_hs_tk = None;
         self.client_ap_tk = None;
         self.server_ap_tk = None;
+        self.negotiated_alpn = AlpnProtocol::None;
         // server_hs_secret / client_hs_secret already cleared above.
     }
 
@@ -494,6 +516,25 @@ impl TlsServer {
             self.tx_pos = 0;
         }
         n
+    }
+
+    /// `true` once the handshake has completed and application data can
+    /// flow. The dispatch in `lib.rs` pumps until this is true, then
+    /// reads [`Self::negotiated_alpn`] to pick the HTTP version.
+    pub fn is_established(&self) -> bool {
+        self.state == State::Established
+    }
+
+    /// `true` when the connection has reached a terminal state (peer
+    /// close / fatal error) — the dispatch treats this as a failed
+    /// handshake.
+    pub fn is_terminated(&self) -> bool {
+        matches!(self.state, State::Closed | State::Failed)
+    }
+
+    /// The ALPN protocol selected during the handshake.
+    pub fn negotiated_alpn(&self) -> AlpnProtocol {
+        self.negotiated_alpn
     }
 
     /// `true` when an undelivered decrypted plaintext record is

@@ -51,7 +51,7 @@ impl From<QuicListenError> for ListenError {
 /// HEADERS + DATA + FIN on the request stream.
 ///
 /// `cert_chain` (DER, leaf first then intermediates) and
-/// `key_pkcs8_der` are the same blobs `tls::listen` accepts.
+/// `key_pkcs8_der` are the same blobs `https::listen` accepts.
 ///
 /// Returns once the server is bound; the listener stays alive for
 /// the duration of the program (waitless's task system retains it).

@@ -39,7 +39,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::keys::{ct_eq_32, derive_finished_key, hmac_sha256};
 use crate::profile;
-use crate::server::{HandshakeError, State, TX_BUF_LEN, TlsServer, TlsServerConfig};
+use crate::server::{AlpnProtocol, HandshakeError, State, TX_BUF_LEN, TlsServer, TlsServerConfig};
 use crate::ticket::{
     SEALED_LEN, TICKET_LIFETIME_SECONDS, TICKET_VERSION, TicketPlaintext, open_ticket, seal_ticket,
 };
@@ -252,9 +252,11 @@ impl TlsServer {
         // copy the chosen name into a small stack array so we can
         // use it later in EncryptedExtensions. `selected_alpn_len`
         // == 0 means "client didn't offer ALPN" — we skip the
-        // extension entirely in that case.
+        // extension entirely in that case. `negotiated` records the
+        // choice for the post-handshake HTTP-version dispatch.
         let mut selected_alpn = [0u8; 8]; // longest currently-supported is "http/1.1" (8)
         let mut selected_alpn_len: usize = 0;
+        let mut negotiated = AlpnProtocol::None;
 
         let (client_x25519_pub, session_id_echo, sid_len, resume_accept) = {
             let ch = ClientHello::parse(hs_body).map_err(|_| HandshakeError::UnsupportedClient)?;
@@ -271,17 +273,35 @@ impl TlsServer {
             // selected name in EncryptedExtensions. Modern Chrome
             // refuses to fall back on a missing-ALPN ServerHello
             // when it offered `h2,http/1.1` — surfaces as
-            // ERR_SSL_PROTOCOL_ERROR. We don't speak HTTP/2, so
-            // `http/1.1` is the only protocol we select on the
-            // TCP/TLS path. (HTTP/3 is selected separately by
-            // `quic`'s own EncryptedExtensions builder.)
+            // ERR_SSL_PROTOCOL_ERROR.
+            //
+            // Server preference: `h2` over `http/1.1` (any h2-capable
+            // client gets multiplexing). HTTP/1.1 stays the fallback
+            // for clients that don't offer h2 — it remains the golden
+            // path, just no longer the only choice. (HTTP/3 is selected
+            // separately by `quic`'s own EncryptedExtensions builder.)
             if let Some(alpn_list) = ch.alpn_protocol_list {
+                let mut offered_h2 = false;
+                let mut offered_h11 = false;
                 for name in iter_alpn(alpn_list) {
-                    if name == b"http/1.1" {
-                        selected_alpn[..name.len()].copy_from_slice(name);
-                        selected_alpn_len = name.len();
-                        break;
+                    if name == b"h2" {
+                        offered_h2 = true;
+                    } else if name == b"http/1.1" {
+                        offered_h11 = true;
                     }
+                }
+                let selected: &[u8] = if offered_h2 {
+                    negotiated = AlpnProtocol::H2;
+                    b"h2"
+                } else if offered_h11 {
+                    negotiated = AlpnProtocol::Http11;
+                    b"http/1.1"
+                } else {
+                    b""
+                };
+                if !selected.is_empty() {
+                    selected_alpn[..selected.len()].copy_from_slice(selected);
+                    selected_alpn_len = selected.len();
                 }
             }
 
@@ -298,6 +318,9 @@ impl TlsServer {
 
             (pub_key, sid, sid_len, resume_accept)
         };
+        // Remember the negotiated protocol for the post-handshake
+        // HTTP-version dispatch (read once the conn is Established).
+        self.negotiated_alpn = negotiated;
         if resume_accept.is_some() {
             trace::step(b"[tls] ClientHello parsed (resumed)\n");
         } else {

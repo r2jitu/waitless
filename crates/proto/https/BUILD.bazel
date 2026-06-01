@@ -1,0 +1,31 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# The HTTPS server: TLS-over-TCP listener + per-connection HTTP-version
+# dispatch. Composes the pure `//crates/proto/tls` state machine with the
+# transport-agnostic HTTP serve loops (`//crates/proto/http` for H1.1,
+# `//crates/proto/http2` for H2), selecting between them by ALPN. Keeping
+# this composition in its own crate is what lets `proto/tls` carry no
+# `http`/`http2` dependency — the same shape as `proto/http3` being its
+# own listener over `proto/quic`.
+rust_library(
+    name = "https",
+    srcs = ["src/lib.rs"],
+    crate_name = "https",
+    deps = [
+        "//crates/proto/http",
+        "//crates/proto/http2",
+        "//crates/proto/tls",
+        "//crates/runtime/worker",
+        "//crates/util/iobuf",
+        "//crates/waitless",
+    ],
+)
+
+rust_test(
+    name = "https_test",
+    size = "small",
+    crate = ":https",
+)

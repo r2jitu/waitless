@@ -1,7 +1,7 @@
 // Byte-level transport abstraction for the HTTP server.
 //
 // `HttpStream` is the trait `serve_conn` drives — plain HTTP uses
-// `TcpStream` directly; HTTPS wraps it in `tls::TlsStream`; HTTP/3
+// `TcpStream` directly; HTTPS wraps it in `https::TlsStream`; HTTP/3
 // hands a pre-buffered `NullStream` so the same handler signature
 // works across all three.
 
@@ -13,7 +13,7 @@ use crate::body::BodyReader;
 //
 // `HttpStream` is the byte-level interface the conn handler uses
 // to talk to a peer. Plain HTTP impls it directly over
-// `TcpStream`; HTTPS impls it via `tls::TlsStream`, which
+// `TcpStream`; HTTPS impls it via `https::TlsStream`, which
 // pumps the TLS state machine inside `recv` / `send` so the
 // handler stays protocol-agnostic.
 //
@@ -43,7 +43,7 @@ pub trait HttpStream {
     /// The default returns `None`: [`NullStream`] (HTTP/3, body
     /// pre-buffered) has no streaming chunk path, and `BodyReader`
     /// then serves the body from its prebuf alone.
-    /// `waitless::runtime::TcpStream` and `tls::TlsStream` override
+    /// `waitless::runtime::TcpStream` and `https::TlsStream` override
     /// this with their real `recv_chunk` implementations.
     ///
     /// `&mut self` is load-bearing, not incidental — the returned

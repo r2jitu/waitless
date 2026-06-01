@@ -3,14 +3,15 @@ load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# TLS 1.3 protocol stack for HTTPS-over-TCP.
+# TLS 1.3 protocol stack (sans-io).
 #
-# After the //crates/net:tls{,_crypto,_handshake,_record} merger, this
-# crate owns the FULL TLS implementation: sans-io primitives
-# (`schedule`, `aead`, `handshake`, `record`) plus the per-conn
-# server state machine. //crates/proto/quic depends on `schedule` / `aead`
-# / `handshake` for its TLS-over-CRYPTO-frames driver; HTTPS apps
-# use the higher-level `acceptor` / `listen` API.
+# Owns the FULL TLS implementation: sans-io primitives (`schedule`,
+# `aead`, `handshake`, `record`) plus the per-conn server state machine.
+# Transport- and HTTP-agnostic — NO `http`/`http2` dep. //crates/proto/quic
+# depends on `schedule` / `aead` / `handshake` for its
+# TLS-over-CRYPTO-frames driver; //crates/proto/https drives this state
+# machine over TCP and owns the `listen` / `HttpStream` adapter + the
+# ALPN dispatch to the HTTP serve loops.
 #
 # To enable diagnostic tracing add `--cfg=tls_debug` to rustc_flags
 # below. When unset, the trace module compiles to no-op stubs with
@@ -80,8 +81,6 @@ rust_library(
     }),
     deps = [
         "//crates/crypto/aes-gcm",
-        "//crates/proto/http",
-        "//crates/runtime/worker",
         "//crates/util/iobuf",
         # `obs::{Counter, LastEvent}` — the shared observability
         # primitives (`docs/observability.md`).
