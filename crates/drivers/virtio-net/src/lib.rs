@@ -74,11 +74,19 @@ pub(crate) const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
 /// Driver handles packets with partial checksum (host computes for us).
 /// Prerequisite for `VIRTIO_NET_F_HOST_TSO4`.
 pub(crate) const VIRTIO_NET_F_CSUM: u32 = 1 << 0;
+// MAC / MRG_RXBUF / STATUS are consumed only by the aarch64 MMIO
+// bring-up path (`init.rs`, where the import is the matching
+// `#[cfg(target_arch = "aarch64")]`); gate the declarations the same
+// way so x86_64 — which negotiates these generically and never names
+// the consts — doesn't see them as dead code under `-D warnings`.
+#[cfg(target_arch = "aarch64")]
 pub(crate) const VIRTIO_NET_F_MAC: u32 = 1 << 5;
 /// Device segments a driver-supplied TCPv4 GSO super-segment host-side
 /// (`gso_type=TCPV4` + `gso_size=MSS`) — saves the per-MSS TX loop.
 pub(crate) const VIRTIO_NET_F_HOST_TSO4: u32 = 1 << 11;
+#[cfg(target_arch = "aarch64")]
 pub(crate) const VIRTIO_NET_F_MRG_RXBUF: u32 = 1 << 15;
+#[cfg(target_arch = "aarch64")]
 pub(crate) const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
 pub(crate) const VIRTIO_NET_F_CTRL_VQ: u32 = 1 << 17;
 pub(crate) const VIRTIO_NET_F_MQ: u32 = 1 << 22;
