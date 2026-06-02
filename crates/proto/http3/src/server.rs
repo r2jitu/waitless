@@ -17,12 +17,15 @@
 // Sans-allocation hot path: each request reuses `Request` /
 // `BufWriter`-style scratch buffers from the conn handler.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 
 use quic::{QuicConn, QuicListenError, quic_listen};
 
-use http::{BodyReader, Method, Request, Response};
+use http::{BodyReader, BodySource, IOBuf, Method, Request, Response};
 
 use crate::frame::{self, ftype as h3_ftype};
 use crate::qpack::{self, FieldSink};
@@ -221,10 +224,6 @@ pub(crate) struct Scratch {
     /// HEADERS-frame body, copied out of `recv_buf` before the
     /// outer `drain` invalidates the borrow into it.
     pub(crate) headers_value: Vec<u8>,
-    /// Reassembled request body across DATA frames (POST/PUT).
-    /// Empty path for GET. Kept as scratch so an occasional POST
-    /// on the same conn doesn't allocate.
-    pub(crate) data: Vec<u8>,
     /// Pool of `Box<[u8]>` storage for response-framing IOBufs.
     /// Each `write_response` takes one from the pool, builds the
     /// HEADERS+QPACK+DATA framing IOBuf in it, and hands the
@@ -246,9 +245,6 @@ impl Scratch {
             // 4 KiB covers Chrome's typical HEADERS frame size
             // (compressed pseudo + a dozen literal headers).
             headers_value: Vec::with_capacity(4 * 1024),
-            // Empty by default; will allocate if a request body
-            // arrives.
-            data: Vec::new(),
             framing_pool: FramingPool::new(),
         }
     }
@@ -381,35 +377,35 @@ async fn handle_request<H>(conn: &QuicConn, sid: u64, handler: &H, scratch: &mut
 where
     H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
 {
-    // Accumulate stream bytes until we have a complete H3 frame
-    // sequence: HEADERS frame, then 0+ DATA frames, then FIN.
+    // Read just far enough to parse the HEADERS frame, then dispatch
+    // and stream the body (any later DATA frames) lazily — no
+    // whole-body buffer, so uploads aren't capped at a fixed RX size.
     //
-    // Buffer cap: enough for our worst-case single request (path +
-    // headers + small body). Match `http::Request`'s 8 KiB body.
-    // `scratch` is per-conn; we clear and reuse capacity across
-    // requests on the same connection.
-    const RECV_CAP: usize = 16 * 1024;
+    // Cap only the pre-HEADERS accumulation: a request's HEADERS frame
+    // (QPACK field section) is small, so this guards a malicious
+    // oversized one without bounding the body. Any bytes left in `buf`
+    // after the HEADERS frame are the start of the DATA stream — they
+    // seed the body source below.
+    const HEADERS_CAP: usize = 64 * 1024;
     scratch.recv_buf.clear();
     scratch.headers_value.clear();
-    scratch.data.clear();
     let buf = &mut scratch.recv_buf;
     let headers_value = &mut scratch.headers_value;
-    let data = &mut scratch.data;
     let mut chunk = [0u8; 4096];
     let mut headers_seen = false;
     let mut eof = false;
 
     crate::h3_event!(requests_received, "sid={}", sid);
-    while !eof {
+    while !headers_seen && !eof {
         let (n, end) = conn.recv(sid, &mut chunk).await;
         if n > 0 {
-            if buf.len() + n > RECV_CAP {
+            if buf.len() + n > HEADERS_CAP {
                 crate::h3_drop!(
                     recv_buffer_overflow,
                     "sid={} buf_len={} cap={}",
                     sid,
                     buf.len(),
-                    RECV_CAP
+                    HEADERS_CAP
                 );
                 conn.close_stream(sid);
                 return;
@@ -420,7 +416,7 @@ where
             eof = true;
         }
 
-        // Try to parse complete frames off the front.
+        // Parse complete frames off the front, stopping at HEADERS.
         loop {
             let (f, used) = match frame::parse_frame(buf) {
                 Ok(x) => x,
@@ -437,26 +433,19 @@ where
                     return;
                 }
             };
-            match f {
-                frame::Frame::Headers(body) => {
-                    // Copy into per-conn scratch BEFORE the outer
-                    // `buf.drain` invalidates the borrow.
-                    headers_value.clear();
-                    headers_value.extend_from_slice(body);
-                    headers_seen = true;
-                }
-                frame::Frame::Data(body) => {
-                    data.extend_from_slice(body);
-                }
-                frame::Frame::Settings(_) | frame::Frame::GoAway(_) => {
-                    // Illegal on a request stream — but be lenient.
-                }
-                frame::Frame::Skipped { .. } => {}
+            if let frame::Frame::Headers(body) = f {
+                // Copy into per-conn scratch BEFORE the `buf.drain`
+                // invalidates the borrow.
+                headers_value.clear();
+                headers_value.extend_from_slice(body);
+                headers_seen = true;
             }
+            // Skip any control / grease frames that precede HEADERS;
+            // DATA-before-HEADERS is illegal but we just consume it.
             buf.drain(..used);
-        }
-        if eof && headers_seen {
-            break;
+            if headers_seen {
+                break;
+            }
         }
     }
     crate::diag::COUNTERS.read_loop_completed.bump();
@@ -538,19 +527,32 @@ where
             return;
         }
     }
-    // Tell the request its Content-Length so the handler can
-    // budget reads — for h3 the entire body is already
-    // reassembled in `data`, but `BodyReader::chunk()` still
-    // needs a stop point that matches the prebuf length.
-    req.set_content_length(data.len());
+    // Declared body length (if any) — bounds the streamed read; absent
+    // means the body is delimited only by FIN, which the source detects.
+    let content_length = req.header(b"content-length").and_then(parse_content_length);
+    if let Some(cl) = content_length {
+        req.set_content_length(cl);
+    }
 
     crate::diag::COUNTERS.user_handler_invoked.bump();
-    // Build a `BodyReader` whose `prebuf` is the fully-buffered body.
-    // No source (`None`) — h3 reassembles the whole body before
-    // dispatch, so `total == prebuf.len()` and the reader never reaches
-    // a stream-refill path.
-    let mut body = BodyReader::new(None, &data[..], data.len());
-    let response = handler(&req, &mut body).await;
+    // Stream the body: `H3BodySource` parses later DATA frames lazily
+    // from the QUIC stream (seeded with the bytes already read after
+    // HEADERS), so the handler sees the same `BodyReader` streaming
+    // interface as HTTP/1.1 and large uploads aren't buffered whole.
+    let mut src = H3BodySource::new(conn, sid, buf.clone(), eof);
+    let response = {
+        let mut body = BodyReader::new_streaming(Some(&mut src), &[], content_length);
+        handler(&req, &mut body).await
+    };
+    // The handler returned; abandon any unread request body WITHOUT
+    // awaiting it. The old `body.discard().await` parked forever on a
+    // peer that declared a Content-Length then stalled (no FIN) — and
+    // because h3 dispatches request streams inline in the conn task (no
+    // per-stream spawn), that stalled every *other* stream on the same
+    // connection too. `discard_recv` drops the buffered bytes + credits
+    // the connection window synchronously; any further DATA stays bounded
+    // by the (now enforced) receive window and is reaped at conn close.
+    conn.discard_recv(sid);
     crate::diag::COUNTERS.user_handler_returned.bump();
     let status = response.status;
     // Encode response: HEADERS + DATA + FIN.
@@ -558,6 +560,120 @@ where
     crate::diag::COUNTERS.write_response_completed.bump();
     crate::h3_event!(requests_handled, "sid={} status={}", sid, status);
     crate::diag::COUNTERS.responses_sent.bump();
+}
+
+/// Parse a `content-length` header value (ASCII decimal). `None` if
+/// empty or non-numeric — the body is then treated as unknown-length
+/// (FIN-delimited).
+fn parse_content_length(v: &[u8]) -> Option<usize> {
+    if v.is_empty() {
+        return None;
+    }
+    let mut n: usize = 0;
+    for &b in v {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+    }
+    Some(n)
+}
+
+/// Streams a request body off one QUIC stream: parses DATA frames out
+/// of the stream bytes (seeded with whatever was read after HEADERS,
+/// then pulling more via `conn.recv(sid, …)`) and yields each payload
+/// as an owned `IOBuf`. A trailing HEADERS frame (trailers) or FIN ends
+/// the body. This is the h3 implementation of `http::BodySource`, so a
+/// streamed h3 body reaches the handler through the same `BodyReader`
+/// as HTTP/1.1 — no whole-body buffering, no upload-size cap.
+///
+/// The DATA payload is copied out of the parse buffer (same per-frame
+/// copy the old buffered path paid); true zero-copy would need the QUIC
+/// recv path to surface `IOBuf`s (rx-path item L), out of scope here.
+struct H3BodySource<'c> {
+    conn: &'c QuicConn,
+    sid: u64,
+    /// Raw stream bytes not yet parsed into DATA payloads.
+    buf: Vec<u8>,
+    /// The QUIC stream has signalled FIN; no more bytes will arrive.
+    eof: bool,
+    /// Body is finished (FIN reached with the buffer drained, trailers
+    /// seen, or a parse error) — further `next_chunk` calls return None.
+    done: bool,
+}
+
+impl<'c> H3BodySource<'c> {
+    fn new(conn: &'c QuicConn, sid: u64, buf: Vec<u8>, eof: bool) -> Self {
+        H3BodySource {
+            conn,
+            sid,
+            buf,
+            eof,
+            done: false,
+        }
+    }
+}
+
+impl BodySource for H3BodySource<'_> {
+    fn next_chunk(&mut self) -> Pin<Box<dyn Future<Output = Option<IOBuf>> + '_>> {
+        Box::pin(async move {
+            if self.done {
+                return None;
+            }
+            // Owned action so the immutable `parse_frame` borrow of
+            // `self.buf` ends before we mutate `self.buf` / `self`.
+            enum Act {
+                Data(Vec<u8>),
+                Skip,
+                Need,
+                Done,
+            }
+            loop {
+                let (act, used) = match frame::parse_frame(&self.buf) {
+                    Ok((frame::Frame::Data(payload), used)) => (Act::Data(payload.to_vec()), used),
+                    // Trailing HEADERS (trailers) — end of body.
+                    Ok((frame::Frame::Headers(_), used)) => (Act::Done, used),
+                    // Control / grease frame interleaved in the body — skip.
+                    Ok((_, used)) => (Act::Skip, used),
+                    Err(frame::FrameError::Truncated) => (Act::Need, 0),
+                    Err(_) => (Act::Done, 0),
+                };
+                match act {
+                    Act::Data(payload) => {
+                        self.buf.drain(..used);
+                        return Some(IOBuf::from(payload));
+                    }
+                    Act::Skip => {
+                        self.buf.drain(..used);
+                        continue;
+                    }
+                    Act::Done => {
+                        self.buf.drain(..used);
+                        self.done = true;
+                        return None;
+                    }
+                    Act::Need => {
+                        if self.eof {
+                            self.done = true;
+                            return None;
+                        }
+                        let mut chunk = [0u8; 4096];
+                        let (n, end) = self.conn.recv(self.sid, &mut chunk).await;
+                        if n > 0 {
+                            self.buf.extend_from_slice(&chunk[..n]);
+                        }
+                        if end {
+                            self.eof = true;
+                        }
+                        if n == 0 && self.eof {
+                            self.done = true;
+                            return None;
+                        }
+                    }
+                }
+            }
+        })
+    }
 }
 
 /// Maximum bytes an H3 frame header (type varint + length

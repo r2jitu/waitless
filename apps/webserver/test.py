@@ -28,6 +28,7 @@ import unittest
 from scripts.test_helpers import (
     PtyLauncher,
     h3_get,
+    h3_post,
     http_get,
     https_get,
     https_session_resume_check,
@@ -392,6 +393,28 @@ class WebserverServiceTest(unittest.TestCase):
                 status, body = h3_get(path, port=TLS_PORT)
                 self.assertEqual(status, 200)
                 self._assert_full_html(body, title, active)
+
+    def test_h3_upload_streams_past_old_cap(self) -> None:
+        """POST a 64 KiB body over HTTP/3 to `/discard`.
+
+        Regression guard for the streamed request-body work: h3 used to
+        buffer the whole body in a fixed 16 KiB `RECV_CAP` and close the
+        stream on overflow, so an upload this size would have failed.
+        With `H3BodySource` the body streams through `BodyReader`
+        (no whole-body buffer, no cap), so `/discard` drains all 64 KiB
+        and returns 200. Exercises the streaming path end-to-end —
+        dispatch-after-HEADERS, incremental DATA parsing, FIN-delimited
+        drain — that GET-only tests never touch.
+
+        Sized at 64 KiB: comfortably past the old 16 KiB cap, but under
+        the QUIC `initial_max_stream_data` window (256 KiB) so the test
+        doesn't depend on `MAX_STREAM_DATA` flow-control extension (a
+        separate QUIC-transport item)."""
+        payload = (b"waitless-h3-upload!" * 4000)[: 64 * 1024]  # 64 KiB
+        self.assertGreater(len(payload), 16 * 1024, "must exceed the old cap")
+        status, body = h3_post("/discard", payload, port=TLS_PORT)
+        self.assertEqual(status, 200, "large h3 upload should stream, not overflow")
+        self.assertIn(b"discarded", body)
 
     def test_h3_burst_20_conns(self) -> None:
         """20 sequential HTTP/3 GETs over fresh connections.

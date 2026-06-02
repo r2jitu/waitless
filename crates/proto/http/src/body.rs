@@ -47,8 +47,13 @@ pub struct BodyReader<'a> {
     /// runs.
     prebuf: &'a [u8],
     prebuf_consumed: usize,
-    /// Total body length declared by the request's Content-Length.
-    total: usize,
+    /// Body length limit. `Some(n)` — exactly `n` bytes (the request's
+    /// `Content-Length`); the reader stops there and leaves the
+    /// transport at the next pipelined request. `None` — unknown length
+    /// (an h2/h3 body delimited only by END_STREAM/FIN, no
+    /// `content-length`); the reader streams until the source reports
+    /// EOF.
+    limit: Option<usize>,
     /// Bytes already handed to the handler via `chunk`.
     delivered: usize,
     /// Post-body residue captured when a transport chunk straddled the
@@ -74,7 +79,32 @@ impl<'a> BodyReader<'a> {
             source,
             prebuf: &prebuf[..prebuf_avail],
             prebuf_consumed: 0,
-            total,
+            limit: Some(total),
+            delivered: 0,
+            leftover: None,
+        }
+    }
+
+    /// Construct a reader whose length may be unknown — for framed
+    /// transports (h2/h3) where the body is delimited by END_STREAM/FIN.
+    /// `content_length` is `Some(n)` when the request declared one (the
+    /// reader behaves exactly like [`new`](Self::new)), or `None` to
+    /// stream until the source reports EOF. `prebuf` carries any body
+    /// bytes already read alongside the headers.
+    pub fn new_streaming(
+        source: Option<&'a mut dyn BodySource>,
+        prebuf: &'a [u8],
+        content_length: Option<usize>,
+    ) -> Self {
+        let prebuf_avail = match content_length {
+            Some(n) => prebuf.len().min(n),
+            None => prebuf.len(),
+        };
+        BodyReader {
+            source,
+            prebuf: &prebuf[..prebuf_avail],
+            prebuf_consumed: 0,
+            limit: content_length,
             delivered: 0,
             leftover: None,
         }
@@ -88,12 +118,15 @@ impl<'a> BodyReader<'a> {
         self.leftover
     }
 
-    /// Bytes still to be delivered.
+    /// Bytes still to be delivered. Meaningful only for a
+    /// known-length body (`Some` limit); an unknown-length (streamed)
+    /// body reports 0 (its callers consume via `chunk` until `None`,
+    /// not by counting).
     pub fn remaining(&self) -> usize {
-        self.total - self.delivered
+        self.limit.map_or(0, |t| t.saturating_sub(self.delivered))
     }
 
-    /// True once the body is fully consumed.
+    /// True once the body is fully consumed (or known-empty).
     pub fn is_empty(&self) -> bool {
         self.remaining() == 0
     }
@@ -119,10 +152,16 @@ impl<'a> BodyReader<'a> {
     ///     `leftover` (zero-copy via `into_remainder`) for the serve
     ///     loop to carry forward.
     pub async fn chunk(&mut self) -> Option<BodyChunkGuard<'_>> {
-        if self.delivered >= self.total {
-            return None;
-        }
-        let want_max = self.total - self.delivered;
+        let want_max = match self.limit {
+            Some(t) => {
+                if self.delivered >= t {
+                    return None;
+                }
+                t - self.delivered
+            }
+            // Unknown length — take whatever the source yields, until EOF.
+            None => usize::MAX,
+        };
 
         // 1. Drain prebuf first — zero-copy, the bytes already sit in
         //    the serve loop's parse buffer.
@@ -189,15 +228,20 @@ impl<'a> BodyReader<'a> {
     /// if the transport closed before delivering all `Content-Length`
     /// bytes — caller's contract is to tear the connection down.
     pub async fn discard(&mut self) -> Result<(), ()> {
-        while self.delivered < self.total {
+        loop {
+            if let Some(t) = self.limit
+                && self.delivered >= t
+            {
+                return Ok(());
+            }
             match self.chunk().await {
                 Some(g) if !g.data().is_empty() => {}
-                // `None` (or an empty chunk) before `delivered` reached
-                // `total` — the transport closed mid-body.
-                _ => return Err(()),
+                // EOF. For a known length not yet reached, the transport
+                // closed mid-body (`Err`); for an unknown-length stream,
+                // EOF is the clean end (`Ok`).
+                _ => return if self.limit.is_some() { Err(()) } else { Ok(()) },
             }
         }
-        Ok(())
     }
 }
 
