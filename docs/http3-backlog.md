@@ -22,8 +22,12 @@ stream** + an (empty) **SETTINGS** frame, **HEADERS**/**DATA** request and
 response framing (`frame.rs`), **QPACK** encode/decode (`qpack.rs`,
 static-table-only), the RFC 9204 static table (`static_table.rs`) and the
 RFC 7541 Huffman codec (`huffman.rs`). The request/response/body types and
-handler API are the shared `proto/http` core. Validated live against
-Chrome/Safari/Firefox over `udp:443`.
+handler API are the shared `proto/http` core. **Request bodies stream**
+(`H3BodySource` feeds `BodyReader` from live DATA frames — no whole-body
+buffer, no fixed cap), and the QUIC transport reactively extends
+MAX_STREAM_DATA / MAX_DATA so an upload runs past the initial window
+(see [`conformance-roadmap.md`](conformance-roadmap.md) RFC 9000).
+Validated live against Chrome/Safari/Firefox over `udp:443`.
 
 ## Gaps — priority order
 

@@ -288,11 +288,19 @@ on top (RFC 9114 framing + RFC 9204 QPACK) is tracked in
 
 - **Have**: long/short header parsing, connection IDs, the connection
   state machine, frame encode/decode, streams, the UDP endpoint
-  routing datagrams to connection tasks. `quic_test` covers wire
-  formats, frame round-trips, and packet-number decode.
-- **Missing**: audit needed for flow control (MAX_DATA /
-  MAX_STREAM_DATA), connection migration, and the full transport-
-  parameter set.
+  routing datagrams to connection tasks. **Receive-side flow control**:
+  advertised initial limits plus reactive MAX_STREAM_DATA / MAX_DATA
+  crediting that slides each window forward as the app drains, so an
+  upload runs past the initial window (`conn/tx.rs` pull-emission +
+  `RecvStream::recv_max` / `Connection::data_consumed`; validated by a
+  1.5 MiB h3 upload). `quic_test` covers wire formats, frame
+  round-trips, packet-number decode, and the MAX_* frame writers.
+- **Missing**: audit needed for **send-side** flow control (honoring
+  the peer's MAX_DATA / MAX_STREAM_DATA when *we* transmit — fine for
+  small responses today, unaudited for large ones), connection
+  migration, and the full transport-parameter set. Lost MAX_* frames
+  aren't retransmitted (shared with the frame-retx gap below); a newer
+  credit supersedes a lost one as consumption advances.
 - **Conformance test**: extend `quic_test` with scripted-packet
   cases — the harness already exists; this is additive.
 

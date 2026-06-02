@@ -163,11 +163,41 @@ landed this session; the rate-limit-flood guard is still open.
 
 - **H2-10 — Streaming request bodies.** Request DATA frames are buffered
   whole (capped at `MAX_BODY` = 256 KiB; larger → `RST_STREAM`) and handed
-  to the handler via a prebuf `BodyReader`, mirroring the h3 server. A body
-  past the cap is rejected rather than streamed. Streaming through
-  `BodyReader` over live DATA frames (so an arbitrarily large upload flows
-  without buffering) needs the same `recv_chunk`-style plumbing the h3
-  streaming-body follow-up wants — defer with it.
+  to the handler via a prebuf `BodyReader`, mirroring the old h3 server.
+  A body past the cap is rejected rather than streamed.
+
+  **h2 is now the only non-streaming transport** — h1.1 always streamed,
+  and h3 now streams (`H3BodySource` + the QUIC receive-flow-control
+  extension uncap h3 uploads). h2 stayed buffered because, unlike the
+  per-stream h3/h1.1 case, true h2 streaming is a multiplexing-server
+  rework, not a `recv_chunk` swap. The serve loop (`serve_conn`) owns one
+  TLS stream and runs it **serially** — `flush` (write) → `read_frame`
+  (read) → `process_frame` (dispatch the handler *inline*). To stream, the
+  handler must receive DATA *while* frame-reading continues. Three shapes,
+  all with real correctness load:
+
+  1. **Reentrant body source** — the body source itself calls `read_frame`,
+     returns DATA for its stream, and buffers other streams' frames for
+     after the handler returns. Keeps the current serial (one-handler)
+     concurrency. Hazards: HPACK is order-sensitive across the whole
+     connection, so deferred HEADERS must be *decoded* in wire order;
+     CONTINUATION means a deferred header block spans frames; receive
+     flow-control (WINDOW_UPDATE crediting) must run during the reentrant
+     reads.
+  2. **Per-stream handler tasks** — demux task routes DATA to per-stream
+     body channels; handlers run concurrently; a writer coordinates the
+     single TLS stream. True multiplexing, but needs read/write **split**
+     of the TLS stream (concurrent reader + writer on one connection) and
+     two channels per stream.
+  3. **Cooperative `select`** — keep one task owning the stream, store the
+     in-flight handler future, `select(read_frame, handler_fut)`. Avoids a
+     stream split but gives up multiplexing (one in-flight handler), same
+     as today.
+
+  Low priority: h2 in practice is GETs + small POSTs (≤ 256 KiB buffers
+  fine); large uploads ride h1.1/h3, which stream. Pick (1) for the
+  smallest diff that matches today's serial concurrency, (2) for real
+  multiplexing if h2 upload concurrency ever matters.
 - **H2-11 — Zero-copy DATA framing.** `next_output_frame` copies each
   outbound DATA frame's payload out of the response `IOBufChain` into a
   fresh `Vec` (bounded by `MAX_FRAME_SIZE` per frame). Correct and
