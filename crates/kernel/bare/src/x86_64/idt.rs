@@ -340,7 +340,50 @@ pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
             crate::serial::print_hex(rflags);
             crate::serial::puts(b" cr2=");
             crate::serial::print_hex(cr2);
-            crate::serial::puts(b"\nSystem halted.\n");
+            crate::serial::puts(b"\n");
+
+            // Stack backtrace: the faulting context's stack (`frame.rsp`)
+            // holds the call history. The kernel links at a fixed
+            // higher-half base (`0xFFFFFFFF80100000`, no KASLR), so any
+            // stack word in the kernel-image range is a return address /
+            // code pointer that maps 1:1 to an ELF symbol offline
+            // (`addr2line -e webserver.elf <addr>`). Stack and heap live
+            // in the lower `0xFFFF8000_xxxxxxxx` HHDM range, so the
+            // `>= 0xFFFFFFFF80000000` filter cleanly keeps only code
+            // pointers. Critical for an `rip=0` fault (a call through a
+            // null/corrupt function pointer): the topmost hit is the
+            // call site that jumped to null.
+            crate::diag::append(b"  bt (code addrs from rsp):\n");
+            crate::serial::puts(b"  bt (code addrs from rsp):\n");
+            {
+                const KERNEL_IMAGE_LO: u64 = 0xFFFF_FFFF_8000_0000;
+                let sp = rsp as *const u64;
+                let mut i = 0usize;
+                let mut printed = 0u32;
+                // Bounded scan (≤ 512 words = 4 KiB above rsp, ≤ 24
+                // printed frames) so a near-stack-top fault can't make
+                // the backtrace itself fault into a loop.
+                while i < 512 && printed < 24 {
+                    // SAFETY: reading words at higher addresses than the
+                    // faulting `rsp` — the live task stack is mapped from
+                    // `rsp` up to its top. The count bound caps how far
+                    // we walk so we can't run off the mapping. (Already in
+                    // the enclosing `unsafe` handler context.)
+                    let val = core::ptr::read_volatile(sp.add(i));
+                    if val >= KERNEL_IMAGE_LO {
+                        crate::diag::append(b"    0x");
+                        crate::diag::append_hex(val);
+                        crate::diag::append(b"\n");
+                        crate::serial::puts(b"    ");
+                        crate::serial::print_hex(val);
+                        crate::serial::puts(b"\n");
+                        printed += 1;
+                    }
+                    i += 1;
+                }
+            }
+
+            crate::serial::puts(b"System halted.\n");
             loop {
                 asm!("cli", "hlt", options(nomem, nostack));
             }
