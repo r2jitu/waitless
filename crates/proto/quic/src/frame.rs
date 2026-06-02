@@ -678,6 +678,35 @@ pub fn write_max_streams_uni(max_streams: u64, out: &mut [u8]) -> Result<usize, 
     Ok(1 + n)
 }
 
+/// MAX_DATA (RFC 9000 §19.9). Connection-level flow control: raises the
+/// cumulative byte ceiling the peer may send across *all* streams. The
+/// limit is monotonic — a value below one already announced is ignored.
+pub fn write_max_data(max: u64, out: &mut [u8]) -> Result<usize, FrameError> {
+    if out.is_empty() {
+        return Err(FrameError::OutputTooSmall);
+    }
+    out[0] = ftype::MAX_DATA;
+    let n = write_varint(max, &mut out[1..])?;
+    Ok(1 + n)
+}
+
+/// MAX_STREAM_DATA (RFC 9000 §19.10). Per-stream flow control: raises
+/// the max byte *offset* the peer may send on `stream_id`. Carries the
+/// stream id then the new limit, both varints. Monotonic like MAX_DATA.
+pub fn write_max_stream_data(
+    stream_id: u64,
+    max: u64,
+    out: &mut [u8],
+) -> Result<usize, FrameError> {
+    if out.is_empty() {
+        return Err(FrameError::OutputTooSmall);
+    }
+    out[0] = ftype::MAX_STREAM_DATA;
+    let id_n = write_varint(stream_id, &mut out[1..])?;
+    let max_n = write_varint(max, &mut out[1 + id_n..])?;
+    Ok(1 + id_n + max_n)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -722,6 +751,32 @@ mod tests {
         let (f, n) = parse_frame(&buf).unwrap();
         assert!(matches!(f, Frame::Skipped { kind: 0x10 }));
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn write_max_data_round_trips_through_skip() {
+        let mut buf = [0u8; 16];
+        let n = write_max_data(1 << 20, &mut buf).unwrap();
+        let (f, parsed) = parse_frame(&buf[..n]).unwrap();
+        assert!(matches!(f, Frame::Skipped { kind: 0x10 }));
+        assert_eq!(parsed, n);
+        assert_eq!(buf[0], ftype::MAX_DATA);
+    }
+
+    #[test]
+    fn write_max_stream_data_round_trips_through_skip() {
+        let mut buf = [0u8; 24];
+        // Small ids/limits (single-byte varints).
+        let n = write_max_stream_data(0, 384 << 10, &mut buf).unwrap();
+        let (f, parsed) = parse_frame(&buf[..n]).unwrap();
+        assert!(matches!(f, Frame::Skipped { kind: 0x11 }));
+        assert_eq!(parsed, n);
+        assert_eq!(buf[0], ftype::MAX_STREAM_DATA);
+        // Large id + limit to exercise multi-byte varints in both fields.
+        let n2 = write_max_stream_data(1 << 30, 1 << 22, &mut buf).unwrap();
+        let (f2, parsed2) = parse_frame(&buf[..n2]).unwrap();
+        assert!(matches!(f2, Frame::Skipped { kind: 0x11 }));
+        assert_eq!(parsed2, n2);
     }
 
     #[test]

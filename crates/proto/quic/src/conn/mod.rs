@@ -547,6 +547,36 @@ pub struct Connection {
     pub(super) peer_max_streams_bidi_advertised: u64,
     pub(super) peer_max_streams_uni_advertised: u64,
 
+    // ── Connection-level receive flow control (RFC 9000 §4.1) ─────
+    //
+    // The peer may send at most `max_data_advertised` cumulative bytes
+    // across all streams. `data_consumed` counts bytes the app has
+    // actually drained (stream_recv + discard_recv); the MAX_DATA
+    // pull-emission in `encode_app_packet` slides the limit forward as
+    // it advances, so uploads aren't capped at the initial 1 MiB
+    // `initial_max_data`. Per-stream limits live on each `RecvStream`
+    // (`recv_max`); this is the conn-wide ceiling stacked above them.
+    /// Cumulative bytes the app has drained across all streams.
+    pub(super) data_consumed: u64,
+    /// Largest cumulative byte total we've granted the peer (last
+    /// MAX_DATA). Monotonic; starts at `initial_max_data` (1 MiB).
+    pub(super) max_data_advertised: u64,
+    /// Cumulative bytes the peer has SENT across all streams — the sum
+    /// of every stream's `recv_high`. Enforced against
+    /// `max_data_advertised` so a peer that ignores the connection
+    /// window can't grow our receive buffers without bound
+    /// (RFC 9000 §4.1). Monotonic.
+    pub(super) data_received: u64,
+    /// Set when the peer signals it's stalled on the connection window
+    /// (DATA_BLOCKED) or a stream window (STREAM_DATA_BLOCKED). Forces
+    /// the next 1-RTT packet to re-advertise the *current* MAX_DATA /
+    /// MAX_STREAM_DATA even if the consume-threshold isn't crossed —
+    /// this recovers a MAX_* the peer lost (we don't retransmit them),
+    /// so an upload can't wedge at a window edge after the app has
+    /// already caught up. Cleared once re-advertised.
+    pub(super) force_max_data: bool,
+    pub(super) force_max_stream_data: bool,
+
     // ── Anti-amplification (RFC 9000 §8.1) ────────────────────────
     //
     // Until the peer's address is validated, we MUST NOT send more
@@ -794,6 +824,13 @@ impl Connection {
             // advertised or fail to use credit we already gave.
             peer_max_streams_bidi_advertised: 1024,
             peer_max_streams_uni_advertised: 1024,
+            data_consumed: 0,
+            // Must match `transport_params::ServerParams::defaults`'s
+            // initial_max_data (1 MiB) — the initial conn-level window.
+            max_data_advertised: 1 << 20,
+            data_received: 0,
+            force_max_data: false,
+            force_max_stream_data: false,
             bytes_received_pre_validation: 0,
             bytes_sent_pre_validation: 0,
             path_validated: false,
@@ -1114,7 +1151,13 @@ impl Connection {
     /// drained.
     pub fn stream_recv(&mut self, sid: u64, out: &mut [u8]) -> (usize, bool) {
         match self.recv_streams.get_mut(&sid) {
-            Some(s) => s.drain(out),
+            Some(s) => {
+                let r = s.drain(out);
+                // Count drained bytes toward conn-level flow control so
+                // the MAX_DATA pull-emission can slide the window up.
+                self.data_consumed += r.0 as u64;
+                r
+            }
             None => (0, false),
         }
     }
@@ -1131,12 +1174,18 @@ impl Connection {
         if let Some(s) = self.recv_streams.get_mut(&sid) {
             // Drain in 2 KiB chunks until empty.
             let mut sink = [0u8; 2048];
+            let mut total = 0u64;
             loop {
                 let (n, _eof) = s.drain(&mut sink);
                 if n == 0 {
                     break;
                 }
+                total += n as u64;
             }
+            // Discarded bytes are consumed too — credit them at the
+            // conn level so a chatty peer uni stream (QPACK encoder)
+            // can't exhaust the connection window over a long session.
+            self.data_consumed += total;
         }
     }
 
@@ -1199,6 +1248,32 @@ pub(super) fn append_max_streams_into(
     } else {
         crate::frame::write_max_streams_bidi(max, &mut tmp)?
     };
+    out.extend_from_slice(&tmp[..n]);
+    Ok(())
+}
+
+/// Append a MAX_DATA frame (conn-level credit). Mirrors
+/// [`append_max_streams_into`].
+pub(super) fn append_max_data_into(
+    out: &mut Vec<u8>,
+    max: u64,
+) -> Result<(), crate::frame::FrameError> {
+    let mut tmp = [0u8; 16];
+    let n = crate::frame::write_max_data(max, &mut tmp)?;
+    out.extend_from_slice(&tmp[..n]);
+    Ok(())
+}
+
+/// Append a MAX_STREAM_DATA frame (per-stream credit). `sid` + `max`
+/// are both varints, so the scratch is sized for two 8-byte varints
+/// plus the type byte.
+pub(super) fn append_max_stream_data_into(
+    out: &mut Vec<u8>,
+    sid: u64,
+    max: u64,
+) -> Result<(), crate::frame::FrameError> {
+    let mut tmp = [0u8; 24];
+    let n = crate::frame::write_max_stream_data(sid, max, &mut tmp)?;
     out.extend_from_slice(&tmp[..n]);
     Ok(())
 }

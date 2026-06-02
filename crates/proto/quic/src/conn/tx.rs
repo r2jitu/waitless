@@ -14,7 +14,7 @@
 
 use super::{
     ConnError, ConnState, Connection, HS_CRYPTO_BUDGET, MAX_QUIC_DATAGRAM, SpaceState,
-    append_max_streams_into,
+    append_max_data_into, append_max_stream_data_into, append_max_streams_into,
 };
 use crate::crypto::{HP_SAMPLE_LEN, TAG_LEN, apply_hp_mask, packet_nonce};
 use crate::frame::{write_ack, write_crypto};
@@ -563,6 +563,74 @@ impl Connection {
             )
             .map_err(|_| ConnError::Wire)?;
             ack_eliciting = true;
+        }
+
+        // ── Flow-control credit (RFC 9000 §4.1) ──────────────────
+        //
+        // Slide the receive windows forward as the app drains data so
+        // an upload can run past the initial transport-param limits.
+        // Pull model: we re-check the condition every time we build a
+        // 1-RTT packet, so credit naturally piggybacks on the ACKs we
+        // send for inbound STREAM frames (and on the proactive flush
+        // `endpoint::recv` does after consuming). Refill when less than
+        // half a window of credit remains — keeps ≥ half a window open
+        // without a MAX_* frame per packet.
+        //
+        // MAX_DATA: conn-level ceiling above all per-stream limits.
+        const MAX_DATA_WINDOW: u64 = 1 << 20; // 1 MiB, matches initial_max_data
+        let max_data_threshold =
+            self.max_data_advertised.saturating_sub(self.data_consumed) <= MAX_DATA_WINDOW / 2;
+        // Emit on the half-window threshold, or when the peer signalled
+        // DATA_BLOCKED (re-advertise the current ceiling to recover a
+        // lost MAX_DATA). Only slide the ceiling on the threshold path.
+        if max_data_threshold || self.force_max_data {
+            if max_data_threshold {
+                // Clamp to the QUIC max varint (2^62-1) so a runaway
+                // ceiling can't make `write_varint` fail and tear the
+                // conn down — unreachable in practice (4.6 EB/conn).
+                self.max_data_advertised =
+                    (self.data_consumed + MAX_DATA_WINDOW).min((1u64 << 62) - 1);
+            }
+            append_max_data_into(out, self.max_data_advertised).map_err(|_| ConnError::Wire)?;
+            self.force_max_data = false;
+            ack_eliciting = true;
+        }
+
+        // MAX_STREAM_DATA: per receive stream. Skip fully-closed
+        // streams (the peer won't send more) and stop once the packet
+        // is near full — any stream that misses out this round gets its
+        // credit on the next flush.
+        const STREAM_DATA_WINDOW: u64 = crate::streams::INITIAL_MAX_STREAM_DATA; // 256 KiB
+        // STREAM_DATA_BLOCKED doesn't name the stream in our skip path,
+        // so re-advertise every open recv stream — re-sending an
+        // unchanged MAX_STREAM_DATA is idempotent.
+        let force_stream = self.force_max_stream_data;
+        let mut stream_sweep_complete = true;
+        for (sid, rs) in self.recv_streams.iter_mut() {
+            if out.len() - header_start > PACKET_BODY_BUDGET {
+                stream_sweep_complete = false;
+                break;
+            }
+            if rs.is_closed() {
+                continue;
+            }
+            let consumed = rs.consumed();
+            let threshold = rs.recv_max.saturating_sub(consumed) <= STREAM_DATA_WINDOW / 2;
+            if threshold || force_stream {
+                if threshold {
+                    rs.recv_max = (consumed + STREAM_DATA_WINDOW).min((1u64 << 62) - 1);
+                }
+                append_max_stream_data_into(out, *sid, rs.recv_max)
+                    .map_err(|_| ConnError::Wire)?;
+                ack_eliciting = true;
+            }
+        }
+        // Cleared only once every open stream was re-advertised; if the
+        // packet budget cut the sweep short, leave it set so the rest
+        // re-advertise next packet. (If the peer is still stuck after a
+        // full sweep it re-sends *_BLOCKED, which re-sets the flag.)
+        if stream_sweep_complete {
+            self.force_max_stream_data = false;
         }
 
         // Drain any 1-RTT-level handshake bytes (NewSessionTicket

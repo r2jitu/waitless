@@ -800,6 +800,43 @@ impl Connection {
                             // response stream FINs (see `streams.rs`).
                             s.rx_us = cur_rx_us;
                         }
+                        // ── Receive flow control (RFC 9000 §4.1) ──────
+                        // Reject any byte past the per-stream
+                        // MAX_STREAM_DATA (`recv_max`) or connection
+                        // MAX_DATA (`max_data_advertised`) limits we
+                        // advertised, BEFORE ingest: the contiguous
+                        // append in `RecvStream::ingest` is otherwise
+                        // unbounded, so a peer that ignores the window
+                        // could grow our recv buffer until the heap is
+                        // exhausted. `recv_high` is this stream's largest
+                        // received offset; `data_received` sums them
+                        // across the connection. A compliant peer never
+                        // exceeds the window it was granted, so this
+                        // never fires on the happy path.
+                        let frame_end = offset.saturating_add(data.len() as u64);
+                        let recv_max = s.recv_max;
+                        let conn_delta = frame_end.saturating_sub(s.recv_high);
+                        if frame_end > recv_max
+                            || self.data_received.saturating_add(conn_delta)
+                                > self.max_data_advertised
+                        {
+                            crate::quic_drop!(
+                                other_wire,
+                                "recv flow control: sid={} end={} recv_max={} received={} max_data={}",
+                                stream_id,
+                                frame_end,
+                                recv_max,
+                                self.data_received,
+                                self.max_data_advertised
+                            );
+                            self.close_with_error(0x03 /* FLOW_CONTROL_ERROR */, b"flow control");
+                            return Ok(());
+                        }
+                        self.data_received = self.data_received.saturating_add(conn_delta);
+                        let s = self.recv_streams.get_mut(&stream_id).unwrap();
+                        if frame_end > s.recv_high {
+                            s.recv_high = frame_end;
+                        }
                         s.ingest(offset, data, fin);
                         if was_new {
                             crate::diag::COUNTERS.recv_streams_created.bump();
@@ -862,10 +899,22 @@ impl Connection {
                         self.application_space.ack_pending = true;
                     }
                 }
-                Frame::Skipped { .. } => {
-                    // Wire-recognized but no app-level reaction yet
-                    // (MAX_DATA, NEW_CONNECTION_ID, …). Frame layer
-                    // already consumed the right number of bytes.
+                Frame::Skipped { kind } => {
+                    // Most wire-recognized frames need no app-level
+                    // reaction (MAX_DATA, NEW_CONNECTION_ID, …); the
+                    // frame layer already consumed the right bytes. But
+                    // DATA_BLOCKED / STREAM_DATA_BLOCKED mean the peer is
+                    // stalled at a receive-window edge — force the next
+                    // packet (this datagram's post-dispatch flush) to
+                    // re-advertise the current window so a MAX_* the peer
+                    // lost is recovered (we don't retransmit them).
+                    match kind {
+                        crate::frame::ftype::DATA_BLOCKED => self.force_max_data = true,
+                        crate::frame::ftype::STREAM_DATA_BLOCKED => {
+                            self.force_max_stream_data = true;
+                        }
+                        _ => {}
+                    }
                 }
             }
             payload = &payload[consumed..];

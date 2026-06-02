@@ -26,15 +26,28 @@
 //     offset > current recv offset until the gap fills. Cap at
 //     16 KiB per stream — past that we drop.
 //
+// Receive flow control IS implemented: each stream advertises
+// `recv_max` (starts at the initial transport-param limit) and the
+// 1-RTT TX path slides it forward via MAX_STREAM_DATA as the app
+// drains, with MAX_DATA covering the conn-level ceiling — so an
+// upload runs past the initial window. See `consumed` / `recv_max`
+// here and the pull-emission in `Connection::encode_app_packet`.
+//
 // Out of scope (not needed for MVP):
 //   * RESET_STREAM / STOP_SENDING (we'd close the conn on stream
 //     errors instead — fine for HTTP/3 GET/POST).
-//   * Per-stream MAX_STREAM_DATA reactive flow control —
-//     advertised initial limits in transport_params are sized so
-//     a small request/response fits without ever blocking.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+
+/// Initial per-stream receive limit we advertise (= the
+/// `initial_max_stream_data_*` transport params in
+/// `transport_params::ServerParams::defaults`). A fresh `RecvStream`
+/// starts crediting the peer this many bytes; the limit then slides
+/// forward as the app consumes (MAX_STREAM_DATA emission in
+/// `Connection::encode_app_packet`). Must stay in sync with the
+/// transport-param defaults — both are 256 KiB.
+pub(crate) const INITIAL_MAX_STREAM_DATA: u64 = 256 << 10;
 
 /// QUIC stream type bits (RFC 9000 §2.1).
 pub mod stream_type {
@@ -107,6 +120,19 @@ pub struct RecvStream {
     /// `ensure_send_stream` carries it onto the matching `SendStream`
     /// so the request RX→TX latency can be sampled at response FIN.
     pub rx_us: u64,
+    /// Largest byte offset the peer is currently allowed to send on
+    /// this stream — the value of the last MAX_STREAM_DATA we
+    /// advertised. Starts at [`INITIAL_MAX_STREAM_DATA`] and is raised
+    /// reactively as the app drains the buffer, so an upload can run
+    /// past the initial window. See the pull-emission in
+    /// `Connection::encode_app_packet`.
+    pub recv_max: u64,
+    /// Largest byte offset+len ever received on this stream — the
+    /// receive-flow-control high-water mark, counting out-of-order
+    /// frames too. Used to enforce `recv_max` (RFC 9000 §4.1) and to
+    /// compute this stream's contribution to the connection-level
+    /// received total. Monotonic.
+    pub recv_high: u64,
 }
 
 impl Default for RecvStream {
@@ -118,6 +144,8 @@ impl Default for RecvStream {
             state: RecvState::Open,
             gap_budget: 16 * 1024,
             rx_us: 0,
+            recv_max: INITIAL_MAX_STREAM_DATA,
+            recv_high: 0,
         }
     }
 }
@@ -138,6 +166,8 @@ impl RecvStream {
         self.state = RecvState::Open;
         self.gap_budget = 16 * 1024;
         self.rx_us = 0;
+        self.recv_max = INITIAL_MAX_STREAM_DATA;
+        self.recv_high = 0;
     }
 
     /// Snapshot of internal state for diagnostics. Used by the
@@ -171,6 +201,15 @@ impl RecvStream {
     /// Equivalent to `matches!(state, RecvState::Closed { .. })`.
     pub fn is_closed(&self) -> bool {
         matches!(self.state, RecvState::Closed { .. })
+    }
+
+    /// Bytes the app has drained off this stream = contiguous bytes
+    /// received (`offset`) minus those still sitting in `buffer`.
+    /// Drives reactive MAX_STREAM_DATA crediting: as this advances the
+    /// advertised `recv_max` slides forward to keep the peer's window
+    /// open.
+    pub fn consumed(&self) -> u64 {
+        self.offset - self.buffer.len() as u64
     }
 
     /// Record a FIN at `end` and re-evaluate whether the stream

@@ -416,6 +416,68 @@ class WebserverServiceTest(unittest.TestCase):
         self.assertEqual(status, 200, "large h3 upload should stream, not overflow")
         self.assertIn(b"discarded", body)
 
+    def test_h3_upload_past_flow_control_window(self) -> None:
+        """POST a 1.5 MiB body over HTTP/3 to `/discard`.
+
+        Exercises the QUIC receive-flow-control extension
+        (MAX_STREAM_DATA + MAX_DATA). The body is larger than BOTH
+        initial windows we advertise in transport params — 256 KiB per
+        stream and 1 MiB per connection — so completing it *requires*
+        the server to slide both windows forward as the handler drains
+        the body. aioquic blocks at each window edge (and sends
+        STREAM_DATA_BLOCKED / DATA_BLOCKED); the upload only finishes if
+        our reactive credit reaches the client. Before the flow-control
+        work this would stall at 256 KiB and time out."""
+        # QEMU-TCG can't push 1.5 MiB through QUIC's flow-controlled,
+        # many-round-trip transfer within 25 s — each credit grant costs
+        # an emulated RTT, so the upload stalls at a window edge waiting
+        # for the next MAX_DATA. HVF + native (the representative paths)
+        # cover the window-sliding; test_h3_upload_streams_past_old_cap
+        # exercises h3 streaming under TCG with a body small enough to
+        # finish. So skip the heavy case on the slow emulated runners.
+        if "qemu" in LAUNCHER_NAME:
+            self.skipTest(
+                f"1.5 MiB h3 upload is too slow under TCG emulation; "
+                f"launcher={LAUNCHER_NAME}"
+            )
+        payload = (b"waitless-h3-bigupload!" * 80_000)[: 3 * 512 * 1024]  # 1.5 MiB
+        self.assertGreater(len(payload), 1 << 20, "must exceed the 1 MiB conn window")
+        status, body = h3_post("/discard", payload, port=TLS_PORT, timeout=25.0)
+        self.assertEqual(status, 200, "upload must stream past both initial windows")
+        self.assertIn(b"discarded", body)
+
+    def test_h3_concurrent_uploads(self) -> None:
+        """Several streamed h3 uploads in flight at once.
+
+        Opens N concurrent HTTP/3 connections (one upload stream each),
+        each POSTing a body past the 256 KiB per-stream initial window
+        to `/discard` — so every upload must slide its own stream window
+        (MAX_STREAM_DATA) while the others are mid-flight. Stresses the
+        per-connection QUIC tasks + reactive flow control *under
+        concurrency*, the h3-specific risk in the streamed-body path.
+        (The gve NIC datapath under upload load is covered transport-
+        agnostically by the h1.1/h2 upload tests.)"""
+        # TCG can't push many concurrent flow-controlled QUIC uploads in
+        # reasonable wall-time (each credit grant is an emulated RTT);
+        # native + HVF are the representative runners for this.
+        if "qemu" in LAUNCHER_NAME:
+            self.skipTest(f"concurrent h3 uploads too slow under TCG; launcher={LAUNCHER_NAME}")
+        from concurrent.futures import ThreadPoolExecutor
+
+        n = 8
+        payload = (b"waitless-h3-concurrent!" * 20_000)[: 384 * 1024]  # 384 KiB
+        self.assertGreater(len(payload), 256 * 1024, "must exceed the 256 KiB stream window")
+
+        def one(_i: int) -> tuple[int, bytes]:
+            return h3_post("/discard", payload, port=TLS_PORT, timeout=30.0)
+
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            results = list(ex.map(one, range(n)))
+
+        for i, (status, body) in enumerate(results):
+            self.assertEqual(status, 200, f"concurrent upload {i} failed (status={status})")
+            self.assertIn(b"discarded", body, f"concurrent upload {i} missing discard ack")
+
     def test_h3_burst_20_conns(self) -> None:
         """20 sequential HTTP/3 GETs over fresh connections.
 
