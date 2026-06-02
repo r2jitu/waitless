@@ -79,7 +79,7 @@ const RST_FLOOD_CAP: u32 = 200;
 pub async fn serve_conn<S, H>(handler: Arc<H>, mut stream: S)
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, S>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
 {
     // One-time lazy-init of the shared Huffman tree (matches
     // http3::listen / tls::preinit — keeps the first request's alloc
@@ -435,7 +435,7 @@ async fn process_frame<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, S>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
 {
     // A header block in mid-assembly forbids interleaving: only a
     // CONTINUATION on the same stream may follow (RFC 7540 §6.2).
@@ -529,7 +529,7 @@ async fn process_headers<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, S>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
 {
     if hdr.stream_id == 0 || hdr.stream_id.is_multiple_of(2) {
         // Client streams are non-zero and odd (RFC 7540 §5.1.1).
@@ -562,7 +562,7 @@ async fn continue_headers<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, S>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
 {
     {
         let asm = conn.header_asm.as_mut().expect("checked by caller");
@@ -593,7 +593,7 @@ async fn complete_headers<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, S>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
 {
     let mut req = Request::new();
     let malformed = {
@@ -667,7 +667,7 @@ async fn process_data<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, S>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
 {
     if hdr.stream_id == 0 {
         return Err(error::PROTOCOL_ERROR);
@@ -780,12 +780,18 @@ async fn dispatch_stream<S, H>(
     body_bytes: &[u8],
 ) where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, S>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
 {
     crate::diag::COUNTERS.requests_received.bump();
     req.set_content_length(body_bytes.len());
     let resp = {
-        let mut body = BodyReader::new(stream, body_bytes, body_bytes.len());
+        // The body is already fully buffered in `body_bytes` (h2
+        // reassembles DATA frames before dispatch) and `total ==
+        // body_bytes.len()`, so the `BodyReader` serves entirely from
+        // its prebuf — the `Some(stream)` source is wired but never
+        // pulled. (`stream` is the TLS conn; pulling it here would read
+        // raw records, which by construction never happens.)
+        let mut body = BodyReader::new(Some(stream), body_bytes, body_bytes.len());
         (**handler)(&req, &mut body).await
     };
     crate::diag::COUNTERS.requests_handled.bump();

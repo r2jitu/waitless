@@ -1,15 +1,18 @@
 // Streaming request-body reader.
 //
-// Hands the handler bytes the request declared via Content-Length,
-// drawn first from any prebuf bytes that rode in with the headers
-// and then from the transport stream's own `recv_chunk` path —
-// both surfaced zero-copy through `BodyChunkGuard`.
+// Hands the handler the bytes the request declared via Content-Length,
+// drawn first from any prebuf bytes that rode in with the headers and
+// then from the transport, surfaced through a **transport-erased**
+// [`BodySource`] (`&mut dyn`). That erasure is what keeps `BodyReader`
+// — and therefore the handler signature — free of any stream type
+// parameter: one `(&Request, &mut BodyReader<'_>)` handler serves
+// HTTP/1.1, HTTP/2, and HTTP/3 alike.
 
 use core::marker::PhantomData;
 
 use iobuf::IOBuf;
 
-use crate::stream::HttpStream;
+use crate::stream::BodySource;
 
 /// Streaming reader for the request body.
 ///
@@ -18,59 +21,57 @@ use crate::stream::HttpStream;
 /// currently holds them:
 ///   * the per-connection parse buffer (`prebuf`) — body bytes that
 ///     arrived in the same TCP/TLS read that delivered the headers;
-///   * the transport's own buffer past the prebuf — surfaced by
-///     [`HttpStream::recv_chunk`] with no intermediate copy (an
-///     `ExternalOwned` NIC RX buffer on bare-metal TCP, a
-///     `Borrowed` view into the TLS plaintext window for HTTPS).
-///
-/// Before RX item H the past-prebuf bytes were copied through a
-/// 4 KiB `refill` scratch field; `recv_chunk` removes that copy, so
-/// the field is gone — small bodies are served straight from the
-/// prebuf, large ones straight from the transport buffer.
+///   * the transport's own buffer past the prebuf — surfaced by the
+///     [`BodySource`] with no intermediate copy of the *bytes* (an
+///     owned `External` NIC RX buffer on bare-metal TCP, an
+///     `Owned(Shared)` view of the TLS plaintext window for HTTPS).
 ///
 /// The reader knows the total body length (from the request's
-/// `Content-Length`) and stops handing out bytes after exactly
-/// that many have been delivered, so the underlying transport
-/// stream is left positioned at the start of the next pipelined
-/// request.
+/// `Content-Length`) and stops handing out bytes after exactly that
+/// many have been delivered, so the underlying transport is left
+/// positioned at the start of the next pipelined request.
 ///
-/// If the handler returns without consuming all bytes,
-/// `serve_conn` calls [`discard`](Self::discard) before sending the
-/// response so the keep-alive contract holds. Handlers that
-/// intentionally want to abort a large unwanted upload should
-/// return a response with `Connection: close` set; `serve_conn`
-/// then skips the drain and tears down the conn.
-pub struct BodyReader<'a, S: HttpStream> {
-    stream: &'a mut S,
-    /// Bytes from `serve_conn`'s parse buffer that belong to the
-    /// body — already received from the wire by the time the
-    /// handler runs.
+/// `source` is `None` for transports that buffer the whole body before
+/// dispatch (HTTP/2 and HTTP/3 reassemble it first): the body is then
+/// entirely in `prebuf` and the reader never touches the transport.
+///
+/// If the handler returns without consuming all bytes, the serve loop
+/// calls [`discard`](Self::discard) before sending the response so the
+/// keep-alive contract holds.
+pub struct BodyReader<'a> {
+    /// Transport-erased source for body bytes past the prebuf. `None`
+    /// for fully-buffered transports (h2/h3).
+    source: Option<&'a mut dyn BodySource>,
+    /// Bytes from the serve loop's parse buffer that belong to the
+    /// body — already received from the wire by the time the handler
+    /// runs.
     prebuf: &'a [u8],
     prebuf_consumed: usize,
     /// Total body length declared by the request's Content-Length.
     total: usize,
     /// Bytes already handed to the handler via `chunk`.
     delivered: usize,
-    /// Post-body residue captured when a fresh-recv chunk straddled
-    /// the `Content-Length` boundary. `serve_conn` retrieves this
-    /// via [`into_leftover`](Self::into_leftover) and threads it
-    /// into the next outer-iteration carry so the next pipelined
-    /// request's HEAD bytes aren't dropped on the floor.
+    /// Post-body residue captured when a transport chunk straddled the
+    /// `Content-Length` boundary. The serve loop retrieves this via
+    /// [`into_leftover`](Self::into_leftover) and threads it into the
+    /// next outer-iteration carry so the next pipelined request's HEAD
+    /// bytes aren't dropped.
     leftover: Option<IOBuf>,
 }
 
-impl<'a, S: HttpStream> BodyReader<'a, S> {
-    /// Construct a reader against `stream`, with `prebuf` carrying
-    /// any body bytes already received during the parse step.
-    /// `total` is the declared body length; the reader delivers
-    /// exactly that many bytes (possibly fewer on EOF) and refuses
-    /// to read past it into the next pipelined request.
-    pub fn new(stream: &'a mut S, prebuf: &'a [u8], total: usize) -> Self {
-        // Trim `prebuf` to at most `total` so the reader never
-        // reaches into post-body bytes (next pipelined request).
+impl<'a> BodyReader<'a> {
+    /// Construct a reader with `prebuf` carrying any body bytes already
+    /// received during the parse step, and `source` for bytes past it
+    /// (`None` when the whole body is already in `prebuf`). `total` is
+    /// the declared body length; the reader delivers exactly that many
+    /// bytes (possibly fewer on EOF) and refuses to read past it into
+    /// the next pipelined request.
+    pub fn new(source: Option<&'a mut dyn BodySource>, prebuf: &'a [u8], total: usize) -> Self {
+        // Trim `prebuf` to at most `total` so the reader never reaches
+        // into post-body bytes (next pipelined request).
         let prebuf_avail = prebuf.len().min(total);
         BodyReader {
-            stream,
+            source,
             prebuf: &prebuf[..prebuf_avail],
             prebuf_consumed: 0,
             total,
@@ -80,16 +81,9 @@ impl<'a, S: HttpStream> BodyReader<'a, S> {
     }
 
     /// Consume the reader and return any post-body residue captured
-    /// from a straddling fresh-recv chunk. `serve_conn` calls this
-    /// after the handler returns and assigns the result into its
-    /// `carry` slot — that's what threads the next pipelined
-    /// request's HEAD bytes (which arrived in the same chunk as
-    /// the body-tail) forward instead of dropping them.
-    ///
-    /// Returns `None` in the common case where the body fit
-    /// entirely in `prebuf` (no stream pulls), or where the
-    /// stream-side chunks happened to align with `Content-Length`
-    /// (no straddle).
+    /// from a straddling transport chunk. The serve loop calls this
+    /// after the handler returns and threads the result into its
+    /// `carry` slot.
     pub fn into_leftover(self) -> Option<IOBuf> {
         self.leftover
     }
@@ -107,47 +101,31 @@ impl<'a, S: HttpStream> BodyReader<'a, S> {
     /// Get the next chunk of body bytes as a [`BodyChunkGuard`].
     ///
     /// `None` signals end-of-body — either the expected "all
-    /// `Content-Length` bytes delivered" end state (the caller
-    /// stops) or "transport EOF / close before `Content-Length` was
-    /// reached." Distinguish the two via [`remaining`](Self::remaining):
-    /// a clean end leaves it at 0.
+    /// `Content-Length` bytes delivered" end state (the caller stops)
+    /// or "transport EOF / close before `Content-Length` was reached."
+    /// Distinguish the two via [`remaining`](Self::remaining): a clean
+    /// end leaves it at 0.
     ///
-    /// Two byte sources, both surfaced zero-copy:
-    ///   * **Prebuf** — body bytes that rode in with the request
-    ///     headers. The guard wraps a `Borrowed` `IOBuf` over
-    ///     `serve_conn`'s parse buffer.
-    ///   * **Past the prebuf** — pulled from the transport via
-    ///     [`HttpStream::recv_chunk`]; the guard wraps whatever that
-    ///     surfaced (an `ExternalOwned` NIC RX buffer for bare-metal
-    ///     TCP, a `Borrowed` view into the TLS plaintext window).
-    ///
-    /// The returned guard borrows `&mut self` for its whole life, so
-    /// the transport buffer it views cannot be re-read — hence
-    /// overwritten — while the handler still holds the chunk. That
-    /// is the item-F/G borrow-safety property, one layer up.
-    ///
-    /// A single `recv_chunk` chunk is delivered whole when the
-    /// chunk's byte count is ≤ the remaining body length; the
-    /// straddling case (chunk spans the `Content-Length` boundary,
-    /// reachable when a client pipelines a follow-up request into
-    /// the tail of a body that wouldn't fit in `serve_conn`'s
-    /// outer-loop carry) splits the chunk at the boundary: the
-    /// body-side bytes are copied to a heap IOBuf and returned as
-    /// the guard; the post-body residue is detached via
-    /// [`RecvChunkGuard::into_remainder`] and stashed in
-    /// `self.leftover` for `serve_conn` to retrieve via
-    /// [`into_leftover`](Self::into_leftover) after the handler
-    /// returns. Two memcpys on the straddle path (body bytes +
-    /// residue copy for `Borrowed` transports like TLS); zero copy
-    /// on the no-straddle path.
+    /// Two byte sources:
+    ///   * **Prebuf** — body bytes that rode in with the headers; the
+    ///     guard wraps a `Borrowed` `IOBuf` over the serve loop's parse
+    ///     buffer (zero copy).
+    ///   * **Past the prebuf** — pulled from the [`BodySource`] as an
+    ///     owned `IOBuf` (the body bytes themselves are zero-copy — the
+    ///     `IOBuf` owns the device buffer). When that chunk straddles
+    ///     the `Content-Length` boundary (a follow-up pipelined request
+    ///     packed into the body tail), it's split: the body-side bytes
+    ///     are copied to a heap `IOBuf` and the residue is stashed in
+    ///     `leftover` (zero-copy via `into_remainder`) for the serve
+    ///     loop to carry forward.
     pub async fn chunk(&mut self) -> Option<BodyChunkGuard<'_>> {
         if self.delivered >= self.total {
             return None;
         }
         let want_max = self.total - self.delivered;
 
-        // 1. Drain prebuf first — zero-copy, the bytes already sit
-        //    in serve_conn's parse buffer.
+        // 1. Drain prebuf first — zero-copy, the bytes already sit in
+        //    the serve loop's parse buffer.
         if self.prebuf_consumed < self.prebuf.len() {
             let start = self.prebuf_consumed;
             let avail = self.prebuf.len() - start;
@@ -157,17 +135,13 @@ impl<'a, S: HttpStream> BodyReader<'a, S> {
             let slice = &self.prebuf[start..start + take];
             // SAFETY: `IOBuf::borrow` needs the region valid,
             // unaliased, and unmutated for the IOBuf's whole life.
-            //  * `slice` points into `serve_conn`'s parse buffer; it
-            //    is `take` bytes, in-bounds, and — a slice pointer —
-            //    non-null and aligned.
-            //  * The returned `BodyChunkGuard` carries the
-            //    `&mut self` borrow for its whole life, so the
-            //    handler cannot return — and `serve_conn` cannot
-            //    resume to mutate the parse buffer — while the guard
-            //    is live.
-            //  * The `Borrowed` IOBuf is owned by the guard and
-            //    drops with it; no drop callback (the bytes are
-            //    borrowed, not owned).
+            //  * `slice` points into the serve loop's parse buffer; it
+            //    is `take` bytes, in-bounds, non-null, aligned.
+            //  * The returned `BodyChunkGuard` carries the `&mut self`
+            //    borrow for its whole life, so the parse buffer can't
+            //    be mutated while the guard is live.
+            //  * The `Borrowed` IOBuf is owned by the guard and drops
+            //    with it; no drop callback (the bytes are borrowed).
             let iobuf = unsafe {
                 IOBuf::borrow(
                     core::ptr::NonNull::new_unchecked(slice.as_ptr() as *mut u8),
@@ -181,50 +155,45 @@ impl<'a, S: HttpStream> BodyReader<'a, S> {
             });
         }
 
-        // 2. Past the prebuf — pull a chunk from the transport.
-        //    Common path (chunk len ≤ want_max): pass the guard
-        //    through as `ChunkSource::Stream`, zero copy.
-        //    Straddle path (chunk len > want_max): copy body-side
-        //    bytes out, detach the residue past `want_max` into
-        //    `self.leftover` via `RecvChunkGuard::into_remainder`.
-        //    `None` means peer close / EOF, or a transport with no
-        //    chunk path (NullStream / HTTP/3, whose body is always
-        //    in the prebuf — this branch is unreachable for it).
-        let guard = self.stream.recv_chunk().await?;
-        let take = guard.data().len().min(want_max);
+        // 2. Past the prebuf — pull from the transport-erased source.
+        //    `None` source (h2/h3 buffered body) or peer EOF ends here.
+        let chunk: Option<IOBuf> = match self.source.as_deref_mut() {
+            Some(src) => src.next_chunk().await,
+            None => return None,
+        };
+        let iobuf = chunk?;
+        let avail = iobuf.data().len();
+        let take = avail.min(want_max);
         if take == 0 {
             return None;
         }
         self.delivered += take;
-        if take == guard.data().len() {
-            // No straddle — pass the guard through.
+        if take == avail {
+            // No straddle — the whole chunk is body.
             Some(BodyChunkGuard {
-                src: ChunkSource::Stream { guard, len: take },
+                src: ChunkSource::Owned(iobuf),
             })
         } else {
-            // Straddle — split at `take`.
+            // Straddle — body-side bytes copied; residue stashed
+            // zero-copy via `into_remainder` for the serve loop.
             use alloc::vec::Vec;
-            let body_bytes: Vec<u8> = guard.data()[..take].to_vec();
-            self.leftover = guard
-                .into_remainder(take)
-                .expect("take <= data().len()");
+            let body_bytes: Vec<u8> = iobuf.data()[..take].to_vec();
+            self.leftover = iobuf.into_remainder(take).expect("take <= data().len()");
             Some(BodyChunkGuard {
                 src: ChunkSource::Owned(IOBuf::from(body_bytes)),
             })
         }
     }
 
-    /// Drain the rest of the body, dropping every byte. Returns
-    /// `Err` if the transport closed before delivering all
-    /// `Content-Length` bytes — caller's contract is to tear the
-    /// connection down in that case.
+    /// Drain the rest of the body, dropping every byte. Returns `Err`
+    /// if the transport closed before delivering all `Content-Length`
+    /// bytes — caller's contract is to tear the connection down.
     pub async fn discard(&mut self) -> Result<(), ()> {
         while self.delivered < self.total {
             match self.chunk().await {
                 Some(g) if !g.data().is_empty() => {}
-                // `None` (or a chunk that came back empty) before
-                // `delivered` reached `total` — the transport
-                // closed mid-body.
+                // `None` (or an empty chunk) before `delivered` reached
+                // `total` — the transport closed mid-body.
                 _ => return Err(()),
             }
         }
@@ -235,16 +204,10 @@ impl<'a, S: HttpStream> BodyReader<'a, S> {
 /// A single contiguous chunk of request-body bytes, handed to the
 /// handler by [`BodyReader::chunk`].
 ///
-/// The guard borrows the `BodyReader` — hence the transport's
-/// buffer — for its whole life: read the bytes in place with
-/// [`data`](Self::data) (zero copy), or call
+/// The guard borrows the `BodyReader` for its whole life: read the
+/// bytes in place with [`data`](Self::data) (zero copy), or call
 /// [`into_owned`](Self::into_owned) to lift them into an owned
-/// [`IOBuf`] that can outlive the guard (e.g. a proxy forwarding
-/// the chunk into an outbound `send`).
-///
-/// Single-part by design: `BodyReader` delivers one contiguous run
-/// of bytes per `chunk` call. Multi-part RX delivery is a separate
-/// RX-path item; this API stays frozen single-part.
+/// [`IOBuf`] that can outlive the guard.
 pub struct BodyChunkGuard<'a> {
     src: ChunkSource<'a>,
 }
@@ -254,30 +217,14 @@ pub struct BodyChunkGuard<'a> {
 /// `into_owned()`.
 enum ChunkSource<'a> {
     /// Body bytes that arrived in the same read as the request
-    /// headers: a `Borrowed` `IOBuf` over `serve_conn`'s parse
-    /// buffer. `data()` is zero copy; `into_owned()` copies to
-    /// `Heap`. The `PhantomData` ties the borrow to the
-    /// `&'a mut BodyReader` that `chunk` took — the parse buffer
-    /// must not be mutated while the chunk is live.
+    /// headers: a `Borrowed` `IOBuf` over the serve loop's parse
+    /// buffer. `data()` is zero copy; `into_owned()` copies to `Heap`.
+    /// The `PhantomData` ties the borrow to the `&'a mut BodyReader`
+    /// `chunk` took.
     Prebuf(IOBuf, PhantomData<&'a mut ()>),
-    /// Body bytes past the prebuf: the transport's own buffer, held
-    /// behind the [`RecvChunkGuard`](waitless::runtime::RecvChunkGuard)
-    /// that `stream.recv_chunk()` surfaced (which already carries
-    /// the `&'a mut` borrow). `len` is the delivered byte count —
-    /// equal to the surfaced chunk length when the whole chunk is
-    /// body. The straddle case (chunk runs past `Content-Length`)
-    /// is handled by the `Owned` variant instead, so here `len`
-    /// always equals `guard.data().len()`.
-    Stream {
-        guard: waitless::runtime::RecvChunkGuard<'a>,
-        len: usize,
-    },
-    /// Body bytes lifted from a straddling fresh-recv chunk. The
-    /// chunk's body-side prefix was copied to a heap `IOBuf` so the
-    /// post-body residue (which belongs to the next pipelined
-    /// request) could be detached into `BodyReader.leftover` for
-    /// `serve_conn` to carry forward. One memcpy paid in this
-    /// branch only.
+    /// Body bytes pulled from the transport source (or copied out of a
+    /// straddling chunk): an owned `IOBuf`. `data()` is zero copy;
+    /// `into_owned()` is a move.
     Owned(IOBuf),
 }
 
@@ -286,54 +233,38 @@ impl<'a> BodyChunkGuard<'a> {
     pub fn data(&self) -> &[u8] {
         match &self.src {
             ChunkSource::Prebuf(buf, _) => buf.data(),
-            ChunkSource::Stream { guard, len } => &guard.data()[..*len],
             ChunkSource::Owned(buf) => buf.data(),
         }
     }
 
     /// Take owned possession of the chunk's bytes.
     ///
-    /// Zero copy when the bytes already sit in an owned buffer — the
-    /// `ExternalOwned` NIC RX buffer on the bare-metal TCP path. One
-    /// memcpy when they are a borrowed view: the parse-buffer prebuf
-    /// (copied to `Heap`), or the TLS plaintext window. The escape
-    /// hatch for holding the bytes past the guard's borrow.
+    /// Zero copy when the bytes already sit in an owned buffer (the
+    /// transport-source path); one memcpy for the borrowed prebuf view.
     pub fn into_owned(self) -> IOBuf {
         match self.src {
             ChunkSource::Prebuf(buf, _) => buf.into_owned(),
-            ChunkSource::Stream { guard, len: _ } => {
-                // `chunk()`'s straddle handling now routes the
-                // straddling case to the `Owned` variant, so here
-                // the whole surfaced chunk is body bytes — hand the
-                // guard's IOBuf straight on (`into_owned` is zero
-                // copy for an owned source).
-                guard.into_owned()
-            }
             ChunkSource::Owned(buf) => buf,
         }
     }
 }
 
-/// Item H — `BodyReader::chunk` returns a `BodyChunkGuard`. These
-/// tests pin the two prebuf-side chunk sources (in-place `data()`
+/// These tests pin the prebuf-side chunk sources (in-place `data()`
 /// and the `into_owned()` heap copy), the prebuf trim to
-/// `Content-Length`, and the `NullStream` (HTTP/3-style pre-buffered
-/// body) case where `recv_chunk` has no chunk path. The
-/// transport-`recv_chunk` source needs a live backend and is
-/// exercised by `test_hvf` instead.
+/// `Content-Length`, and the `None`-source (fully-buffered) case where
+/// there's no transport to pull from. The live-transport source needs a
+/// backend and is exercised by `test_hvf`.
 #[cfg(test)]
 mod body_reader_tests {
     use super::BodyReader;
-    use crate::stream::NullStream;
     use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-    /// Minimal executor: every future these tests build resolves on
-    /// the first poll — the prebuf path returns without awaiting,
-    /// and `NullStream::recv_chunk` (the inherited `-> None` default)
-    /// is itself non-suspending — so a single poll with a no-op
-    /// waker drives any of them to completion.
+    /// Minimal executor: every future these tests build resolves on the
+    /// first poll — the prebuf path returns without awaiting, and a
+    /// `None` source never awaits — so a single poll with a no-op waker
+    /// drives any of them to completion.
     fn block_on<F: Future>(fut: F) -> F::Output {
         fn noop(_: *const ()) {}
         fn clone(_: *const ()) -> RawWaker {
@@ -352,13 +283,12 @@ mod body_reader_tests {
         }
     }
 
-    /// A body whose bytes all rode in with the headers is served
-    /// from the prebuf in one chunk; the next `chunk` is `None`.
+    /// A body whose bytes all rode in with the headers is served from
+    /// the prebuf in one chunk; the next `chunk` is `None`.
     #[test]
     fn serves_prebuf_then_none() {
-        let mut s = NullStream;
         let prebuf = b"PINGPONG-body";
-        let mut br = BodyReader::new(&mut s, prebuf, prebuf.len());
+        let mut br = BodyReader::new(None, prebuf, prebuf.len());
         let g = block_on(br.chunk()).expect("prebuf chunk");
         assert_eq!(g.data(), prebuf);
         drop(g);
@@ -370,9 +300,8 @@ mod body_reader_tests {
     /// outlives the guard and preserves the bytes.
     #[test]
     fn prebuf_chunk_into_owned_copies() {
-        let mut s = NullStream;
         let prebuf = b"materialise-me";
-        let mut br = BodyReader::new(&mut s, prebuf, prebuf.len());
+        let mut br = BodyReader::new(None, prebuf, prebuf.len());
         let owned = block_on(br.chunk()).unwrap().into_owned();
         assert_eq!(owned.data(), prebuf);
     }
@@ -382,32 +311,27 @@ mod body_reader_tests {
     /// post-body bytes into the chunk.
     #[test]
     fn prebuf_trimmed_to_content_length() {
-        let mut s = NullStream;
         // 4 body bytes followed by the next request's bytes.
         let raw = b"BODYGET / HTTP/1.1\r\n";
-        let mut br = BodyReader::new(&mut s, raw, 4);
+        let mut br = BodyReader::new(None, raw, 4);
         let g = block_on(br.chunk()).unwrap();
         assert_eq!(g.data(), b"BODY");
         drop(g);
         assert!(block_on(br.chunk()).is_none());
     }
 
-    /// When the declared body is longer than the prebuf and the
-    /// stream has no chunk path (`NullStream` — the HTTP/3-style
-    /// pre-buffered case), `chunk` returns `None` past the prebuf:
-    /// EOF before `Content-Length`, surfaced via `remaining()`.
+    /// When the declared body is longer than the prebuf and there's no
+    /// transport source (the HTTP/2/3 fully-buffered case), `chunk`
+    /// returns `None` past the prebuf: EOF before `Content-Length`,
+    /// surfaced via `remaining()`.
     #[test]
-    fn nullstream_past_prebuf_is_eof() {
-        let mut s = NullStream;
+    fn buffered_past_prebuf_is_eof() {
         let prebuf = b"HALF";
-        let mut br = BodyReader::new(&mut s, prebuf, 100);
+        let mut br = BodyReader::new(None, prebuf, 100);
         let g = block_on(br.chunk()).unwrap();
         assert_eq!(g.data(), prebuf);
         drop(g);
-        assert!(
-            block_on(br.chunk()).is_none(),
-            "NullStream recv_chunk -> None"
-        );
+        assert!(block_on(br.chunk()).is_none(), "no source -> None past prebuf");
         assert_eq!(br.remaining(), 96);
     }
 }

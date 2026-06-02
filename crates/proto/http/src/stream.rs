@@ -1,26 +1,36 @@
 // Byte-level transport abstraction for the HTTP server.
 //
-// `HttpStream` is the trait `serve_conn` drives — plain HTTP uses
-// `TcpStream` directly; HTTPS wraps it in `http2::TlsStream`; HTTP/3
-// hands a pre-buffered `NullStream` so the same handler signature
-// works across all three.
+// `HttpStream` is the trait the per-connection loop drives for its own
+// I/O — plain HTTP uses `TcpStream` directly; HTTPS wraps it in
+// `http2::TlsStream`. The serve loop reads the request head and writes
+// the response through `HttpStream` (monomorphised per transport, so
+// those calls inline).
+//
+// The request *body* past the prebuf reaches the handler through a
+// transport-erased seam — [`BodySource`] + `&mut dyn BodySource` on
+// `BodyReader` — so the handler signature is `(&Request, &mut
+// BodyReader<'_>)` with **no** stream type parameter, identical for
+// HTTP/1.1, HTTP/2, and HTTP/3. That's what lets one handler value
+// serve every transport (and the `https::serve` facade take a single
+// handler) without a per-protocol `Service` trait or `NullStream` stub.
 
-use iobuf::IOBufChain;
+use core::future::Future;
+use core::pin::Pin;
 
-use crate::body::BodyReader;
+use alloc::boxed::Box;
+
+use iobuf::{IOBuf, IOBufChain};
 
 // ---- HttpStream abstraction --------------------------------------------------
 //
-// `HttpStream` is the byte-level interface the conn handler uses
-// to talk to a peer. Plain HTTP impls it directly over
-// `TcpStream`; HTTPS impls it via `http2::TlsStream`, which
-// pumps the TLS state machine inside `recv` / `send` so the
-// handler stays protocol-agnostic.
+// `HttpStream` is the byte-level interface the conn loop uses to talk
+// to a peer. Plain HTTP impls it directly over `TcpStream`; HTTPS impls
+// it via `http2::TlsStream`, which pumps the TLS state machine inside
+// `recv` / `send` so the loop stays protocol-agnostic.
 //
-// Static dispatch: `serve_conn<S: HttpStream>` is monomorphised
-// per impl, so trait method calls inline. Plain and TLS paths
-// share the same connection-loop machinery; the only thing
-// changing is the byte-level transport.
+// Static dispatch: `serve_conn<S: HttpStream>` is monomorphised per
+// impl, so trait method calls inline. Plain and TLS paths share the
+// same connection-loop machinery; only the byte-level transport changes.
 
 /// `async_fn_in_trait` lints because the lint can't see that
 /// our connection futures are `!Send` by design — `TcpStream` is
@@ -35,16 +45,15 @@ pub trait HttpStream {
     /// slice. `None` on peer close / EOF, or on a transport with no
     /// streaming chunk path.
     ///
-    /// [`BodyReader::chunk`] calls this once its prebuf is drained,
-    /// so request-body bytes past the prebuf reach the handler with
-    /// no intermediate copy — item H of
-    /// `docs/rx-path-optimizations.md`.
+    /// The serve loop calls this for the request head, and
+    /// [`BodyReader`](crate::BodyReader) reaches it (via the
+    /// [`BodySource`] blanket impl) for request-body bytes past the
+    /// prebuf — both zero-copy from the device buffer (item H of
+    /// `docs/rx-path-optimizations.md`).
     ///
-    /// The default returns `None`: [`NullStream`] (HTTP/3, body
-    /// pre-buffered) has no streaming chunk path, and `BodyReader`
-    /// then serves the body from its prebuf alone.
-    /// `waitless::runtime::TcpStream` and `http2::TlsStream` override
-    /// this with their real `recv_chunk` implementations.
+    /// The default returns `None` (a transport with no streaming chunk
+    /// path); `waitless::runtime::TcpStream` and `http2::TlsStream`
+    /// override it with their real implementations.
     ///
     /// `&mut self` is load-bearing, not incidental — the returned
     /// [`RecvChunkGuard`] carries that borrow for its whole life, so
@@ -89,30 +98,37 @@ pub trait HttpStream {
     }
 }
 
-/// `HttpStream` impl for transports that hand the request body to
-/// the HTTP layer pre-buffered in one go (HTTP/3 reassembles DATA
-/// frames before invoking the handler). [`BodyReader`] draws stream
-/// bytes (via `recv_chunk`) only once its `prebuf` is exhausted —
-/// for an h3 body constructed with `prebuf.len() == total`, that
-/// path never fires. `NullStream` exists so the generic type
-/// parameter is satisfied for those transports: it inherits the
-/// default `recv_chunk` (returns `None`, so `BodyReader` serves
-/// from the prebuf alone); calling `send` panics — that transport
-/// does not write through `HttpStream`.
-pub struct NullStream;
+// ---- BodySource: the transport-erased request-body seam ----------------------
 
-/// Friendly alias for a [`BodyReader`] over [`NullStream`] — i.e.
-/// a body whose bytes are entirely in the prebuf and won't trigger
-/// any stream refill. Used by transports that buffer the request
-/// body before handing control to the application (HTTP/3 today).
-pub type BufferedBody<'a> = BodyReader<'a, NullStream>;
+/// Object-safe source of request-body bytes, held by
+/// [`BodyReader`](crate::BodyReader) as `&mut dyn BodySource` so the
+/// handler never names the transport stream type.
+///
+/// There is a blanket impl for every [`HttpStream`], so transports get
+/// this for free — `BodyReader` works over `&mut dyn BodySource` while
+/// the serve loops keep their concrete `S` for head/response I/O.
+///
+/// `next_chunk` returns a **boxed** future. The box is the price of
+/// object-safety (async methods aren't `dyn`-compatible on stable), and
+/// it lands **only on the cold request-body path**: a GET never calls
+/// it, and HTTP/2 / HTTP/3 buffer their body and pass *no* source. The
+/// body *bytes* stay zero-copy — the returned `IOBuf` owns the device
+/// buffer (`into_owned` is a move for `External`/`Heap`). Eliminating
+/// even the per-chunk box would mean a poll-based source replicating the
+/// reactor's chunk-slot/waker/cancel contract; deferred as a perf
+/// follow-up since the body path is cold.
+pub trait BodySource {
+    /// Next run of body bytes as an owned `IOBuf`, or `None` at
+    /// end-of-body / peer close.
+    fn next_chunk(&mut self) -> Pin<Box<dyn Future<Output = Option<IOBuf>> + '_>>;
+}
 
-impl HttpStream for NullStream {
-    async fn send(&mut self, _chain: &mut IOBufChain) -> Result<(), ()> {
-        panic!("NullStream::send: this transport does not write through HttpStream")
-    }
-    async fn close(&mut self) -> Result<(), ()> {
-        Ok(())
+impl<T: HttpStream + ?Sized> BodySource for T {
+    fn next_chunk(&mut self) -> Pin<Box<dyn Future<Output = Option<IOBuf>> + '_>> {
+        // Reuse the transport's zero-copy `recv_chunk` and take owned
+        // possession of the surfaced buffer. `into_owned` is a move for
+        // an owned device buffer; a copy only for a borrowed view.
+        Box::pin(async move { self.recv_chunk().await.map(|g| g.into_owned()) })
     }
 }
 

@@ -74,13 +74,7 @@ fn now_cycles() -> u64 {
 /// so a slow handler suspends only its own connection.
 pub fn listen<H>(port: u16, handler: H) -> Result<(), waitless::runtime::TcpBindError>
 where
-    H: for<'a, 'b> AsyncFn(
-            &'a Request,
-            &'a mut BodyReader<'b, waitless::runtime::TcpStream>,
-        ) -> Response
-        + Send
-        + Sync
-        + 'static,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + Send + Sync + 'static,
 {
     let listener = waitless::runtime::TcpListener::bind(port)?;
     let handler = Arc::new(handler);
@@ -118,7 +112,7 @@ where
 pub async fn serve_conn<S, H>(handler: Arc<H>, mut stream: S)
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, S>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
 {
     crate::diag::COUNTERS.connections_served.bump();
     let mut req = Request::new();
@@ -236,7 +230,7 @@ where
                     }
                     None => &[],
                 };
-                let mut body = BodyReader::new(&mut stream, prebuf, content_length);
+                let mut body = BodyReader::new(Some(&mut stream), prebuf, content_length);
                 let __h0 = now_cycles();
                 resp = (*handler)(&req, &mut body).await;
                 crate::diag::COUNTERS
@@ -411,7 +405,7 @@ mod serve_conn_tests {
     // request the handler sees. thread_local! because the handler
     // must be a plain `async fn` (a state-capturing closure fights
     // the compiler over the HRTB
-    // `for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, S>)`).
+    // `for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>)`).
     // Each test resets the cell before driving serve_conn.
     type ObservedReq = (Method, Vec<u8>, Vec<u8>);
 
@@ -419,7 +413,7 @@ mod serve_conn_tests {
         static OBSERVED: RefCell<Vec<ObservedReq>> = const { RefCell::new(Vec::new()) };
     }
 
-    async fn observe_handler(req: &Request, body: &mut BodyReader<'_, MockStream>) -> Response {
+    async fn observe_handler(req: &Request, body: &mut BodyReader<'_>) -> Response {
         let mut body_bytes = Vec::new();
         while let Some(guard) = body.chunk().await {
             body_bytes.extend_from_slice(guard.data());

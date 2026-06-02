@@ -9,13 +9,13 @@
 // actually lives — the per-transport listeners (`http2::listen`,
 // `http3::listen`) remain available for finer control.
 //
-// One handler serves every transport via the [`Service`] trait. The
-// trait's `handle` method is **generic over the byte stream**, which is
-// what lets a single value drive both transports: the TCP path
-// monomorphizes `handle::<http2::TlsStream>`, the QUIC path
-// `handle::<http::NullStream>`. (A plain `async fn` handler can't do
-// this — one value can't be two stream-monomorphizations at once — so
-// the polymorphism moves into the trait method. See `docs/crates.md`.)
+// One **plain** handler serves every transport. The handler signature —
+// `(&Request, &mut BodyReader<'_>)` — is transport-erased (the request
+// body reaches it through `http`'s `&mut dyn BodySource` seam, not a
+// stream type parameter), so a single value drives h1.1/h2 over TLS and
+// h3 over QUIC alike. No `Service` trait, no per-protocol adapter: the
+// facade just hands the same (`Arc`-shared) handler to both listeners,
+// wrapping the TCP path to append `Alt-Svc`.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -25,47 +25,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use http::{BodyReader, HttpStream, NullStream, Request, Response};
-
-/// A request handler that serves any HTTP version over any transport.
-///
-/// `handle` is generic over the byte stream `S` so one `Service` value
-/// can be driven by every transport the facade binds — the TCP/TLS path
-/// instantiates it with `http2::TlsStream`, the QUIC path with
-/// `http::NullStream`. Implement it once (typically forwarding to a
-/// stream-generic free function) and hand it to [`serve`].
-///
-/// ```ignore
-/// #[derive(Clone, Copy)]
-/// struct Site;
-/// impl https::Service for Site {
-///     async fn handle<S: http::HttpStream>(
-///         &self,
-///         req: &http::Request,
-///         body: &mut http::BodyReader<'_, S>,
-///     ) -> http::Response {
-///         my_router(req, body).await
-///     }
-/// }
-/// https::serve(443, Site, CERT_CHAIN, KEY_DER)?;
-/// ```
-pub trait Service: Send + Sync + 'static {
-    /// Handle one request. Borrows the request and a `BodyReader` over
-    /// whatever transport stream `S` the active listener uses.
-    ///
-    /// The returned future is intentionally **not** `Send`-bounded: the
-    /// listeners run each connection on its owning worker (the per-conn
-    /// future is `!Send` by design — `BodyReader<S>` borrows per-worker
-    /// transport state), so requiring a `Send` future here would make
-    /// the trait unimplementable. The `Service` *value* is `Send + Sync`
-    /// (it's shared across workers via `Arc`); the work it produces is
-    /// not.
-    fn handle<S: HttpStream>(
-        &self,
-        req: &Request,
-        body: &mut BodyReader<'_, S>,
-    ) -> impl core::future::Future<Output = Response>;
-}
+use http::{BodyReader, Request, Response};
 
 /// Outcome of a successful [`serve`]. The TCP/TLS server is always up
 /// (otherwise `serve` returns `Err`); `h3` reports whether the QUIC/UDP
@@ -87,27 +47,33 @@ pub enum ServeError {
     Tcp(http2::ListenError),
 }
 
-/// Serve `service` as a full HTTPS site on `port`: h1.1 + h2 over
+/// Serve `handler` as a full HTTPS site on `port`: h1.1 + h2 over
 /// TLS/TCP and h3 over QUIC/UDP, with automatic `Alt-Svc`. `cert_chain`
 /// (DER, leaf first) + `key_der` are the same blobs the per-transport
 /// listeners accept.
-pub fn serve<Sv: Service>(
+///
+/// `handler` is any async `fn`/closure taking `(&Request, &mut
+/// BodyReader<'_>)` — the same shape `http::listen` takes — so one
+/// handler can drive plain HTTP, HTTPS, and HTTP/3 with no per-version
+/// wrapper.
+pub fn serve<H>(
     port: u16,
-    service: Sv,
+    handler: H,
     cert_chain: &'static [&'static [u8]],
     key_der: &'static [u8],
-) -> Result<Served, ServeError> {
-    let service = Arc::new(service);
+) -> Result<Served, ServeError>
+where
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + Send + Sync + 'static,
+{
+    // One handler, shared across both transports' per-conn tasks.
+    let handler = Arc::new(handler);
 
     // Bring up h3 (QUIC/UDP) first, best-effort — its success gates the
-    // Alt-Svc advertisement on the TCP path. `handle::<NullStream>`:
-    // h3 reassembles the body and hands a prebuffered BodyReader.
-    let svc_h3 = Arc::clone(&service);
+    // Alt-Svc advertisement on the TCP path.
+    let h3 = Arc::clone(&handler);
     let h3_up = http3::listen(
         port,
-        async move |req: Request, body: &mut BodyReader<'_, NullStream>| -> Response {
-            svc_h3.handle(&req, body).await
-        },
+        async move |req: &Request, body: &mut BodyReader<'_>| -> Response { (*h3)(req, body).await },
         cert_chain,
         key_der,
     )
@@ -117,13 +83,13 @@ pub fn serve<Sv: Service>(
     // suppressed when h3 didn't come up.
     let alt: Option<&'static [u8]> = if h3_up { Some(alt_svc_value(port)) } else { None };
 
-    // h1.1 + h2 over TLS/TCP — the required half.
-    // `handle::<http2::TlsStream>`: the live TLS stream.
-    let svc_tcp = Arc::clone(&service);
+    // h1.1 + h2 over TLS/TCP — the required half. Wrap the handler to
+    // append `Alt-Svc` so plain/H2 clients learn about the h3 endpoint.
+    let tcp = Arc::clone(&handler);
     http2::listen(
         port,
-        async move |req: &Request, body: &mut BodyReader<'_, http2::TlsStream>| -> Response {
-            let resp = svc_tcp.handle(req, body).await;
+        async move |req: &Request, body: &mut BodyReader<'_>| -> Response {
+            let resp = (*tcp)(req, body).await;
             match alt {
                 Some(a) => resp.with_header(&b"Alt-Svc"[..], a),
                 None => resp,

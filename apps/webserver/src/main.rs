@@ -173,10 +173,13 @@ async fn init() {
 
     // One call brings up all of HTTPS: h1.1 + h2 over TLS/TCP and h3
     // over QUIC/UDP on the same port, with the `Alt-Svc` h3
-    // advertisement wired automatically. `Site` routes every transport
-    // through the shared `handle_request`. h3 is best-effort inside
-    // `serve` — the TCP server still comes up if the UDP bind fails.
-    match https::serve(HTTPS_PORT, Site, TLS_CERT_CHAIN, TLS_KEY_PKCS8_DER) {
+    // advertisement wired automatically. The *same* `handle_request`
+    // serves every transport — its `(&Request, &mut BodyReader<'_>)`
+    // signature is transport-erased, so no per-version wrapper is
+    // needed (it's the same handler plain `http::listen` takes above).
+    // h3 is best-effort inside `serve` — the TCP server still comes up
+    // if the UDP bind fails.
+    match https::serve(HTTPS_PORT, handle_request, TLS_CERT_CHAIN, TLS_KEY_PKCS8_DER) {
         Ok(served) => {
             waitless::println!(
                 "listen :{} (https — h1.1+h2/TLS{}, TLS_AES_128_GCM_SHA256)",
@@ -188,25 +191,6 @@ async fn init() {
             }
         }
         Err(_) => waitless::println!("[WARN] https disabled (cert/key invalid)"),
-    }
-}
-
-/// Routes every HTTPS transport — h1.1 + h2 over TLS, h3 over QUIC —
-/// through the shared `handle_request`. The `https::Service` trait's
-/// generic `handle` is what lets one value serve all transports: the
-/// TCP path monomorphizes it over `TlsStream`, the QUIC path over
-/// `NullStream`. The `Alt-Svc` header advertising h3 is added by
-/// `https::serve`, so the handler itself stays transport-oblivious.
-#[derive(Clone, Copy)]
-struct Site;
-
-impl https::Service for Site {
-    async fn handle<S: http::HttpStream>(
-        &self,
-        req: &Request,
-        body: &mut http::BodyReader<'_, S>,
-    ) -> Response {
-        handle_request(req, body).await
     }
 }
 
@@ -271,10 +255,7 @@ async fn gateway(mut stream: TcpStream, backend_ip: [u8; 4]) {
 
 // ---- Request dispatch -------------------------------------------------------
 
-async fn handle_request<S: http::HttpStream>(
-    req: &Request,
-    body: &mut http::BodyReader<'_, S>,
-) -> Response {
+async fn handle_request(req: &Request, body: &mut http::BodyReader<'_>) -> Response {
     match req.path() {
         // ── HTML pages ───────────────────────────────────────────
         b"/" => page_home(),
