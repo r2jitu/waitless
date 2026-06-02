@@ -97,6 +97,25 @@ SECTIONS {
         *(.data .data.*)
     } :data
 
+    /* GOT / relocation-target sections. lld places these as *orphan*
+       sections when the script doesn't name them — and its orphan
+       placement put GOT entries PAST the `.got` blob, overlapping the
+       writable `.bss` statics (gve's TX_QUEUES / diag counters share
+       addresses with GOT call slots). A gve write (a diag-counter
+       `lock add` under load, or a queue pointer) then clobbers a GOT
+       entry, and the next GOT-indirect call jumps to garbage -> #PF.
+       Naming them here forces a single contiguous GOT in the data
+       segment, BEFORE .bss, so nothing in .bss aliases a GOT slot. */
+    .data.rel.ro ALIGN(8) : {
+        *(.data.rel.ro .data.rel.ro.*)
+    } :data
+    .got ALIGN(8) : {
+        *(.got)
+    } :data
+    .got.plt ALIGN(8) : {
+        *(.got.plt)
+    } :data
+
     .init_array ALIGN(8) : {
         __init_array_start = .;
         KEEP(*(.init_array .init_array.*))
