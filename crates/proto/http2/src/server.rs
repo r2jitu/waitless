@@ -23,11 +23,17 @@
 // conn_window) discipline — distinct from, and stacked on top of, TCP's
 // window underneath.
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::rc::Rc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cell::RefCell;
+use core::future::Future;
+use core::pin::Pin;
 
-use http::{BodyReader, IOBuf, IOBufChain, Method, Request, Response, HttpStream};
+use http::{BodyReader, BodySource, HttpStream, IOBuf, IOBufChain, Method, Request, Response};
+use waitless::runtime::{AsyncEvent, Either, select, spawn};
 
 use crate::frame::{self, FrameHeader, error, flags, ftype, settings_id};
 use crate::hpack::{self, FieldSink, HpackError};
@@ -59,9 +65,12 @@ const MAX_CONCURRENT_STREAMS: usize = 100;
 /// both the connection and each stream).
 const INITIAL_WINDOW: i64 = 65_535;
 
-/// Largest request body we buffer before dispatch. Beyond this the
-/// stream is reset — streaming large request bodies is a tail item.
-const MAX_BODY: usize = 256 * 1024;
+/// Backpressure cap on a streaming stream's not-yet-consumed receive
+/// buffer. We credit the peer (WINDOW_UPDATE) only as the handler
+/// drains, so a well-behaved peer never exceeds the window we
+/// advertised; this is the defensive ceiling for a peer that ignores
+/// flow control — past it we reset the stream.
+const STREAM_RECV_BUF_CAP: usize = 1024 * 1024;
 
 /// Cap on the bytes of one header block (HEADERS + CONTINUATIONs)
 /// before END_HEADERS — the H2-5 CONTINUATION-flood guard.
@@ -79,7 +88,7 @@ const RST_FLOOD_CAP: u32 = 200;
 pub async fn serve_conn<S, H>(handler: Arc<H>, mut stream: S)
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
 {
     // One-time lazy-init of the shared Huffman tree (matches
     // http3::listen / tls::preinit — keeps the first request's alloc
@@ -114,34 +123,73 @@ where
 
     let mut payload: Vec<u8> = Vec::with_capacity(MAX_FRAME_SIZE);
     loop {
-        // 1. Flush queued control + response frames the windows allow.
+        // Arm the handler-wakeup before the bookkeeping sweeps. The
+        // sweeps below run unconditionally (nothing is missed); the
+        // flag only governs whether the `select` re-wakes for work a
+        // handler task signals after this point.
+        conn.demux_wake.reset();
+        // 1. Emit receive-window credit for body bytes streaming
+        //    handlers consumed, and move finished responses into the
+        //    framing queue.
+        conn.credit_consumed_bodies();
+        conn.drain_responses();
+        // 2. Flush queued control + response frames the windows allow.
         if flush(&mut conn, &mut stream).await.is_err() {
+            reset_all_streams(&mut conn);
             return;
         }
-        // 2. Done? (peer GOAWAY / our error after everything drained)
-        if conn.closing && conn.out_queue.is_empty() && conn.ctrl_out.is_empty() {
+        // 3. Done? (peer GOAWAY / our error, everything drained, no
+        //    in-flight handlers).
+        if conn.closing
+            && conn.out_queue.is_empty()
+            && conn.ctrl_out.is_empty()
+            && conn.streams.is_empty()
+        {
             return;
         }
-        // 3. Read the next frame.
-        let hdr = match read_frame(&mut conn.inbuf, &mut stream, &mut payload).await {
-            ReadResult::Frame(h) => h,
-            ReadResult::FrameTooLarge => {
+        // 4. Wait for the next frame OR a handler task signalling work.
+        //    `select` polls the read first and only drops it while
+        //    pending (no chunk dequeued yet), so no inbound bytes are
+        //    lost when the wakeup branch wins.
+        let wake = Rc::clone(&conn.demux_wake);
+        let read = read_frame(&mut conn.inbuf, &mut stream, &mut payload);
+        let hdr = match select(read, wake.wait()).await {
+            Either::Right(()) => continue, // handler signalled → re-sweep.
+            Either::Left(ReadResult::Frame(h)) => h,
+            Either::Left(ReadResult::FrameTooLarge) => {
                 conn.error_goaway(error::FRAME_SIZE_ERROR);
                 let _ = flush(&mut conn, &mut stream).await;
+                reset_all_streams(&mut conn);
                 return;
             }
-            ReadResult::Eof => return,
+            Either::Left(ReadResult::Eof) => {
+                reset_all_streams(&mut conn);
+                return;
+            }
         };
-        // 4. Process it.
+        // 5. Process it.
         match process_frame(&mut conn, &mut stream, &handler, hdr, &payload).await {
             Ok(()) => {}
             Err(code) => {
                 conn.error_goaway(code);
                 let _ = flush(&mut conn, &mut stream).await;
+                reset_all_streams(&mut conn);
                 return;
             }
         }
     }
+}
+
+/// Tear down all in-flight streaming handlers: flag each reset and wake
+/// it so its `H2BodySource` returns `None` and the task unwinds (its
+/// response, if any, is dropped). Drops the demux's `StreamBody`
+/// handles; the tasks keep their own clones until they finish.
+fn reset_all_streams(conn: &mut H2Conn) {
+    for slot in &conn.streams {
+        slot.body.data.borrow_mut().reset = true;
+        slot.body.event.set();
+    }
+    conn.streams.clear();
 }
 
 // ── Connection state ───────────────────────────────────────────────
@@ -159,8 +207,17 @@ struct H2Conn {
     ctrl_out: Vec<u8>,
     /// Responses being framed onto the wire, FIFO.
     out_queue: VecDeque<StreamOut>,
-    /// Streams past HEADERS still accumulating a request body.
-    pending_bodies: Vec<StreamReq>,
+    /// Streaming request streams — one spawned handler task each, fed by
+    /// a `StreamBody` the demux pushes DATA into. The body path for
+    /// every request that carries one.
+    streams: Vec<StreamSlot>,
+    /// Responses produced by spawned handler tasks, awaiting framing.
+    /// The task pushes `(stream_id, response)`; the demux drains into
+    /// `out_queue`. Shared (the tasks hold a clone).
+    resp_sink: Rc<RefCell<VecDeque<(u32, Response)>>>,
+    /// Set by handler tasks when a response is ready or body bytes were
+    /// consumed (credit to emit). The demux is the single waiter.
+    demux_wake: Rc<AsyncEvent>,
     /// In-progress header block (HEADERS without END_HEADERS); only one
     /// at a time per RFC 7540 §6.2 (no interleaving).
     header_asm: Option<HeaderAsm>,
@@ -189,7 +246,9 @@ impl H2Conn {
             value_scratch: alloc::vec![0u8; 16 * 1024],
             ctrl_out: Vec::new(),
             out_queue: VecDeque::new(),
-            pending_bodies: Vec::new(),
+            streams: Vec::new(),
+            resp_sink: Rc::new(RefCell::new(VecDeque::new())),
+            demux_wake: Rc::new(AsyncEvent::new()),
             header_asm: None,
             conn_send_window: INITIAL_WINDOW,
             peer_initial_window: INITIAL_WINDOW,
@@ -200,10 +259,71 @@ impl H2Conn {
         }
     }
 
-    /// Streams that count against `MAX_CONCURRENT_STREAMS`: bodies being
-    /// assembled plus responses still in flight.
+    /// Streams that count against `MAX_CONCURRENT_STREAMS`: streaming
+    /// handlers in flight plus responses still framing.
     fn active_count(&self) -> usize {
-        self.pending_bodies.len() + self.out_queue.len()
+        self.streams.len() + self.out_queue.len()
+    }
+
+    /// Emit WINDOW_UPDATE credit for body bytes streaming handlers have
+    /// consumed since the last sweep (receive-side flow control). Called
+    /// each demux iteration; cheap when nothing was consumed.
+    fn credit_consumed_bodies(&mut self) {
+        for slot in &self.streams {
+            let n = {
+                let mut d = slot.body.data.borrow_mut();
+                core::mem::take(&mut d.consumed_uncredited)
+            };
+            if n > 0 {
+                // Stream-level credit only — the connection window is
+                // replenished on arrival in `process_data`. `n` is bounded
+                // by STREAM_RECV_BUF_CAP (1 MiB) « i31, so the clamp never
+                // actually drops credit; the assert guards that invariant
+                // if the cap is ever raised.
+                debug_assert!(n <= 0x7fff_ffff, "WINDOW_UPDATE increment {n} exceeds i31");
+                frame::push_window_update(&mut self.ctrl_out, slot.id, n.min(0x7fff_ffff) as u32);
+            }
+        }
+    }
+
+    /// Move completed handler responses into the framing queue. Drops a
+    /// response whose stream was reset. Returns the stream ids that
+    /// finished (so the caller can retire their slots).
+    fn drain_responses(&mut self) {
+        loop {
+            let next = self.resp_sink.borrow_mut().pop_front();
+            let Some((sid, resp)) = next else { break };
+            // Locate the slot; a reset stream drops its response. No slot
+            // (already reset+removed) → drop.
+            let pos = self.streams.iter().position(|s| s.id == sid);
+            if let Some(i) = pos {
+                let was_reset = self.streams[i].body.data.borrow().reset;
+                self.streams.remove(i);
+                if !was_reset {
+                    self.queue_response(sid, resp);
+                }
+            }
+        }
+    }
+
+    /// Frame a finished `Response` onto `out_queue` (headers + body),
+    /// honouring the per-stream initial send window.
+    fn queue_response(&mut self, sid: u32, resp: Response) {
+        let mut header_block = Vec::with_capacity(64);
+        encode_response_headers(&resp, &mut header_block);
+        let body = resp.into_body();
+        let body_remaining = body.total_len();
+        self.out_queue.push_back(StreamOut {
+            id: sid,
+            header_block,
+            headers_sent: false,
+            cur: None,
+            cur_off: 0,
+            body,
+            body_remaining,
+            send_window: self.peer_initial_window,
+        });
+        crate::diag::COUNTERS.responses_sent.bump();
     }
 
     /// Queue a GOAWAY with the given error code and mark the connection
@@ -268,12 +388,75 @@ impl H2Conn {
     }
 }
 
-/// A request stream still accumulating its body (HEADERS seen, awaiting
-/// DATA + END_STREAM).
-struct StreamReq {
+/// Shared receive-body channel for one *streaming* request stream. The
+/// demux task pushes DATA payloads in arrival order; the spawned
+/// handler task drains them through an [`H2BodySource`]. `event` lives
+/// outside the `RefCell` so the handler can `await` it without holding
+/// a borrow across the suspend point (the demux needs `borrow_mut` to
+/// push).
+struct StreamBody {
+    data: RefCell<BodyChanData>,
+    event: AsyncEvent,
+}
+
+struct BodyChanData {
+    /// Queued DATA payloads, oldest first.
+    chunks: VecDeque<Vec<u8>>,
+    /// END_STREAM seen — no more DATA will arrive.
+    eof: bool,
+    /// Stream reset / connection error — the handler should stop and
+    /// its response (if any) is dropped.
+    reset: bool,
+    /// Bytes the handler has drained but not yet credited to the peer.
+    /// The demux reads + clears this and emits WINDOW_UPDATE, giving
+    /// receive-side backpressure (we credit on consume, not arrival).
+    consumed_uncredited: usize,
+    /// Total bytes currently buffered (sum of `chunks` lengths) — the
+    /// `STREAM_RECV_BUF_CAP` check reads this without walking the deque.
+    buffered: usize,
+}
+
+/// Demux-side handle to a streaming request stream.
+struct StreamSlot {
     id: u32,
-    req: Request,
-    body: Vec<u8>,
+    body: Rc<StreamBody>,
+}
+
+/// [`BodySource`] over a streaming request stream, owned by the spawned
+/// handler task. Pulls DATA payloads the demux pushes into the shared
+/// [`StreamBody`]; signals `demux_wake` on consume so the demux emits
+/// the WINDOW_UPDATE credit.
+struct H2BodySource {
+    body: Rc<StreamBody>,
+    demux_wake: Rc<AsyncEvent>,
+}
+
+impl BodySource for H2BodySource {
+    fn next_chunk(&mut self) -> Pin<Box<dyn Future<Output = Option<IOBuf>> + '_>> {
+        Box::pin(async move {
+            loop {
+                // Arm the wakeup BEFORE checking so a push between the
+                // check and the wait can't be lost.
+                self.body.event.reset();
+                {
+                    let mut d = self.body.data.borrow_mut();
+                    if let Some(chunk) = d.chunks.pop_front() {
+                        d.buffered -= chunk.len();
+                        d.consumed_uncredited += chunk.len();
+                        drop(d);
+                        // Tell the demux to credit the peer for the
+                        // bytes we just took off the window.
+                        self.demux_wake.set();
+                        return Some(IOBuf::from(chunk));
+                    }
+                    if d.reset || d.eof {
+                        return None;
+                    }
+                }
+                self.body.event.wait().await;
+            }
+        })
+    }
 }
 
 /// A response being framed onto the wire.
@@ -435,7 +618,7 @@ async fn process_frame<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
 {
     // A header block in mid-assembly forbids interleaving: only a
     // CONTINUATION on the same stream may follow (RFC 7540 §6.2).
@@ -453,7 +636,7 @@ where
     match hdr.ty {
         ftype::SETTINGS => process_settings(conn, hdr, payload),
         ftype::HEADERS => process_headers(conn, stream, handler, hdr, payload).await,
-        ftype::DATA => process_data(conn, stream, handler, hdr, payload).await,
+        ftype::DATA => process_data(conn, hdr, payload),
         ftype::WINDOW_UPDATE => process_window_update(conn, hdr, payload),
         ftype::RST_STREAM => process_rst_stream(conn, hdr),
         ftype::PING => process_ping(conn, hdr, payload),
@@ -529,7 +712,7 @@ async fn process_headers<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
 {
     if hdr.stream_id == 0 || hdr.stream_id.is_multiple_of(2) {
         // Client streams are non-zero and odd (RFC 7540 §5.1.1).
@@ -562,7 +745,7 @@ async fn continue_headers<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
 {
     {
         let asm = conn.header_asm.as_mut().expect("checked by caller");
@@ -593,7 +776,7 @@ async fn complete_headers<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
 {
     let mut req = Request::new();
     let malformed = {
@@ -619,19 +802,36 @@ where
         }
     };
 
-    // Trailers on a stream already accumulating a body: the only thing
-    // that matters is the END_STREAM they (must) carry.
-    if let Some(pos) = conn.pending_bodies.iter().position(|s| s.id == sid) {
+    // Trailers on a streaming stream: a HEADERS block after DATA. The
+    // HPACK was decoded above (keeps the dynamic table in sync); we
+    // ignore the trailer fields but honour the END_STREAM they carry —
+    // it ends the request body.
+    if let Some(slot) = conn.streams.iter().find(|s| s.id == sid) {
         if end_stream {
-            let StreamReq { id, req, body } = conn.pending_bodies.remove(pos);
-            dispatch_stream(conn, stream, handler, id, req, &body).await;
+            slot.body.data.borrow_mut().eof = true;
+            slot.body.event.set();
         }
         return Ok(());
     }
 
-    // A new request stream — ids must strictly increase (RFC 7540 §5.1.1).
+    // No active slot. An id in the already-opened range (`<=
+    // last_stream_id`) is a late frame on a stream we've finished and
+    // dropped — most often a trailer HEADERS whose END_STREAM arrived
+    // after the handler already responded (a legal request-with-trailers
+    // race) — so ignore it rather than tear the whole connection down
+    // with a GOAWAY. The HPACK above was decoded, so the dynamic table
+    // stays in sync. Only a strictly-increasing id opens a new stream
+    // (RFC 7540 §5.1.1). Charge each one to the rapid-reset flood budget:
+    // legitimate late trailers are rare (≤1 per request where we respond
+    // first), so a peer spamming HEADERS on old ids for unbounded
+    // HPACK-decode work still trips ENHANCE_YOUR_CALM.
     if sid <= conn.last_stream_id {
-        return Err(error::PROTOCOL_ERROR);
+        conn.streams_reset += 1;
+        if conn.streams_reset > RST_FLOOD_CAP {
+            crate::h2_drop!(rapid_reset_abort, "closed-stream frame flood={}", conn.streams_reset);
+            return Err(error::ENHANCE_YOUR_CALM);
+        }
+        return Ok(());
     }
     conn.last_stream_id = sid;
 
@@ -647,63 +847,169 @@ where
     }
 
     if end_stream {
-        dispatch_stream(conn, stream, handler, sid, req, &[]).await;
+        // Bodyless request (typically GET): run the handler inline —
+        // it has no body to await, so it returns promptly without
+        // stalling the demux, and we skip a task spawn on the hot path.
+        dispatch_bodyless(conn, stream, handler, sid, req).await;
     } else {
-        conn.pending_bodies.push(StreamReq {
-            id: sid,
-            req,
-            body: Vec::new(),
-        });
+        // A body is coming: spawn a handler task fed by a StreamBody so
+        // the demux keeps reading DATA into it while the handler runs.
+        // Arena exhaustion → refuse the stream (h2's overload response)
+        // rather than buffer unboundedly.
+        if !spawn_streaming(conn, handler, sid, req) {
+            crate::h2_drop!(stream_refused, "sid={} spawn arena full", sid);
+            frame::push_rst_stream(&mut conn.ctrl_out, sid, error::REFUSED_STREAM);
+        }
     }
     Ok(())
 }
 
-async fn process_data<S, H>(
-    conn: &mut H2Conn,
-    stream: &mut S,
-    handler: &Arc<H>,
-    hdr: FrameHeader,
-    payload: &[u8],
-) -> Result<(), u32>
+/// Parse an ASCII `content-length` value. `None` if absent or
+/// non-numeric (h2 delimits the body by END_STREAM regardless; this is
+/// only used to give the handler an accurate `remaining()`).
+fn parse_content_length(v: Option<&[u8]>) -> Option<usize> {
+    let v = v?;
+    if v.is_empty() {
+        return None;
+    }
+    let mut n: usize = 0;
+    for &b in v {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+    }
+    Some(n)
+}
+
+/// Spawn a per-stream handler task that streams the request body from a
+/// `StreamBody` and pushes its response to `resp_sink`. Returns `false`
+/// if the task arena is full (caller refuses the stream). On success
+/// the demux keeps a `StreamSlot` to route DATA + account for the
+/// stream; the task is detached (its handle is dropped — no Drop, so it
+/// runs to completion and frees its own slot).
+fn spawn_streaming<H>(conn: &mut H2Conn, handler: &Arc<H>, sid: u32, req: Request) -> bool
 where
-    S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
 {
+    let content_length = parse_content_length(req.header(b"content-length"));
+    let body = Rc::new(StreamBody {
+        data: RefCell::new(BodyChanData {
+            chunks: VecDeque::new(),
+            eof: false,
+            reset: false,
+            consumed_uncredited: 0,
+            buffered: 0,
+        }),
+        event: AsyncEvent::new(),
+    });
+    let handler = Arc::clone(handler);
+    let body_task = Rc::clone(&body);
+    let sink = Rc::clone(&conn.resp_sink);
+    let demux_wake = Rc::clone(&conn.demux_wake);
+    let spawned = spawn(async move {
+        crate::diag::COUNTERS.requests_received.bump();
+        let resp = {
+            let mut src = H2BodySource {
+                body: body_task,
+                demux_wake: Rc::clone(&demux_wake),
+            };
+            let mut reader = BodyReader::new_streaming(Some(&mut src), &[], content_length);
+            // Run the handler, then surrender the stream WITHOUT draining
+            // any body it left unread. The old post-handler
+            // `reader.discard().await` would park forever on a peer that
+            // declared a Content-Length then stalled (holding the task +
+            // slot until the 30s idle timeout) and forced the whole body
+            // off the wire even for an early reject. Once `drain_responses`
+            // drops the slot, late DATA is ignored + conn-window-credited
+            // by `process_data`'s no-slot arm, and the peer stops at the
+            // un-extended stream window — the h2-correct way to abandon an
+            // unwanted request body.
+            (*handler)(&req, &mut reader).await
+        };
+        crate::diag::COUNTERS.requests_handled.bump();
+        sink.borrow_mut().push_back((sid, resp));
+        demux_wake.set();
+    });
+    match spawned {
+        Ok(_handle) => {
+            conn.streams.push(StreamSlot { id: sid, body });
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn process_data(conn: &mut H2Conn, hdr: FrameHeader, payload: &[u8]) -> Result<(), u32> {
     if hdr.stream_id == 0 {
         return Err(error::PROTOCOL_ERROR);
     }
     let data = data_payload(payload, hdr.flags).ok_or(error::PROTOCOL_ERROR)?;
     // The full frame length (incl. padding) counts against flow control
-    // (RFC 7540 §6.1); replenish it so the peer can keep sending.
+    // (RFC 7540 §6.1).
     let full_len = hdr.length;
-    let mut stream_open = false;
+    let end_stream = hdr.has_flag(flags::END_STREAM);
 
-    if let Some(pos) = conn.pending_bodies.iter().position(|s| s.id == hdr.stream_id) {
-        let too_big = conn.pending_bodies[pos].body.len() + data.len() > MAX_BODY;
-        if too_big {
-            frame::push_rst_stream(&mut conn.ctrl_out, hdr.stream_id, error::ENHANCE_YOUR_CALM);
-            conn.pending_bodies.remove(pos);
-        } else {
-            conn.pending_bodies[pos].body.extend_from_slice(data);
-            if hdr.has_flag(flags::END_STREAM) {
-                let StreamReq { id, req, body } = conn.pending_bodies.remove(pos);
-                dispatch_stream(conn, stream, handler, id, req, &body).await;
-            } else {
-                stream_open = true;
+    match conn.streams.iter().position(|s| s.id == hdr.stream_id) {
+        Some(i) => {
+            // Route the payload into the streaming handler's body
+            // channel. The STREAM-level window is credited on consume
+            // (see `credit_consumed_bodies`) for backpressure; the
+            // CONNECTION window is credited here on arrival (bounded by
+            // per-stream window × MAX_CONCURRENT_STREAMS, and it keeps
+            // the conn-level accounting free of per-stream credit
+            // races).
+            let over_cap = {
+                let body = &conn.streams[i].body;
+                let mut d = body.data.borrow_mut();
+                if d.buffered + data.len() > STREAM_RECV_BUF_CAP {
+                    true
+                } else {
+                    if !data.is_empty() {
+                        d.chunks.push_back(data.to_vec());
+                        d.buffered += data.len();
+                    }
+                    if end_stream {
+                        d.eof = true;
+                    }
+                    drop(d);
+                    body.event.set();
+                    false
+                }
+            };
+            if over_cap {
+                // Peer ignored the stream window we advertised —
+                // defensive reset.
+                crate::h2_drop!(flow_control_error, "recv buffer overflow sid={}", hdr.stream_id);
+                reset_stream(conn, hdr.stream_id, error::FLOW_CONTROL_ERROR);
+            }
+            if full_len > 0 {
+                frame::push_window_update(&mut conn.ctrl_out, 0, full_len);
+            }
+        }
+        None => {
+            // DATA for an unknown stream (finished / reset / never
+            // opened) is leniently ignored — we still replenish the
+            // connection window so the peer's accounting stays
+            // consistent.
+            if full_len > 0 {
+                frame::push_window_update(&mut conn.ctrl_out, 0, full_len);
             }
         }
     }
-    // DATA for an unknown stream is leniently ignored (it may be one we
-    // already finished / reset) — we still replenish the connection
-    // window so the peer's accounting stays consistent.
-
-    if full_len > 0 {
-        frame::push_window_update(&mut conn.ctrl_out, 0, full_len);
-        if stream_open {
-            frame::push_window_update(&mut conn.ctrl_out, hdr.stream_id, full_len);
-        }
-    }
     Ok(())
+}
+
+/// Reset a streaming stream we own (e.g. it overflowed its receive
+/// buffer): flag + wake its handler task so it unwinds, drop our slot,
+/// and tell the peer with RST_STREAM.
+fn reset_stream(conn: &mut H2Conn, sid: u32, code: u32) {
+    if let Some(i) = conn.streams.iter().position(|s| s.id == sid) {
+        let slot = conn.streams.remove(i);
+        slot.body.data.borrow_mut().reset = true;
+        slot.body.event.set();
+    }
+    frame::push_rst_stream(&mut conn.ctrl_out, sid, code);
 }
 
 fn process_window_update(conn: &mut H2Conn, hdr: FrameHeader, payload: &[u8]) -> Result<(), u32> {
@@ -743,7 +1049,13 @@ fn process_rst_stream(conn: &mut H2Conn, hdr: FrameHeader) -> Result<(), u32> {
         return Err(error::FRAME_SIZE_ERROR);
     }
     conn.streams_reset += 1;
-    conn.pending_bodies.retain(|s| s.id != hdr.stream_id);
+    // Terminate a streaming handler for this stream (its response, if
+    // any, is dropped on drain) and drop any queued response.
+    if let Some(i) = conn.streams.iter().position(|s| s.id == hdr.stream_id) {
+        let slot = conn.streams.remove(i);
+        slot.body.data.borrow_mut().reset = true;
+        slot.body.event.set();
+    }
     conn.out_queue.retain(|s| s.id != hdr.stream_id);
     if conn.streams_reset > RST_FLOOD_CAP {
         crate::h2_drop!(rapid_reset_abort, "resets={}", conn.streams_reset);
@@ -767,50 +1079,28 @@ fn process_ping(conn: &mut H2Conn, hdr: FrameHeader, payload: &[u8]) -> Result<(
     Ok(())
 }
 
-/// Run the handler for a completed request stream and enqueue its
-/// response frames. The request body is fully buffered in `body_bytes`,
-/// so the `BodyReader` serves entirely from its prebuf and never pulls
-/// the stream (matching the h3 server's buffered-body model).
-async fn dispatch_stream<S, H>(
+/// Run a bodyless request's handler inline and enqueue its response.
+/// No DATA will arrive (END_STREAM came with the HEADERS), so the
+/// `BodyReader` is empty — the `Some(stream)` source is wired for the
+/// type but never pulled. Inline (vs a spawned task) keeps GETs off the
+/// task arena and returns promptly without stalling the demux.
+async fn dispatch_bodyless<S, H>(
     conn: &mut H2Conn,
     stream: &mut S,
     handler: &Arc<H>,
     sid: u32,
-    mut req: Request,
-    body_bytes: &[u8],
+    req: Request,
 ) where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
 {
     crate::diag::COUNTERS.requests_received.bump();
-    req.set_content_length(body_bytes.len());
     let resp = {
-        // The body is already fully buffered in `body_bytes` (h2
-        // reassembles DATA frames before dispatch) and `total ==
-        // body_bytes.len()`, so the `BodyReader` serves entirely from
-        // its prebuf — the `Some(stream)` source is wired but never
-        // pulled. (`stream` is the TLS conn; pulling it here would read
-        // raw records, which by construction never happens.)
-        let mut body = BodyReader::new(Some(stream), body_bytes, body_bytes.len());
+        let mut body = BodyReader::new(Some(stream), &[], 0);
         (**handler)(&req, &mut body).await
     };
     crate::diag::COUNTERS.requests_handled.bump();
-
-    let mut header_block = Vec::with_capacity(64);
-    encode_response_headers(&resp, &mut header_block);
-    let body = resp.into_body();
-    let body_remaining = body.total_len();
-    conn.out_queue.push_back(StreamOut {
-        id: sid,
-        header_block,
-        headers_sent: false,
-        cur: None,
-        cur_off: 0,
-        body,
-        body_remaining,
-        send_window: conn.peer_initial_window,
-    });
-    crate::diag::COUNTERS.responses_sent.bump();
+    conn.queue_response(sid, resp);
 }
 
 // ── Header (de)framing helpers ─────────────────────────────────────

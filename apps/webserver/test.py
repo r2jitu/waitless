@@ -337,6 +337,65 @@ class WebserverServiceTest(unittest.TestCase):
         )
         self.assertEqual(n_close, len(urls), "some h2 page bodies were truncated")
 
+    def test_h2_upload_streams_with_flow_control(self) -> None:
+        """POST a 512 KiB body over HTTP/2 to `/discard`.
+
+        Exercises the streamed h2 request-body path end to end. The body
+        is larger than BOTH the old whole-body buffer cap (256 KiB,
+        beyond which the stream used to be reset) AND the 65535-byte h2
+        stream flow-control window — so completing it requires the
+        handler to run as its own task while the demux feeds DATA into
+        the body channel and emits WINDOW_UPDATE credit as the handler
+        drains. Before the streaming rework this size would have been
+        rejected; without correct flow-control crediting it would stall.
+        """
+        if not DEV_CERT.is_file():
+            self.skipTest("dev_cert.pem missing from runfiles")
+        try:
+            ver = subprocess.run(["curl", "-V"], capture_output=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest("curl not available")
+        if b"HTTP2" not in ver and b"http2" not in ver:
+            self.skipTest("local curl lacks HTTP/2 support")
+        payload = (b"waitless-h2-upload!" * 30_000)[: 512 * 1024]  # 512 KiB
+        self.assertGreater(len(payload), 256 * 1024, "must exceed the old buffer cap")
+        proc = subprocess.run(
+            [
+                "curl",
+                "-s",
+                "--http2",
+                "--cacert",
+                str(DEV_CERT),
+                "--resolve",
+                f"waitless.local:{TLS_PORT}:127.0.0.1",
+                "-X",
+                "POST",
+                "--data-binary",
+                "@-",
+                "-H",
+                "Content-Type: application/octet-stream",
+                "-o",
+                "-",
+                "-w",
+                "\n__CODE__:%{http_code}__VER__:%{http_version}\n",
+                f"https://waitless.local:{TLS_PORT}/discard",
+            ],
+            input=payload,
+            capture_output=True,
+            timeout=25,
+        )
+        out = proc.stdout
+        self.assertIn(
+            b"__VER__:2", out, f"curl didn't use HTTP/2 (stderr={proc.stderr[:200]!r})"
+        )
+        self.assertIn(
+            b"__CODE__:200",
+            out,
+            f"512 KiB h2 upload should stream to 200 (out={out[:200]!r}, "
+            f"stderr={proc.stderr[:200]!r})",
+        )
+        self.assertIn(b"discarded", out, "missing /discard body")
+
     def test_https_session_resumption(self) -> None:
         """Verify TLS 1.3 session resumption end-to-end.
 
