@@ -4,7 +4,41 @@
 
 use crate::state::{MAX_SEGMENTS, NULL_SLOT, SEGMENT_SIZE, TcpConnection, TcpState};
 use alloc::boxed::Box;
+use core::sync::atomic::{AtomicBool, Ordering};
 use types::IpAddr;
+
+/// A minimal test-and-set latch guarding the `segments` `Vec` against a
+/// reallocation racing a cross-core read. `grow_segment` (which does a
+/// `Vec::push` that can realloc + free the old buffer) and the
+/// cross-core `live_and_armed_snapshot` are the only holders. The
+/// owning core's hot path (`alloc`/`free`/`slot_ptr` with no growth)
+/// never takes it, so connection accept/recv stay lock-free. Built on
+/// `core`-only atomics (no extra crate dep). A panic while held just
+/// poisons it, but a `#![no_std]` panic shuts the kernel down anyway.
+struct GrowLatch(AtomicBool);
+
+impl GrowLatch {
+    const fn new() -> Self {
+        GrowLatch(AtomicBool::new(false))
+    }
+    fn lock(&self) -> GrowGuard<'_> {
+        while self
+            .0
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        GrowGuard(self)
+    }
+}
+
+struct GrowGuard<'a>(&'a GrowLatch);
+impl Drop for GrowGuard<'_> {
+    fn drop(&mut self) {
+        self.0 .0.store(false, Ordering::Release);
+    }
+}
 
 // Per-core connection pools. Core N owns POOLS[N].
 //
@@ -61,6 +95,13 @@ pub(crate) struct TcpPool {
     /// slot to advance the head; on free we push the slot's index
     /// here.
     free_head: core::cell::UnsafeCell<u16>,
+    /// Serialises `grow_segment`'s `Vec` reallocation against the
+    /// cross-core `live_and_armed_snapshot` read. Without it a `push`
+    /// that reallocates + frees the old `segments` buffer races a
+    /// `/obs`-core read of that buffer → use-after-free → wild segment
+    /// pointer → #GP. The owning core's growth-free hot path never
+    /// touches this latch.
+    grow_lock: GrowLatch,
 }
 // SAFETY: per-core ownership — only the owning worker accesses its
 // `TcpPool`. The interior mutability (UnsafeCell) is single-writer
@@ -73,6 +114,7 @@ impl TcpPool {
         TcpPool {
             segments: core::cell::UnsafeCell::new(alloc::vec::Vec::new()),
             free_head: core::cell::UnsafeCell::new(NULL_SLOT),
+            grow_lock: GrowLatch::new(),
         }
     }
 
@@ -155,6 +197,11 @@ impl TcpPool {
     /// in `tcp_test` that didn't reproduce in production
     /// (single-writer per core).
     fn grow_segment(&self) -> bool {
+        // Block any cross-core snapshot read for the whole mutation:
+        // `segs.push` below can reallocate the `segments` Vec and free
+        // its old buffer, which a concurrent `live_and_armed_snapshot`
+        // would otherwise be mid-read of (use-after-free).
+        let _grow = self.grow_lock.lock();
         // SAFETY: per-core ownership.
         let segs = unsafe { &mut *self.segments.get() };
         if segs.len() >= MAX_SEGMENTS {
@@ -730,20 +777,25 @@ pub(crate) fn live_and_armed_snapshot() -> (u64, u64) {
     let mut live = 0u64;
     let mut armed = 0u64;
     for core in 0..n {
-        let cap = pool_capacity(core);
+        let pool = POOLS.at(core);
+        // Hold the owning core's growth latch for this whole per-core
+        // scan. Without it, that core's `grow_segment` can `Vec::push`
+        // a new segment — reallocating and FREEING the `segments`
+        // buffer we're walking — turning `slot_ptr` into a read of a
+        // freed (and possibly reused) buffer: a wild segment pointer
+        // and a #GP. The latch makes the realloc and this scan mutually
+        // exclusive. (The remaining sampling of the two byte fields
+        // below still races the owning core's in-place state writes,
+        // but that only ever miscounts by one — fine for a `/obs`
+        // diagnostic; `state` is `repr(u8)` and `tick_in_list` a bool,
+        // both naturally atomic on aarch64/x86_64.)
+        let _g = pool.grow_lock.lock();
+        let cap = pool.capacity();
         for slot in 0..cap {
-            // SAFETY: cross-core diagnostic read — deliberately
-            // outside the usual per-core ownership rule. The
-            // owning core is the sole writer to its slots; we
-            // sample two byte-sized fields (`state` enum repr u8,
-            // `tick_in_list` bool) whose stores are naturally
-            // atomic on aarch64 and x86_64. A torn read that
-            // racing-classifies a slot as wrong-state just
-            // miscounts by one — fine for a per-`/obs` sample.
-            // No fence: the bench harness reads `/obs` from a
-            // different thread and tolerates eventual consistency
-            // by design.
-            let c = unsafe { &*conn_ptr(core, slot) };
+            // SAFETY: `slot < cap` so the segment is materialised, and
+            // the latch above keeps it from being reallocated out from
+            // under us; sole reader of these two sampled fields.
+            let c = unsafe { &*pool.slot_ptr(slot) };
             if c.state != TcpState::Closed && c.state != TcpState::Listen {
                 live += 1;
             }
