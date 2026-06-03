@@ -340,6 +340,17 @@ fn make_waker_for(worker_id: u32, slot_idx: usize) -> Waker {
     unsafe { Waker::from_raw(raw) }
 }
 
+/// Wake a task by its integer-packed `(worker, slot)` waker id —
+/// WITHOUT dereferencing any future. Used by the timer wheel
+/// (`sleep_fire`) so a timer that fires after its `Sleep` future was
+/// freed only sets a (bounds-checked, generation-filtered) ready bit
+/// instead of dereferencing a dangling `*const Sleep`. A stale id is
+/// harmless: `waker_wake_by_ref` rejects out-of-range ids and the
+/// arena's `is_used`/epoch checks drop a spurious wake.
+pub(crate) fn wake_by_packed(packed: usize) {
+    waker_wake_by_ref(packed as *const ());
+}
+
 // ---- Event-loop entry points ----------------------------------------------
 
 /// Advance this worker's timer wheel (firing expired timers, which

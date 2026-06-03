@@ -7,7 +7,7 @@
 
 use core::future::Future;
 use core::pin::Pin;
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 
 use platform::now_ticks;
 use worker::timer::{Timer, TimerWheel};
@@ -38,7 +38,13 @@ pub(crate) fn has_timers(cc: &CurrentWorker) -> bool {
 pub struct Sleep {
     deadline: u64,
     timer_scheduled: bool,
-    waker: Option<Waker>,
+    /// Integer-packed `(worker, slot)` id of the polling task's waker
+    /// (see `task::make_waker_for`). Stored — instead of a raw
+    /// `*const Sleep` — so the timer wakes the task WITHOUT
+    /// dereferencing this future; a timer that outlives the future
+    /// (cancel-on-drop missed under churn) then only sets a harmless
+    /// ready bit. Also the cancel key (with `deadline`). 0 until polled.
+    waker_packed: usize,
 }
 
 impl Sleep {
@@ -47,7 +53,7 @@ impl Sleep {
         Sleep {
             deadline,
             timer_scheduled: false,
-            waker: None,
+            waker_packed: 0,
         }
     }
 }
@@ -64,18 +70,20 @@ impl Future for Sleep {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
         if now_ticks() >= this.deadline {
-            this.waker = None;
             return Poll::Ready(());
         }
         if !this.timer_scheduled {
-            this.waker = Some(cx.waker().clone());
-            let self_ptr: *const Sleep = this;
+            // The packed task-waker id — an integer bit-pattern, never a
+            // real pointer (see `task::make_waker_for`). The timer wakes
+            // the task by this id, so it never dereferences this future.
+            let packed = cx.waker().data() as usize;
+            this.waker_packed = packed;
             let cc = CurrentWorker::enter();
             if WHEELS.with_mut(&cc, |w| {
                 w.insert(Timer {
                     deadline: this.deadline,
                     func: sleep_fire,
-                    arg: self_ptr as usize,
+                    arg: packed,
                 })
             }) {
                 this.timer_scheduled = true;
@@ -88,25 +96,21 @@ impl Future for Sleep {
 impl Drop for Sleep {
     fn drop(&mut self) {
         if self.timer_scheduled {
-            let self_ptr: *const Sleep = self;
             let cc = CurrentWorker::enter();
-            // O(MAX_PER_SLOT) via the deadline-keyed lookup —
-            // significantly faster than the full-wheel scan when
-            // many `timeout_us`-wrapped futures cancel-and-recreate
-            // their inner Sleep on every iteration of a keep-alive
-            // loop.
-            let _ = WHEELS.with_mut(&cc, |w| w.cancel_at(self.deadline, self_ptr as usize));
+            // Cancel by (deadline, packed-id). O(MAX_PER_SLOT) deadline-
+            // keyed lookup. If churn ever leaves a stale timer behind,
+            // `sleep_fire` only sets a harmless ready bit — it never
+            // dereferences this (freed) future, so a missed cancel is
+            // no longer a use-after-free.
+            let _ = WHEELS.with_mut(&cc, |w| w.cancel_at(self.deadline, self.waker_packed));
         }
     }
 }
 
 fn sleep_fire(arg: usize) {
-    let sleep = arg as *const Sleep;
-    // SAFETY: `Sleep::drop` cancels the timer before the future is
-    // freed.
-    unsafe {
-        if let Some(w) = (*sleep).waker.as_ref() {
-            w.wake_by_ref();
-        }
-    }
+    // `arg` is the packed task-waker id. Wake the task by id — NO
+    // dereference of the (possibly-already-freed) `Sleep` future. A
+    // stale id is rejected by `waker_wake_by_ref`'s bounds + the
+    // arena's generation check.
+    crate::task::wake_by_packed(arg);
 }
