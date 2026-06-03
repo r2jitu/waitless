@@ -1140,7 +1140,14 @@ pub(crate) fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, mut callback
         // observation.
         core::sync::atomic::compiler_fence(Ordering::Acquire);
 
-        let pkt_len = (pkt_word & 0x3FFF) as usize;
+        // Clamp to the posted buffer size. The DQO `packet_len` field is
+        // 14 bits (up to 16383), but a single buffer is only
+        // `RX_BUFFER_SIZE`; a device (or a coalescing/header-split quirk)
+        // reporting `pkt_len > RX_BUFFER_SIZE` would otherwise make
+        // `wrap_owned` build an IOBuf with `len > capacity`, so every
+        // downstream `data()`/copy reads past the buffer. Never trust the
+        // device's length past what we posted.
+        let pkt_len = ((pkt_word & 0x3FFF) as usize).min(RX_BUFFER_SIZE as usize);
         let status = unsafe { ptr::read_volatile(desc_ptr.add(8)) };
         // buf_id at offset 12 — aligned u16 read, same rationale as
         // pkt_word above.
