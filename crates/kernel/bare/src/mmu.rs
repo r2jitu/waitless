@@ -247,6 +247,68 @@ mod x86_64 {
             flush_tlb_all();
         }
     }
+
+    /// Walk `table[idx]`; if absent, allocate + zero a fresh next-level
+    /// table and install it. Returns the next-level table's *virtual*
+    /// pointer (HHDM), or null on OOM.
+    unsafe fn next_table(table: *mut u64, idx: usize) -> *mut u64 {
+        unsafe {
+            let entry = ptr::read_volatile(table.add(idx));
+            // A present huge-page entry (PS at the PDPT/PD level) maps a
+            // 1 GiB/2 MiB block, not a sub-table; descending would mis-read
+            // the data frame as a page table and corrupt memory. The
+            // dedicated stacks region is virgin so this never fires in
+            // practice, but reject it rather than rely on that invariant.
+            if (entry & PRESENT) != 0 && (entry & PS) != 0 {
+                return ptr::null_mut();
+            }
+            let next_phys = if (entry & PRESENT) != 0 {
+                entry & ADDR_MASK
+            } else {
+                let p = mm::alloc_pages(1); // physical
+                if p == 0 {
+                    return ptr::null_mut();
+                }
+                ptr::write_bytes(mm::phys_to_virt(p), 0, 4096);
+                ptr::write_volatile(table.add(idx), p | TABLE_FLAGS);
+                p
+            };
+            mm::phys_to_virt(next_phys) as *mut u64
+        }
+    }
+
+    /// Map `count` 4 KiB pages `[phys_base ..]` at `[virt_base ..]` as
+    /// normal cached writable kernel memory, creating PDPT/PD/PT tables
+    /// on demand. Unlike `map_device_range` this descends to the 4 KiB
+    /// PT level, so callers can leave individual pages unmapped (e.g. a
+    /// stack guard page). Caller serializes against concurrent callers —
+    /// the page tables are shared across cores. Returns false on OOM.
+    pub unsafe fn map_pages_4k(virt_base: u64, phys_base: u64, count: usize) -> bool {
+        unsafe {
+            let pml4 = mm::phys_to_virt(read_cr3_phys()) as *mut u64;
+            for i in 0..count {
+                let virt = virt_base + (i as u64) * 4096;
+                let phys = phys_base + (i as u64) * 4096;
+                let pdpt = next_table(pml4, ((virt >> 39) & 0x1FF) as usize);
+                if pdpt.is_null() {
+                    return false;
+                }
+                let pd = next_table(pdpt, ((virt >> 30) & 0x1FF) as usize);
+                if pd.is_null() {
+                    return false;
+                }
+                let pt = next_table(pd, ((virt >> 21) & 0x1FF) as usize);
+                if pt.is_null() {
+                    return false;
+                }
+                // PRESENT | WRITABLE, cached. No NX (EFER.NXE is off; see
+                // MMIO_2MB_FLAGS note).
+                ptr::write_volatile(pt.add(((virt >> 12) & 0x1FF) as usize), phys | TABLE_FLAGS);
+            }
+            flush_tlb_all();
+            true
+        }
+    }
 }
 
 // ============================================================================
@@ -270,5 +332,26 @@ pub fn map_device_range(phys_base: u64, size: u64) {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let _ = (phys_base, size);
+    }
+}
+
+/// Map `count` 4 KiB pages `[phys_base ..]` at `[virt_base ..]` as
+/// normal cached writable kernel memory (x86_64). Used to lay out
+/// worker stacks in a dedicated VA region with an unmapped guard page
+/// below each, so a stack overflow faults at the guard instead of
+/// silently corrupting neighbouring memory. Returns `false` on OOM or
+/// on non-x86_64 (the caller then uses an unguarded stack — no
+/// regression). `# Safety`: installs page-table entries; the caller
+/// must serialize concurrent callers (the tables are shared) and ensure
+/// `virt_base` is in a region not otherwise mapped.
+pub unsafe fn map_pages_4k(virt_base: u64, phys_base: u64, count: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        x86_64::map_pages_4k(virt_base, phys_base, count)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (virt_base, phys_base, count);
+        false
     }
 }

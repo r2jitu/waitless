@@ -57,6 +57,13 @@ pub fn init_tls(id: u32) {
             options(nomem, nostack),
         );
     }
+    // Load this core's per-core TSS so its `ist1` double-fault stack is
+    // active (see `gdt`). The BSP (id 0) already `ltr`'d its TSS in
+    // `gdt::init`; re-loading it here would fault on a busy TSS, so APs
+    // only.
+    if id != 0 {
+        super::gdt::load_tss(id);
+    }
 }
 
 /// Number of online cores. Acquire pairs with the AP's `SeqCst` `fetch_add`
@@ -165,13 +172,15 @@ pub unsafe extern "C" fn ap_entry_via_limine(apic_id: u32) -> ! {
         serial::puts(&buf[..pos]);
 
         // Switch off Limine's 64 KiB MP stack onto a dedicated
-        // `AP_STACK_SIZE` (256 KiB) per-core stack before entering the
-        // never-returning event loop — the deep TLS-decrypt + `/obs`
-        // render path overruns 64 KiB on a secondary core. `sti` is
-        // deferred to the trampoline so the switch runs interrupts-masked.
-        let stack_base = mm::alloc_pages(AP_STACK_SIZE / 4096);
-        if stack_base != 0 {
-            let stack_top = (stack_base + AP_STACK_SIZE as u64) & !0xF;
+        // `AP_STACK_SIZE` (256 KiB) per-core stack — guarded by an
+        // unmapped page just below it (see `alloc_guarded_stack`) —
+        // before entering the never-returning event loop. The deep
+        // TLS-decrypt + `/obs` render path overruns 64 KiB on a
+        // secondary core; the guard turns any future over-run into a
+        // clean #DF instead of silent corruption. `sti` is deferred to
+        // the trampoline so the switch runs interrupts-masked.
+        let stack_top = alloc_guarded_stack(id, AP_STACK_SIZE);
+        if stack_top != 0 {
             core::arch::asm!(
                 "mov rsp, {sp}",
                 "call {f}",
@@ -181,7 +190,7 @@ pub unsafe extern "C" fn ap_entry_via_limine(apic_id: u32) -> ! {
                 options(noreturn),
             );
         }
-        // Page allocation failed — run on Limine's (small) stack rather
+        // Mapping failed (OOM) — run on Limine's (small) stack rather
         // than leaving this core parked.
         core::arch::asm!("sti", options(nomem, nostack));
         crate::eventloop::run(id);
@@ -197,6 +206,61 @@ extern "C" fn ap_run_on_stack(id: u32) -> ! {
     // the dedicated event-loop stack.
     unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
     crate::eventloop::run(id)
+}
+
+// ---- Guarded per-core worker stacks ---------------------------------------
+
+/// Dedicated VA region for per-core worker stacks. Each core's stack is
+/// mapped here at 4 KiB granularity with an unmapped GUARD PAGE just
+/// below it, so a stack overflow faults on the guard (→ #PF, or → #DF on
+/// the IST stack once the stack is fully exhausted; see `gdt`/`idt`)
+/// instead of silently corrupting neighbouring memory. Canonical, PML4
+/// slot 0x180 — distinct from the HHDM (0x100) and higher-half kernel
+/// (0x1FF), so the 4 KiB mapper's intermediate tables never collide with
+/// the existing mappings.
+const STACK_REGION_BASE: u64 = 0xffff_c000_0000_0000;
+/// Per-core VA slot; 2 MiB easily holds the guard + `AP_STACK_SIZE` with
+/// slack (one PD entry's worth of PTs per core).
+const STACK_SLOT_SIZE: u64 = 2 * 1024 * 1024;
+
+/// Serializes worker-stack mapping: the page tables are shared across
+/// cores and Limine APs come up concurrently.
+static STACK_MAP_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// Allocate `size` bytes of physical stack and map it into this core's
+/// slot of the dedicated stacks region with an unmapped guard page
+/// below. Returns the 16-byte-aligned stack top to load into RSP, or 0
+/// on failure (the caller then falls back to an unguarded stack).
+fn alloc_guarded_stack(core_id: u32, size: usize) -> u64 {
+    // Keep the slot inside this PML4 entry (512 GiB); absurd ids fall back.
+    if (core_id as u64).saturating_mul(STACK_SLOT_SIZE) >= (1u64 << 39) {
+        return 0;
+    }
+    debug_assert!(size % 4096 == 0, "worker stack size must be a page multiple");
+    let pages = size / 4096;
+    let phys = mm::alloc_pages(pages);
+    if phys == 0 {
+        return 0;
+    }
+    // Guard page = slot base; usable stack starts one page above it.
+    let slot_base = STACK_REGION_BASE + core_id as u64 * STACK_SLOT_SIZE;
+    let stack_lo = slot_base + 4096;
+
+    while STACK_MAP_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    // SAFETY: `stack_lo` is in the dedicated, otherwise-unmapped stacks
+    // region; the lock serializes edits to the shared page tables.
+    let ok = unsafe { crate::mmu::map_pages_4k(stack_lo, phys, pages) };
+    STACK_MAP_LOCK.store(false, Ordering::Release);
+
+    if !ok {
+        return 0;
+    }
+    (stack_lo + size as u64) & !0xF
 }
 
 /// Boot secondary cores via INIT-SIPI-SIPI (Multiboot2 / PVH path).

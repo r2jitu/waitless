@@ -297,6 +297,24 @@ pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
         // capture via `/diag-panic` — critical when serial-port-output is
         // not externally accessible (sandboxed GCE deploys).
         if vector < 32 {
+            // Per-core re-entrancy guard. A fault taken WHILE this
+            // handler is dumping — e.g. the backtrace below reading off
+            // the top of a guarded stack into the unmapped VA above it —
+            // would otherwise re-enter and dump again. A core that faults
+            // here halts, so once its flag is set a nested fault skips
+            // straight to halt instead of recursing the dump. (Cores past
+            // the array just dump as before — no regression.)
+            static FAULT_GUARD: [core::sync::atomic::AtomicBool; 64] =
+                [const { core::sync::atomic::AtomicBool::new(false) }; 64];
+            let cpu = crate::cpu_id() as usize;
+            if cpu < FAULT_GUARD.len()
+                && FAULT_GUARD[cpu].swap(true, core::sync::atomic::Ordering::AcqRel)
+            {
+                crate::serial::puts(b"\n!!! NESTED FAULT in exception handler -- halting ***\n");
+                loop {
+                    asm!("cli", "hlt", options(nomem, nostack));
+                }
+            }
             let rip = (*frame).rip;
             let err = (*frame).error_code;
             let rsp = (*frame).rsp;
@@ -342,6 +360,20 @@ pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
             crate::serial::print_hex(cr2);
             crate::serial::puts(b"\n");
 
+            // A #DF here is almost always a worker-stack overflow caught
+            // by the guard page: the guard #PF couldn't push its frame on
+            // the exhausted stack, cascading to a #DF (taken on the IST
+            // stack). `rip` is the overflowing instruction; `cr2` is the
+            // guard-page address the overflow ran into.
+            if vector == 8 {
+                crate::diag::append(
+                    b"  *** #DF DOUBLE FAULT -- likely worker-stack overflow (rip=faulting instr, cr2=guard page) ***\n",
+                );
+                crate::serial::puts(
+                    b"  *** #DF DOUBLE FAULT -- likely worker-stack overflow (rip=faulting instr, cr2=guard page) ***\n",
+                );
+            }
+
             // Stack backtrace: the faulting context's stack (`frame.rsp`)
             // holds the call history. The kernel links at a fixed
             // higher-half base (`0xFFFFFFFF80100000`, no KASLR), so any
@@ -357,18 +389,27 @@ pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
             crate::serial::puts(b"  bt (code addrs from rsp):\n");
             {
                 const KERNEL_IMAGE_LO: u64 = 0xFFFF_FFFF_8000_0000;
-                let sp = rsp as *const u64;
+                // For a #DF (stack overflow) the faulting `rsp` sits in
+                // the unmapped guard page; the overflowed call stack is
+                // in the mapped page just above. Round up past the guard
+                // before scanning so the backtrace reads the real stack
+                // instead of faulting on the guard (a spurious 2nd dump).
+                let scan_start = if vector == 8 { rsp.wrapping_add(0xFFF) & !0xFFF } else { rsp };
+                let sp = scan_start as *const u64;
                 let mut i = 0usize;
                 let mut printed = 0u32;
-                // Bounded scan (≤ 512 words = 4 KiB above rsp, ≤ 24
-                // printed frames) so a near-stack-top fault can't make
-                // the backtrace itself fault into a loop.
+                // Bounded scan (≤ 512 words = 4 KiB, ≤ 24 printed frames).
+                // The guarded worker stacks leave unmapped VA above each
+                // stack, so a near-top fault's scan CAN read off the top
+                // into unmapped memory; that nested #PF is caught by the
+                // per-core re-entrancy guard above (it halts rather than
+                // re-dumping), so the worst case is one partial backtrace,
+                // never a loop.
                 while i < 512 && printed < 24 {
-                    // SAFETY: reading words at higher addresses than the
-                    // faulting `rsp` — the live task stack is mapped from
-                    // `rsp` up to its top. The count bound caps how far
-                    // we walk so we can't run off the mapping. (Already in
-                    // the enclosing `unsafe` handler context.)
+                    // SAFETY: reading stack words at/above the faulting
+                    // context's rsp. May read past the mapped stack top
+                    // (the re-entrancy guard above contains the nested
+                    // #PF); always in the enclosing `unsafe` handler.
                     let val = core::ptr::read_volatile(sp.add(i));
                     if val >= KERNEL_IMAGE_LO {
                         crate::diag::append(b"    0x");
@@ -415,8 +456,17 @@ pub fn init() {
         // Install all 256 ISR stubs into the IDT.
         // Type/attr = 0x8E: Present=1, DPL=0, Type=0xE (64-bit interrupt gate)
         // An interrupt gate automatically clears IF on entry (unlike a trap gate).
+        //
+        // The double-fault gate (vector 8) uses `ist=1`: the CPU loads
+        // RSP from this core's `TSS.ist1` (a dedicated #DF stack — see
+        // `gdt`) before pushing the frame. A worker-stack overflow hits
+        // its guard page; that #PF can't push its frame on the exhausted
+        // stack, cascading to a #DF — which we then take cleanly on the
+        // IST stack and dump, instead of triple-faulting into a silent
+        // reboot.
         for (i, &stub) in isr_stub_table.iter().enumerate() {
-            set_idt_entry(i, stub as u64, KERNEL_CODE_SELECTOR, 0, 0x8E);
+            let ist = if i == 8 { 1 } else { 0 };
+            set_idt_entry(i, stub as u64, KERNEL_CODE_SELECTOR, ist, 0x8E);
         }
 
         // Load the IDTR
