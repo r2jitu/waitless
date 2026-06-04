@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 mod gateway;
 mod h3_health;
 mod http_close;
+mod http_load;
 mod http_upload;
 mod tcp_echo;
 mod tls_handshake;
@@ -152,6 +153,38 @@ enum Workload {
         warmup_secs: u64,
         #[arg(long, default_value = "4")]
         parallelism: usize,
+    },
+    /// Unified keep-alive HTTP GET throughput across protocol
+    /// versions — the keep-alive analogue of `wrk` (h1) and
+    /// `h3-health` (h3), plus HTTP/2. `--proto h1|h2|h3` selects the
+    /// version; `--connections` opens that many transport connections
+    /// and `--streams` fires that many concurrent in-flight requests
+    /// per connection (h2/h3 only — h1 is sequential keep-alive). Maps
+    /// onto h2load's `-c` / `-m`. h2/h3 always run over TLS/QUIC; h1
+    /// is TLS by default (`--plaintext` for cleartext HTTP).
+    Http {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        port: u16,
+        #[arg(long, default_value = "/health")]
+        endpoint: String,
+        #[arg(long, value_enum, default_value = "h1")]
+        proto: http_load::Proto,
+        #[arg(long, default_value = "5")]
+        duration_secs: u64,
+        #[arg(long, default_value = "1")]
+        warmup_secs: u64,
+        /// Parallel transport connections (h2load `-c`).
+        #[arg(long, default_value = "4")]
+        connections: usize,
+        /// Concurrent in-flight requests per connection (h2load `-m`);
+        /// h2/h3 only — h1 forces 1 (sequential keep-alive).
+        #[arg(long, default_value = "1")]
+        streams: usize,
+        /// Cleartext HTTP for h1 (no TLS). Ignored for h2/h3.
+        #[arg(long, default_value = "false")]
+        plaintext: bool,
     },
     /// API-gateway / sidecar ping-pong: drives the unikernel's
     /// `GATEWAY_PORT` listener, which on each request forwards a
@@ -291,6 +324,27 @@ fn main() -> std::io::Result<()> {
             connections,
             msg_size,
             tls,
+        )),
+        Workload::Http {
+            host,
+            port,
+            endpoint,
+            proto,
+            duration_secs,
+            warmup_secs,
+            connections,
+            streams,
+            plaintext,
+        } => runtime.block_on(http_load::run(
+            proto,
+            &host,
+            port,
+            &endpoint,
+            Duration::from_secs(duration_secs),
+            Duration::from_secs(warmup_secs),
+            connections,
+            streams,
+            plaintext,
         )),
         Workload::Gateway {
             host,

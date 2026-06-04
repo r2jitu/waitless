@@ -616,6 +616,54 @@ def run_loadgen_h3_health(port, endpoint, duration, host, parallelism, warmup=1)
         return 0.0, "TIMEOUT", "TIMEOUT"
 
 
+def run_loadgen_http(
+    proto, port, endpoint, duration, host, connections, streams=1, warmup=1
+):
+    """Run the Rust loadgen unified keep-alive HTTP workload for the
+    given protocol version (`proto` in {"h1", "h2", "h3"}). `--streams`
+    is the per-connection in-flight concurrency (h2/h3 only; h1 forces
+    1). This is the apples-to-apples keep-alive GET hot path across all
+    three HTTP versions — the analogue of `wrk` (h1) and `h3-health`
+    (h3), now also covering HTTP/2. Returns `(rps, p50, p99)`.
+
+    No Python fallback: there's no stdlib h2/h3 client and brew's curl
+    isn't a load generator — without `cargo` we report NO_LOADGEN."""
+    bin_path = _loadgen_bin()
+    if bin_path is None:
+        return 0.0, "NO_LOADGEN", "NO_LOADGEN"
+    try:
+        r = subprocess.run(
+            [
+                bin_path,
+                "http",
+                "--proto",
+                proto,
+                "--host",
+                host,
+                "--port",
+                str(port),
+                "--endpoint",
+                endpoint,
+                "--duration-secs",
+                str(duration),
+                "--warmup-secs",
+                str(warmup),
+                "--connections",
+                str(connections),
+                "--streams",
+                str(streams),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=duration + warmup + 30,
+        )
+        if r.returncode != 0:
+            return 0.0, "ERROR", "ERROR"
+        return _parse_loadgen_output(r.stdout)
+    except (subprocess.TimeoutExpired, OSError):
+        return 0.0, "TIMEOUT", "TIMEOUT"
+
+
 def run_loadgen_tcp_echo(port, conns, duration, host="127.0.0.1", msg_size=64):
     """Run the Rust loadgen TCP-echo workload. Returns the same
     `(rps, p50, p99)` shape as `run_tcp_echo`."""

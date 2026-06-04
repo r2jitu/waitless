@@ -78,10 +78,34 @@ P99_US 3839
 
 Anything else on stdout is informational. Stderr is for logs.
 
+## Keep-alive HTTP across versions (`http`)
+
+The `http` subcommand drives keep-alive GET throughput over any of
+the three HTTP versions, so an A/B across them is apples-to-apples
+(one runtime, one timing harness, one percentile sketch):
+
+```
+loadgen http --proto h1|h2|h3 --host H --port P [--endpoint /health] \
+    --connections C --streams M --duration-secs D [--warmup-secs W] \
+    [--plaintext]
+```
+
+* `--connections` (h2load `-c`) — parallel transport connections.
+* `--streams` (h2load `-m`) — concurrent in-flight requests **per
+  connection**; h2/h3 only (HTTP/1.1 has no multiplexing, so it's
+  forced to 1 — sequential keep-alive).
+* `--proto h1` is TLS by default; `--plaintext` drops to cleartext
+  HTTP. `h2`/`h3` always run over TLS/QUIC (ALPN `h2` / `h3`).
+
+`h2` uses the low-level hyperium `h2` crate; `h3` reuses the
+quinn + `h3` stack (it subsumes the older `h3-health` workload,
+which stays for back-compat).
+
 ## Future work
 
-* Replace `wrk` with a `loadgen http` subcommand so all HTTP
-  workloads share one binary (smaller dep tree on bench hosts).
+* Migrate the throughput workloads in `bench.py` from `wrk` to the
+  `http --proto h1` subcommand so all HTTP workloads share one binary
+  (smaller dep tree on bench hosts).
 * Replace `udp_bench.c` with a `loadgen udp` subcommand for the
   same reason.
 * Wire into Bazel via `rust_binary` once the cc_toolchain provides
