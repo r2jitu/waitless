@@ -593,16 +593,30 @@ async fn send_bytes<S: HttpStream>(stream: &mut S, bytes: Vec<u8>) -> Result<(),
 }
 
 /// Flush pending control frames, then drain the response queue subject
-/// to flow control.
+/// to flow control — coalesced into a *single* chained send.
+///
+/// Control frames go first (wire order), then every response frame the
+/// connection + per-stream windows allow, each pushed as one `IOBuf`
+/// onto one `IOBufChain`. `TlsStream::send` seals up to a TLS record's
+/// worth (16 KiB) *from the whole chain* per AEAD pass, so a small
+/// response's HEADERS + DATA ride one TLS record / one TCP send instead
+/// of two, and across multiplexed streams every sendable frame leaves
+/// in one send rather than one-send-per-frame (H2-11). Bodies larger
+/// than a record still split into successive records inside `send`,
+/// exactly as before.
 async fn flush<S: HttpStream>(conn: &mut H2Conn, stream: &mut S) -> Result<(), ()> {
+    let mut chain = IOBufChain::new();
     if !conn.ctrl_out.is_empty() {
         let bytes = core::mem::take(&mut conn.ctrl_out);
-        send_bytes(stream, bytes).await?;
+        chain.push_back(IOBuf::from(bytes));
     }
     while let Some(frame_bytes) = conn.next_output_frame() {
-        send_bytes(stream, frame_bytes).await?;
+        chain.push_back(IOBuf::from(frame_bytes));
     }
-    Ok(())
+    if chain.is_empty() {
+        return Ok(());
+    }
+    stream.send(&mut chain).await
 }
 
 // ── Frame dispatch ─────────────────────────────────────────────────
