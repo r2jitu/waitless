@@ -93,19 +93,22 @@ SECTIONS {
         KEEP(*(.limine_requests_end))
     } :data
 
-    .data ALIGN(4K) : {
-        *(.data .data.*)
-    } :data
+    /* RELRO sections (`dyn` vtables + relocated read-only pointers) and
+       the GOT. These MUST be listed BEFORE `.data`. lld assigns each
+       input section to the FIRST output section in script order whose
+       pattern matches, and `.data`'s glob `*(.data .data.*)` ALSO matches
+       `.data.rel.ro` (the `.data.*` wildcard subsumes `.data.rel.ro`).
+       With `.data` listed first it STOLE every `.data.rel.ro` input, so
+       `.data.rel.ro` came out empty (size 0) and every `dyn` vtable
+       landed in the writable, mutable `.data` section. Listed first, the
+       vtables land in their own `.data.rel.ro`, separated from `.data`'s
+       mutable statics.
 
-    /* GOT / relocation-target sections. lld places these as *orphan*
-       sections when the script doesn't name them — and its orphan
-       placement put GOT entries PAST the `.got` blob, overlapping the
-       writable `.bss` statics (gve's TX_QUEUES / diag counters share
-       addresses with GOT call slots). A gve write (a diag-counter
-       `lock add` under load, or a queue pointer) then clobbers a GOT
-       entry, and the next GOT-indirect call jumps to garbage -> #PF.
-       Naming them here forces a single contiguous GOT in the data
-       segment, BEFORE .bss, so nothing in .bss aliases a GOT slot. */
+       The GOT stays in this block too — contiguous and BEFORE `.bss`, so
+       no `.bss` static (gve's TX_QUEUES / diag counters) aliases a GOT
+       call slot. lld's orphan placement used to put GOT entries past the
+       `.got` blob into `.bss`; a stray `.bss` write then clobbered a GOT
+       entry and the next GOT-indirect call jumped to garbage (#PF). */
     .data.rel.ro ALIGN(8) : {
         *(.data.rel.ro .data.rel.ro.*)
     } :data
@@ -114,6 +117,10 @@ SECTIONS {
     } :data
     .got.plt ALIGN(8) : {
         *(.got.plt)
+    } :data
+
+    .data ALIGN(4K) : {
+        *(.data .data.*)
     } :data
 
     .init_array ALIGN(8) : {
