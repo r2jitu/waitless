@@ -10,8 +10,15 @@ use crate::serial;
 use crate::time;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-/// Per-core stack size: 64KB.
-const AP_STACK_SIZE: usize = 64 * 1024;
+/// Per-core stack size: 256 KiB — matches the BSP's `limine_stack`
+/// (see `boot/limine_entry.rs`). Limine's default MP stack is only
+/// 64 KiB, which the deep TLS-handshake/decrypt path (large RustCrypto
+/// scalar-mult temporaries) plus the 12-subsystem `/obs` render
+/// overruns on a secondary core — corrupting the stack under load and
+/// faulting only on APs (the BSP already has 256 KiB), the "high-load
+/// crash" signature. Both AP entry paths switch to a stack of this
+/// size before entering the (never-returning) event loop.
+const AP_STACK_SIZE: usize = 256 * 1024;
 
 /// Physical address where the AP trampoline is copied.
 /// Must be page-aligned and below 1MB. 0x8000 is conventionally safe.
@@ -157,9 +164,39 @@ pub unsafe extern "C" fn ap_entry_via_limine(apic_id: u32) -> ! {
         }
         serial::puts(&buf[..pos]);
 
+        // Switch off Limine's 64 KiB MP stack onto a dedicated
+        // `AP_STACK_SIZE` (256 KiB) per-core stack before entering the
+        // never-returning event loop — the deep TLS-decrypt + `/obs`
+        // render path overruns 64 KiB on a secondary core. `sti` is
+        // deferred to the trampoline so the switch runs interrupts-masked.
+        let stack_base = mm::alloc_pages(AP_STACK_SIZE / 4096);
+        if stack_base != 0 {
+            let stack_top = (stack_base + AP_STACK_SIZE as u64) & !0xF;
+            core::arch::asm!(
+                "mov rsp, {sp}",
+                "call {f}",
+                sp = in(reg) stack_top,
+                f = sym ap_run_on_stack,
+                in("edi") id,
+                options(noreturn),
+            );
+        }
+        // Page allocation failed — run on Limine's (small) stack rather
+        // than leaving this core parked.
         core::arch::asm!("sti", options(nomem, nostack));
         crate::eventloop::run(id);
     }
+}
+
+/// Enter the event loop on a freshly-switched per-core stack. `extern
+/// "C"` so the stack-switch `call` in `ap_entry_via_limine` passes the
+/// core id in `edi` per the System V ABI. Enables interrupts (deferred
+/// from the switch) before looping.
+extern "C" fn ap_run_on_stack(id: u32) -> ! {
+    // SAFETY: ring-0; re-enable maskable interrupts now that we're on
+    // the dedicated event-loop stack.
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    crate::eventloop::run(id)
 }
 
 /// Boot secondary cores via INIT-SIPI-SIPI (Multiboot2 / PVH path).
