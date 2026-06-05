@@ -190,13 +190,26 @@ landed this session; the rate-limit-flood guard is still open.
      `select`'s cancel-safe read.
   3. **Cooperative `select` on one handler future** — no spawn, but one
      in-flight handler (gives up multiplexing).
-- **H2-11 — Zero-copy DATA framing.** `next_output_frame` copies each
-  outbound DATA frame's payload out of the response `IOBufChain` into a
-  fresh `Vec` (bounded by `MAX_FRAME_SIZE` per frame). Correct and
-  modest-cost on the happy path, but it forfeits the zero-copy TX the H1.1
-  path has. Frame each DATA directly from the chain's IOBufs (a header
-  IOBuf + a narrowed body view) once the perf matters. One `stream.send`
-  per frame is also a batching opportunity.
+- **H2-11 — DATA framing / send batching. *Batching done; zero-copy
+  deferred.*** The **one-send-per-frame** half is fixed: `flush` now
+  frames all sendable frames into one `IOBufChain` and emits a single
+  `stream.send`, so a small response's HEADERS + DATA ride one TLS
+  record / one TCP send instead of two (measured on HVF: TCP sends and
+  TLS encrypt-records per `/health` request 2.0 → 1.0, i.e. H1.1 parity;
+  closed the bulk of the h2-vs-h1.1 small-response gap — h2 went from
+  ~0.65× h1.1 throughput to ~parity). Per-response allocations were also
+  trimmed (header list stack-allocated; the DATA chunk `Vec` folded into
+  the frame `Vec` — `/health` allocs/req 7.3 → 5.4). **Still copies** the
+  DATA payload into a per-frame `Vec` (forfeiting H1.1's zero-copy TX).
+  A true zero-copy rewrite (frame DATA directly from the body's own
+  IOBufs via narrowed/shared views, or coalesce into one reused buffer)
+  was prototyped and **reverted**: it intermittently corrupted large
+  single-stream transfers (~40% h2load failure on `/static-256k`, the
+  multi-flush window-blocked path) with the server-side frame/flow
+  counters clean — a latent hazard in the TLS-seal / TX path triggered
+  by emitting non-frame-shaped (oversized or refcount-shared) buffers.
+  Needs that path investigated first; the remaining alloc delta isn't
+  worth the corruption risk until then.
 - **H2-12 — Pre-dispatch WINDOW_UPDATE.** A WINDOW_UPDATE that arrives for
   a stream before its response is queued (no `StreamOut` yet) is dropped.
   Harmless for the request/response shape (clients grow the window in
