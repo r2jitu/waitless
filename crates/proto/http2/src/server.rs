@@ -348,6 +348,11 @@ impl H2Conn {
             .add(now_cycles().wrapping_sub(__e0));
         let body = resp.into_body();
         let body_remaining = body.total_len();
+        // Large bodies frame their DATA payloads zero-copy from the
+        // body's own IOBufs; small ones copy inline into the flush
+        // buffer (one contiguous send, cheaper than a chain part +
+        // VecDeque for a handful of bytes).
+        let zero_copy = body_remaining > INLINE_BODY_MAX;
         self.out_queue.push_back(StreamOut {
             id: sid,
             header_block,
@@ -357,6 +362,7 @@ impl H2Conn {
             body,
             body_remaining,
             send_window: self.peer_initial_window,
+            zero_copy,
         });
         crate::diag::COUNTERS.responses_sent.bump();
     }
@@ -371,64 +377,80 @@ impl H2Conn {
         }
     }
 
-    /// Frame the next wire frame across the out_queue *directly into*
-    /// `out` (the reused flush buffer), honouring the connection +
-    /// per-stream send windows. Mutates accounting and removes finished
-    /// streams. Returns `false` when nothing can make progress right now
-    /// (all window-blocked or queue empty). Appending into the caller's
-    /// reused buffer — instead of returning a fresh per-frame `Vec` —
-    /// drops one heap allocation + one IOBuf wrap per frame; the whole
-    /// flush ships as one contiguous part (see `flush`).
-    ///
-    /// Body bytes are read via `StreamOut`'s non-mutating `cur`/`cur_off`
-    /// cursor (the long-proven `take_body` walk) — the body's own IOBufs
-    /// are never mutated, so the chain stays frame-correct.
-    fn frame_next_into(&mut self, out: &mut Vec<u8>) -> bool {
-        let conn_win = self.conn_send_window;
+    /// Drain every sendable frame across the out_queue into one send,
+    /// honouring the connection + per-stream windows. Small frames
+    /// (HEADERS, control already in `hdr_buf`, DATA frame headers, and
+    /// the DATA payloads of small responses) accumulate contiguously in
+    /// `hdr_buf`; a large response's DATA payloads are appended to
+    /// `chain` **zero-copy** as the body's own (window-sliced) IOBufs,
+    /// cutting the accumulated `hdr_buf` into the chain first so wire
+    /// order holds. The caller flushes any trailing `hdr_buf` and ships
+    /// `chain` in a single send. Mutates accounting and removes finished
+    /// streams.
+    fn drain_to_chain(&mut self, hdr_buf: &mut Vec<u8>, chain: &mut IOBufChain) {
         let peer_max = self.peer_max_frame_size as i64;
         let mut idx = 0;
         while idx < self.out_queue.len() {
-            let item = &mut self.out_queue[idx];
-            if !item.headers_sent {
+            if !self.out_queue[idx].headers_sent {
+                let item = &mut self.out_queue[idx];
                 let end_stream = item.body_remaining == 0;
                 let fl = flags::END_HEADERS | if end_stream { flags::END_STREAM } else { 0 };
-                frame::push_frame(out, ftype::HEADERS, fl, item.id, &item.header_block);
+                frame::push_frame(hdr_buf, ftype::HEADERS, fl, item.id, &item.header_block);
                 item.headers_sent = true;
                 if end_stream {
                     self.out_queue.remove(idx);
                 }
-                return true;
+                continue;
             }
-            if item.body_remaining > 0 {
-                let allowed = conn_win
+            if self.out_queue[idx].body_remaining > 0 {
+                let item = &self.out_queue[idx];
+                let allowed = self
+                    .conn_send_window
                     .min(item.send_window)
                     .min(peer_max)
                     .min(item.body_remaining as i64);
-                if allowed > 0 {
-                    let n = allowed as usize;
-                    let id = item.id;
-                    // END_STREAM iff this frame drains the last body byte.
-                    let finishes = item.body_remaining == n;
-                    let fl = if finishes { flags::END_STREAM } else { 0 };
-                    frame::push_frame_header(out, n as u32, ftype::DATA, fl, id);
-                    item.append_body_into(out, n);
-                    item.send_window -= n as i64;
-                    self.conn_send_window -= n as i64;
-                    if finishes {
-                        self.out_queue.remove(idx);
-                    }
-                    return true;
+                if allowed <= 0 {
+                    // Window-blocked: try the next stream.
+                    idx += 1;
+                    continue;
                 }
-                // Window-blocked: try the next stream.
-                idx += 1;
+                let n = allowed as usize;
+                let item = &mut self.out_queue[idx];
+                // END_STREAM iff this frame drains the last body byte.
+                let finishes = item.body_remaining == n;
+                let fl = if finishes { flags::END_STREAM } else { 0 };
+                frame::push_frame_header(hdr_buf, n as u32, ftype::DATA, fl, item.id);
+                if item.zero_copy {
+                    // Cut the accumulated header bytes, then append the
+                    // body's own IOBufs zero-copy after them.
+                    if !hdr_buf.is_empty() {
+                        chain.push_back(IOBuf::from_slice_with_headroom(0, &hdr_buf[..], 0));
+                        hdr_buf.clear();
+                    }
+                    item.push_body(chain, n);
+                } else {
+                    item.append_body_into(hdr_buf, n);
+                }
+                item.send_window -= n as i64;
+                self.conn_send_window -= n as i64;
+                if finishes {
+                    self.out_queue.remove(idx);
+                }
                 continue;
             }
             // Headers sent and no body left — shouldn't linger; drop it.
             self.out_queue.remove(idx);
         }
-        false
     }
 }
+
+/// DATA payloads from responses with a body at or below this size are
+/// copied inline into the flush header buffer (keeping the send chain a
+/// single contiguous part); larger responses frame their payloads
+/// zero-copy from the body's own IOBufs. 4 KiB comfortably covers
+/// small JSON / API / redirect / page responses while the bulk
+/// static-asset path stays copy-free.
+const INLINE_BODY_MAX: usize = 4096;
 
 /// Shared receive-body channel for one *streaming* request stream. The
 /// demux task pushes DATA payloads in arrival order; the spawned
@@ -506,7 +528,8 @@ struct StreamOut {
     id: u32,
     header_block: Vec<u8>,
     headers_sent: bool,
-    /// Current front body part being drained.
+    /// Current front body part being drained (inline path only —
+    /// `cur`/`cur_off` non-mutating cursor; unused when `zero_copy`).
     cur: Option<IOBuf>,
     cur_off: usize,
     /// Remaining body parts.
@@ -515,6 +538,11 @@ struct StreamOut {
     body_remaining: usize,
     /// Per-stream send window (peer-granted).
     send_window: i64,
+    /// Frame DATA payloads zero-copy from the body's own IOBufs (large
+    /// bodies) vs copy them inline into the flush buffer (small ones).
+    /// Fixed at queue time; a response uses one path throughout, so the
+    /// inline cursor and the zero-copy pop/narrow never interleave.
+    zero_copy: bool,
 }
 
 impl StreamOut {
@@ -550,6 +578,42 @@ impl StreamOut {
             }
         }
         self.body_remaining -= out.len() - start;
+    }
+
+    /// Append `n` body bytes onto `chain` **zero-copy** as the body's own
+    /// IOBufs — moving a whole front part, or splitting it via a
+    /// refcount-shared view (`clone_shared` + `narrow`) when it overruns
+    /// `n`, the tail going back on the body for the next frame. A part
+    /// not yet shareable (`Owned(Heap)`, e.g. a dynamically-rendered
+    /// body) is promoted with one `share()` copy first; static /
+    /// already-shared bodies (the bulk-asset path) never copy. The large-
+    /// body counterpart to `append_body_into`'s inline copy.
+    fn push_body(&mut self, chain: &mut IOBufChain, n: usize) {
+        let mut need = n;
+        while need > 0 {
+            let Some(mut part) = self.body.pop_front() else {
+                break;
+            };
+            let plen = part.data().len();
+            if plen <= need {
+                need -= plen;
+                chain.push_back(part);
+            } else {
+                let mut tail = match part.clone_shared() {
+                    Ok(t) => t,
+                    Err(_) => {
+                        part = part.share();
+                        part.clone_shared().expect("shareable after share()")
+                    }
+                };
+                let _ = part.narrow(0, need);
+                let _ = tail.consume(need);
+                chain.push_back(part);
+                self.body.push_front(tail);
+                need = 0;
+            }
+        }
+        self.body_remaining -= n - need;
     }
 }
 
@@ -636,41 +700,40 @@ async fn send_bytes<S: HttpStream>(stream: &mut S, bytes: Vec<u8>) -> Result<(),
 }
 
 /// Flush pending control frames, then drain the response queue subject
-/// to flow control — framed into one reused buffer and shipped as a
-/// *single* contiguous send.
+/// to flow control — framed into one send.
 ///
 /// Control frames go first (wire order), then every response frame the
-/// connection + per-stream windows allow, all appended into the reused
-/// `frame_buf`. The buffer is then copied once into a single `IOBuf` —
-/// one contiguous part keeps the chain in its zero-alloc `Single` state,
-/// and `TlsStream::send` seals it into as few TLS records / TCP sends as
-/// the 16 KiB record cap allows (one, for a small response). Bodies
-/// larger than a record still split into successive records inside
-/// `send`. Reusing `frame_buf` makes the steady-state framing path one
-/// allocation (the send `IOBuf`), down from a per-frame `Vec` + IOBuf
-/// wrap + the chain's `VecDeque`.
+/// connection + per-stream windows allow. Small responses' frames
+/// accumulate contiguously in the reused `frame_buf`, copied once into a
+/// single `IOBuf` — one part keeps the chain in its zero-alloc `Single`
+/// state. A large response's DATA payloads ride the chain **zero-copy**
+/// as the body's own (window-sliced) IOBufs, with the small header bytes
+/// cut in as contiguous segments. `TlsStream::send` then seals the whole
+/// chain into as few TLS records / TCP sends as the 16 KiB record cap
+/// allows (one, for a small response). Reusing `frame_buf` keeps the
+/// small-response framing path at one allocation (the send `IOBuf`).
 async fn flush<S: HttpStream>(conn: &mut H2Conn, stream: &mut S) -> Result<(), ()> {
     let __f0 = now_cycles();
-    let mut buf = core::mem::take(&mut conn.frame_buf);
-    buf.clear();
+    let mut hdr_buf = core::mem::take(&mut conn.frame_buf);
+    hdr_buf.clear();
     if !conn.ctrl_out.is_empty() {
-        buf.extend_from_slice(&conn.ctrl_out);
+        hdr_buf.extend_from_slice(&conn.ctrl_out);
         conn.ctrl_out.clear();
     }
-    while conn.frame_next_into(&mut buf) {}
+    let mut chain = IOBufChain::new();
+    conn.drain_to_chain(&mut hdr_buf, &mut chain);
+    // Trailing accumulated header / inline-body bytes become the final
+    // (and, for an all-small flush, only) contiguous chain part.
+    if !hdr_buf.is_empty() {
+        chain.push_back(IOBuf::from_slice_with_headroom(0, &hdr_buf[..], 0));
+    }
+    conn.frame_buf = hdr_buf;
     crate::diag::COUNTERS
         .frame_cycles
         .add(now_cycles().wrapping_sub(__f0));
-    if buf.is_empty() {
-        conn.frame_buf = buf;
+    if chain.is_empty() {
         return Ok(());
     }
-    // One contiguous part → the chain stays in its zero-alloc `Single`
-    // state (no `VecDeque`); the only framing allocation is this copy
-    // out of the reused `frame_buf` into the send IOBuf.
-    let mut chain = IOBufChain::new();
-    chain.push_back(IOBuf::from_slice_with_headroom(0, &buf, 0));
-    conn.frame_buf = buf;
     stream.send(&mut chain).await
 }
 
@@ -1352,21 +1415,26 @@ mod tests {
         assert_eq!(&b[off..], b"12345");
     }
 
-    #[test]
-    fn append_body_into_coalesces_parts() {
-        let mut chain = IOBufChain::new();
-        chain.push_back(IOBuf::from(b"hello".to_vec()));
-        chain.push_back(IOBuf::from(b"world".to_vec()));
-        let mut out = StreamOut {
+    fn test_stream_out(body: IOBufChain, body_remaining: usize, zero_copy: bool) -> StreamOut {
+        StreamOut {
             id: 1,
             header_block: Vec::new(),
             headers_sent: true,
             cur: None,
             cur_off: 0,
-            body: chain,
-            body_remaining: 10,
+            body,
+            body_remaining,
             send_window: INITIAL_WINDOW,
-        };
+            zero_copy,
+        }
+    }
+
+    #[test]
+    fn append_body_into_coalesces_parts() {
+        let mut chain = IOBufChain::new();
+        chain.push_back(IOBuf::from(b"hello".to_vec()));
+        chain.push_back(IOBuf::from(b"world".to_vec()));
+        let mut out = test_stream_out(chain, 10, false);
         // Appends into a buffer that may already hold a frame header —
         // the prefix must be preserved and the cursor split mid-part.
         let mut buf = alloc::vec![0xAA];
@@ -1377,5 +1445,81 @@ mod tests {
         out.append_body_into(&mut buf, 100);
         assert_eq!(buf, b"rld");
         assert_eq!(out.body_remaining, 0);
+    }
+
+    #[test]
+    fn push_body_zero_copy_splits_and_coalesces() {
+        // The zero-copy path coalesces whole parts and splits a part
+        // mid-way (here heap parts, exercising the share()+clone_shared
+        // promotion), carrying the tail for the next frame.
+        let mut chain = IOBufChain::new();
+        chain.push_back(IOBuf::from(b"hello".to_vec()));
+        chain.push_back(IOBuf::from(b"world".to_vec()));
+        let mut out = test_stream_out(chain, 10, true);
+        let mut sink = IOBufChain::new();
+        out.push_body(&mut sink, 7);
+        assert_eq!(out.body_remaining, 3);
+        let mut got = Vec::new();
+        while let Some(b) = sink.pop_front() {
+            got.extend_from_slice(b.data());
+        }
+        assert_eq!(got, b"hellowo");
+        out.push_body(&mut sink, 3);
+        assert_eq!(out.body_remaining, 0);
+        let mut rest = Vec::new();
+        while let Some(b) = sink.pop_front() {
+            rest.extend_from_slice(b.data());
+        }
+        assert_eq!(rest, b"rld");
+    }
+
+    #[test]
+    fn drain_small_inline_large_zero_copy() {
+        // A small response inlines its DATA into hdr_buf (chain empty);
+        // a large one frames its DATA onto the chain (zero-copy).
+        let mut conn = H2Conn::new();
+        let mut small = IOBufChain::new();
+        small.push_back(IOBuf::from(b"hi".to_vec()));
+        conn.out_queue.push_back(StreamOut {
+            id: 1,
+            header_block: alloc::vec![0xAB],
+            headers_sent: false,
+            cur: None,
+            cur_off: 0,
+            body: small,
+            body_remaining: 2,
+            send_window: INITIAL_WINDOW,
+            zero_copy: false,
+        });
+        let mut hdr_buf = Vec::new();
+        let mut chain = IOBufChain::new();
+        conn.drain_to_chain(&mut hdr_buf, &mut chain);
+        assert!(chain.is_empty(), "small response inlines, chain stays empty");
+        assert!(!hdr_buf.is_empty());
+        assert!(conn.out_queue.is_empty());
+
+        let big = alloc::vec![7u8; INLINE_BODY_MAX + 64];
+        let mut bigbody = IOBufChain::new();
+        bigbody.push_back(IOBuf::from(big.clone()));
+        conn.out_queue.push_back(StreamOut {
+            id: 3,
+            header_block: alloc::vec![0xCD],
+            headers_sent: false,
+            cur: None,
+            cur_off: 0,
+            body: bigbody,
+            body_remaining: big.len(),
+            send_window: INITIAL_WINDOW,
+            zero_copy: true,
+        });
+        let mut hdr_buf2 = Vec::new();
+        let mut chain2 = IOBufChain::new();
+        conn.drain_to_chain(&mut hdr_buf2, &mut chain2);
+        assert!(!chain2.is_empty(), "large response frames onto the chain");
+        let mut got = Vec::new();
+        while let Some(b) = chain2.pop_front() {
+            got.extend_from_slice(b.data());
+        }
+        assert_eq!(&got[got.len() - big.len()..], &big[..]);
     }
 }
