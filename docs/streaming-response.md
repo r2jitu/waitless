@@ -297,7 +297,7 @@ per-stream flow control, `demux_wake`) already exists.
 
 The bounded-memory + large-transfer-correctness proof must run on GCE —
 HVF's userspace TCP proxy lies about both. The standing recipe (used for
-Phase 1c above, scriptable as `/tmp/bounded_validate.sh` driven from
+Phase 1c above, scriptable as `scripts/bounded-stream-validate.sh` driven from
 `kvm-vm`): for the h1 path, stream/echo a payload far larger than any
 per-request budget while sampling `/obs` `heap_allocated_bytes`
 mid-transfer — a bounded path grows live heap by `O(chunk)` (kilobytes
