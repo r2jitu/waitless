@@ -255,8 +255,25 @@ async fn gateway(mut stream: TcpStream, backend_ip: [u8; 4]) {
 
 // ---- Request dispatch -------------------------------------------------------
 
-async fn handle_request(req: &Request, body: &mut http::BodyReader<'_>) -> Response {
-    match req.path() {
+async fn handle_request(req: &mut Request<'_>, res: &mut Response) -> Result<(), ()> {
+    // Body-consuming routes run first: they need `&mut req` for
+    // `read_chunk`, so they can't sit inside a `match req.path()` whose
+    // scrutinee holds an immutable borrow of `req` across the arms.
+    if req.path() == b"/discard" {
+        // `read_chunk().await` yields the next run of body bytes as a
+        // `BodyChunkGuard` — a zero-copy view over the parse buffer's
+        // leading prebuf or, past it, the transport's own RX buffer
+        // (item H of docs/rx-path-optimizations.md). We don't look at
+        // the bytes; just walking the stream advances the conn state
+        // past the body so the next keep-alive request parses
+        // correctly. `None` ends the body.
+        while let Some(chunk) = req.read_chunk().await {
+            core::hint::black_box(chunk.data().len());
+        }
+        *res = Response::ok(b"application/json", b"{\"status\":\"discarded\"}");
+        return Ok(());
+    }
+    *res = match req.path() {
         // ── HTML pages ───────────────────────────────────────────
         b"/" => page_home(),
         b"/architecture" => page_architecture(),
@@ -291,26 +308,6 @@ async fn handle_request(req: &Request, body: &mut http::BodyReader<'_>) -> Respo
             core::hint::black_box(compute_work());
             Response::ok(b"application/json", b"{\"status\":\"computed\"}")
         }
-        // Bulk-RX bench sink. Accepts POST of any length, drains
-        // the body via the streaming `BodyReader` (the bytes
-        // never sit in a single contiguous buffer — they flow
-        // through `body.chunk()` and get dropped each iter), and
-        // returns a tiny 200 OK. Paired with the `upload_*_*`
-        // bench workloads — see scripts/bench/cli.py.
-        b"/discard" => {
-            // `chunk().await` yields the next run of body bytes as a
-            // `BodyChunkGuard` — a zero-copy view over the parse
-            // buffer's leading prebuf or, past it, the transport's
-            // own RX buffer (item H of docs/rx-path-optimizations.md).
-            // We don't look at the bytes; just walking the stream is
-            // enough to advance the conn state past the body so the
-            // next keep-alive request can parse correctly. `None`
-            // ends the body.
-            while let Some(chunk) = body.chunk().await {
-                core::hint::black_box(chunk.data().len());
-            }
-            Response::ok(b"application/json", b"{\"status\":\"discarded\"}")
-        }
         b"/tls_profile" => tls_profile_response(),
         b"/tls_profile_reset" => {
             tls::tls_profile_reset();
@@ -324,7 +321,8 @@ async fn handle_request(req: &Request, body: &mut http::BodyReader<'_>) -> Respo
         b"/diag-gve" => diag_gve_response(),
 
         _ => Response::not_found(),
-    }
+    };
+    Ok(())
 }
 
 fn log_boot_info() {

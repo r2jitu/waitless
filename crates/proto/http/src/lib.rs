@@ -26,7 +26,7 @@ mod stream;
 mod streaming;
 
 pub use body::{BodyChunkGuard, BodyReader};
-pub use request::{Header, Method, Request};
+pub use request::{Header, Method, Request, RequestHead};
 pub use response::{Bytes, MAX_EXTRA_HEADERS, Response, bytes_owned, bytes_static};
 pub use server::{listen, serve_conn};
 pub use stream::{BodySource, HttpStream};

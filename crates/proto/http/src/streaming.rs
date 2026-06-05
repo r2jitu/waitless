@@ -33,7 +33,7 @@
 // names or values, duplicate / disagreeing `Content-Length` values.
 
 use crate::request::{
-    Method, Request, parse_usize, transfer_encoding_is_chunked,
+    Method, RequestHead, parse_usize, transfer_encoding_is_chunked,
 };
 
 /// Per-byte parser state — one variant per distinct cursor position
@@ -151,7 +151,7 @@ impl StreamingRequestParser {
     /// first feed of a new request; subsequent feeds within the
     /// same request must reuse the same `Request` so the in-progress
     /// field cursors line up.
-    pub(crate) fn feed(&mut self, req: &mut Request, bytes: &[u8]) -> FeedResult {
+    pub(crate) fn feed(&mut self, req: &mut RequestHead, bytes: &[u8]) -> FeedResult {
         // Clamp the chunk view to whatever the per-request HEAD-bytes
         // cap still allows. Each "scan-until-delimiter" state below
         // walks `bytes[i..]` with `iter().position()` + bulk
@@ -402,7 +402,7 @@ impl StreamingRequestParser {
 
     /// Match the accumulated `method_buf` against the known verbs
     /// and set `req.method`. Anything else: `Method::Unknown`.
-    fn decode_method(&self, req: &mut Request) {
+    fn decode_method(&self, req: &mut RequestHead) {
         let m = &self.method_buf[..self.method_buf_len as usize];
         req.method = match m {
             b"GET" => Method::Get,
@@ -417,7 +417,7 @@ impl StreamingRequestParser {
     /// End-of-headers bookkeeping: extract Content-Length, flag
     /// chunked-TE for rejection. Identical to the tail of
     /// `parse_request_with_state`.
-    fn finish_headers(&mut self, req: &mut Request) {
+    fn finish_headers(&mut self, req: &mut RequestHead) {
         self.state = State::Done;
         req.content_length = match req.header(b"Content-Length") {
             Some(cl_val) => parse_usize(cl_val),
@@ -433,11 +433,11 @@ impl StreamingRequestParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request::Request;
+    use crate::request::RequestHead;
     use alloc::vec::Vec;
 
-    fn feed_whole(raw: &[u8]) -> (Request, FeedResult) {
-        let mut req = Request::new();
+    fn feed_whole(raw: &[u8]) -> (RequestHead, FeedResult) {
+        let mut req = RequestHead::new();
         let mut p = StreamingRequestParser::new();
         let r = p.feed(&mut req, raw);
         (req, r)
@@ -489,7 +489,7 @@ mod tests {
         const REQ: &[u8] = b"POST /discard HTTP/1.1\r\nHost: h\r\n\
             Content-Type: application/octet-stream\r\nContent-Length: 262144\r\n\r\n";
         let mut p = StreamingRequestParser::new();
-        let mut req = Request::new();
+        let mut req = RequestHead::new();
 
         // First request on the connection — fresh slots, parses fine.
         assert!(matches!(p.feed(&mut req, REQ), FeedResult::Done { .. }));
@@ -557,7 +557,7 @@ mod tests {
             raw.extend_from_slice(b"X-Pad: padpadpadpadpadpadpadpadpad\r\n");
         }
         raw.extend_from_slice(b"\r\n");
-        let mut req = Request::new();
+        let mut req = RequestHead::new();
         let mut p = StreamingRequestParser::new();
         assert!(matches!(p.feed(&mut req, &raw), FeedResult::Overflow));
     }
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn dos_no_sp_returns_overflow() {
         let evil = alloc::vec![b'a'; (super::MAX_HEAD_BYTES as usize) + 1];
-        let mut req = Request::new();
+        let mut req = RequestHead::new();
         let mut p = StreamingRequestParser::new();
         assert!(matches!(p.feed(&mut req, &evil), FeedResult::Overflow));
     }
@@ -583,7 +583,7 @@ mod tests {
     /// fifth chunk's first byte is past the cap.
     #[test]
     fn dos_no_sp_returns_overflow_across_chunks() {
-        let mut req = Request::new();
+        let mut req = RequestHead::new();
         let mut p = StreamingRequestParser::new();
         let chunk = alloc::vec![b'a'; 4096];
         for _ in 0..4 {
@@ -656,7 +656,7 @@ mod tests {
 
         for split in 0..=raw.len() {
             let (a, b) = raw.split_at(split);
-            let mut req = Request::new();
+            let mut req = RequestHead::new();
             let mut p = StreamingRequestParser::new();
             let total_consumed = match p.feed(&mut req, a) {
                 FeedResult::Done { consumed } => consumed,

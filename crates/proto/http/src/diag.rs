@@ -15,7 +15,7 @@ use core::fmt;
 
 use obs::{Counter, LastEvent, ObsRecord};
 
-use crate::{Method, Request};
+use crate::{Method, RequestHead};
 
 /// One counter per HTTP/1.1 connection / request lifecycle event.
 /// Field names are the stable tokens; a counter and the line that
@@ -152,7 +152,7 @@ fn method_str(m: Method) -> &'static str {
 /// Record a rejected request: bump `requests_rejected` and snapshot
 /// the method + path into `LAST_REJECT`. Called by `serve_conn`
 /// when the parser sets `Request::reject`.
-pub fn record_reject(req: &Request) {
+pub fn record_reject(req: &RequestHead) {
     COUNTERS.requests_rejected.bump();
     let path = req.path();
     let n = path.len().min(PATH_CAP);
@@ -214,7 +214,7 @@ mod tests {
     fn record_reject_populates_last_reject() {
         let (before, _) = LAST_REJECT.snapshot();
         let rejected = COUNTERS.requests_rejected.get();
-        let mut req = Request::new();
+        let mut req = RequestHead::new();
         req.method = Method::Post;
         req.set_path(b"/upload");
         record_reject(&req);

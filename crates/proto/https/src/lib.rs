@@ -25,7 +25,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use http::{BodyReader, Request, Response};
+use http::{Request, Response};
 
 /// Outcome of a successful [`serve`]. The TCP/TLS server is always up
 /// (otherwise `serve` returns `Err`); `h3` reports whether the QUIC/UDP
@@ -63,7 +63,7 @@ pub fn serve<H>(
     key_der: &'static [u8],
 ) -> Result<Served, ServeError>
 where
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + Send + Sync + 'static,
+    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + Send + Sync + 'static,
 {
     // One handler, shared across both transports' per-conn tasks.
     let handler = Arc::new(handler);
@@ -73,7 +73,9 @@ where
     let h3 = Arc::clone(&handler);
     let h3_up = http3::listen(
         port,
-        async move |req: &Request, body: &mut BodyReader<'_>| -> Response { (*h3)(req, body).await },
+        async move |req: &mut Request<'_>, res: &mut Response| -> Result<(), ()> {
+            (*h3)(req, res).await
+        },
         cert_chain,
         key_der,
     )
@@ -88,12 +90,16 @@ where
     let tcp = Arc::clone(&handler);
     http2::listen(
         port,
-        async move |req: &Request, body: &mut BodyReader<'_>| -> Response {
-            let resp = (*tcp)(req, body).await;
-            match alt {
-                Some(a) => resp.with_header(&b"Alt-Svc"[..], a),
-                None => resp,
+        async move |req: &mut Request<'_>, res: &mut Response| -> Result<(), ()> {
+            let r = (*tcp)(req, res).await;
+            // Append Alt-Svc so plain/H2 clients learn the h3 endpoint.
+            // Phase 0 buffers the response, so the head isn't on the wire
+            // yet — setting it here is fine. (A streaming sink, later
+            // phase, must set Alt-Svc before the first body byte.)
+            if let Some(a) = alt {
+                res.header(&b"Alt-Svc"[..], a);
             }
+            r
         },
         cert_chain,
         key_der,

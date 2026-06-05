@@ -32,7 +32,7 @@ use core::cell::RefCell;
 use core::future::Future;
 use core::pin::Pin;
 
-use http::{BodyReader, BodySource, HttpStream, IOBuf, IOBufChain, Method, Request, Response};
+use http::{BodyReader, BodySource, HttpStream, IOBuf, IOBufChain, Method, Request, RequestHead, Response};
 use waitless::runtime::{AsyncEvent, Either, select, spawn};
 
 use crate::frame::{self, FrameHeader, error, flags, ftype, settings_id};
@@ -114,7 +114,7 @@ fn now_cycles() -> u64 {
 pub async fn serve_conn<S, H>(handler: Arc<H>, mut stream: S)
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
+    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
 {
     // One-time lazy-init of the shared Huffman tree (matches
     // http3::listen / tls::preinit — keeps the first request's alloc
@@ -764,7 +764,7 @@ async fn process_frame<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
+    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
 {
     // A header block in mid-assembly forbids interleaving: only a
     // CONTINUATION on the same stream may follow (RFC 7540 §6.2).
@@ -858,7 +858,7 @@ async fn process_headers<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
+    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
 {
     if hdr.stream_id == 0 || hdr.stream_id.is_multiple_of(2) {
         // Client streams are non-zero and odd (RFC 7540 §5.1.1).
@@ -891,7 +891,7 @@ async fn continue_headers<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
+    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
 {
     {
         let asm = conn.header_asm.as_mut().expect("checked by caller");
@@ -922,9 +922,9 @@ async fn complete_headers<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
+    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
 {
-    let mut req = Request::new();
+    let mut req = RequestHead::new();
     let __d0 = now_cycles();
     let malformed = {
         let mut sink = RequestSink {
@@ -1039,9 +1039,9 @@ fn parse_content_length(v: Option<&[u8]>) -> Option<usize> {
 /// the demux keeps a `StreamSlot` to route DATA + account for the
 /// stream; the task is detached (its handle is dropped — no Drop, so it
 /// runs to completion and frees its own slot).
-fn spawn_streaming<H>(conn: &mut H2Conn, handler: &Arc<H>, sid: u32, req: Request) -> bool
+fn spawn_streaming<H>(conn: &mut H2Conn, handler: &Arc<H>, sid: u32, req: RequestHead) -> bool
 where
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
+    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
 {
     let content_length = parse_content_length(req.header(b"content-length"));
     let body = Rc::new(StreamBody {
@@ -1060,12 +1060,14 @@ where
     let demux_wake = Rc::clone(&conn.demux_wake);
     let spawned = spawn(async move {
         crate::diag::COUNTERS.requests_received.bump();
-        let resp = {
+        let mut res = Response::new();
+        {
             let mut src = H2BodySource {
                 body: body_task,
                 demux_wake: Rc::clone(&demux_wake),
             };
-            let mut reader = BodyReader::new_streaming(Some(&mut src), &[], content_length);
+            let reader = BodyReader::new_streaming(Some(&mut src), &[], content_length);
+            let mut request = Request::new(&req, reader);
             // Run the handler, then surrender the stream WITHOUT draining
             // any body it left unread. The old post-handler
             // `reader.discard().await` would park forever on a peer that
@@ -1076,10 +1078,10 @@ where
             // by `process_data`'s no-slot arm, and the peer stops at the
             // un-extended stream window — the h2-correct way to abandon an
             // unwanted request body.
-            (*handler)(&req, &mut reader).await
-        };
+            let _ = (*handler)(&mut request, &mut res).await;
+        }
         crate::diag::COUNTERS.requests_handled.bump();
-        sink.borrow_mut().push_back((sid, resp));
+        sink.borrow_mut().push_back((sid, res));
         demux_wake.set();
     });
     match spawned {
@@ -1240,18 +1242,20 @@ async fn dispatch_bodyless<S, H>(
     stream: &mut S,
     handler: &Arc<H>,
     sid: u32,
-    req: Request,
+    req: RequestHead,
 ) where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
+    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
 {
     crate::diag::COUNTERS.requests_received.bump();
-    let resp = {
-        let mut body = BodyReader::new(Some(stream), &[], 0);
-        (**handler)(&req, &mut body).await
-    };
+    let mut res = Response::new();
+    {
+        let body = BodyReader::new(Some(stream), &[], 0);
+        let mut request = Request::new(&req, body);
+        let _ = (**handler)(&mut request, &mut res).await;
+    }
     crate::diag::COUNTERS.requests_handled.bump();
-    conn.queue_response(sid, resp);
+    conn.queue_response(sid, res);
 }
 
 // ── Header (de)framing helpers ─────────────────────────────────────
@@ -1259,7 +1263,7 @@ async fn dispatch_bodyless<S, H>(
 /// Sink that maps decoded HPACK fields into an `http::Request` — the H2
 /// cousin of the h3 server's `RequestSink`.
 struct RequestSink<'r> {
-    req: &'r mut Request,
+    req: &'r mut RequestHead,
     /// Set on a malformed pseudo-header (response pseudo in a request, or
     /// an unknown `:`-prefixed name) → stream error.
     malformed: bool,

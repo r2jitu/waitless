@@ -12,8 +12,9 @@ extern crate alloc;
 use http::{Request, Response};
 use waitless::net::Net;
 
-async fn hello(_: &Request, _: &mut http::BodyReader<'_>) -> Response {
-    Response::ok(b"text/plain", b"Hello from bare metal!\n")
+async fn hello(_: &mut Request<'_>, res: &mut Response) -> Result<(), ()> {
+    *res = Response::ok(b"text/plain", b"Hello from bare metal!\n");
+    Ok(())
 }
 
 #[waitless::init]

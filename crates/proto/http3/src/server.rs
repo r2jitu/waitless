@@ -25,7 +25,7 @@ use core::pin::Pin;
 
 use quic::{QuicConn, QuicListenError, quic_listen};
 
-use http::{BodyReader, BodySource, IOBuf, Method, Request, Response};
+use http::{BodyReader, BodySource, IOBuf, Method, Request, RequestHead, Response};
 
 use crate::frame::{self, ftype as h3_ftype};
 use crate::qpack::{self, FieldSink};
@@ -65,7 +65,7 @@ pub fn listen<H>(
     key_pkcs8_der: &'static [u8],
 ) -> Result<(), ListenError>
 where
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + Send + Sync + 'static,
+    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + Send + Sync + 'static,
 {
     // Pay one-time lazy-init costs upfront so they land in the
     // HEAP_BASELINE snapshot rather than the first request's
@@ -99,7 +99,7 @@ where
 
 async fn handle_conn<H>(conn: QuicConn, handler: Arc<H>)
 where
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
+    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
 {
     // 1. Open control stream and send SETTINGS.
     //    Server-initiated unidirectional streams use IDs 3, 7, 11, ...
@@ -375,7 +375,7 @@ unsafe fn framing_pool_drop(base: core::ptr::NonNull<u8>, capacity: u32, ctx: *m
 
 async fn handle_request<H>(conn: &QuicConn, sid: u64, handler: &H, scratch: &mut Scratch)
 where
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()>,
 {
     // Read just far enough to parse the HEADERS frame, then dispatch
     // and stream the body (any later DATA frames) lazily — no
@@ -468,7 +468,7 @@ where
     // emits header callbacks, consumer copies into final
     // storage immediately, decoder owns nothing.
     struct RequestSink<'r> {
-        req: &'r mut Request,
+        req: &'r mut RequestHead,
     }
     impl FieldSink for RequestSink<'_> {
         fn on_field(&mut self, name: &[u8], value: &[u8]) {
@@ -500,7 +500,7 @@ where
             }
         }
     }
-    let mut req = Request::new();
+    let mut req = RequestHead::new();
     {
         let mut sink = RequestSink { req: &mut req };
         // 4 KiB on the stack covers ≥99th percentile
@@ -540,10 +540,12 @@ where
     // HEADERS), so the handler sees the same `BodyReader` streaming
     // interface as HTTP/1.1 and large uploads aren't buffered whole.
     let mut src = H3BodySource::new(conn, sid, buf.clone(), eof);
-    let response = {
-        let mut body = BodyReader::new_streaming(Some(&mut src), &[], content_length);
-        handler(&req, &mut body).await
-    };
+    let mut response = Response::new();
+    {
+        let body = BodyReader::new_streaming(Some(&mut src), &[], content_length);
+        let mut request = Request::new(&req, body);
+        let _ = handler(&mut request, &mut response).await;
+    }
     // The handler returned; abandon any unread request body WITHOUT
     // awaiting it. The old `body.discard().await` parked forever on a
     // peer that declared a Content-Length then stalled (no FIN) — and

@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 use iobuf::{IOBuf, IOBufChain};
 
 use crate::body::BodyReader;
-use crate::request::Request;
+use crate::request::{Request, RequestHead};
 use crate::response::{Response, write_response_into_iobuf};
 use crate::stream::HttpStream;
 use crate::streaming;
@@ -74,7 +74,7 @@ fn now_cycles() -> u64 {
 /// so a slow handler suspends only its own connection.
 pub fn listen<H>(port: u16, handler: H) -> Result<(), waitless::runtime::TcpBindError>
 where
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + Send + Sync + 'static,
+    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + Send + Sync + 'static,
 {
     let listener = waitless::runtime::TcpListener::bind(port)?;
     let handler = Arc::new(handler);
@@ -112,10 +112,13 @@ where
 pub async fn serve_conn<S, H>(handler: Arc<H>, mut stream: S)
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()>,
 {
     crate::diag::COUNTERS.connections_served.bump();
-    let mut req = Request::new();
+    // The reused request HEAD (parser storage). The handler sees a
+    // per-dispatch `Request` facade built over a borrow of this head
+    // plus the body reader.
+    let mut req = RequestHead::new();
     let mut out_chain = IOBufChain::with_capacity(4);
     // Inline storage for the response-header IOBuf, sized for the
     // typical header set plus the worst-case transport reserve.
@@ -201,14 +204,16 @@ where
         let content_length = req.content_length;
 
         let want_close;
-        let resp;
+        // The outbound message the handler fills (buffered body via
+        // `res.ok(..)`, or — later phases — streamed via `res.write`).
+        let mut res = Response::new();
         // Post-body residue captured by BodyReader when a fresh-recv
         // chunk straddled the Content-Length boundary. None in every
         // path that doesn't pull from the stream past the prebuf.
         let body_leftover: Option<IOBuf>;
         if req.reject {
             crate::diag::record_reject(&req);
-            resp = Response::bad_request();
+            res = Response::bad_request();
             want_close = true;
             body_leftover = None;
         } else {
@@ -230,12 +235,20 @@ where
                     }
                     None => &[],
                 };
-                let mut body = BodyReader::new(Some(&mut stream), prebuf, content_length);
+                let body = BodyReader::new(Some(&mut stream), prebuf, content_length);
+                let mut request = Request::new(&req, body);
                 let __h0 = now_cycles();
-                resp = (*handler)(&req, &mut body).await;
+                let handler_result = (*handler)(&mut request, &mut res).await;
                 crate::diag::COUNTERS
                     .handler_cycles
                     .add(now_cycles().wrapping_sub(__h0));
+                // Recover the body reader to drain leftovers + capture
+                // any straddle residue.
+                let mut body = request.into_body();
+                if handler_result.is_err() {
+                    crate::diag::COUNTERS.send_failed.bump();
+                    return;
+                }
                 body_drained_ok = want_close
                     || body.is_empty()
                     || body.discard().await.is_ok();
@@ -279,10 +292,10 @@ where
         };
         let mut header = header;
         let __b0 = now_cycles();
-        write_response_into_iobuf(&mut header, &resp, !want_close);
+        write_response_into_iobuf(&mut header, &res, !want_close);
 
         debug_assert!(out_chain.is_empty());
-        for part in resp.into_body().into_parts() {
+        for part in res.into_body().into_parts() {
             out_chain.push_back(part);
         }
         out_chain.push_front(header);
@@ -338,7 +351,6 @@ where
 #[cfg(test)]
 mod serve_conn_tests {
     use super::serve_conn;
-    use crate::body::BodyReader;
     use crate::request::{Method, Request};
     use crate::response::Response;
     use crate::stream::HttpStream;
@@ -413,16 +425,17 @@ mod serve_conn_tests {
         static OBSERVED: RefCell<Vec<ObservedReq>> = const { RefCell::new(Vec::new()) };
     }
 
-    async fn observe_handler(req: &Request, body: &mut BodyReader<'_>) -> Response {
+    async fn observe_handler(req: &mut Request<'_>, res: &mut Response) -> Result<(), ()> {
         let mut body_bytes = Vec::new();
-        while let Some(guard) = body.chunk().await {
+        while let Some(guard) = req.read_chunk().await {
             body_bytes.extend_from_slice(guard.data());
         }
         OBSERVED.with(|o| {
             o.borrow_mut()
-                .push((req.method, req.path().to_vec(), body_bytes))
+                .push((req.method(), req.path().to_vec(), body_bytes))
         });
-        Response::ok(b"text/plain".as_slice(), b"OK".as_slice())
+        *res = Response::ok(b"text/plain".as_slice(), b"OK".as_slice());
+        Ok(())
     }
 
     fn reset_observed() {

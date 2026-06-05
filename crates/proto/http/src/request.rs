@@ -47,7 +47,13 @@ impl Header {
     }
 }
 
-pub struct Request {
+/// The parsed request **head** — method, target, headers, declared
+/// body length. Built by each transport's frontend (the HTTP/1.1
+/// parser, the h2 HPACK `RequestSink`, the h3 QPACK frontend) and
+/// reused across keep-alive requests via [`clear`](RequestHead::clear).
+/// The handler never sees this directly; it sees [`Request`], which
+/// pairs a borrow of this head with the streaming body reader.
+pub struct RequestHead {
     pub method: Method,
     pub(crate) path: [u8; 256],
     pub(crate) path_len: usize,
@@ -71,15 +77,15 @@ pub struct Request {
     pub(crate) reject: bool,
 }
 
-impl Default for Request {
+impl Default for RequestHead {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Request {
+impl RequestHead {
     pub fn new() -> Self {
-        Request {
+        RequestHead {
             method: Method::Unknown,
             path: [0; 256],
             path_len: 0,
@@ -88,6 +94,13 @@ impl Request {
             content_length: 0,
             reject: false,
         }
+    }
+
+    /// The request method. An accessor (not just the `pub method`
+    /// field) so handlers reach it through the [`Request`] facade's
+    /// `Deref` the same way as `path()` / `header()`.
+    pub fn method(&self) -> Method {
+        self.method
     }
 
     pub fn path(&self) -> &[u8] {
@@ -176,6 +189,64 @@ impl Request {
         self.header_count = 0;
         self.content_length = 0;
         self.reject = false;
+    }
+}
+
+// ---- Request: the handler-facing in-message (head + streaming body) ----------
+
+/// The inbound message a handler reads: the parsed [`RequestHead`] plus
+/// the streaming request **body**. Symmetric with [`Response`], the
+/// out-message a handler writes.
+///
+/// Head accessors (`method()`, `path()`, `header()`, …) are reached via
+/// `Deref<Target = RequestHead>`; the body is read with
+/// [`read_chunk`](Request::read_chunk). A bodyless request (typical GET)
+/// simply never calls `read_chunk`.
+///
+/// Built per-dispatch by the transport (borrowing its reused head and
+/// owning a fresh [`BodyReader`] over the transport's body source), so
+/// the long-lived, reused `RequestHead` carries no lifetime.
+///
+/// [`Response`]: crate::Response
+/// [`BodyReader`]: crate::BodyReader
+pub struct Request<'a> {
+    head: &'a RequestHead,
+    body: crate::body::BodyReader<'a>,
+}
+
+impl<'a> Request<'a> {
+    /// Pair a borrowed head with a body reader. The transport calls
+    /// this at dispatch, then hands `&mut Request` to the handler.
+    pub fn new(head: &'a RequestHead, body: crate::body::BodyReader<'a>) -> Self {
+        Request { head, body }
+    }
+
+    /// Next run of request-body bytes, or `None` at end-of-body / peer
+    /// close — the same contract as the underlying
+    /// [`BodyReader::chunk`](crate::BodyReader::chunk), now reached
+    /// through the request itself.
+    pub async fn read_chunk(&mut self) -> Option<crate::body::BodyChunkGuard<'_>> {
+        self.body.chunk().await
+    }
+
+    /// Reborrow the underlying body reader — for the rare caller that
+    /// needs the `BodyReader` API directly (e.g. `remaining()` /
+    /// `into_leftover` plumbing inside a transport).
+    pub fn body_mut(&mut self) -> &mut crate::body::BodyReader<'a> {
+        &mut self.body
+    }
+
+    /// Consume the request, surrendering the body reader (so the serve
+    /// loop can recover its post-body `leftover` residue).
+    pub fn into_body(self) -> crate::body::BodyReader<'a> {
+        self.body
+    }
+}
+
+impl core::ops::Deref for Request<'_> {
+    type Target = RequestHead;
+    fn deref(&self) -> &RequestHead {
+        self.head
     }
 }
 

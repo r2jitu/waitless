@@ -26,136 +26,193 @@ pub type Bytes = IOBuf;
 /// matching the Request-side header-cap behaviour.
 pub const MAX_EXTRA_HEADERS: usize = 4;
 
+/// The outbound message a handler writes — symmetric with [`Request`],
+/// the in-message it reads. The handler receives `&mut Response` and
+/// either sets a one-shot buffered body (`res.ok(ct, body)`, the common
+/// case) or streams it (`res.write(chunk).await` / `res.finish().await`).
+///
+/// Head fields (status / content-type / extra headers) are editable
+/// until the first body byte goes out; for a buffered response that's at
+/// handler return, for a streaming one it's the first `write`.
+///
+/// Phase 0 (this commit) is buffering-only on every transport: `write`
+/// appends to `body` and the transport serialises + sends the whole
+/// `Response` after the handler returns — byte-identical to the old
+/// returned-`Response` path. Real per-transport streaming (a
+/// `ResponseSink` the writes go to immediately, with backpressure) lands
+/// in later phases; see `docs/streaming-response.md`.
+///
+/// [`Request`]: crate::Request
 pub struct Response {
     pub status: i32,
-    /// Content-Type header value. `Bytes` (Cow<'static, [u8]>) so
-    /// the common `Response::ok(b"text/plain", ...)` case stays
-    /// borrowed-static (no alloc), while dynamically-built MIME
-    /// strings can flow through Cow::Owned.
+    /// Content-Type header value. `Bytes` (Cow<'static, [u8]>) so the
+    /// common `res.ok(b"text/plain", ...)` case stays borrowed-static
+    /// (no alloc), while dynamically-built MIME strings flow through
+    /// Cow::Owned.
     content_type: Bytes,
-    /// The response body, as a chain of IOBuf parts. Uniform
-    /// shape — `Response::ok(ct, b"static")` builds a 1-part
-    /// chain; multi-part templates push static + dynamic parts
-    /// without ever materialising a single contiguous buffer.
-    /// `IOBufChain` is the standard transport-side buffer type
-    /// (`HttpStream::send`, `TcpStream::send`) so
-    /// the body flows through to the wire with no enum dispatch
-    /// or shape-flattening on the way down.
+    /// The response body, as a chain of IOBuf parts. `res.ok(ct,
+    /// b"static")` is a 1-part chain; streaming `write`s push parts.
     body: IOBufChain,
-    /// Optional extra response headers (Alt-Svc, Cache-Control,
-    /// etc.) that the app sets via `with_header`. Inline storage
-    /// — no Vec allocation per response. Both name and value are
-    /// `Bytes` so static literals stay zero-alloc.
+    /// Optional extra response headers (Alt-Svc, Cache-Control, etc.)
+    /// the app sets via `header`. Inline storage — no per-response Vec.
     extra_headers: [Option<(Bytes, Bytes)>; MAX_EXTRA_HEADERS],
+    /// Set once the handler streams via `write` (vs a one-shot buffered
+    /// body). Phase 0 ignores it (both paths buffer); later phases use
+    /// it to route writes to the live `ResponseSink`.
+    streaming: bool,
 }
 
-// Note: no `unsafe impl Send/Sync for Response` needed —
-// `IOBuf` and `ResponseBody` are themselves Send + Sync (the
-// static-borrow branch has 'static lifetime, the heap branch
-// holds Box<[u8]>; no thread-local interior mutability).
+// Note: no `unsafe impl Send/Sync` needed — `IOBuf` is Send + Sync
+// (static-borrow branch is 'static, heap branch is Box<[u8]>; no
+// thread-local interior mutability).
+
+impl Default for Response {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Response {
-    /// Build a 200 OK. `body` accepts anything convertible into
-    /// an [`IOBufChain`]:
-    ///
-    ///   * `&'static [u8]` / `&'static str` — zero-alloc 1-part chain.
-    ///   * `Vec<u8>` / `String` / `Box<[u8]>` — heap-rendered, moved.
-    ///   * `IOBuf` — pre-built chunk.
-    ///   * `IOBufChain` — multi-part body the app composed itself.
-    ///
-    /// `content_type` is `Bytes` — pass `b"text/plain"` for a
-    /// static value or build dynamically as `Cow::Owned`.
+    /// A blank `200` the transport hands to the handler as `&mut
+    /// Response`; the handler overwrites the head + body via the
+    /// builder methods (`ok` / `status` / `write` / …).
+    pub fn new() -> Self {
+        Response {
+            status: 200,
+            content_type: IOBuf::from_static(b"application/octet-stream"),
+            body: IOBufChain::new(),
+            extra_headers: [const { None }; MAX_EXTRA_HEADERS],
+            streaming: false,
+        }
+    }
+
+    /// Build a `200 OK` value with the given content-type and buffered
+    /// body — the common case. The handler installs it with `*res =
+    /// Response::ok(..)`. `body` accepts `&'static [u8]` / `Vec<u8>` /
+    /// `IOBuf` / `IOBufChain` (anything `Into<IOBufChain>`).
     pub fn ok(content_type: impl Into<Bytes>, body: impl Into<IOBufChain>) -> Self {
         Response {
             status: 200,
             content_type: content_type.into(),
             body: body.into(),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
+            streaming: false,
         }
     }
 
+    /// Build a `404 Not Found` value.
     pub fn not_found() -> Self {
         Response {
             status: 404,
             content_type: IOBuf::from_static(b"text/plain"),
             body: IOBuf::from_static(b"Not Found").into(),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
+            streaming: false,
         }
     }
 
-    /// Build a `400 Bad Request`. Used by `serve_conn` to answer a
-    /// request the HTTP/1.1 parser flagged as malformed — today a
-    /// `Transfer-Encoding: chunked` request, which the parser
-    /// rejects rather than mis-frame (item E in
-    /// docs/rx-path-optimizations.md). `serve_conn` pairs this
-    /// response with `Connection: close`.
+    /// Build a `400 Bad Request` value. `serve_conn` uses it to answer a
+    /// request the HTTP/1.1 parser flagged as malformed (a `Transfer-
+    /// Encoding: chunked` request — item E in
+    /// docs/rx-path-optimizations.md); it pairs the response with
+    /// `Connection: close`.
     pub fn bad_request() -> Self {
         Response {
             status: 400,
             content_type: IOBuf::from_static(b"text/plain"),
             body: IOBuf::from_static(b"Bad Request").into(),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
+            streaming: false,
         }
     }
 
-    /// Build a `301 Moved Permanently` with an empty body and the
-    /// supplied `Location` header. The HTTP redirect every browser,
-    /// crawler, and proxy treats as "always use this URL instead" —
-    /// the right tool for HTTP→HTTPS upgrades and permanent renames.
-    /// Pair this with a plain `http::listen` so the TLS server never
-    /// has to handle un-encrypted traffic at all.
+    /// Build a `301 Moved Permanently` value with an empty body and a
+    /// `Location` header — the redirect for HTTP→HTTPS upgrades /
+    /// permanent renames.
     pub fn moved_permanently(location: impl Into<Bytes>) -> Self {
         Response {
             status: 301,
             content_type: IOBuf::from_static(b"text/plain"),
             body: IOBuf::from_static(b"").into(),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
+            streaming: false,
         }
         .with_header(b"Location", location)
     }
 
-    /// Add an extra response header. Use for `Alt-Svc`,
-    /// `Cache-Control`, `Set-Cookie`, etc. Both `name` and
-    /// `value` are `Bytes` (Cow<'static, [u8]>) so static
-    /// literals stay zero-alloc; dynamically-built values
-    /// flow through `Cow::Owned`. Builder-style — chains.
-    /// Silently drops past `MAX_EXTRA_HEADERS` (4 today).
+    /// Add an extra header to a `Response` value, consuming + returning
+    /// it — the chaining builder for the `*res = Response::ok(..)
+    /// .with_header(..)` value path (`Alt-Svc`, `Cache-Control`,
+    /// `Set-Cookie`, …). Silently drops past `MAX_EXTRA_HEADERS` (4).
     pub fn with_header(mut self, name: impl Into<Bytes>, value: impl Into<Bytes>) -> Self {
+        self.header(name, value);
+        self
+    }
+
+    /// Set the status code in place (streaming/out-object path).
+    pub fn status(&mut self, status: i32) -> &mut Self {
+        self.status = status;
+        self
+    }
+
+    /// Set the Content-Type in place — set the head before the first
+    /// `write` on the streaming path.
+    pub fn content_type(&mut self, content_type: impl Into<Bytes>) -> &mut Self {
+        self.content_type = content_type.into();
+        self
+    }
+
+    /// Add an extra header in place (the `&mut` out-object form of
+    /// `with_header`). Silently drops past `MAX_EXTRA_HEADERS` (4).
+    pub fn header(&mut self, name: impl Into<Bytes>, value: impl Into<Bytes>) -> &mut Self {
         for slot in self.extra_headers.iter_mut() {
             if slot.is_none() {
                 *slot = Some((name.into(), value.into()));
-                return self;
+                break;
             }
         }
         self
     }
 
-    /// Iterate the extra headers set via `with_header`. Used by
-    /// the HTTP/1.1 response writer and the H3 frontend's QPACK
-    /// encoder to emit them on the wire.
+    /// Stream one body chunk. **Phase 0**: appends to the buffered body
+    /// (the transport sends it after the handler returns). Later phases
+    /// route this to the transport's live `ResponseSink` so the bytes
+    /// hit the wire immediately and backpressure applies here. Set the
+    /// head (status / content-type / headers) before the first `write`.
+    pub async fn write(&mut self, buf: &[u8]) -> Result<(), ()> {
+        self.streaming = true;
+        self.body.push_back(IOBuf::from_slice_with_headroom(0, buf, 0));
+        Ok(())
+    }
+
+    /// Finish a streamed response. **Phase 0**: a no-op (the buffered
+    /// body is sent at handler return); later phases flush the sink's
+    /// end-of-stream marker.
+    pub async fn finish(&mut self) -> Result<(), ()> {
+        Ok(())
+    }
+
+    /// Iterate the extra headers set via `header`. Used by the HTTP/1.1
+    /// response writer and the H3 QPACK encoder to emit them.
     pub fn extra_headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
         self.extra_headers
             .iter()
             .filter_map(|slot| slot.as_ref().map(|(n, v)| (n.data(), v.data())))
     }
 
-    /// Consume the response and yield its body chain. Frontends
-    /// drain it via `pop_front`, `iter`, or by appending it to
-    /// an outbound chain (`stream.send(&mut out_chain)`).
+    /// Consume the response and yield its body chain. Transports drain
+    /// it (`pop_front` / append to an outbound chain).
     pub fn into_body(self) -> IOBufChain {
         self.body
     }
 
     /// Borrow the body chain without consuming the response.
-    /// Used by frontends that want to inspect length / parts
-    /// before deciding whether to inline / stream / coalesce.
     pub fn body(&self) -> &IOBufChain {
         &self.body
     }
 
-    /// Total body length in bytes. Used by frontends to write
-    /// the Content-Length header (HTTP/1.1) or DATA-frame
-    /// length prefix (HTTP/3) without walking the parts twice.
+    /// Total body length in bytes — for the Content-Length header (h1)
+    /// or DATA-frame length (h2/h3).
     pub fn body_len(&self) -> usize {
         self.body.total_len()
     }
