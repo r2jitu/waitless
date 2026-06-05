@@ -235,6 +235,12 @@ struct H2Conn {
     /// into it, then ships it as one IOBuf. Persisting it keeps the
     /// framing path allocation-free across requests.
     frame_buf: Vec<u8>,
+    /// Reused send chain — held across flushes so the `Many` VecDeque
+    /// backing (allocated once a flush goes multi-part, e.g. a large
+    /// zero-copy body framed into many DATA parts) is retained and
+    /// refilled rather than reallocated every flush. `send` drains it
+    /// empty; `clear` resets it (keeping capacity) before each reuse.
+    out_chain: IOBufChain,
     /// Responses being framed onto the wire, FIFO.
     out_queue: VecDeque<StreamOut>,
     /// Streaming request streams — one spawned handler task each, fed by
@@ -276,6 +282,7 @@ impl H2Conn {
             value_scratch: alloc::vec![0u8; 16 * 1024],
             ctrl_out: Vec::new(),
             frame_buf: Vec::new(),
+            out_chain: IOBufChain::new(),
             out_queue: VecDeque::new(),
             streams: Vec::new(),
             resp_sink: Rc::new(RefCell::new(VecDeque::new())),
@@ -720,7 +727,11 @@ async fn flush<S: HttpStream>(conn: &mut H2Conn, stream: &mut S) -> Result<(), (
         hdr_buf.extend_from_slice(&conn.ctrl_out);
         conn.ctrl_out.clear();
     }
-    let mut chain = IOBufChain::new();
+    // Reuse the conn-held chain (kept across flushes so its `Many`
+    // VecDeque backing is refilled, not reallocated). `send` drains it
+    // empty; clear here is defensive (resets capacity-preserving).
+    let mut chain = core::mem::take(&mut conn.out_chain);
+    chain.clear();
     conn.drain_to_chain(&mut hdr_buf, &mut chain);
     // Trailing accumulated header / inline-body bytes become the final
     // (and, for an all-small flush, only) contiguous chain part.
@@ -732,9 +743,12 @@ async fn flush<S: HttpStream>(conn: &mut H2Conn, stream: &mut S) -> Result<(), (
         .frame_cycles
         .add(now_cycles().wrapping_sub(__f0));
     if chain.is_empty() {
+        conn.out_chain = chain;
         return Ok(());
     }
-    stream.send(&mut chain).await
+    let r = stream.send(&mut chain).await;
+    conn.out_chain = chain;
+    r
 }
 
 // ── Frame dispatch ─────────────────────────────────────────────────
