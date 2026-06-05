@@ -101,6 +101,18 @@ loadgen http --proto h1|h2|h3 --host H --port P [--endpoint /health] \
 quinn + `h3` stack (it subsumes the older `h3-health` workload,
 which stays for back-compat).
 
+### Profiling against a deployed server
+
+`../h2_profile.py <host> --proto h2 [--endpoint /static-64k] ...` runs
+this `http` workload and derives **per-request work** (sends/req,
+TLS-records/req, allocs/req) and **per-phase CPU** (h2 decode / encode /
+frame cycles) from the server's `/obs` deltas. `../gce-h2-bench.sh
+--proto h2 ...` drives it from `kvm-vm` against the deployed
+`waitless-webserver` (the h2/h3 analog of `c3-bench-once.sh`, which is
+`wrk`/HTTP-1.1 only). Use GCE for throughput + CPU truth — HVF is
+proxy-bound and reports false parity; HVF's trustworthy signals are the
+contention-immune work counters only.
+
 ## Future work
 
 * Migrate the throughput workloads in `bench.py` from `wrk` to the
