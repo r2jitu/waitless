@@ -579,7 +579,16 @@ pub(super) fn handle_tcp(family: IpFamily, tcp: &[u8]) {
                 replies.push_back(f);
             }
             if flags & 0x01 != 0 {
-                let ack = snap.ack.wrapping_add(1);
+                // ACK the guest's FIN *and* any data the same segment
+                // carried. The server coalesces FIN onto the last data
+                // segment for a small `Connection: close` response, so
+                // the ack must cover `payload.len() + 1`. `snap.ack`
+                // predates this segment, so `snap.ack + 1` under-acks a
+                // data+FIN by the payload length — leaving the guest in
+                // FinWait waiting for an ack that never comes, so the
+                // conn never frees (fresh-conn workloads then leaked
+                // every connection → guest heap OOM under churn).
+                let ack = seq.wrapping_add(payload.len() as u32).wrapping_add(1);
                 let f = build_tcp_reply(family, snap.port, src_port, snap.seq, ack, 0x11, &[]);
                 replies.push_back(f);
             }

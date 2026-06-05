@@ -1472,6 +1472,9 @@ fn drain_conn_rx(
             port: u16,
             seq_advance: u32,
             eof: bool,
+            /// Host connection reset (read returned a terminal error,
+            /// e.g. ECONNRESET) — tear the guest conn down with an RST.
+            reset: bool,
         }
         let mut results: Vec<RxResult> = Vec::new();
         let mut injected = false;
@@ -1508,11 +1511,33 @@ fn drain_conn_rx(
             let n = unsafe { libc::read(cs.fd, payload_ptr as *mut _, max_payload) };
             if n <= 0 {
                 if n == 0 {
+                    // Clean EOF — the host half-closed; send our FIN.
                     results.push(RxResult {
                         port: cs.port,
                         seq_advance: 0,
                         eof: true,
+                        reset: false,
                     });
+                } else {
+                    // n < 0. EAGAIN/EWOULDBLOCK on the non-blocking fd is
+                    // just "no data yet" — ignore. Any other errno
+                    // (notably ECONNRESET, which every fresh-conn loadgen
+                    // workload triggers — they close with SO_LINGER{1,0},
+                    // so close() sends RST not FIN) means the host conn is
+                    // gone: reset the guest conn so it frees instead of
+                    // leaking. The old code dropped this case, so
+                    // RST-closed connections accumulated as live guest
+                    // conns until the slot pool starved and fresh-conn
+                    // workloads stalled to 0.
+                    let err = unsafe { *libc::__error() };
+                    if err != libc::EAGAIN && err != libc::EWOULDBLOCK {
+                        results.push(RxResult {
+                            port: cs.port,
+                            seq_advance: 0,
+                            eof: false,
+                            reset: true,
+                        });
+                    }
                 }
                 continue;
             }
@@ -1558,6 +1583,7 @@ fn drain_conn_rx(
                 port: cs.port,
                 seq_advance: payload_len as u32,
                 eof: false,
+                reset: false,
             });
             injected = true;
         }
@@ -1566,7 +1592,32 @@ fn drain_conn_rx(
             let mut conns = shared.conns.lock().unwrap();
             for r in &results {
                 if let Some(c) = conns.get_mut(&r.port) {
-                    if r.eof {
+                    if r.reset {
+                        // Host conn reset — RST the guest side so it
+                        // frees immediately (seq = our next send seq =
+                        // the guest's rcv.nxt, so the RST is in-window
+                        // and accepted), then mark Closed for reaping.
+                        if c.host_fd >= 0 {
+                            unsafe {
+                                libc::close(c.host_fd);
+                            }
+                            c.host_fd = -1;
+                        }
+                        if c.state < ConnState::Closed {
+                            let frame = build_tcp_reply(
+                                c.family,
+                                c.src_port,
+                                c.guest_port,
+                                c.my_seq,
+                                c.peer_ack,
+                                0x04,
+                                &[],
+                            );
+                            inject_frame(frame.as_slice(), qsnap, &mut io.rx_last);
+                            injected = true;
+                        }
+                        c.state = ConnState::Closed;
+                    } else if r.eof {
                         let frame = build_tcp_reply(
                             c.family,
                             c.src_port,
