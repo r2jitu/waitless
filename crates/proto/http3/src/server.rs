@@ -6,16 +6,20 @@
 //      with no entries (defaults are fine).
 //   2. For each accepted peer stream:
 //      - Bidi (id & 0x3 == 0): a request stream. Read HEADERS +
-//        DATA frames until FIN, build `http::Request`, hand
-//        to the user handler, encode response (HEADERS + DATA +
-//        FIN), close stream.
+//        DATA frames until FIN, build `http::Request`, hand to the
+//        user handler. The response is either streamed as the
+//        handler produces it (`res.write` → `H3Sink` frames HEADERS
+//        + DATA under QUIC stream flow control, bounded) or, when
+//        the handler buffers (`res.set`), encoded in one shot
+//        (HEADERS + DATA + FIN); then close the stream.
 //      - Uni (id & 0x3 == 0x2): peer's control / QPACK encoder /
 //        QPACK decoder stream. We accept and discard everything
 //        on these (control stream's SETTINGS frame is ignored,
 //        QPACK streams stay empty since we negotiated capacity 0).
 //
-// Sans-allocation hot path: each request reuses `Request` /
-// `BufWriter`-style scratch buffers from the conn handler.
+// Sans-allocation hot path: each request reuses the conn handler's
+// `Request` and its `Scratch` buffers (recv / HEADERS / body / QPACK
+// out / H3 framing prefix) instead of allocating per request.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -155,10 +159,14 @@ where
         // Bidi peer stream (id & 0x3 == 0): request stream.
         if sid & 0x3 == 0 {
             let h = Arc::clone(&handler);
-            // Drive request handling inline. We'd ideally spawn a
-            // task per request, but the conn task already
-            // multiplexes; doing it inline keeps lifetimes simple
-            // and matches the shape of //crates/proto/http's handle_conn.
+            // Drive request handling inline — so requests on one conn
+            // serialize through this loop. A task per request was tried
+            // (to overlap them) and reverted: every task would park on the
+            // connection's shared `progress` `AsyncEvent`, which is
+            // *single-waiter* — a second waiter overwrites the first's
+            // waker, dropping wakeups and stalling concurrent streams (see
+            // `docs/streaming-response.md`). Overlapping h3 requests needs
+            // a multi-waiter conn wakeup first; until then, inline.
             handle_request(&conn, sid, h.as_ref(), &mut scratch).await;
         } else if sid & 0x3 == 0x2 {
             // Peer unidirectional streams — control, QPACK

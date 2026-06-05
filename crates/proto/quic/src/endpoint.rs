@@ -247,8 +247,9 @@ impl QuicConn {
 
     /// Append an owned `Vec<u8>` to stream `sid`'s send queue
     /// (no FIN). Stream stays open for further writes — caller
-    /// closes via `close_stream` when ready. Used by H3 to
-    /// queue the framing block before queuing the body chunk.
+    /// closes via `close_stream` when ready. Used by H3 for the
+    /// one-shot CONTROL-stream SETTINGS write; the per-request
+    /// framing + body path uses the zero-copy `send_iobuf` instead.
     pub fn send_owned(&self, sid: u64, data: Vec<u8>) {
         {
             let mut c = self.conn.borrow_mut();

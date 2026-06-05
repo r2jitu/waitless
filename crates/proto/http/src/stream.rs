@@ -7,12 +7,13 @@
 // those calls inline).
 //
 // The request *body* past the prebuf reaches the handler through a
-// transport-erased seam — [`BodySource`] + `&mut dyn BodySource` on
-// `BodyReader` — so the handler signature is `(&Request, &mut
-// BodyReader<'_>)` with **no** stream type parameter, identical for
-// HTTP/1.1, HTTP/2, and HTTP/3. That's what lets one handler value
-// serve every transport (and the `https::serve` facade take a single
-// handler) without a per-protocol `Service` trait or `NullStream` stub.
+// transport-erased seam — [`BodySource`] + `&mut dyn BodySource` held by
+// `BodyReader` (read via `req.read_chunk()`) — so the handler signature
+// is `(&mut Request<'_>, &mut Response<'_>)` with **no** stream type
+// parameter, identical for HTTP/1.1, HTTP/2, and HTTP/3. That's what lets
+// one handler value serve every transport (and the `https::serve` facade
+// take a single handler) without a per-protocol `Service` trait or
+// `NullStream` stub.
 
 use core::future::Future;
 use core::pin::Pin;

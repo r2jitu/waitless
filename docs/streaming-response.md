@@ -32,9 +32,9 @@ generated body.
 
 ### Why not "split both sides symmetrically"
 
-The asymmetry in today's `(&Request, &mut BodyReader)` (split) vs a
-single response writer is **intrinsic to HTTP message ordering**, not
-arbitrary:
+The asymmetry between the prior request-only API's `(&Request, &mut
+BodyReader)` (split) and a single response writer is **intrinsic to HTTP
+message ordering**, not arbitrary:
 
 - A **request** is *received* head-first then body, so the head is a
   complete value to read (`&Request`) and the body streams in after
@@ -108,7 +108,10 @@ source and the response sink (see [Phase 1d]). The handler uses them
 sequentially — `read_chunk` returns *owned* bytes, releasing the stream
 before `res.write` re-borrows it — so the two never overlap, and a
 single per-conn task is the cell's only borrower. Bounded `O(chunk)`
-over plaintext and TLS; on h2/h3 `res.write` buffers (Phase 2–3).
+over plaintext and TLS. h3 streams every response through a live sink,
+and h2 streams bodied requests through a spawned per-stream sink (Phases
+2–3); the lone unbounded case is a *bodyless* h2 GET, which h2 dispatches
+inline with a sink-less `Response` (see Phase 2).
 
 ### Transport seam (unchanged in spirit)
 

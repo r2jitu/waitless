@@ -174,7 +174,7 @@ async fn init() {
     // One call brings up all of HTTPS: h1.1 + h2 over TLS/TCP and h3
     // over QUIC/UDP on the same port, with the `Alt-Svc` h3
     // advertisement wired automatically. The *same* `handle_request`
-    // serves every transport — its `(&Request, &mut BodyReader<'_>)`
+    // serves every transport — its `(&mut Request<'_>, &mut Response<'_>)`
     // signature is transport-erased, so no per-version wrapper is
     // needed (it's the same handler plain `http::listen` takes above).
     // h3 is best-effort inside `serve` — the TCP server still comes up
@@ -259,9 +259,12 @@ async fn handle_request(req: &mut Request<'_>, res: &mut Response<'_>) -> Result
     // Streaming generated body: the handler **pushes** chunks via
     // `res.write()`. On h1 each chunk goes straight to the wire with TCP
     // backpressure, so peak memory stays O(chunk) — a 1 GiB body streams
-    // fine on a 512 MiB VM, which buffering could not. (On h2/h3 today
-    // `res.write` buffers — see docs/streaming-response.md; don't fetch
-    // the huge size there yet.)
+    // fine on a 512 MiB VM, which buffering could not. h3 streams it too
+    // (every h3 request gets a live `H3Sink`). h2 is the one exception:
+    // `/stream` is a bodyless GET, and h2 dispatches those inline with a
+    // sink-less `Response`, so `res.write` buffers the whole 1 GiB —
+    // don't fetch the huge size over h2. (A bodied request streams on h2
+    // too; see docs/streaming-response.md.)
     if req.path() == b"/stream" {
         res.content_type(b"application/octet-stream");
         let zeros = STATIC_64K_BYTES.get(); // 64 KiB of zeros, reused
@@ -278,9 +281,10 @@ async fn handle_request(req: &mut Request<'_>, res: &mut Response<'_>) -> Result
     // the response body — plain handler code, no framework echo mode. On
     // h1 `req.read_chunk` and `res.write` share one connection (the serve
     // loop's RefCell duplex), so each chunk is read, then written to the
-    // wire with backpressure: bounded O(chunk) over plaintext AND TLS. On
-    // h2/h3 `res.write` buffers (materialise — correct, not yet bounded).
-    // The same shape expresses a proxy / transform.
+    // wire with backpressure: bounded O(chunk) over plaintext AND TLS.
+    // `/echo` is a bodied request, so it's bounded on h2 (the spawned
+    // per-stream `H2Sink`) and h3 (`H3Sink`) too. The same shape
+    // expresses a proxy / transform.
     if req.path() == b"/echo" {
         let ct = req
             .header(b"content-type")

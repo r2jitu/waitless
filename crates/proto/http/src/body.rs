@@ -5,8 +5,8 @@
 // then from the transport, surfaced through a **transport-erased**
 // [`BodySource`] (`&mut dyn`). That erasure is what keeps `BodyReader`
 // — and therefore the handler signature — free of any stream type
-// parameter: one `(&Request, &mut BodyReader<'_>)` handler serves
-// HTTP/1.1, HTTP/2, and HTTP/3 alike.
+// parameter: one `(&mut Request<'_>, &mut Response<'_>)` handler (reading
+// the body via `req.read_chunk()`) serves HTTP/1.1, HTTP/2, and HTTP/3.
 
 use core::marker::PhantomData;
 
