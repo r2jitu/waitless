@@ -310,7 +310,34 @@ per-stream flow control, `demux_wake`) already exists.
   > path. The realistic large-streamed case (echo / proxy / transform =
   > body-present POST, which already runs in a spawned task) is bounded.
 
-- **Phase 3 — h3 bounded streaming.** QUIC stream writes + flow control.
+- **Phase 3 — h3 bounded streaming. ✅ DONE (commit `a6d4591`).** A
+  streaming h3 handler (`res.write`) frames HEADERS + DATA straight onto
+  the QUIC stream via `H3Sink` and backpressures on the stream send
+  buffer (`H3_SEND_BUF_CAP` = 256 KiB): each `write_chunk` ships its
+  frame with `send_iobuf` (append + `flush` + drain to the socket), and
+  if the unsent buffer exceeds the cap, parks on
+  `QuicConn::stream_drain_below` until the conn task flushes more (peer
+  ACK / MAX_STREAM_DATA). The h3 handler is inline, but QUIC's transmit
+  runs in a **separate conn task**, so the buffer drains while the
+  handler awaits — no per-request spawn, no deadlock. QUIC core add:
+  `SendStream::buffered_len` + `Connection::stream_send_buffered` +
+  `QuicConn::{stream_buffered, stream_drain_below}` (reusing the existing
+  `progress` event — no conn-task surgery). A buffered handler (`res.set`)
+  flows through the unchanged `write_response` (content-length preserved).
+  **No bodyless residual** (unlike h2): the h3 handler always runs with
+  the sink, so a bodyless GET that streams (`/stream`) is bounded too.
+  **Validated:** HVF — `/echo` over h3 round-trips 32 KiB byte-identical
+  (aioquic, real QUIC). GCE (c3-highcpu-4, gVNIC) — a 256 MiB `/stream`
+  over h3 (aioquic GET) kept the **server heap bounded at +731 KB**
+  while streaming, `heap_oom=0`, server serving `/health` 200 after. (A
+  later unreachability under sustained `/obs` polling matched the
+  separate known `/obs`-triggered heap-corruption issue, not the h3
+  stream; the spot VM was also preempted twice mid-session — h3 bounded
+  behaviour itself reproduced cleanly. The QUIC core stayed untouched
+  beyond the additive query/await methods.)
+  > A mid-stream handler **error** FINs the partial stream rather than
+  > RESET_STREAM — the h3 layer doesn't surface a stream reset; rare
+  > path, noted in the code.
 
 ## Validation
 
