@@ -145,6 +145,7 @@ from .workloads import (
     next_port,
     run_loadgen_gateway,
     run_loadgen_h3_health,
+    run_loadgen_http,
     run_loadgen_http_close,
     run_loadgen_http_upload,
     run_loadgen_tcp_echo,
@@ -457,6 +458,67 @@ WORKLOADS = [
         "parallelism_per_core": 4,
         "tier": "available",
         "desc": "TLS 1.3 PSK-DHE resumed handshake + GET + close (4 workers × cpus)",
+    },
+    # ── Unified HTTP load: HTTP/1.1, /2, /3 via the one loadgen
+    # `http` subcommand (one client → apples-to-apples across
+    # versions). Off by default — the default tier keeps wrk for the
+    # h1.1 RPS baseline; these add the h2/h3 comparison + the high-
+    # concurrency stress the per-core-scaled workloads don't cover.
+    # Run e.g. `--workload get_h1,get_h2,get_h3` for a protocol A/B,
+    # or `get_h2_c4000` for multiplexed high-conc. `streams` =
+    # per-connection in-flight requests (h2/h3 only; h1 is sequential
+    # keep-alive). h1 here is over TLS, so it's comparable to h2/h3.
+    {
+        "name": "get_h1",
+        "type": "http",
+        "proto": "h1",
+        "endpoint": "/health",
+        "conns_per_core": 32,
+        "tier": "available",
+        "desc": "/health keep-alive over HTTP/1.1+TLS (32 conn × cpus) — loadgen",
+    },
+    {
+        "name": "get_h2",
+        "type": "http",
+        "proto": "h2",
+        "endpoint": "/health",
+        "conns_per_core": 8,
+        "streams": 8,
+        "tier": "available",
+        "desc": "/health keep-alive over HTTP/2 (8 conn × cpus × 8 streams)",
+    },
+    {
+        "name": "get_h3",
+        "type": "http",
+        "proto": "h3",
+        "endpoint": "/health",
+        "conns_per_core": 4,
+        "streams": 8,
+        "tier": "available",
+        "desc": "/health keep-alive over HTTP/3 / QUIC (4 conn × cpus × 8 streams)",
+    },
+    # High-concurrency stress — thousands of in-flight requests held
+    # at once, the gap the per-core-scaled workloads above don't
+    # reach. Fixed conn/stream counts (not per-core) so the offered
+    # concurrency is the constant held across target sizes.
+    {
+        "name": "get_h1_c4000",
+        "type": "http",
+        "proto": "h1",
+        "endpoint": "/health",
+        "conns": 4000,
+        "tier": "available",
+        "desc": "/health HTTP/1.1+TLS at 4000 concurrent connections (high-conc)",
+    },
+    {
+        "name": "get_h2_c4000",
+        "type": "http",
+        "proto": "h2",
+        "endpoint": "/health",
+        "conns": 250,
+        "streams": 16,
+        "tier": "available",
+        "desc": "/health HTTP/2 at 250 conn × 16 streams = 4000 in-flight (high-conc)",
     },
     # Single-flow UDP RTT. Replaces the dropped `udp_sync`; same
     # shape, new name. Off by default — `echo_udp` (throughput
@@ -958,6 +1020,45 @@ def main():
                                 duration,
                                 host=wrk_host,
                                 parallelism=par,
+                            )
+                        allocs_after = fetch_total_allocs(wrk_port, host=wrk_host)
+                        results[(env_name, cpus, wname)] = (rps, p50, p99)
+                        client_cpu[(env_name, cpus, wname)] = m["cores"]
+                        alloc_tag = _alloc_tag(
+                            allocs_before, allocs_after, rps * duration
+                        )
+                        print(
+                            f"    {wname:<20s} {rps:>10.0f} req/s  "
+                            f"p50={p50}  p99={p99}  "
+                            f"{_cpu_tag(m['cores'])}{alloc_tag}"
+                        )
+                    elif w["type"] == "http":
+                        # Unified keep-alive GET via the loadgen `http`
+                        # subcommand — one client for HTTP/1.1, /2, /3
+                        # (apples-to-apples across versions). `proto`
+                        # picks the version; `conns` × `streams` is the
+                        # offered concurrency (`streams` h2/h3 only —
+                        # h1 is sequential keep-alive). h1+TLS / h2 / h3
+                        # use the TLS/QUIC port; h1 with `plaintext` uses
+                        # the wrk port. /obs (alloc counter) is read off
+                        # the plain port like the other loadgen arms.
+                        proto = w.get("proto", "h1")
+                        streams = w.get("streams", 1)
+                        target_port = (
+                            wrk_port
+                            if (proto == "h1" and w.get("plaintext"))
+                            else tls_target_port
+                        )
+                        allocs_before = fetch_total_allocs(wrk_port, host=wrk_host)
+                        with measure_client_cpu() as m:
+                            rps, p50, p99 = run_loadgen_http(
+                                proto,
+                                target_port,
+                                w["endpoint"],
+                                duration,
+                                host=wrk_host,
+                                connections=conns,
+                                streams=streams,
                             )
                         allocs_after = fetch_total_allocs(wrk_port, host=wrk_host)
                         results[(env_name, cpus, wname)] = (rps, p50, p99)
