@@ -180,12 +180,34 @@ per-stream flow control, `demux_wake`) already exists.
   buffering would OOM. (This is the generated/computed path; the
   interleaved *echo* below is the remaining variant.)
 
-- **Phase 1b — interleaved echo (read-while-write).** Needs the
-  in-handler `write` path live (Response<'a> + `&mut dyn ResponseSink`)
-  **and** a per-transport read/write split so the body reader + the
-  response sink can hold the stream at once. Plaintext `TcpStream` split
-  is straightforward (disjoint RX/TX waker slots); `TlsStream` + the
-  generic `HttpStream` seam are the harder part. Not yet started.
+- **Phase 1b — streaming echo (write-as-you-read). ✅ DONE (commit
+  `3771910`).** `res.echo_request(ct)` splices the request body straight
+  back out, bounded `O(chunk)`. The two-object `(&mut Request, &mut
+  Response)` API can't hand a handler the read + write halves of one
+  stream at once (two `&mut`), so the **serve loop** does the splice: it
+  owns the stream and runs `recv_chunk → into_owned → send`
+  sequentially (`into_owned` drops the read borrow before `send`
+  re-borrows) — **no read/write split needed**. Generic over `S:
+  HttpStream`, so h1 streams the echo bounded over **both plaintext and
+  TLS**; h2/h3 drain the request body into the response (materialise —
+  correct, not yet bounded). `/echo` endpoint added. **Validated on HVF
+  (512 MiB RAM): small echo correct over h1/h1-TLS/h2; a 256 MiB POST to
+  /echo over h1 echoed back exactly 268,435,456 bytes with the heap flat
+  at 3.4 MB** (256 MiB req + 256 MiB resp = 512 MiB would OOM).
+
+  > The serve-loop splice covers pure echo/proxy (the asked-for case). A
+  > *transforming* handler that interleaves its own `read_chunk` +
+  > `write` chunk-by-chunk would still need the in-handler sink +
+  > read/write split (Response<'a>); deferred — the splice delivers the
+  > bounded large-payload echo without it.
+
+- **Phases 2–3 — native h2/h3 bounded streaming (optimisation).** h2/h3
+  currently *materialise* a streamed/echoed body (correct output,
+  `O(body)` memory). Bounding them needs the per-transport streaming
+  sink: h2 = a TX chunk queue the demux drains with conn+stream
+  flow-control backpressure (mirror of the RX `StreamBody`); h3 = QUIC
+  stream writes with FC. Deferred — not the core ask (which is
+  delivered + bounded on h1).
 - **Phase 2 — h2 streaming.** Per-stream TX queue + demux integration +
   window/cap backpressure. The correctness-sensitive part — GCE-validate
   large transfers (byte-perfect + bounded peak).
