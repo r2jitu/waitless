@@ -211,11 +211,16 @@ where
         // chunk straddled the Content-Length boundary. None in every
         // path that doesn't pull from the stream past the prebuf.
         let body_leftover: Option<IOBuf>;
+        // Echo mode: the handler asked to splice the request body back
+        // out (`res.echo_request`). The splice below reads the body
+        // itself, so the normal post-handler discard is skipped.
+        let do_echo;
         if req.reject {
             crate::diag::record_reject(&req);
             res = Response::bad_request();
             want_close = true;
             body_leftover = None;
+            do_echo = false;
         } else {
             want_close = match req.header(b"Connection") {
                 Some(v) => v.eq_ignore_ascii_case(b"close"),
@@ -249,26 +254,102 @@ where
                     crate::diag::COUNTERS.send_failed.bump();
                     return;
                 }
-                body_drained_ok = want_close
-                    || body.is_empty()
-                    || body.discard().await.is_ok();
-                // Pick up any residue BodyReader stashed when a
-                // stream-side chunk straddled the body boundary.
-                // Only meaningful when the body was fully drained
-                // AND the body actually drew from the stream
-                // (CL > 0); a CL=0 body cannot have created a
-                // straddle, so skip the call entirely on the GET
-                // fast path.
-                body_leftover = if body_drained_ok && content_length > 0 {
-                    body.into_leftover()
+                do_echo = res.is_echo();
+                if do_echo {
+                    // The echo splice below reads + writes the body
+                    // itself (bounded); skip the discard. `carry` still
+                    // holds the prebuf body bytes (the BodyReader only
+                    // borrowed them).
+                    body_drained_ok = true;
+                    body_leftover = None;
                 } else {
-                    None
-                };
+                    body_drained_ok = want_close
+                        || body.is_empty()
+                        || body.discard().await.is_ok();
+                    // Pick up any residue BodyReader stashed when a
+                    // stream-side chunk straddled the body boundary.
+                    // Only meaningful when the body was fully drained
+                    // AND the body actually drew from the stream
+                    // (CL > 0); a CL=0 body cannot have created a
+                    // straddle, so skip the call entirely on the GET
+                    // fast path.
+                    body_leftover = if body_drained_ok && content_length > 0 {
+                        body.into_leftover()
+                    } else {
+                        None
+                    };
+                }
             }
             if !body_drained_ok {
                 crate::diag::COUNTERS.body_drain_failed.bump();
                 return;
             }
+        }
+
+        // Echo mode: splice the request body straight back out as the
+        // response body, bounded O(chunk). Write a close-delimited head,
+        // then the prebuf body bytes (`carry` — the body that rode in
+        // with the head), then `recv_chunk → into_owned → send` the
+        // remainder up to Content-Length. `into_owned` releases the read
+        // borrow before `send` re-borrows the stream, so read + write
+        // stay sequential — no read/write split needed.
+        if do_echo {
+            let mut head = unsafe {
+                IOBuf::borrow(
+                    core::ptr::NonNull::new_unchecked(header_storage.as_mut_ptr()),
+                    HEADER_BUF_SIZE as u32,
+                    0,
+                    0,
+                )
+            };
+            crate::response::write_streaming_head_into_iobuf(&mut head, &res);
+            out_chain.clear();
+            out_chain.push_back(head);
+            if stream.send(&mut out_chain).await.is_err() {
+                crate::diag::COUNTERS.send_failed.bump();
+                return;
+            }
+            let mut remaining = content_length;
+            if let Some(c) = carry.take() {
+                let n = remaining.min(c.data().len());
+                if n > 0 {
+                    let mut chunk = c;
+                    let _ = chunk.narrow(0, n);
+                    out_chain.clear();
+                    out_chain.push_back(chunk);
+                    if stream.send(&mut out_chain).await.is_err() {
+                        crate::diag::COUNTERS.send_failed.bump();
+                        return;
+                    }
+                    remaining -= n;
+                }
+            }
+            while remaining > 0 {
+                match stream.recv_chunk().await {
+                    Some(guard) => {
+                        let mut owned = guard.into_owned();
+                        let avail = owned.data().len();
+                        if avail == 0 {
+                            break;
+                        }
+                        let n = remaining.min(avail);
+                        let _ = owned.narrow(0, n);
+                        out_chain.clear();
+                        out_chain.push_back(owned);
+                        if stream.send(&mut out_chain).await.is_err() {
+                            crate::diag::COUNTERS.send_failed.bump();
+                            return;
+                        }
+                        remaining -= n;
+                    }
+                    // Peer closed before Content-Length — echo what we got.
+                    None => break,
+                }
+            }
+            out_chain.clear();
+            crate::diag::COUNTERS.responses_sent.bump();
+            let _ = stream.close().await;
+            return;
         }
 
         // Streaming response (handler installed a body producer): write

@@ -1079,6 +1079,15 @@ where
             // un-extended stream window — the h2-correct way to abandon an
             // unwanted request body.
             let _ = (*handler)(&mut request, &mut res).await;
+            // Echo mode: drain the request body into the response body
+            // (materialise — correct, not yet bounded; native h2
+            // streaming is a later phase). h1 splices this bounded.
+            if res.is_echo() {
+                let mut reader = request.into_body();
+                while let Some(g) = reader.chunk().await {
+                    let _ = res.write(g.data()).await;
+                }
+            }
         }
         // h2 buffers; drain any streaming producer (correct, not bounded).
         res.materialize().await;

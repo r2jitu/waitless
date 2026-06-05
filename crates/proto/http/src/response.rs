@@ -66,6 +66,14 @@ pub struct Response {
     /// memory stays `O(chunk)`. Mutually exclusive with a buffered
     /// `body` in practice (a handler picks one).
     producer: Option<alloc::boxed::Box<dyn crate::stream::ResponseBodyProducer>>,
+    /// Echo mode (`echo_request`): the response body **is** the request
+    /// body, spliced straight back. The transport reads request-body
+    /// chunks and writes each back out, bounded `O(chunk)` — the
+    /// streaming echo for large payloads. h1 splices in the serve loop
+    /// (`recv_chunk → into_owned → send`, sequential, no read/write
+    /// split needed); h2/h3 drain the request body into `body`
+    /// (materialise — correct, not yet bounded).
+    echo: bool,
 }
 
 // Note: no `unsafe impl Send/Sync` needed — `IOBuf` is Send + Sync
@@ -90,6 +98,7 @@ impl Response {
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
             streaming: false,
             producer: None,
+            echo: false,
         }
     }
 
@@ -105,6 +114,7 @@ impl Response {
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
             streaming: false,
             producer: None,
+            echo: false,
         }
     }
 
@@ -117,6 +127,7 @@ impl Response {
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
             streaming: false,
             producer: None,
+            echo: false,
         }
     }
 
@@ -133,6 +144,7 @@ impl Response {
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
             streaming: false,
             producer: None,
+            echo: false,
         }
     }
 
@@ -147,6 +159,7 @@ impl Response {
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
             streaming: false,
             producer: None,
+            echo: false,
         }
         .with_header(b"Location", location)
     }
@@ -205,6 +218,23 @@ impl Response {
     /// `true` if the handler installed a streaming-body producer.
     pub fn has_stream(&self) -> bool {
         self.producer.is_some()
+    }
+
+    /// **Echo mode**: stream the request body straight back as the
+    /// response body — the bounded-memory streaming echo for large
+    /// payloads. The transport reads each request-body chunk and writes
+    /// it back out, so peak memory stays `O(chunk)`. The handler just
+    /// signals the mode (it does not read the body itself):
+    /// `res.echo_request(b"application/octet-stream"); Ok(())`.
+    pub fn echo_request(&mut self, content_type: impl Into<Bytes>) -> &mut Self {
+        self.content_type = content_type.into();
+        self.echo = true;
+        self
+    }
+
+    /// `true` if the handler put the response in echo mode.
+    pub fn is_echo(&self) -> bool {
+        self.echo
     }
 
     /// Take the streaming-body producer for the transport to drive

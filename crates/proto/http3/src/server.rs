@@ -545,6 +545,15 @@ where
         let body = BodyReader::new_streaming(Some(&mut src), &[], content_length);
         let mut request = Request::new(&req, body);
         let _ = handler(&mut request, &mut response).await;
+        // Echo mode: drain the request body into the response body
+        // (materialise — correct, not yet bounded; native h3 streaming
+        // is a later phase). h1 splices this bounded.
+        if response.is_echo() {
+            let mut reader = request.into_body();
+            while let Some(g) = reader.chunk().await {
+                let _ = response.write(g.data()).await;
+            }
+        }
     }
     // h3 buffers; drain any streaming producer into the body (correct,
     // not yet bounded — h3 streaming sink is a later phase).

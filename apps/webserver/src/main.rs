@@ -271,6 +271,18 @@ async fn handle_request(req: &mut Request<'_>, res: &mut Response) -> Result<(),
         );
         return Ok(());
     }
+    // Streaming echo: splice the POST body straight back out. h1 streams
+    // it chunk-by-chunk with bounded O(chunk) memory (the serve-loop
+    // splice); h2/h3 materialise it (correct, not yet bounded). The
+    // handler just signals echo mode — the transport does the splice.
+    if req.path() == b"/echo" {
+        let ct = req
+            .header(b"content-type")
+            .map(|v| v.to_vec())
+            .unwrap_or_else(|| b"application/octet-stream".to_vec());
+        res.echo_request(ct);
+        return Ok(());
+    }
     // Body-consuming routes run first: they need `&mut req` for
     // `read_chunk`, so they can't sit inside a `match req.path()` whose
     // scrutinee holds an immutable borrow of `req` across the arms.
