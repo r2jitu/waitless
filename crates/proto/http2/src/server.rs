@@ -7,17 +7,29 @@
 // *not* bind a port — `proto/tls`'s `listen` accepts the connection,
 // runs the TLS handshake, and dispatches here on the negotiated ALPN.
 //
-// Multiplexing model (happy path): one connection task reads frames in
-// order, assembles each request stream (HEADERS [+ CONTINUATION]
-// [+ DATA] until END_STREAM), dispatches the handler inline when a
-// stream completes, and enqueues the response. After every inbound
-// frame the loop flushes queued responses subject to the HTTP/2
-// connection + per-stream send windows — a cooperative single-writer
-// over the one socket (the design the backlog favours over a task per
-// stream). WINDOW_UPDATE frames credit the windows and the next flush
-// drains more. Request bodies are buffered before dispatch (like the
-// h3 server); streaming request bodies through `BodyReader` is a
-// tracked tail item.
+// Multiplexing model: one connection task ("the demux") reads frames in
+// order and assembles each request stream (HEADERS [+ CONTINUATION]
+// [+ DATA] until END_STREAM). Dispatch splits on whether a request body
+// is coming:
+//   * **Bodyless** (END_STREAM rode the HEADERS — typically a GET): run
+//     the handler *inline* with a buffered `Response`. It has no body to
+//     await, returns promptly without stalling the demux, and stays off
+//     the task arena. A streamed response here is `O(body)` (no sink on
+//     the inline path); spawning bodyless GETs too was measured (~+65%
+//     allocs on `/health`) and isn't worth it — see
+//     `docs/streaming-response.md`.
+//   * **Bodied**: *spawn* a per-stream handler task fed by a `StreamBody`
+//     (the request body streams through `BodyReader` while the demux
+//     keeps reading DATA into it) and an `H2Sink` (the response streams
+//     via `res.write` — head + DATA chunks queued into a per-stream
+//     `StreamTx` the demux frames under flow control, bounded to
+//     `STREAM_SEND_BUF_CAP`). A handler that buffers (`res.set`) instead
+//     hands the whole `Response` to the demux via `resp_sink`.
+//
+// Either way the demux owns the single writer: after every inbound frame
+// it flushes queued + streaming responses subject to the HTTP/2
+// connection + per-stream send windows (`drain_streaming`). WINDOW_UPDATE
+// frames credit the windows and the next flush drains more.
 //
 // Flow control here is the H2 layer's own min(stream_window,
 // conn_window) discipline — distinct from, and stacked on top of, TCP's
@@ -526,8 +538,13 @@ impl H2Conn {
 
             // 2. DATA chunks up to the windows (inline copy + `consume`
             //    for a window-cut front chunk — streaming is the cold
-            //    path, so no zero-copy split machinery).
+            //    path, so no zero-copy split machinery). When `finish`
+            //    was already called, END_STREAM rides the *last* DATA
+            //    frame (the chunk that empties the chain in full) rather
+            //    than a separate trailing empty frame — one fewer frame
+            //    + TLS record per streamed response.
             let mut freed = false;
+            let mut sent_end_stream = false;
             while !d.chunks.is_empty() {
                 // Peek the front chunk's length immutably so the mutable
                 // borrow for the copy/`consume` below doesn't span the
@@ -542,7 +559,12 @@ impl H2Conn {
                     break; // window-blocked — try again after WINDOW_UPDATE
                 }
                 let n = allowed as usize;
-                frame::push_frame_header(hdr_buf, n as u32, ftype::DATA, 0, id);
+                // This frame ends the stream iff `finish` was called and
+                // it sends the last chunk whole (so the chain empties).
+                let last = n as i64 == avail && d.chunks.len() == 1;
+                let end_stream = d.fin && last;
+                let fl = if end_stream { flags::END_STREAM } else { 0 };
+                frame::push_frame_header(hdr_buf, n as u32, ftype::DATA, fl, id);
                 let front = d.chunks.front_mut().unwrap();
                 hdr_buf.extend_from_slice(&front.data()[..n]);
                 if n as i64 == avail {
@@ -554,12 +576,19 @@ impl H2Conn {
                 self.streams[i].send_window -= n as i64;
                 self.conn_send_window -= n as i64;
                 freed = true;
+                if end_stream {
+                    sent_end_stream = true;
+                }
             }
 
-            // 3. END_STREAM once finished and fully drained — an empty
-            //    DATA(END_STREAM) closes the stream (valid per RFC 7540).
+            // 3. Finished + fully drained, but no DATA frame above carried
+            //    END_STREAM (an empty streamed body, or the body was sent
+            //    whole in an earlier pass) — close with an empty
+            //    DATA(END_STREAM) (valid per RFC 7540 §6.1).
             if d.fin && d.chunks.is_empty() {
-                frame::push_frame_header(hdr_buf, 0, ftype::DATA, flags::END_STREAM, id);
+                if !sent_end_stream {
+                    frame::push_frame_header(hdr_buf, 0, ftype::DATA, flags::END_STREAM, id);
+                }
                 finished.push(id);
             }
             drop(d);
@@ -1920,14 +1949,48 @@ mod tests {
         conn.drain_streaming(&mut hdr_buf);
         let fr = frames(&hdr_buf);
         let types: Vec<u8> = fr.iter().map(|f| f.0).collect();
-        assert_eq!(types, alloc::vec![ftype::HEADERS, ftype::DATA, ftype::DATA, ftype::DATA]);
+        // END_STREAM rides the final DATA frame ("world") — no separate
+        // trailing empty DATA, so 3 frames not 4.
+        assert_eq!(types, alloc::vec![ftype::HEADERS, ftype::DATA, ftype::DATA]);
         assert_eq!(fr[0].1 & flags::END_STREAM, 0, "HEADERS not END_STREAM (body follows)");
         assert_eq!(fr[1].3, b"hello");
+        assert_eq!(fr[1].1 & flags::END_STREAM, 0, "mid-body DATA not END_STREAM");
         assert_eq!(fr[2].3, b"world");
-        assert_eq!(fr[3].1 & flags::END_STREAM, flags::END_STREAM);
-        assert!(fr[3].3.is_empty(), "END_STREAM rides an empty trailing DATA");
+        assert_eq!(
+            fr[2].1 & flags::END_STREAM,
+            flags::END_STREAM,
+            "END_STREAM rides the final non-empty DATA"
+        );
         assert!(conn.streams.is_empty(), "finished stream retired");
         assert_eq!(conn.conn_send_window, INITIAL_WINDOW - 10, "window debited by body bytes");
+    }
+
+    #[test]
+    fn drain_streaming_finish_after_drain_emits_empty_endstream() {
+        // Body sent whole in pass 1 while `fin` is still false (handler
+        // hasn't called `finish` yet), then `fin` flips in pass 2 with the
+        // chain already empty → the trailing empty DATA(END_STREAM) is the
+        // only way left to close the stream.
+        let mut conn = H2Conn::new();
+        conn.streams
+            .push(streaming_slot(head_block(), &[b"hello"], false, INITIAL_WINDOW));
+        let mut hdr1 = Vec::new();
+        conn.drain_streaming(&mut hdr1);
+        let fr1 = frames(&hdr1);
+        assert_eq!(fr1.iter().map(|f| f.0).collect::<Vec<_>>(), alloc::vec![ftype::HEADERS, ftype::DATA]);
+        assert_eq!(fr1[1].3, b"hello");
+        assert_eq!(fr1[1].1 & flags::END_STREAM, 0, "not finished — no END_STREAM yet");
+        assert!(!conn.streams.is_empty(), "stream still open pending finish");
+        // Handler calls finish() with nothing more to write.
+        conn.streams[0].tx.data.borrow_mut().fin = true;
+        let mut hdr2 = Vec::new();
+        conn.drain_streaming(&mut hdr2);
+        let fr2 = frames(&hdr2);
+        assert_eq!(fr2.len(), 1, "lone empty DATA closes the stream");
+        assert_eq!(fr2[0].0, ftype::DATA);
+        assert_eq!(fr2[0].1 & flags::END_STREAM, flags::END_STREAM);
+        assert!(fr2[0].3.is_empty(), "trailing END_STREAM DATA is empty");
+        assert!(conn.streams.is_empty(), "finished stream retired");
     }
 
     #[test]
