@@ -229,13 +229,6 @@ impl<'a> Request<'a> {
         self.body.chunk().await
     }
 
-    /// Reborrow the underlying body reader — for the rare caller that
-    /// needs the `BodyReader` API directly (e.g. `remaining()` /
-    /// `into_leftover` plumbing inside a transport).
-    pub fn body_mut(&mut self) -> &mut crate::body::BodyReader<'a> {
-        &mut self.body
-    }
-
     /// Consume the request, surrendering the body reader (so the serve
     /// loop can recover its post-body `leftover` residue).
     pub fn into_body(self) -> crate::body::BodyReader<'a> {
