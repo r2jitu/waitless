@@ -80,6 +80,32 @@ const HEADER_BLOCK_CAP: usize = 64 * 1024;
 /// the H2-1 Rapid-Reset (CVE-2023-44487) guard.
 const RST_FLOOD_CAP: u32 = 200;
 
+/// Steady-state cycle counter for the per-phase profiling brackets
+/// (HPACK decode / encode / framing). Same rdtsc / cntvct instruction
+/// the `http` + `tls` profilers use; zero on unsupported targets.
+#[inline(always)]
+fn now_cycles() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let lo: u32;
+        let hi: u32;
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+            options(nomem, nostack, preserves_flags));
+        ((hi as u64) << 32) | (lo as u64)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let v: u64;
+        core::arch::asm!("mrs {0}, cntvct_el0", out(reg) v,
+            options(nomem, nostack, preserves_flags));
+        v
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        0
+    }
+}
+
 // ── Public entry point ─────────────────────────────────────────────
 
 /// Serve one HTTP/2 connection to completion over `stream`. Mirrors
@@ -205,6 +231,10 @@ struct H2Conn {
     /// Pending control frames (SETTINGS ack, WINDOW_UPDATE, PING ack,
     /// RST_STREAM, GOAWAY) awaiting flush. Not flow-controlled.
     ctrl_out: Vec<u8>,
+    /// Reused flush scratch: each flush frames control + response frames
+    /// into it, then ships it as one IOBuf. Persisting it keeps the
+    /// framing path allocation-free across requests.
+    frame_buf: Vec<u8>,
     /// Responses being framed onto the wire, FIFO.
     out_queue: VecDeque<StreamOut>,
     /// Streaming request streams — one spawned handler task each, fed by
@@ -245,6 +275,7 @@ impl H2Conn {
             name_scratch: alloc::vec![0u8; 256],
             value_scratch: alloc::vec![0u8; 16 * 1024],
             ctrl_out: Vec::new(),
+            frame_buf: Vec::new(),
             out_queue: VecDeque::new(),
             streams: Vec::new(),
             resp_sink: Rc::new(RefCell::new(VecDeque::new())),
@@ -310,7 +341,11 @@ impl H2Conn {
     /// honouring the per-stream initial send window.
     fn queue_response(&mut self, sid: u32, resp: Response) {
         let mut header_block = Vec::with_capacity(64);
+        let __e0 = now_cycles();
         encode_response_headers(&resp, &mut header_block);
+        crate::diag::COUNTERS
+            .encode_cycles
+            .add(now_cycles().wrapping_sub(__e0));
         let body = resp.into_body();
         let body_remaining = body.total_len();
         self.out_queue.push_back(StreamOut {
@@ -336,11 +371,19 @@ impl H2Conn {
         }
     }
 
-    /// Build the next wire frame to emit across the out_queue, honouring
-    /// the connection + per-stream send windows. Mutates accounting and
-    /// removes finished streams. Returns `None` when nothing can make
-    /// progress right now (all window-blocked or queue empty).
-    fn next_output_frame(&mut self) -> Option<Vec<u8>> {
+    /// Frame the next wire frame across the out_queue *directly into*
+    /// `out` (the reused flush buffer), honouring the connection +
+    /// per-stream send windows. Mutates accounting and removes finished
+    /// streams. Returns `false` when nothing can make progress right now
+    /// (all window-blocked or queue empty). Appending into the caller's
+    /// reused buffer — instead of returning a fresh per-frame `Vec` —
+    /// drops one heap allocation + one IOBuf wrap per frame; the whole
+    /// flush ships as one contiguous part (see `flush`).
+    ///
+    /// Body bytes are read via `StreamOut`'s non-mutating `cur`/`cur_off`
+    /// cursor (the long-proven `take_body` walk) — the body's own IOBufs
+    /// are never mutated, so the chain stays frame-correct.
+    fn frame_next_into(&mut self, out: &mut Vec<u8>) -> bool {
         let conn_win = self.conn_send_window;
         let peer_max = self.peer_max_frame_size as i64;
         let mut idx = 0;
@@ -348,14 +391,13 @@ impl H2Conn {
             let item = &mut self.out_queue[idx];
             if !item.headers_sent {
                 let end_stream = item.body_remaining == 0;
-                let mut f = Vec::with_capacity(frame::FRAME_HEADER_LEN + item.header_block.len());
                 let fl = flags::END_HEADERS | if end_stream { flags::END_STREAM } else { 0 };
-                frame::push_frame(&mut f, ftype::HEADERS, fl, item.id, &item.header_block);
+                frame::push_frame(out, ftype::HEADERS, fl, item.id, &item.header_block);
                 item.headers_sent = true;
                 if end_stream {
                     self.out_queue.remove(idx);
                 }
-                return Some(f);
+                return true;
             }
             if item.body_remaining > 0 {
                 let allowed = conn_win
@@ -368,19 +410,14 @@ impl H2Conn {
                     // END_STREAM iff this frame drains the last body byte.
                     let finishes = item.body_remaining == n;
                     let fl = if finishes { flags::END_STREAM } else { 0 };
-                    // Frame the DATA header + payload into one Vec: write
-                    // the 9-byte header, then append the body bytes straight
-                    // in (via the same cursor `take_body` walks). Saves the
-                    // separate per-frame chunk `Vec` + its copy.
-                    let mut f = Vec::with_capacity(frame::FRAME_HEADER_LEN + n);
-                    frame::push_frame_header(&mut f, n as u32, ftype::DATA, fl, id);
-                    item.append_body_into(&mut f, n);
+                    frame::push_frame_header(out, n as u32, ftype::DATA, fl, id);
+                    item.append_body_into(out, n);
                     item.send_window -= n as i64;
                     self.conn_send_window -= n as i64;
                     if finishes {
                         self.out_queue.remove(idx);
                     }
-                    return Some(f);
+                    return true;
                 }
                 // Window-blocked: try the next stream.
                 idx += 1;
@@ -389,7 +426,7 @@ impl H2Conn {
             // Headers sent and no body left — shouldn't linger; drop it.
             self.out_queue.remove(idx);
         }
-        None
+        false
     }
 }
 
@@ -599,29 +636,41 @@ async fn send_bytes<S: HttpStream>(stream: &mut S, bytes: Vec<u8>) -> Result<(),
 }
 
 /// Flush pending control frames, then drain the response queue subject
-/// to flow control — coalesced into a *single* chained send.
+/// to flow control — framed into one reused buffer and shipped as a
+/// *single* contiguous send.
 ///
 /// Control frames go first (wire order), then every response frame the
-/// connection + per-stream windows allow, each pushed as one `IOBuf`
-/// onto one `IOBufChain`. `TlsStream::send` seals up to a TLS record's
-/// worth (16 KiB) *from the whole chain* per AEAD pass, so a small
-/// response's HEADERS + DATA ride one TLS record / one TCP send instead
-/// of two, and across multiplexed streams every sendable frame leaves
-/// in one send rather than one-send-per-frame (H2-11). Bodies larger
-/// than a record still split into successive records inside `send`,
-/// exactly as before.
+/// connection + per-stream windows allow, all appended into the reused
+/// `frame_buf`. The buffer is then copied once into a single `IOBuf` —
+/// one contiguous part keeps the chain in its zero-alloc `Single` state,
+/// and `TlsStream::send` seals it into as few TLS records / TCP sends as
+/// the 16 KiB record cap allows (one, for a small response). Bodies
+/// larger than a record still split into successive records inside
+/// `send`. Reusing `frame_buf` makes the steady-state framing path one
+/// allocation (the send `IOBuf`), down from a per-frame `Vec` + IOBuf
+/// wrap + the chain's `VecDeque`.
 async fn flush<S: HttpStream>(conn: &mut H2Conn, stream: &mut S) -> Result<(), ()> {
-    let mut chain = IOBufChain::new();
+    let __f0 = now_cycles();
+    let mut buf = core::mem::take(&mut conn.frame_buf);
+    buf.clear();
     if !conn.ctrl_out.is_empty() {
-        let bytes = core::mem::take(&mut conn.ctrl_out);
-        chain.push_back(IOBuf::from(bytes));
+        buf.extend_from_slice(&conn.ctrl_out);
+        conn.ctrl_out.clear();
     }
-    while let Some(frame_bytes) = conn.next_output_frame() {
-        chain.push_back(IOBuf::from(frame_bytes));
-    }
-    if chain.is_empty() {
+    while conn.frame_next_into(&mut buf) {}
+    crate::diag::COUNTERS
+        .frame_cycles
+        .add(now_cycles().wrapping_sub(__f0));
+    if buf.is_empty() {
+        conn.frame_buf = buf;
         return Ok(());
     }
+    // One contiguous part → the chain stays in its zero-alloc `Single`
+    // state (no `VecDeque`); the only framing allocation is this copy
+    // out of the reused `frame_buf` into the send IOBuf.
+    let mut chain = IOBufChain::new();
+    chain.push_back(IOBuf::from_slice_with_headroom(0, &buf, 0));
+    conn.frame_buf = buf;
     stream.send(&mut chain).await
 }
 
@@ -799,17 +848,22 @@ where
     H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b>) -> Response + 'static,
 {
     let mut req = Request::new();
+    let __d0 = now_cycles();
     let malformed = {
         let mut sink = RequestSink {
             req: &mut req,
             malformed: false,
         };
-        match conn.hpack.decode(
+        let r = conn.hpack.decode(
             block,
             &mut conn.name_scratch[..],
             &mut conn.value_scratch[..],
             &mut sink,
-        ) {
+        );
+        crate::diag::COUNTERS
+            .decode_cycles
+            .add(now_cycles().wrapping_sub(__d0));
+        match r {
             Ok(()) => sink.malformed,
             Err(HpackError::HeaderListTooLarge) => {
                 crate::h2_drop!(header_list_too_large, "sid={}", sid);

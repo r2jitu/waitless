@@ -47,6 +47,17 @@ pub struct Counters {
     pub flow_control_error: Counter,
     /// A GOAWAY frame was emitted (graceful or error shutdown).
     pub goaway_sent: Counter,
+    /// Cumulative cycles in HPACK decode (`hpack.decode` per request
+    /// header block). Profiling — divide by `requests_received`.
+    pub decode_cycles: Counter,
+    /// Cumulative cycles encoding response headers
+    /// (`encode_response_headers` per response). Divide by
+    /// `responses_sent`.
+    pub encode_cycles: Counter,
+    /// Cumulative cycles framing responses onto the wire (the
+    /// `next_output_frame` drain in `flush`, excluding the send await).
+    /// Divide by `responses_sent`.
+    pub frame_cycles: Counter,
 }
 
 impl Counters {
@@ -65,6 +76,9 @@ impl Counters {
             rapid_reset_abort: Counter::new(),
             flow_control_error: Counter::new(),
             goaway_sent: Counter::new(),
+            decode_cycles: Counter::new(),
+            encode_cycles: Counter::new(),
+            frame_cycles: Counter::new(),
         }
     }
 }
@@ -156,7 +170,7 @@ pub fn should_log_event() -> bool {
 }
 
 /// Counter `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 13] {
+pub fn snapshot() -> [(&'static str, u64); 16] {
     let c = &COUNTERS;
     [
         ("connections_served", c.connections_served.get()),
@@ -172,6 +186,9 @@ pub fn snapshot() -> [(&'static str, u64); 13] {
         ("rapid_reset_abort", c.rapid_reset_abort.get()),
         ("flow_control_error", c.flow_control_error.get()),
         ("goaway_sent", c.goaway_sent.get()),
+        ("decode_cycles", c.decode_cycles.get()),
+        ("encode_cycles", c.encode_cycles.get()),
+        ("frame_cycles", c.frame_cycles.get()),
     ]
 }
 
