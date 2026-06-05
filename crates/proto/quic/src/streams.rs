@@ -447,6 +447,17 @@ impl SendStream {
         self.write_iobuf(iobuf::IOBuf::from(data));
     }
 
+    /// Bytes queued but not yet emitted onto the wire — the sum of the
+    /// `outbound` chunk lengths minus the head bytes already sent. The
+    /// h3 streaming sink reads this to backpressure `res.write`: once it
+    /// exceeds a cap, the handler parks until the connection drains the
+    /// chain (peer ACK / window grant), bounding the send buffer to
+    /// `O(cap)` rather than `O(response)`.
+    pub fn buffered_len(&self) -> usize {
+        let total: usize = self.outbound.iter().map(|c| c.data().len()).sum();
+        total.saturating_sub(self.head_consumed)
+    }
+
     pub fn close(&mut self) {
         match self.state {
             SendState::Open => self.state = SendState::Closing,

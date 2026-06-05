@@ -670,6 +670,20 @@ class WebserverServiceTest(unittest.TestCase):
                 f"stderr={proc.stderr[:200]!r})",
             )
 
+    def test_h3_echo_streams_back(self) -> None:
+        """POST a body to `/echo` over HTTP/3 and assert it streams back
+        byte-identical. Exercises the h3 streaming response sink
+        (`H3Sink`): the handler's `read_chunk` -> `write` loop frames
+        HEADERS + DATA onto the QUIC stream incrementally with send-buffer
+        backpressure. Modest size — the >RAM bounded-memory proof runs on
+        GCE; aioquic over HVF keeps this a correctness check."""
+        payload = bytes((i * 31 + 7) & 0xFF for i in range(32 * 1024))
+        status, body = h3_post("/echo", payload, port=TLS_PORT, timeout=20.0)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body, payload, f"h3 /echo not byte-identical (got {len(body)} B)"
+        )
+
     # ── UDP ──────────────────────────────────────────────────────
     def test_udp_echo(self) -> None:
         self.assertEqual(udp_echo(port=UDP_PORT), b"hello")

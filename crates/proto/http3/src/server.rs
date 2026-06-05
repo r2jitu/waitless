@@ -25,7 +25,7 @@ use core::pin::Pin;
 
 use quic::{QuicConn, QuicListenError, quic_listen};
 
-use http::{BodyReader, BodySource, IOBuf, Method, Request, RequestHead, Response};
+use http::{BodyReader, BodySource, IOBuf, Method, Request, RequestHead, Response, ResponseSink};
 
 use crate::frame::{self, ftype as h3_ftype};
 use crate::qpack::{self, FieldSink};
@@ -540,16 +540,24 @@ where
     // HEADERS), so the handler sees the same `BodyReader` streaming
     // interface as HTTP/1.1 and large uploads aren't buffered whole.
     let mut src = H3BodySource::new(conn, sid, buf.clone(), eof);
-    let mut response = Response::new();
+    let mut sink = H3Sink { conn, sid };
+    let mut response = Response::with_sink(&mut sink);
+    let streamed;
     {
         let body = BodyReader::new_streaming(Some(&mut src), &[], content_length);
         let mut request = Request::new(&req, body);
-        // The handler reads the request body (`req.read_chunk`) and writes
-        // the response (`res.write`) itself. On h3 there is no live sink,
-        // so `res.write` buffers into the response body (materialise —
-        // correct, `O(body)`; native h3 bounded streaming is a later
-        // phase). h1 streams the same loop bounded.
+        // A handler that streams (`res.write`) frames HEADERS + DATA
+        // straight onto the QUIC stream via `H3Sink`, bounded `O(cap)` by
+        // `stream_drain_below`; one that buffers (`res.set`) leaves the
+        // sink unused and is framed in one shot by `write_response` below.
         let _ = handler(&mut request, &mut response).await;
+        streamed = response.is_streamed();
+        if streamed {
+            // Head + body already on the stream — FIN it. (A mid-stream
+            // handler error has no clean h3 recovery — RESET_STREAM isn't
+            // surfaced — so we still FIN; rare path.)
+            let _ = response.finish().await;
+        }
     }
     // The handler returned; abandon any unread request body WITHOUT
     // awaiting it. The old `body.discard().await` parked forever on a
@@ -562,8 +570,10 @@ where
     conn.discard_recv(sid);
     crate::diag::COUNTERS.user_handler_returned.bump();
     let status = response.status;
-    // Encode response: HEADERS + DATA + FIN.
-    write_response(conn, sid, response, &scratch.framing_pool);
+    if !streamed {
+        // Buffered response: encode HEADERS + DATA + FIN in one shot.
+        write_response(conn, sid, response, &scratch.framing_pool);
+    }
     crate::diag::COUNTERS.write_response_completed.bump();
     crate::h3_event!(requests_handled, "sid={} status={}", sid, status);
     crate::diag::COUNTERS.responses_sent.bump();
@@ -827,6 +837,99 @@ fn write_response(
 /// headroom/tailroom for layers below to prepend / append.
 fn queue_chunk(conn: &QuicConn, sid: u64, b: http::IOBuf) {
     conn.send_iobuf(sid, b);
+}
+
+/// Per-stream send-buffer cap for a *streaming* h3 response. Once a
+/// `res.write` leaves more than this many bytes window-blocked on the
+/// QUIC stream, the handler parks (`stream_drain_below`) until the conn
+/// task flushes more onto the wire — peak send memory `O(cap)`, not
+/// `O(response)`. Mirrors the h2 `STREAM_SEND_BUF_CAP`.
+const H3_SEND_BUF_CAP: usize = 256 * 1024;
+
+/// h3 [`ResponseSink`]: frames a handler's `res.write` chunks as H3
+/// HEADERS + DATA frames straight onto the QUIC stream, backpressuring
+/// on the stream send buffer. The QUIC conn task drains the stream
+/// (peer ACK / `MAX_STREAM_DATA`) independently of this inline handler,
+/// so `stream_drain_below` makes progress without a per-request spawn.
+struct H3Sink<'c> {
+    conn: &'c QuicConn,
+    sid: u64,
+}
+
+impl ResponseSink for H3Sink<'_> {
+    fn send_head(
+        &mut self,
+        status: i32,
+        content_type: &[u8],
+        extra_headers: &[(&[u8], &[u8])],
+    ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
+        // Streaming head: no content-length (END_STREAM/FIN delimits the
+        // body), framed as an H3 HEADERS frame and shipped immediately.
+        let frame = build_h3_headers_frame(status, content_type, extra_headers);
+        Box::pin(async move {
+            match frame {
+                Some(f) => {
+                    self.conn.send_iobuf(self.sid, f);
+                    Ok(())
+                }
+                None => Err(()), // QPACK overflow
+            }
+        })
+    }
+
+    fn write_chunk(&mut self, buf: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
+        let frame = build_h3_data_frame(buf);
+        Box::pin(async move {
+            // `send_iobuf` appends + flushes what the stream window allows
+            // straight to the socket; only window-blocked bytes linger.
+            self.conn.send_iobuf(self.sid, frame);
+            if self.conn.stream_buffered(self.sid) > H3_SEND_BUF_CAP {
+                self.conn.stream_drain_below(self.sid, H3_SEND_BUF_CAP).await;
+            }
+            Ok(())
+        })
+    }
+
+    fn finish(&mut self) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
+        Box::pin(async move {
+            self.conn.close_stream(self.sid); // FIN on the last queued chunk
+            Ok(())
+        })
+    }
+}
+
+/// Build a streaming H3 HEADERS frame (QPACK field section, **no
+/// content-length**) as an owned IOBuf. `None` on QPACK overflow.
+fn build_h3_headers_frame(
+    status: i32,
+    content_type: &[u8],
+    extra: &[(&[u8], &[u8])],
+) -> Option<IOBuf> {
+    let status_str = status_to_bytes(status);
+    let mut list: Vec<(&[u8], &[u8])> = Vec::with_capacity(2 + extra.len());
+    list.push((&b":status"[..], status_str.as_slice()));
+    list.push((&b"content-type"[..], content_type));
+    list.extend_from_slice(extra);
+    let mut qpack = alloc::vec![0u8; QPACK_BODY_RESERVE];
+    let qlen = qpack::encode_field_section_into(&list, &mut qpack).ok()?;
+    let mut hdr = [0u8; H3_FRAME_HEADER_MAX];
+    let hlen = frame::write_frame_header(h3_ftype::HEADERS, qlen, &mut hdr).ok()?;
+    let mut out = Vec::with_capacity(hlen + qlen);
+    out.extend_from_slice(&hdr[..hlen]);
+    out.extend_from_slice(&qpack[..qlen]);
+    Some(IOBuf::from(out))
+}
+
+/// Build an H3 DATA frame (`type 0x00` + length varint + payload) as an
+/// owned IOBuf for one streamed body chunk.
+fn build_h3_data_frame(buf: &[u8]) -> IOBuf {
+    let mut hdr = [0u8; H3_FRAME_HEADER_MAX];
+    let hlen =
+        frame::write_frame_header(h3_ftype::DATA, buf.len(), &mut hdr).expect("data hdr fits");
+    let mut out = Vec::with_capacity(hlen + buf.len());
+    out.extend_from_slice(&hdr[..hlen]);
+    out.extend_from_slice(buf);
+    IOBuf::from(out)
 }
 
 fn status_to_bytes(status: i32) -> [u8; 3] {

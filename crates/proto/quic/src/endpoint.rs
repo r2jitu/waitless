@@ -299,6 +299,38 @@ impl QuicConn {
         self.drain_outbound();
     }
 
+    /// Bytes queued on `sid`'s send side but not yet on the wire.
+    pub fn stream_buffered(&self, sid: u64) -> usize {
+        self.conn.borrow().stream_send_buffered(sid)
+    }
+
+    /// Park until `sid`'s unsent send buffer drains to `cap` or below —
+    /// the peer ACKed / granted stream window and the conn task flushed
+    /// more onto the wire — or the connection fails. The h3 streaming
+    /// sink calls this after a `send_iobuf` that left more than `cap`
+    /// bytes window-blocked, bounding the per-stream send buffer to
+    /// `O(cap)` instead of `O(response)`. Mirrors `accept_stream`'s
+    /// reset → re-check → await loop on the shared `progress` event
+    /// (which the conn task signals on every ingested datagram).
+    pub async fn stream_drain_below(&self, sid: u64, cap: usize) {
+        loop {
+            {
+                let c = self.conn.borrow();
+                if c.stream_send_buffered(sid) <= cap || matches!(c.state(), ConnState::Failed) {
+                    return;
+                }
+            }
+            self.progress.reset();
+            {
+                let c = self.conn.borrow();
+                if c.stream_send_buffered(sid) <= cap || matches!(c.state(), ConnState::Failed) {
+                    return;
+                }
+            }
+            self.progress.wait().await;
+        }
+    }
+
     fn drain_outbound(&self) {
         loop {
             let pkt = {

@@ -1232,6 +1232,14 @@ impl Connection {
     pub fn stream_close(&mut self, sid: u64) {
         self.ensure_send_stream(sid).close();
     }
+
+    /// Bytes queued on `sid`'s send side but not yet emitted onto the
+    /// wire (0 if the send stream doesn't exist). The h3 streaming sink
+    /// reads this to backpressure `res.write`. Non-creating — a query
+    /// never materialises a send stream.
+    pub fn stream_send_buffered(&self, sid: u64) -> usize {
+        self.send_streams.get(&sid).map_or(0, |s| s.buffered_len())
+    }
 }
 
 /// Append a MAX_STREAMS frame to `out` directly. Wraps the
