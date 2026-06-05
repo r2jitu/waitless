@@ -362,15 +362,17 @@ pub fn encode_header_list(headers: &[(&[u8], &[u8])], out: &mut Vec<u8>) {
 }
 
 fn encode_one(name: &[u8], value: &[u8], out: &mut Vec<u8>) {
-    if let Some(idx) = static_table::find_exact(name, value) {
-        // §6.1 Indexed Header Field: 1xxxxxxx.
-        write_int(out, idx as u64, 7, 0x80);
-        return;
-    }
-    // §6.2.2 Literal without Indexing: top nibble 0000, 4-bit name index.
-    match static_table::find_name(name) {
-        Some(name_idx) => write_int(out, name_idx as u64, 4, 0x00),
-        None => {
+    // One static-table scan resolves both cases (exact → indexed,
+    // name-only → literal-with-name); see `static_table::find`.
+    match static_table::find(name, value) {
+        static_table::Match::Exact(idx) => {
+            // §6.1 Indexed Header Field: 1xxxxxxx.
+            write_int(out, idx as u64, 7, 0x80);
+            return;
+        }
+        // §6.2.2 Literal without Indexing: top nibble 0000, 4-bit name index.
+        static_table::Match::Name(name_idx) => write_int(out, name_idx as u64, 4, 0x00),
+        static_table::Match::Miss => {
             write_int(out, 0, 4, 0x00);
             write_string(out, name);
         }

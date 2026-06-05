@@ -56,6 +56,43 @@ pub fn find_name(name: &[u8]) -> Option<usize> {
     None
 }
 
+/// Outcome of a single-pass encoder lookup.
+pub enum Match {
+    /// Exact `(name, value)` hit — emit an indexed header field.
+    Exact(usize),
+    /// Name-only hit (value differs) — emit a literal with the name's
+    /// index, then the value as a string.
+    Name(usize),
+    /// No name in the table — emit a literal with a fresh name string.
+    Miss,
+}
+
+/// One-pass encoder lookup: the exact-then-name fallback that
+/// `encode_one` needs, in a single scan. An exact `(name, value)` hit
+/// short-circuits; otherwise the *first* name-only match is remembered
+/// and returned. Equivalent to `find_exact(name, value)` falling back
+/// to `find_name(name)`, but scans the 61 entries once rather than
+/// twice — the value-specific response headers (`content-length`,
+/// `content-type`, `date`) never hit an exact match, so they used to
+/// pay for two full scans every response.
+pub fn find(name: &[u8], value: &[u8]) -> Match {
+    let mut name_idx = None;
+    for (i, e) in TABLE.iter().enumerate() {
+        if e.name == name {
+            if e.value == value {
+                return Match::Exact(i + 1);
+            }
+            if name_idx.is_none() {
+                name_idx = Some(i + 1);
+            }
+        }
+    }
+    match name_idx {
+        Some(idx) => Match::Name(idx),
+        None => Match::Miss,
+    }
+}
+
 // Convenience constants for entries the server commonly emits as an
 // indexed `:status`.
 pub const IDX_STATUS: usize = 8; // name of entries 8..=14
