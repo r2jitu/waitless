@@ -624,6 +624,53 @@ class WebserverServiceTest(unittest.TestCase):
                 failures.append(f"#{i}: {e!r}")
         self.assertFalse(failures, f"{len(failures)}/{n} failed: {failures[:5]}")
 
+    def test_https_echo_roundtrip(self) -> None:
+        """POST a body to `/echo` over HTTP/1.1 and HTTP/2 (TLS) and
+        assert it comes back byte-identical.
+
+        `/echo` is the streaming-echo endpoint: the handler just calls
+        `res.echo_request(ct)` and the transport splices the request body
+        straight back as the response body — h1 streams it chunk-by-chunk
+        with bounded `O(chunk)` memory (the serve-loop splice), h2
+        materialises it. This guards the wire round-trip for the
+        `echo_request` API across both transports; the bounded-memory
+        proof at >RAM body sizes runs on GCE (HVF's userspace TCP proxy
+        is unreliable for large transfers, so we keep this modest)."""
+        if not DEV_CERT.is_file():
+            self.skipTest("dev_cert.pem missing from runfiles")
+        # 32 KiB of non-trivial bytes — spans several chunks/records so a
+        # mid-stream corruption (off-by-one record header, half-flushed
+        # splice) shows up as a mismatch, not just a length error.
+        payload = bytes((i * 31 + 7) & 0xFF for i in range(32 * 1024))
+        try:
+            ver = subprocess.run(
+                ["curl", "-V"], capture_output=True, timeout=10
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest("curl not available")
+        has_h2 = b"HTTP2" in ver or b"http2" in ver
+        for mode, flag in (("h1", "--http1.1"), ("h2", "--http2")):
+            if mode == "h2" and not has_h2:
+                continue  # local curl lacks h2; the h1 leg still ran
+            proc = subprocess.run(
+                [
+                    "curl", "-s", flag,
+                    "--cacert", str(DEV_CERT),
+                    "--resolve", f"waitless.local:{TLS_PORT}:127.0.0.1",
+                    "-X", "POST", "--data-binary", "@-",
+                    "-H", "Content-Type: application/octet-stream",
+                    "-H", "Expect:",  # no 100-continue; send body straight away
+                    f"https://waitless.local:{TLS_PORT}/echo",
+                ],
+                input=payload, capture_output=True, timeout=25,
+            )
+            self.assertEqual(
+                proc.stdout, payload,
+                f"{mode}: /echo not byte-identical "
+                f"(got {len(proc.stdout)} B, want {len(payload)} B; "
+                f"stderr={proc.stderr[:200]!r})",
+            )
+
     # ── UDP ──────────────────────────────────────────────────────
     def test_udp_echo(self) -> None:
         self.assertEqual(udp_echo(port=UDP_PORT), b"hello")
