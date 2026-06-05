@@ -256,6 +256,21 @@ async fn gateway(mut stream: TcpStream, backend_ip: [u8; 4]) {
 // ---- Request dispatch -------------------------------------------------------
 
 async fn handle_request(req: &mut Request<'_>, res: &mut Response) -> Result<(), ()> {
+    // Streaming generated body: hands the response a producer the
+    // transport drives chunk-by-chunk with backpressure, so peak memory
+    // stays O(chunk) on h1 (the connection-close-delimited streaming
+    // path) — a 1 GiB body streams fine on a 512 MiB VM, which buffering
+    // could not. (On h2/h3 today this materialises — see
+    // docs/streaming-response.md; don't fetch the huge size there yet.)
+    if req.path() == b"/stream" {
+        res.stream_body(
+            b"application/octet-stream",
+            alloc::boxed::Box::new(ZeroStream {
+                remaining: 1024 * 1024 * 1024,
+            }),
+        );
+        return Ok(());
+    }
     // Body-consuming routes run first: they need `&mut req` for
     // `read_chunk`, so they can't sit inside a `match req.path()` whose
     // scrutinee holds an immutable borrow of `req` across the arms.
@@ -323,6 +338,32 @@ async fn handle_request(req: &mut Request<'_>, res: &mut Response) -> Result<(),
         _ => Response::not_found(),
     };
     Ok(())
+}
+
+/// Streaming-body producer that yields `remaining` bytes of zeros in
+/// fixed 64 KiB chunks — a generated large body for the `/stream`
+/// endpoint. Each `next()` allocates one chunk; the transport sends it
+/// (backpressure) and drops it before the next pull, so peak memory is
+/// one chunk regardless of the total. Demonstrates the streaming
+/// response path (docs/streaming-response.md).
+struct ZeroStream {
+    remaining: usize,
+}
+
+impl http::ResponseBodyProducer for ZeroStream {
+    fn next(
+        &mut self,
+    ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Option<http::IOBuf>> + '_>>
+    {
+        alloc::boxed::Box::pin(async move {
+            if self.remaining == 0 {
+                return None;
+            }
+            let n = self.remaining.min(64 * 1024);
+            self.remaining -= n;
+            Some(http::IOBuf::from(alloc::vec![0u8; n]))
+        })
+    }
 }
 
 fn log_boot_info() {

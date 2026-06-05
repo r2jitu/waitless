@@ -271,6 +271,43 @@ where
             }
         }
 
+        // Streaming response (handler installed a body producer): write
+        // a close-delimited head, then drive the producer chunk-by-chunk
+        // onto the wire. `send` applies backpressure (TCP cwnd/rwnd), so
+        // the producer is pulled only as fast as the wire drains — peak
+        // memory stays O(chunk), not O(response size). Connection-close-
+        // delimited (no Content-Length), so the conn ends after.
+        if res.has_stream() {
+            let mut head = unsafe {
+                IOBuf::borrow(
+                    core::ptr::NonNull::new_unchecked(header_storage.as_mut_ptr()),
+                    HEADER_BUF_SIZE as u32,
+                    0,
+                    0,
+                )
+            };
+            crate::response::write_streaming_head_into_iobuf(&mut head, &res);
+            out_chain.clear();
+            out_chain.push_back(head);
+            if stream.send(&mut out_chain).await.is_err() {
+                crate::diag::COUNTERS.send_failed.bump();
+                return;
+            }
+            let mut producer = res.take_stream().expect("has_stream");
+            while let Some(chunk) = producer.next().await {
+                out_chain.clear();
+                out_chain.push_back(chunk);
+                if stream.send(&mut out_chain).await.is_err() {
+                    crate::diag::COUNTERS.send_failed.bump();
+                    return;
+                }
+            }
+            out_chain.clear();
+            crate::diag::COUNTERS.responses_sent.bump();
+            let _ = stream.close().await;
+            return;
+        }
+
         // SAFETY contract for the borrowed header IOBuf:
         //   * `header_storage` outlives every IOBuf wrapping it
         //     (future-state field; future is pinned; we drop the

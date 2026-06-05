@@ -546,6 +546,9 @@ where
         let mut request = Request::new(&req, body);
         let _ = handler(&mut request, &mut response).await;
     }
+    // h3 buffers; drain any streaming producer into the body (correct,
+    // not yet bounded — h3 streaming sink is a later phase).
+    response.materialize().await;
     // The handler returned; abandon any unread request body WITHOUT
     // awaiting it. The old `body.discard().await` parked forever on a
     // peer that declared a Content-Length then stalled (no FIN) — and

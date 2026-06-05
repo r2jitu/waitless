@@ -60,6 +60,12 @@ pub struct Response {
     /// body). Phase 0 ignores it (both paths buffer); later phases use
     /// it to route writes to the live `ResponseSink`.
     streaming: bool,
+    /// A lazily-pulled streaming body (`stream_body`). When set, the
+    /// transport drives the producer chunk-by-chunk onto the wire with
+    /// backpressure instead of sending a materialised `body` — so peak
+    /// memory stays `O(chunk)`. Mutually exclusive with a buffered
+    /// `body` in practice (a handler picks one).
+    producer: Option<alloc::boxed::Box<dyn crate::stream::ResponseBodyProducer>>,
 }
 
 // Note: no `unsafe impl Send/Sync` needed — `IOBuf` is Send + Sync
@@ -83,6 +89,7 @@ impl Response {
             body: IOBufChain::new(),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
             streaming: false,
+            producer: None,
         }
     }
 
@@ -97,6 +104,7 @@ impl Response {
             body: body.into(),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
             streaming: false,
+            producer: None,
         }
     }
 
@@ -108,6 +116,7 @@ impl Response {
             body: IOBuf::from_static(b"Not Found").into(),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
             streaming: false,
+            producer: None,
         }
     }
 
@@ -123,6 +132,7 @@ impl Response {
             body: IOBuf::from_static(b"Bad Request").into(),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
             streaming: false,
+            producer: None,
         }
     }
 
@@ -136,6 +146,7 @@ impl Response {
             body: IOBuf::from_static(b"").into(),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
             streaming: false,
+            producer: None,
         }
         .with_header(b"Location", location)
     }
@@ -172,6 +183,51 @@ impl Response {
             }
         }
         self
+    }
+
+    /// Hand the response a **lazily-pulled streaming body** — the
+    /// transport drives `producer.next()` chunk-by-chunk onto the wire
+    /// with backpressure, so peak memory stays `O(chunk)` rather than
+    /// `O(response size)`. Sets the content-type + producer; set
+    /// `status`/`header` first if non-default. For generated / computed
+    /// large bodies; see [`ResponseBodyProducer`](crate::ResponseBodyProducer).
+    pub fn stream_body(
+        &mut self,
+        content_type: impl Into<Bytes>,
+        producer: alloc::boxed::Box<dyn crate::stream::ResponseBodyProducer>,
+    ) -> &mut Self {
+        self.content_type = content_type.into();
+        self.producer = Some(producer);
+        self.streaming = true;
+        self
+    }
+
+    /// `true` if the handler installed a streaming-body producer.
+    pub fn has_stream(&self) -> bool {
+        self.producer.is_some()
+    }
+
+    /// Take the streaming-body producer for the transport to drive
+    /// (leaving `None`). The transport pulls `next()` + writes each
+    /// chunk with backpressure.
+    pub fn take_stream(
+        &mut self,
+    ) -> Option<alloc::boxed::Box<dyn crate::stream::ResponseBodyProducer>> {
+        self.producer.take()
+    }
+
+    /// Drain any streaming-body producer into the buffered `body`,
+    /// turning a streaming response into a materialised one. The
+    /// fallback for transports that don't (yet) stream on the wire
+    /// (h2/h3 today): correct output, but `O(response size)` memory —
+    /// the bounded-memory win is h1-only until the per-transport
+    /// streaming sinks land. No-op when there's no producer.
+    pub async fn materialize(&mut self) {
+        if let Some(mut producer) = self.producer.take() {
+            while let Some(chunk) = producer.next().await {
+                self.body.push_back(chunk);
+            }
+        }
     }
 
     /// Stream one body chunk. **Phase 0**: appends to the buffered body
@@ -283,6 +339,39 @@ pub(crate) fn write_response_into_iobuf(buf: &mut IOBuf, resp: &Response, keep_a
     push!(b"\r\nConnection: ");
     push!(if keep_alive { b"keep-alive" } else { b"close" });
     push!(b"\r\n");
+    for (name, value) in resp.extra_headers() {
+        push!(name);
+        push!(b": ");
+        push!(value);
+        push!(b"\r\n");
+    }
+    push!(b"\r\n");
+}
+
+/// Serialise the head for an HTTP/1.1 **streaming** response — no
+/// `Content-Length` (the producer-driven length is unknown up front),
+/// so the body is delimited by connection close and `Connection: close`
+/// is forced. The transport writes this head, then drives the producer
+/// chunk-by-chunk, then closes. (A future revision could switch to
+/// `Transfer-Encoding: chunked` to keep the connection alive across a
+/// streamed response.)
+pub(crate) fn write_streaming_head_into_iobuf(buf: &mut IOBuf, resp: &Response) {
+    macro_rules! push {
+        ($data:expr) => {{
+            let r = buf.append_slice($data);
+            debug_assert!(r.is_ok(), "response header overflow (raise HEADER_CAP)");
+            let _ = r;
+        }};
+    }
+    push!(b"HTTP/1.1 ");
+    let mut status_buf = [0u8; 4];
+    let status_len = write_status_code(&mut status_buf, resp.status);
+    push!(&status_buf[..status_len]);
+    push!(b" ");
+    push!(status_text(resp.status).as_bytes());
+    push!(b"\r\nContent-Type: ");
+    push!(resp.content_type_bytes());
+    push!(b"\r\nConnection: close\r\n");
     for (name, value) in resp.extra_headers() {
         push!(name);
         push!(b": ");

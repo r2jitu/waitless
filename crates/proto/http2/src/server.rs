@@ -1080,6 +1080,8 @@ where
             // unwanted request body.
             let _ = (*handler)(&mut request, &mut res).await;
         }
+        // h2 buffers; drain any streaming producer (correct, not bounded).
+        res.materialize().await;
         crate::diag::COUNTERS.requests_handled.bump();
         sink.borrow_mut().push_back((sid, res));
         demux_wake.set();
@@ -1254,6 +1256,9 @@ async fn dispatch_bodyless<S, H>(
         let mut request = Request::new(&req, body);
         let _ = (**handler)(&mut request, &mut res).await;
     }
+    // h2 buffers; drain any streaming producer into the body (correct,
+    // not yet bounded — h2 streaming sink is a later phase).
+    res.materialize().await;
     crate::diag::COUNTERS.requests_handled.bump();
     conn.queue_response(sid, res);
 }

@@ -132,6 +132,32 @@ impl<T: HttpStream + ?Sized> BodySource for T {
     }
 }
 
+// ---- ResponseBodyProducer: a lazily-pulled streaming response body -----------
+
+/// A response body produced **lazily, chunk by chunk** — the TX
+/// counterpart of [`BodySource`]. A handler hands one to the response
+/// (`res.stream_body(ct, producer)`) instead of a materialised body;
+/// the transport then drives `next()` and writes each chunk to the
+/// wire, so the per-connection peak memory stays `O(chunk)` rather than
+/// `O(response size)`. Backpressure: the transport awaits its own send
+/// (TCP cwnd / TLS / h2 window) between pulls, so the producer is pulled
+/// only as fast as the wire drains.
+///
+/// `'static` (owned, no borrows) because the producer outlives the
+/// handler — the transport drives it after the handler returns. That is
+/// why this expresses **generated / computed** bodies (and
+/// read-everything-then-stream); a true interleaved *echo* (read the
+/// request while writing the response) instead needs the in-handler
+/// `write` path + a per-transport read/write split — see
+/// `docs/streaming-response.md`.
+///
+/// `next` returns a boxed future for object-safety, exactly like
+/// `BodySource::next_chunk`; it lands only on the cold streaming path.
+pub trait ResponseBodyProducer {
+    /// Next body chunk as an owned `IOBuf`, or `None` at end-of-body.
+    fn next(&mut self) -> Pin<Box<dyn Future<Output = Option<IOBuf>> + '_>>;
+}
+
 impl HttpStream for waitless::runtime::TcpStream {
     /// Forwards to the inherent `waitless::runtime::TcpStream::recv_chunk`.
     ///
