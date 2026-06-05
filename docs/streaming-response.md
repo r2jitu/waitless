@@ -102,19 +102,25 @@ res.finish().await
 
 ### Transport seam (unchanged in spirit)
 
-`Response` holds `&mut dyn ResponseSink` (the TX mirror of
-`BodySource`); the head + buffered-body path and the streaming
-`write_chunk` path both go through it. Per-transport sinks below.
+`Response<'s>` holds `Option<&'s mut dyn ResponseSink>` (the TX mirror
+of `BodySource`); `res.write` routes straight to it when wired, and the
+head goes out lazily on the first chunk. Per-transport sinks below.
 
 ```rust
 pub trait ResponseSink {
-    fn send_head(&mut self, head: &ResponseHead<'_>)
+    fn send_head(&mut self, status: i32, content_type: &[u8],
+                 extra_headers: &[(&[u8], &[u8])])
         -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>>;
     fn write_chunk(&mut self, buf: &[u8])
         -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>>;
     fn finish(&mut self) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>>;
 }
 ```
+
+The head is passed as loose parts (status / content-type / extra
+headers) rather than a `ResponseHead` struct — `Response`'s fields are
+disjoint borrows, so the sink can read them while `self.sink` is
+borrowed `&mut`, with no intermediate value.
 
 ### Migration cost
 
@@ -166,19 +172,17 @@ per-stream flow control, `demux_wake`) already exists.
   > stream is the single writer). A *generated* streaming body (no
   > concurrent request read) avoids the split but does not satisfy the
   > echo use case.
-- **Phase 1 — h1 streaming (generated/producer path). ✅ DONE (commit
-  `cb9ad8f`).** `ResponseBodyProducer` (TX counterpart of `BodySource`)
-  + `res.stream_body(ct, producer)`; the transport drives `next()`
+- **Phase 1 — h1 streaming (generated path). ✅ DONE (commit `cb9ad8f`);
+  mechanism later reshaped in Phase 1c.** First cut used a *pull*-model
+  `ResponseBodyProducer` (TX counterpart of `BodySource`) +
+  `res.stream_body(ct, producer)`; the transport drove `next()`
   chunk-by-chunk, awaiting its own `send` between pulls (TCP
-  backpressure) → peak memory `O(chunk)`. h1 streams close-delimited
-  (`write_streaming_head_into_iobuf`: no Content-Length, `Connection:
-  close`); h2/h3 fall back to `Response::materialize()` (drain producer
-  → buffered body; correct, not bounded). `/stream` endpoint serves a
-  1 GiB generated body. **Validated on HVF (512 MiB RAM): GET /stream
-  over h1 returned exactly 1,073,741,824 bytes, all-zero, and the kernel
-  heap stayed flat at ~3.4 MB across the whole 1 GiB transfer** —
-  buffering would OOM. (This is the generated/computed path; the
-  interleaved *echo* below is the remaining variant.)
+  backpressure) → peak memory `O(chunk)`. h1 streamed close-delimited
+  (no Content-Length, `Connection: close`); h2/h3 fell back to
+  `Response::materialize()` (drain producer → buffered body; correct,
+  not bounded). `/stream` serves a 1 GiB generated body. (The producer
+  was replaced by the in-handler `res.write()` push model in Phase 1c;
+  see there for the current mechanism + GCE re-validation.)
 
 - **Phase 1b — streaming echo (write-as-you-read). ✅ DONE (commit
   `3771910`).** `res.echo_request(ct)` splices the request body straight
@@ -201,6 +205,37 @@ per-stream flow control, `demux_wake`) already exists.
   > read/write split (Response<'a>); deferred — the splice delivers the
   > bounded large-payload echo without it.
 
+- **Phase 1c — push-model reshape (remove `ResponseBodyProducer`). ✅
+  DONE (commits `38582f2` + `380cb08`).** Replaced the pull-model producer
+  with the in-handler push model the API section above describes:
+  `Response<'s>` owns `Option<&'s mut dyn ResponseSink>`, the handler
+  generates a streamed body with `res.write(chunk).await` (head flushed
+  lazily on the first chunk, each chunk awaited → backpressure) and ends
+  it with `res.finish()`. h1 wires a live `H1Sink` for a **bodyless**
+  request (read half idle → the sink can hold the stream; generic over
+  `S`, so it streams over plaintext *and* TLS); a request with a body
+  buffers (read half busy) and bounded echo stays the Phase 1b splice.
+  `res.set(Response::ok(..))` installs a buffered response without
+  disturbing the invariant `&'s mut` sink borrow. The four near-identical
+  head writers collapsed to two (`*_parts`) with the `&Response` writers
+  delegating. h2/h3 still buffer (their streaming sink is Phase 2–3); the
+  obsolete `materialize()` drains are gone (`res.write` buffers directly).
+  `/stream` is now an in-handler `res.write()` loop; the `ZeroStream`
+  producer is deleted.
+
+  > **Re-validated on GCE (c3-highcpu-4, gVNIC, production datapath —
+  > HVF lies about large transfers):**
+  > - `/health` TLS A/B (wrk -t4 -c4000 -d15s, 3 samples each):
+  >   branch median **283.5K rps** (279.4/285.7/283.5) vs main median
+  >   **287.9K rps** (285.6/287.9/288.1) — ~1.5%, ranges overlap,
+  >   **identical per-request work (~1 send/req)** → the universal
+  >   bodyless fork is perf-neutral on the golden hot path.
+  > - `/stream` 1 GiB over h1: exactly 1,073,741,824 bytes, all-zero,
+  >   live heap grew **~1.3 MB** across the whole transfer, `heap_oom=0`.
+  > - `/echo` 256 MiB over h1: exactly 268,435,456 bytes, **sha256
+  >   byte-perfect**, live heap grew **~41 KB** across the echo,
+  >   `heap_oom=0`, server live after. Bounded `O(chunk)` confirmed.
+
 - **Phases 2–3 — native h2/h3 bounded streaming (optimisation).** h2/h3
   currently *materialise* a streamed/echoed body (correct output,
   `O(body)` memory). Bounding them needs the per-transport streaming
@@ -215,10 +250,19 @@ per-stream flow control, `demux_wake`) already exists.
 
 ## Validation
 
-For each streaming transport: a large payload (e.g. 100 MB) echoes
-**byte-perfect** (GCE, `curl`/loadgen — HVF's toy proxy lies about
-large-transfer correctness) **and** the server's peak heap watermark
-stays bounded (`O(chunk)`, not `O(payload)`) — read off `/obs`
-`heap_*` — A/B against the materialised path.
+The bounded-memory + large-transfer-correctness proof must run on GCE —
+HVF's userspace TCP proxy lies about both. The standing recipe (used for
+Phase 1c above, scriptable as `/tmp/bounded_validate.sh` driven from
+`kvm-vm`): for the h1 path, stream/echo a payload far larger than any
+per-request budget while sampling `/obs` `heap_allocated_bytes`
+mid-transfer — a bounded path grows live heap by `O(chunk)` (kilobytes
+to a megabyte), a buffering path by `O(payload)`; verify exact byte
+count + `sha256` (echo) + `heap_oom=0` + the server still serving
+`/health` after. Pair any hot-path-touching change with a `/health` TLS
+A/B against `main` (wrk -c4000, ≥3 samples each, compare medians +
+`/obs` per-request work counters — ranges overlap under SPOT noise, so
+the work counters are the tie-breaker). h2/h3 bounded streaming
+(Phases 2–3) await their per-transport sink; until then they materialise
+(correct, `O(body)`), so don't point the >RAM `/stream` at them.
 
 [Contract 3]: stack-architecture.md (One handler API)
