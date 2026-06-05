@@ -225,6 +225,27 @@ impl<'s> Response<'s> {
         (self.status, self.content_type, self.body, self.extra_headers)
     }
 
+    /// Rebuild an owned, sink-less `Response<'static>` from the parts
+    /// [`into_parts`](Self::into_parts) yields — the inverse. A transport
+    /// whose handler ran with a live sink (so `res` is `Response<'a>`, not
+    /// `'static`) but *buffered* its body uses this to recover a `'static`
+    /// value it can hand to a deferred framing queue. `head_sent` resets
+    /// to `false` (the recovered value is buffered, not yet on the wire).
+    #[allow(clippy::type_complexity)]
+    pub fn from_parts(
+        parts: (i32, Bytes, IOBufChain, [Option<(Bytes, Bytes)>; MAX_EXTRA_HEADERS]),
+    ) -> Response<'static> {
+        let (status, content_type, body, extra_headers) = parts;
+        Response {
+            status,
+            content_type,
+            body,
+            extra_headers,
+            sink: None,
+            head_sent: false,
+        }
+    }
+
     /// Install an owned, fully-built response's data into this slot,
     /// leaving the live `sink` borrow intact. This is how a handler
     /// returns a *buffered* response through the `&mut Response` API:

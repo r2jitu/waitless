@@ -32,7 +32,10 @@ use core::cell::RefCell;
 use core::future::Future;
 use core::pin::Pin;
 
-use http::{BodyReader, BodySource, HttpStream, IOBuf, IOBufChain, Method, Request, RequestHead, Response};
+use http::{
+    BodyReader, BodySource, HttpStream, IOBuf, IOBufChain, Method, Request, RequestHead, Response,
+    ResponseSink,
+};
 use waitless::runtime::{AsyncEvent, Either, select, spawn};
 
 use crate::frame::{self, FrameHeader, error, flags, ftype, settings_id};
@@ -71,6 +74,14 @@ const INITIAL_WINDOW: i64 = 65_535;
 /// advertised; this is the defensive ceiling for a peer that ignores
 /// flow control — past it we reset the stream.
 const STREAM_RECV_BUF_CAP: usize = 1024 * 1024;
+
+/// Backpressure cap on a *streaming* response's not-yet-framed send
+/// buffer (the TX mirror of `STREAM_RECV_BUF_CAP`). A streaming handler
+/// pushes body chunks into the per-stream `StreamTx`; once this many
+/// bytes sit unframed, `res.write().await` parks until the demux drains
+/// them onto the wire (bounded by the peer's send window). Peak
+/// per-stream TX memory is therefore `O(cap)`, not `O(response)`.
+const STREAM_SEND_BUF_CAP: usize = 256 * 1024;
 
 /// Cap on the bytes of one header block (HEADERS + CONTINUATIONs)
 /// before END_HEADERS — the H2-5 CONTINUATION-flood guard.
@@ -214,6 +225,11 @@ fn reset_all_streams(conn: &mut H2Conn) {
     for slot in &conn.streams {
         slot.body.data.borrow_mut().reset = true;
         slot.body.event.set();
+        // Also tear down the TX channel so a handler parked on the
+        // send-buffer cap (`res.write`) unparks and its `res.write` /
+        // `res.finish` returns `Err`, unwinding the task.
+        slot.tx.data.borrow_mut().reset = true;
+        slot.tx.event.set();
     }
     conn.streams.clear();
 }
@@ -449,6 +465,114 @@ impl H2Conn {
             self.out_queue.remove(idx);
         }
     }
+
+    /// Frame *streaming* responses (handlers that called `res.write`) onto
+    /// the wire: HEADERS once, then DATA chunks pulled from each stream's
+    /// `StreamTx` up to the connection + per-stream send window, with
+    /// END_STREAM once `finish` was called and the buffer is drained. The
+    /// TX mirror of how `process_data` pushes RX DATA into `StreamBody`;
+    /// signals each handler after draining so a `res.write` parked on the
+    /// send-buffer cap resumes. Buffered responses (no `head`) flow
+    /// through `resp_sink`/`out_queue`/`drain_to_chain` instead and are
+    /// skipped here. Retires fully-finished (or reset) streaming slots.
+    fn drain_streaming(&mut self, hdr_buf: &mut Vec<u8>) {
+        let peer_max = self.peer_max_frame_size as i64;
+        let mut finished: Vec<u32> = Vec::new();
+        let mut i = 0;
+        while i < self.streams.len() {
+            // Detach an Rc clone so the channel borrow doesn't tangle with
+            // the `&mut self.streams[i]` field mutations below.
+            let tx = Rc::clone(&self.streams[i].tx);
+            let mut d = tx.data.borrow_mut();
+            let id = self.streams[i].id;
+
+            if d.reset {
+                // Handler abandoned a streamed response. If HEADERS were
+                // already on the wire we must RST_STREAM; either way the
+                // streaming slot is done (a non-streaming/buffered slot
+                // has `head == None` and is left for `drain_responses`).
+                if self.streams[i].headers_sent {
+                    frame::push_rst_stream(hdr_buf, id, error::INTERNAL_ERROR);
+                    finished.push(id);
+                } else if d.head.is_some() {
+                    finished.push(id);
+                }
+                drop(d);
+                i += 1;
+                continue;
+            }
+            // Only streaming responses (head set) are framed here.
+            if d.head.is_none() {
+                drop(d);
+                i += 1;
+                continue;
+            }
+
+            // 1. HEADERS, once. END_STREAM here iff the whole (empty) body
+            //    is already known finished.
+            if !self.streams[i].headers_sent {
+                let end_stream = d.fin && d.chunks.is_empty();
+                let fl = flags::END_HEADERS | if end_stream { flags::END_STREAM } else { 0 };
+                frame::push_frame(hdr_buf, ftype::HEADERS, fl, id, d.head.as_ref().unwrap());
+                self.streams[i].headers_sent = true;
+                crate::diag::COUNTERS.responses_sent.bump();
+                if end_stream {
+                    finished.push(id);
+                    drop(d);
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // 2. DATA chunks up to the windows (inline copy + `consume`
+            //    for a window-cut front chunk — streaming is the cold
+            //    path, so no zero-copy split machinery).
+            let mut freed = false;
+            while !d.chunks.is_empty() {
+                // Peek the front chunk's length immutably so the mutable
+                // borrow for the copy/`consume` below doesn't span the
+                // `pop_front`.
+                let avail = d.chunks.front().unwrap().data().len() as i64;
+                let allowed = self
+                    .conn_send_window
+                    .min(self.streams[i].send_window)
+                    .min(peer_max)
+                    .min(avail);
+                if allowed <= 0 {
+                    break; // window-blocked — try again after WINDOW_UPDATE
+                }
+                let n = allowed as usize;
+                frame::push_frame_header(hdr_buf, n as u32, ftype::DATA, 0, id);
+                let front = d.chunks.front_mut().unwrap();
+                hdr_buf.extend_from_slice(&front.data()[..n]);
+                if n as i64 == avail {
+                    d.chunks.pop_front();
+                } else {
+                    let _ = front.consume(n);
+                }
+                d.buffered -= n;
+                self.streams[i].send_window -= n as i64;
+                self.conn_send_window -= n as i64;
+                freed = true;
+            }
+
+            // 3. END_STREAM once finished and fully drained — an empty
+            //    DATA(END_STREAM) closes the stream (valid per RFC 7540).
+            if d.fin && d.chunks.is_empty() {
+                frame::push_frame_header(hdr_buf, 0, ftype::DATA, flags::END_STREAM, id);
+                finished.push(id);
+            }
+            drop(d);
+            if freed {
+                // Unpark a `res.write` parked on the send-buffer cap.
+                tx.event.set();
+            }
+            i += 1;
+        }
+        if !finished.is_empty() {
+            self.streams.retain(|s| !finished.contains(&s.id));
+        }
+    }
 }
 
 /// DATA payloads from responses with a body at or below this size are
@@ -487,10 +611,20 @@ struct BodyChanData {
     buffered: usize,
 }
 
-/// Demux-side handle to a streaming request stream.
+/// Demux-side handle to an in-flight stream: the shared RX body channel,
+/// the shared TX response channel, and the demux-only TX framing state.
 struct StreamSlot {
     id: u32,
     body: Rc<StreamBody>,
+    /// Shared send channel — `Some(head)` in its data marks the response
+    /// as streaming (framed by `drain_streaming`); a buffered response
+    /// arrives separately on `resp_sink`.
+    tx: Rc<StreamTx>,
+    /// Per-stream send window for the streaming response (peer-granted;
+    /// grows via WINDOW_UPDATE). Mirrors `StreamOut::send_window`.
+    send_window: i64,
+    /// HEADERS frame emitted for the streaming response.
+    headers_sent: bool,
 }
 
 /// [`BodySource`] over a streaming request stream, owned by the spawned
@@ -526,6 +660,110 @@ impl BodySource for H2BodySource {
                 }
                 self.body.event.wait().await;
             }
+        })
+    }
+}
+
+/// Shared **send**-body channel for one *streaming* response stream — the
+/// TX mirror of [`StreamBody`]. The spawned handler task pushes the head
+/// then DATA chunks via an [`H2Sink`]; the demux drains them into frames
+/// under flow control (`drain_streaming`). `event` lives outside the
+/// `RefCell` so the handler can `await` it (park when the buffer is full)
+/// without holding a borrow across the suspend point.
+struct StreamTx {
+    data: RefCell<TxChanData>,
+    event: AsyncEvent,
+}
+
+struct TxChanData {
+    /// HPACK-encoded response header block, set once by `send_head`
+    /// (lazily, on the first `write`/`finish`). `Some` marks the stream
+    /// as streaming — the demux frames it via `drain_streaming` rather
+    /// than waiting for a buffered response on `resp_sink`.
+    head: Option<Vec<u8>>,
+    /// Queued body chunks awaiting framing, oldest first.
+    chunks: VecDeque<IOBuf>,
+    /// Bytes currently buffered (sum of `chunks` lengths) — the
+    /// `STREAM_SEND_BUF_CAP` park check reads this without walking.
+    buffered: usize,
+    /// `finish()` called — no more chunks; emit END_STREAM once drained.
+    fin: bool,
+    /// Stream/connection reset — the handler stops, the demux drops it.
+    reset: bool,
+}
+
+/// [`ResponseSink`] over a streaming response stream, owned by the
+/// spawned handler task. Pushes the head + body chunks into the shared
+/// [`StreamTx`] and signals `demux_wake` so the demux frames them; parks
+/// on `tx.event` when the buffer is at `STREAM_SEND_BUF_CAP` (the demux
+/// signals it after draining). The TX cousin of [`H2BodySource`].
+struct H2Sink {
+    tx: Rc<StreamTx>,
+    demux_wake: Rc<AsyncEvent>,
+}
+
+impl ResponseSink for H2Sink {
+    fn send_head(
+        &mut self,
+        status: i32,
+        content_type: &[u8],
+        extra_headers: &[(&[u8], &[u8])],
+    ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
+        // Encode the streaming head (no content-length — END_STREAM
+        // delimits the body) and stash it; framing happens demux-side.
+        let mut block = Vec::with_capacity(64);
+        encode_streaming_headers(status, content_type, extra_headers, &mut block);
+        Box::pin(async move {
+            {
+                let mut d = self.tx.data.borrow_mut();
+                if d.reset {
+                    return Err(());
+                }
+                d.head = Some(block);
+            }
+            self.demux_wake.set();
+            Ok(())
+        })
+    }
+
+    fn write_chunk(&mut self, buf: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
+        let chunk = IOBuf::from_slice_with_headroom(0, buf, 0);
+        Box::pin(async move {
+            loop {
+                // Arm the wakeup BEFORE the cap check so a demux drain
+                // between the check and the wait can't be lost.
+                self.tx.event.reset();
+                {
+                    let mut d = self.tx.data.borrow_mut();
+                    if d.reset {
+                        return Err(());
+                    }
+                    if d.buffered == 0 || d.buffered + chunk.data().len() <= STREAM_SEND_BUF_CAP {
+                        d.buffered += chunk.data().len();
+                        d.chunks.push_back(chunk);
+                        drop(d);
+                        self.demux_wake.set();
+                        return Ok(());
+                    }
+                }
+                // Buffer full — let the demux drain, then retry.
+                self.demux_wake.set();
+                self.tx.event.wait().await;
+            }
+        })
+    }
+
+    fn finish(&mut self) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
+        Box::pin(async move {
+            {
+                let mut d = self.tx.data.borrow_mut();
+                if d.reset {
+                    return Err(());
+                }
+                d.fin = true;
+            }
+            self.demux_wake.set();
+            Ok(())
         })
     }
 }
@@ -733,6 +971,9 @@ async fn flush<S: HttpStream>(conn: &mut H2Conn, stream: &mut S) -> Result<(), (
     let mut chain = core::mem::take(&mut conn.out_chain);
     chain.clear();
     conn.drain_to_chain(&mut hdr_buf, &mut chain);
+    // Frame any streaming responses (inline DATA into hdr_buf) after the
+    // buffered ones — independent streams, so wire order is free.
+    conn.drain_streaming(&mut hdr_buf);
     // Trailing accumulated header / inline-body bytes become the final
     // (and, for an all-small flush, only) contiguous chain part.
     if !hdr_buf.is_empty() {
@@ -1054,13 +1295,38 @@ where
         }),
         event: AsyncEvent::new(),
     });
+    let tx = Rc::new(StreamTx {
+        data: RefCell::new(TxChanData {
+            head: None,
+            chunks: VecDeque::new(),
+            buffered: 0,
+            fin: false,
+            reset: false,
+        }),
+        event: AsyncEvent::new(),
+    });
     let handler = Arc::clone(handler);
     let body_task = Rc::clone(&body);
-    let sink = Rc::clone(&conn.resp_sink);
+    let tx_task = Rc::clone(&tx);
+    let resp_sink = Rc::clone(&conn.resp_sink);
     let demux_wake = Rc::clone(&conn.demux_wake);
     let spawned = spawn(async move {
         crate::diag::COUNTERS.requests_received.bump();
-        let mut res = Response::new();
+        // Wire the response to a live `H2Sink`: a handler that streams
+        // (`res.write`) pushes head + chunks into `tx` for the demux to
+        // frame bounded (`drain_streaming`); a handler that buffers
+        // (`res.set`) leaves the sink unused and we hand the whole
+        // response to the demux via `resp_sink` (the existing framing
+        // path, content-length preserved). The request body is abandoned
+        // unread if the handler ignored it — `drain_responses` / the
+        // streaming completion drops the slot, late DATA is conn-credited
+        // by `process_data`'s no-slot arm, and the peer stops at the
+        // un-extended stream window.
+        let mut sink = H2Sink {
+            tx: tx_task,
+            demux_wake: Rc::clone(&demux_wake),
+        };
+        let mut res = Response::with_sink(&mut sink);
         {
             let mut src = H2BodySource {
                 body: body_task,
@@ -1068,30 +1334,37 @@ where
             };
             let reader = BodyReader::new_streaming(Some(&mut src), &[], content_length);
             let mut request = Request::new(&req, reader);
-            // Run the handler, then surrender the stream WITHOUT draining
-            // any body it left unread. The old post-handler
-            // `reader.discard().await` would park forever on a peer that
-            // declared a Content-Length then stalled (holding the task +
-            // slot until the 30s idle timeout) and forced the whole body
-            // off the wire even for an early reject. Once `drain_responses`
-            // drops the slot, late DATA is ignored + conn-window-credited
-            // by `process_data`'s no-slot arm, and the peer stops at the
-            // un-extended stream window — the h2-correct way to abandon an
-            // unwanted request body.
-            // The handler reads the request body (`req.read_chunk`) and
-            // writes the response (`res.write`) itself. On h2 there is no
-            // live sink, so `res.write` buffers into the response body
-            // (materialise — correct, `O(body)`; native h2 bounded
-            // streaming is a later phase). h1 streams the same loop bounded.
-            let _ = (*handler)(&mut request, &mut res).await;
+            let r = (*handler)(&mut request, &mut res).await;
+            if res.is_streamed() {
+                if r.is_ok() {
+                    let _ = res.finish().await; // sets `fin` → demux emits END_STREAM
+                }
+                drop(res); // release `&mut sink` so `sink.tx` is reachable
+                if r.is_err() {
+                    // Head already on the wire — abandon via RST_STREAM.
+                    sink.tx.data.borrow_mut().reset = true;
+                }
+            } else {
+                // Buffered: rebuild a sink-less `'static` response and
+                // queue it for the demux (content-length preserved).
+                let parts = res.into_parts();
+                resp_sink
+                    .borrow_mut()
+                    .push_back((sid, Response::from_parts(parts)));
+            }
         }
         crate::diag::COUNTERS.requests_handled.bump();
-        sink.borrow_mut().push_back((sid, res));
         demux_wake.set();
     });
     match spawned {
         Ok(_handle) => {
-            conn.streams.push(StreamSlot { id: sid, body });
+            conn.streams.push(StreamSlot {
+                id: sid,
+                body,
+                tx,
+                send_window: conn.peer_initial_window,
+                headers_sent: false,
+            });
             true
         }
         Err(_) => false,
@@ -1193,6 +1466,14 @@ fn process_window_update(conn: &mut H2Conn, hdr: FrameHeader, payload: &[u8]) ->
         if item.send_window > 0x7fff_ffff {
             frame::push_rst_stream(&mut conn.ctrl_out, hdr.stream_id, error::FLOW_CONTROL_ERROR);
         }
+    } else if let Some(slot) = conn.streams.iter_mut().find(|s| s.id == hdr.stream_id) {
+        // Credit a streaming response's per-stream send window; the next
+        // flush's `drain_streaming` uses it (the demux re-sweeps after
+        // every processed frame, so no explicit wake needed).
+        slot.send_window += inc as i64;
+        if slot.send_window > 0x7fff_ffff {
+            frame::push_rst_stream(&mut conn.ctrl_out, hdr.stream_id, error::FLOW_CONTROL_ERROR);
+        }
     }
     // A WINDOW_UPDATE for a stream with no queued response (already
     // flushed, or not yet dispatched) is ignored.
@@ -1213,6 +1494,11 @@ fn process_rst_stream(conn: &mut H2Conn, hdr: FrameHeader) -> Result<(), u32> {
         let slot = conn.streams.remove(i);
         slot.body.data.borrow_mut().reset = true;
         slot.body.event.set();
+        // Unpark a handler parked on the TX send-buffer cap so `res.write`
+        // returns `Err` and the task unwinds (no HEADERS were necessarily
+        // sent yet; if they were, dropping the slot stops further DATA).
+        slot.tx.data.borrow_mut().reset = true;
+        slot.tx.event.set();
     }
     conn.out_queue.retain(|s| s.id != hdr.stream_id);
     if conn.streams_reset > RST_FLOOD_CAP {
@@ -1356,6 +1642,28 @@ fn encode_response_headers(resp: &Response<'_>, out: &mut Vec<u8>) {
             break;
         }
         list[n] = (name, value);
+        n += 1;
+    }
+    hpack::encode_header_list(&list[..n], out);
+}
+
+/// Encode a *streaming* response's header block from explicit parts —
+/// `:status` + `content-type` + the extra headers, **no
+/// `content-length`** (the body length is unknown up front; END_STREAM
+/// delimits it). The `H2Sink` head writer; mirrors the streamed-head
+/// path on h1 (`Connection: close`, no Content-Length).
+fn encode_streaming_headers(status: i32, content_type: &[u8], extra: &[(&[u8], &[u8])], out: &mut Vec<u8>) {
+    let status3 = status_to_3digits(status);
+    let mut list: [(&[u8], &[u8]); 2 + http::MAX_EXTRA_HEADERS] =
+        [(&[][..], &[][..]); 2 + http::MAX_EXTRA_HEADERS];
+    list[0] = (b":status", &status3[..]);
+    list[1] = (b"content-type", content_type);
+    let mut n = 2;
+    for (name, value) in extra {
+        if n >= list.len() {
+            break;
+        }
+        list[n] = (*name, *value);
         n += 1;
     }
     hpack::encode_header_list(&list[..n], out);
@@ -1544,5 +1852,136 @@ mod tests {
             got.extend_from_slice(b.data());
         }
         assert_eq!(&got[got.len() - big.len()..], &big[..]);
+    }
+
+    // ── Streaming response framing (the bounded TX path) ──────────────
+
+    /// A streaming `StreamSlot` carrying `head` + queued body `chunks`.
+    fn streaming_slot(head: Vec<u8>, chunks: &[&[u8]], fin: bool, send_window: i64) -> StreamSlot {
+        let buffered: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut q = VecDeque::new();
+        for c in chunks {
+            q.push_back(IOBuf::from_slice_with_headroom(0, c, 0));
+        }
+        StreamSlot {
+            id: 1,
+            body: Rc::new(StreamBody {
+                data: RefCell::new(BodyChanData {
+                    chunks: VecDeque::new(),
+                    eof: true,
+                    reset: false,
+                    consumed_uncredited: 0,
+                    buffered: 0,
+                }),
+                event: AsyncEvent::new(),
+            }),
+            tx: Rc::new(StreamTx {
+                data: RefCell::new(TxChanData {
+                    head: Some(head),
+                    chunks: q,
+                    buffered,
+                    fin,
+                    reset: false,
+                }),
+                event: AsyncEvent::new(),
+            }),
+            send_window,
+            headers_sent: false,
+        }
+    }
+
+    /// Walk the framed bytes into `(type, flags, stream_id, payload)`.
+    fn frames(buf: &[u8]) -> Vec<(u8, u8, u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 9 <= buf.len() {
+            let len = ((buf[i] as usize) << 16) | ((buf[i + 1] as usize) << 8) | buf[i + 2] as usize;
+            let ty = buf[i + 3];
+            let fl = buf[i + 4];
+            let sid = u32::from_be_bytes([buf[i + 5] & 0x7f, buf[i + 6], buf[i + 7], buf[i + 8]]);
+            out.push((ty, fl, sid, buf[i + 9..i + 9 + len].to_vec()));
+            i += 9 + len;
+        }
+        out
+    }
+
+    fn head_block() -> Vec<u8> {
+        let mut b = Vec::new();
+        encode_streaming_headers(200, b"text/plain", &[], &mut b);
+        b
+    }
+
+    #[test]
+    fn drain_streaming_headers_data_endstream() {
+        let mut conn = H2Conn::new();
+        conn.streams
+            .push(streaming_slot(head_block(), &[b"hello", b"world"], true, INITIAL_WINDOW));
+        let mut hdr_buf = Vec::new();
+        conn.drain_streaming(&mut hdr_buf);
+        let fr = frames(&hdr_buf);
+        let types: Vec<u8> = fr.iter().map(|f| f.0).collect();
+        assert_eq!(types, alloc::vec![ftype::HEADERS, ftype::DATA, ftype::DATA, ftype::DATA]);
+        assert_eq!(fr[0].1 & flags::END_STREAM, 0, "HEADERS not END_STREAM (body follows)");
+        assert_eq!(fr[1].3, b"hello");
+        assert_eq!(fr[2].3, b"world");
+        assert_eq!(fr[3].1 & flags::END_STREAM, flags::END_STREAM);
+        assert!(fr[3].3.is_empty(), "END_STREAM rides an empty trailing DATA");
+        assert!(conn.streams.is_empty(), "finished stream retired");
+        assert_eq!(conn.conn_send_window, INITIAL_WINDOW - 10, "window debited by body bytes");
+    }
+
+    #[test]
+    fn drain_streaming_window_blocked_then_resumes() {
+        let mut conn = H2Conn::new();
+        // Per-stream window admits only 3 of the 5 body bytes this pass.
+        conn.streams.push(streaming_slot(head_block(), &[b"hello"], true, 3));
+        let mut hdr_buf = Vec::new();
+        conn.drain_streaming(&mut hdr_buf);
+        let fr = frames(&hdr_buf);
+        assert_eq!(fr[0].0, ftype::HEADERS);
+        assert_eq!(fr[1].0, ftype::DATA);
+        assert_eq!(fr[1].3, b"hel", "only the windowed prefix ships");
+        assert_eq!(fr.len(), 2, "no END_STREAM yet (body unfinished)");
+        assert!(!conn.streams.is_empty(), "window-blocked stream stays in flight");
+        assert_eq!(conn.streams[0].send_window, 0);
+        // Peer grants more window — the rest drains + END_STREAM.
+        conn.streams[0].send_window += 10;
+        let mut hdr2 = Vec::new();
+        conn.drain_streaming(&mut hdr2);
+        let fr2 = frames(&hdr2);
+        assert_eq!(fr2[0].3, b"lo", "remaining body resumes mid-chunk");
+        assert_eq!(fr2.last().unwrap().1 & flags::END_STREAM, flags::END_STREAM);
+        assert!(conn.streams.is_empty(), "retired after full drain");
+    }
+
+    #[test]
+    fn drain_streaming_empty_body_endstream_on_headers() {
+        let mut conn = H2Conn::new();
+        conn.streams.push(streaming_slot(head_block(), &[], true, INITIAL_WINDOW));
+        let mut hdr_buf = Vec::new();
+        conn.drain_streaming(&mut hdr_buf);
+        let fr = frames(&hdr_buf);
+        assert_eq!(fr.len(), 1, "only HEADERS for an empty streamed body");
+        assert_eq!(fr[0].0, ftype::HEADERS);
+        assert_eq!(fr[0].1 & flags::END_STREAM, flags::END_STREAM);
+        assert!(conn.streams.is_empty());
+    }
+
+    #[test]
+    fn drain_streaming_reset_after_headers_rsts() {
+        let mut conn = H2Conn::new();
+        conn.streams
+            .push(streaming_slot(head_block(), &[b"partial"], false, INITIAL_WINDOW));
+        let mut hdr_buf = Vec::new();
+        conn.drain_streaming(&mut hdr_buf); // HEADERS + DATA, not finished (fin=false)
+        assert!(!conn.streams.is_empty());
+        // Handler aborts mid-stream — HEADERS already on the wire → RST.
+        conn.streams[0].tx.data.borrow_mut().reset = true;
+        let mut hdr2 = Vec::new();
+        conn.drain_streaming(&mut hdr2);
+        let fr = frames(&hdr2);
+        assert_eq!(fr.len(), 1);
+        assert_eq!(fr[0].0, ftype::RST_STREAM);
+        assert!(conn.streams.is_empty(), "reset stream retired");
     }
 }
