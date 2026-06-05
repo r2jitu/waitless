@@ -339,6 +339,43 @@ per-stream flow control, `demux_wake`) already exists.
   > RESET_STREAM — the h3 layer doesn't surface a stream reset; rare
   > path, noted in the code.
 
+## Per-stream task spawn — explored, not shipped
+
+The two remaining seams — h2's bodyless-generated-streaming residual and
+h3's inline request serialization — would both be closed by giving every
+request stream its own task (the per-stream-task model). Built and
+measured on GCE; **reverted** — neither pays off as-is:
+
+- **h2: spawn bodyless GETs too.** Routing bodyless requests through the
+  same spawned-task path as body-present ones (an `eof_now`-seeded body
+  channel) bounds a generated streamed GET. Cost, measured on GCE
+  (c3-highcpu-4, h2 `/health`, `/obs` `heap_total_allocation_count` ÷
+  `responses_sent`): **3.08 allocs/req inline → 5.09 spawned, +~2.0
+  allocs/req (+65%)** — the boxed future + the StreamBody/StreamTx `Rc`s.
+  RPS was identical (≈236K) but **client-bound** (loadgen saturates the
+  8-core kvm-vm), so server-throughput-neutrality couldn't be proven.
+  Adding +65% allocator work to the single hottest path (every GET) to
+  bound a *rare* case (a bodyless GET that generates a large body —
+  downloads are normally static/buffered) is a poor trade, so bodyless
+  GETs stay inline (`dispatch_bodyless`), the residual documented.
+
+- **h3: spawn a task per request stream.** Would fix the inline
+  serialization (a streaming/slow handler blocking the accept loop).
+  **Blocked by the single-waiter `AsyncEvent`:** the conn's `progress`
+  event parks exactly one waker (a second waiter overwrites the first).
+  Inline, only one thing waits at a time; with per-stream tasks the
+  accept loop **and** N concurrent request tasks all wait on the one
+  shared `progress`, clobbering each other's wakers → lost wakeups →
+  `test_h3_concurrent_uploads` stalls (a racy concurrency bug, worse than
+  the serialization it replaces). Shipping it needs a **multi-waiter
+  wakeup in the QUIC conn** (per-stream events the conn task fans out to,
+  or a broadcast event) — a real change to the fragile, non-golden QUIC
+  core; deferred rather than rushed. h3 stays inline.
+
+Net: the streaming feature ships as Phases 0–3; the per-stream-task model
+is a future option gated on (a) cheaper task/channel reuse for the h2 hot
+path and (b) a multi-waiter conn wakeup for h3.
+
 ## Validation
 
 The bounded-memory + large-transfer-correctness proof must run on GCE —
