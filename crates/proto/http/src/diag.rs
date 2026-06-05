@@ -66,8 +66,8 @@ pub struct Counters {
     /// awaiting handler would fold its park time in here (so this is
     /// only a clean CPU figure for non-awaiting handlers).
     pub handler_cycles: Counter,
-    /// Cumulative cycles building the response wire bytes
-    /// (`write_response_into_iobuf` + body-part chaining).
+    /// Cumulative cycles building the buffered response wire bytes
+    /// (`write_response_head_parts` + body-part chaining).
     pub build_cycles: Counter,
 }
 

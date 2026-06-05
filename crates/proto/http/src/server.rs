@@ -726,4 +726,99 @@ mod serve_conn_tests {
             "request 2 body must not be dropped (stale-slot Content-Length=0 regression)",
         );
     }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Drive `serve_conn` with an arbitrary handler over the pre-canned
+    /// MockStream and return the bytes it sent. Same harness as `drive`,
+    /// but the handler isn't pinned to `observe_handler` — so the
+    /// streamed (`res.write`) paths can be exercised too.
+    fn drive_handler<H>(handler: H, chunks_vec: Vec<Option<Vec<u8>>>) -> Vec<u8>
+    where
+        H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()>,
+    {
+        let chunks = Rc::new(RefCell::new(VecDeque::from(chunks_vec)));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let mock = MockStream {
+            chunks,
+            sent: Rc::clone(&sent),
+        };
+        block_on(serve_conn(Arc::new(handler), mock));
+        Rc::try_unwrap(sent).ok().unwrap().into_inner()
+    }
+
+    /// App-written streaming echo: read each request-body chunk and write
+    /// it straight back out. On h1 `read_chunk` and `write` share the
+    /// connection via the serve loop's `RefCell` duplex.
+    async fn echo_handler(req: &mut Request<'_>, res: &mut Response<'_>) -> Result<(), ()> {
+        res.content_type(b"application/octet-stream".as_slice());
+        while let Some(chunk) = req.read_chunk().await {
+            res.write(chunk.data()).await?;
+        }
+        res.finish().await
+    }
+
+    /// Generated streamed body — `res.write` with no request read.
+    async fn generated_handler(_req: &mut Request<'_>, res: &mut Response<'_>) -> Result<(), ()> {
+        res.content_type(b"text/plain".as_slice());
+        res.write(b"chunk-one;").await?;
+        res.write(b"chunk-two").await?;
+        res.finish().await
+    }
+
+    /// **Duplex echo, body past the prebuf.** HEAD in chunk 1 (no
+    /// trailing body), body in chunk 2 — so the body read flows through
+    /// `CellSource` (`recv_chunk` under a `borrow_mut` held across the
+    /// await), and `res.write` flows through `CellSink`, both on the same
+    /// per-conn `RefCell`. A borrow-discipline regression (e.g. a read
+    /// guard that held the cell across the following write) would panic
+    /// here at runtime — this is the deterministic guard the live
+    /// (HVF/GCE) echo tests can't be in CI.
+    #[test]
+    fn duplex_echo_streams_body_back_over_cell() {
+        let head = b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 8\r\n\r\n".to_vec();
+        let body = b"ECHOBACK".to_vec();
+        let sent = drive_handler(echo_handler, alloc::vec![Some(head), Some(body), None]);
+        assert!(
+            sent.starts_with(b"HTTP/1.1 200"),
+            "streamed head, got {:?}",
+            &sent[..sent.len().min(24)],
+        );
+        assert!(contains(&sent, b"Connection: close"), "streamed = close-delimited");
+        assert!(!contains(&sent, b"Content-Length"), "streamed head carries no Content-Length");
+        assert!(sent.ends_with(b"ECHOBACK"), "echoed body follows the head");
+    }
+
+    /// **Duplex echo, body riding in the HEAD chunk.** HEAD + body in one
+    /// chunk — the body read comes from the prebuf (`carry`), whose guard
+    /// borrows the parse buffer, *not* the cell, so it can be held across
+    /// the `res.write` that borrows the cell. Guards the guard/cell
+    /// disjointness.
+    #[test]
+    fn duplex_echo_body_in_head_chunk() {
+        let raw = b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nHELLO".to_vec();
+        let sent = drive_handler(echo_handler, alloc::vec![Some(raw), None]);
+        assert!(sent.starts_with(b"HTTP/1.1 200"));
+        assert!(contains(&sent, b"Connection: close"));
+        assert!(sent.ends_with(b"HELLO"), "echoed body follows the head");
+    }
+
+    /// **Generated bodyless streaming.** A GET handler that streams two
+    /// chunks via `res.write` then `finish` — exercises `CellSink`
+    /// (`send_head` + `write_chunk` + `finish`) and the streamed→close
+    /// branch on the bodyless path.
+    #[test]
+    fn generated_bodyless_streaming_close_delimited() {
+        let head = b"GET /stream HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+        let sent = drive_handler(generated_handler, alloc::vec![Some(head), None]);
+        assert!(sent.starts_with(b"HTTP/1.1 200"));
+        assert!(contains(&sent, b"Connection: close"));
+        assert!(!contains(&sent, b"Content-Length"));
+        assert!(
+            sent.ends_with(b"chunk-one;chunk-two"),
+            "both streamed chunks land in order",
+        );
+    }
 }

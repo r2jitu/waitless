@@ -314,11 +314,6 @@ impl<'s> Response<'s> {
         self.body
     }
 
-    /// Borrow the body chain without consuming the response.
-    pub fn body(&self) -> &IOBufChain {
-        &self.body
-    }
-
     /// Total body length in bytes — for the Content-Length header (h1)
     /// or DATA-frame length (h2/h3).
     pub fn body_len(&self) -> usize {
