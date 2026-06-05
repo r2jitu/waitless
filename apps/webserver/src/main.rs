@@ -274,17 +274,23 @@ async fn handle_request(req: &mut Request<'_>, res: &mut Response<'_>) -> Result
         res.finish().await?;
         return Ok(());
     }
-    // Streaming echo: splice the POST body straight back out. h1 streams
-    // it chunk-by-chunk with bounded O(chunk) memory (the serve-loop
-    // splice); h2/h3 materialise it (correct, not yet bounded). The
-    // handler just signals echo mode — the transport does the splice.
+    // Streaming echo: write each request-body chunk straight back out as
+    // the response body — plain handler code, no framework echo mode. On
+    // h1 `req.read_chunk` and `res.write` share one connection (the serve
+    // loop's RefCell duplex), so each chunk is read, then written to the
+    // wire with backpressure: bounded O(chunk) over plaintext AND TLS. On
+    // h2/h3 `res.write` buffers (materialise — correct, not yet bounded).
+    // The same shape expresses a proxy / transform.
     if req.path() == b"/echo" {
         let ct = req
             .header(b"content-type")
             .map(|v| v.to_vec())
             .unwrap_or_else(|| b"application/octet-stream".to_vec());
-        res.echo_request(ct);
-        return Ok(());
+        res.content_type(ct);
+        while let Some(chunk) = req.read_chunk().await {
+            res.write(chunk.data()).await?;
+        }
+        return res.finish().await;
     }
     // Body-consuming routes run first: they need `&mut req` for
     // `read_chunk`, so they can't sit inside a `match req.path()` whose

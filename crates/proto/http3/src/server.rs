@@ -544,16 +544,12 @@ where
     {
         let body = BodyReader::new_streaming(Some(&mut src), &[], content_length);
         let mut request = Request::new(&req, body);
+        // The handler reads the request body (`req.read_chunk`) and writes
+        // the response (`res.write`) itself. On h3 there is no live sink,
+        // so `res.write` buffers into the response body (materialise —
+        // correct, `O(body)`; native h3 bounded streaming is a later
+        // phase). h1 streams the same loop bounded.
         let _ = handler(&mut request, &mut response).await;
-        // Echo mode: drain the request body into the response body
-        // (materialise — correct, not yet bounded; native h3 streaming
-        // is a later phase). h1 splices this bounded.
-        if response.is_echo() {
-            let mut reader = request.into_body();
-            while let Some(g) = reader.chunk().await {
-                let _ = response.write(g.data()).await;
-            }
-        }
     }
     // The handler returned; abandon any unread request body WITHOUT
     // awaiting it. The old `body.discard().await` parked forever on a

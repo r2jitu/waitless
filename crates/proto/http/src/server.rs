@@ -12,40 +12,78 @@ use core::pin::Pin;
 
 use iobuf::{IOBuf, IOBufChain};
 
+use core::cell::RefCell;
+
 use crate::body::BodyReader;
 use crate::request::{Request, RequestHead};
-use crate::response::{
-    Bytes, Response, write_response_head_parts, write_response_into_iobuf,
-    write_streaming_head_parts,
-};
+use crate::response::{Bytes, Response, write_response_head_parts, write_streaming_head_parts};
 use crate::MAX_EXTRA_HEADERS;
-use crate::stream::{HttpStream, ResponseSink};
+use crate::stream::{BodySource, HttpStream, ResponseSink};
 use crate::streaming;
 
-/// The h1 [`ResponseSink`]: streams a handler's `res.write()` chunks
-/// straight onto the connection. Wired by `serve_conn` for a bodyless
-/// request (the read half is idle, so the sink can hold the stream).
-/// The head goes out close-delimited (`Connection: close`) on the first
-/// chunk; each chunk is its own awaited `send`, so the handler is paced
-/// by TCP backpressure and per-connection peak memory is `O(chunk)`.
-/// Generic over `S`, so it streams over plaintext **and** TLS h1 — only
-/// `send`/`recv` are used (no read/write split, which TLS can't do
-/// soundly), and a streamed response touches send-only.
-struct H1Sink<'a, S: HttpStream> {
-    stream: &'a mut S,
+/// Per-connection duplex backing for one handler call: the borrowed
+/// stream wrapped in a `RefCell` so the request-body source and the
+/// response sink can **both** draw on it. The handler reads the request
+/// (`req.read_chunk`) and writes the response (`res.write`) over one
+/// stream, used **sequentially** — each `recv`/`send` is awaited under
+/// its own `borrow_mut`, and a body chunk is owned (copied off the
+/// stream) before the following `write` re-borrows the cell, so the two
+/// never overlap. That is the same `recv → owned → send` discipline the
+/// serve loop used for the old echo splice, now exposed through
+/// `req`/`res`: an echo / proxy / transform streams bounded `O(chunk)`
+/// over plaintext **and** TLS with no read/write split of the transport.
+/// (The per-conn task is the cell's only user, so the `borrow_mut`s held
+/// across `.await` are sound — no other task touches this connection.)
+type StreamCell<'s, S> = RefCell<&'s mut S>;
+
+/// Request-body source over the shared [`StreamCell`]. `next_chunk`
+/// borrows the cell only for one `recv_chunk`, then returns **owned**
+/// bytes — releasing the cell before the handler's following
+/// `res.write` re-borrows it. (`BodyReader` reaches this via the
+/// `BodySource` seam, exactly like the non-duplex transports.)
+struct CellSource<'c, 's, S: HttpStream> {
+    cell: &'c StreamCell<'s, S>,
+}
+
+impl<S: HttpStream> BodySource for CellSource<'_, '_, S> {
+    // `borrow_mut` is held across the `recv_chunk` await. Sound here: the
+    // per-conn handler future is the cell's only borrower, and it uses the
+    // source and sink sequentially (a chunk is owned and the borrow
+    // released before the following `res.write`), so the borrow is never
+    // re-entered. The general-case lint can't see that invariant.
+    #[allow(clippy::await_holding_refcell_ref)]
+    fn next_chunk(&mut self) -> Pin<Box<dyn Future<Output = Option<IOBuf>> + '_>> {
+        Box::pin(async move {
+            let mut g = self.cell.borrow_mut();
+            g.recv_chunk().await.map(|c| c.into_owned())
+        })
+    }
+}
+
+/// Response sink over the shared [`StreamCell`]. The head goes out
+/// close-delimited (`Connection: close`) on the first chunk; each chunk
+/// is its own awaited `send` (TCP/TLS backpressure → `O(chunk)` peak).
+/// Takes the stream from `cell.borrow_mut()` per send, so it coexists
+/// with [`CellSource`] reading the request body on the same connection.
+struct CellSink<'c, 's, S: HttpStream> {
+    cell: &'c StreamCell<'s, S>,
     out: IOBufChain,
 }
 
-impl<'a, S: HttpStream> H1Sink<'a, S> {
-    fn new(stream: &'a mut S) -> Self {
-        H1Sink {
-            stream,
+impl<'c, 's, S: HttpStream> CellSink<'c, 's, S> {
+    fn new(cell: &'c StreamCell<'s, S>) -> Self {
+        CellSink {
+            cell,
             out: IOBufChain::new(),
         }
     }
 }
 
-impl<S: HttpStream> ResponseSink for H1Sink<'_, S> {
+impl<S: HttpStream> ResponseSink for CellSink<'_, '_, S> {
+    // `borrow_mut` held across the `send` await — sound for the same
+    // reason as `CellSource::next_chunk` (single per-conn borrower, used
+    // sequentially with the body source).
+    #[allow(clippy::await_holding_refcell_ref)]
     fn send_head(
         &mut self,
         status: i32,
@@ -59,16 +97,19 @@ impl<S: HttpStream> ResponseSink for H1Sink<'_, S> {
         Box::pin(async move {
             self.out.clear();
             self.out.push_back(head);
-            self.stream.send(&mut self.out).await
+            let mut g = self.cell.borrow_mut();
+            g.send(&mut self.out).await
         })
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
     fn write_chunk(&mut self, buf: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
         let chunk = IOBuf::from_slice_with_headroom(0, buf, 0);
         Box::pin(async move {
             self.out.clear();
             self.out.push_back(chunk);
-            self.stream.send(&mut self.out).await
+            let mut g = self.cell.borrow_mut();
+            g.send(&mut self.out).await
         })
     }
 
@@ -276,239 +317,103 @@ where
             }
         };
 
-        // BODYLESS streaming-capable path. A request with no body leaves
-        // the read half idle, so we wire a live `H1Sink` for the handler
-        // — `res.write()` then streams chunks straight to the wire
-        // (bounded O(chunk)). A handler that instead sets a buffered body
-        // (`*res = Response::ok(..)`) leaves the sink unused; we send that
-        // buffer afterward through the same borrowed-head path as the
-        // body branch (so `/health` etc. stay zero-alloc). A request
-        // *with* a body keeps the read half and can't also hold a write
-        // sink, so it takes the body branch below (`res.write` buffers
-        // there; bounded echo uses the serve-loop splice).
-        if !req.reject && content_length == 0 {
-            let streamed;
-            #[allow(clippy::type_complexity)]
-            let buffered: Option<(i32, Bytes, IOBufChain, [Option<(Bytes, Bytes)>; MAX_EXTRA_HEADERS])>;
-            {
-                let mut sink = H1Sink::new(&mut stream);
-                let mut res = Response::with_sink(&mut sink);
-                let empty = BodyReader::new(None, &[], 0);
-                let mut request = Request::new(&req, empty);
-                let __h0 = now_cycles();
-                let r = (*handler)(&mut request, &mut res).await;
-                crate::diag::COUNTERS
-                    .handler_cycles
-                    .add(now_cycles().wrapping_sub(__h0));
-                if r.is_err() {
-                    crate::diag::COUNTERS.send_failed.bump();
-                    return;
-                }
-                if res.is_streamed() {
-                    if res.finish().await.is_err() {
-                        crate::diag::COUNTERS.send_failed.bump();
-                        return;
-                    }
-                    streamed = true;
-                    buffered = None;
-                } else {
-                    streamed = false;
-                    buffered = Some(res.into_parts());
-                }
-            } // `sink` dropped → `stream` free again
-            if streamed {
-                crate::diag::COUNTERS.responses_sent.bump();
-                let _ = stream.close().await; // streamed = close-delimited
-                return;
-            }
-            // Buffered bodyless response: same borrowed-head + chain send
-            // as the body branch (zero-alloc head).
-            let (status, content_type, body, extra) =
-                buffered.expect("buffered set when !streamed");
-            let mut header = unsafe {
-                IOBuf::borrow(
-                    core::ptr::NonNull::new_unchecked(header_storage.as_mut_ptr()),
-                    HEADER_BUF_SIZE as u32,
-                    0,
-                    0,
-                )
-            };
-            let mut hdrs: [(&[u8], &[u8]); MAX_EXTRA_HEADERS] =
-                [(&[][..], &[][..]); MAX_EXTRA_HEADERS];
-            let mut nh = 0;
-            for (name, value) in extra.iter().flatten() {
-                hdrs[nh] = (name.data(), value.data());
-                nh += 1;
-            }
-            write_response_head_parts(
-                &mut header,
-                status,
-                content_type.data(),
-                &hdrs[..nh],
-                body.total_len(),
-                !want_close,
-            );
-            out_chain.clear(); // empty at loop top, but match the body branch
-            out_chain.push_back(header);
-            for part in body.into_parts() {
-                out_chain.push_back(part);
-            }
-            if stream.send(&mut out_chain).await.is_err() {
-                crate::diag::COUNTERS.send_failed.bump();
-                return;
-            }
-            crate::diag::COUNTERS.responses_sent.bump();
-            if want_close {
-                let _ = stream.close().await;
-                return;
-            }
-            continue; // keep-alive: `carry` holds the next pipelined request
-        }
-
-        // The outbound message the handler fills (buffered body via
-        // `*res = Response::ok(..)`; `res.write` here buffers since this
-        // path has no live sink — a request body holds the read half).
-        let mut res = Response::new();
+        // Per-connection request/response dispatch. Wrap the borrowed
+        // stream in a `RefCell` and hand the handler a body reader
+        // (`CellSource`) + a response sink (`CellSink`) that BOTH draw on
+        // it, so a handler can read the request body and stream the
+        // response over one connection — a bounded `O(chunk)` echo /
+        // proxy / transform on plaintext AND TLS, no read/write split. A
+        // handler that buffers (`res.set(..)`) leaves the sink unused;
+        // the buffered response is sent afterward through the borrowed-
+        // head path (so `/health` etc. stay zero-alloc). A malformed
+        // request (`reject`) short-circuits to a buffered `400` + close.
+        let streamed;
+        #[allow(clippy::type_complexity)]
+        let buffered: Option<(i32, Bytes, IOBufChain, [Option<(Bytes, Bytes)>; MAX_EXTRA_HEADERS])>;
         // Post-body residue captured by BodyReader when a fresh-recv
-        // chunk straddled the Content-Length boundary. None in every
+        // chunk straddled the Content-Length boundary. None on every
         // path that doesn't pull from the stream past the prebuf.
         let body_leftover: Option<IOBuf>;
-        // Echo mode: the handler asked to splice the request body back
-        // out (`res.echo_request`). The splice below reads the body
-        // itself, so the normal post-handler discard is skipped.
-        let do_echo;
         if req.reject {
             crate::diag::record_reject(&req);
-            res = Response::bad_request();
+            streamed = false;
+            buffered = Some(Response::bad_request().into_parts());
             body_leftover = None;
-            do_echo = false;
         } else {
-            let body_drained_ok;
-            {
-                // Body prebuf comes from `carry` (the bytes that
-                // landed in the same chunk as the HEAD terminator).
-                // Trim to declared `Content-Length` so we don't
-                // hand the body reader bytes that belong to the
-                // next pipelined request.
-                let prebuf: &[u8] = match carry.as_ref() {
-                    Some(c) => {
-                        let n = content_length.min(c.data().len());
-                        &c.data()[..n]
-                    }
-                    None => &[],
-                };
-                let body = BodyReader::new(Some(&mut stream), prebuf, content_length);
-                let mut request = Request::new(&req, body);
-                let __h0 = now_cycles();
-                let handler_result = (*handler)(&mut request, &mut res).await;
-                crate::diag::COUNTERS
-                    .handler_cycles
-                    .add(now_cycles().wrapping_sub(__h0));
-                // Recover the body reader to drain leftovers + capture
-                // any straddle residue.
-                let mut body = request.into_body();
-                if handler_result.is_err() {
+            let cell: StreamCell<'_, S> = RefCell::new(&mut stream);
+            let mut source = CellSource { cell: &cell };
+            let mut sink = CellSink::new(&cell);
+            // Body prebuf: the bytes that rode in with the HEAD
+            // terminator (`carry`), trimmed to the declared
+            // Content-Length so the reader never reaches into the next
+            // pipelined request. A bodyless request (CL=0) gets no
+            // source — the read half stays idle.
+            let prebuf: &[u8] = match carry.as_ref() {
+                Some(c) => {
+                    let n = content_length.min(c.data().len());
+                    &c.data()[..n]
+                }
+                None => &[],
+            };
+            let body = if content_length > 0 {
+                BodyReader::new(Some(&mut source), prebuf, content_length)
+            } else {
+                BodyReader::new(None, &[], 0)
+            };
+            let mut request = Request::new(&req, body);
+            let mut res = Response::with_sink(&mut sink);
+            let __h0 = now_cycles();
+            let r = (*handler)(&mut request, &mut res).await;
+            crate::diag::COUNTERS
+                .handler_cycles
+                .add(now_cycles().wrapping_sub(__h0));
+            if r.is_err() {
+                crate::diag::COUNTERS.send_failed.bump();
+                return; // `cell` drops → `stream` freed → FIN
+            }
+            if res.is_streamed() {
+                // The handler streamed: head + body already went out
+                // over the sink (close-delimited). Finish the body; the
+                // conn closes after — no keep-alive, no body drain (the
+                // close discards anything the handler left unread).
+                if res.finish().await.is_err() {
                     crate::diag::COUNTERS.send_failed.bump();
                     return;
                 }
-                do_echo = res.is_echo();
-                if do_echo {
-                    // The echo splice below reads + writes the body
-                    // itself (bounded); skip the discard. `carry` still
-                    // holds the prebuf body bytes (the BodyReader only
-                    // borrowed them).
-                    body_drained_ok = true;
-                    body_leftover = None;
+                streamed = true;
+                buffered = None;
+                body_leftover = None;
+            } else {
+                // The handler buffered: drain any request body it left
+                // unread (keep-alive contract), capture any straddle
+                // residue, then take the buffered parts out before the
+                // cell (and its `&mut stream` borrow) drops.
+                let mut body = request.into_body();
+                let drained_ok =
+                    want_close || body.is_empty() || body.discard().await.is_ok();
+                if !drained_ok {
+                    crate::diag::COUNTERS.body_drain_failed.bump();
+                    return;
+                }
+                body_leftover = if content_length > 0 {
+                    body.into_leftover()
                 } else {
-                    body_drained_ok = want_close
-                        || body.is_empty()
-                        || body.discard().await.is_ok();
-                    // Pick up any residue BodyReader stashed when a
-                    // stream-side chunk straddled the body boundary.
-                    // Only meaningful when the body was fully drained
-                    // AND the body actually drew from the stream
-                    // (CL > 0); a CL=0 body cannot have created a
-                    // straddle, so skip the call entirely on the GET
-                    // fast path.
-                    body_leftover = if body_drained_ok && content_length > 0 {
-                        body.into_leftover()
-                    } else {
-                        None
-                    };
-                }
+                    None
+                };
+                streamed = false;
+                buffered = Some(res.into_parts());
             }
-            if !body_drained_ok {
-                crate::diag::COUNTERS.body_drain_failed.bump();
-                return;
-            }
-        }
+        } // `cell` / `source` / `sink` dropped → `stream` free again
 
-        // Echo mode: splice the request body straight back out as the
-        // response body, bounded O(chunk). Write a close-delimited head,
-        // then the prebuf body bytes (`carry` — the body that rode in
-        // with the head), then `recv_chunk → into_owned → send` the
-        // remainder up to Content-Length. `into_owned` releases the read
-        // borrow before `send` re-borrows the stream, so read + write
-        // stay sequential — no read/write split needed.
-        if do_echo {
-            let mut head = unsafe {
-                IOBuf::borrow(
-                    core::ptr::NonNull::new_unchecked(header_storage.as_mut_ptr()),
-                    HEADER_BUF_SIZE as u32,
-                    0,
-                    0,
-                )
-            };
-            crate::response::write_streaming_head_into_iobuf(&mut head, &res);
-            out_chain.clear();
-            out_chain.push_back(head);
-            if stream.send(&mut out_chain).await.is_err() {
-                crate::diag::COUNTERS.send_failed.bump();
-                return;
-            }
-            let mut remaining = content_length;
-            if let Some(c) = carry.take() {
-                let n = remaining.min(c.data().len());
-                if n > 0 {
-                    let mut chunk = c;
-                    let _ = chunk.narrow(0, n);
-                    out_chain.clear();
-                    out_chain.push_back(chunk);
-                    if stream.send(&mut out_chain).await.is_err() {
-                        crate::diag::COUNTERS.send_failed.bump();
-                        return;
-                    }
-                    remaining -= n;
-                }
-            }
-            while remaining > 0 {
-                match stream.recv_chunk().await {
-                    Some(guard) => {
-                        let mut owned = guard.into_owned();
-                        let avail = owned.data().len();
-                        if avail == 0 {
-                            break;
-                        }
-                        let n = remaining.min(avail);
-                        let _ = owned.narrow(0, n);
-                        out_chain.clear();
-                        out_chain.push_back(owned);
-                        if stream.send(&mut out_chain).await.is_err() {
-                            crate::diag::COUNTERS.send_failed.bump();
-                            return;
-                        }
-                        remaining -= n;
-                    }
-                    // Peer closed before Content-Length — echo what we got.
-                    None => break,
-                }
-            }
-            out_chain.clear();
+        if streamed {
             crate::diag::COUNTERS.responses_sent.bump();
-            let _ = stream.close().await;
+            let _ = stream.close().await; // streamed = close-delimited
             return;
         }
 
+        // Buffered response: borrowed-storage head (zero-alloc) + the
+        // body parts, then keep-alive or close.
+        //
         // SAFETY contract for the borrowed header IOBuf:
         //   * `header_storage` outlives every IOBuf wrapping it
         //     (future-state field; future is pinned; we drop the
@@ -520,7 +425,9 @@ where
         //     the next iteration wrap the same storage.
         //   * No drop callback (drop_fn = None) — the storage is
         //     borrowed, so the IOBuf's drop is a no-op.
-        let header = unsafe {
+        let (status, content_type, body, extra) =
+            buffered.expect("buffered set when !streamed");
+        let mut header = unsafe {
             IOBuf::borrow(
                 core::ptr::NonNull::new_unchecked(header_storage.as_mut_ptr()),
                 HEADER_BUF_SIZE as u32,
@@ -528,15 +435,27 @@ where
                 0,
             )
         };
-        let mut header = header;
         let __b0 = now_cycles();
-        write_response_into_iobuf(&mut header, &res, !want_close);
-
-        debug_assert!(out_chain.is_empty());
-        for part in res.into_body().into_parts() {
+        let mut hdrs: [(&[u8], &[u8]); MAX_EXTRA_HEADERS] =
+            [(&[][..], &[][..]); MAX_EXTRA_HEADERS];
+        let mut nh = 0;
+        for (name, value) in extra.iter().flatten() {
+            hdrs[nh] = (name.data(), value.data());
+            nh += 1;
+        }
+        write_response_head_parts(
+            &mut header,
+            status,
+            content_type.data(),
+            &hdrs[..nh],
+            body.total_len(),
+            !want_close,
+        );
+        out_chain.clear();
+        out_chain.push_back(header);
+        for part in body.into_parts() {
             out_chain.push_back(part);
         }
-        out_chain.push_front(header);
         crate::diag::COUNTERS
             .build_cycles
             .add(now_cycles().wrapping_sub(__b0));

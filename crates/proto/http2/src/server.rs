@@ -1078,16 +1078,12 @@ where
             // by `process_data`'s no-slot arm, and the peer stops at the
             // un-extended stream window — the h2-correct way to abandon an
             // unwanted request body.
+            // The handler reads the request body (`req.read_chunk`) and
+            // writes the response (`res.write`) itself. On h2 there is no
+            // live sink, so `res.write` buffers into the response body
+            // (materialise — correct, `O(body)`; native h2 bounded
+            // streaming is a later phase). h1 streams the same loop bounded.
             let _ = (*handler)(&mut request, &mut res).await;
-            // Echo mode: drain the request body into the response body
-            // (materialise — correct, not yet bounded; native h2
-            // streaming is a later phase). h1 splices this bounded.
-            if res.is_echo() {
-                let mut reader = request.into_body();
-                while let Some(g) = reader.chunk().await {
-                    let _ = res.write(g.data()).await;
-                }
-            }
         }
         crate::diag::COUNTERS.requests_handled.bump();
         sink.borrow_mut().push_back((sid, res));
