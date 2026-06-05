@@ -10,12 +10,13 @@
 // `http3::listen`) remain available for finer control.
 //
 // One **plain** handler serves every transport. The handler signature —
-// `(&Request, &mut BodyReader<'_>)` — is transport-erased (the request
-// body reaches it through `http`'s `&mut dyn BodySource` seam, not a
-// stream type parameter), so a single value drives h1.1/h2 over TLS and
-// h3 over QUIC alike. No `Service` trait, no per-protocol adapter: the
-// facade just hands the same (`Arc`-shared) handler to both listeners,
-// wrapping the TCP path to append `Alt-Svc`.
+// `(&mut Request<'_>, &mut Response<'_>)` — is transport-erased (the
+// request body reaches it through `http`'s `&mut dyn BodySource` seam and
+// the response writes through `&mut dyn ResponseSink`, neither a stream
+// type parameter), so a single value drives h1.1/h2 over TLS and h3 over
+// QUIC alike. No `Service` trait, no per-protocol adapter: the facade
+// just hands the same (`Arc`-shared) handler to both listeners, wrapping
+// the TCP path to append `Alt-Svc`.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -52,10 +53,9 @@ pub enum ServeError {
 /// (DER, leaf first) + `key_der` are the same blobs the per-transport
 /// listeners accept.
 ///
-/// `handler` is any async `fn`/closure taking `(&Request, &mut
-/// BodyReader<'_>)` — the same shape `http::listen` takes — so one
-/// handler can drive plain HTTP, HTTPS, and HTTP/3 with no per-version
-/// wrapper.
+/// `handler` is any async `fn`/closure taking `(&mut Request<'_>, &mut
+/// Response<'_>)` — the same shape `http::listen` takes — so one handler
+/// can drive plain HTTP, HTTPS, and HTTP/3 with no per-version wrapper.
 pub fn serve<H>(
     port: u16,
     handler: H,
@@ -91,12 +91,25 @@ where
     http2::listen(
         port,
         async move |req: &mut Request<'_>, res: &mut Response| -> Result<(), ()> {
-            let r = (*tcp)(req, res).await;
-            // Append Alt-Svc so plain/H2 clients learn the h3 endpoint.
-            // Phase 0 buffers the response, so the head isn't on the wire
-            // yet — setting it here is fine. (A streaming sink, later
-            // phase, must set Alt-Svc before the first body byte.)
+            // Advertise the h3 endpoint via Alt-Svc on the TCP path. A
+            // *streaming* handler ships the head on its first `res.write`,
+            // so set Alt-Svc BEFORE the handler runs — it rides the head.
+            // A *buffering* handler that calls `res.set(..)` replaces the
+            // whole response (clobbering `extra_headers`), so re-apply on
+            // the buffered path. `header` appends without de-dup, so guard
+            // the re-apply on absence: a handler that buffered *without*
+            // `set` still carries our pre-set header and must not double
+            // it. (Streamed → already framed → leave it.)
             if let Some(a) = alt {
+                res.header(&b"Alt-Svc"[..], a);
+            }
+            let r = (*tcp)(req, res).await;
+            if let Some(a) = alt
+                && !res.is_streamed()
+                && !res
+                    .extra_headers()
+                    .any(|(n, _)| n.eq_ignore_ascii_case(b"alt-svc"))
+            {
                 res.header(&b"Alt-Svc"[..], a);
             }
             r
