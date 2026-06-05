@@ -281,17 +281,36 @@ per-stream flow control, `demux_wake`) already exists.
   >   work (~1 send/req)** → perf-neutral; the cell is created but never
   >   borrowed on the buffered `/health` path, so it adds no work.
 
-- **Phases 2–3 — native h2/h3 bounded streaming (optimisation).** h2/h3
-  currently *materialise* a streamed/echoed body (correct output,
-  `O(body)` memory). Bounding them needs the per-transport streaming
-  sink: h2 = a TX chunk queue the demux drains with conn+stream
-  flow-control backpressure (mirror of the RX `StreamBody`); h3 = QUIC
-  stream writes with FC. Deferred — not the core ask (which is
-  delivered + bounded on h1).
-- **Phase 2 — h2 streaming.** Per-stream TX queue + demux integration +
-  window/cap backpressure. The correctness-sensitive part — GCE-validate
-  large transfers (byte-perfect + bounded peak).
-- **Phase 3 — h3 streaming.** QUIC stream writes + flow control.
+- **Phase 2 — h2 bounded streaming. ✅ DONE (commit `a139b4c`).** A
+  streaming h2 handler (`res.write`) pushes head + chunks into a bounded
+  per-stream `StreamTx` the demux drains into DATA frames under conn +
+  stream flow control — the TX mirror of the RX `StreamBody`.
+  `res.write().await` parks on `STREAM_SEND_BUF_CAP` (256 KiB) when the
+  demux is behind; the demux signals it after draining; peak per-stream
+  TX memory is `O(cap)`, not `O(response)`. `H2Sink` (the `ResponseSink`)
+  encodes a streaming head (no content-length, END_STREAM-delimited) +
+  enqueues chunks; `drain_streaming` frames HEADERS once then DATA up to
+  the windows (inline copy + `consume` for a window-cut chunk),
+  END_STREAM on `fin`, retiring finished/reset slots; WINDOW_UPDATE
+  credits a streaming slot and RST/teardown reset the TX channel so a
+  parked write returns `Err`. A handler that *buffers* (`res.set`) is
+  rebuilt to a sink-less `'static` response (`Response::from_parts`) and
+  flows through the **unchanged** `resp_sink`/`queue_response` path
+  (content-length preserved) — the proven buffered framing is untouched.
+  4 deterministic `drain_streaming` unit tests + HVF h2 echo + 512 KiB
+  upload. **GCE: `/echo` 256 MiB over h2/TLS = 268,435,456 bytes,
+  `sha256` byte-perfect, live heap +~193 KB (bounded by the RX+TX caps,
+  not the body), `heap_oom=0`, server live.** `get_h2` 470K req/s; the
+  bodyless h2 GET hot path is structurally unchanged (`drain_streaming`
+  no-ops when no streaming slot exists).
+
+  > **Residual:** a *bodyless* GET that generates a large streamed body
+  > stays inline + buffered (`O(body)`) — the inline demux task can't
+  > park on itself, and spawning every GET would regress the h2 GET hot
+  > path. The realistic large-streamed case (echo / proxy / transform =
+  > body-present POST, which already runs in a spawned task) is bounded.
+
+- **Phase 3 — h3 bounded streaming.** QUIC stream writes + flow control.
 
 ## Validation
 

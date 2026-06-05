@@ -82,6 +82,29 @@ echo "heap_max_during=\$MAXH2 (\$(mib \$MAXH2))  heap_base=\$BASE2  growth=\$(( 
 echo "heap_oom=\$(ho)"
 rm -f /tmp/up.bin /tmp/echo.out
 
+echo "================ /echo (256 MiB upload, h2 over TLS) ================"
+if curl -V 2>/dev/null | grep -qiE 'HTTP2|http2'; then
+  head -c 268435456 /dev/urandom > /tmp/up2.bin
+  UPSHA2=\$(sha256sum /tmp/up2.bin | cut -d' ' -f1)
+  echo "upload_sha=\$UPSHA2"
+  BASE3=\$(hb); echo "heap_base=\$BASE3 (\$(mib \$BASE3))"
+  curl -s -k --http2 "https://\$IP/echo" -H 'Content-Type: application/octet-stream' \
+       --data-binary @/tmp/up2.bin -o /tmp/echo2.out \
+       -w 'echo_http=%{http_code} echo_ver=%{http_version} echo_bytes=%{size_download}\n' &
+  EPID2=\$!
+  MAXH3=\$(sample_during "\$EPID2")
+  wait "\$EPID2" 2>/dev/null || true
+  EBYTES2=\$(stat -c %s /tmp/echo2.out 2>/dev/null || wc -c </tmp/echo2.out)
+  ECHOSHA2=\$(sha256sum /tmp/echo2.out | cut -d' ' -f1)
+  echo "echo_bytes=\$EBYTES2 (want 268435456)"
+  if [ "\$ECHOSHA2" = "\$UPSHA2" ]; then echo "ECHO INTEGRITY: OK (sha match)"; else echo "ECHO INTEGRITY: FAIL (sha mismatch)"; fi
+  echo "heap_max_during=\$MAXH3 (\$(mib \$MAXH3))  heap_base=\$BASE3  growth=\$(( MAXH3 - BASE3 )) bytes"
+  echo "heap_oom=\$(ho)"
+  rm -f /tmp/up2.bin /tmp/echo2.out
+else
+  echo "(curl lacks http2 — skipping h2 echo)"
+fi
+
 echo "================ liveness ================"
 echo "health_after=\$(curl -s -o /dev/null -w '%{http_code}' http://\$IP/health)"
 REMOTE
