@@ -322,7 +322,7 @@ fn write_event_loop_obs<W: core::fmt::Write>(w: &mut W) {
 /// `last_conn_close`, `last_conn_exit`). The render lives in
 /// `quic::diag::write_obs_json`, so there is exactly one rendering
 /// path shared with `/obs`. See `docs/observability.md`.
-pub(crate) fn quic_stats_response() -> Response {
+pub(crate) fn quic_stats_response() -> Response<'static> {
     // 4 KiB body region: 45 flat counters (worst-case u64 width)
     // plus three nested snapshot objects, with margin. Slow path,
     // so the reservation is free; rendered in place to skip the
@@ -343,7 +343,7 @@ pub(crate) fn quic_stats_response() -> Response {
 /// all surface here (see the rollout checklist in
 /// `docs/observability.md`). `/quic_stats` is the QUIC-only view of
 /// the same `write_obs_json` output.
-pub(crate) fn obs_response() -> Response {
+pub(crate) fn obs_response() -> Response<'static> {
     // 16 KiB covers all subsystem blocks (QUIC counters + snapshots
     // + latency histograms, plus tcp / udp / nic / tls / http /
     // http2 / http3 / runtime / kernel / net), the NIC per-qp
@@ -387,7 +387,7 @@ pub(crate) fn obs_response() -> Response {
 /// access-controlled and the in-band channel is the only way to
 /// surface a panic from the running unikernel — combine with
 /// `curl http://<ip>/diag-panic` to read the trace.
-pub(crate) fn diag_panic_response() -> Response {
+pub(crate) fn diag_panic_response() -> Response<'static> {
     // Diag buffer caps at 4 KiB (cf. `kernel::diag::CAPTURE_LEN`); a
     // 4 KiB scratch + small-string prelude lands in one body region
     // without allocating beyond `body_iobuf`.
@@ -414,7 +414,7 @@ pub(crate) fn diag_panic_response() -> Response {
 /// GCE where serial-port output is sandboxed and `tcpdump` on the
 /// loadgen VM only shows post-hypervisor wire bytes — `/diag-gve`
 /// shows what the unikernel actually wrote to the descriptor ring.
-pub(crate) fn diag_gve_response() -> Response {
+pub(crate) fn diag_gve_response() -> Response<'static> {
     use core::fmt::Write as _;
 
     let mut entries: alloc::vec::Vec<waitless::diagnostics::NetTxDescLogEntry> =
@@ -455,7 +455,7 @@ pub(crate) fn diag_gve_response() -> Response {
 
 pub(crate) const PROFILE_BUF_LEN: usize = 4096;
 
-pub(crate) fn tls_profile_response() -> Response {
+pub(crate) fn tls_profile_response() -> Response<'static> {
     let mut buf = alloc::vec![0u8; PROFILE_BUF_LEN];
     let n = tls::tls_profile_report(buf.as_mut_slice());
     buf.truncate(n);

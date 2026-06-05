@@ -29,7 +29,7 @@ pub use body::{BodyChunkGuard, BodyReader};
 pub use request::{Header, Method, Request, RequestHead};
 pub use response::{Bytes, MAX_EXTRA_HEADERS, Response, bytes_owned, bytes_static};
 pub use server::{listen, serve_conn};
-pub use stream::{BodySource, HttpStream, ResponseBodyProducer};
+pub use stream::{BodySource, HttpStream, ResponseSink};
 
 /// Allocate an IOBuf for a response body part with `cap` bytes
 /// of usable payload capacity. The returned IOBuf's visible

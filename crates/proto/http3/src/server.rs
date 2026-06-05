@@ -65,7 +65,7 @@ pub fn listen<H>(
     key_pkcs8_der: &'static [u8],
 ) -> Result<(), ListenError>
 where
-    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + Send + Sync + 'static,
+    H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()> + Send + Sync + 'static,
 {
     // Pay one-time lazy-init costs upfront so they land in the
     // HEAP_BASELINE snapshot rather than the first request's
@@ -99,7 +99,7 @@ where
 
 async fn handle_conn<H>(conn: QuicConn, handler: Arc<H>)
 where
-    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
+    H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()> + 'static,
 {
     // 1. Open control stream and send SETTINGS.
     //    Server-initiated unidirectional streams use IDs 3, 7, 11, ...
@@ -375,7 +375,7 @@ unsafe fn framing_pool_drop(base: core::ptr::NonNull<u8>, capacity: u32, ctx: *m
 
 async fn handle_request<H>(conn: &QuicConn, sid: u64, handler: &H, scratch: &mut Scratch)
 where
-    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()>,
+    H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()>,
 {
     // Read just far enough to parse the HEADERS frame, then dispatch
     // and stream the body (any later DATA frames) lazily — no
@@ -555,9 +555,6 @@ where
             }
         }
     }
-    // h3 buffers; drain any streaming producer into the body (correct,
-    // not yet bounded — h3 streaming sink is a later phase).
-    response.materialize().await;
     // The handler returned; abandon any unread request body WITHOUT
     // awaiting it. The old `body.discard().await` parked forever on a
     // peer that declared a Content-Length then stalled (no FIN) — and

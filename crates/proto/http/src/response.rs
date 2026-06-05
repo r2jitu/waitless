@@ -35,15 +35,17 @@ pub const MAX_EXTRA_HEADERS: usize = 4;
 /// until the first body byte goes out; for a buffered response that's at
 /// handler return, for a streaming one it's the first `write`.
 ///
-/// Phase 0 (this commit) is buffering-only on every transport: `write`
-/// appends to `body` and the transport serialises + sends the whole
-/// `Response` after the handler returns — byte-identical to the old
-/// returned-`Response` path. Real per-transport streaming (a
-/// `ResponseSink` the writes go to immediately, with backpressure) lands
-/// in later phases; see `docs/streaming-response.md`.
+/// Two modes, picked by the transport per connection:
+///   - **Buffered** (no `sink`): `write` appends to `body`; the handler
+///     usually installs a complete response with `res.set(Response::ok(..))`
+///     and the transport serialises + sends it after the handler returns.
+///   - **Streaming** (`sink` wired — h1 on a bodyless/keep-alive request):
+///     the first `write` flushes the head, each subsequent `write` awaits
+///     a `ResponseSink::write_chunk` straight to the wire, so peak memory
+///     stays `O(chunk)`. See `docs/streaming-response.md`.
 ///
 /// [`Request`]: crate::Request
-pub struct Response {
+pub struct Response<'s> {
     pub status: i32,
     /// Content-Type header value. `Bytes` (Cow<'static, [u8]>) so the
     /// common `res.ok(b"text/plain", ...)` case stays borrowed-static
@@ -51,28 +53,30 @@ pub struct Response {
     /// Cow::Owned.
     content_type: Bytes,
     /// The response body, as a chain of IOBuf parts. `res.ok(ct,
-    /// b"static")` is a 1-part chain; streaming `write`s push parts.
+    /// b"static")` is a 1-part chain. Holds the **buffered** body; when
+    /// a live `sink` is wired and the handler `write`s, bytes go to the
+    /// wire instead and this stays empty.
     body: IOBufChain,
     /// Optional extra response headers (Alt-Svc, Cache-Control, etc.)
     /// the app sets via `header`. Inline storage — no per-response Vec.
     extra_headers: [Option<(Bytes, Bytes)>; MAX_EXTRA_HEADERS],
-    /// Set once the handler streams via `write` (vs a one-shot buffered
-    /// body). Phase 0 ignores it (both paths buffer); later phases use
-    /// it to route writes to the live `ResponseSink`.
-    streaming: bool,
-    /// A lazily-pulled streaming body (`stream_body`). When set, the
-    /// transport drives the producer chunk-by-chunk onto the wire with
-    /// backpressure instead of sending a materialised `body` — so peak
-    /// memory stays `O(chunk)`. Mutually exclusive with a buffered
-    /// `body` in practice (a handler picks one).
-    producer: Option<alloc::boxed::Box<dyn crate::stream::ResponseBodyProducer>>,
+    /// Live write sink, wired by the transport when the connection can
+    /// stream a response in-handler (h1, request bodyless). When set,
+    /// `write`/`finish` push to the wire (bounded `O(chunk)`); when
+    /// `None`, `write` appends to the buffered `body` (h2/h3, or h1 with
+    /// a request body in flight). A handler that returns a buffered
+    /// `Response` value (`*res = Response::ok(..)`) leaves this `None` —
+    /// the transport sends the buffered body afterward.
+    sink: Option<&'s mut dyn crate::stream::ResponseSink>,
+    /// Set once the head has gone out via the `sink` (first `write`), so
+    /// `finish` and the transport know the response is already on the
+    /// wire (streamed) vs still buffered.
+    head_sent: bool,
     /// Echo mode (`echo_request`): the response body **is** the request
-    /// body, spliced straight back. The transport reads request-body
-    /// chunks and writes each back out, bounded `O(chunk)` — the
-    /// streaming echo for large payloads. h1 splices in the serve loop
-    /// (`recv_chunk → into_owned → send`, sequential, no read/write
-    /// split needed); h2/h3 drain the request body into `body`
-    /// (materialise — correct, not yet bounded).
+    /// body, spliced straight back, bounded `O(chunk)`. h1 splices in
+    /// the serve loop (`recv_chunk → into_owned → send`, sequential —
+    /// sound on plaintext AND TLS, unlike a concurrent read/write
+    /// split); h2/h3 drain the request body into `body` (materialise).
     echo: bool,
 }
 
@@ -80,13 +84,13 @@ pub struct Response {
 // (static-borrow branch is 'static, heap branch is Box<[u8]>; no
 // thread-local interior mutability).
 
-impl Default for Response {
+impl Default for Response<'_> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Response {
+impl<'s> Response<'s> {
     /// A blank `200` the transport hands to the handler as `&mut
     /// Response`; the handler overwrites the head + body via the
     /// builder methods (`ok` / `status` / `write` / …).
@@ -96,8 +100,8 @@ impl Response {
             content_type: IOBuf::from_static(b"application/octet-stream"),
             body: IOBufChain::new(),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
-            streaming: false,
-            producer: None,
+            sink: None,
+            head_sent: false,
             echo: false,
         }
     }
@@ -112,8 +116,8 @@ impl Response {
             content_type: content_type.into(),
             body: body.into(),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
-            streaming: false,
-            producer: None,
+            sink: None,
+            head_sent: false,
             echo: false,
         }
     }
@@ -125,8 +129,8 @@ impl Response {
             content_type: IOBuf::from_static(b"text/plain"),
             body: IOBuf::from_static(b"Not Found").into(),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
-            streaming: false,
-            producer: None,
+            sink: None,
+            head_sent: false,
             echo: false,
         }
     }
@@ -142,8 +146,8 @@ impl Response {
             content_type: IOBuf::from_static(b"text/plain"),
             body: IOBuf::from_static(b"Bad Request").into(),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
-            streaming: false,
-            producer: None,
+            sink: None,
+            head_sent: false,
             echo: false,
         }
     }
@@ -157,8 +161,8 @@ impl Response {
             content_type: IOBuf::from_static(b"text/plain"),
             body: IOBuf::from_static(b"").into(),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
-            streaming: false,
-            producer: None,
+            sink: None,
+            head_sent: false,
             echo: false,
         }
         .with_header(b"Location", location)
@@ -198,26 +202,60 @@ impl Response {
         self
     }
 
-    /// Hand the response a **lazily-pulled streaming body** — the
-    /// transport drives `producer.next()` chunk-by-chunk onto the wire
-    /// with backpressure, so peak memory stays `O(chunk)` rather than
-    /// `O(response size)`. Sets the content-type + producer; set
-    /// `status`/`header` first if non-default. For generated / computed
-    /// large bodies; see [`ResponseBodyProducer`](crate::ResponseBodyProducer).
-    pub fn stream_body(
-        &mut self,
-        content_type: impl Into<Bytes>,
-        producer: alloc::boxed::Box<dyn crate::stream::ResponseBodyProducer>,
-    ) -> &mut Self {
-        self.content_type = content_type.into();
-        self.producer = Some(producer);
-        self.streaming = true;
-        self
+    /// Build a `200` wired to a live write `sink` — the transport hands
+    /// this to the handler when the connection can stream a response
+    /// in-handler. The handler then either `write`s (streams, bounded)
+    /// or sets a buffered body (`*res = Response::ok(..)`, which clears
+    /// the sink; the transport sends the buffer afterward).
+    pub fn with_sink(sink: &'s mut dyn crate::stream::ResponseSink) -> Self {
+        Response {
+            status: 200,
+            content_type: IOBuf::from_static(b"application/octet-stream"),
+            body: IOBufChain::new(),
+            extra_headers: [const { None }; MAX_EXTRA_HEADERS],
+            sink: Some(sink),
+            head_sent: false,
+            echo: false,
+        }
     }
 
-    /// `true` if the handler installed a streaming-body producer.
-    pub fn has_stream(&self) -> bool {
-        self.producer.is_some()
+    /// `true` once the handler streamed via `write` (the head went out
+    /// over the sink). The transport uses this to finish the streamed
+    /// response vs send the still-buffered one.
+    pub fn is_streamed(&self) -> bool {
+        self.head_sent
+    }
+
+    /// Consume the response into its buffered parts `(status,
+    /// content_type, body, extra_headers)`, dropping the sink borrow.
+    /// The transport calls this on the buffered path to send the parts
+    /// after releasing the (now unused) sink.
+    #[allow(clippy::type_complexity)]
+    pub fn into_parts(
+        self,
+    ) -> (i32, Bytes, IOBufChain, [Option<(Bytes, Bytes)>; MAX_EXTRA_HEADERS]) {
+        (self.status, self.content_type, self.body, self.extra_headers)
+    }
+
+    /// Install an owned, fully-built response's data into this slot,
+    /// leaving the live `sink` borrow intact. This is how a handler
+    /// returns a *buffered* response through the `&mut Response` API:
+    /// `res.set(Response::ok(ct, body))` or `res.set(match path { .. })`.
+    ///
+    /// It exists because `Response<'s>` is **invariant** in `'s` (the
+    /// `&'s mut dyn ResponseSink` sink) — `*res = other` can't coerce an
+    /// owned `Response<'static>` into the handler's `Response<'c>`. Moving
+    /// only the data fields (status / content-type / body / headers)
+    /// sidesteps that and keeps the slot's sink usable. `head_sent` is
+    /// untouched (the buffered path runs with it `false`); `echo` is
+    /// cleared since a buffered body is never an echo.
+    pub fn set(&mut self, other: Response<'static>) {
+        let (status, content_type, body, extra_headers) = other.into_parts();
+        self.status = status;
+        self.content_type = content_type;
+        self.body = body;
+        self.extra_headers = extra_headers;
+        self.echo = false;
     }
 
     /// **Echo mode**: stream the request body straight back as the
@@ -237,45 +275,60 @@ impl Response {
         self.echo
     }
 
-    /// Take the streaming-body producer for the transport to drive
-    /// (leaving `None`). The transport pulls `next()` + writes each
-    /// chunk with backpressure.
-    pub fn take_stream(
-        &mut self,
-    ) -> Option<alloc::boxed::Box<dyn crate::stream::ResponseBodyProducer>> {
-        self.producer.take()
-    }
-
-    /// Drain any streaming-body producer into the buffered `body`,
-    /// turning a streaming response into a materialised one. The
-    /// fallback for transports that don't (yet) stream on the wire
-    /// (h2/h3 today): correct output, but `O(response size)` memory —
-    /// the bounded-memory win is h1-only until the per-transport
-    /// streaming sinks land. No-op when there's no producer.
-    pub async fn materialize(&mut self) {
-        if let Some(mut producer) = self.producer.take() {
-            while let Some(chunk) = producer.next().await {
-                self.body.push_back(chunk);
+    /// Push one body chunk. When a live `sink` is wired (h1, streamable
+    /// request) the chunk goes **straight to the wire** — the head is
+    /// flushed lazily on the first `write`, then each chunk is awaited
+    /// (backpressure), so peak memory is `O(chunk)`. With no sink (h2/h3,
+    /// or h1 with a request body in flight) it appends to the buffered
+    /// `body` instead (correct, `O(body)`). Set the head (status /
+    /// content-type / headers) before the first `write`.
+    pub async fn write(&mut self, buf: &[u8]) -> Result<(), ()> {
+        if let Some(sink) = self.sink.as_mut() {
+            if !self.head_sent {
+                // Flush the head once. Gather the extra headers into a
+                // stack slice; `self.content_type` / `self.extra_headers`
+                // and `self.sink` are disjoint fields, so this borrows
+                // cleanly.
+                let mut hdrs: [(&[u8], &[u8]); MAX_EXTRA_HEADERS] =
+                    [(&[][..], &[][..]); MAX_EXTRA_HEADERS];
+                let mut n = 0;
+                for (name, value) in self.extra_headers.iter().flatten() {
+                    hdrs[n] = (name.data(), value.data());
+                    n += 1;
+                }
+                sink.send_head(self.status, self.content_type.data(), &hdrs[..n])
+                    .await?;
+                self.head_sent = true;
             }
+            sink.write_chunk(buf).await
+        } else {
+            self.body.push_back(IOBuf::from_slice_with_headroom(0, buf, 0));
+            Ok(())
         }
     }
 
-    /// Stream one body chunk. **Phase 0**: appends to the buffered body
-    /// (the transport sends it after the handler returns). Later phases
-    /// route this to the transport's live `ResponseSink` so the bytes
-    /// hit the wire immediately and backpressure applies here. Set the
-    /// head (status / content-type / headers) before the first `write`.
-    pub async fn write(&mut self, buf: &[u8]) -> Result<(), ()> {
-        self.streaming = true;
-        self.body.push_back(IOBuf::from_slice_with_headroom(0, buf, 0));
-        Ok(())
-    }
-
-    /// Finish a streamed response. **Phase 0**: a no-op (the buffered
-    /// body is sent at handler return); later phases flush the sink's
-    /// end-of-stream marker.
+    /// End a streamed response. Over a live sink, flushes the head first
+    /// if the handler wrote no body (an empty streamed response), then
+    /// ends the body. A no-op when there's no sink (the buffered body is
+    /// sent by the transport after the handler returns).
     pub async fn finish(&mut self) -> Result<(), ()> {
-        Ok(())
+        if let Some(sink) = self.sink.as_mut() {
+            if !self.head_sent {
+                let mut hdrs: [(&[u8], &[u8]); MAX_EXTRA_HEADERS] =
+                    [(&[][..], &[][..]); MAX_EXTRA_HEADERS];
+                let mut n = 0;
+                for (name, value) in self.extra_headers.iter().flatten() {
+                    hdrs[n] = (name.data(), value.data());
+                    n += 1;
+                }
+                sink.send_head(self.status, self.content_type.data(), &hdrs[..n])
+                    .await?;
+                self.head_sent = true;
+            }
+            sink.finish().await
+        } else {
+            Ok(())
+        }
     }
 
     /// Iterate the extra headers set via `header`. Used by the HTTP/1.1
@@ -323,29 +376,79 @@ pub fn bytes_owned(v: alloc::vec::Vec<u8>) -> IOBuf {
 // ---- Response sender --------------------------------------------------------
 
 /// Serialise an HTTP/1.1 response head (status line + headers,
-/// terminated by `\r\n\r\n`) into a heap-backed `IOBuf` whose
-/// reserves were sized for the transport stack. The body is NOT
-/// appended here — the caller `push_front`s this IOBuf onto the
-/// response body chain and lets the transport stitch the parts.
+/// terminated by `\r\n\r\n`) into the caller's `IOBuf` from a
+/// `&Response`. The body is NOT appended here — the caller chains the
+/// response body parts after this head. A thin adapter over
+/// [`write_response_head_parts`] (the single implementation): it flattens
+/// the response's extra headers and forwards the status / content-type /
+/// body length. Extra headers (`Alt-Svc`, `Cache-Control`, …) come from
+/// `resp.extra_headers()`; apps add them via `Response::with_header`.
+pub(crate) fn write_response_into_iobuf(buf: &mut IOBuf, resp: &Response<'_>, keep_alive: bool) {
+    let (hdrs, n) = gather_extra_headers(resp);
+    write_response_head_parts(
+        buf,
+        resp.status,
+        resp.content_type_bytes(),
+        &hdrs[..n],
+        resp.body_len(),
+        keep_alive,
+    );
+}
+
+/// Serialise the head for an HTTP/1.1 **streaming** response — no
+/// `Content-Length` (the streamed length is unknown up front), so the
+/// body is delimited by connection close and `Connection: close` is
+/// forced. The transport writes this head, then streams the body
+/// chunk-by-chunk, then closes. (A future revision could switch to
+/// `Transfer-Encoding: chunked` to keep the connection alive across a
+/// streamed response.)
+pub(crate) fn write_streaming_head_into_iobuf(buf: &mut IOBuf, resp: &Response<'_>) {
+    let (hdrs, n) = gather_extra_headers(resp);
+    write_streaming_head_parts(buf, resp.status, resp.content_type_bytes(), &hdrs[..n]);
+}
+
+/// Flatten a response's optional extra-header slots into a stack array
+/// of `(name, value)` byte slices plus a count — the shape the
+/// `*_parts` head writers take. Borrows `resp`, so the returned slices
+/// live as long as the borrow.
+#[allow(clippy::type_complexity)]
+fn gather_extra_headers<'r>(
+    resp: &'r Response<'_>,
+) -> ([(&'r [u8], &'r [u8]); MAX_EXTRA_HEADERS], usize) {
+    let mut hdrs: [(&[u8], &[u8]); MAX_EXTRA_HEADERS] = [(&[][..], &[][..]); MAX_EXTRA_HEADERS];
+    let mut n = 0;
+    for (name, value) in resp.extra_headers() {
+        hdrs[n] = (name, value);
+        n += 1;
+    }
+    (hdrs, n)
+}
+
+/// Buffered-response head from explicit parts (status / content-type /
+/// extra headers / body length). The single head-serialisation
+/// implementation; the `&Response` writer above delegates here. Used
+/// directly by the h1 serve loop's bodyless-buffered path after it has
+/// split the response into [`Response::into_parts`].
 ///
-/// Hot path — called once per HTTP request. `core::fmt`'s
-/// machinery (format-string walker, Display vtable dispatch,
-/// padding logic) adds up at hundreds of thousands of req/s; the
-/// manual byte-level `append_slice` calls here plus a small itoa
-/// for the only variable integer (`Content-Length`) measurably
-/// outperform `write!(...)`.
+/// `append_slice` returns `Err(NoTailroom)` if we exceed the IOBuf's
+/// reserved capacity. The caller picks `HEADER_BUF_SIZE` bytes well
+/// above the realistic header total (~ a few hundred bytes), so an
+/// `Err` here means the head was truncated. `debug_assert` panics in
+/// tests; release builds silently truncate.
 ///
-/// Extra headers (`Alt-Svc`, `Cache-Control`, `Set-Cookie`, etc.)
-/// are pulled from `resp.extra_headers()` — apps add them via
-/// `Response::with_header`. The framework no longer hardcodes any
-/// optional header itself; per-response branches live in app code.
-pub(crate) fn write_response_into_iobuf(buf: &mut IOBuf, resp: &Response, keep_alive: bool) {
-    // `append_slice` returns `Err(NoTailroom)` if we exceed the
-    // IOBuf's reserved capacity. The caller picks `HEADER_BUF_SIZE`
-    // bytes well above the realistic header total (~ a few hundred
-    // bytes), so an `Err` here means the producer truncated the
-    // response head. `debug_assert` panics in tests; release builds
-    // silently truncate.
+/// Hot path — called once per HTTP request. `core::fmt`'s machinery
+/// (format-string walker, Display vtable dispatch, padding logic) adds
+/// up at hundreds of thousands of req/s; the manual byte-level
+/// `append_slice` calls plus a small itoa for the only variable integer
+/// (`Content-Length`) measurably outperform `write!(...)`.
+pub(crate) fn write_response_head_parts(
+    buf: &mut IOBuf,
+    status: i32,
+    content_type: &[u8],
+    extra_headers: &[(&[u8], &[u8])],
+    content_length: usize,
+    keep_alive: bool,
+) {
     macro_rules! push {
         ($data:expr) => {{
             let r = buf.append_slice($data);
@@ -353,39 +456,38 @@ pub(crate) fn write_response_into_iobuf(buf: &mut IOBuf, resp: &Response, keep_a
             let _ = r;
         }};
     }
-
     push!(b"HTTP/1.1 ");
     let mut status_buf = [0u8; 4];
-    let status_len = write_status_code(&mut status_buf, resp.status);
+    let status_len = write_status_code(&mut status_buf, status);
     push!(&status_buf[..status_len]);
     push!(b" ");
-    push!(status_text(resp.status).as_bytes());
+    push!(status_text(status).as_bytes());
     push!(b"\r\nContent-Type: ");
-    push!(resp.content_type_bytes());
+    push!(content_type);
     push!(b"\r\nContent-Length: ");
     let mut len_buf = [0u8; 20];
-    let len_len = write_usize(&mut len_buf, resp.body_len());
+    let len_len = write_usize(&mut len_buf, content_length);
     push!(&len_buf[..len_len]);
     push!(b"\r\nConnection: ");
     push!(if keep_alive { b"keep-alive" } else { b"close" });
     push!(b"\r\n");
-    for (name, value) in resp.extra_headers() {
-        push!(name);
+    for (name, value) in extra_headers {
+        push!(*name);
         push!(b": ");
-        push!(value);
+        push!(*value);
         push!(b"\r\n");
     }
     push!(b"\r\n");
 }
 
-/// Serialise the head for an HTTP/1.1 **streaming** response — no
-/// `Content-Length` (the producer-driven length is unknown up front),
-/// so the body is delimited by connection close and `Connection: close`
-/// is forced. The transport writes this head, then drives the producer
-/// chunk-by-chunk, then closes. (A future revision could switch to
-/// `Transfer-Encoding: chunked` to keep the connection alive across a
-/// streamed response.)
-pub(crate) fn write_streaming_head_into_iobuf(buf: &mut IOBuf, resp: &Response) {
+/// Streamed-response head (no `Content-Length`, `Connection: close`)
+/// from explicit parts — the `ResponseSink::send_head` head writer.
+pub(crate) fn write_streaming_head_parts(
+    buf: &mut IOBuf,
+    status: i32,
+    content_type: &[u8],
+    extra_headers: &[(&[u8], &[u8])],
+) {
     macro_rules! push {
         ($data:expr) => {{
             let r = buf.append_slice($data);
@@ -395,17 +497,17 @@ pub(crate) fn write_streaming_head_into_iobuf(buf: &mut IOBuf, resp: &Response) 
     }
     push!(b"HTTP/1.1 ");
     let mut status_buf = [0u8; 4];
-    let status_len = write_status_code(&mut status_buf, resp.status);
+    let status_len = write_status_code(&mut status_buf, status);
     push!(&status_buf[..status_len]);
     push!(b" ");
-    push!(status_text(resp.status).as_bytes());
+    push!(status_text(status).as_bytes());
     push!(b"\r\nContent-Type: ");
-    push!(resp.content_type_bytes());
+    push!(content_type);
     push!(b"\r\nConnection: close\r\n");
-    for (name, value) in resp.extra_headers() {
-        push!(name);
+    for (name, value) in extra_headers {
+        push!(*name);
         push!(b": ");
-        push!(value);
+        push!(*value);
         push!(b"\r\n");
     }
     push!(b"\r\n");

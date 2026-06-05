@@ -114,7 +114,7 @@ fn now_cycles() -> u64 {
 pub async fn serve_conn<S, H>(handler: Arc<H>, mut stream: S)
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
+    H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()> + 'static,
 {
     // One-time lazy-init of the shared Huffman tree (matches
     // http3::listen / tls::preinit — keeps the first request's alloc
@@ -250,7 +250,7 @@ struct H2Conn {
     /// Responses produced by spawned handler tasks, awaiting framing.
     /// The task pushes `(stream_id, response)`; the demux drains into
     /// `out_queue`. Shared (the tasks hold a clone).
-    resp_sink: Rc<RefCell<VecDeque<(u32, Response)>>>,
+    resp_sink: Rc<RefCell<VecDeque<(u32, Response<'static>)>>>,
     /// Set by handler tasks when a response is ready or body bytes were
     /// consumed (credit to emit). The demux is the single waiter.
     demux_wake: Rc<AsyncEvent>,
@@ -346,7 +346,7 @@ impl H2Conn {
 
     /// Frame a finished `Response` onto `out_queue` (headers + body),
     /// honouring the per-stream initial send window.
-    fn queue_response(&mut self, sid: u32, resp: Response) {
+    fn queue_response(&mut self, sid: u32, resp: Response<'static>) {
         let mut header_block = Vec::with_capacity(64);
         let __e0 = now_cycles();
         encode_response_headers(&resp, &mut header_block);
@@ -764,7 +764,7 @@ async fn process_frame<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
+    H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()> + 'static,
 {
     // A header block in mid-assembly forbids interleaving: only a
     // CONTINUATION on the same stream may follow (RFC 7540 §6.2).
@@ -858,7 +858,7 @@ async fn process_headers<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
+    H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()> + 'static,
 {
     if hdr.stream_id == 0 || hdr.stream_id.is_multiple_of(2) {
         // Client streams are non-zero and odd (RFC 7540 §5.1.1).
@@ -891,7 +891,7 @@ async fn continue_headers<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
+    H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()> + 'static,
 {
     {
         let asm = conn.header_asm.as_mut().expect("checked by caller");
@@ -922,7 +922,7 @@ async fn complete_headers<S, H>(
 ) -> Result<(), u32>
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
+    H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()> + 'static,
 {
     let mut req = RequestHead::new();
     let __d0 = now_cycles();
@@ -1041,7 +1041,7 @@ fn parse_content_length(v: Option<&[u8]>) -> Option<usize> {
 /// runs to completion and frees its own slot).
 fn spawn_streaming<H>(conn: &mut H2Conn, handler: &Arc<H>, sid: u32, req: RequestHead) -> bool
 where
-    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
+    H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()> + 'static,
 {
     let content_length = parse_content_length(req.header(b"content-length"));
     let body = Rc::new(StreamBody {
@@ -1089,8 +1089,6 @@ where
                 }
             }
         }
-        // h2 buffers; drain any streaming producer (correct, not bounded).
-        res.materialize().await;
         crate::diag::COUNTERS.requests_handled.bump();
         sink.borrow_mut().push_back((sid, res));
         demux_wake.set();
@@ -1256,7 +1254,7 @@ async fn dispatch_bodyless<S, H>(
     req: RequestHead,
 ) where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + 'static,
+    H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()> + 'static,
 {
     crate::diag::COUNTERS.requests_received.bump();
     let mut res = Response::new();
@@ -1265,9 +1263,6 @@ async fn dispatch_bodyless<S, H>(
         let mut request = Request::new(&req, body);
         let _ = (**handler)(&mut request, &mut res).await;
     }
-    // h2 buffers; drain any streaming producer into the body (correct,
-    // not yet bounded — h2 streaming sink is a later phase).
-    res.materialize().await;
     crate::diag::COUNTERS.requests_handled.bump();
     conn.queue_response(sid, res);
 }
@@ -1346,7 +1341,7 @@ fn data_payload(payload: &[u8], fl: u8) -> Option<&[u8]> {
 }
 
 /// Encode a `Response`'s header section as an HPACK header block.
-fn encode_response_headers(resp: &Response, out: &mut Vec<u8>) {
+fn encode_response_headers(resp: &Response<'_>, out: &mut Vec<u8>) {
     let status = status_to_3digits(resp.status);
     let mut len_buf = [0u8; 20];
     let len_off = format_usize(resp.body_len(), &mut len_buf);

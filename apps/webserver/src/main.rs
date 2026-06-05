@@ -255,20 +255,23 @@ async fn gateway(mut stream: TcpStream, backend_ip: [u8; 4]) {
 
 // ---- Request dispatch -------------------------------------------------------
 
-async fn handle_request(req: &mut Request<'_>, res: &mut Response) -> Result<(), ()> {
-    // Streaming generated body: hands the response a producer the
-    // transport drives chunk-by-chunk with backpressure, so peak memory
-    // stays O(chunk) on h1 (the connection-close-delimited streaming
-    // path) — a 1 GiB body streams fine on a 512 MiB VM, which buffering
-    // could not. (On h2/h3 today this materialises — see
-    // docs/streaming-response.md; don't fetch the huge size there yet.)
+async fn handle_request(req: &mut Request<'_>, res: &mut Response<'_>) -> Result<(), ()> {
+    // Streaming generated body: the handler **pushes** chunks via
+    // `res.write()`. On h1 each chunk goes straight to the wire with TCP
+    // backpressure, so peak memory stays O(chunk) — a 1 GiB body streams
+    // fine on a 512 MiB VM, which buffering could not. (On h2/h3 today
+    // `res.write` buffers — see docs/streaming-response.md; don't fetch
+    // the huge size there yet.)
     if req.path() == b"/stream" {
-        res.stream_body(
-            b"application/octet-stream",
-            alloc::boxed::Box::new(ZeroStream {
-                remaining: 1024 * 1024 * 1024,
-            }),
-        );
+        res.content_type(b"application/octet-stream");
+        let zeros = STATIC_64K_BYTES.get(); // 64 KiB of zeros, reused
+        let mut remaining: usize = 1024 * 1024 * 1024;
+        while remaining > 0 {
+            let n = remaining.min(zeros.len());
+            res.write(&zeros[..n]).await?;
+            remaining -= n;
+        }
+        res.finish().await?;
         return Ok(());
     }
     // Streaming echo: splice the POST body straight back out. h1 streams
@@ -297,10 +300,10 @@ async fn handle_request(req: &mut Request<'_>, res: &mut Response) -> Result<(),
         while let Some(chunk) = req.read_chunk().await {
             core::hint::black_box(chunk.data().len());
         }
-        *res = Response::ok(b"application/json", b"{\"status\":\"discarded\"}");
+        res.set(Response::ok(b"application/json", b"{\"status\":\"discarded\"}"));
         return Ok(());
     }
-    *res = match req.path() {
+    res.set(match req.path() {
         // ── HTML pages ───────────────────────────────────────────
         b"/" => page_home(),
         b"/architecture" => page_architecture(),
@@ -348,34 +351,8 @@ async fn handle_request(req: &mut Request<'_>, res: &mut Response) -> Result<(),
         b"/diag-gve" => diag_gve_response(),
 
         _ => Response::not_found(),
-    };
+    });
     Ok(())
-}
-
-/// Streaming-body producer that yields `remaining` bytes of zeros in
-/// fixed 64 KiB chunks — a generated large body for the `/stream`
-/// endpoint. Each `next()` allocates one chunk; the transport sends it
-/// (backpressure) and drops it before the next pull, so peak memory is
-/// one chunk regardless of the total. Demonstrates the streaming
-/// response path (docs/streaming-response.md).
-struct ZeroStream {
-    remaining: usize,
-}
-
-impl http::ResponseBodyProducer for ZeroStream {
-    fn next(
-        &mut self,
-    ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Option<http::IOBuf>> + '_>>
-    {
-        alloc::boxed::Box::pin(async move {
-            if self.remaining == 0 {
-                return None;
-            }
-            let n = self.remaining.min(64 * 1024);
-            self.remaining -= n;
-            Some(http::IOBuf::from(alloc::vec![0u8; n]))
-        })
-    }
 }
 
 fn log_boot_info() {

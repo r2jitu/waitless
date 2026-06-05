@@ -5,15 +5,79 @@
 // pump that plain-HTTP / HTTPS / HTTP/3 all drive (each through
 // its own `HttpStream` impl).
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
+use core::future::Future;
+use core::pin::Pin;
 
 use iobuf::{IOBuf, IOBufChain};
 
 use crate::body::BodyReader;
 use crate::request::{Request, RequestHead};
-use crate::response::{Response, write_response_into_iobuf};
-use crate::stream::HttpStream;
+use crate::response::{
+    Bytes, Response, write_response_head_parts, write_response_into_iobuf,
+    write_streaming_head_parts,
+};
+use crate::MAX_EXTRA_HEADERS;
+use crate::stream::{HttpStream, ResponseSink};
 use crate::streaming;
+
+/// The h1 [`ResponseSink`]: streams a handler's `res.write()` chunks
+/// straight onto the connection. Wired by `serve_conn` for a bodyless
+/// request (the read half is idle, so the sink can hold the stream).
+/// The head goes out close-delimited (`Connection: close`) on the first
+/// chunk; each chunk is its own awaited `send`, so the handler is paced
+/// by TCP backpressure and per-connection peak memory is `O(chunk)`.
+/// Generic over `S`, so it streams over plaintext **and** TLS h1 — only
+/// `send`/`recv` are used (no read/write split, which TLS can't do
+/// soundly), and a streamed response touches send-only.
+struct H1Sink<'a, S: HttpStream> {
+    stream: &'a mut S,
+    out: IOBufChain,
+}
+
+impl<'a, S: HttpStream> H1Sink<'a, S> {
+    fn new(stream: &'a mut S) -> Self {
+        H1Sink {
+            stream,
+            out: IOBufChain::new(),
+        }
+    }
+}
+
+impl<S: HttpStream> ResponseSink for H1Sink<'_, S> {
+    fn send_head(
+        &mut self,
+        status: i32,
+        content_type: &[u8],
+        extra_headers: &[(&[u8], &[u8])],
+    ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
+        // Build the close-delimited head into a small heap IOBuf (one
+        // alloc on the cold streaming path) and ship it.
+        let mut head = crate::body_iobuf(512);
+        write_streaming_head_parts(&mut head, status, content_type, extra_headers);
+        Box::pin(async move {
+            self.out.clear();
+            self.out.push_back(head);
+            self.stream.send(&mut self.out).await
+        })
+    }
+
+    fn write_chunk(&mut self, buf: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
+        let chunk = IOBuf::from_slice_with_headroom(0, buf, 0);
+        Box::pin(async move {
+            self.out.clear();
+            self.out.push_back(chunk);
+            self.stream.send(&mut self.out).await
+        })
+    }
+
+    fn finish(&mut self) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
+        // Close-delimited: nothing to flush; the serve loop closes the
+        // connection after a streamed response.
+        Box::pin(async { Ok(()) })
+    }
+}
 
 /// Idle-connection timeout. After this long without inbound data,
 /// the per-conn task tears down the connection and releases its
@@ -74,7 +138,7 @@ fn now_cycles() -> u64 {
 /// so a slow handler suspends only its own connection.
 pub fn listen<H>(port: u16, handler: H) -> Result<(), waitless::runtime::TcpBindError>
 where
-    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + Send + Sync + 'static,
+    H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()> + Send + Sync + 'static,
 {
     let listener = waitless::runtime::TcpListener::bind(port)?;
     let handler = Arc::new(handler);
@@ -112,7 +176,7 @@ where
 pub async fn serve_conn<S, H>(handler: Arc<H>, mut stream: S)
 where
     S: HttpStream,
-    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()>,
+    H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()>,
 {
     crate::diag::COUNTERS.connections_served.bump();
     // The reused request HEAD (parser storage). The handler sees a
@@ -203,9 +267,107 @@ where
         crate::diag::COUNTERS.requests_parsed.bump();
         let content_length = req.content_length;
 
-        let want_close;
+        let want_close = if req.reject {
+            true
+        } else {
+            match req.header(b"Connection") {
+                Some(v) => v.eq_ignore_ascii_case(b"close"),
+                None => false,
+            }
+        };
+
+        // BODYLESS streaming-capable path. A request with no body leaves
+        // the read half idle, so we wire a live `H1Sink` for the handler
+        // — `res.write()` then streams chunks straight to the wire
+        // (bounded O(chunk)). A handler that instead sets a buffered body
+        // (`*res = Response::ok(..)`) leaves the sink unused; we send that
+        // buffer afterward through the same borrowed-head path as the
+        // body branch (so `/health` etc. stay zero-alloc). A request
+        // *with* a body keeps the read half and can't also hold a write
+        // sink, so it takes the body branch below (`res.write` buffers
+        // there; bounded echo uses the serve-loop splice).
+        if !req.reject && content_length == 0 {
+            let streamed;
+            #[allow(clippy::type_complexity)]
+            let buffered: Option<(i32, Bytes, IOBufChain, [Option<(Bytes, Bytes)>; MAX_EXTRA_HEADERS])>;
+            {
+                let mut sink = H1Sink::new(&mut stream);
+                let mut res = Response::with_sink(&mut sink);
+                let empty = BodyReader::new(None, &[], 0);
+                let mut request = Request::new(&req, empty);
+                let __h0 = now_cycles();
+                let r = (*handler)(&mut request, &mut res).await;
+                crate::diag::COUNTERS
+                    .handler_cycles
+                    .add(now_cycles().wrapping_sub(__h0));
+                if r.is_err() {
+                    crate::diag::COUNTERS.send_failed.bump();
+                    return;
+                }
+                if res.is_streamed() {
+                    if res.finish().await.is_err() {
+                        crate::diag::COUNTERS.send_failed.bump();
+                        return;
+                    }
+                    streamed = true;
+                    buffered = None;
+                } else {
+                    streamed = false;
+                    buffered = Some(res.into_parts());
+                }
+            } // `sink` dropped → `stream` free again
+            if streamed {
+                crate::diag::COUNTERS.responses_sent.bump();
+                let _ = stream.close().await; // streamed = close-delimited
+                return;
+            }
+            // Buffered bodyless response: same borrowed-head + chain send
+            // as the body branch (zero-alloc head).
+            let (status, content_type, body, extra) =
+                buffered.expect("buffered set when !streamed");
+            let mut header = unsafe {
+                IOBuf::borrow(
+                    core::ptr::NonNull::new_unchecked(header_storage.as_mut_ptr()),
+                    HEADER_BUF_SIZE as u32,
+                    0,
+                    0,
+                )
+            };
+            let mut hdrs: [(&[u8], &[u8]); MAX_EXTRA_HEADERS] =
+                [(&[][..], &[][..]); MAX_EXTRA_HEADERS];
+            let mut nh = 0;
+            for (name, value) in extra.iter().flatten() {
+                hdrs[nh] = (name.data(), value.data());
+                nh += 1;
+            }
+            write_response_head_parts(
+                &mut header,
+                status,
+                content_type.data(),
+                &hdrs[..nh],
+                body.total_len(),
+                !want_close,
+            );
+            out_chain.clear(); // empty at loop top, but match the body branch
+            out_chain.push_back(header);
+            for part in body.into_parts() {
+                out_chain.push_back(part);
+            }
+            if stream.send(&mut out_chain).await.is_err() {
+                crate::diag::COUNTERS.send_failed.bump();
+                return;
+            }
+            crate::diag::COUNTERS.responses_sent.bump();
+            if want_close {
+                let _ = stream.close().await;
+                return;
+            }
+            continue; // keep-alive: `carry` holds the next pipelined request
+        }
+
         // The outbound message the handler fills (buffered body via
-        // `res.ok(..)`, or — later phases — streamed via `res.write`).
+        // `*res = Response::ok(..)`; `res.write` here buffers since this
+        // path has no live sink — a request body holds the read half).
         let mut res = Response::new();
         // Post-body residue captured by BodyReader when a fresh-recv
         // chunk straddled the Content-Length boundary. None in every
@@ -218,14 +380,9 @@ where
         if req.reject {
             crate::diag::record_reject(&req);
             res = Response::bad_request();
-            want_close = true;
             body_leftover = None;
             do_echo = false;
         } else {
-            want_close = match req.header(b"Connection") {
-                Some(v) => v.eq_ignore_ascii_case(b"close"),
-                None => false,
-            };
             let body_drained_ok;
             {
                 // Body prebuf comes from `carry` (the bytes that
@@ -344,43 +501,6 @@ where
                     }
                     // Peer closed before Content-Length — echo what we got.
                     None => break,
-                }
-            }
-            out_chain.clear();
-            crate::diag::COUNTERS.responses_sent.bump();
-            let _ = stream.close().await;
-            return;
-        }
-
-        // Streaming response (handler installed a body producer): write
-        // a close-delimited head, then drive the producer chunk-by-chunk
-        // onto the wire. `send` applies backpressure (TCP cwnd/rwnd), so
-        // the producer is pulled only as fast as the wire drains — peak
-        // memory stays O(chunk), not O(response size). Connection-close-
-        // delimited (no Content-Length), so the conn ends after.
-        if res.has_stream() {
-            let mut head = unsafe {
-                IOBuf::borrow(
-                    core::ptr::NonNull::new_unchecked(header_storage.as_mut_ptr()),
-                    HEADER_BUF_SIZE as u32,
-                    0,
-                    0,
-                )
-            };
-            crate::response::write_streaming_head_into_iobuf(&mut head, &res);
-            out_chain.clear();
-            out_chain.push_back(head);
-            if stream.send(&mut out_chain).await.is_err() {
-                crate::diag::COUNTERS.send_failed.bump();
-                return;
-            }
-            let mut producer = res.take_stream().expect("has_stream");
-            while let Some(chunk) = producer.next().await {
-                out_chain.clear();
-                out_chain.push_back(chunk);
-                if stream.send(&mut out_chain).await.is_err() {
-                    crate::diag::COUNTERS.send_failed.bump();
-                    return;
                 }
             }
             out_chain.clear();
@@ -543,7 +663,7 @@ mod serve_conn_tests {
         static OBSERVED: RefCell<Vec<ObservedReq>> = const { RefCell::new(Vec::new()) };
     }
 
-    async fn observe_handler(req: &mut Request<'_>, res: &mut Response) -> Result<(), ()> {
+    async fn observe_handler(req: &mut Request<'_>, res: &mut Response<'_>) -> Result<(), ()> {
         let mut body_bytes = Vec::new();
         while let Some(guard) = req.read_chunk().await {
             body_bytes.extend_from_slice(guard.data());

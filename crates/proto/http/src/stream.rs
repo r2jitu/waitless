@@ -132,30 +132,39 @@ impl<T: HttpStream + ?Sized> BodySource for T {
     }
 }
 
-// ---- ResponseBodyProducer: a lazily-pulled streaming response body -----------
+// ---- ResponseSink: the transport-erased response-write seam ------------------
 
-/// A response body produced **lazily, chunk by chunk** — the TX
-/// counterpart of [`BodySource`]. A handler hands one to the response
-/// (`res.stream_body(ct, producer)`) instead of a materialised body;
-/// the transport then drives `next()` and writes each chunk to the
-/// wire, so the per-connection peak memory stays `O(chunk)` rather than
-/// `O(response size)`. Backpressure: the transport awaits its own send
-/// (TCP cwnd / TLS / h2 window) between pulls, so the producer is pulled
-/// only as fast as the wire drains.
+/// The TX write seam a [`Response`](crate::Response) holds so a handler
+/// can **push** body chunks to the wire as it produces them —
+/// `res.write(chunk).await` routes straight here. The TX counterpart of
+/// [`BodySource`]: the response never names the transport (object-safe,
+/// boxed futures), and `res.write` awaits each `write_chunk`, so the
+/// handler is paced by the wire (backpressure) and per-connection peak
+/// memory stays `O(chunk)` rather than `O(body)`.
 ///
-/// `'static` (owned, no borrows) because the producer outlives the
-/// handler — the transport drives it after the handler returns. That is
-/// why this expresses **generated / computed** bodies (and
-/// read-everything-then-stream); a true interleaved *echo* (read the
-/// request while writing the response) instead needs the in-handler
-/// `write` path + a per-transport read/write split — see
-/// `docs/streaming-response.md`.
+/// `send_head` is invoked once, lazily, on the first `write_chunk` (the
+/// head stays editable until then); a streamed body has no up-front
+/// length, so h1 sends it close-delimited. `finish` ends the body.
 ///
-/// `next` returns a boxed future for object-safety, exactly like
-/// `BodySource::next_chunk`; it lands only on the cold streaming path.
-pub trait ResponseBodyProducer {
-    /// Next body chunk as an owned `IOBuf`, or `None` at end-of-body.
-    fn next(&mut self) -> Pin<Box<dyn Future<Output = Option<IOBuf>> + '_>>;
+/// Wired by the transport for the duration of the handler when the
+/// connection can stream a response (h1, request bodyless so the read
+/// half is idle); otherwise the response has no sink and `res.write`
+/// buffers (h2/h3, or h1 with a request body in flight).
+pub trait ResponseSink {
+    /// Emit the response head (status line + headers), once, before the
+    /// first chunk.
+    fn send_head(
+        &mut self,
+        status: i32,
+        content_type: &[u8],
+        extra_headers: &[(&[u8], &[u8])],
+    ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>>;
+
+    /// Write one body chunk to the wire (awaited → backpressure).
+    fn write_chunk(&mut self, buf: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>>;
+
+    /// End the response body.
+    fn finish(&mut self) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>>;
 }
 
 impl HttpStream for waitless::runtime::TcpStream {

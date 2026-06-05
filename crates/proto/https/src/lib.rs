@@ -63,7 +63,7 @@ pub fn serve<H>(
     key_der: &'static [u8],
 ) -> Result<Served, ServeError>
 where
-    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + Send + Sync + 'static,
+    H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()> + Send + Sync + 'static,
 {
     // One handler, shared across both transports' per-conn tasks.
     let handler = Arc::new(handler);

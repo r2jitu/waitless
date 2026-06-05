@@ -61,7 +61,7 @@ pub fn listen<H>(
     key_der: &'static [u8],
 ) -> Result<(), ListenError>
 where
-    H: for<'a, 'b> AsyncFn(&'a mut Request<'b>, &'a mut Response) -> Result<(), ()> + Send + Sync + 'static,
+    H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()> + Send + Sync + 'static,
 {
     let cfg = TlsServerConfig::from_chain(cert_chain, key_der).ok_or(ListenError::Cert)?;
     let cfg = Arc::new(cfg);

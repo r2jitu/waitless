@@ -154,7 +154,7 @@ pub(crate) fn shell_body(active: &str, title: &str, body: IOBufChain) -> IOBufCh
     chain
 }
 
-pub(crate) fn html_response(active: &str, title: &str, body: impl Into<http::IOBufChain>) -> Response {
+pub(crate) fn html_response(active: &str, title: &str, body: impl Into<http::IOBufChain>) -> Response<'static> {
     Response::ok(
         b"text/html; charset=utf-8",
         shell_body(active, title, body.into()),
@@ -163,7 +163,7 @@ pub(crate) fn html_response(active: &str, title: &str, body: impl Into<http::IOB
 
 // ---- Page bodies ------------------------------------------------------------
 
-pub(crate) fn page_home() -> Response {
+pub(crate) fn page_home() -> Response<'static> {
     let body = "\
 <h1>Waitless</h1>\
 <p class=\"lead\">A bare-metal Rust web server. The whole stack — \
@@ -210,7 +210,7 @@ upgrade to <code>h3</code>; otherwise it rides over HTTP/1.1 + TLS \
     html_response("/", "Home", body)
 }
 
-pub(crate) fn page_architecture() -> Response {
+pub(crate) fn page_architecture() -> Response<'static> {
     let body = "\
 <h1>Architecture</h1>\
 <p class=\"lead\">A unikernel is a single binary that contains <em>all</em> \
@@ -261,7 +261,7 @@ paging-walk.</div>";
     html_response("/architecture", "Architecture", body)
 }
 
-pub(crate) fn page_network() -> Response {
+pub(crate) fn page_network() -> Response<'static> {
     let body = "\
 <h1>Network stack</h1>\
 <p class=\"lead\">L2 through L7 written from scratch. The application \
@@ -301,7 +301,7 @@ write).</p>";
     html_response("/network", "Network", body)
 }
 
-pub(crate) fn page_tls() -> Response {
+pub(crate) fn page_tls() -> Response<'static> {
     let body = "\
 <h1>TLS 1.3</h1>\
 <p class=\"lead\">A hand-rolled TLS 1.3 handshake — no OpenSSL, no \
@@ -346,7 +346,7 @@ For a Chrome-trusted local cert run \
     html_response("/tls", "TLS", body)
 }
 
-pub(crate) fn page_quic() -> Response {
+pub(crate) fn page_quic() -> Response<'static> {
     let body = "\
 <h1>QUIC + HTTP/3</h1>\
 <p class=\"lead\">RFC 9000 (transport), RFC 9001 (TLS-over-QUIC), \
@@ -403,7 +403,7 @@ event on the serial console.</p>";
     html_response("/quic", "QUIC", body)
 }
 
-pub(crate) fn page_diagnostics() -> Response {
+pub(crate) fn page_diagnostics() -> Response<'static> {
     // Build the dynamic body straight into an IOBuf with reserved
     // headroom + tailroom for the TLS record envelope. The previous
     // version allocated a `String::with_capacity(8192)`, grew it as
