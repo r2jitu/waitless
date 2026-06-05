@@ -628,12 +628,11 @@ class WebserverServiceTest(unittest.TestCase):
         """POST a body to `/echo` over HTTP/1.1 and HTTP/2 (TLS) and
         assert it comes back byte-identical.
 
-        `/echo` is the streaming-echo endpoint: the handler just calls
-        `res.echo_request(ct)` and the transport splices the request body
-        straight back as the response body — h1 streams it chunk-by-chunk
-        with bounded `O(chunk)` memory (the serve-loop splice), h2
-        materialises it. This guards the wire round-trip for the
-        `echo_request` API across both transports; the bounded-memory
+        `/echo` is plain handler code — a `req.read_chunk()` ->
+        `res.write()` loop. On h1 the read and write share one connection
+        (the serve loop's RefCell duplex) and stream chunk-by-chunk with
+        bounded `O(chunk)` memory; on h2 `res.write` buffers. This guards
+        the wire round-trip across both transports; the bounded-memory
         proof at >RAM body sizes runs on GCE (HVF's userspace TCP proxy
         is unreliable for large transfers, so we keep this modest)."""
         if not DEV_CERT.is_file():

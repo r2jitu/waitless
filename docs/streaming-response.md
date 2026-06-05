@@ -89,8 +89,8 @@ return the transport sends whatever the handler left:
 res.finish_on_drop_or_return();
 ```
 
-Echo reads `&mut req` and writes `&mut res` — distinct borrows, so the
-simultaneous read+write the echo needs is clean:
+Echo (and any proxy / transform) reads `&mut req` and writes `&mut res`
+in one loop — this is **plain handler code**, no framework echo mode:
 
 ```rust
 res.content_type(b"application/octet-stream");
@@ -99,6 +99,16 @@ while let Some(chunk) = req.read_chunk().await {   // RX backpressure
 }
 res.finish().await
 ```
+
+`req` and `res` are distinct values, but on h1 they draw on the **same
+connection** — the read and the write both need the stream. The serve
+loop resolves that without a read/write split (unsound on TLS): it wraps
+the borrowed stream in a per-connection `RefCell` shared by the body
+source and the response sink (see [Phase 1d]). The handler uses them
+sequentially — `read_chunk` returns *owned* bytes, releasing the stream
+before `res.write` re-borrows it — so the two never overlap, and a
+single per-conn task is the cell's only borrower. Bounded `O(chunk)`
+over plaintext and TLS; on h2/h3 `res.write` buffers (Phase 2–3).
 
 ### Transport seam (unchanged in spirit)
 
@@ -199,11 +209,10 @@ per-stream flow control, `demux_wake`) already exists.
   /echo over h1 echoed back exactly 268,435,456 bytes with the heap flat
   at 3.4 MB** (256 MiB req + 256 MiB resp = 512 MiB would OOM).
 
-  > The serve-loop splice covers pure echo/proxy (the asked-for case). A
-  > *transforming* handler that interleaves its own `read_chunk` +
-  > `write` chunk-by-chunk would still need the in-handler sink +
-  > read/write split (Response<'a>); deferred — the splice delivers the
-  > bounded large-payload echo without it.
+  > The serve-loop splice covered pure echo/proxy but a *transforming*
+  > handler (interleaving its own `read_chunk` + `write`) still needed the
+  > handler to hold the read and write halves at once. [Phase 1d] delivers
+  > exactly that, retiring this splice + the echo-mode flag.
 
 - **Phase 1c — push-model reshape (remove `ResponseBodyProducer`). ✅
   DONE (commits `38582f2` + `380cb08`).** Replaced the pull-model producer
@@ -236,6 +245,42 @@ per-stream flow control, `demux_wake`) already exists.
   >   byte-perfect**, live heap grew **~41 KB** across the echo,
   >   `heap_oom=0`, server live after. Bounded `O(chunk)` confirmed.
 
+- **Phase 1d — app-written duplex echo (retire `echo_request`). ✅ DONE
+  (commit `815c954`).** Echo / proxy / transform is now **plain handler
+  code** — the `read_chunk` → `write` loop in the API section — with no
+  framework echo mode. `serve_conn` wraps the borrowed stream in a
+  per-connection `RefCell<&mut S>` shared by a `CellSource` (request-body
+  reader) and a `CellSink` (response sink): the handler reads the request
+  and streams the response over one connection. Sound without a
+  read/write split because the two are used **sequentially** —
+  `read_chunk` returns *owned* bytes, releasing the cell before
+  `res.write` re-borrows it — and the single per-conn task is the cell's
+  only borrower, so the `borrow_mut` held across `.await` can't be
+  re-entered (`#[allow(await_holding_refcell_ref)]` with that rationale).
+  This is the same `recv → owned → send` discipline the Phase 1b splice
+  used, now driven by the handler over **plaintext and TLS** alike, with
+  no TLS-engine surgery. It unifies `serve_conn` onto one dispatch path
+  (the separate bodyless fork + the do_echo splice are gone) and removes
+  `Response::echo_request`/`is_echo` + the `&Response` head writers; h2/h3
+  drop their `is_echo` materialise blocks (the handler's own loop drains
+  the body into the sink-less response, buffering `O(body)` — Phase 2–3
+  bounds it). `/health` stays zero-alloc (the cell is created but never
+  borrowed when the handler buffers).
+
+  > **Validated on GCE (c3-highcpu-4, gVNIC, production datapath):**
+  > - `/echo` 256 MiB over **TLS h1** via the app-written `read_chunk` →
+  >   `write` loop: exactly 268,435,456 bytes, **`sha256` byte-perfect**,
+  >   live heap grew **~25 KB** across the 256 MiB echo, `heap_oom=0`,
+  >   server live after. The `RefCell`-across-await duplex is correct +
+  >   bounded under real load — no panic, no corruption.
+  > - `/stream` 1 GiB over h1 (now `CellSink`): exactly 1,073,741,824
+  >   bytes, all-zero, live heap **~+275 KB**, `heap_oom=0`.
+  > - `/health` TLS A/B (wrk -t4 -c4000 -d15s, 3 samples): duplex median
+  >   **280.3K rps** (279.0/280.7/280.3) vs `main` median **287.9K**
+  >   (~2.6%, within cross-deploy SPOT variance), **identical per-request
+  >   work (~1 send/req)** → perf-neutral; the cell is created but never
+  >   borrowed on the buffered `/health` path, so it adds no work.
+
 - **Phases 2–3 — native h2/h3 bounded streaming (optimisation).** h2/h3
   currently *materialise* a streamed/echoed body (correct output,
   `O(body)` memory). Bounding them needs the per-transport streaming
@@ -266,3 +311,4 @@ the work counters are the tie-breaker). h2/h3 bounded streaming
 (correct, `O(body)`), so don't point the >RAM `/stream` at them.
 
 [Contract 3]: stack-architecture.md (One handler API)
+[Phase 1d]: #phased-plan
