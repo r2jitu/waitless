@@ -142,14 +142,30 @@ per-stream flow control, `demux_wake`) already exists.
 
 ## Phased plan
 
-- **Phase 0 — API + plumbing (no behaviour change).** Introduce the
-  `(&mut Request, &mut Response) -> Result` handler shape: move the
-  streaming body-read onto `Request`; turn `Response` into the
-  out-message object backed by `&mut dyn ResponseSink`. Ripple through
-  `https::serve` + all three `serve_conn`s + both apps; every transport
-  uses a **buffering** sink (collect head + writes → materialise + send
-  the old way at handler return). Pure refactor, all tests green; the
-  common `res.ok(..)` path is byte-identical to today's `Response::ok`.
+- **Phase 0 — API + plumbing (no behaviour change). ✅ DONE (commit
+  `cbb80fb`).** Introduced the `(&mut Request, &mut Response) -> Result`
+  handler shape: `RequestHead` (parser storage) + `Request<'a>` facade
+  (`Deref` to head + `read_chunk`); `Response` keeps value constructors
+  (`*res = Response::ok(..)` for the buffered common case) + in-place
+  `status`/`content_type`/`header`/`write`/`finish`. `write` **buffers**
+  in Phase 0; the transport sends `res` at handler return —
+  byte-identical to the old returned-`Response` path. Rippled through h1
+  / h2 / h3 / https + both apps; all proto tests pass; HVF smoke
+  (h1/h2/404/body-read/64K) green.
+
+  > **Discovered cost for the on-wire phases:** real streaming needs the
+  > `ResponseSink` *live during the handler* (not a post-return drive),
+  > because an **echo** reads the request body and writes the response
+  > body **concurrently** on the same connection. That requires (a)
+  > `Response<'a>` holding `&'a mut dyn ResponseSink` (a second handler-
+  > signature touch), and (b) a **per-transport read/write split** so the
+  > body reader and the response sink can hold the stream at once. The
+  > split is easy for plaintext `TcpStream` (disjoint RX/TX waker slots),
+  > harder for `TlsStream` (shared TLS state — though RX/TX keys +
+  > sequence numbers are per-direction) and for h2/h3 (the demux/QUIC
+  > stream is the single writer). A *generated* streaming body (no
+  > concurrent request read) avoids the split but does not satisfy the
+  > echo use case.
 - **Phase 1 — h1 streaming.** Real chunked-encoding sink over
   `TcpStream`; backpressure = TCP. Streaming echo endpoint →
   demonstrates bounded-memory streaming. Validate byte-correctness +
