@@ -814,4 +814,33 @@ mod tests {
         assert_eq!(off2, 4);
         assert_eq!(c2, b"efgh");
     }
+
+    /// `buffered_len` reports the un-emitted byte count
+    /// (`sum(outbound lens) - head_consumed`) that the h2/h3 streaming
+    /// sinks read to backpressure `res.write`. This pins its accounting
+    /// across writes + (partial and full) pops: if it ever over-reports
+    /// the send-buffer cap parks the handler forever, and if it
+    /// under-reports the buffer grows unbounded (OOM). Guards both.
+    #[test]
+    fn send_buffered_len_tracks_writes_and_pops() {
+        let mut s = SendStream::default();
+        assert_eq!(s.buffered_len(), 0);
+        s.write_owned(b"abcdefghij".to_vec()); // 10
+        s.write_owned(b"klmno".to_vec()); // +5 = 15
+        assert_eq!(s.buffered_len(), 15);
+        // Partial pop of the head chunk (4 of the first 10).
+        s.pop_chunk(4).unwrap();
+        assert_eq!(s.buffered_len(), 11);
+        // Pop the rest of the head chunk (6) → first chunk retires.
+        s.pop_chunk(6).unwrap();
+        assert_eq!(s.buffered_len(), 5);
+        // Drain the tail chunk fully.
+        s.pop_chunk(100).unwrap();
+        assert_eq!(s.buffered_len(), 0);
+        // A fresh write counts again, and `reset_for_reuse` clears it.
+        s.write_owned(b"xyz".to_vec());
+        assert_eq!(s.buffered_len(), 3);
+        s.reset_for_reuse();
+        assert_eq!(s.buffered_len(), 0);
+    }
 }
