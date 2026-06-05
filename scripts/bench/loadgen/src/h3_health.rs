@@ -12,17 +12,16 @@
 // Skip cert verification (the unikernel ships a self-signed dev
 // cert; the workload measures throughput, not chain validation).
 
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 use http::Request;
-use quinn::{ClientConfig, Endpoint, TransportConfig};
-use rustls::pki_types::ServerName;
+use quinn::Endpoint;
 use tokio::time::timeout;
 
 use crate::WorkloadResult;
+use crate::tls_util::{quic_client_config, resolve};
 
 const PER_OP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -34,91 +33,8 @@ fn log_first<F: FnOnce(&mut bool)>(gate: &mut bool, f: F) {
     }
 }
 
-#[derive(Debug)]
-struct NoCertVerify;
-
-impl rustls::client::danger::ServerCertVerifier for NoCertVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        use rustls::SignatureScheme::*;
-        vec![
-            ECDSA_NISTP256_SHA256,
-            ED25519,
-            RSA_PSS_SHA256,
-            RSA_PKCS1_SHA256,
-        ]
-    }
-}
-
-fn build_client_config() -> ClientConfig {
-    let mut tls_cfg = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoCertVerify))
-        .with_no_client_auth();
-    // ALPN: the unikernel's QUIC server only accepts `h3` (RFC 9114).
-    // Without this, the QUIC handshake completes but the H3 layer
-    // refuses the connection with `H3_NO_ERROR`.
-    tls_cfg.alpn_protocols = vec![b"h3".to_vec()];
-
-    let crypto =
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls_cfg).expect("valid QUIC TLS config");
-
-    let mut cfg = ClientConfig::new(Arc::new(crypto));
-
-    // Generous transport defaults — the workload measures
-    // application-layer throughput, not flow-control behaviour, so
-    // bump the per-stream and per-conn windows past the one-RTT
-    // working set.
-    let mut transport = TransportConfig::default();
-    transport
-        .max_concurrent_bidi_streams(256u32.into())
-        .keep_alive_interval(Some(Duration::from_secs(10)))
-        .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
-    cfg.transport_config(Arc::new(transport));
-
-    cfg
-}
-
-fn resolve(host: &str, port: u16) -> Option<std::net::SocketAddr> {
-    // Match the loopback-on-numeric pattern the other workloads use:
-    // `localhost` resolves to v6 first on some glibc configs, but
-    // the unikernel listens on v4. Prefer the first v4 result.
-    let target = (host, port);
-    let mut addrs: Vec<_> = target.to_socket_addrs().ok()?.collect();
-    addrs.sort_by_key(|a| match a {
-        std::net::SocketAddr::V4(_) => 0,
-        std::net::SocketAddr::V6(_) => 1,
-    });
-    addrs.into_iter().next()
-}
+// `NoCertVerify`, the QUIC client config, and `resolve` come from the
+// shared `tls_util` module (see `crate::tls_util`).
 
 pub async fn run(
     host: &str,
@@ -141,7 +57,7 @@ pub async fn run(
         }
     };
 
-    let client_cfg = Arc::new(build_client_config());
+    let client_cfg = Arc::new(quic_client_config());
     let endpoint = Arc::new(endpoint.to_string());
     let host: Arc<str> = Arc::from(host.to_string().into_boxed_str());
 

@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
-use rustls::ClientConfig;
 use rustls::client::Resumption;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,59 +22,7 @@ use tokio::sync::Barrier;
 use tokio_rustls::TlsConnector;
 
 use crate::WorkloadResult;
-
-#[derive(Debug)]
-struct NoCertVerify;
-
-impl rustls::client::danger::ServerCertVerifier for NoCertVerify {
-    fn verify_server_cert(
-        &self,
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &[rustls::pki_types::CertificateDer<'_>],
-        _: &ServerName<'_>,
-        _: &[u8],
-        _: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        use rustls::SignatureScheme::*;
-        vec![
-            ECDSA_NISTP256_SHA256,
-            ED25519,
-            RSA_PSS_SHA256,
-            RSA_PKCS1_SHA256,
-        ]
-    }
-}
-
-fn build_tls_config() -> Arc<ClientConfig> {
-    let mut cfg = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoCertVerify))
-        .with_no_client_auth();
-    // Keep-alive workload — resumption is irrelevant past the
-    // first handshake. Disable for symmetry with the rest of the
-    // suite (each conn does exactly one handshake).
-    cfg.resumption = Resumption::disabled();
-    Arc::new(cfg)
-}
+use crate::tls_util::tcp_tls_config;
 
 pub async fn run(
     host: &str,
@@ -102,7 +49,7 @@ pub async fn run(
     let request: Arc<[u8]> = Arc::from(req_bytes.into_boxed_slice());
 
     let tls_setup: Option<(TlsConnector, ServerName<'static>)> = if tls {
-        let cfg = build_tls_config();
+        let cfg = tcp_tls_config(&[], Resumption::disabled());
         let connector = TlsConnector::from(cfg);
         let server_name: ServerName<'static> = ServerName::try_from("localhost").unwrap();
         Some((connector, server_name))

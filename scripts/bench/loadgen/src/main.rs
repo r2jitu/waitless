@@ -23,6 +23,7 @@ mod http_upload;
 mod tcp_echo;
 mod tls_handshake;
 mod tls_resume;
+mod tls_util;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]

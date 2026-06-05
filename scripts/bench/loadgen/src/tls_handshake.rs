@@ -17,74 +17,15 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 use rustls::client::Resumption;
 use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
 use crate::WorkloadResult;
+use crate::tls_util::tcp_tls_config;
 
 const PER_OP_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[derive(Debug)]
-struct NoCertVerify;
-
-impl rustls::client::danger::ServerCertVerifier for NoCertVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        use rustls::SignatureScheme::*;
-        vec![
-            ECDSA_NISTP256_SHA256,
-            ED25519,
-            RSA_PSS_SHA256,
-            RSA_PKCS1_SHA256,
-        ]
-    }
-}
-
-fn build_client_config() -> Arc<ClientConfig> {
-    let mut cfg = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoCertVerify))
-        .with_no_client_auth();
-    // Explicitly disable session resumption: this workload measures
-    // FRESH handshake throughput. With our server now issuing
-    // NewSessionTicket on every handshake, rustls's default
-    // in-memory cache would silently turn subsequent handshakes
-    // into resumed PSK-DHE flights, biasing the result low. The
-    // resumption hot path lives in `tls_resume.rs`.
-    cfg.resumption = Resumption::disabled();
-    Arc::new(cfg)
-}
 
 pub async fn run(
     host: &str,
@@ -94,8 +35,12 @@ pub async fn run(
     warmup: Duration,
     parallelism: usize,
 ) -> WorkloadResult {
-    let _ = RootCertStore::empty(); // touch import so unused-import lint stays quiet
-    let cfg = build_client_config();
+    // Resumption disabled: this workload measures FRESH handshake
+    // throughput. With the server issuing NewSessionTicket on every
+    // handshake, rustls's default in-memory cache would silently turn
+    // subsequent handshakes into resumed PSK-DHE flights, biasing the
+    // result low. The resumption hot path lives in `tls_resume.rs`.
+    let cfg = tcp_tls_config(&[], Resumption::disabled());
     let connector = TlsConnector::from(cfg);
     // Server name verification is bypassed by `NoCertVerify`, so any
     // valid SNI string works — using a literal SNI that the dev cert

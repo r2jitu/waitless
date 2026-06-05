@@ -31,7 +31,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
-use rustls::ClientConfig;
 use rustls::client::Resumption;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -40,6 +39,7 @@ use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
 use crate::WorkloadResult;
+use crate::tls_util::tcp_tls_config;
 
 const PER_OP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -55,64 +55,6 @@ const PER_OP_TIMEOUT: Duration = Duration::from_secs(5);
 /// returns None, N=9+ works. We use 64 to leave headroom and
 /// match the rustls default-ish "many sessions" intent.
 const SESSION_CACHE_CAPACITY: usize = 64;
-
-#[derive(Debug)]
-struct NoCertVerify;
-
-impl rustls::client::danger::ServerCertVerifier for NoCertVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        use rustls::SignatureScheme::*;
-        vec![
-            ECDSA_NISTP256_SHA256,
-            ED25519,
-            RSA_PSS_SHA256,
-            RSA_PKCS1_SHA256,
-        ]
-    }
-}
-
-/// Build a fresh ClientConfig with TLS 1.3 session resumption
-/// explicitly enabled (in-memory ticket cache, per-worker).
-fn build_client_config_with_resumption() -> Arc<ClientConfig> {
-    let mut cfg = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoCertVerify))
-        .with_no_client_auth();
-    // The default `Resumption` already has an in-memory cache, but
-    // setting it explicitly documents the intent and protects the
-    // workload from a future rustls default change.
-    cfg.resumption = Resumption::in_memory_sessions(SESSION_CACHE_CAPACITY);
-    Arc::new(cfg)
-}
 
 pub async fn run(
     host: &str,
@@ -136,10 +78,11 @@ pub async fn run(
 
     let mut handles = Vec::with_capacity(parallelism);
     for _ in 0..parallelism {
-        // Per-worker config = per-worker ticket cache. The first
-        // handshake on each cache is necessarily fresh (no cached
-        // ticket); we exclude it from the histogram below.
-        let cfg = build_client_config_with_resumption();
+        // Per-worker config = per-worker ticket cache (resumption on:
+        // explicit in-memory sessions). The first handshake on each
+        // cache is necessarily fresh (no cached ticket); we exclude it
+        // from the histogram below.
+        let cfg = tcp_tls_config(&[], Resumption::in_memory_sessions(SESSION_CACHE_CAPACITY));
         let connector = TlsConnector::from(cfg);
         let server_name = server_name.clone();
         let request = Arc::clone(&request);

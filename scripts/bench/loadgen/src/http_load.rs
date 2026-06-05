@@ -17,17 +17,15 @@
 // connection and merge their sub-histograms first. The top level then
 // merges across connections.
 //
-// Cert verification is bypassed (the unikernel ships a self-signed dev
-// cert; this measures throughput, not chain validation) — the
-// `NoCertVerify` here mirrors the copies in `tls_handshake.rs` /
-// `h3_health.rs`; they are deliberately kept per-file.
+// Cert verification is bypassed and host:port resolution + the TLS/QUIC
+// client configs come from the shared `tls_util` module.
 
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use hdrhistogram::Histogram;
+use rustls::client::Resumption;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -35,6 +33,7 @@ use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
 use crate::WorkloadResult;
+use crate::tls_util::{quic_client_config, resolve, tcp_tls_config};
 
 const PER_OP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -46,92 +45,6 @@ pub enum Proto {
     H2,
     /// HTTP/3 over QUIC (ALPN "h3").
     H3,
-}
-
-// ── Cert verifier (accept anything — dev cert) ─────────────────────
-
-#[derive(Debug)]
-struct NoCertVerify;
-
-impl rustls::client::danger::ServerCertVerifier for NoCertVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        use rustls::SignatureScheme::*;
-        vec![
-            ECDSA_NISTP256_SHA256,
-            ED25519,
-            RSA_PSS_SHA256,
-            RSA_PKCS1_SHA256,
-        ]
-    }
-}
-
-/// TLS 1.3 client config for the TCP path (h1/h2), advertising the
-/// given ALPN protocol(s). Resumption disabled so every connection's
-/// first handshake is fresh (keep-alive amortises it anyway).
-fn build_tcp_tls_config(alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
-    let mut cfg = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoCertVerify))
-        .with_no_client_auth();
-    cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    Arc::new(cfg)
-}
-
-fn build_quic_client_config() -> quinn::ClientConfig {
-    let mut tls_cfg = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoCertVerify))
-        .with_no_client_auth();
-    tls_cfg.alpn_protocols = vec![b"h3".to_vec()];
-
-    let crypto =
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls_cfg).expect("valid QUIC TLS config");
-    let mut cfg = quinn::ClientConfig::new(Arc::new(crypto));
-    let mut transport = quinn::TransportConfig::default();
-    transport
-        .max_concurrent_bidi_streams(256u32.into())
-        .keep_alive_interval(Some(Duration::from_secs(10)))
-        .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
-    cfg.transport_config(Arc::new(transport));
-    cfg
-}
-
-fn resolve(host: &str, port: u16) -> Option<std::net::SocketAddr> {
-    let mut addrs: Vec<_> = (host, port).to_socket_addrs().ok()?.collect();
-    addrs.sort_by_key(|a| match a {
-        std::net::SocketAddr::V4(_) => 0,
-        std::net::SocketAddr::V6(_) => 1,
-    });
-    addrs.into_iter().next()
 }
 
 fn new_hist() -> Histogram<u64> {
@@ -246,7 +159,7 @@ async fn run_h1(
     let host: Arc<str> = Arc::from(host.to_string().into_boxed_str());
 
     let connector = (!plaintext).then(|| {
-        let cfg = build_tcp_tls_config(&[b"http/1.1"]);
+        let cfg = tcp_tls_config(&[b"http/1.1"], Resumption::disabled());
         TlsConnector::from(cfg)
     });
     let server_name: ServerName<'static> = ServerName::try_from("localhost").unwrap();
@@ -421,7 +334,7 @@ async fn run_h2(
     measure_start: Instant,
     deadline: Instant,
 ) -> (u64, Histogram<u64>) {
-    let connector = TlsConnector::from(build_tcp_tls_config(&[b"h2"]));
+    let connector = TlsConnector::from(tcp_tls_config(&[b"h2"], Resumption::disabled()));
     let server_name: ServerName<'static> = ServerName::try_from("localhost").unwrap();
     let uri: Arc<str> = Arc::from(format!("https://{host}{endpoint}").into_boxed_str());
     let host: Arc<str> = Arc::from(host.to_string().into_boxed_str());
@@ -560,7 +473,7 @@ async fn run_h3(
             return (0, new_hist());
         }
     };
-    let client_cfg = Arc::new(build_quic_client_config());
+    let client_cfg = Arc::new(quic_client_config());
     let uri: Arc<str> = Arc::from(format!("https://{host}{endpoint}").into_boxed_str());
 
     let mut handles = Vec::with_capacity(connections);
