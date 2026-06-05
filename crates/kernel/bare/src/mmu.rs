@@ -341,9 +341,13 @@ pub fn map_device_range(phys_base: u64, size: u64) {
 /// below each, so a stack overflow faults at the guard instead of
 /// silently corrupting neighbouring memory. Returns `false` on OOM or
 /// on non-x86_64 (the caller then uses an unguarded stack — no
-/// regression). `# Safety`: installs page-table entries; the caller
-/// must serialize concurrent callers (the tables are shared) and ensure
-/// `virt_base` is in a region not otherwise mapped.
+/// regression).
+///
+/// # Safety
+///
+/// Installs page-table entries; the caller must serialize concurrent
+/// callers (the tables are shared) and ensure `virt_base` is in a
+/// region not otherwise mapped.
 pub unsafe fn map_pages_4k(virt_base: u64, phys_base: u64, count: usize) -> bool {
     #[cfg(target_arch = "x86_64")]
     unsafe {
