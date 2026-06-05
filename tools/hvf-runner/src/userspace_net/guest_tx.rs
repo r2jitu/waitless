@@ -7,6 +7,14 @@
 
 use super::*;
 use super::frame::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Cumulative guest→host TCP bytes the best-effort non-blocking write
+/// couldn't take (host send buffer full) and that were therefore lost —
+/// the bytes had already been ACKed to the guest, which won't resend.
+/// Bumped + logged-once at the drop site; should stay 0 with the 16 MiB
+/// `SO_SNDBUF` for any transfer that fits the buffer.
+static HOST_WRITE_DROPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 // ── Guest TX (vCPU thread) ──────────────────────────────────────────────────
 
@@ -509,6 +517,21 @@ pub(super) fn handle_tcp(family: IpFamily, tcp: &[u8]) {
     }; // conns lock released
 
     // write() outside both conns and tx_replies locks — no contention.
+    //
+    // Best-effort non-blocking write. The payload was already ACKed to
+    // the guest (peer_ack advanced under the lock), so anything a full
+    // host send buffer can't take is *lost* — the guest won't resend.
+    // The 16 MiB SO_SNDBUF set at accept makes that rare for any
+    // realistic transfer; when it does happen, surface it LOUDLY (the
+    // old `break` swallowed it, so it presented only as a flaky
+    // downstream "connection error" on large single-conn transfers — a
+    // toy-proxy limit, never seen on a real NIC). We deliberately do NOT
+    // block-and-retry here: the ACK reply for this segment is queued
+    // *after* this write, so stalling the write would delay the ACK and
+    // wedge the guest against the proxy's fixed 64 KiB window. A fully
+    // lossless guest→host path needs a POLLOUT-drained host-side buffer
+    // (with the ACK still emitted promptly) — tracked, not done here;
+    // use GCE for definitive large-transfer correctness.
     if snap.state == ConnState::Established && !payload.is_empty() {
         let mut written = 0usize;
         while written < payload.len() {
@@ -523,6 +546,18 @@ pub(super) fn handle_tcp(family: IpFamily, tcp: &[u8]) {
                 break;
             }
             written += n as usize;
+        }
+        if written < payload.len() {
+            let dropped = (payload.len() - written) as u64;
+            let prev = HOST_WRITE_DROPPED_BYTES.fetch_add(dropped, Ordering::Relaxed);
+            if prev == 0 {
+                eprintln!(
+                    "[hvf-net] WARNING: guest→host TCP write dropped {dropped} bytes \
+                     (host send buffer full on port {}); a large single-connection \
+                     transfer may truncate. Toy-proxy limit, not a guest bug.",
+                    snap.port
+                );
+            }
         }
     }
 

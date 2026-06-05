@@ -1256,6 +1256,54 @@ fn accept_listen_backlog(
                         &one as *const _ as *const _,
                         4,
                     );
+                    // Big send/recv buffers so a bursty guest response
+                    // (the server emitting a multi-segment body back to
+                    // back, filling its window) doesn't fill the host
+                    // socket's send buffer mid-burst. `handle_tcp`'s
+                    // best-effort guest→host write drops on EAGAIN
+                    // (`guest_tx.rs`), so a too-small SO_SNDBUF turned a
+                    // large single-conn download into an intermittent
+                    // truncation — only on the toy proxy, never on a real
+                    // NIC.
+                    //
+                    // Size it off the kernel ceiling: macOS/BSD's
+                    // `setsockopt(SO_SNDBUF)` *rejects* (EINVAL) a value
+                    // above `kern.ipc.maxsockbuf` rather than clamping, so
+                    // a fixed 16 MiB silently failed on the default 8 MiB
+                    // ceiling and left the buffer at the 128 KiB default —
+                    // which passed 256 KiB transfers but dropped 1 MiB
+                    // ones. Request 3/4 of the ceiling (BSD's effective
+                    // `sb_max_adj` is ~0.93×, so stay clear of it); fall
+                    // back to 2 MiB if the sysctl is unavailable.
+                    let mut maxsockbuf: i32 = 0;
+                    let mut msz = std::mem::size_of::<i32>();
+                    let have_max = libc::sysctlbyname(
+                        b"kern.ipc.maxsockbuf\0".as_ptr() as *const _,
+                        &mut maxsockbuf as *mut _ as *mut _,
+                        &mut msz,
+                        std::ptr::null_mut(),
+                        0,
+                    ) == 0
+                        && maxsockbuf > 0;
+                    let bufsz: i32 = if have_max {
+                        (maxsockbuf / 4 * 3).min(16 * 1024 * 1024)
+                    } else {
+                        2 * 1024 * 1024
+                    };
+                    libc::setsockopt(
+                        client_fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        &bufsz as *const _ as *const _,
+                        4,
+                    );
+                    libc::setsockopt(
+                        client_fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVBUF,
+                        &bufsz as *const _ as *const _,
+                        4,
+                    );
                 }
                 // Flow-hash-aware src_port selection (v4 only): pick
                 // a port whose 4-tuple hashes to the current vCPU's
