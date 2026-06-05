@@ -1038,17 +1038,35 @@ def main():
                         # (apples-to-apples across versions). `proto`
                         # picks the version; `conns` × `streams` is the
                         # offered concurrency (`streams` h2/h3 only —
-                        # h1 is sequential keep-alive). h1+TLS / h2 / h3
-                        # use the TLS/QUIC port; h1 with `plaintext` uses
+                        # h1 is sequential keep-alive). Port selection
+                        # mirrors the per-transport arms: h3 → QUIC/UDP
+                        # (`h3_target_port`, guest UDP:443 — NOT the TLS
+                        # TCP port, which has no UDP listener); h1+TLS /
+                        # h2 → the TLS-over-TCP port; h1 `plaintext` →
                         # the wrk port. /obs (alloc counter) is read off
                         # the plain port like the other loadgen arms.
                         proto = w.get("proto", "h1")
                         streams = w.get("streams", 1)
-                        target_port = (
-                            wrk_port
-                            if (proto == "h1" and w.get("plaintext"))
-                            else tls_target_port
-                        )
+                        if proto == "h3":
+                            if h3_target_port is None:
+                                # Env doesn't expose an H3/QUIC port —
+                                # skip rather than mis-target the TCP
+                                # port (matches the h3_health arm).
+                                results[(env_name, cpus, wname)] = (
+                                    0.0,
+                                    "NO_H3_PORT",
+                                    "NO_H3_PORT",
+                                )
+                                client_cpu[(env_name, cpus, wname)] = 0.0
+                                print(
+                                    f"    {wname:<20s} (env has no H3 port — skipped)"
+                                )
+                                continue
+                            target_port = h3_target_port
+                        elif proto == "h1" and w.get("plaintext"):
+                            target_port = wrk_port
+                        else:
+                            target_port = tls_target_port
                         allocs_before = fetch_total_allocs(wrk_port, host=wrk_host)
                         with measure_client_cpu() as m:
                             rps, p50, p99 = run_loadgen_http(
