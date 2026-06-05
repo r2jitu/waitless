@@ -364,15 +364,20 @@ impl H2Conn {
                     .min(item.body_remaining as i64);
                 if allowed > 0 {
                     let n = allowed as usize;
-                    let chunk = item.take_body(n);
-                    let end_stream = item.body_remaining == 0;
                     let id = item.id;
+                    // END_STREAM iff this frame drains the last body byte.
+                    let finishes = item.body_remaining == n;
+                    let fl = if finishes { flags::END_STREAM } else { 0 };
+                    // Frame the DATA header + payload into one Vec: write
+                    // the 9-byte header, then append the body bytes straight
+                    // in (via the same cursor `take_body` walks). Saves the
+                    // separate per-frame chunk `Vec` + its copy.
+                    let mut f = Vec::with_capacity(frame::FRAME_HEADER_LEN + n);
+                    frame::push_frame_header(&mut f, n as u32, ftype::DATA, fl, id);
+                    item.append_body_into(&mut f, n);
                     item.send_window -= n as i64;
-                    let mut f = Vec::with_capacity(frame::FRAME_HEADER_LEN + chunk.len());
-                    let fl = if end_stream { flags::END_STREAM } else { 0 };
-                    frame::push_frame(&mut f, ftype::DATA, fl, id, &chunk);
                     self.conn_send_window -= n as i64;
-                    if end_stream {
+                    if finishes {
                         self.out_queue.remove(idx);
                     }
                     return Some(f);
@@ -476,11 +481,13 @@ struct StreamOut {
 }
 
 impl StreamOut {
-    /// Copy up to `n` body bytes out (advancing the cursor) for the next
-    /// DATA frame. Single-part per call is unnecessary — we coalesce
-    /// across parts up to `n`.
-    fn take_body(&mut self, n: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(n.min(self.body_remaining));
+    /// Append up to `n` body bytes onto `out` (advancing the cursor) for
+    /// the next DATA frame's payload — coalescing across the body's parts
+    /// up to `n`. Same cursor walk the old `take_body` used, but writing
+    /// straight into the caller's frame buffer instead of a throwaway
+    /// `Vec`. `body_remaining` is decremented by what was appended.
+    fn append_body_into(&mut self, out: &mut Vec<u8>, n: usize) {
+        let start = out.len();
         let mut need = n;
         while need > 0 {
             if self.cur.is_none() {
@@ -505,8 +512,7 @@ impl StreamOut {
                 self.cur = None;
             }
         }
-        self.body_remaining -= out.len();
-        out
+        self.body_remaining -= out.len() - start;
     }
 }
 
@@ -1196,14 +1202,23 @@ fn encode_response_headers(resp: &Response, out: &mut Vec<u8>) {
     let mut len_buf = [0u8; 20];
     let len_off = format_usize(resp.body_len(), &mut len_buf);
 
-    let mut list: Vec<(&[u8], &[u8])> = Vec::with_capacity(3 + http::MAX_EXTRA_HEADERS);
-    list.push((b":status", &status));
-    list.push((b"content-type", resp.content_type_bytes()));
-    list.push((b"content-length", &len_buf[len_off..]));
+    // Fixed pseudo/standard trio + the response's extra headers, built
+    // on the stack — responses carry few headers, so a per-response heap
+    // `Vec` here is needless allocation on the hot path.
+    let mut list: [(&[u8], &[u8]); 3 + http::MAX_EXTRA_HEADERS] =
+        [(&[][..], &[][..]); 3 + http::MAX_EXTRA_HEADERS];
+    list[0] = (b":status", &status[..]);
+    list[1] = (b"content-type", resp.content_type_bytes());
+    list[2] = (b"content-length", &len_buf[len_off..]);
+    let mut n = 3;
     for (name, value) in resp.extra_headers() {
-        list.push((name, value));
+        if n >= list.len() {
+            break;
+        }
+        list[n] = (name, value);
+        n += 1;
     }
-    hpack::encode_header_list(&list, out);
+    hpack::encode_header_list(&list[..n], out);
 }
 
 /// Render an HTTP status code as 3 ASCII digits (clamped to 0..=999).
@@ -1284,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn take_body_coalesces_parts() {
+    fn append_body_into_coalesces_parts() {
         let mut chain = IOBufChain::new();
         chain.push_back(IOBuf::from(b"hello".to_vec()));
         chain.push_back(IOBuf::from(b"world".to_vec()));
@@ -1298,11 +1313,15 @@ mod tests {
             body_remaining: 10,
             send_window: INITIAL_WINDOW,
         };
-        let first = out.take_body(7);
-        assert_eq!(first, b"hellowo");
+        // Appends into a buffer that may already hold a frame header —
+        // the prefix must be preserved and the cursor split mid-part.
+        let mut buf = alloc::vec![0xAA];
+        out.append_body_into(&mut buf, 7);
+        assert_eq!(buf, b"\xAAhellowo");
         assert_eq!(out.body_remaining, 3);
-        let rest = out.take_body(100);
-        assert_eq!(rest, b"rld");
+        buf.clear();
+        out.append_body_into(&mut buf, 100);
+        assert_eq!(buf, b"rld");
         assert_eq!(out.body_remaining, 0);
     }
 }
