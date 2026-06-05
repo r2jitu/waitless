@@ -166,10 +166,26 @@ per-stream flow control, `demux_wake`) already exists.
   > stream is the single writer). A *generated* streaming body (no
   > concurrent request read) avoids the split but does not satisfy the
   > echo use case.
-- **Phase 1 — h1 streaming.** Real chunked-encoding sink over
-  `TcpStream`; backpressure = TCP. Streaming echo endpoint →
-  demonstrates bounded-memory streaming. Validate byte-correctness +
-  bounded `/obs` heap watermark on GCE (HVF lies about large transfers).
+- **Phase 1 — h1 streaming (generated/producer path). ✅ DONE (commit
+  `cb9ad8f`).** `ResponseBodyProducer` (TX counterpart of `BodySource`)
+  + `res.stream_body(ct, producer)`; the transport drives `next()`
+  chunk-by-chunk, awaiting its own `send` between pulls (TCP
+  backpressure) → peak memory `O(chunk)`. h1 streams close-delimited
+  (`write_streaming_head_into_iobuf`: no Content-Length, `Connection:
+  close`); h2/h3 fall back to `Response::materialize()` (drain producer
+  → buffered body; correct, not bounded). `/stream` endpoint serves a
+  1 GiB generated body. **Validated on HVF (512 MiB RAM): GET /stream
+  over h1 returned exactly 1,073,741,824 bytes, all-zero, and the kernel
+  heap stayed flat at ~3.4 MB across the whole 1 GiB transfer** —
+  buffering would OOM. (This is the generated/computed path; the
+  interleaved *echo* below is the remaining variant.)
+
+- **Phase 1b — interleaved echo (read-while-write).** Needs the
+  in-handler `write` path live (Response<'a> + `&mut dyn ResponseSink`)
+  **and** a per-transport read/write split so the body reader + the
+  response sink can hold the stream at once. Plaintext `TcpStream` split
+  is straightforward (disjoint RX/TX waker slots); `TlsStream` + the
+  generic `HttpStream` seam are the harder part. Not yet started.
 - **Phase 2 — h2 streaming.** Per-stream TX queue + demux integration +
   window/cap backpressure. The correctness-sensitive part — GCE-validate
   large transfers (byte-perfect + bounded peak).
