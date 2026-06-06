@@ -1,0 +1,21 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Per-core egress scheduler: a Deficit-Round-Robin fair queue that
+# arbitrates many flows over one NIC TX queue (docs/tx-backpressure.md,
+# back-pressure source #2). Pull-based + lossless; fixed capacity, no
+# alloc, O(1) per op — host-unit-testable.
+rust_library(
+    name = "egress",
+    srcs = ["src/lib.rs"],
+    crate_name = "net_egress",
+    crate_root = "src/lib.rs",
+)
+
+rust_test(
+    name = "egress_test",
+    size = "small",
+    crate = ":egress",
+)
