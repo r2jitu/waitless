@@ -888,11 +888,25 @@ impl ResponseSink for H3Sink<'_> {
     fn write_chunk(&mut self, buf: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
         let frame = build_h3_data_frame(buf);
         Box::pin(async move {
+            // Stop if the peer closed: `stream_drain_below` returns
+            // immediately on a failed conn, so without this an app
+            // streaming a large body (e.g. a 1 GiB `/stream` the client
+            // abandons after a few MiB) would race ahead buffering the
+            // remainder into a dead stream and exhaust the heap. The `Err`
+            // breaks the handler's `res.write(..).await?` loop.
+            if self.conn.is_failed() {
+                return Err(());
+            }
             // `send_iobuf` appends + flushes what the stream window allows
             // straight to the socket; only window-blocked bytes linger.
             self.conn.send_iobuf(self.sid, frame);
             if self.conn.stream_buffered(self.sid) > H3_SEND_BUF_CAP {
                 self.conn.stream_drain_below(self.sid, H3_SEND_BUF_CAP).await;
+            }
+            // Re-check after parking: the conn may have failed while we
+            // waited for window.
+            if self.conn.is_failed() {
+                return Err(());
             }
             Ok(())
         })

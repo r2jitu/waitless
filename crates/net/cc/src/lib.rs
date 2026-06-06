@@ -89,6 +89,16 @@ pub const fn minimum_window(mss: u32) -> u32 {
     mss.saturating_mul(2)
 }
 
+/// Default maximum congestion window (cap on bytes-in-flight). RFC 9002
+/// places no upper bound on cwnd — it's normally limited by the receiver
+/// flow-control window — but a sender that retains in-flight data for
+/// retransmission must cap it to bound memory, and a peer that auto-tunes
+/// a huge receive window (or a fast lossless path where slow-start grows
+/// cwnd without bound before any loss) would otherwise let in-flight grow
+/// until the heap is exhausted. 2 MiB is ample throughput on low-RTT paths
+/// (2 MiB / 0.1 ms ≈ 20 GB/s) and bounds per-connection send memory.
+pub const DEFAULT_MAX_WINDOW: u32 = 2 << 20;
+
 const fn min_u32(a: u32, b: u32) -> u32 {
     if a < b { a } else { b }
 }
@@ -111,6 +121,9 @@ pub struct NewReno {
     in_recovery: bool,
     /// Last smoothed RTT (µs) seen on an ack, for `pacing_rate`.
     srtt_us: u32,
+    /// Upper bound on `cwnd` (and thus bytes-in-flight). See
+    /// [`DEFAULT_MAX_WINDOW`].
+    max_window: u32,
 }
 
 impl NewReno {
@@ -124,12 +137,19 @@ impl NewReno {
             ssthresh: u32::MAX,
             in_recovery: false,
             srtt_us: 0,
+            max_window: max_u32(DEFAULT_MAX_WINDOW, initial_window(mss)),
         }
     }
 
     /// Default-MSS constructor.
     pub const fn with_default_mss() -> Self {
         Self::new(DEFAULT_MSS)
+    }
+
+    /// Override the maximum congestion window (see [`DEFAULT_MAX_WINDOW`]).
+    /// Clamped to at least the initial window.
+    pub fn set_max_window(&mut self, max: u32) {
+        self.max_window = max_u32(max, initial_window(self.mss));
     }
 
     pub fn ssthresh(&self) -> u32 {
@@ -176,6 +196,10 @@ impl CongestionControl for NewReno {
             let inc = (self.mss as u64 * bytes_acked as u64 / self.cwnd as u64) as u32;
             self.cwnd = self.cwnd.saturating_add(inc.max(1));
         }
+        // Cap the window so bytes-in-flight (and any per-packet data a
+        // sender retains for retransmission) can't grow without bound on a
+        // lossless / large-receive-window path. See `DEFAULT_MAX_WINDOW`.
+        self.cwnd = min_u32(self.cwnd, self.max_window);
     }
 
     fn on_loss(&mut self, _bytes_lost: u32, persistent: bool) {
@@ -200,8 +224,8 @@ impl CongestionControl for NewReno {
     }
 
     fn window(&self) -> u32 {
-        // Never advertise below the floor.
-        max_u32(self.cwnd, minimum_window(self.mss))
+        // Clamped to `[minimum_window, max_window]`.
+        min_u32(max_u32(self.cwnd, minimum_window(self.mss)), self.max_window)
     }
 
     fn pacing_rate(&self) -> u64 {
@@ -317,6 +341,21 @@ mod tests {
             cc.on_loss(MSS, true);
         }
         assert_eq!(cc.window(), minimum_window(MSS));
+    }
+
+    #[test]
+    fn window_capped_at_max() {
+        let mut cc = NewReno::new(MSS);
+        // Slow start would otherwise grow the window without bound on a
+        // lossless path; the cap must hold.
+        for _ in 0..40 {
+            let w = cc.window();
+            cc.on_ack(w, 0, rtt());
+        }
+        assert_eq!(cc.window(), DEFAULT_MAX_WINDOW);
+        // A lower override is honored (clamped to ≥ initial window).
+        cc.set_max_window(64 * 1024);
+        assert!(cc.window() <= 64 * 1024);
     }
 
     #[test]

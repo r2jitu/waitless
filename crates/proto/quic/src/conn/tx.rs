@@ -13,7 +13,7 @@
 // timer in `loss.rs`.
 
 use super::{
-    ConnError, ConnState, Connection, HS_CRYPTO_BUDGET, MAX_QUIC_DATAGRAM, SpaceState,
+    ConnError, ConnState, Connection, HS_CRYPTO_BUDGET, MAX_QUIC_DATAGRAM, SpaceState, StreamRetx,
     append_max_data_into, append_max_stream_data_into, append_max_streams_into,
 };
 use net_cc::CongestionControl;
@@ -321,6 +321,10 @@ impl Connection {
     /// which we already drain in the first pass). Used by
     /// `flush_outbound` to decide whether to emit another packet.
     fn has_pending_one_rtt_data(&self) -> bool {
+        // Retransmissions waiting to go out (RFC 9000 §13.3).
+        if !self.retx_queue.is_empty() {
+            return true;
+        }
         // Any send stream with bytes queued OR a close pending.
         for s in self.send_streams.values() {
             match s.state {
@@ -665,27 +669,52 @@ impl Connection {
             );
         }
 
-        // Drain pending STREAM data, directly into `out`. Use
-        // iter_mut so we don't have to collect the stream IDs
-        // into a temporary Vec just to satisfy the borrow
-        // checker — the per-flush stream-ids alloc the old
-        // shape required is gone.
+        // Drain STREAM data into `out` — retransmissions first, then
+        // fresh data. Frames emitted here are recorded in `pkt_frames`
+        // and handed to `record_sent_packet` (via
+        // `pending_sent_stream_frames`) so they can be retransmitted if
+        // this packet is lost.
         //
-        // Congestion gate (RFC 9002 §7): only emit STREAM data while
-        // bytes-in-flight is below the congestion window. `cc_budget`
-        // is the per-packet ceiling on fresh STREAM bytes; when the
-        // window is full it's 0, so this loop is skipped and the packet
-        // carries only ACK / control frames (which are not
-        // congestion-controlled) — the unsent data stays in the
-        // streams' `outbound` queues, which backpressures the handler
-        // via `stream_drain_below`. Computed before the `iter_mut`
-        // borrow so `self.cc` / `self.bytes_in_flight` aren't aliased.
-        let mut cc_budget =
-            self.cc.window().saturating_sub(self.bytes_in_flight) as usize;
-        // Connection-level send flow control (RFC 9000 §4.1): total
-        // STREAM bytes still authorized across all streams by the peer's
-        // MAX_DATA. Read before the `iter_mut` borrow; the delta is
-        // applied to `self.data_sent` after the loop.
+        // Congestion gate (RFC 9002 §7): `cc_budget` caps fresh STREAM
+        // bytes at `window() − bytes_in_flight`; when the window is full
+        // the loops are skipped and the packet carries only ACK / control
+        // frames (not congestion-controlled), leaving unsent data queued
+        // to backpressure the handler via `stream_drain_below`. Computed
+        // before the `iter_mut` borrow so `self.cc` isn't aliased.
+        // Fresh-data budget = window − total unacked (in-flight +
+        // awaiting-retransmit). Counting `retx_bytes` here is what bounds
+        // total send memory: a lost packet moves its data from
+        // `bytes_in_flight` to the retx queue, and without this term the
+        // gate would re-open and let fresh data pile up beside an
+        // ever-growing retx queue (the OOM under heavy loss).
+        let total_unacked = self.bytes_in_flight.saturating_add(self.retx_bytes);
+        let mut cc_budget = self.cc.window().saturating_sub(total_unacked) as usize;
+        let mut pkt_frames: alloc::vec::Vec<StreamRetx> = alloc::vec::Vec::new();
+
+        // (a) Retransmissions (RFC 9000 §13.3): re-send lost ranges before
+        // any fresh data so the receiver's gap fills promptly. A retx
+        // re-sends already-counted data (it moves from `retx_bytes` back
+        // into in-flight), so it doesn't consume the fresh `cc_budget`;
+        // gate it on packet room only. Each queued range is ≤ one packet's
+        // payload; if it doesn't fit this (partly-full) packet, leave it
+        // for the next packet in the flush loop.
+        while let Some(front) = self.retx_queue.front() {
+            let body_so_far = out.len() - payload_offset;
+            let room = PACKET_BODY_BUDGET.saturating_sub(body_so_far + 16);
+            if room == 0 || front.data.len() > room {
+                break;
+            }
+            let rtx = self.retx_queue.pop_front().unwrap();
+            self.retx_bytes = self.retx_bytes.saturating_sub(rtx.data.len() as u32);
+            crate::frame::append_stream_header(rtx.sid, rtx.offset, rtx.fin, rtx.data.len(), out)
+                .map_err(|_| ConnError::Wire)?;
+            out.extend_from_slice(&rtx.data);
+            ack_eliciting = true;
+            pkt_frames.push(rtx);
+        }
+
+        // (b) Fresh STREAM data, gated by cwnd + send-side flow control
+        // (RFC 9000 §4.1: conn-level MAX_DATA + per-stream MAX_STREAM_DATA).
         let mut conn_fc_budget = self.peer_max_data.saturating_sub(self.data_sent) as usize;
         let mut data_sent_delta: u64 = 0;
         for (sid, s) in self.send_streams.iter_mut() {
@@ -698,8 +727,7 @@ impl Connection {
             if body_so_far >= PACKET_BODY_BUDGET {
                 break;
             }
-            // Per-stream send FC: bytes still authorized on this stream
-            // by the peer's MAX_STREAM_DATA.
+            // Per-stream send FC: bytes still authorized on this stream.
             let stream_fc_budget = s.peer_max_stream_data.saturating_sub(s.send_offset) as usize;
             let max_chunk = PACKET_BODY_BUDGET
                 .saturating_sub(body_so_far + 16)
@@ -712,18 +740,31 @@ impl Connection {
                 // streams may still have credit, so try the next.
                 continue;
             }
-            let off_before = s.send_offset;
-            if s.pop_chunk_into(*sid, max_chunk, out)
-                .map_err(|_| ConnError::Wire)?
-            {
+            // `pop_chunk` returns the owned bytes (the copy retained for
+            // retransmission); we frame them into `out` ourselves.
+            if let Some((offset, data, fin)) = s.pop_chunk(max_chunk) {
+                crate::frame::append_stream_header(*sid, offset, fin, data.len(), out)
+                    .map_err(|_| ConnError::Wire)?;
+                out.extend_from_slice(&data);
                 ack_eliciting = true;
+                let data_popped = data.len();
+                cc_budget = cc_budget.saturating_sub(data_popped);
+                conn_fc_budget = conn_fc_budget.saturating_sub(data_popped);
+                data_sent_delta += data_popped as u64;
+                pkt_frames.push(StreamRetx {
+                    sid: *sid,
+                    offset,
+                    fin,
+                    data,
+                });
             }
-            let data_popped = s.send_offset.saturating_sub(off_before) as usize;
-            cc_budget = cc_budget.saturating_sub(data_popped);
-            conn_fc_budget = conn_fc_budget.saturating_sub(data_popped);
-            data_sent_delta += data_popped as u64;
         }
         self.data_sent = self.data_sent.saturating_add(data_sent_delta);
+        // Stage the frames this packet carried so `record_sent_packet`
+        // can retain them for retransmission.
+        if !pkt_frames.is_empty() {
+            self.pending_sent_stream_frames = pkt_frames;
+        }
 
         let body_len = out.len() - payload_offset;
         if body_len == 0 {

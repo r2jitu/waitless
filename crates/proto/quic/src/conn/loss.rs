@@ -269,11 +269,15 @@ impl Connection {
         }
         let total_lost = lost_threshold_n + lost_time_n;
         let mut lost_bytes: u32 = 0;
+        // Lost STREAM frames, collected in PN order (lowest offset first)
+        // and re-queued for retransmission after the `space` borrow ends.
+        let mut lost_frames: alloc::vec::Vec<super::StreamRetx> = alloc::vec::Vec::new();
         for &pn in &lost_buf[..total_lost] {
-            if let Some(pkt) = space.sent_packets.remove(&pn)
-                && pkt.in_flight
-            {
-                lost_bytes = lost_bytes.saturating_add(pkt.byte_count);
+            if let Some(mut pkt) = space.sent_packets.remove(&pn) {
+                if pkt.in_flight {
+                    lost_bytes = lost_bytes.saturating_add(pkt.byte_count);
+                }
+                lost_frames.append(&mut pkt.stream_frames);
             }
         }
         let lost_threshold_n = lost_threshold_n as u64;
@@ -294,6 +298,14 @@ impl Connection {
         if lost_bytes > 0 {
             self.cc.on_loss(lost_bytes, false);
         }
+        // Re-queue the lost STREAM ranges for retransmission (RFC 9000
+        // §13.3). `encode_one_rtt_packet` drains this before fresh data.
+        // Count their bytes so the congestion gate treats in-flight +
+        // awaiting-retransmit as one bound (else the queue grows unbounded).
+        for f in &lost_frames {
+            self.retx_bytes = self.retx_bytes.saturating_add(f.data.len() as u32);
+        }
+        self.retx_queue.extend(lost_frames);
     }
 
     /// RFC 9002 §5.3: SRTT/RTTvar EWMA update. Called once per
@@ -345,11 +357,16 @@ impl Connection {
         byte_count: u32,
     ) {
         let now = tls::ticket::now_us();
+        // Take the STREAM frames the encoder staged for this packet (empty
+        // for ACK-only / PING / CRYPTO packets) so they ride along for
+        // retransmission on loss.
+        let stream_frames = core::mem::take(&mut self.pending_sent_stream_frames);
         let pkt = SentPacket {
             time_sent_us: now,
             ack_eliciting,
             in_flight: ack_eliciting,
             byte_count,
+            stream_frames,
         };
         let (space, idx) = match level {
             CryptoLevel::Initial => (&mut self.initial_space, 0usize),

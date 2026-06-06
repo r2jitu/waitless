@@ -201,6 +201,26 @@ pub(super) struct SentPacket {
     /// congestion controller.
     #[allow(dead_code)] // reserved for the eventual congestion controller
     pub(super) byte_count: u32,
+    /// STREAM frames this packet carried, retained for retransmission
+    /// (RFC 9002 §6 / RFC 9000 §13.3). On loss these move to
+    /// `Connection::retx_queue` to be re-sent; on ACK the packet (and
+    /// these copies) are dropped. Empty for non-data packets (ACK-only,
+    /// PING probes, CRYPTO). The retained bytes are bounded by
+    /// bytes-in-flight (≤ cwnd), so this can't grow without bound.
+    pub(super) stream_frames: alloc::vec::Vec<StreamRetx>,
+}
+
+/// One STREAM frame's retransmittable contents — the offset, FIN bit,
+/// and a copy of the data bytes. Held in a [`SentPacket`] until the
+/// packet is acked (then dropped) or declared lost (then moved to
+/// [`Connection::retx_queue`] and re-emitted). Each copy is ≤ one
+/// packet's STREAM payload (~1100 B), so re-emitting fits one packet.
+#[derive(Clone, Debug)]
+pub(super) struct StreamRetx {
+    pub(super) sid: u64,
+    pub(super) offset: u64,
+    pub(super) fin: bool,
+    pub(super) data: alloc::vec::Vec<u8>,
 }
 
 /// Pop every PN in `[low, high]` (inclusive) from `sent_packets`,
@@ -781,6 +801,24 @@ pub struct Connection {
     /// One-shot guard: whether `apply_peer_flow_control` has parsed and
     /// applied the peer's transport-param flow-control limits.
     pub(super) peer_fc_applied: bool,
+
+    /// STREAM ranges declared lost and awaiting retransmission (RFC 9000
+    /// §13.3). `detect_loss` moves a lost packet's `stream_frames` here;
+    /// `encode_one_rtt_packet` drains it (highest priority, before fresh
+    /// data) so the receiver's gap is filled and the stream can complete.
+    pub(super) retx_queue: alloc::collections::VecDeque<StreamRetx>,
+    /// Sum of `retx_queue` payload bytes. Folded into the congestion gate
+    /// alongside `bytes_in_flight` so total unacked data (in-flight +
+    /// awaiting-retransmit) stays ≤ the window — without this, declaring a
+    /// packet lost both drops it from `bytes_in_flight` AND queues its
+    /// data, re-opening the gate to send fresh data while the retx queue
+    /// grows unbounded (heap exhaustion under heavy loss).
+    pub(super) retx_bytes: u32,
+    /// Staging for the STREAM frames the packet currently being encoded
+    /// carries — `record_sent_packet` moves them into the `SentPacket`.
+    /// A field (not a return value) so the 6 `record_sent_packet` call
+    /// sites that carry no stream data need no signature change.
+    pub(super) pending_sent_stream_frames: alloc::vec::Vec<StreamRetx>,
 }
 
 impl Drop for Connection {
@@ -901,6 +939,9 @@ impl Connection {
             peer_initial_max_stream_data_bidi: 0,
             peer_initial_max_stream_data_uni: 0,
             peer_fc_applied: false,
+            retx_queue: alloc::collections::VecDeque::new(),
+            retx_bytes: 0,
+            pending_sent_stream_frames: alloc::vec::Vec::new(),
         }
     }
 

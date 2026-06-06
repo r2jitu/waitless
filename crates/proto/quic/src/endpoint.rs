@@ -305,6 +305,15 @@ impl QuicConn {
         self.conn.borrow().stream_send_buffered(sid)
     }
 
+    /// Whether the connection has failed / been closed by the peer. A
+    /// streaming handler checks this so it stops producing once the peer
+    /// goes away — otherwise, since `stream_drain_below` returns
+    /// immediately on a failed conn, an app streaming a large body would
+    /// race ahead buffering the remainder into a dead stream (heap OOM).
+    pub fn is_failed(&self) -> bool {
+        matches!(self.conn.borrow().state(), ConnState::Failed)
+    }
+
     /// Park until `sid`'s unsent send buffer drains to `cap` or below —
     /// the peer ACKed / granted stream window and the conn task flushed
     /// more onto the wire — or the connection fails. The h3 streaming
