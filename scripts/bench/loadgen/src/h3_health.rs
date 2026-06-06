@@ -74,6 +74,11 @@ pub async fn run(
         let h = tokio::spawn(async move {
             let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
             let mut count_post = 0u64;
+            // Requests that did NOT fully download (send/recv error or
+            // body-read timeout). A timed-out body is a FAILURE, not a
+            // slow success — counting it as a 5 s "success" hid that a
+            // download never completed (e.g. h3 without retransmission).
+            let mut failures_post = 0u64;
             // First-occurrence log gates: a single stuck connection
             // would otherwise spam stderr with the same line every
             // few microseconds.
@@ -94,7 +99,7 @@ pub async fn run(
                 Ok(e) => e,
                 Err(e) => {
                     eprintln!("h3_health[{worker_idx}]: bind failed: {e}");
-                    return (count_post, hist);
+                    return (count_post, failures_post, hist);
                 }
             };
             quinn_ep.set_default_client_config((*client_cfg).clone());
@@ -110,11 +115,11 @@ pub async fn run(
                 Ok(Ok(c)) => c,
                 Ok(Err(e)) => {
                     eprintln!("h3_health[{worker_idx}]: connect failed: {e}");
-                    return (count_post, hist);
+                    return (count_post, failures_post, hist);
                 }
                 Err(_) => {
                     eprintln!("h3_health[{worker_idx}]: connect timed out");
-                    return (count_post, hist);
+                    return (count_post, failures_post, hist);
                 }
             };
 
@@ -123,7 +128,7 @@ pub async fn run(
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("h3_health[{worker_idx}]: h3 init failed: {e}");
-                    return (count_post, hist);
+                    return (count_post, failures_post, hist);
                 }
             };
 
@@ -160,6 +165,9 @@ pub async fn run(
                             );
                             *once = true;
                         });
+                        if post_warmup {
+                            failures_post += 1;
+                        }
                         continue;
                     }
                     Err(_) => {
@@ -169,10 +177,16 @@ pub async fn run(
                             );
                             *once = true;
                         });
+                        if post_warmup {
+                            failures_post += 1;
+                        }
                         continue;
                     }
                 };
                 if timeout(PER_OP_TIMEOUT, stream.finish()).await.is_err() {
+                    if post_warmup {
+                        failures_post += 1;
+                    }
                     continue;
                 }
                 match timeout(PER_OP_TIMEOUT, stream.recv_response()).await {
@@ -184,6 +198,9 @@ pub async fn run(
                             );
                             *once = true;
                         });
+                        if post_warmup {
+                            failures_post += 1;
+                        }
                         continue;
                     }
                     Err(_) => {
@@ -193,21 +210,32 @@ pub async fn run(
                             );
                             *once = true;
                         });
+                        if post_warmup {
+                            failures_post += 1;
+                        }
                         continue;
                     }
                 }
+                let mut completed = false;
                 loop {
                     match timeout(PER_OP_TIMEOUT, stream.recv_data()).await {
                         Ok(Ok(Some(_chunk))) => continue,
-                        Ok(Ok(None)) => break,
-                        _ => break,
+                        Ok(Ok(None)) => {
+                            completed = true; // full body received
+                            break;
+                        }
+                        _ => break, // recv error or body-read timeout → incomplete
                     }
                 }
 
                 if post_warmup {
-                    let elapsed_us = t0.elapsed().as_micros() as u64;
-                    let _ = hist.record(elapsed_us.max(1));
-                    count_post += 1;
+                    if completed {
+                        let elapsed_us = t0.elapsed().as_micros() as u64;
+                        let _ = hist.record(elapsed_us.max(1));
+                        count_post += 1;
+                    } else {
+                        failures_post += 1;
+                    }
                 }
             }
 
@@ -219,19 +247,26 @@ pub async fn run(
             let _ = driver_task.await;
             quinn_ep.close(0u32.into(), b"bye");
             quinn_ep.wait_idle().await;
-            (count_post, hist)
+            (count_post, failures_post, hist)
         });
         handles.push(h);
     }
 
     let mut total = 0u64;
+    let mut total_failures = 0u64;
     let mut combined = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
     for h in handles {
-        if let Ok((c, h)) = h.await {
+        if let Ok((c, f, h)) = h.await {
             total += c;
+            total_failures += f;
             combined.add(h).ok();
         }
     }
+    // Surface incomplete requests (body never fully downloaded) so a
+    // download that stalls — e.g. h3 without retransmission — reads as a
+    // failure, not a phantom slow "success". The harness parses only the
+    // RPS / P50_US / P99_US lines; this is diagnostic.
+    eprintln!("h3_health: completed={total} failed={total_failures}");
 
     let elapsed = duration;
     let p50 = combined.value_at_quantile(0.50);
