@@ -2,7 +2,7 @@
 // completion drain, slice-shaped convenience send, deferred-kick
 // flush helpers, and the small/big TSO pool acquire path.
 
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{AtomicU64, Ordering, compiler_fence};
 
 use kernel_bare::mm::virt_to_phys;
 use tx_pool::{POOL_ID_BIG, POOL_ID_SMALL, claim_first_free, decode_token, encode_token};
@@ -32,6 +32,18 @@ pub(crate) fn qp_needs_lock() -> bool {
 /// `(*tx_q(0))` and is mutable through the existing
 /// raw-pointer accessors; this lock just provides mutual exclusion.
 pub(crate) static TX_LOCK: sync::Spinlock<()> = sync::Spinlock::new(());
+
+/// TX-ring stall circuit breaker (see [`acquire_tx_buf`]). When a full
+/// spin-drain budget elapses without a TX pool slot freeing, the device
+/// has stopped draining the ring; we stamp `now_cycles() + COOLDOWN`
+/// here. While `now_cycles() < TX_STALL_UNTIL`, acquires on a full pool
+/// FAST-FAIL (return `None` after one cheap drain) instead of spinning,
+/// so a stalled ring can't peg the core — the whole-core wedge after a
+/// large h3 `/stream` on Apple HVF (see reference_hvf_h3_stream_wedge).
+/// 0 = not stalled. One global cell: a real stall only ever arises on
+/// the contended/coherence-starved ring, so cross-worker coupling under
+/// healthy load (where it's never armed) is a non-issue.
+static TX_STALL_UNTIL: AtomicU64 = AtomicU64::new(0);
 
 // ---- TX drain ---------------------------------------------------------------
 
@@ -191,49 +203,118 @@ fn tx_drain_qp_locked(qp: usize) {
     }
 }
 
+/// Claim a free slot from `worker`'s small pool, accumulating the
+/// linear-scan depth into `local_iters`. Returns the slot index or
+/// `None` if the pool is full.
+///
+/// SAFETY: single-writer-per-worker — only this worker claims from its
+/// own pool (`claim_first_free`'s required invariant); the slice is
+/// formed from the live `wpool(worker)` pointer. Bind the array
+/// reference explicitly first so the `[..]` slice isn't an implicit
+/// autoref through the raw-pointer deref.
+#[inline]
+fn claim_small_slot(worker: usize, local_iters: &mut u64) -> Option<usize> {
+    let (got, scanned) = unsafe {
+        let small_used = &(*wpool(worker)).small_used;
+        claim_first_free(&small_used[..TX_POOL_SMALL_SIZE])
+    };
+    *local_iters += scanned as u64;
+    got
+}
+
+/// Wrap a claimed small-pool slot as a [`TxBufHandle`] and bump the
+/// acquire diagnostics (`local_iters / acquires` is the average scan
+/// depth; relaxed ordering since the counters gate no other read).
+#[inline]
+fn small_slot_handle(worker: usize, slot: usize, local_iters: u64) -> nic_api::TxBufHandle {
+    TX_SMALL_SCAN_ITERS.add(local_iters);
+    TX_SMALL_ACQUIRES.bump();
+    let buf = unsafe { &mut (*wpool(worker)).small[slot] };
+    nic_api::TxBufHandle {
+        data_ptr: buf.data.as_mut_ptr(),
+        data_cap: MAX_ETH_FRAME_SMALL as u32,
+        driver_token: encode_token(worker, slot, POOL_ID_SMALL),
+        release_fn: release_tx_slot,
+    }
+}
+
 pub(crate) fn acquire_tx_buf() -> Option<nic_api::TxBufHandle> {
     let (worker, qp) = current_worker_and_qp()?;
-
-    // Spin-drain on full. Per-worker pool means slot allocation
-    // is lock-free regardless of nqp; only the qp drain takes
-    // TX_LOCK on Tier 2 (single shared qp).
     let mut local_iters: u64 = 0;
+
+    // Fast path: a slot is almost always immediately free. Take it before
+    // touching the clock / stall cell so the hot path carries zero
+    // circuit-breaker overhead.
+    if let Some(slot) = claim_small_slot(worker, &mut local_iters) {
+        return Some(small_slot_handle(worker, slot, local_iters));
+    }
+
+    // Pool full — enter the bounded spin-drain with a stall circuit
+    // breaker. Per-worker pool means slot allocation is lock-free
+    // regardless of nqp; only the qp drain takes TX_LOCK on Tier 2.
+    //
+    // Under normal transient saturation a slot frees within a few sweeps
+    // (µs) and the spin-drain beats the drop+retransmit cost. But the spin
+    // MUST be bounded: if the device stops draining the TX ring, an
+    // unbounded spin hard-hangs the whole core synchronously (no executor
+    // yield, no serial) — RX, timers, and every other connection starve.
+    // That is the Apple-HVF h3-`/stream` wedge: the guest's cacheable read
+    // of the TX `used->idx` goes stale, completions are never observed,
+    // pool slots never free, and the old unbounded loop spun at ~100% CPU
+    // forever (see reference_hvf_h3_stream_wedge).
+    //
+    // So: spin-drain only up to `spin_budget`; if it elapses, arm a
+    // fast-fail `COOLDOWN` window and return `None` ("ring full"). The
+    // budget is ~1000× a healthy free latency, so it never trips under
+    // normal saturation. While the cooldown is armed every full-pool
+    // acquire fast-fails after one cheap drain — keeping each call O(µs)
+    // so even a sender that floods the dead ring (QUIC has no congestion
+    // controller yet, so a stalled stream keeps producing) drains as a
+    // brief burst and the event loop stays live. Callers honor the `None`
+    // contract: QUIC falls back to a Heap datagram (then `submit_tx` drops
+    // on full) and retransmits; TCP resends. The cooldown self-clears on
+    // the first successful acquire (the ring recovered).
+    let cycles_per_us = kernel_bare::time::cycles_per_us();
+    let spin_start = kernel_bare::time::now_cycles();
+    let stalled = spin_start < TX_STALL_UNTIL.load(Ordering::Relaxed);
+    let spin_budget = cycles_per_us.saturating_mul(1000); // ~1 ms
+
     loop {
-        // SAFETY: single-writer-per-worker — only this worker claims
-        // from its own pool (`claim_first_free`'s required invariant);
-        // the slice is formed from the live `wpool(worker)` pointer.
-        // Bind the array reference explicitly first so the `[..]` slice
-        // isn't an implicit autoref through the raw-pointer deref.
-        let (got, scanned) = unsafe {
-            let small_used = &(*wpool(worker)).small_used;
-            claim_first_free(&small_used[..TX_POOL_SMALL_SIZE])
-        };
-        local_iters += scanned as u64;
-        if let Some(slot) = got {
-            // Diagnostics: bump aggregate scan-depth + acquire counts.
-            // One write each per successful acquire — `local_iters /
-            // acquires` (read-side) is the average scan depth. Relaxed
-            // ordering: counters never gate any other read.
-            TX_SMALL_SCAN_ITERS.add(local_iters);
-            TX_SMALL_ACQUIRES.bump();
-            let buf = unsafe { &mut (*wpool(worker)).small[slot] };
-            return Some(nic_api::TxBufHandle {
-                data_ptr: buf.data.as_mut_ptr(),
-                data_cap: MAX_ETH_FRAME_SMALL as u32,
-                driver_token: encode_token(worker, slot, POOL_ID_SMALL),
-                release_fn: release_tx_slot,
-            });
-        }
-        // All slots busy — flush deferred kicks so the host can
-        // process the pending TX batch and produce completions,
-        // then drain and re-scan. Each full sweep counts as one
-        // saturation event for `tx_diag`.
+        // All slots busy — flush deferred kicks so the host can process
+        // the pending TX batch and produce completions, then drain and
+        // re-scan. Each full sweep counts as one saturation event.
         TX_SMALL_FULL_SPINS.bump();
         unsafe {
             (*tx_q(qp)).flush_kick();
         }
         tx_drain_qp_locked(qp);
         compiler_fence(Ordering::SeqCst);
+        // Re-claim a slot the drain may have just freed before deciding
+        // to bail (so a drain-freed slot isn't missed on the exit path).
+        if let Some(slot) = claim_small_slot(worker, &mut local_iters) {
+            if stalled {
+                TX_STALL_UNTIL.store(0, Ordering::Relaxed);
+            }
+            return Some(small_slot_handle(worker, slot, local_iters));
+        }
+        // Cooldown active → one drain attempt was enough; fast-fail.
+        // Otherwise spin until the budget, then arm the cooldown.
+        let over_budget = kernel_bare::time::now_cycles().wrapping_sub(spin_start) > spin_budget;
+        if stalled || over_budget {
+            if over_budget && !stalled {
+                const COOLDOWN_US: u64 = 10_000; // ~10 ms fast-fail window
+                let until =
+                    kernel_bare::time::now_cycles().wrapping_add(cycles_per_us.saturating_mul(COOLDOWN_US));
+                TX_STALL_UNTIL.store(until, Ordering::Relaxed);
+            }
+            crate::diag::record_tx_drop(
+                &crate::diag::COUNTERS.tx_acquire_giveup,
+                "tx_acquire_giveup",
+                qp as u32,
+                0,
+            );
+            return None;
+        }
     }
 }
 

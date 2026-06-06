@@ -173,6 +173,17 @@ pub struct Counters {
     /// type-distinct handles guarantee a valid pool); any nonzero
     /// value means a corrupted `TxBufHandle`.
     pub tx_bad_token: Counter,
+    /// `acquire_tx_buf` couldn't get a TX pool slot — either it
+    /// spin-drained its full budget without one freeing (the TX ring
+    /// has stalled) or it fast-failed inside the post-stall cooldown.
+    /// It returns `None` ("ring full") rather than hang the core; the
+    /// caller sheds load (QUIC → drop+retransmit, TCP → resend). Happens
+    /// when the device stops draining the TX ring — observed on Apple
+    /// HVF, where the guest's cacheable read of the TX `used->idx` goes
+    /// stale so completions are never seen (see
+    /// reference_hvf_h3_stream_wedge). Nonzero flags a stalled TX ring,
+    /// not a logic bug.
+    pub tx_acquire_giveup: Counter,
 }
 
 impl Counters {
@@ -183,6 +194,7 @@ impl Counters {
             tx_submit_failed: Counter::new(),
             tx_bad_frame_len: Counter::new(),
             tx_bad_token: Counter::new(),
+            tx_acquire_giveup: Counter::new(),
         }
     }
 }
@@ -244,6 +256,7 @@ pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
         w,
         "{{\"driver\":\"virtio-net\",\"rx_runt_frames\":{},\"rx_repost_bad_qp\":{},\
          \"tx_submit_failed\":{},\"tx_bad_frame_len\":{},\"tx_bad_token\":{},\
+         \"tx_acquire_giveup\":{},\
          \"rx_buf_reposts\":{},\"tx_packets\":{},\"tx_bytes\":{},\"rx_bytes\":{},\
          \"tx_small_full_spins\":{},\"tx_big_full_returns\":{},",
         c.rx_runt_frames.get(),
@@ -251,6 +264,7 @@ pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
         c.tx_submit_failed.get(),
         c.tx_bad_frame_len.get(),
         c.tx_bad_token.get(),
+        c.tx_acquire_giveup.get(),
         sum(&RX_BUF_REPOST_COUNT),
         sum(&TX_PACKETS_PER_QP),
         sum(&TX_BYTES_PER_QP),
