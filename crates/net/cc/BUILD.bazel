@@ -1,0 +1,21 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Shared congestion-control core: one `CongestionControl` trait + NewReno,
+# driven identically by TCP and QUIC (docs/stack-architecture.md "one
+# congestion-control / loss-recovery / pacing core"; docs/tx-backpressure.md).
+# Pure integer state, no deps — host-unit-testable.
+rust_library(
+    name = "cc",
+    srcs = ["src/lib.rs"],
+    crate_name = "net_cc",
+    crate_root = "src/lib.rs",
+)
+
+rust_test(
+    name = "cc_test",
+    size = "small",
+    crate = ":cc",
+)
