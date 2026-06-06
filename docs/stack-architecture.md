@@ -505,13 +505,18 @@ currently *detects* loss but has no window to shrink), so it serves both stacks
 in one stroke. Gate it behind the `SendProgress` contract (so the CC has a clean
 backpressure signal) and, for the L4 half, behind SACK (T7).
 
-- **Status**: [ ] not started. **Where**: a new shared CC module (e.g.
-  `crates/net/cc`); `net/tcp/src/state.rs` delegates to it; `proto/quic/src/conn`
-  adopts it. **Win**: CUBIC/BBR + pacing written once; QUIC gets its first
-  controller; the L1/L3 Linux-parity gap closes for both transports together.
-  **Effort**: large. **Risk**: medium — CC is subtle; keep the existing TCP
-  controller's `tcp_test` scenarios (`cwnd_on_ack` / RTO collapse / fast
-  retransmit / slow-start ABC) green through the extraction.
+- **Status**: [~] foundation landed. The shared module exists —
+  [`crates/net/cc`](../crates/net/cc) has the `CongestionControl` trait (this
+  exact signature) + a `NewReno` controller + unit tests; see
+  [`tx-backpressure.md`](tx-backpressure.md) (stage 1) for how it fits the
+  end-to-end backpressure chain. **Pending**: `net/tcp/src/state.rs` delegating
+  its embedded `cwnd`/`ssthresh` to it, and `proto/quic/src/conn` adopting it.
+  **Win**: CUBIC/BBR + pacing written once; QUIC gets its first controller; the
+  L1/L3 Linux-parity gap closes for both transports together. **Effort**:
+  large (the wiring; the controller core is done). **Risk**: medium — CC is
+  subtle; keep the existing TCP controller's `tcp_test` scenarios
+  (`cwnd_on_ack` / RTO collapse / fast retransmit / slow-start ABC) green
+  through the extraction.
 
 ---
 
