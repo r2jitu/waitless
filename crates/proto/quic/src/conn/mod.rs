@@ -763,6 +763,24 @@ pub struct Connection {
     /// `detect_loss`. The congestion gate is `bytes_in_flight <
     /// cc.window()`.
     pub(super) bytes_in_flight: u32,
+
+    /// Send-side connection-level flow control (RFC 9000 §4.1): the
+    /// max total STREAM bytes we may send across all streams, =
+    /// peer's `initial_max_data` raised by inbound MAX_DATA frames.
+    /// `data_sent` is the running total. Seeded from the peer's
+    /// transport params by `apply_peer_flow_control` once Established.
+    pub(super) peer_max_data: u64,
+    pub(super) data_sent: u64,
+    /// Peer's per-stream initial send limits, used to seed a new
+    /// `SendStream`'s `peer_max_stream_data` by stream class:
+    /// `_bidi` (= the peer's `initial_max_stream_data_bidi_local`) for
+    /// client-opened bidi streams (our h3 responses); `_uni` for our
+    /// server-opened uni control streams.
+    pub(super) peer_initial_max_stream_data_bidi: u64,
+    pub(super) peer_initial_max_stream_data_uni: u64,
+    /// One-shot guard: whether `apply_peer_flow_control` has parsed and
+    /// applied the peer's transport-param flow-control limits.
+    pub(super) peer_fc_applied: bool,
 }
 
 impl Drop for Connection {
@@ -878,6 +896,11 @@ impl Connection {
             // implicit burst the loss/PTO machinery already assumed.
             cc: net_cc::NewReno::new(MAX_QUIC_DATAGRAM as u32),
             bytes_in_flight: 0,
+            peer_max_data: 0,
+            data_sent: 0,
+            peer_initial_max_stream_data_bidi: 0,
+            peer_initial_max_stream_data_uni: 0,
+            peer_fc_applied: false,
         }
     }
 
@@ -908,6 +931,9 @@ impl Connection {
     /// handle so the caller can immediately write into it.
     pub(super) fn ensure_send_stream(&mut self, sid: u64) -> &mut crate::streams::SendStream {
         if !self.send_streams.contains_key(&sid) {
+            // Make sure the peer's send-side flow-control limits are in
+            // hand before seeding the new stream's window.
+            self.apply_peer_flow_control();
             let mut new_stream = self
                 .send_pool
                 .pop()
@@ -918,10 +944,43 @@ impl Connection {
             // client-bidi request has a RecvStream here — server-
             // initiated streams find none and stay untracked (0).
             new_stream.rx_us = self.recv_streams.get(&sid).map_or(0, |r| r.rx_us);
+            // Send-side per-stream flow-control limit (RFC 9000 §4.1),
+            // by stream class: a client-opened bidi stream (our h3
+            // response) is bounded by the peer's
+            // initial_max_stream_data_bidi_local; our server-opened uni
+            // control streams by initial_max_stream_data_uni.
+            new_stream.peer_max_stream_data = if crate::streams::is_bidirectional(sid) {
+                self.peer_initial_max_stream_data_bidi
+            } else {
+                self.peer_initial_max_stream_data_uni
+            };
             self.send_streams.insert(sid, new_stream);
             crate::diag::COUNTERS.send_streams_created.bump();
         }
         self.send_streams.get_mut(&sid).unwrap()
+    }
+
+    /// Parse the peer's transport parameters (available once the
+    /// handshake has processed the client's TLS) and apply the
+    /// send-side flow-control limits — `peer_max_data` and the
+    /// per-stream-class initial windows. One-shot: a no-op once applied
+    /// or while the params aren't available yet (no 1-RTT STREAM data
+    /// flows before the handshake completes, so the gate isn't consulted
+    /// until after this has run).
+    pub(super) fn apply_peer_flow_control(&mut self) {
+        if self.peer_fc_applied {
+            return;
+        }
+        if let Some(p) = self
+            .tls
+            .client_transport_params()
+            .and_then(|b| crate::transport_params::parse_client_params(b).ok())
+        {
+            self.peer_max_data = p.initial_max_data;
+            self.peer_initial_max_stream_data_bidi = p.initial_max_stream_data_bidi_local;
+            self.peer_initial_max_stream_data_uni = p.initial_max_stream_data_uni;
+            self.peer_fc_applied = true;
+        }
     }
 
     pub fn state(&self) -> ConnState {

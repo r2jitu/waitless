@@ -159,6 +159,16 @@ pub enum Frame<'a> {
         reason: &'a [u8],
     },
     HandshakeDone,
+    /// 0x10 MAX_DATA — peer raised the connection-level limit on how
+    /// many total stream bytes we may send (send-side flow control).
+    MaxData {
+        maximum: u64,
+    },
+    /// 0x11 MAX_STREAM_DATA — peer raised the per-stream send limit.
+    MaxStreamData {
+        stream_id: u64,
+        maximum: u64,
+    },
     /// Wire-recognized frame whose semantics the connection layer
     /// doesn't act on yet. Carries the type byte for diagnostics —
     /// upgrading to a typed variant is a one-arm change in dispatch.
@@ -239,20 +249,35 @@ pub fn parse_frame(data: &[u8]) -> Result<(Frame<'_>, usize), FrameError> {
         // ignoring it is safe; treating it as an unknown frame
         // tripped CONNECTION_CLOSE(PROTOCOL_VIOLATION) instead.
         ftype::STOP_SENDING => skip_two_varints(rest, t, frame_total_offset),
-        ftype::MAX_DATA
-        | ftype::MAX_STREAMS_BIDI
+        // MAX_DATA / MAX_STREAM_DATA carry the peer's send-side
+        // flow-control credit — parsed (not skipped) so the connection
+        // can raise its send windows.
+        ftype::MAX_DATA => parse_max_data(rest, frame_total_offset),
+        ftype::MAX_STREAM_DATA => parse_max_stream_data(rest, frame_total_offset),
+        ftype::MAX_STREAMS_BIDI
         | ftype::MAX_STREAMS_UNI
         | ftype::DATA_BLOCKED
         | ftype::STREAMS_BLOCKED_BIDI
         | ftype::STREAMS_BLOCKED_UNI
         | ftype::RETIRE_CONNECTION_ID => skip_one_varint(rest, t, frame_total_offset),
-        ftype::MAX_STREAM_DATA | ftype::STREAM_DATA_BLOCKED => {
-            skip_two_varints(rest, t, frame_total_offset)
-        }
+        ftype::STREAM_DATA_BLOCKED => skip_two_varints(rest, t, frame_total_offset),
         ftype::NEW_CONNECTION_ID => skip_new_connection_id(rest, t, frame_total_offset),
         ftype::PATH_CHALLENGE | ftype::PATH_RESPONSE => skip_fixed(rest, t, 8, frame_total_offset),
         other => Err(FrameError::UnknownFrameType(other)),
     }
+}
+
+// ── Flow-control frame parsers ───────────────────────────────────
+
+fn parse_max_data(body: &[u8], header: usize) -> Result<(Frame<'_>, usize), FrameError> {
+    let (maximum, n) = read_varint(body)?;
+    Ok((Frame::MaxData { maximum }, header + n))
+}
+
+fn parse_max_stream_data(body: &[u8], header: usize) -> Result<(Frame<'_>, usize), FrameError> {
+    let (stream_id, n) = read_varint(body)?;
+    let (maximum, m) = read_varint(&body[n..])?;
+    Ok((Frame::MaxStreamData { stream_id, maximum }, header + n + m))
 }
 
 // ── Skip helpers ─────────────────────────────────────────────────
@@ -745,37 +770,43 @@ mod tests {
     }
 
     #[test]
-    fn skip_max_data_consumes_one_varint() {
+    fn parse_max_data_yields_value() {
         // type=0x10 || varint(7) = 1 + 1 bytes (7 fits in 6-bit form).
         let buf = [0x10u8, 0x07];
         let (f, n) = parse_frame(&buf).unwrap();
-        assert!(matches!(f, Frame::Skipped { kind: 0x10 }));
+        assert!(matches!(f, Frame::MaxData { maximum: 7 }));
         assert_eq!(n, 2);
     }
 
     #[test]
-    fn write_max_data_round_trips_through_skip() {
+    fn write_max_data_round_trips() {
         let mut buf = [0u8; 16];
         let n = write_max_data(1 << 20, &mut buf).unwrap();
         let (f, parsed) = parse_frame(&buf[..n]).unwrap();
-        assert!(matches!(f, Frame::Skipped { kind: 0x10 }));
+        assert!(matches!(f, Frame::MaxData { maximum } if maximum == 1 << 20));
         assert_eq!(parsed, n);
         assert_eq!(buf[0], ftype::MAX_DATA);
     }
 
     #[test]
-    fn write_max_stream_data_round_trips_through_skip() {
+    fn write_max_stream_data_round_trips() {
         let mut buf = [0u8; 24];
         // Small ids/limits (single-byte varints).
         let n = write_max_stream_data(0, 384 << 10, &mut buf).unwrap();
         let (f, parsed) = parse_frame(&buf[..n]).unwrap();
-        assert!(matches!(f, Frame::Skipped { kind: 0x11 }));
+        assert!(
+            matches!(f, Frame::MaxStreamData { stream_id: 0, maximum } if maximum == 384 << 10)
+        );
         assert_eq!(parsed, n);
         assert_eq!(buf[0], ftype::MAX_STREAM_DATA);
         // Large id + limit to exercise multi-byte varints in both fields.
         let n2 = write_max_stream_data(1 << 30, 1 << 22, &mut buf).unwrap();
         let (f2, parsed2) = parse_frame(&buf[..n2]).unwrap();
-        assert!(matches!(f2, Frame::Skipped { kind: 0x11 }));
+        assert!(matches!(
+            f2,
+            Frame::MaxStreamData { stream_id, maximum }
+                if stream_id == 1 << 30 && maximum == 1 << 22
+        ));
         assert_eq!(parsed2, n2);
     }
 

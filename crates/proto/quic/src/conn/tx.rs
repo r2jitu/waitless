@@ -101,6 +101,11 @@ impl Connection {
     pub(super) fn flush_outbound(&mut self, _config: &TlsServerConfig) -> Result<(), ConnError> {
         use executor::reactor::MAX_L2_HEADROOM;
 
+        // Make sure the peer's send-side flow-control limits are applied
+        // before the 1-RTT STREAM-data gate consults `peer_max_data`
+        // (one-shot; no-op until the peer's transport params arrive).
+        self.apply_peer_flow_control();
+
         // CONNECTION_CLOSE short-circuits the normal flush flow.
         // RFC 9000 §10.2.1: once we decide to close, we send one
         // packet with the close frame and stop generating packets
@@ -677,28 +682,48 @@ impl Connection {
         // borrow so `self.cc` / `self.bytes_in_flight` aren't aliased.
         let mut cc_budget =
             self.cc.window().saturating_sub(self.bytes_in_flight) as usize;
+        // Connection-level send flow control (RFC 9000 §4.1): total
+        // STREAM bytes still authorized across all streams by the peer's
+        // MAX_DATA. Read before the `iter_mut` borrow; the delta is
+        // applied to `self.data_sent` after the loop.
+        let mut conn_fc_budget = self.peer_max_data.saturating_sub(self.data_sent) as usize;
+        let mut data_sent_delta: u64 = 0;
         for (sid, s) in self.send_streams.iter_mut() {
-            if cc_budget == 0 {
+            // cwnd / conn-level FC are global — once exhausted no stream
+            // can send this packet.
+            if cc_budget == 0 || conn_fc_budget == 0 {
                 break;
             }
             let body_so_far = out.len() - payload_offset;
             if body_so_far >= PACKET_BODY_BUDGET {
                 break;
             }
+            // Per-stream send FC: bytes still authorized on this stream
+            // by the peer's MAX_STREAM_DATA.
+            let stream_fc_budget = s.peer_max_stream_data.saturating_sub(s.send_offset) as usize;
             let max_chunk = PACKET_BODY_BUDGET
                 .saturating_sub(body_so_far + 16)
-                .min(cc_budget);
+                .min(cc_budget)
+                .min(conn_fc_budget)
+                .min(stream_fc_budget);
             if max_chunk == 0 {
-                break;
+                // This stream is flow-control- (or packet-) blocked; its
+                // data stays queued (backpressuring the handler). Other
+                // streams may still have credit, so try the next.
+                continue;
             }
-            let before = out.len();
+            let off_before = s.send_offset;
             if s.pop_chunk_into(*sid, max_chunk, out)
                 .map_err(|_| ConnError::Wire)?
             {
                 ack_eliciting = true;
             }
-            cc_budget = cc_budget.saturating_sub(out.len() - before);
+            let data_popped = s.send_offset.saturating_sub(off_before) as usize;
+            cc_budget = cc_budget.saturating_sub(data_popped);
+            conn_fc_budget = conn_fc_budget.saturating_sub(data_popped);
+            data_sent_delta += data_popped as u64;
         }
+        self.data_sent = self.data_sent.saturating_add(data_sent_delta);
 
         let body_len = out.len() - payload_offset;
         if body_len == 0 {

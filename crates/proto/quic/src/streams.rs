@@ -377,6 +377,12 @@ pub struct SendStream {
     /// request latency; cleared to `0` after recording so the
     /// sample fires at most once.
     pub rx_us: u64,
+    /// Send-side flow-control limit (RFC 9000 §4.1): the highest
+    /// stream offset the peer has authorized us to send, = the peer's
+    /// per-stream-class initial limit raised by inbound MAX_STREAM_DATA.
+    /// Seeded by `ensure_send_stream`; `send_offset` may not exceed it.
+    /// `0` until seeded (no data flows before the handshake completes).
+    pub peer_max_stream_data: u64,
 }
 
 impl Default for SendStream {
@@ -387,6 +393,7 @@ impl Default for SendStream {
             send_offset: 0,
             state: SendState::Open,
             rx_us: 0,
+            peer_max_stream_data: 0,
         }
     }
 }
@@ -405,6 +412,7 @@ impl SendStream {
         self.send_offset = 0;
         self.state = SendState::Open;
         self.rx_us = 0;
+        self.peer_max_stream_data = 0;
     }
 
     /// Convenience predicate (FIN was emitted) — kept for the

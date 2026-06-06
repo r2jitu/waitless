@@ -899,9 +899,24 @@ impl Connection {
                         self.application_space.ack_pending = true;
                     }
                 }
+                Frame::MaxData { maximum } => {
+                    // Peer raised our connection-level send limit
+                    // (RFC 9000 §4.1). Flow-control limits are
+                    // monotonic; `max` ignores reordered / stale frames.
+                    self.peer_max_data = self.peer_max_data.max(maximum);
+                }
+                Frame::MaxStreamData { stream_id, maximum } => {
+                    // Peer raised a stream's send limit. The common h3
+                    // case: the client extends the window as it consumes
+                    // our response. Apply only if the send stream exists;
+                    // otherwise the initial-param seed stands.
+                    if let Some(s) = self.send_streams.get_mut(&stream_id) {
+                        s.peer_max_stream_data = s.peer_max_stream_data.max(maximum);
+                    }
+                }
                 Frame::Skipped { kind } => {
                     // Most wire-recognized frames need no app-level
-                    // reaction (MAX_DATA, NEW_CONNECTION_ID, …); the
+                    // reaction (NEW_CONNECTION_ID, …); the
                     // frame layer already consumed the right bytes. But
                     // DATA_BLOCKED / STREAM_DATA_BLOCKED mean the peer is
                     // stalled at a receive-window edge — force the next
