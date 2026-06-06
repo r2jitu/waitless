@@ -464,3 +464,40 @@ fn pto_period_backs_off_exponentially() {
     assert_eq!(conn.pto_period_us(), base * (1 << 10));
     assert!(conn.pto_period_us() > at_9);
 }
+
+/// Egress pacer (RFC 9002 §7.7) arming logic: a pacing deadline is reported
+/// only when there is pending 1-RTT data AND the token bucket is spent.
+/// Without it the unpaced cwnd burst is dropped by GCE's per-VM egress
+/// policer (the multi-packet h3 download loss — see reference_gce_h3_burst_loss).
+#[test]
+fn pacer_arms_deadline_only_when_limited() {
+    use net_cc::CongestionControl;
+    let mut conn = Connection::new_server(ConnectionId::new(&[0xab; 8]), [0x42u8; 32]);
+    // Feed the congestion controller an RTT sample so `pacing_rate()` > 0.
+    // A 0.2 ms SRTT makes N·cwnd/srtt enormous, so the absolute rate cap is
+    // what binds — the low-RTT internal-VPC case the pacer targets.
+    conn.cc.on_ack(12_000, 0, net_cc::Rtt::new(200, 200));
+    conn.pace_last_us = 1_000_000;
+
+    // No pending 1-RTT data → never pacing-limited, whatever the budget.
+    conn.pace_budget = -700;
+    assert!(conn.pace_deadline_us().is_none());
+
+    // Pending data (a queued retransmission) + a spent budget → a deadline
+    // in the near future (sub-millisecond at the capped rate).
+    conn.retx_queue.push_back(super::StreamRetx {
+        sid: 0,
+        offset: 0,
+        fin: false,
+        data: alloc::vec![0u8; 100],
+    });
+    let d = conn
+        .pace_deadline_us()
+        .expect("pending data + spent budget → a deadline is armed");
+    assert!(d > 1_000_000, "deadline must be in the future");
+    assert!(d <= 1_000_000 + 1_000, "paced interval is sub-ms at the rate cap");
+
+    // Pending data but positive budget → may send now, no deadline.
+    conn.pace_budget = 1;
+    assert!(conn.pace_deadline_us().is_none());
+}

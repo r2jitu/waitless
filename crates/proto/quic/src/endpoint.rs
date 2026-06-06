@@ -723,9 +723,14 @@ where
         // After wake we figure out which one fired, since `select`
         // is binary: we know the timer fired, then check now()
         // against each deadline independently.
-        let (idle_us, last_recv_us, pto_deadline) = {
+        let (idle_us, last_recv_us, pto_deadline, pace_deadline) = {
             let c = conn.borrow();
-            (c.idle_timeout_us(), c.last_recv_us(), c.pto_deadline_us())
+            (
+                c.idle_timeout_us(),
+                c.last_recv_us(),
+                c.pto_deadline_us(),
+                c.pace_deadline_us(),
+            )
         };
         let now = tls::ticket::now_us();
         let elapsed = now.saturating_sub(last_recv_us);
@@ -741,10 +746,16 @@ where
             break;
         }
         let idle_deadline = last_recv_us + idle_us;
-        let timer_deadline = match pto_deadline {
-            Some(p) => p.min(idle_deadline),
-            None => idle_deadline,
-        };
+        // Race the inbox against the earliest of idle / PTO / pacing
+        // deadlines. The pacing deadline fires when the egress token bucket
+        // has refilled enough to ship the next paced burst (RFC 9002 §7.7).
+        let mut timer_deadline = idle_deadline;
+        if let Some(p) = pto_deadline {
+            timer_deadline = timer_deadline.min(p);
+        }
+        if let Some(p) = pace_deadline {
+            timer_deadline = timer_deadline.min(p);
+        }
         let remaining = timer_deadline.saturating_sub(now).max(1);
 
         let dgram = match waitless::runtime::select(inbox.pop(), waitless::runtime::sleep_us(remaining)).await
@@ -786,25 +797,32 @@ where
                     exit_reason = crate::diag::ExitReason::IdleTimeout;
                     break;
                 }
-                // Not idle — the PTO deadline is what woke us.
-                // Emit a probe if it has actually arrived (a
-                // too-early wakeup just loops and re-arms the
-                // timer); then loop back. PTO is recovery, not
-                // teardown.
-                if pto_deadline.is_some_and(|p| after >= p) {
-                    let probed = conn.borrow_mut().send_pto_probe();
-                    if probed {
-                        crate::diag::COUNTERS.pto_probes_sent.bump();
-                        // Drain the probe to the wire immediately
-                        // via the ownership-transfer pop + recycle
-                        // pattern.
-                        loop {
-                            let pkt = match conn.borrow_mut().pop_packet_owned() {
-                                Some(p) => p,
-                                None => break,
-                            };
-                            ship_datagram(&sock, &conn, peer_ip.get(), peer_port.get(), pkt);
-                        }
+                // Not idle — a PTO and/or pacing deadline woke us
+                // (a too-early wakeup just loops and re-arms the timer).
+                // PTO is recovery; pacing resumes a throttled response burst.
+                // Neither is teardown. Do both if both are due, then ship
+                // everything queued in one drain.
+                let mut shipped_work = false;
+                if pto_deadline.is_some_and(|p| after >= p) && conn.borrow_mut().send_pto_probe() {
+                    crate::diag::COUNTERS.pto_probes_sent.bump();
+                    shipped_work = true;
+                }
+                if pace_deadline.is_some_and(|p| after >= p) {
+                    // The token bucket has refilled — emit the next paced
+                    // burst of 1-RTT data (and re-arm `pace_deadline_us` if
+                    // more remains).
+                    let _ = conn.borrow_mut().flush(&cfg);
+                    shipped_work = true;
+                }
+                if shipped_work {
+                    // Drain to the wire via the ownership-transfer pop +
+                    // recycle pattern.
+                    loop {
+                        let pkt = match conn.borrow_mut().pop_packet_owned() {
+                            Some(p) => p,
+                            None => break,
+                        };
+                        ship_datagram(&sock, &conn, peer_ip.get(), peer_port.get(), pkt);
                     }
                 }
                 continue;

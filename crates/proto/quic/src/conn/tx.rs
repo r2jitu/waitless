@@ -26,6 +26,28 @@ use alloc::vec;
 use alloc::vec::Vec;
 use tls::TlsServerConfig;
 
+/// Absolute ceiling on the paced egress rate, in bytes/s (100 Mbps).
+/// On real-RTT paths `cc.pacing_rate()` (N·cwnd/srtt) is the binding limit
+/// and stays well under this; on the low-RTT internal bench path that rate
+/// is enormous, so this cap is what actually spaces the burst under GCE's
+/// per-VM egress policer. Tunable: raise for more h3 throughput once the
+/// policer headroom is known (see reference_gce_h3_burst_loss).
+const MAX_PACE_RATE_BPS: u64 = 12_500_000;
+
+/// Burst-budget ceiling, in bytes. Deliberately BELOW one full data packet
+/// (`MAX_QUIC_DATAGRAM / 2`): with the `budget > 0` gate this means a single
+/// large data packet always drives the budget negative → exactly one large
+/// packet per paced send (the GCE egress policer drops large packets bunched
+/// in a burst — the HEADERS packet rides a ~1100 B data packet, so a multi-
+/// packet burst loses it; a lone large packet passes, like the always-fine
+/// single-packet /health). Small control / health-check packets (≪ this) stay
+/// positive and ship back-to-back with no pacing delay — they're cheap to the
+/// byte-based policer, and gating them on a full packet's worth of credit
+/// added a ~1 ms timer wait to every small response (a 5× /health regression).
+/// Throughput is set by the rate, not this. Tunable up once policer headroom
+/// is known.
+const MAX_PACE_BURST: i64 = MAX_QUIC_DATAGRAM as i64 / 2;
+
 impl Connection {
     /// Schedule a CONNECTION_CLOSE on the next outbound flush.
     /// Per RFC 9000 §10.2 the close is emitted as a single packet
@@ -94,6 +116,78 @@ impl Connection {
         self.flush_outbound(config)?;
         self.reap_finished_streams();
         Ok(())
+    }
+
+    // ── Egress pacing (RFC 9002 §7.7) ────────────────────────────
+    //
+    // The flush tail loop dumps the whole congestion window as one
+    // back-to-back microburst. GCE's per-VM egress policer drops such an
+    // unpaced burst (the multi-packet h3 download loss — see
+    // reference_gce_h3_burst_loss; TCP dodges it via TSO, single-packet
+    // /health never bursts). A token bucket spaces the bytes out.
+    //
+    // Rate = `min(cc.pacing_rate(), MAX_PACE_RATE)`. `cc.pacing_rate()` is
+    // RFC-correct (N·cwnd/srtt) and binds on real-RTT paths; on the
+    // low-RTT internal bench path it is enormous (cwnd/srtt with srtt≈0.2 ms)
+    // so the absolute `MAX_PACE_RATE` cap is what actually spaces the burst
+    // there. `MAX_PACE_BURST` caps the instantaneous burst regardless of
+    // rate — the lever that keeps each sub-burst under the policer.
+
+    /// Effective paced rate in bytes/s. `cc.pacing_rate()` (N·cwnd/srtt) is
+    /// RFC-correct and binds on real-RTT paths; capped by `MAX_PACE_RATE_BPS`.
+    /// Before the first RTT sample `cc.pacing_rate()` is 0 — the RFC sends the
+    /// initial window UNPACED there, but that IW microburst is exactly what
+    /// the GCE policer drops (the response often flushes on a fast handshake
+    /// before any ACK of our own packets → no sample yet). So pace at the cap
+    /// even with no sample; never return 0 (pacing always on once Established).
+    fn pace_rate(&self) -> u64 {
+        let r = self.cc.pacing_rate();
+        if r == 0 {
+            return MAX_PACE_RATE_BPS;
+        }
+        r.min(MAX_PACE_RATE_BPS)
+    }
+
+    /// Refill the token bucket for the elapsed wall-clock and return whether
+    /// a packet may be emitted now. Emits on any positive credit: a large
+    /// data packet then drives the budget negative (next packet waits for
+    /// `pace_deadline_us`), giving 1-large-packet bursts, while small packets
+    /// keep the budget positive and ship without a pacing wait (see
+    /// `MAX_PACE_BURST`).
+    fn pace_gate(&mut self) -> bool {
+        let now = tls::ticket::now_us();
+        let rate = self.pace_rate(); // always > 0
+        let elapsed = now.saturating_sub(self.pace_last_us);
+        let add = rate.saturating_mul(elapsed) / 1_000_000;
+        self.pace_budget = self
+            .pace_budget
+            .saturating_add(add as i64)
+            .min(MAX_PACE_BURST);
+        self.pace_last_us = now;
+        self.pace_budget > 0
+    }
+
+    /// Debit the bucket by the wire bytes of a packet just emitted.
+    fn pace_consume(&mut self, n: u64) {
+        self.pace_budget = self.pace_budget.saturating_sub(n as i64);
+    }
+
+    /// Wall-clock μs at which the pacer next permits a send, or `None` when
+    /// not pacing-limited (no pending 1-RTT data, unpaced, or budget left).
+    /// The conn task folds this into its timer race and re-flushes on wake.
+    /// Accrues back to a full `MAX_PACE_BURST` so each wake ships one burst
+    /// rather than one packet at a time (fewer wakeups).
+    pub fn pace_deadline_us(&self) -> Option<u64> {
+        if !self.has_pending_one_rtt_data() {
+            return None;
+        }
+        let rate = self.pace_rate();
+        if rate == 0 || self.pace_budget > 0 {
+            return None;
+        }
+        let deficit = (MAX_PACE_BURST - self.pace_budget) as u64;
+        let wait = (deficit.saturating_mul(1_000_000) / rate).max(1);
+        Some(self.pace_last_us.saturating_add(wait))
     }
 
     // ── TLS state machine drive + outbound flush ────────────────
@@ -195,7 +289,23 @@ impl Connection {
         // Handshake flight has been sent — so it never shares a
         // datagram with the large multi-fragment flight.
         if matches!(self.state, ConnState::Established) {
-            self.encode_one_rtt_packet(datagram.vec_mut())?;
+            // Pace the first 1-RTT packet too, not just the tail loop. The
+            // conn task batches many inbound datagrams and flushes after
+            // each, then ships all queued packets together; an unmetered
+            // first packet per flush lets a batch emit one burst per inbound
+            // datagram, defeating the pacer (the GCE microburst returns —
+            // observed as a 7-packet back-to-back cluster). Gate it on the
+            // token bucket — but ONLY when it would carry congestion-
+            // controlled STREAM data: an ACK-/control-only packet must never
+            // be paced (small, harmless to the policer, and pacing it could
+            // strand an ACK since `pace_deadline_us` only re-arms while
+            // stream data is pending). Debit the 1-RTT wire bytes either way.
+            let pace_ok = !self.has_pending_one_rtt_data() || self.pace_gate();
+            if pace_ok {
+                let before = datagram.len();
+                self.encode_one_rtt_packet(datagram.vec_mut())?;
+                self.pace_consume((datagram.len() - before) as u64);
+            }
         }
         // Invariant: every datagram stays within MAX_QUIC_DATAGRAM
         // (see the const's docs — protocol MTU *and* TX-slot
@@ -299,6 +409,16 @@ impl Connection {
                 if self.anti_amp_remaining() == 0 {
                     break;
                 }
+                // Pacing gate (RFC 9002 §7.7): stop the tail burst once the
+                // token bucket is spent; the conn task re-flushes at
+                // `pace_deadline_us()`. Bounds the per-flush microburst the
+                // GCE egress policer would otherwise drop. The first 1-RTT
+                // packet above is unmetered, so HEADERS / a small response
+                // still ship immediately and every flush makes ≥1 pkt of
+                // progress (no pacer-induced deadlock).
+                if !self.pace_gate() {
+                    break;
+                }
                 let mut more = self.take_datagram_buf(1500);
                 self.encode_one_rtt_packet(more.vec_mut())?;
                 if more.len() <= MAX_L2_HEADROOM {
@@ -309,6 +429,7 @@ impl Connection {
                     crate::diag::COUNTERS.anti_amp_throttled.bump();
                     break;
                 }
+                self.pace_consume(n);
                 self.record_bytes_sent(n);
                 self.outbound.push_back(more);
             }

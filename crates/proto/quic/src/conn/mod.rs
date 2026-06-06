@@ -826,6 +826,18 @@ pub struct Connection {
     /// A field (not a return value) so the 6 `record_sent_packet` call
     /// sites that carry no stream data need no signature change.
     pub(super) pending_sent_stream_frames: alloc::vec::Vec<StreamRetx>,
+
+    /// Egress pacing token bucket (RFC 9002 §7.7). `pace_budget` is send
+    /// credit in bytes — it goes negative after a burst and refills at the
+    /// paced rate (`min(cc.pacing_rate(), MAX_PACE_RATE)`), capped at
+    /// `MAX_PACE_BURST`. The flush tail loop gates 1-RTT data emission on
+    /// it; the conn task arms `pace_deadline_us()` to resume when credit
+    /// accrues. This bounds the per-flush microburst so GCE's per-VM egress
+    /// policer doesn't drop the unpaced cwnd dump — the multi-packet h3
+    /// download loss (see reference_gce_h3_burst_loss). `pace_last_us` is
+    /// the last refill timestamp; 0 lets the first refill grant a full burst.
+    pub(super) pace_budget: i64,
+    pub(super) pace_last_us: u64,
 }
 
 impl Drop for Connection {
@@ -950,6 +962,8 @@ impl Connection {
             retx_queue: alloc::collections::VecDeque::new(),
             retx_bytes: 0,
             pending_sent_stream_frames: alloc::vec::Vec::new(),
+            pace_budget: 0,
+            pace_last_us: 0,
         }
     }
 
