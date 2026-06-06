@@ -20,20 +20,25 @@ use crate::tls::CryptoLevel;
 
 impl Connection {
     /// PTO (Probe Timeout) period in microseconds, RFC 9002 §6.2.1:
-    ///   `PTO = SRTT + max(4 * RTTvar, kGranularity) + max_ack_delay`
-    /// Until we have an SRTT sample, falls back to kInitialRtt =
-    /// 333 ms. We don't yet implement exponential backoff
-    /// (`PTO * 2^pto_count`); a single missed probe is acceptable
-    /// for first-pass behaviour.
+    ///   `PTO = (SRTT + max(4 * RTTvar, kGranularity) + max_ack_delay) << pto_count`
+    /// Until we have an SRTT sample, the base falls back to
+    /// kInitialRtt = 333 ms. `pto_count` (the exponential backoff) grows
+    /// each time a probe fires without progress and resets when an ACK
+    /// acknowledges new data, so a deadlocked / unresponsive peer probes
+    /// at a geometrically increasing interval instead of flooding PINGs.
     pub fn pto_period_us(&self) -> u64 {
         const K_INITIAL_RTT_US: u64 = 333_000;
         const K_GRANULARITY_US: u64 = 1_000;
         // Default peer max_ack_delay is 25 ms (RFC 9000 §18.2).
         let max_ack_delay_us: u64 = 25_000;
-        match self.smoothed_rtt_us {
+        let base = match self.smoothed_rtt_us {
             None => K_INITIAL_RTT_US + K_GRANULARITY_US,
             Some(srtt) => srtt + (4 * self.rttvar_us).max(K_GRANULARITY_US) + max_ack_delay_us,
-        }
+        };
+        // Cap the exponent so the period can't overflow and a long-
+        // unresponsive peer can't shift it to absurd values — the idle
+        // timeout reaps such a conn long before count 10 (~1024× base).
+        base.saturating_mul(1u64 << self.pto_count.min(10))
     }
 
     /// Microseconds-since-boot timestamp at which the PTO timer
@@ -80,6 +85,9 @@ impl Connection {
             && datagram.len() > MAX_L2_HEADROOM
         {
             self.outbound.push_back(datagram);
+            // Back off the next PTO (RFC 9002 §6.2.1). Reset in `process_ack`
+            // when an ACK acknowledges new data.
+            self.pto_count = self.pto_count.saturating_add(1);
             return true;
         }
         false
@@ -184,6 +192,8 @@ impl Connection {
         // `on_ack` sees the fresh SRTT for its pacing-rate estimate.
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(acked_bytes);
         if acked_bytes > 0 {
+            // Progress: reset the PTO backoff exponent (RFC 9002 §6.2.1).
+            self.pto_count = 0;
             let rtt = net_cc::Rtt::new(
                 self.smoothed_rtt_us.unwrap_or(0) as u32,
                 self.min_rtt_us.unwrap_or(0) as u32,

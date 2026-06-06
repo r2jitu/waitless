@@ -440,3 +440,27 @@ fn recv_flow_control_rejects_over_conn_window() {
         .expect("exceeding the conn window must schedule a close");
     assert_eq!(close.0, 0x03, "FLOW_CONTROL_ERROR");
 }
+
+/// PTO exponential backoff (RFC 9002 §6.2.1): the probe period doubles
+/// per `pto_count` and the exponent is capped so an unresponsive peer
+/// probes at a geometric (not fixed) interval. A missing backoff is what
+/// let a stuck connection emit 3180 PINGs in 12 s on the gve path; the
+/// cap keeps `base << count` from overflowing.
+#[test]
+fn pto_period_backs_off_exponentially() {
+    let mut conn = Connection::new_server(ConnectionId::new(&[0xab; 8]), [0x42u8; 32]);
+    // No RTT sample yet → base = kInitialRtt (333 ms) + kGranularity (1 ms).
+    let base = conn.pto_period_us();
+    assert_eq!(base, 334_000);
+    conn.pto_count = 1;
+    assert_eq!(conn.pto_period_us(), base * 2);
+    conn.pto_count = 4;
+    assert_eq!(conn.pto_period_us(), base * 16);
+    // Exponent caps at 10: the period stops growing (and can't overflow)
+    // however long the peer stays silent — the idle timeout reaps it first.
+    conn.pto_count = 9;
+    let at_9 = conn.pto_period_us();
+    conn.pto_count = 100;
+    assert_eq!(conn.pto_period_us(), base * (1 << 10));
+    assert!(conn.pto_period_us() > at_9);
+}

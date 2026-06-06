@@ -650,6 +650,13 @@ pub struct Connection {
     /// SpaceState) so `pto_deadline_us` can fold across all three
     /// spaces with a single borrow.
     pub(super) time_of_last_ack_eliciting_us: [Option<u64>; 3],
+    /// PTO backoff exponent (RFC 9002 §6.2.1): the PTO period is
+    /// `base_pto << pto_count`. Incremented each time a PTO probe fires
+    /// without intervening progress; reset to 0 when an ACK acknowledges
+    /// new data. Without this the timer re-arms at a fixed period and
+    /// floods PINGs when the peer is unresponsive (3180 probes / 12 s on
+    /// the gve retransmit-storm conn). Capped so the period can't overflow.
+    pub(super) pto_count: u32,
 
     /// Microseconds since boot when this conn last accepted ANY
     /// inbound datagram. Bumped at the end of `process_datagram`
@@ -915,6 +922,7 @@ impl Connection {
             smoothed_rtt_us: None,
             rttvar_us: 0,
             time_of_last_ack_eliciting_us: [None; 3],
+            pto_count: 0,
             last_recv_us: 0,
             cur_rx_us: 0,
             close_pending: None,

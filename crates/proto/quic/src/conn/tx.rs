@@ -675,43 +675,66 @@ impl Connection {
         // `pending_sent_stream_frames`) so they can be retransmitted if
         // this packet is lost.
         //
-        // Congestion gate (RFC 9002 §7): `cc_budget` caps fresh STREAM
-        // bytes at `window() − bytes_in_flight`; when the window is full
-        // the loops are skipped and the packet carries only ACK / control
-        // frames (not congestion-controlled), leaving unsent data queued
-        // to backpressure the handler via `stream_drain_below`. Computed
-        // before the `iter_mut` borrow so `self.cc` isn't aliased.
-        // Fresh-data budget = window − total unacked (in-flight +
-        // awaiting-retransmit). Counting `retx_bytes` here is what bounds
-        // total send memory: a lost packet moves its data from
-        // `bytes_in_flight` to the retx queue, and without this term the
-        // gate would re-open and let fresh data pile up beside an
-        // ever-growing retx queue (the OOM under heavy loss).
-        let total_unacked = self.bytes_in_flight.saturating_add(self.retx_bytes);
-        let mut cc_budget = self.cc.window().saturating_sub(total_unacked) as usize;
+        // ── Congestion gate (RFC 9002 §7) ────────────────────────────
+        // Both retransmitted AND fresh STREAM data are congestion-controlled
+        // and must fit under the window. `window()` is the cwnd;
+        // `bytes_in_flight` is what's already on the wire. `wire_budget` is
+        // the room left under cwnd — the retx drain and the fresh loop both
+        // spend from it. When it's exhausted the packet carries only
+        // ACK / control frames (not congestion-controlled), leaving unsent
+        // data queued to backpressure the handler via `stream_drain_below`.
+        //
+        // Gating RETRANSMISSIONS here (not just on packet room) is what stops
+        // the gve-path retransmit storm: slow-start grows cwnd to the 2 MiB
+        // cap across a keep-alive conn, so a full response burst overruns the
+        // path; the cumulative ACK jumps, `detect_loss` threshold-declares
+        // the whole un-ACKed backlog, and an UNGATED retx drain re-sends it
+        // cwnd-unbounded (MAX_FLUSH_PACKETS/flush). The client can only ACK
+        // the highest, so the rest are re-declared every round → ~60× over-
+        // send, never converging. Pacing retx to cwnd lets recovery settle
+        // at what the path actually sustains. Computed before the `iter_mut`
+        // borrow so `self.cc` isn't aliased.
+        let window = self.cc.window() as usize;
+        let in_flight = self.bytes_in_flight as usize;
+        let mut wire_budget = window.saturating_sub(in_flight);
         let mut pkt_frames: alloc::vec::Vec<StreamRetx> = alloc::vec::Vec::new();
 
         // (a) Retransmissions (RFC 9000 §13.3): re-send lost ranges before
-        // any fresh data so the receiver's gap fills promptly. A retx
-        // re-sends already-counted data (it moves from `retx_bytes` back
-        // into in-flight), so it doesn't consume the fresh `cc_budget`;
-        // gate it on packet room only. Each queued range is ≤ one packet's
-        // payload; if it doesn't fit this (partly-full) packet, leave it
-        // for the next packet in the flush loop.
+        // any fresh data so the receiver's gap fills promptly. Gated on
+        // packet room AND `wire_budget`. A retx moves its bytes from the
+        // queue back onto the wire (retx_bytes↓ now, in-flight↑ when the
+        // packet is recorded), so it spends `wire_budget`. A retx chunk is
+        // ≤ one packet's payload and the minimum cwnd is 2·MSS, so a chunk
+        // always fits on an empty wire — recovery can't deadlock. Each
+        // queued range is ≤ one packet's payload; if it doesn't fit this
+        // (partly-full) packet, leave it for the next packet in the flush.
         while let Some(front) = self.retx_queue.front() {
             let body_so_far = out.len() - payload_offset;
             let room = PACKET_BODY_BUDGET.saturating_sub(body_so_far + 16);
             if room == 0 || front.data.len() > room {
                 break;
             }
+            // cwnd gate — but always allow one packet onto an empty wire so
+            // a collapsed cwnd still makes forward progress.
+            if front.data.len() > wire_budget && !(in_flight == 0 && pkt_frames.is_empty()) {
+                break;
+            }
             let rtx = self.retx_queue.pop_front().unwrap();
             self.retx_bytes = self.retx_bytes.saturating_sub(rtx.data.len() as u32);
+            wire_budget = wire_budget.saturating_sub(rtx.data.len());
             crate::frame::append_stream_header(rtx.sid, rtx.offset, rtx.fin, rtx.data.len(), out)
                 .map_err(|_| ConnError::Wire)?;
             out.extend_from_slice(&rtx.data);
             ack_eliciting = true;
             pkt_frames.push(rtx);
         }
+
+        // Fresh-data budget: the remaining wire room, additionally held
+        // behind any retransmit backlog — don't grow the in-flight set while
+        // lost data still awaits resend, which also bounds total retained
+        // send memory under heavy loss. `retx_bytes` is what's still queued.
+        let mut cc_budget =
+            wire_budget.min(window.saturating_sub(in_flight + self.retx_bytes as usize));
 
         // (b) Fresh STREAM data, gated by cwnd + send-side flow control
         // (RFC 9000 §4.1: conn-level MAX_DATA + per-stream MAX_STREAM_DATA).
