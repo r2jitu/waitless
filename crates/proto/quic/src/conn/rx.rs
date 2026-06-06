@@ -385,7 +385,7 @@ impl Connection {
             // also cleared by the TLS-Established hook later, but
             // doing them eagerly here is cheap and keeps state
             // consistent with the "Initial is gone" invariant.
-            self.initial_space.sent_packets.clear();
+            self.discard_sent_packets(crate::tls::CryptoLevel::Initial);
             self.initial_space.largest_acked = None;
             self.time_of_last_ack_eliciting_us[0] = None;
         }
@@ -543,7 +543,7 @@ impl Connection {
             self.handshake_keys_discarded = true;
             self.handshake_send = None;
             self.handshake_recv = None;
-            self.handshake_space.sent_packets.clear();
+            self.discard_sent_packets(crate::tls::CryptoLevel::Handshake);
             self.handshake_space.largest_acked = None;
             self.time_of_last_ack_eliciting_us[1] = None;
         }

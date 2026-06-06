@@ -16,6 +16,8 @@ use super::{
     ConnError, ConnState, Connection, HS_CRYPTO_BUDGET, MAX_QUIC_DATAGRAM, SpaceState,
     append_max_data_into, append_max_stream_data_into, append_max_streams_into,
 };
+use net_cc::CongestionControl;
+
 use crate::crypto::{HP_SAMPLE_LEN, TAG_LEN, apply_hp_mask, packet_nonce};
 use crate::frame::{write_ack, write_crypto};
 use crate::tls::CryptoLevel;
@@ -663,20 +665,39 @@ impl Connection {
         // into a temporary Vec just to satisfy the borrow
         // checker — the per-flush stream-ids alloc the old
         // shape required is gone.
+        //
+        // Congestion gate (RFC 9002 §7): only emit STREAM data while
+        // bytes-in-flight is below the congestion window. `cc_budget`
+        // is the per-packet ceiling on fresh STREAM bytes; when the
+        // window is full it's 0, so this loop is skipped and the packet
+        // carries only ACK / control frames (which are not
+        // congestion-controlled) — the unsent data stays in the
+        // streams' `outbound` queues, which backpressures the handler
+        // via `stream_drain_below`. Computed before the `iter_mut`
+        // borrow so `self.cc` / `self.bytes_in_flight` aren't aliased.
+        let mut cc_budget =
+            self.cc.window().saturating_sub(self.bytes_in_flight) as usize;
         for (sid, s) in self.send_streams.iter_mut() {
+            if cc_budget == 0 {
+                break;
+            }
             let body_so_far = out.len() - payload_offset;
             if body_so_far >= PACKET_BODY_BUDGET {
                 break;
             }
-            let max_chunk = PACKET_BODY_BUDGET.saturating_sub(body_so_far + 16);
+            let max_chunk = PACKET_BODY_BUDGET
+                .saturating_sub(body_so_far + 16)
+                .min(cc_budget);
             if max_chunk == 0 {
                 break;
             }
+            let before = out.len();
             if s.pop_chunk_into(*sid, max_chunk, out)
                 .map_err(|_| ConnError::Wire)?
             {
                 ack_eliciting = true;
             }
+            cc_budget = cc_budget.saturating_sub(out.len() - before);
         }
 
         let body_len = out.len() - payload_offset;

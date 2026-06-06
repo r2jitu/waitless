@@ -214,6 +214,7 @@ pub(super) fn ack_remove_range(
     high: u64,
     target_pn: u64,
     largest_out: &mut Option<SentPacket>,
+    acked_in_flight_bytes: &mut u32,
 ) {
     if low > high {
         return;
@@ -223,10 +224,15 @@ pub(super) fn ack_remove_range(
     // explicit loop is still O((high-low) * log n) which is fine.
     let mut pn = high;
     loop {
-        if let Some(pkt) = space.sent_packets.remove(&pn)
-            && pn == target_pn
-        {
-            *largest_out = Some(pkt);
+        if let Some(pkt) = space.sent_packets.remove(&pn) {
+            // Release its congestion-control bytes-in-flight (RFC 9002
+            // §7.8 OnPacketAcked); accumulated for the caller's `on_ack`.
+            if pkt.in_flight {
+                *acked_in_flight_bytes = acked_in_flight_bytes.saturating_add(pkt.byte_count);
+            }
+            if pn == target_pn {
+                *largest_out = Some(pkt);
+            }
         }
         if pn == low {
             break;
@@ -743,6 +749,20 @@ pub struct Connection {
     /// Replacement is FIFO via `reaped_idx`.
     pub(super) reaped_streams: [u64; REAPED_STREAMS_CAP],
     pub(super) reaped_idx: usize,
+
+    /// Congestion controller (RFC 9002 §7). Bounds how much
+    /// ack-eliciting data may be outstanding (`window()`), so the
+    /// server paces to the ACK clock instead of blasting a whole
+    /// response at line rate. Fed by `process_ack` (on_ack) and
+    /// `detect_loss` (on_loss); read at packetization time to gate
+    /// the 1-RTT STREAM-data sweep (see `encode_one_rtt_packet`).
+    pub(super) cc: net_cc::NewReno,
+    /// Bytes of ack-eliciting data currently in flight (sealed +
+    /// sent, not yet acked or declared lost). Incremented in
+    /// `record_sent_packet`, decremented in `process_ack` /
+    /// `detect_loss`. The congestion gate is `bytes_in_flight <
+    /// cc.window()`.
+    pub(super) bytes_in_flight: u32,
 }
 
 impl Drop for Connection {
@@ -853,6 +873,11 @@ impl Connection {
             opened_streams: Vec::new(),
             reaped_streams: [REAPED_STREAM_EMPTY; REAPED_STREAMS_CAP],
             reaped_idx: 0,
+            // NewReno over the QUIC datagram payload size (~1200 B);
+            // initial window = IW10 (RFC 9002 §7.2), matching the old
+            // implicit burst the loss/PTO machinery already assumed.
+            cc: net_cc::NewReno::new(MAX_QUIC_DATAGRAM as u32),
+            bytes_in_flight: 0,
         }
     }
 

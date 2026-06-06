@@ -64,6 +64,7 @@ rust_library(
     }),
     deps = [
         "//crates/drivers/nic:api",
+        "//crates/net/cc",
         "//crates/proto/tls",
         "//crates/runtime/executor",
         "//crates/waitless",

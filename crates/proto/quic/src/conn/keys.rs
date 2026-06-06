@@ -315,9 +315,9 @@ impl Connection {
                 self.initial_send = None;
                 self.initial_recv = None;
             }
-            self.initial_space.sent_packets.clear();
+            self.discard_sent_packets(crate::tls::CryptoLevel::Initial);
             self.initial_space.largest_acked = None;
-            self.handshake_space.sent_packets.clear();
+            self.discard_sent_packets(crate::tls::CryptoLevel::Handshake);
             self.handshake_space.largest_acked = None;
             self.time_of_last_ack_eliciting_us[0] = None;
             self.time_of_last_ack_eliciting_us[1] = None;

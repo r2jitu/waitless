@@ -13,6 +13,8 @@
 // conn task in `endpoint.rs` races a sleep against the deadline
 // and calls `send_pto_probe` when the sleep wins.
 
+use net_cc::CongestionControl;
+
 use super::{Connection, SentPacket, ack_remove_range};
 use crate::tls::CryptoLevel;
 
@@ -120,6 +122,10 @@ impl Connection {
         // specifically, since RFC 9002 §5.1 requires the RTT
         // sample to come from THAT packet (only).
         let mut largest_pkt: Option<SentPacket> = None;
+        // Sum of bytes-in-flight released by this ACK — fed to the
+        // congestion controller's `on_ack` and subtracted from
+        // `bytes_in_flight` below.
+        let mut acked_bytes: u32 = 0;
         let space_now_empty: bool;
         {
             let space = match level {
@@ -138,6 +144,7 @@ impl Connection {
                 largest_acknowledged,
                 largest_acknowledged,
                 &mut largest_pkt,
+                &mut acked_bytes,
             );
             let mut largest_smallest = first_smallest;
             for (gap, length) in ack_ranges {
@@ -150,7 +157,14 @@ impl Connection {
                     None => break,
                 };
                 let low = high.saturating_sub(length);
-                ack_remove_range(space, low, high, largest_acknowledged, &mut largest_pkt);
+                ack_remove_range(
+                    space,
+                    low,
+                    high,
+                    largest_acknowledged,
+                    &mut largest_pkt,
+                    &mut acked_bytes,
+                );
                 largest_smallest = low;
             }
             space_now_empty = space.sent_packets.is_empty();
@@ -164,6 +178,17 @@ impl Connection {
             let now = tls::ticket::now_us();
             let latest = now.saturating_sub(pkt.time_sent_us);
             self.update_rtt(latest, ack_delay);
+        }
+        // Release acked bytes from flight and grow the congestion
+        // window (RFC 9002 §7.8 OnPacketAcked). After the RTT sample so
+        // `on_ack` sees the fresh SRTT for its pacing-rate estimate.
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(acked_bytes);
+        if acked_bytes > 0 {
+            let rtt = net_cc::Rtt::new(
+                self.smoothed_rtt_us.unwrap_or(0) as u32,
+                self.min_rtt_us.unwrap_or(0) as u32,
+            );
+            self.cc.on_ack(acked_bytes, self.bytes_in_flight, rtt);
         }
         // Loss detection — runs after each ACK in the same space.
         // RFC 9002 §6.1: declare lost any sent packet that's both
@@ -243,8 +268,13 @@ impl Connection {
             }
         }
         let total_lost = lost_threshold_n + lost_time_n;
+        let mut lost_bytes: u32 = 0;
         for &pn in &lost_buf[..total_lost] {
-            space.sent_packets.remove(&pn);
+            if let Some(pkt) = space.sent_packets.remove(&pn)
+                && pkt.in_flight
+            {
+                lost_bytes = lost_bytes.saturating_add(pkt.byte_count);
+            }
         }
         let lost_threshold_n = lost_threshold_n as u64;
         let lost_time_n = lost_time_n as u64;
@@ -255,6 +285,14 @@ impl Connection {
         }
         if lost_time_n > 0 {
             crate::diag::COUNTERS.packets_lost_time.add(lost_time_n);
+        }
+        // Release the lost packets' bytes from flight and shrink the
+        // congestion window once per loss episode (RFC 9002 §7.8
+        // OnPacketsLost; NewReno halves, guarded internally to one
+        // reduction per recovery period). `space` is no longer borrowed.
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(lost_bytes);
+        if lost_bytes > 0 {
+            self.cc.on_loss(lost_bytes, false);
         }
     }
 
@@ -321,6 +359,32 @@ impl Connection {
         space.sent_packets.insert(pn, pkt);
         if ack_eliciting {
             self.time_of_last_ack_eliciting_us[idx] = Some(now);
+            // RFC 9002 §7.8 OnPacketSent: ack-eliciting packets count
+            // against bytes-in-flight. Released in `process_ack` (acked)
+            // or `detect_loss` (lost).
+            self.bytes_in_flight = self.bytes_in_flight.saturating_add(byte_count);
         }
+    }
+
+    /// Discard every sent packet in `level`'s space (Initial/Handshake
+    /// key discard — RFC 9001 §4.9 / RFC 9002 §6.4): those packets no
+    /// longer count toward bytes-in-flight. Use this instead of
+    /// `sent_packets.clear()` so the congestion-control accounting stays
+    /// accurate (a bare clear would strand their bytes in flight and
+    /// permanently shrink the effective window).
+    pub(super) fn discard_sent_packets(&mut self, level: CryptoLevel) {
+        let space = match level {
+            CryptoLevel::Initial => &mut self.initial_space,
+            CryptoLevel::Handshake => &mut self.handshake_space,
+            CryptoLevel::OneRtt => &mut self.application_space,
+        };
+        let freed: u32 = space
+            .sent_packets
+            .values()
+            .filter(|p| p.in_flight)
+            .map(|p| p.byte_count)
+            .sum();
+        space.sent_packets.clear();
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(freed);
     }
 }
