@@ -41,7 +41,13 @@ pub(crate) fn current_qp() -> Option<usize> {
 /// lands. TODO(productionize): make this per-format runtime detection —
 /// on where the device is verified, off for virtio-without-USO / HVF.
 pub(crate) fn udp_gso_enabled() -> bool {
-    true
+    // OFF: GCE gVNIC does not honor the UDP-segmentation descriptor
+    // (de-risked on n2/GQI — h3 bulk completed=0, the client received only
+    // small control packets, zero segmented data; matches upstream Linux
+    // gve not advertising NETIF_F_GSO_UDP_L4). The descriptor path + QUIC
+    // encoder are kept for any USO-capable NIC, but gve falls back to the
+    // per-datagram path. Re-enable per-format only once a device is verified.
+    false
 }
 
 pub(crate) fn acquire_tx_udp_gso_buf() -> Option<nic_api::TxUdpGsoBufHandle> {

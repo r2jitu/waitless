@@ -29,6 +29,26 @@ Profile (/obs delta over the bulk sweep): `datagrams_sent ≈ aead_seal_packets`
 - **Small-resp** QUIC tops out ~175K (par≥32) = per-packet crypto (AEAD+HP) + async/framing
   overhead. GSO does not help single-packet responses; crypto batching + async flattening do.
 
-### n2 (gve GQI), kvm-qemu (virtio-net), HVF — TODO
+### n2 (gve GQI) baseline
+- /health par=1: ~10,200 rps (per-packet path).
 
-## After (TODO)
+## Findings
+
+### HW UDP-GSO is NOT supported on GCE gVNIC (de-risked on n2/GQI)
+Enabled the fully-implemented GQI UDP-GSO path and ran h3 bulk: **completed=0**;
+client tcpdump showed **only small control packets (45/87 B), zero ~1171 B
+segmented data** — the device silently drops the UDP-segmentation descriptor
+(matches the code note: upstream Linux gve doesn't advertise
+`NETIF_F_GSO_UDP_L4`). `/health` per-packet was unaffected (10.2K rps). So the
+GSO TX encoder is correct but **gve cannot hardware-segment UDP** → `udp_gso`
+stays off on gve. (Encoder retained for any USO-capable NIC, e.g. modern
+virtio — to be tested on kvm-qemu.)
+
+Consequence: the bulk win on gve cannot come from descriptor batching. The
+baseline bulk (125 Mbps) was the **100 Mbps low-RTT pacing cap**, far below
+both line rate and the per-packet CPU ceiling — so the lever is raising the
+cap and letting cwnd + ring back-pressure bound the burst. QUIC bulk on gve
+will still be per-packet-CPU-bound (no TSO equivalent), so it improves but
+won't match TCP's TSO line rate; honest target = the per-packet CPU ceiling.
+
+## After (in progress)

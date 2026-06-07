@@ -50,7 +50,7 @@ const LOW_RTT_CAP_THRESHOLD_US: u64 = 1_000;
 /// Fixed paced rate for the ultra-low-RTT / pre-sample regime, bytes/s
 /// (100 Mbps). Conservative + stable; below GCE's per-VM egress policer so
 /// downloads complete. Tunable up toward the policer ceiling once profiled.
-const LOW_RTT_PACE_RATE_BPS: u64 = 12_500_000;
+const LOW_RTT_PACE_RATE_BPS: u64 = 500_000_000;
 
 /// Burst-budget ceiling, in bytes. Deliberately BELOW one full data packet
 /// (`MAX_QUIC_DATAGRAM / 2`): with the `budget > 0` gate this means a single
@@ -64,7 +64,7 @@ const LOW_RTT_PACE_RATE_BPS: u64 = 12_500_000;
 /// added a ~1 ms timer wait to every small response (a 5× /health regression).
 /// Throughput is set by the rate, not this. Tunable up once policer headroom
 /// is known.
-const MAX_PACE_BURST: i64 = MAX_QUIC_DATAGRAM as i64 / 2;
+const MAX_PACE_BURST: i64 = 16 * MAX_QUIC_DATAGRAM as i64;
 
 impl Connection {
     /// Schedule a CONNECTION_CLOSE on the next outbound flush.
