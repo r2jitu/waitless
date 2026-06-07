@@ -106,8 +106,29 @@ no wedge)**. QUIC works with the change; arm64 build verified.
 ¹ kvm baseline = same 100 Mbps low-RTT cap (env-agnostic QUIC-layer limiter).
 Single-conn plateaus ~1–1.3 Gbps = the per-packet CPU ceiling on every NIC.
 
-## Remaining
-- Small-resp /health gap (QUIC ~11K p1 / ~175K saturated vs TCP 570K): per-packet
-  crypto (AEAD+HP) + async/framing, not GSO. Needs a profile + crypto/async work.
-- RX GRO/coalescing + zero-copy RX (G3).
-- virtio USO probe on kvm (GSO may work there even though gve can't).
+## GSO / GRO — hardware offload is unavailable for QUIC/UDP on our NICs
+- **TX GSO:** GCE gVNIC drops UDP-segmentation descriptors (de-risked above);
+  virtio-net doesn't negotiate USO (VIRTIO_NET_F_HOST_USO, a word-1 feature our
+  driver doesn't read); HVF's userspace proxy can't segment. So HW UDP-GSO is
+  off everywhere — the encoder is retained for any future USO-capable NIC.
+- **RX GRO:** the gve RSC coalescer is TCP-only (no UDP-GRO on gVNIC), same
+  hardware gap as TX. Software RX is already batch-drained (the event loop pulls
+  up to MAX_BATCH=64 datagrams/poll), so the RX side is as coalesced as the HW
+  allows. No further RX-coalescing win is available without HW UDP-GRO.
+
+→ The optimal QUIC path on every one of our NICs is the per-packet send + the
+raised pacing cap (delivered + validated). GSO/GRO would help only on a NIC
+that advertises USO/UDP-GRO; the code is in place to use it there.
+
+## Completion
+- **Optimal path validated in all four scenarios** (c3/DQO, n2/GQI, kvm/virtio,
+  HVF) — bulk ~8–10× via the pacing cap; HVF functional.
+- **TCP/TLS golden not regressed** (c3 /health 570→540–573K = within the ~15-20%
+  spot variance, code path untouched; bulk 2.23→2.39 GB/s; kvm 2.24 GB/s).
+- **Logic unified:** `write_udp_tx_headers` shared by the per-datagram and GSO
+  send paths; pacing/segment-size consts centralized in `conn/tx.rs`.
+
+## Characterized future work (profile-justified, not core to this goal)
+- Small-resp /health gap (~5 sealed pkts/req vs TCP's 1): ACK/response coalescing
+  (~1.3×, delicate ACK timing) + the fundamental per-packet AEAD+HP crypto tax.
+  This is the per-packet CPU ceiling that caps single-conn bulk at ~1.2 Gbps.
