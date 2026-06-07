@@ -266,6 +266,9 @@ impl Connection {
         let mut lost_buf: [u64; SCRATCH_CAP] = [0; SCRATCH_CAP];
         let mut lost_threshold_n: usize = 0;
         let mut lost_time_n: usize = 0;
+        // In-flight (unacked) sent-packet count at entry — sizes the
+        // cascade for the `last_loss` diagnostic snapshot below.
+        let inflight_pkts = space.sent_packets.len() as u64;
         // Walk in PN order. Threshold-lost PNs come first
         // (lowest PNs). Time-lost can appear after them. We pack
         // both into the same buffer with threshold first;
@@ -294,8 +297,16 @@ impl Connection {
         // Lost STREAM frames, collected in PN order (lowest offset first)
         // and re-queued for retransmission after the `space` borrow ends.
         let mut lost_frames: alloc::vec::Vec<super::StreamRetx> = alloc::vec::Vec::new();
-        for &pn in &lost_buf[..total_lost] {
+        // Age of the lowest-PN lost packet (lost_buf is filled in PN
+        // order, so [0] is the smallest). Captured for `last_loss`:
+        // an age well below one RTT means its ACK is still in flight =
+        // a spurious threshold declaration.
+        let mut min_lost_age_us: u64 = 0;
+        for (i, &pn) in lost_buf[..total_lost].iter().enumerate() {
             if let Some(mut pkt) = space.sent_packets.remove(&pn) {
+                if i == 0 {
+                    min_lost_age_us = now.saturating_sub(pkt.time_sent_us);
+                }
                 if pkt.in_flight {
                     lost_bytes = lost_bytes.saturating_add(pkt.byte_count);
                 }
@@ -311,6 +322,17 @@ impl Connection {
         }
         if lost_time_n > 0 {
             crate::diag::COUNTERS.packets_lost_time.add(lost_time_n);
+        }
+        if total_lost > 0 {
+            crate::diag::LAST_LOSS.record(crate::diag::LossRecord {
+                largest_acked,
+                threshold_n: lost_threshold_n,
+                time_n: lost_time_n,
+                min_lost_pn: lost_buf[0],
+                min_lost_age_us,
+                inflight_pkts,
+                at_us: now,
+            });
         }
         // Release the lost packets' bytes from flight and shrink the
         // congestion window once per loss episode (RFC 9002 §7.8

@@ -408,6 +408,15 @@ pub static LAST_CONN_CLOSE: LastEvent<ConnCloseRecord> = LastEvent::new();
 /// whether an idle-timeout exit was legitimate.
 pub static LAST_CONN_EXIT: LastEvent<ConnExitRecord> = LastEvent::new();
 
+/// Most recent `detect_loss` call that declared ≥1 packet lost. Holds
+/// the inputs needed to tell a SPURIOUS loss declaration from a real
+/// one at real RTT: `min_lost_age_us` is the age (now − time_sent) of
+/// the lowest-PN declared-lost packet — if that is well below one RTT,
+/// the packet's own ACK is still in flight and the loss is spurious
+/// (the packet-threshold fired too eagerly). `inflight_pkts` (in-flight
+/// count at entry) and `largest_acked − min_lost_pn` size the cascade.
+pub static LAST_LOSS: LastEvent<LossRecord> = LastEvent::new();
+
 // ── Performance histograms (microseconds) ───────────────────────────
 //
 // The performance pillar (see `docs/observability.md`). `record` is
@@ -536,6 +545,43 @@ impl ObsRecord for ConnExitRecord {
             w,
             "\",\"iterations\":{},\"last_recv_age_us\":{},\"idle_us\":{},\"at_us\":{}",
             self.iterations, self.last_recv_age_us, self.idle_us, self.at_us,
+        )
+    }
+}
+
+/// Snapshot payload for `LAST_LOSS`.
+#[derive(Clone, Copy)]
+pub struct LossRecord {
+    /// `largest_acked` in the space when the loss was declared.
+    pub largest_acked: u64,
+    /// Packets declared lost by the packet-number threshold this call.
+    pub threshold_n: u64,
+    /// Packets declared lost by the time threshold this call.
+    pub time_n: u64,
+    /// Lowest PN declared lost this call (the head of the cascade).
+    pub min_lost_pn: u64,
+    /// Age (now − time_sent) of `min_lost_pn`'s packet, µs. Well below
+    /// one RTT ⇒ its ACK is still in flight ⇒ spurious declaration.
+    pub min_lost_age_us: u64,
+    /// In-flight (unacked) sent-packet count at entry to detect_loss.
+    pub inflight_pkts: u64,
+    /// `tls::ticket::now_us()` at the declaration.
+    pub at_us: u64,
+}
+
+impl ObsRecord for LossRecord {
+    fn write_fields(&self, w: &mut dyn fmt::Write) -> fmt::Result {
+        write!(
+            w,
+            "\"largest_acked\":{},\"threshold_n\":{},\"time_n\":{},\
+             \"min_lost_pn\":{},\"min_lost_age_us\":{},\"inflight_pkts\":{},\"at_us\":{}",
+            self.largest_acked,
+            self.threshold_n,
+            self.time_n,
+            self.min_lost_pn,
+            self.min_lost_age_us,
+            self.inflight_pkts,
+            self.at_us,
         )
     }
 }
@@ -810,6 +856,8 @@ pub fn write_obs_json(w: &mut dyn fmt::Write) -> fmt::Result {
     LAST_CONN_CLOSE.write_json(w, "last_conn_close")?;
     w.write_str(",")?;
     LAST_CONN_EXIT.write_json(w, "last_conn_exit")?;
+    w.write_str(",")?;
+    LAST_LOSS.write_json(w, "last_loss")?;
     w.write_str(",")?;
     REQUEST_LATENCY.write_json(w, "request_latency_us")?;
     w.write_str(",")?;
