@@ -702,7 +702,7 @@ static GVE_OPS: NicOps = NicOps {
     // bench-validatable by flipping `udp_gso_available` to
     // `|| true`. Default off keeps callers on the per-datagram
     // small-pool path until we confirm.
-    udp_gso_available: || false,
+    udp_gso_available: tx::udp_gso_enabled,
     acquire_tx_udp_gso_buf: Some(tx::acquire_tx_udp_gso_buf),
     submit_tx_udp_gso: Some(tx::submit_tx_udp_gso),
     poll_rx: rx::poll,

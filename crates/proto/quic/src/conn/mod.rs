@@ -324,6 +324,18 @@ pub enum DatagramBuf {
         handle: nic_api::TxBufHandle,
         vec: ManuallyDrop<Vec<u8>>,
     },
+    /// Big-pool slot holding N back-to-back QUIC packets (each
+    /// `gso_size` bytes) for hardware UDP segmentation. The encoder
+    /// seals N packets in place; `ship_datagram` hands the driver one
+    /// segmentation descriptor and the device splits it into N UDP
+    /// datagrams. Same `ManuallyDrop`-over-driver-slot contract as
+    /// `TxSlot`, but the slot is from the TSO/GSO big pool (≈16-20 KiB)
+    /// and submitted via `submit_tx_udp_gso`, not `submit_tx`.
+    GsoSlot {
+        handle: nic_api::TxUdpGsoBufHandle,
+        vec: ManuallyDrop<Vec<u8>>,
+        gso_size: u16,
+    },
 }
 
 impl DatagramBuf {
@@ -335,6 +347,7 @@ impl DatagramBuf {
         match self {
             DatagramBuf::Heap(v) => v,
             DatagramBuf::TxSlot { vec, .. } => vec,
+            DatagramBuf::GsoSlot { vec, .. } => vec,
         }
     }
 
@@ -343,6 +356,7 @@ impl DatagramBuf {
         match self {
             DatagramBuf::Heap(v) => v,
             DatagramBuf::TxSlot { vec, .. } => vec,
+            DatagramBuf::GsoSlot { vec, .. } => vec,
         }
     }
 
@@ -363,6 +377,35 @@ impl DatagramBuf {
     /// `true` iff [`Self::into_tx_handle`] would succeed.
     pub fn is_tx_slot(&self) -> bool {
         matches!(self, DatagramBuf::TxSlot { .. })
+    }
+
+    /// Whether this buf is a UDP-GSO big-pool super-packet.
+    pub fn is_gso_slot(&self) -> bool {
+        matches!(self, DatagramBuf::GsoSlot { .. })
+    }
+
+    /// Consume a `GsoSlot` and return its handle + frame_len + gso_size
+    /// for `submit_tx_udp_gso`. Returns the buf back via `Err(self)`
+    /// for non-GSO variants. Same reallocation tripwire as
+    /// [`Self::into_tx_handle`].
+    pub fn into_gso_handle(self) -> Result<(nic_api::TxUdpGsoBufHandle, usize, u16), Self> {
+        match self {
+            DatagramBuf::GsoSlot {
+                handle,
+                vec,
+                gso_size,
+            } => {
+                let len = vec.len();
+                assert!(
+                    core::ptr::eq(vec.as_ptr(), handle.0.data_ptr as *const u8),
+                    "QUIC GSO datagram reallocated off its {}-byte driver slot",
+                    handle.0.data_cap,
+                );
+                let _ = vec;
+                Ok((handle, len, gso_size))
+            }
+            other => Err(other),
+        }
     }
 
     /// Consume the buf and return its TxBufHandle + frame_len
@@ -419,6 +462,10 @@ impl DatagramBuf {
             DatagramBuf::TxSlot { .. } => {
                 // Drop fires `handle.Drop` → `release_fn` → slot
                 // back to pool.
+            }
+            DatagramBuf::GsoSlot { .. } => {
+                // Big-pool slot; handle's `Drop` returns it (or the
+                // device's PKT completion frees it once submitted).
             }
         }
     }
@@ -1292,6 +1339,36 @@ impl Connection {
         };
         v.resize(MAX_L2_HEADROOM, 0);
         DatagramBuf::Heap(v)
+    }
+
+    /// Acquire a UDP-GSO big-pool slot and wrap it as a `GsoSlot`
+    /// datagram, headroom pre-reserved. The GSO flush seals N back-to-
+    /// back QUIC packets (each `gso_size` bytes) into it. `None` when
+    /// the driver has no hardware UDP segmentation, the big pool is
+    /// full, or the slot can't hold ≥2 segments — caller falls back to
+    /// the per-datagram path.
+    pub(super) fn take_gso_datagram_buf(&mut self, gso_size: u16) -> Option<DatagramBuf> {
+        use executor::reactor::MAX_L2_HEADROOM;
+        let handle = executor::reactor::acquire_tx_udp_gso_buf()?;
+        let cap = handle.data_cap() as usize;
+        if cap < MAX_L2_HEADROOM + 2 * gso_size as usize {
+            drop(handle); // too small to be worth a GSO super-packet
+            return None;
+        }
+        // SAFETY:
+        //   * `handle.0.data_ptr` is `data_cap` writable bytes for the
+        //     handle's lifetime (the driver's TX big-pool slot).
+        //   * `ManuallyDrop` suppresses the Vec's dealloc, and the GSO
+        //     flush never writes past `cap` (it gates on
+        //     `buf.len() + gso_size <= cap`), so the Vec never reallocs
+        //     off the driver slot.
+        let mut vec: Vec<u8> = unsafe { Vec::from_raw_parts(handle.0.data_ptr, 0, cap) };
+        vec.resize(MAX_L2_HEADROOM, 0);
+        Some(DatagramBuf::GsoSlot {
+            handle,
+            vec: ManuallyDrop::new(vec),
+            gso_size,
+        })
     }
 
     /// Whether there's an outbound datagram queued. Cheap check

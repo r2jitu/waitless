@@ -32,12 +32,27 @@ pub(crate) fn current_qp() -> Option<usize> {
     Some(if core < num_qp { core as usize } else { 0 })
 }
 
+/// Master gate for hardware UDP-GSO on gve. Drives BOTH the NicOps
+/// `udp_gso_available` flag AND `acquire_tx_udp_gso_buf` so they agree
+/// (QUIC's `take_gso_datagram_buf` gates on acquire returning `Some`;
+/// keeping the two in sync is what lets `udp_gso_available` stay the
+/// single switch). ON for this branch to bench GQI UDP-GSO; the DQO
+/// branch in `acquire` still returns `None` until its descriptor path
+/// lands. TODO(productionize): make this per-format runtime detection —
+/// on where the device is verified, off for virtio-without-USO / HVF.
+pub(crate) fn udp_gso_enabled() -> bool {
+    true
+}
+
 pub(crate) fn acquire_tx_udp_gso_buf() -> Option<nic_api::TxUdpGsoBufHandle> {
-    // DQO UDP-GSO is not implemented yet (T5); `submit_tx_udp_gso`
-    // below is a no-op on DQO, so don't hand out a (TSO) big slot that
-    // would just be claimed and dropped. GQI shares the big pool with
-    // TSO — same slot shape, rewrapped as the type-distinct handle so
-    // the API surface routes it through `submit_tx_udp_gso`.
+    if !udp_gso_enabled() {
+        return None;
+    }
+    // DQO UDP-GSO is not implemented yet; `submit_tx_udp_gso` below is a
+    // no-op on DQO, so don't hand out a (TSO) big slot that would just be
+    // claimed and dropped. GQI shares the big pool with TSO — same slot
+    // shape, rewrapped as the type-distinct handle so the API surface
+    // routes it through `submit_tx_udp_gso`.
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
         return None;
     }

@@ -26,6 +26,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 use tls::TlsServerConfig;
 
+/// Per-packet 1-RTT payload budget. Leaves headroom for the short
+/// header (1 + DCID + 4 pn) + AEAD tag under the path MTU; STREAM
+/// frame headers add ~4-12 B of varint overhead. The UDP-GSO segment
+/// size and the ≥2-packet GSO gate are both derived from this.
+const PACKET_BODY_BUDGET: usize = 1100;
+
 /// Floor on the spacing between paced sends, µs — a busy-spin guard so a
 /// near-zero computed wait doesn't spin the conn task. The runtime timer is
 /// µs-resolution (serviced once per event-loop iteration), so this is also
@@ -412,6 +418,15 @@ impl Connection {
         // field), so each extra packet becomes its own datagram.
         // Cap the loop at MAX_FLUSH_PACKETS so a wedged peer
         // can't make us spin emitting endlessly.
+        // Bulk tail: prefer ONE UDP-GSO super-packet (zero-copy + a
+        // single descriptor; the device segments + paces). `try_flush_gso`
+        // returns false when there's no hardware GSO, too little data, or
+        // the window is blocked — then fall through to the per-datagram
+        // tail loop below (which keeps the egress pacer for the no-GSO
+        // microburst).
+        if matches!(self.state, ConnState::Established) && self.try_flush_gso()? {
+            return Ok(());
+        }
         if matches!(self.state, ConnState::Established) {
             const MAX_FLUSH_PACKETS: usize = 32;
             for _ in 0..MAX_FLUSH_PACKETS {
@@ -476,6 +491,88 @@ impl Connection {
             }
         }
         false
+    }
+
+    /// Sum of 1-RTT stream bytes queued to send — fresh outbound across
+    /// open send streams plus the retransmit backlog. Gates UDP-GSO: we
+    /// only coalesce into a super-packet when there's ≥2 packets' worth,
+    /// so a small single-packet response (a 60-byte /health) stays on the
+    /// per-datagram path instead of being padded to a full GSO segment.
+    fn pending_one_rtt_stream_bytes(&self) -> usize {
+        let mut n = self.retx_bytes as usize;
+        for s in self.send_streams.values() {
+            n = n.saturating_add(s.buffered_len());
+        }
+        n
+    }
+
+    /// Per-connection UDP-GSO segment size = the largest 1-RTT packet
+    /// this connection emits: short header (1 + DCID + 4 pn) + the
+    /// payload budget + AEAD tag. Every GSO segment is padded to exactly
+    /// this so the device can split the super-buffer at fixed offsets.
+    fn gso_segment_size(&self) -> usize {
+        1 + self.peer_cid.len() + 4 + PACKET_BODY_BUDGET + TAG_LEN
+    }
+
+    /// Emit the bulk 1-RTT tail as one UDP-GSO super-packet when the
+    /// driver has hardware UDP segmentation: seal up to `MAX_GSO_SEGMENTS`
+    /// back-to-back QUIC packets (each padded to `gso_segment_size`) into
+    /// one big-pool slot and push it as a `GsoSlot` — `ship_datagram`
+    /// hands the driver a single segmentation descriptor and the device
+    /// splits it into N UDP datagrams on the wire. This replaces the
+    /// per-datagram tail loop's N descriptors + N doorbells with one, and
+    /// removes the unpaced microburst the per-packet pacer was guarding
+    /// against (the cwnd is the limiter; the NIC paces the segmented
+    /// output). Returns `Ok(true)` if a super-packet was produced (caller
+    /// skips the per-packet tail), `Ok(false)` to fall through to the
+    /// per-datagram path (no HW GSO, too little data, or window-blocked).
+    fn try_flush_gso(&mut self) -> Result<bool, ConnError> {
+        if !matches!(self.state, ConnState::Established) {
+            return Ok(false);
+        }
+        let gso = self.gso_segment_size();
+        let window = self.cc.window() as usize;
+        let in_flight = self.bytes_in_flight as usize;
+        // Need ≥2 packets of cwnd budget AND ≥2 packets of pending stream
+        // data, else GSO under-fills or wastes padding.
+        if window.saturating_sub(in_flight) < 2 * gso
+            || self.pending_one_rtt_stream_bytes() < 2 * PACKET_BODY_BUDGET
+        {
+            return Ok(false);
+        }
+        let mut buf = match self.take_gso_datagram_buf(gso as u16) {
+            Some(b) => b,
+            None => return Ok(false), // big pool full / no HW GSO
+        };
+        let cap = buf.vec().capacity();
+        const MAX_GSO_SEGMENTS: usize = 16;
+        let mut n = 0usize;
+        while n < MAX_GSO_SEGMENTS {
+            if !self.has_pending_one_rtt_data() {
+                break;
+            }
+            if buf.len() + gso > cap {
+                break; // no room for another full segment in the slot
+            }
+            if (self.bytes_in_flight as usize) + gso > window {
+                break; // cwnd-blocked
+            }
+            let before = buf.len();
+            self.encode_one_rtt_packet_padded(buf.vec_mut(), Some(gso))?;
+            let produced = buf.len() - before;
+            if produced == 0 {
+                break; // nothing emittable (control-only / fc-blocked)
+            }
+            self.record_bytes_sent(produced as u64);
+            n += 1;
+        }
+        if n == 0 {
+            // Nothing encoded → no state mutated; drop the slot (its
+            // handle's Drop returns it) and let the per-packet path run.
+            return Ok(false);
+        }
+        self.outbound.push_back(buf);
+        Ok(true)
     }
 
     // ── Outbound encoding ───────────────────────────────────────
@@ -644,11 +741,22 @@ impl Connection {
     /// packet body per emitted packet vs. the old "build frames in
     /// scratch, then extend_from_slice into datagram" path.
     fn encode_one_rtt_packet(&mut self, out: &mut Vec<u8>) -> Result<(), ConnError> {
-        // Per-packet body budget. Leaves headroom for short-header
-        // (1+CID+pn=13) + tag (16) under MTU 1200; STREAM frame
-        // headers add ~4-12 bytes of varint overhead.
-        const PACKET_BODY_BUDGET: usize = 1100;
+        self.encode_one_rtt_packet_padded(out, None)
+    }
 
+    /// As [`Self::encode_one_rtt_packet`], but when `pad_to_wire` is
+    /// `Some(g)` the packet's payload is topped up with PADDING frames
+    /// (0x00, AEAD-protected, ignored by the peer) so the sealed packet
+    /// is exactly `g` wire bytes. Hardware UDP GSO requires every
+    /// segment but the last to be an identical `gso_size` — the GSO
+    /// flush pads each packet so the device can split the super-buffer.
+    fn encode_one_rtt_packet_padded(
+        &mut self,
+        out: &mut Vec<u8>,
+        pad_to_wire: Option<usize>,
+    ) -> Result<(), ConnError> {
+        // `PACKET_BODY_BUDGET` is the module-level const (shared with the
+        // UDP-GSO segment-size math).
         let send_keys = match self.application_send.as_ref() {
             Some(k) => k.clone(),
             None => return Ok(()),
@@ -944,6 +1052,15 @@ impl Connection {
         // 16 bytes of ciphertext after AEAD seal.
         while out.len() - pn_offset < 4 + HP_SAMPLE_LEN {
             out.push(0); // PADDING frame
+        }
+        // UDP-GSO equal-segment padding: top the payload up with PADDING
+        // frames (0x00) so the sealed packet (header + payload + tag) is
+        // exactly `g` bytes. Only the GSO flush sets this; the per-packet
+        // path passes None and never pads beyond the HP-sample minimum.
+        if let Some(g) = pad_to_wire {
+            while (out.len() - header_start) + TAG_LEN < g {
+                out.push(0); // PADDING frame
+            }
         }
         let payload_len = out.len() - payload_offset;
         out.extend_from_slice(&[0u8; TAG_LEN]);

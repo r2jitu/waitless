@@ -78,6 +78,20 @@ fn ship_datagram(
     peer_port: u16,
     pkt: DatagramBuf,
 ) {
+    if pkt.is_gso_slot() {
+        // UDP-GSO super-packet: one descriptor → N UDP datagrams on the
+        // wire. Count all N toward datagrams_sent (each is a real QUIC
+        // packet that was sealed) so /obs stays comparable to
+        // aead_seal_packets.
+        let (handle, frame_len, gso_size) = pkt
+            .into_gso_handle()
+            .unwrap_or_else(|_| unreachable!("is_gso_slot() guarded"));
+        let payload = frame_len.saturating_sub(executor::reactor::MAX_L2_HEADROOM);
+        let n = (payload / gso_size.max(1) as usize).max(1) as u64;
+        let _ = sock.send_gso_via_tx_handle(peer_ip, peer_port, handle, frame_len, gso_size);
+        crate::diag::COUNTERS.datagrams_sent.add(n);
+        return;
+    }
     if pkt.is_tx_slot() {
         // is_tx_slot() guarantees this branch.
         let (handle, frame_len) = pkt
