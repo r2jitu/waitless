@@ -225,13 +225,25 @@ impl Connection {
     fn detect_loss(&mut self, level: CryptoLevel) {
         const K_PACKET_THRESHOLD: u64 = 3;
         const K_GRANULARITY_US: u64 = 1_000;
+        // Peer's default max_ack_delay (RFC 9000 §18.2). Added to the time
+        // threshold below.
+        const MAX_ACK_DELAY_US: u64 = 25_000;
         // Cache `max_rtt` and `now` before borrowing through SpaceState.
         // Both `latest_rtt_us` and `smoothed_rtt_us` live on Connection.
         let max_rtt = self
             .smoothed_rtt_us
             .map(|s| s.max(self.latest_rtt_us.unwrap_or(0)))
             .unwrap_or(self.latest_rtt_us.unwrap_or(0));
-        let time_threshold_us = ((max_rtt * 9) / 8).max(K_GRANULARITY_US);
+        // Time threshold = 9/8·max(SRTT, latest_rtt) + max_ack_delay. The
+        // `+ max_ack_delay` is essential on a real-RTT path: SRTT is computed
+        // with the peer's ack_delay SUBTRACTED (RFC 9002 §5.3), but a peer may
+        // legitimately hold an ACK up to max_ack_delay, so an in-order
+        // delivered packet's ACK can arrive ~max_ack_delay after 9/8·SRTT.
+        // Without this term those packets were declared time-lost spuriously
+        // (~27 % of a clean transfer at 24 ms RTT), collapsing cwnd to the
+        // floor — the h3 real-RTT throughput bug. At low RTT the term is
+        // irrelevant (packet-threshold dominates; ACKs return in µs).
+        let time_threshold_us = ((max_rtt * 9) / 8).max(K_GRANULARITY_US) + MAX_ACK_DELAY_US;
         let now = tls::ticket::now_us();
 
         let space = match level {

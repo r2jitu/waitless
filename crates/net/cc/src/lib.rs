@@ -115,10 +115,19 @@ pub struct NewReno {
     mss: u32,
     cwnd: u32,
     ssthresh: u32,
-    /// In a recovery episode → ignore further loss reductions until the
-    /// next ack exits it (approximates RFC 9002's "loss after the recovery
-    /// start time" guard without needing packet numbers here).
+    /// In a recovery episode → ignore further loss reductions (RFC 9002
+    /// §7.3.2: at most one cwnd reduction per congestion event). The episode
+    /// ends only after `recovery_rem_bytes` of NEW data is acknowledged
+    /// (≈ one window ≈ one RTT — i.e. packets sent after recovery started are
+    /// now being acked), NOT on the next ack. Resetting on every ack (the old
+    /// behaviour) let a cluster of losses within one RTT halve cwnd once per
+    /// loss → collapse to the minimum window on a real-RTT path where acks
+    /// arrive several times per RTT (the h3 real-RTT throughput bug).
     in_recovery: bool,
+    /// Bytes of fresh acks still required to exit the current recovery
+    /// episode. Set to the pre-reduction cwnd on entry; decremented by
+    /// `on_ack`. Meaningless when `in_recovery` is false.
+    recovery_rem_bytes: u32,
     /// Last smoothed RTT (µs) seen on an ack, for `pacing_rate`.
     srtt_us: u32,
     /// Upper bound on `cwnd` (and thus bytes-in-flight). See
@@ -136,6 +145,7 @@ impl NewReno {
             // start (RFC 5681 §3.1).
             ssthresh: u32::MAX,
             in_recovery: false,
+            recovery_rem_bytes: 0,
             srtt_us: 0,
             max_window: max_u32(DEFAULT_MAX_WINDOW, initial_window(mss)),
         }
@@ -163,6 +173,9 @@ impl NewReno {
     /// Halve the window into recovery (RFC 5681 §3.1 / RFC 9002 §7.3.2):
     /// `ssthresh = cwnd/2` (≥ min), `cwnd = ssthresh`.
     fn enter_recovery(&mut self) {
+        // The recovery period ends once ~one window of new data is acked
+        // (≈ one RTT). Anchor it to the pre-reduction cwnd.
+        self.recovery_rem_bytes = max_u32(self.cwnd, minimum_window(self.mss));
         let half = self.cwnd / 2;
         self.ssthresh = max_u32(half, minimum_window(self.mss));
         self.cwnd = self.ssthresh;
@@ -175,10 +188,19 @@ impl CongestionControl for NewReno {
         if rtt.smoothed_us != 0 {
             self.srtt_us = rtt.smoothed_us;
         }
-        // An ack exits any recovery episode: a subsequent loss is then a
-        // fresh congestion event that may reduce the window again.
-        self.in_recovery = false;
         if bytes_acked == 0 {
+            return;
+        }
+        // Recovery period (RFC 9002 §7.3.2): hold cwnd — neither grow nor
+        // reduce again — until ~one window of new data is acked, which marks
+        // the recovery-triggering congestion event as past. Only THEN may a
+        // later loss reduce cwnd again. (Counting acked bytes ≈ "a packet
+        // sent after recovery started has been acked" without packet numbers.)
+        if self.in_recovery {
+            self.recovery_rem_bytes = self.recovery_rem_bytes.saturating_sub(bytes_acked);
+            if self.recovery_rem_bytes == 0 {
+                self.in_recovery = false;
+            }
             return;
         }
         if self.in_slow_start() {
@@ -209,6 +231,7 @@ impl CongestionControl for NewReno {
             self.ssthresh = self.cwnd / 2;
             self.ssthresh = max_u32(self.ssthresh, minimum_window(self.mss));
             self.cwnd = minimum_window(self.mss);
+            self.recovery_rem_bytes = self.cwnd;
             self.in_recovery = true;
             return;
         }
@@ -294,11 +317,21 @@ mod tests {
         // halve again.
         cc.on_loss(MSS, false);
         assert_eq!(cc.window(), after);
-        // After an ack (episode exits), a fresh loss reduces again.
+        // A SINGLE ack must NOT end the recovery period (the real-RTT bug: at
+        // several acks per RTT, that let a loss cluster halve once per loss).
         cc.on_ack(MSS, 0, rtt());
+        cc.on_loss(MSS, false);
+        assert_eq!(cc.window(), after, "one ack must not reopen reductions");
+        // Only after ~a full window of acks does the episode end; a fresh loss
+        // then reduces again (a new congestion event).
+        let mut acked = 0;
+        while acked < before {
+            cc.on_ack(MSS, 0, rtt());
+            acked += MSS;
+        }
         let grown = cc.window();
         cc.on_loss(MSS, false);
-        assert!(cc.window() < grown);
+        assert!(cc.window() < grown, "a new event after recovery reduces cwnd");
     }
 
     #[test]
@@ -306,8 +339,15 @@ mod tests {
         let mut cc = NewReno::new(MSS);
         // Force into congestion avoidance via a loss (sets ssthresh<=cwnd).
         cc.on_ack(cc.window(), 0, rtt());
+        let pre = cc.window();
         cc.on_loss(MSS, false);
-        cc.on_ack(MSS, 0, rtt()); // exit recovery; now cwnd>=ssthresh → CA
+        // Drain the recovery period (~one pre-loss window of acks) so cwnd is
+        // free to grow again; now cwnd>=ssthresh → CA.
+        let mut drain = 0;
+        while drain < pre {
+            cc.on_ack(MSS, 0, rtt());
+            drain += MSS;
+        }
         assert!(!cc.in_slow_start());
         let w0 = cc.window();
         // Acking ~one full window should add ~one MSS (additive increase).
@@ -378,5 +418,34 @@ mod tests {
         // Bigger cwnd (more acks) → higher rate at the same RTT.
         cc.on_ack(cc.window(), 0, rtt());
         assert!(cc.pacing_rate() > r1);
+    }
+
+    /// Regression for the h3 real-RTT collapse (task #52): a burst of losses
+    /// interleaved with the many acks-per-RTT a real RTT produces must reduce
+    /// cwnd ONCE for the episode, not once per loss. The old code reset
+    /// recovery on every ack, so this sequence drove cwnd to the floor.
+    #[test]
+    fn clustered_losses_with_acks_reduce_once() {
+        let mut cc = NewReno::new(MSS);
+        // Grow into a healthy window.
+        for _ in 0..6 {
+            let w = cc.window();
+            cc.on_ack(w, 0, rtt());
+        }
+        let pre = cc.window();
+        assert!(pre > 8 * minimum_window(MSS), "need headroom to see a collapse");
+        // One congestion event spread across an RTT: losses interleaved with
+        // small acks (as a real-RTT flow sees). cwnd must halve at most once.
+        for _ in 0..20 {
+            cc.on_loss(MSS, false);
+            cc.on_ack(MSS, 0, rtt()); // a few packets ack within the same RTT
+        }
+        let after = cc.window();
+        // Exactly one halving (to ssthresh), NOT a collapse to the floor.
+        assert_eq!(after, max_u32(pre / 2, minimum_window(MSS)));
+        assert!(
+            after > minimum_window(MSS),
+            "cwnd collapsed to the floor: {after} (regression)"
+        );
     }
 }
