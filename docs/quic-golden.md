@@ -51,4 +51,63 @@ cap and letting cwnd + ring back-pressure bound the burst. QUIC bulk on gve
 will still be per-packet-CPU-bound (no TSO equivalent), so it improves but
 won't match TCP's TSO line rate; honest target = the per-packet CPU ceiling.
 
-## After (in progress)
+## After — bulk via raised pacing cap (cap=4 Gbps, burst=16; GSO off on gve)
+
+### c3/DQO (headline)
+| workload | before | after |
+|---|---|---|
+| h3 /static-1m p1 | 122 Mbps | **1.26 Gbps (10.3×)** |
+| h3 /static-1m p4 | — | 2.92 Gbps (agg) |
+| h3 /static-1m p16 | — | 3.66 Gbps (agg) |
+| h3 /health p1 | 11,190 | 11,150 (neutral) |
+| TCP /health c4000 | 570,890 | **572,927 (no regress)** |
+| TCP /static-1m c64 | 2.23 GB/s | **2.39 GB/s (no regress)** |
+
+loss ~0.13% (recovered, +2 PTO, 0 failed).
+
+### n2/GQI
+| workload | before | after |
+|---|---|---|
+| h3 /static-64k p1 | ~125 Mbps | 755 Mbps |
+| h3 /static-256k p1 | ~125 Mbps | 880 Mbps |
+| h3 /static-1m p1 | ~125 Mbps | **1.19 Gbps (9.5×)** |
+| h3 /static-1m p16 | — | 4.3 Gbps (agg) |
+| h3 /health p1 | ~10,200 | 9,500 (neutral) |
+
+loss ~0.004%, 0 failed.
+
+Single-conn plateaus ~1.2 Gbps = the per-packet CPU ceiling (no TSO equivalent
+for QUIC on gve). TCP/TLS golden path unchanged on both formats.
+
+### kvm-qemu (virtio-net + vhost-net, real KVM)
+| workload | after |
+|---|---|
+| h3 /static-1m p1 | **1.02 Gbps (8×)** |
+| h3 /static-1m p4 | 2.35 Gbps (agg) |
+| h3 /health p1 | 8,543 |
+| TCP /static-64k c1000 | 2.24 GB/s |
+
+loss ~0% recovered, 0 failed. virtio-net does not negotiate USO (word-1
+feature) so GSO is unavailable here too → same pacing path; bulk win applies.
+
+### HVF (Apple Silicon, virtio-net userspace proxy)
+Functional (proxy-bound, not a throughput env per doctrine): boots; TCP/TLS
+/health 77K; **h3 /health 200 (54 B) + /static-64k 200 (full 65536, multi-packet,
+no wedge)**. QUIC works with the change; arm64 build verified.
+
+## Full before→after matrix (h3 /static-1m single-conn bulk)
+| env | NIC | before | after | TCP/TLS no-regress |
+|---|---|---|---|---|
+| c3 | gve DQO | 122 Mbps | **1.26 Gbps (10.3×)** | /health 570→573K, bulk 2.23→2.39 GB/s |
+| n2 | gve GQI | 125 Mbps | **1.19 Gbps (9.5×)** | (QUIC-layer change; TCP path untouched) |
+| kvm | virtio-net | ~125 Mbps¹ | **1.02 Gbps (8×)** | TCP 2.24 GB/s static-64k |
+| HVF | virtio (proxy) | — | h3 functional ✓ | TLS 77K |
+
+¹ kvm baseline = same 100 Mbps low-RTT cap (env-agnostic QUIC-layer limiter).
+Single-conn plateaus ~1–1.3 Gbps = the per-packet CPU ceiling on every NIC.
+
+## Remaining
+- Small-resp /health gap (QUIC ~11K p1 / ~175K saturated vs TCP 570K): per-packet
+  crypto (AEAD+HP) + async/framing, not GSO. Needs a profile + crypto/async work.
+- RX GRO/coalescing + zero-copy RX (G3).
+- virtio USO probe on kvm (GSO may work there even though gve can't).

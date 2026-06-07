@@ -340,11 +340,59 @@ pub fn send_with_l2_headroom(dst: IpAddr, src_port: u16, dst_port: u16, frame: &
 /// Bypasses the `udp::send_to_addr → drivers::net::send` chain
 /// for v6 callers that build their UDP payload (e.g. the QUIC
 /// encoder) directly into a TX pool slot.
+/// Shared frame prep for the UDP TX-handle paths (`send_via_tx_handle`
+/// and `send_udp_gso_via_tx_handle`): for v4, shift the payload back to
+/// the family-correct offset so the L2 frame starts at `frame[0]`; then
+/// write the Eth+IP+UDP header template (one segment's worth — the
+/// device replicates it per GSO segment). `payload_len` is the total
+/// UDP-payload bytes (one datagram, or the whole GSO super-payload).
+/// Returns `(on_wire_len, hdr_len = Eth+IP+UDP, csum_start = Eth+IP)`.
+///
+/// SAFETY: `frame` must be ≥ `MAX_L2_HEADROOM + payload_len` writable
+/// bytes with the payload already at `[MAX_L2_HEADROOM..]`.
+unsafe fn write_udp_tx_headers(
+    frame: &mut [u8],
+    dst: IpAddr,
+    dst_mac: MacAddr,
+    src_port: u16,
+    dst_port: u16,
+    payload_len: usize,
+) -> (usize, u16, u16) {
+    use executor::reactor::MAX_L2_HEADROOM;
+    let ip_hdr_len = match dst {
+        IpAddr::V4(_) => IPV4_HDR_LEN,
+        IpAddr::V6(_) => IPV6_HDR_LEN,
+    };
+    let actual_headroom = ETH_HDR_LEN + ip_hdr_len + UDP_HDR_LEN;
+    unsafe {
+        // v4: shift the payload back 20 B (overlapping move) so the L2
+        // frame starts at frame[0], where the driver expects it.
+        if matches!(dst, IpAddr::V4(_)) {
+            let p = frame.as_mut_ptr();
+            core::ptr::copy(p.add(MAX_L2_HEADROOM), p.add(actual_headroom), payload_len);
+        }
+        fill_udp_frame_headers(
+            frame,
+            0,
+            dst,
+            dst_mac,
+            src_port,
+            dst_port,
+            UDP_HDR_LEN + payload_len,
+        );
+    }
+    (
+        actual_headroom + payload_len,
+        actual_headroom as u16,
+        (ETH_HDR_LEN + ip_hdr_len) as u16,
+    )
+}
+
 pub fn send_via_tx_handle(
     dst: IpAddr,
     src_port: u16,
     dst_port: u16,
-    mut handle: nic_api::TxBufHandle,
+    handle: nic_api::TxBufHandle,
     frame_len: usize,
 ) {
     use executor::reactor::MAX_L2_HEADROOM;
@@ -358,8 +406,6 @@ pub fn send_via_tx_handle(
         diag::COUNTERS.tx_invalid.bump();
         return;
     }
-    let udp_len = UDP_HDR_LEN + payload_len;
-
     let dst_mac = match mac_resolve::resolve(dst) {
         Some(m) => m,
         None => {
@@ -368,43 +414,21 @@ pub fn send_via_tx_handle(
             return;
         }
     };
-
-    let ip_hdr_len = match dst {
-        IpAddr::V4(_) => IPV4_HDR_LEN,
-        IpAddr::V6(_) => IPV6_HDR_LEN,
-    };
-    // Total bytes on wire (after any in-place memmove for v4).
-    let on_wire_actual = ETH_HDR_LEN + ip_hdr_len + UDP_HDR_LEN + payload_len;
-    let actual_headroom = ETH_HDR_LEN + ip_hdr_len + UDP_HDR_LEN;
-
-    {
-        let frame = handle.data_mut();
-        // SAFETY: `frame` is `data_cap` bytes — >= the whole on-wire
-        // frame (bounds-checked above), so all offset arithmetic
-        // stays in-bounds.
-        unsafe {
-            // For v4: shift the payload back 20 B so the L2 frame
-            // starts at slot.data[0], where `submit_tx` expects it.
-            // Overlapping move — `ptr::copy`.
-            if matches!(dst, IpAddr::V4(_)) {
-                let p = frame.as_mut_ptr();
-                core::ptr::copy(p.add(MAX_L2_HEADROOM), p.add(actual_headroom), payload_len);
-            }
-            // Frame starts at offset 0 (after any v4 shift).
-            fill_udp_frame_headers(frame, 0, dst, dst_mac, src_port, dst_port, udp_len);
-        }
-    }
-
-    // The L2 frame now starts at slot.data[0] for both families.
+    let mut handle = handle;
     // The UDP checksum field holds the pseudo-header partial sum;
-    // `submit_tx` hands the driver these offsets to finish it.
-    // 6 = the checksum field's offset within the UDP header.
-    let _ = &mut handle;
-    let csum = nic::CsumOffload {
-        start: (ETH_HDR_LEN + ip_hdr_len) as u16,
-        offset: 6,
+    // `submit_tx` hands the driver these offsets to finish it
+    // (6 = the checksum field's offset within the UDP header).
+    let (on_wire, _hdr_len, csum_start) = unsafe {
+        write_udp_tx_headers(handle.data_mut(), dst, dst_mac, src_port, dst_port, payload_len)
     };
-    nic::submit_tx(handle, on_wire_actual, csum);
+    nic::submit_tx(
+        handle,
+        on_wire,
+        nic::CsumOffload {
+            start: csum_start,
+            offset: 6,
+        },
+    );
     diag::COUNTERS.tx_datagrams.bump();
 }
 
@@ -440,52 +464,23 @@ pub fn send_udp_gso_via_tx_handle(
             return;
         }
     };
-    let ip_hdr_len = match dst {
-        IpAddr::V4(_) => IPV4_HDR_LEN,
-        IpAddr::V6(_) => IPV6_HDR_LEN,
+    // One header template (the device replicates it per gso_size
+    // segment, fixing per-segment length). The v4 shift is one memmove
+    // for the whole burst — amortized across N packets.
+    let (on_wire, hdr_len, csum_start) = unsafe {
+        write_udp_tx_headers(handle.data_mut(), dst, dst_mac, src_port, dst_port, payload_total)
     };
-    let actual_headroom = ETH_HDR_LEN + ip_hdr_len + UDP_HDR_LEN;
-    let on_wire_actual = actual_headroom + payload_total;
-
+    // Zero the UDP checksum so the device computes a full per-segment
+    // checksum (the TSO/GSO convention; the pseudo-sum the template
+    // carries is moot. HVF's proxy ignores the field). csum_start is
+    // the UDP-header start; +6 is the checksum field within it.
     {
         let frame = handle.data_mut();
-        // SAFETY: `frame` is `data_cap` bytes ≥ the whole super-packet
-        // (bounds-checked above); all offsets below stay in-bounds.
-        unsafe {
-            // v4: shift the N-packet payload back 20 B so the L2 frame
-            // starts at slot.data[0] (one memmove for the whole burst —
-            // amortized across N packets vs the per-datagram path).
-            if matches!(dst, IpAddr::V4(_)) {
-                let p = frame.as_mut_ptr();
-                core::ptr::copy(
-                    p.add(MAX_L2_HEADROOM),
-                    p.add(actual_headroom),
-                    payload_total,
-                );
-            }
-            // One header template; `udp_len` is the whole-payload value
-            // (the device overwrites per-segment length). The pseudo-sum
-            // it stamps is moot — we zero the csum field next so the
-            // device computes a full per-segment checksum (the TSO
-            // convention; HVF's proxy ignores it).
-            fill_udp_frame_headers(
-                frame,
-                0,
-                dst,
-                dst_mac,
-                src_port,
-                dst_port,
-                UDP_HDR_LEN + payload_total,
-            );
-            let udp_csum = ETH_HDR_LEN + ip_hdr_len + 6;
-            frame[udp_csum] = 0;
-            frame[udp_csum + 1] = 0;
-        }
+        let udp_csum = csum_start as usize + 6;
+        frame[udp_csum] = 0;
+        frame[udp_csum + 1] = 0;
     }
-
-    let hdr_len = actual_headroom as u16;
-    let csum_start = (ETH_HDR_LEN + ip_hdr_len) as u16;
-    nic::submit_tx_udp_gso(handle, on_wire_actual, hdr_len, csum_start, gso_size);
+    nic::submit_tx_udp_gso(handle, on_wire, hdr_len, csum_start, gso_size);
     diag::COUNTERS.tx_datagrams.bump();
 }
 
