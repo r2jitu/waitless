@@ -408,6 +408,87 @@ pub fn send_via_tx_handle(
     diag::COUNTERS.tx_datagrams.bump();
 }
 
+/// UDP-GSO submit: the caller filled N back-to-back QUIC packets (each
+/// `gso_size`, the last may be shorter) at
+/// `handle.data_mut()[MAX_L2_HEADROOM..frame_len]`. We write ONE
+/// Eth+IP+UDP header template in the headroom and hand the driver a
+/// single segmentation descriptor; the device replicates the header per
+/// `gso_size` chunk, fixing per-segment length + L4 checksum. Mirrors
+/// TCP's `send_super_segment_from_cursor` (header template + zeroed L4
+/// csum, device computes per segment).
+pub fn send_udp_gso_via_tx_handle(
+    dst: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    mut handle: nic_api::TxUdpGsoBufHandle,
+    frame_len: usize,
+    gso_size: u16,
+) {
+    use executor::reactor::MAX_L2_HEADROOM;
+    debug_assert!(frame_len > MAX_L2_HEADROOM);
+    debug_assert!(frame_len <= handle.data_cap() as usize);
+
+    let payload_total = frame_len - MAX_L2_HEADROOM;
+    if payload_total == 0 || gso_size == 0 {
+        diag::COUNTERS.tx_invalid.bump();
+        return;
+    }
+    let dst_mac = match mac_resolve::resolve(dst) {
+        Some(m) => m,
+        None => {
+            diag::COUNTERS.tx_mac_unresolved.bump();
+            return;
+        }
+    };
+    let ip_hdr_len = match dst {
+        IpAddr::V4(_) => IPV4_HDR_LEN,
+        IpAddr::V6(_) => IPV6_HDR_LEN,
+    };
+    let actual_headroom = ETH_HDR_LEN + ip_hdr_len + UDP_HDR_LEN;
+    let on_wire_actual = actual_headroom + payload_total;
+
+    {
+        let frame = handle.data_mut();
+        // SAFETY: `frame` is `data_cap` bytes ≥ the whole super-packet
+        // (bounds-checked above); all offsets below stay in-bounds.
+        unsafe {
+            // v4: shift the N-packet payload back 20 B so the L2 frame
+            // starts at slot.data[0] (one memmove for the whole burst —
+            // amortized across N packets vs the per-datagram path).
+            if matches!(dst, IpAddr::V4(_)) {
+                let p = frame.as_mut_ptr();
+                core::ptr::copy(
+                    p.add(MAX_L2_HEADROOM),
+                    p.add(actual_headroom),
+                    payload_total,
+                );
+            }
+            // One header template; `udp_len` is the whole-payload value
+            // (the device overwrites per-segment length). The pseudo-sum
+            // it stamps is moot — we zero the csum field next so the
+            // device computes a full per-segment checksum (the TSO
+            // convention; HVF's proxy ignores it).
+            fill_udp_frame_headers(
+                frame,
+                0,
+                dst,
+                dst_mac,
+                src_port,
+                dst_port,
+                UDP_HDR_LEN + payload_total,
+            );
+            let udp_csum = ETH_HDR_LEN + ip_hdr_len + 6;
+            frame[udp_csum] = 0;
+            frame[udp_csum + 1] = 0;
+        }
+    }
+
+    let hdr_len = actual_headroom as u16;
+    let csum_start = (ETH_HDR_LEN + ip_hdr_len) as u16;
+    nic::submit_tx_udp_gso(handle, on_wire_actual, hdr_len, csum_start, gso_size);
+    diag::COUNTERS.tx_datagrams.bump();
+}
+
 /// Slice-shaped UDP send. Copies `data` into a stack-local
 /// framing buffer with the headers' reserved headroom, then
 /// delegates to [`send_with_l2_headroom`] for the in-place

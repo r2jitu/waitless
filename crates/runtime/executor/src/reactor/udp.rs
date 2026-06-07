@@ -498,6 +498,22 @@ pub type UdpSendViaTxHandleFn = fn(
 pub type UdpSendWithL2HeadroomFn =
     fn(dst_ip: IpAddr, src_port: u16, dst_port: u16, frame: &mut [u8]);
 
+/// Submit a UDP-GSO super-packet from a TX-pool big-slot: the caller
+/// has written N back-to-back QUIC packets (each `gso_size` bytes,
+/// the last may be shorter) at `frame[MAX_L2_HEADROOM..]`; the backend
+/// writes ONE Eth+IP+UDP header template in the headroom and hands the
+/// driver a single segmentation descriptor. The device replicates the
+/// header per `gso_size` chunk on the wire. `frame_len = MAX_L2_HEADROOM
+/// + Σ segment bytes`.
+pub type UdpSendUdpGsoViaTxHandleFn = fn(
+    dst_ip: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    handle: nic_api::TxUdpGsoBufHandle,
+    frame_len: usize,
+    gso_size: u16,
+);
+
 /// All UDP backend hooks. Installed once at boot by the platform
 /// backend — native (POSIX sockets) or bare-metal (integrated NIC
 /// driver + protocol stack). `UdpSocket::bind` / `send_to` /
@@ -566,6 +582,14 @@ pub struct UdpBackend {
     /// memcpy chain. Bare-metal sets this; native leaves it `None`
     /// (the OS does the wrap on `sendto`).
     pub send_with_l2_headroom: Option<UdpSendWithL2HeadroomFn>,
+    /// Optional acquire-from-TX-big-pool entry for a UDP-GSO super-
+    /// packet slot (≈16-20 KiB). `None` means the driver/device has no
+    /// hardware UDP segmentation (virtio without USO, HVF, native) — the
+    /// caller falls back to per-datagram [`acquire_tx_buf`]. Pairs with
+    /// [`send_udp_gso_via_tx_handle`].
+    pub acquire_tx_udp_gso_buf: Option<fn() -> Option<nic_api::TxUdpGsoBufHandle>>,
+    /// Optional UDP-GSO submit. See [`UdpSendUdpGsoViaTxHandleFn`].
+    pub send_udp_gso_via_tx_handle: Option<UdpSendUdpGsoViaTxHandleFn>,
 }
 
 /// Max bytes a caller of `UdpSocket::send_to_with_l2_headroom`
@@ -596,6 +620,18 @@ pub const MAX_L2_HEADROOM: usize = 14 + 40 + 8;
 pub fn acquire_tx_buf() -> Option<nic_api::TxBufHandle> {
     let b = udp_backend()?;
     let f = b.acquire_tx_buf?;
+    f()
+}
+
+/// Acquire a UDP-GSO super-packet big-slot from the driver's TX big
+/// pool (the same pool TCP TSO uses). `None` when hardware UDP
+/// segmentation isn't available (no USO / native / pool full) — the
+/// QUIC encoder then falls back to per-datagram [`acquire_tx_buf`].
+/// Caller writes N back-to-back QUIC packets at `[MAX_L2_HEADROOM..]`
+/// and ships via [`UdpSocket::send_gso_via_tx_handle`].
+pub fn acquire_tx_udp_gso_buf() -> Option<nic_api::TxUdpGsoBufHandle> {
+    let b = udp_backend()?;
+    let f = b.acquire_tx_udp_gso_buf?;
     f()
 }
 
@@ -934,6 +970,32 @@ impl UdpSocket {
             // handle (returns slot to pool) and let the caller
             // retry via the slice-shaped path. Should not happen
             // when paired with `acquire_tx_buf`'s `None` gating.
+            drop(handle);
+            None
+        }
+    }
+
+    /// Submit a UDP-GSO super-packet acquired via
+    /// [`acquire_tx_udp_gso_buf`]: caller filled N back-to-back QUIC
+    /// packets (each `gso_size`, last may be shorter) at
+    /// `[MAX_L2_HEADROOM..frame_len]`; the backend writes one Eth+IP+UDP
+    /// header template and hands the driver a single segmentation
+    /// descriptor. Consumes the handle. `None` if the backend lacks the
+    /// hook (handle dropped → slot returns to pool).
+    #[must_use = "discarding the `None` swallows a missing-backend bug"]
+    pub fn send_gso_via_tx_handle(
+        &self,
+        dst_ip: IpAddr,
+        dst_port: u16,
+        handle: nic_api::TxUdpGsoBufHandle,
+        frame_len: usize,
+        gso_size: u16,
+    ) -> Option<()> {
+        let b = udp_backend()?;
+        if let Some(f) = b.send_udp_gso_via_tx_handle {
+            f(dst_ip, self.port, dst_port, handle, frame_len, gso_size);
+            Some(())
+        } else {
             drop(handle);
             None
         }

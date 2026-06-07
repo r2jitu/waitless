@@ -625,6 +625,8 @@ static NATIVE_UDP_BACKEND: executor::reactor::UdpBackend = executor::reactor::Ud
     acquire_tx_buf: None,
     send_via_tx_handle: None,
     send_with_l2_headroom: None,
+    acquire_tx_udp_gso_buf: None,
+    send_udp_gso_via_tx_handle: None,
 };
 
 fn init_native() {

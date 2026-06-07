@@ -86,6 +86,8 @@ static BARE_UDP_BACKEND: executor::reactor::UdpBackend = executor::reactor::UdpB
     acquire_tx_buf: Some(nic::acquire_tx_buf),
     send_via_tx_handle: Some(udp::send_via_tx_handle),
     send_with_l2_headroom: Some(udp::send_with_l2_headroom),
+    acquire_tx_udp_gso_buf: Some(nic::acquire_tx_udp_gso_buf),
+    send_udp_gso_via_tx_handle: Some(udp::send_udp_gso_via_tx_handle),
 };
 
 pub fn init_stack() {
