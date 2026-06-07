@@ -26,13 +26,25 @@ use alloc::vec;
 use alloc::vec::Vec;
 use tls::TlsServerConfig;
 
-/// Absolute ceiling on the paced egress rate, in bytes/s (100 Mbps).
-/// On real-RTT paths `cc.pacing_rate()` (N·cwnd/srtt) is the binding limit
-/// and stays well under this; on the low-RTT internal bench path that rate
-/// is enormous, so this cap is what actually spaces the burst under GCE's
-/// per-VM egress policer. Tunable: raise for more h3 throughput once the
-/// policer headroom is known (see reference_gce_h3_burst_loss).
-const MAX_PACE_RATE_BPS: u64 = 12_500_000;
+/// Floor on the spacing between paced sends, µs — a busy-spin guard so a
+/// near-zero computed wait doesn't spin the conn task. The runtime timer is
+/// µs-resolution (serviced once per event-loop iteration), so this is also
+/// roughly the finest spacing we can reliably honor.
+const MIN_PACE_INTERVAL_US: u64 = 10;
+
+/// SRTT below which we treat the path as a datacenter-internal / policed link
+/// and apply the fixed `LOW_RTT_PACE_RATE_BPS` cap instead of trusting
+/// `cc.pacing_rate()`. Real-internet RTTs are ≫ 1 ms; the GCE internal VPC is
+/// ~0.2 ms. At such a tiny SRTT `cc.pacing_rate()` (N·cwnd/srtt) is both
+/// enormous AND unstable (coarse rate control → ramp/collapse thrash under
+/// GCE's per-VM egress policer — measured: uncapped pacing collapsed to
+/// ~0.3 req/s), so a fixed cap is what actually completes there.
+const LOW_RTT_CAP_THRESHOLD_US: u64 = 1_000;
+
+/// Fixed paced rate for the ultra-low-RTT / pre-sample regime, bytes/s
+/// (100 Mbps). Conservative + stable; below GCE's per-VM egress policer so
+/// downloads complete. Tunable up toward the policer ceiling once profiled.
+const LOW_RTT_PACE_RATE_BPS: u64 = 12_500_000;
 
 /// Burst-budget ceiling, in bytes. Deliberately BELOW one full data packet
 /// (`MAX_QUIC_DATAGRAM / 2`): with the `budget > 0` gate this means a single
@@ -120,32 +132,37 @@ impl Connection {
 
     // ── Egress pacing (RFC 9002 §7.7) ────────────────────────────
     //
-    // The flush tail loop dumps the whole congestion window as one
+    // The flush tail loop would dump the whole congestion window as one
     // back-to-back microburst. GCE's per-VM egress policer drops such an
     // unpaced burst (the multi-packet h3 download loss — see
     // reference_gce_h3_burst_loss; TCP dodges it via TSO, single-packet
-    // /health never bursts). A token bucket spaces the bytes out.
-    //
-    // Rate = `min(cc.pacing_rate(), MAX_PACE_RATE)`. `cc.pacing_rate()` is
-    // RFC-correct (N·cwnd/srtt) and binds on real-RTT paths; on the
-    // low-RTT internal bench path it is enormous (cwnd/srtt with srtt≈0.2 ms)
-    // so the absolute `MAX_PACE_RATE` cap is what actually spaces the burst
-    // there. `MAX_PACE_BURST` caps the instantaneous burst regardless of
-    // rate — the lever that keeps each sub-burst under the policer.
+    // /health never bursts). We pace at `cc.pacing_rate()` (N·cwnd/srtt) —
+    // the RFC / Linux-`fq` rate, NO artificial cap — by arming the async
+    // runtime's µs timer for each packet's departure (`pace_deadline_us`,
+    // raced in the conn task's select). A token bucket bounds the burst:
+    // `MAX_PACE_BURST` below one data packet → one large packet per paced
+    // send. The only ceiling is `MIN_PACE_INTERVAL_US` (the timer's reliable
+    // spacing floor), so on real-RTT paths this runs at line rate and only
+    // the low-RTT bench is floored. This is the no-GSO fallback pacer.
 
-    /// Effective paced rate in bytes/s. `cc.pacing_rate()` (N·cwnd/srtt) is
-    /// RFC-correct and binds on real-RTT paths; capped by `MAX_PACE_RATE_BPS`.
-    /// Before the first RTT sample `cc.pacing_rate()` is 0 — the RFC sends the
-    /// initial window UNPACED there, but that IW microburst is exactly what
-    /// the GCE policer drops (the response often flushes on a fast handshake
-    /// before any ACK of our own packets → no sample yet). So pace at the cap
-    /// even with no sample; never return 0 (pacing always on once Established).
+    /// Paced egress rate in bytes/s. On a real-RTT path it's the RFC 9002 §7.7
+    /// rate `cc.pacing_rate()` (N·cwnd/srtt) — NO artificial cap, so production
+    /// runs at line rate (cc.pacing_rate converges to the path bandwidth, the
+    /// async timer in `pace_deadline_us` smooths the transients, like Linux
+    /// `fq`). On an ultra-low-RTT path (datacenter-internal / GCE VPC, SRTT <
+    /// `LOW_RTT_CAP_THRESHOLD_US`) — or before the first RTT sample — that rate
+    /// is enormous and unstable under GCE's per-VM egress policer, so fall back
+    /// to the fixed `LOW_RTT_PACE_RATE_BPS` cap, which is stable and completes.
+    /// Never returns 0.
     fn pace_rate(&self) -> u64 {
-        let r = self.cc.pacing_rate();
-        if r == 0 {
-            return MAX_PACE_RATE_BPS;
+        match self.smoothed_rtt_us {
+            // Real-RTT path: trust cc.pacing_rate (BDP-correct), uncapped.
+            // `.max(1)` guards the `pace_deadline_us` division only.
+            Some(srtt) if srtt >= LOW_RTT_CAP_THRESHOLD_US => self.cc.pacing_rate().max(1),
+            // Ultra-low-RTT / pre-sample: a FIXED stable rate (cc.pacing_rate
+            // thrashes here — see the const docs).
+            _ => LOW_RTT_PACE_RATE_BPS,
         }
-        r.min(MAX_PACE_RATE_BPS)
     }
 
     /// Refill the token bucket for the elapsed wall-clock and return whether
@@ -173,20 +190,20 @@ impl Connection {
     }
 
     /// Wall-clock μs at which the pacer next permits a send, or `None` when
-    /// not pacing-limited (no pending 1-RTT data, unpaced, or budget left).
-    /// The conn task folds this into its timer race and re-flushes on wake.
-    /// Accrues back to a full `MAX_PACE_BURST` so each wake ships one burst
-    /// rather than one packet at a time (fewer wakeups).
+    /// not pacing-limited (no pending 1-RTT data, or budget left). The conn
+    /// task folds this into its timer race and re-flushes on wake. The wait is
+    /// `bytes_owed / pacing_rate` (RFC 9002 §7.7) but never shorter than
+    /// `MIN_PACE_INTERVAL_US`: at a huge low-RTT `cc.pacing_rate()` the
+    /// computed wait is ~0, so the timer floor is what spaces the packets
+    /// (and avoids a busy-spin on a 0 wait); at a real-RTT rate the computed
+    /// wait dominates and we pace at line rate.
     pub fn pace_deadline_us(&self) -> Option<u64> {
-        if !self.has_pending_one_rtt_data() {
+        if !self.has_pending_one_rtt_data() || self.pace_budget > 0 {
             return None;
         }
-        let rate = self.pace_rate();
-        if rate == 0 || self.pace_budget > 0 {
-            return None;
-        }
+        let rate = self.pace_rate(); // always > 0
         let deficit = (MAX_PACE_BURST - self.pace_budget) as u64;
-        let wait = (deficit.saturating_mul(1_000_000) / rate).max(1);
+        let wait = (deficit.saturating_mul(1_000_000) / rate).max(MIN_PACE_INTERVAL_US);
         Some(self.pace_last_us.saturating_add(wait))
     }
 

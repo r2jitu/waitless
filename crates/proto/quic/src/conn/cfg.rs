@@ -473,18 +473,17 @@ fn pto_period_backs_off_exponentially() {
 fn pacer_arms_deadline_only_when_limited() {
     use net_cc::CongestionControl;
     let mut conn = Connection::new_server(ConnectionId::new(&[0xab; 8]), [0x42u8; 32]);
-    // Feed the congestion controller an RTT sample so `pacing_rate()` > 0.
-    // A 0.2 ms SRTT makes N·cwnd/srtt enormous, so the absolute rate cap is
-    // what binds — the low-RTT internal-VPC case the pacer targets.
-    conn.cc.on_ack(12_000, 0, net_cc::Rtt::new(200, 200));
     conn.pace_last_us = 1_000_000;
+    // Ultra-low-RTT path (0.2 ms) → the fixed-cap regime (cc.pacing_rate would
+    // thrash here), so pacing runs at LOW_RTT_PACE_RATE_BPS.
+    conn.smoothed_rtt_us = Some(200);
 
     // No pending 1-RTT data → never pacing-limited, whatever the budget.
     conn.pace_budget = -700;
     assert!(conn.pace_deadline_us().is_none());
 
-    // Pending data (a queued retransmission) + a spent budget → a deadline
-    // in the near future (sub-millisecond at the capped rate).
+    // Pending data (a queued retransmission) + a spent budget → a near-future
+    // deadline (one packet's worth of spacing at the capped rate, sub-ms).
     conn.retx_queue.push_back(super::StreamRetx {
         sid: 0,
         offset: 0,
@@ -495,9 +494,16 @@ fn pacer_arms_deadline_only_when_limited() {
         .pace_deadline_us()
         .expect("pending data + spent budget → a deadline is armed");
     assert!(d > 1_000_000, "deadline must be in the future");
-    assert!(d <= 1_000_000 + 1_000, "paced interval is sub-ms at the rate cap");
+    assert!(d <= 1_000_000 + 1_000, "≈one packet at the low-RTT capped rate (sub-ms)");
 
     // Pending data but positive budget → may send now, no deadline.
     conn.pace_budget = 1;
     assert!(conn.pace_deadline_us().is_none());
+
+    // Real-RTT path (50 ms) uncaps: pacing follows cc.pacing_rate, not the
+    // fixed cap — the gate still arms a deadline when the budget is spent.
+    conn.smoothed_rtt_us = Some(50_000);
+    conn.cc.on_ack(12_000, 0, net_cc::Rtt::new(50_000, 50_000));
+    conn.pace_budget = -700;
+    assert!(conn.pace_deadline_us().is_some());
 }
