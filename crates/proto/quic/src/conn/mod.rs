@@ -1206,10 +1206,31 @@ impl Connection {
     pub(super) fn take_datagram_buf(&mut self, fallback_capacity: usize) -> DatagramBuf {
         use executor::reactor::MAX_L2_HEADROOM;
 
+        // The driver DQO direct-fill path (`acquire_tx_buf`) requires
+        // acquire→submit to be SYNCHRONOUSLY PAIRED: acquire returns the next
+        // ring slot's bounce buffer WITHOUT advancing `fill_cnt`, and submit
+        // emits the descriptor for the slot at the *current* `fill_cnt`. So a
+        // second acquire before the first is submitted returns the SAME slot.
+        //
+        // QUIC's flush violates that: it seals each packet into a DatagramBuf
+        // and DEFERS submission through the `outbound` queue (drained later by
+        // `drain_outbound`), and under pacing a packet sits there for ms. Two
+        // packets then acquire the same un-advanced slot before either ships;
+        // the second seal overwrites the first, and the stale packet goes out
+        // with corrupted ciphertext → the peer drops it on AEAD auth failure.
+        // GCE-confirmed at 24 ms RTT: ~79 client "failed to authenticate
+        // packet" per transfer → cwnd collapse → ~0.3 rps; the heap path below
+        // = 0 auth failures, ~66× throughput. The heap DatagramBuf owns its
+        // Vec until ship, so concurrent queued packets can't alias. Direct-fill
+        // can return here once the driver reserves a slot per handle (acquire
+        // advances; submit targets the handle's own slot, not `fill_cnt`).
+        const QUIC_TX_DIRECT_FILL_SAFE: bool = false;
         // Hot path: acquire a slot from the driver's TX pool and
         // write packet bytes straight into it (no driver-side
         // memcpy at submit time).
-        if let Some(handle) = executor::reactor::acquire_tx_buf() {
+        if QUIC_TX_DIRECT_FILL_SAFE
+            && let Some(handle) = executor::reactor::acquire_tx_buf()
+        {
             // The `TxSlot` datagram wraps the driver slot in a
             // `Vec` that MUST NOT reallocate: a realloc would free
             // `handle.data_ptr` — a NIC TX-pool / DMA address, not
