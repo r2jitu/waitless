@@ -179,6 +179,30 @@ pub(crate) fn flush_all_tx_kicks() {
     }
 }
 
+/// Diagnostic totals across all active TX queue pairs:
+/// `(descriptors submitted = Σ fill_cnt, descriptors completed = Σ done_cnt)`.
+/// `done_cnt` is driven by the device's TX completions (descriptors the NIC
+/// fetched/transmitted), so this lets `/obs` triangulate egress drops:
+/// submitted (our `datagrams_sent`) → NIC-completed (here) → received on the
+/// wire (tcpdump). A near-equal fill/done with packets missing on the wire
+/// means the NIC transmitted them and the drop is downstream (host/network/
+/// receiver); done ≪ fill means our TX/NIC stalled. The u32 ring counters are
+/// widened to u64; a short measurement window won't wrap.
+pub(crate) fn tx_desc_totals() -> (u64, u64) {
+    let mut fill = 0u64;
+    let mut done = 0u64;
+    let n = (NUM_QP.load(Ordering::Acquire) as usize).min(MAX_QUEUE_PAIRS);
+    for qp in 0..n {
+        let p = TX_QUEUES[qp].load(Ordering::Acquire);
+        if !p.is_null() {
+            let tx = unsafe { &*p };
+            fill += tx.fill_cnt.load(Ordering::Relaxed) as u64;
+            done += tx.done_cnt.load(Ordering::Relaxed) as u64;
+        }
+    }
+    (fill, done)
+}
+
 /// Turn on batched TX doorbells. Called once by the kernel after
 /// it has wired `flush_tx_kick_if_dirty` into the event loop —
 /// without that guarantee the device would never see the doorbell

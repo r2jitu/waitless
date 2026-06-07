@@ -313,6 +313,9 @@ pub fn record_rx_skip(qp: u8, status: u8) {
 /// is the active driver (virtio-net renders its own block).
 pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
     let sum = |a: &[AtomicU64]| -> u64 { a.iter().map(|c| c.load(Ordering::Relaxed)).sum() };
+    // TX descriptor totals (Σ across qps): submitted vs device-completed.
+    // Lets /obs triangulate egress drops vs our `datagrams_sent` and the wire.
+    let (tx_desc_fill, tx_desc_done) = crate::tx::tx_desc_totals();
     write!(
         w,
         "{{\"driver\":\"gve\",\"tx_miss_compl\":{},\"tx_reinject_compl\":{},\
@@ -320,7 +323,8 @@ pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
          \"rx_compl_skipped\":{},\"rx_pending_chain_timeouts\":{},\
          \"rx_buf_reposts\":{},\"gqi_recycle_exhausted\":{},\
          \"tx_packets\":{},\"tx_bytes\":{},\"rx_bytes\":{},\"tx_small_full_spins\":{},\
-         \"tx_big_full_returns\":{},\"rx_irq\":{},",
+         \"tx_big_full_returns\":{},\"rx_irq\":{},\
+         \"tx_desc_fill\":{},\"tx_desc_done\":{},",
         crate::dqo::DQO_TX_MISS_COMPL.load(Ordering::Relaxed),
         crate::dqo::DQO_TX_REINJECT_COMPL.load(Ordering::Relaxed),
         crate::dqo::DQO_TX_RING_FULL_DROPS.load(Ordering::Relaxed),
@@ -338,6 +342,8 @@ pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
         // confirms the IRQ path fires; 0 on a busy server (never arms)
         // or an MSI-X-less boot (timer-only idle).
         crate::irq::rx_irq_count(),
+        tx_desc_fill,
+        tx_desc_done,
     )?;
     LAST_RX_SKIP.write_json(w, "last_rx_skip")?;
     w.write_str("}")
