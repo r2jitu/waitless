@@ -62,3 +62,33 @@ P50 is already small vs the ~280 µs client-observed, network+client-dominated).
 The instrumentation (`*_cycles` counters) is kept as permanent observability,
 parallel to the existing tcp/tls/http cycle brackets; overhead is <1% (a
 handful of `rdtsc` reads per request).
+
+## Optimization pass — ideas attempted (one-by-one, keep-if-improvement)
+
+| # | idea | result | kept? |
+|---|---|---|---|
+| 5 | `reap_finished_streams`: per-call heap `Vec` → stack array | `reap_cycles/req` 2025-2809 → 1236 (alloc removed); failed=0 | **kept** (`cc74890`) |
+| 2 | skip the per-datagram flush when it's a no-op | `flush_calls/req` 2.5 → 2.0 (empty flushes skipped); dgrams unchanged | **kept** (`a47251f`) |
+| 4 | gate the 1-RTT CRYPTO pop (skip 1 KiB memset+pop/pkt) | `flush_tx/req` ~15.0K → ~14.0K (sub-noise); failed=0 | **kept** (`bc0adfd`) |
+| 1 | inline-until-pending handler dispatch | analyzed, **not pursued** (below) | — |
+| 3 | cross-connection TX batching | analyzed, **not pursued** (= pending #43) | — |
+
+**GCE c3/gve A/B of the kept set (#5+#2+#4) vs main** — h3 /health par=64, 3
+runs each, failed=0: branch median **234.9 K** (230.3/234.9/236.7) vs main
+median **233.1 K** (233.1/226.0/233.3) = **+0.8%, within the ±15% spot noise**.
+So the three are **provable per-request work reductions** (kvm cycle counters
+confirm: 1 fewer heap alloc/req, 0.5 fewer `flush_outbound` entries/req, a
+1 KiB memset+pop dropped per emitted packet) but **throughput-neutral** on the
+noise-limited /health benchmark — efficiency/density wins, not a throughput
+lever. Kept because each is correct, low-risk, and improves the metric it
+targets; reverting would discard real (if sub-noise) work cuts.
+
+**#1 and #3 — analyzed, not implemented** (unsuitable for a try-and-revert
+loop): #1's handler is a long-lived spawned future (the `accept_stream` loop),
+so "inline-until-pending" means the conn task owns + hand-polls it — bypassing
+the executor's Waker contract and breaking streaming/upload handlers that
+genuinely `await` (single-waiter `progress` event, task #30). The profile also
+shows the executor is already efficient (2.45 polls/req, 1.0 conn-iter/req) and
+the hop is ~10-15 µs. #3 is the same restructure as the pending `net_egress`
+per-core-TX-queue work. Both: large + invariant-breaking for a profile-bounded
+upside. Net: per-request micro-opts banked; architectural levers left open.
