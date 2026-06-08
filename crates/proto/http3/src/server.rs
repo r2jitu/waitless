@@ -821,21 +821,26 @@ fn write_response(
             .expect("DATA hdr fits in reserved tailroom");
     }
 
-    // Move the framing IOBuf into the SendStream as a single
-    // chunk. SendStream now natively holds IOBufs (no Vec
-    // conversion), so reserved headroom/tailroom on body parts
-    // also passes through cleanly for downstream layers.
-    conn.send_iobuf(sid, framing);
+    // Queue the framing IOBuf (HEADERS + DATA frame header) WITHOUT
+    // flushing, then queue the body, then `close_stream` — which is the
+    // single flush point. The QUIC encoder coalesces all queued STREAM
+    // frames that fit into one packet, so a small buffered response
+    // (HEADERS + DATA + FIN) ships as ONE packet instead of three
+    // (3× fewer AEAD-seal/HP passes + datagrams per request on /health;
+    // a large body still spans as many packets as bandwidth needs).
+    // SendStream natively holds IOBufs (no Vec conversion), so reserved
+    // headroom/tailroom on body parts passes through cleanly.
+    conn.queue_iobuf(sid, framing);
 
-    // Queue each body chunk on the QUIC stream. Static borrows
-    // stay borrowed; heap-owned chunks move via send_iobuf.
+    // Queue each body chunk on the QUIC stream (still no flush).
     if body_len > 0 {
         for part in resp.into_body().into_parts() {
             queue_chunk(conn, sid, part);
         }
     }
-    // FIN is set by close_stream; the next pop_chunk_into emits
-    // it on the last queued chunk.
+    // close_stream sets FIN AND flushes: the one flush that emits the
+    // whole coalesced response. The encoder stamps FIN on the last
+    // queued STREAM frame.
     conn.close_stream(sid);
 }
 
@@ -844,7 +849,9 @@ fn write_response(
 /// converting to a Vec — preserves any reserved
 /// headroom/tailroom for layers below to prepend / append.
 fn queue_chunk(conn: &QuicConn, sid: u64, b: http::IOBuf) {
-    conn.send_iobuf(sid, b);
+    // Non-flushing: the response's frames coalesce into as few packets
+    // as fit; `write_response`'s trailing `close_stream` is the flush.
+    conn.queue_iobuf(sid, b);
 }
 
 /// Per-stream send-buffer cap for a *streaming* h3 response. Once a

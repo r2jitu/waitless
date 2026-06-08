@@ -303,6 +303,19 @@ impl QuicConn {
         self.drain_outbound();
     }
 
+    /// Like [`send_iobuf`](Self::send_iobuf) but does NOT flush or drain:
+    /// the frame is appended to `sid`'s send queue and stays there until
+    /// the next flush. Lets a multi-frame response (HEADERS + DATA + FIN)
+    /// be coalesced into ONE flushed QUIC packet instead of one packet
+    /// per frame — the QUIC encoder packs all queued STREAM frames that
+    /// fit (up to `PACKET_BODY_BUDGET`) into each packet. Use when more
+    /// frames or the terminating `close_stream` (which flushes) follow.
+    /// Cuts the per-request packet / AEAD-seal count on small responses
+    /// (a /health response was 3 packets — HEADERS, DATA, FIN — now 1).
+    pub fn queue_iobuf(&self, sid: u64, data: iobuf::IOBuf) {
+        self.conn.borrow_mut().stream_send_iobuf(sid, data);
+    }
+
     /// Discard any bytes buffered for `sid`'s recv side without
     /// awaiting. Use for streams the app never intends to read
     /// (e.g. HTTP/3 peer-initiated uni streams: control, QPACK
