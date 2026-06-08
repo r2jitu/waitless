@@ -21,10 +21,10 @@ use crate::crypto::{
     next_traffic_secret,
 };
 use crate::tls::QuicTlsState;
-use aes_gcm::Aes128Gcm;
-use aes_gcm::aead::{AeadInPlace, KeyInit, generic_array::GenericArray};
+use aes_gcm::aead::{KeyInit, generic_array::GenericArray};
 use aes_gcm::aes::Aes128;
 use aes_gcm::aes::cipher::BlockEncrypt;
+use waitless_aes_gcm::Aes128GcmFast;
 use tls::TlsServerConfig;
 
 // ============================================================================
@@ -37,10 +37,10 @@ use tls::TlsServerConfig;
 /// 12-byte IV, 16-byte HP key) since `TLS_AES_128_GCM_SHA256` is
 /// our sole negotiated cipher suite.
 ///
-/// Caches the keyed `Aes128Gcm` (AEAD) and `Aes128` (ECB-mode HP
+/// Caches the keyed `Aes128GcmFast` (AEAD) and `Aes128` (ECB-mode HP
 /// cipher) so each packet-protection / unprotection skips the AES
-/// round-key expansion + GHASH H-table init that `Aes128Gcm::new`
-/// and `Aes128::new` did per call previously. The work happens once
+/// round-key expansion + GHASH H-table init that the ciphers' `new`
+/// did per call previously. The work happens once
 /// per `from_*` call (once per stage, plus once per RFC 9001 §6.1
 /// key-phase rotation on the AEAD half) instead of once per packet.
 ///
@@ -57,7 +57,7 @@ use tls::TlsServerConfig;
 /// raw key bytes in favour of the keyed ciphers.
 #[derive(Clone)]
 pub(crate) struct DirKeys {
-    pub(super) aead_cipher: Aes128Gcm,
+    pub(super) aead_cipher: Aes128GcmFast,
     pub(super) iv: [u8; NONCE_LEN],
     pub(super) hp_cipher: Aes128,
 }
@@ -72,7 +72,7 @@ impl DirKeys {
         hp_key: &[u8; AES_KEY_LEN],
     ) -> Self {
         DirKeys {
-            aead_cipher: Aes128Gcm::new(GenericArray::from_slice(aead_key)),
+            aead_cipher: Aes128GcmFast::new(aead_key),
             iv: *iv,
             hp_cipher: Aes128::new(GenericArray::from_slice(hp_key)),
         }
@@ -101,7 +101,7 @@ impl DirKeys {
         prev: &DirKeys,
     ) -> Self {
         DirKeys {
-            aead_cipher: Aes128Gcm::new(GenericArray::from_slice(&k.key)),
+            aead_cipher: Aes128GcmFast::new(&k.key),
             iv: k.iv,
             hp_cipher: prev.hp_cipher.clone(),
         }
@@ -113,13 +113,10 @@ impl DirKeys {
         aad: &[u8],
         data: &mut [u8],
     ) -> [u8; TAG_LEN] {
-        let tag = self
-            .aead_cipher
-            .encrypt_in_place_detached(GenericArray::from_slice(nonce), aad, data)
-            .expect("AES-128-GCM encrypt: infallible for in-range buffers");
-        let mut out = [0u8; TAG_LEN];
-        out.copy_from_slice(tag.as_slice());
-        out
+        // `Aes128GcmFast` (stitched AES-CTR + batched GHASH) seals in
+        // place and returns the 16-byte tag — the same fast crate TLS
+        // uses, far cheaper per byte than RustCrypto's non-stitched path.
+        self.aead_cipher.seal(nonce, aad, data)
     }
 
     pub(super) fn aead_open(
@@ -129,14 +126,7 @@ impl DirKeys {
         data: &mut [u8],
         tag: &[u8; TAG_LEN],
     ) -> Result<(), ()> {
-        self.aead_cipher
-            .decrypt_in_place_detached(
-                GenericArray::from_slice(nonce),
-                aad,
-                data,
-                GenericArray::from_slice(tag),
-            )
-            .map_err(|_| ())
+        self.aead_cipher.open(nonce, aad, data, tag).map_err(|_| ())
     }
 
     /// AES-128-ECB on `sample`, truncated to `HP_MASK_LEN` (RFC 9001

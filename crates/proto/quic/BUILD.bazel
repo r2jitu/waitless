@@ -73,6 +73,11 @@ rust_library(
         # observability primitives. QUIC is the doctrine's reference
         # implementation; see `docs/observability.md`.
         "//crates/util/obs",
+        # AEAD packet protection: the hand-rolled stitched/batched
+        # AES-128-GCM (`Aes128GcmFast`) that TLS already uses — far faster
+        # per byte than RustCrypto's non-stitched `aes-gcm`. `@crates//:aes-gcm`
+        # stays for the HP cipher (`aes_gcm::aes::Aes128`, one block/packet).
+        "//crates/crypto/aes-gcm",
         "@crates//:aes-gcm",
         "@crates//:getrandom",
         "@crates//:hmac",
