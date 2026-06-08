@@ -336,7 +336,9 @@ AEAD seals there.
   upgrades it to a pool-borrowed IOBuf.
 
 ### R. UDP GSO on DQO TX
-- **Status**: [ ]
+- **Status**: [x] **landed** — DQO segments UDP super-buffers via
+  the same TSO descriptor path; GQI / virtio / HVF fall back to
+  the per-datagram loop.
 - **Result (when landed)**: UDP-heavy TX paths emit one
   GSO-segmented "big frame" instead of N MTU-sized sends. The
   device hardware segments on its side, eliminating
@@ -346,15 +348,14 @@ AEAD seals there.
   capability on a path the GQI mode has had since the initial
   UDP-GSO landing.
 - **Where**:
-  * Dispatcher (currently early-returns on DQO):
-    [`crates/drivers/gve/src/lib.rs:1619-1630`](crates/drivers/gve/src/lib.rs#L1619-L1630)
-    `submit_tx_udp_gso` — `if QUEUE_FORMAT_DQO { return; }` at
-    line 1626.
-  * Buf-acquire (currently shares GQI big-pool path, returns None
-    on DQO):
-    [`crates/drivers/gve/src/lib.rs:1610-1617`](crates/drivers/gve/src/lib.rs#L1610-L1617)
-    `acquire_tx_udp_gso_buf` → `acquire_tx_tso_buf()` → None on
-    DQO ([lib.rs:1641-1644](crates/drivers/gve/src/lib.rs#L1641-L1644)).
+  * Dispatcher / wiring (DQO segments via the TSO path):
+    [`crates/drivers/gve/src/lib.rs:704-706`](crates/drivers/gve/src/lib.rs#L704-L706)
+    — `udp_gso_available: tx::udp_gso_enabled` +
+    `acquire_tx_udp_gso_buf` / `submit_tx_udp_gso`.
+  * Buf-acquire (DQO returns the TSO slot; GQI = None fallback):
+    [`crates/drivers/gve/src/tx.rs:54-63`](crates/drivers/gve/src/tx.rs#L54-L63)
+    `acquire_tx_udp_gso_buf` → `dqo::acquire_tx_tso_buf` on DQO,
+    `None` on GQI.
   * GQI implementation to mirror:
     [`crates/drivers/gve/src/gqi.rs:571`](crates/drivers/gve/src/gqi.rs#L571)
     `submit_tx_udp_gso_inner`. Same arg shape: `handle`,
@@ -1064,3 +1065,11 @@ effectively covered by the 2026-05-19 uniform-checksum offload.
   `l4_checksum` / `l4_checksum_v4` helpers went with them. Supersedes
   the `csum_tx_offload` + `csum_stamp_convention` mechanism in the
   2026-05-09 "Multi-driver TX-path overhaul" entry above.
+
+- **Item R landed** — DQO UDP-GSO. The device segments UDP
+  super-buffers via the TSO descriptor path (it reads TCP vs UDP
+  from the IP-protocol byte), so `acquire_tx_udp_gso_buf` returns
+  the DQO TSO slot and `submit_tx_udp_gso` reuses `submit_tx_tso`
+  verbatim; c3-validated. GQI / virtio / HVF stay on the
+  per-datagram fallback. Wiring: `udp_gso_available:
+  tx::udp_gso_enabled` (`lib.rs:704-706`) + `tx.rs:54-63`.

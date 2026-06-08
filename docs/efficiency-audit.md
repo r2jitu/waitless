@@ -156,6 +156,11 @@ coverage; HVF functional; GCE allocs/req (expect 1→0) + send-path cy/req.
 >   header/record `into_owned` copy; GCE-validated 1.00 → 0.000 on /health plain
 >   and TLS. (Implemented as a copy-into-reusable-buffer rather than
 >   `clone_shared`, but same net effect: no per-request heap alloc.)
+> - **2(a) — direct-fill since landed (T1).** `nic::acquire_tx_buf` now exposes
+>   a regular direct-fill TX slot on **both** gve formats (`tx.rs:106` →
+>   `dqo::acquire_tx_buf` / `gqi::acquire_tx_buf_for_qp`), so the "gve has no
+>   direct-fill slot" blocker below is stale; the sub-MSS seal-into-slot is
+>   unblocked. The original BLOCKED reasoning is kept for the record:
 > - **2(a) BLOCKED on gve — the direct-fill seal can't reduce the copies on the
 >   GCE deploy.** It was implemented and GCE-tested: `direct_fill_sends = 0`
 >   because **gve does not expose a regular direct-fill TX slot**

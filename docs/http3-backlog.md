@@ -6,9 +6,10 @@ This tracks the **HTTP/3 application layer** — the RFC 9114 framing /
 control-stream / request mapping and the RFC 9204 QPACK header
 compression in `crates/proto/http3/`. The **QUIC transport** underneath
 (RFC 9000/9001/9002 — streams, flow control, loss detection, the
-unbuilt congestion controller, frame retransmission) is tracked
-separately in [`conformance-roadmap.md`](conformance-roadmap.md) Part 3;
-this doc cross-refs it rather than duplicating it.
+`net_cc` NewReno congestion controller, and STREAM-frame retransmission,
+all now landed; CRYPTO-frame retx via the PTO probe is the one residual)
+is tracked separately in [`conformance-roadmap.md`](conformance-roadmap.md)
+Part 3; this doc cross-refs it rather than duplicating it.
 
 H3 is the **differentiator still under construction** (IPv6 + QUIC + H3),
 not the golden path — see [`stack-architecture.md`](stack-architecture.md).
@@ -48,17 +49,21 @@ handshake (Required Insert Count, blocked streams) is the complexity QUIC
 makes necessary that HPACK avoids — see [`http2-backlog.md`](http2-backlog.md)
 H2-7 for the simpler HPACK cousin. **Effort: L.**
 
-### H3-2 — Lost STREAM/CRYPTO frames are never re-queued — P1 (correctness)
+### H3-2 — Lost CRYPTO frames are never re-queued — P1 (correctness)
 
-**What.** `detect_loss` declares packets lost but the lost STREAM/CRYPTO
-frames aren't replayed (`SendStream.send_offset` advances irreversibly;
-the PTO probe is a bare PING). Recovery leans on client retransmits.
+**STREAM half: ✅ done.** `detect_loss` now moves a lost packet's retained
+`StreamRetx` frames to `Connection::retx_queue`, and `encode_one_rtt_packet`
+drains that before fresh data (`pop_chunk` hands out an owned copy so the
+offset bytes survive for replay — RFC 9000 §13.3). So lost request/response
+STREAM data is replayed without leaning on client retransmits.
+
+**Residual — CRYPTO.** The PTO probe is still a bare PING rather than a
+replay of lost CRYPTO frames, so handshake-loss recovery leans on the
+peer's PING-elicited ACK.
 
 **Where tracked.** This is a QUIC-transport gap owned by
-[`conformance-roadmap.md`](conformance-roadmap.md) Part 3 (RFC 9002) and
-flagged in [`stack-architecture.md`](stack-architecture.md) (any
-`SendStream` redesign must leave room for replay-from-offset). Listed here
-only so the H3 picture is complete; **fix it on the transport side.**
+[`conformance-roadmap.md`](conformance-roadmap.md) Part 3 (RFC 9002). Listed
+here only so the H3 picture is complete; **fix it on the transport side.**
 
 ### H3-3 — Peer SETTINGS are ignored — P2
 
@@ -91,12 +96,14 @@ header rejection (`Connection`, `Transfer-Encoding` are illegal in H3).
 Shares the version-agnostic HTTP-semantics gaps with H1/H2 (chunked
 rejection already done — see rx-path item E). **Effort: M.**
 
-### H3-6 — Multi-buffer RX accumulator (unblocks RSC) — P2
+### H3-6 — Multi-buffer RX accumulator (unblocks RSC) — ✅ done
 
 **What.** Hardware RSC (gVNIC `enable_rsc`) emits multi-buffer coalesced
-super-frames our single-EOP DQO RX drops. Tracked as rx-path item I; it's
-an RX/driver gap, not strictly H3, but it's the prerequisite for the H3
-upload/download throughput win on c3. **Where**: rx-path-optimizations.md.
+super-frames our single-EOP DQO RX used to drop. **Done (T4):** the DQO RX
+path now has a multi-buffer accumulator and `enable_rsc` is set on queue
+creation (`crates/drivers/gve`), so coalesced super-frames are accepted —
+GCE-validated +14–19% upload rx and rx_buf_reposts ~2.5× lower. Tracked as
+rx-path item I. **Where**: rx-path-optimizations.md.
 
 ## Non-goals
 
@@ -116,7 +123,8 @@ upload/download throughput win on c3. **Where**: rx-path-optimizations.md.
 ## References
 
 - [`conformance-roadmap.md`](conformance-roadmap.md) — QUIC transport
-  (9000/9001/9002), incl. the frame-retx + congestion-controller gaps.
+  (9000/9001/9002), incl. the landed congestion controller + STREAM retx
+  and the residual CRYPTO-frame-retx gap.
 - [`http2-backlog.md`](http2-backlog.md) — sibling app layer; HPACK is the
   QPACK cousin, shared Huffman lives between them.
 - [`stack-architecture.md`](stack-architecture.md) — H3's place in the

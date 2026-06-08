@@ -231,12 +231,15 @@ impl Connection {
 
     /// Walk one space's `sent_packets` after an ACK arrives and
     /// drop any that meet the RFC 9002 §6.1 packet- or time-threshold
-    /// loss conditions. We don't yet retransmit the frames that
-    /// were in those packets — handshake- and stream-level retx
-    /// is a follow-up that requires offset tracking through
-    /// `pop_handshake` / `SendStream::pop_chunk`. For now, drop +
-    /// counter is the contract: it gives accurate "in flight"
-    /// numbers and visibility into loss without faking recovery.
+    /// loss conditions. A lost packet's STREAM frames (staged on the
+    /// `SentPacket` at send time) are re-queued into `retx_queue` for
+    /// retransmission (RFC 9000 §13.3) at the end of this function;
+    /// their bytes are released from flight and the congestion window
+    /// is shrunk once per loss episode. CRYPTO/handshake retransmission
+    /// is NOT yet wired here — those rely on the PTO PING forcer in
+    /// `send_pto_probe` (a follow-up would track offsets through
+    /// `pop_handshake`). The per-PN counters give accurate "in flight"
+    /// numbers and loss visibility.
     fn detect_loss(&mut self, level: CryptoLevel) {
         const K_PACKET_THRESHOLD: u64 = 3;
         const K_GRANULARITY_US: u64 = 1_000;

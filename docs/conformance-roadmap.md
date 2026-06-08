@@ -1,8 +1,10 @@
 # Conformance — test strategy + RFC status/roadmap (TCP & QUIC)
 
-Status: in progress (steps 1-4 complete). Last updated 2026-05-31
+Status: in progress (steps 1-5 complete). Last updated 2026-06-07
 (TCP window scaling + ABC shipped — see [`tcp-backlog.md`](tcp-backlog.md);
-QUIC RFC 9002 frame retx + congestion controller still open).
+QUIC RFC 9002 frame retx + congestion controller now landed — the shared
+`net_cc` NewReno controller is wired into QUIC; CRYPTO-frame retx via the
+PTO probe is the one residual).
 
 This doc keeps the conformance-testing **strategy** (the in-process
 harness pattern), the **sequencing**, and the per-RFC **status** view
@@ -70,10 +72,13 @@ Landed:
 - `net_classify` (RX parse) is host-tested via
   `//crates/net:classify_test`.
 
-What remains: QUIC loss recovery + congestion (step 5) and the
+QUIC loss recovery + congestion (step 5) has since landed too — STREAM
+retx, the shared `net_cc` NewReno controller wired into QUIC, and PTO
+backoff (only CRYPTO-frame retx remains). What remains is the
 feature-breadth items (SACK, Timestamps/PAWS, and the Linux
-performance-parity gaps) — steps 6 onward. Window scaling (RFC 7323) is
-done. See [`tcp-backlog.md`](tcp-backlog.md).
+performance-parity gaps) — steps 6 onward — plus delegating TCP onto the
+shared `net_cc` core. Window scaling (RFC 7323) is done. See
+[`tcp-backlog.md`](tcp-backlog.md).
 
 ## Part 1 — Conformance-test strategy
 
@@ -295,12 +300,14 @@ on top (RFC 9114 framing + RFC 9204 QPACK) is tracked in
   `RecvStream::recv_max` / `Connection::data_consumed`; validated by a
   1.5 MiB h3 upload). `quic_test` covers wire formats, frame
   round-trips, packet-number decode, and the MAX_* frame writers.
-- **Missing**: audit needed for **send-side** flow control (honoring
-  the peer's MAX_DATA / MAX_STREAM_DATA when *we* transmit — fine for
-  small responses today, unaudited for large ones), connection
-  migration, and the full transport-parameter set. Lost MAX_* frames
-  aren't retransmitted (shared with the frame-retx gap below); a newer
-  credit supersedes a lost one as consumption advances.
+- **Have (send-side flow control)**: enforced — `conn/tx.rs`'s
+  packetization gates STREAM emission on the peer's `peer_max_data`
+  (conn level) and per-stream `peer_max_stream_data`, so a large
+  response can't outrun the peer's advertised credit.
+- **Missing**: connection migration and the full transport-parameter
+  set. Lost MAX_* frames aren't retransmitted (shared with the
+  frame-retx gap below); a newer credit supersedes a lost one as
+  consumption advances.
 - **Conformance test**: extend `quic_test` with scripted-packet
   cases — the harness already exists; this is additive.
 
@@ -317,33 +324,43 @@ on top (RFC 9114 framing + RFC 9204 QPACK) is tracked in
 ### RFC 9002 — loss detection + congestion control
 
 - **Have**: the data model — `sent_packets`, `SentPacket`
-  (`ack_eliciting` / `in_flight`), the RFC 9002 §5 RTT estimator —
-  plus, as of `conn/loss.rs`, packet- and time-threshold loss
-  detection and the PTO timer (`pto_deadline_us`, raced against a
+  (`ack_eliciting` / `in_flight` / `byte_count`), the RFC 9002 §5 RTT
+  estimator — plus, as of `conn/loss.rs`, packet- and time-threshold
+  loss detection and the PTO timer (`pto_deadline_us`, raced against a
   sleep in `endpoint.rs`'s conn task; `send_pto_probe` emits a PING).
-- **Missing**: frame retransmission — `detect_loss` declares packets
-  lost and drops them, but the lost CRYPTO/STREAM frames are never
-  re-queued (`send_pto_probe` sends a bare PING, not the lost data),
-  so recovery still leans on client retransmits. The blocker is on
-  the send side: `SendStream.send_offset` advances irreversibly as
-  `pop_chunk_into` ships each chunk and the head IOBuf is dropped, so
-  there is no replay-from-offset path to resend a lost STREAM frame.
-  There is no congestion controller — `SentPacket.in_flight` /
-  `byte_count` are recorded but `#[allow(dead_code)]`, reserved for it
-  (`conn/mod.rs`) — and the PTO period has no exponential backoff
-  (`PTO * 2^pto_count`). [`stack-architecture.md`](stack-architecture.md)
-  cites this gap (and the h3 content-length policy) as a correctness
-  item owned here; any `SendStream` redesign there must leave room for
-  replay-from-offset. **Build the controller as the shared TCP+QUIC
-  congestion core**, not QUIC-only: the same CUBIC/BBR + pacer serve
-  TCP's L1/L3 Linux-parity gaps, and TCP's RFC 5681 controller is the
-  reference to extract from — see *Transport reliability* in
-  [`stack-architecture.md`](stack-architecture.md). Conversely QUIC's
-  threshold loss detector is already the RACK model TCP's L4 wants.
+  **STREAM-frame retransmission**: each sealed packet retains a
+  `StreamRetx` copy of its STREAM payload (`SentPacket.stream_frames`);
+  `detect_loss` moves a lost packet's frames to `Connection::retx_queue`
+  and `encode_one_rtt_packet` drains that before fresh data — `pop_chunk`
+  hands out an owned copy precisely so the offset bytes survive for replay
+  (RFC 9000 §13.3). **Congestion control**: the shared `net_cc` NewReno
+  controller (`Connection::cc`) is wired in — `bytes_in_flight` (driven by
+  `record_sent_packet` / `process_ack` / `detect_loss`) gates packetization
+  against `cc.window()`, `on_ack` grows it, `on_loss` halves it once per
+  episode, and the PTO path collapses it on persistent congestion (see
+  Missing). The `SentPacket.in_flight` / `byte_count` fields are now live,
+  not `#[allow(dead_code)]`. **PTO backoff**: `pto_period_us` shifts the
+  base left by `pto_count` (`base << pto_count.min(10)`), so an
+  unresponsive peer probes at a geometrically increasing interval.
+- **Missing**: **CRYPTO-frame retransmission** — `send_pto_probe` still
+  emits a bare PING rather than replaying lost CRYPTO frames, so
+  handshake-loss recovery leans on the peer's PING-elicited ACK (the
+  STREAM half above is done; CRYPTO is the residual). Plus the wider
+  loss-recovery audit items (ECN, the §7.6.1 lost-time-span persistent-
+  congestion test — we trigger collapse off `pto_count` instead).
+  **Note (shared core, QUIC-wired only)**: the controller landed as the
+  **shared TCP+QUIC `net_cc` core** (`crates/net/cc`, the `CongestionControl`
+  trait + NewReno) — but it is wired into **QUIC only** today. TCP still
+  uses its own embedded `cwnd`/`ssthresh`; delegating TCP onto the trait,
+  and the CUBIC/BBR + pacer that serve TCP's L1/L3 Linux-parity gaps, are
+  the remaining work — see *Transport reliability* in
+  [`stack-architecture.md`](stack-architecture.md) and *Performance parity*
+  in [`tcp-backlog.md`](tcp-backlog.md). Conversely QUIC's threshold loss
+  detector + token-bucket pacer are already the reference TCP's L4 wants.
 - **Conformance test**: host-testable directly in `quic_test`; the
-  loss-detection + RTT half already rides the clock seam. What
-  remains is "wire frame retx + a controller onto the existing
-  detection".
+  loss-detection + RTT half already rides the clock seam, and `net_cc`'s
+  NewReno is host-unit-tested in `crates/net/cc`. What remains is scripted
+  retx / cwnd-gate cases on the existing detection.
 
 ## Part 4 — Sequencing
 
@@ -363,9 +380,11 @@ Dependency-ordered. Each step is test-first on the harness.
    — which slotted in alongside.) The cwnd-paced send window —
    windowed `async_try_send_chain` + zero-window persist + TSO
    retransmit coverage — followed and is merged to main.
-5. **QUIC RFC 9002 loss recovery + congestion** — the PTO timer, RTT
-   estimator, and loss detection have landed; what remains is frame
-   retransmission and a congestion controller.
+5. ✅ **QUIC RFC 9002 loss recovery + congestion** — the PTO timer (with
+   exponential backoff), RTT estimator, loss detection, STREAM-frame
+   retransmission, and the shared `net_cc` NewReno congestion controller
+   (cwnd-gated packetization + pacing) have all landed. The one residual
+   is CRYPTO-frame retx via the PTO probe (still a bare PING).
 6. **TCP RFC 7323 (window scaling + timestamps)** — widen `rcv_wnd`,
    negotiate and apply the options, PAWS.
 7. **TCP RFC 2018 (SACK)** — reassembly queue, SACK blocks, RFC 6675
@@ -375,9 +394,11 @@ Dependency-ordered. Each step is test-first on the harness.
 10. **QUIC Interop Runner** — cross-implementation validation, after
     step 5.
 
-Steps 1–4 are complete. Step 5 (QUIC loss recovery + congestion) is
-the remaining headline correctness work; 6–8 are feature breadth;
-9–10 are tooling.
+Steps 1–5 are complete (step 5's residual is CRYPTO-frame retx). Steps
+6–8 are feature breadth; 9–10 are tooling. The remaining headline
+transport work is now the *shared-core* follow-through — delegating TCP
+onto the `net_cc` trait and the CUBIC/BBR + TCP-pacing parity gaps — not
+QUIC loss recovery.
 
 ## Non-goals
 

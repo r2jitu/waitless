@@ -438,11 +438,14 @@ share is planned now. State today:
   `net/tcp/src/state.rs`), not a reusable unit.
 - **QUIC** has the RFC 9002 **loss detector** (packet-threshold + `9/8·RTT`
   time-threshold — i.e. RACK), the RTT estimator, and the PTO timer
-  (`proto/quic/src/conn/loss.rs`), but **no congestion controller at all**. It's
-  scaffolded — every `SentPacket` already carries `in_flight` and `byte_count`
-  fields "reserved for the eventual congestion controller" — and the gap is
-  tracked as RFC 9002 step 5 ([`conformance-roadmap.md`](conformance-roadmap.md)).
-- There is **no shared CC code**; the two crates are independent.
+  (`proto/quic/src/conn/loss.rs`), **plus a wired `net_cc::NewReno` congestion
+  controller** — `on_ack`/`on_loss`/`on_rto` drive `cwnd`, and the cwnd gate is
+  enforced on the send path (`conn/tx.rs`, `conn/loss.rs`). It also re-queues
+  lost STREAM frames for retransmission and runs a timer-driven token-bucket
+  pacer. See [`quic-golden.md`](quic-golden.md) +
+  [`tx-backpressure.md`](tx-backpressure.md) for the landed detail.
+- The CC code now lives in the **shared `net_cc` crate** — but only QUIC drives
+  it today; TCP's controller is still embedded (the extraction is the open work).
 
 Three of the [`tcp-backlog.md`](tcp-backlog.md)
 Linux-parity items (L1 CUBIC/BBR, L3 pacing, L4 RACK-TLP) are the TCP half of
@@ -471,8 +474,10 @@ exactly this work.
 
 - **The pacer (L3).** Both want pacing (QUIC's spec effectively requires it,
   RFC 9002 §7.7; TCP needs it before any initial-window raise — see the IW
-  trade-off). One token-bucket pacer driven by `pacing_rate()` serves both send
-  paths.
+  trade-off). QUIC already has a timer-driven token-bucket pacer at
+  `cc.pacing_rate()` (`conn/tx.rs`; see [`quic-golden.md`](quic-golden.md)); the
+  remaining work is **extracting it** so one shared pacer driven by
+  `pacing_rate()` serves both send paths.
 
 - **Loss detection — the arrow runs QUIC → TCP.** QUIC's `detect_loss`
   (packet/time-threshold) is already a working RACK; TCP's L4 (RACK-TLP) is the
@@ -498,12 +503,13 @@ exactly this work.
 
 ### Sequencing implication
 
-QUIC's congestion controller is an open RFC 9002 item *and* TCP's CUBIC/BBR +
-pacing are pending. **Do them as one shared `congestion` module, not twice.**
-Building the shared controller is also what closes QUIC's own RFC 9002 gap (QUIC
-currently *detects* loss but has no window to shrink), so it serves both stacks
-in one stroke. Gate it behind the `SendProgress` contract (so the CC has a clean
-backpressure signal) and, for the L4 half, behind SACK (T7).
+QUIC already has its NewReno controller wired (RFC 9002 step 5 is closed on the
+QUIC side); TCP's CUBIC/BBR + pacing are still pending, and TCP still hasn't
+delegated to the shared `net_cc`. **Do the remaining CC work as one shared
+module, not twice** — the controller core and trait already exist in `net_cc`;
+what remains is TCP delegating to it and the CUBIC/BBR algorithms. Gate the L1
+work behind the `SendProgress` contract (so the CC has a clean backpressure
+signal) and, for the L4 half, behind SACK (T7).
 
 - **Status**: [~] foundation landed. The shared module exists —
   [`crates/net/cc`](../crates/net/cc) has the `CongestionControl` trait (this
@@ -631,11 +637,12 @@ where it reuses an existing tracker item it names the item.
 
 ## Correctness-adjacent findings (cite/defer, not owned here)
 
-- **QUIC frame retransmit gap** — lost STREAM frames are never re-queued
-  (`SendStream.send_offset` advances irreversibly); recovery relies on the PTO
-  PING + cumulative ACK. A correctness gap → [`conformance-roadmap.md`](conformance-roadmap.md)
-  (QUIC RFC 9002 backlog). Any `SendStream` redesign (contract 1) must leave room
-  for replay-from-offset.
+- **QUIC frame retransmit** — **landed.** `detect_loss` re-queues a lost
+  packet's STREAM frames into `retx_queue` (`conn/loss.rs`), drained before fresh
+  data, and the behavior is regression-tested; see
+  [`quic-golden.md`](quic-golden.md). CRYPTO/handshake retx is still PTO-PING-only
+  (a follow-up → [`conformance-roadmap.md`](conformance-roadmap.md)). Any
+  `SendStream` redesign (contract 1) must preserve the replay-from-offset path.
 - **h3 content-length policy** — see contract 3.
 - **TCP receive-window-update deadlock** on streamed uploads — **fixed in
   `ce562ff`**; preserve the recovery (see the regression hazard in the

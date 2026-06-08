@@ -292,11 +292,16 @@ control barely engages and our no-syscall architecture wins ~2×. On
 high-RTT or lossy paths these gaps bind, and the comparison narrows or
 inverts — Linux's CC/loss-recovery is decades deep.
 
-**Build these as the shared TCP+QUIC congestion core, not twice.** L1
-(CUBIC/BBR) and L3 (pacing) are also what QUIC's unbuilt RFC 9002
-congestion controller needs, and L4 (RACK-TLP) is the loss detector QUIC
-*already* has — so the right move when these come up is to extract one
-controller + pacer both transports drive. The plan lives in
+**The shared TCP+QUIC congestion core now exists (QUIC-wired); the TCP
+half is what remains.** The `CongestionControl` trait + a NewReno
+implementation landed in `crates/net/cc` and are **wired into QUIC** (its
+RFC 9002 controller) — but TCP still runs its own embedded `cwnd`/`ssthresh`
+methods. So the moves here are: (a) delegate TCP onto the shared trait, then
+(b) write L1 (CUBIC/BBR) + L3 (pacing) *once* on it for both transports.
+QUIC already provides the reference for the pieces TCP wants — its
+threshold loss detector is the RACK model L4 needs, and its token-bucket
+pacer (`crates/proto/quic/src/conn/tx.rs`) is prior art for L3 — but neither
+is wired into TCP yet. The plan lives in
 [`stack-architecture.md`](stack-architecture.md) → *Transport reliability
 — one congestion-control / loss-recovery / pacing core*.
 
@@ -312,10 +317,12 @@ Reno's `cwnd ÷ 2` per loss + linear reopen badly underfills a fat pipe;
 CUBIC reopens cubically, BBR ignores loss as a signal entirely. The gap
 widens with bandwidth × RTT.
 
-**Fix.** Extract the shared `CongestionControl` trait (see
-[`stack-architecture.md`](stack-architecture.md) → Transport reliability)
-behind the roadmap's "Lift `tcp` above `executor`" seam, then write CUBIC
-once for both TCP and QUIC; CUBIC is the pragmatic first algorithm.
+**Fix.** The shared `CongestionControl` trait already exists
+(`crates/net/cc`, QUIC-wired — see
+[`stack-architecture.md`](stack-architecture.md) → Transport reliability);
+delegate TCP onto it behind the roadmap's "Lift `tcp` above `executor`"
+seam, then write CUBIC once for both TCP and QUIC. CUBIC is the pragmatic
+first algorithm — it genuinely doesn't exist yet (only NewReno/Reno does).
 **Effort: L.**
 
 ### L2 — Appropriate Byte Counting (ABC, RFC 3465) — ✅ done
@@ -367,7 +374,9 @@ we *don't* raise our IW past 10 (see roadmap / the IW trade-off):
 un-paced, a larger IW is a burst-loss bet against constrained clients.
 
 **Fix.** A per-conn pacing timer / token bucket gating `async_try_send_chain`.
-Pairs with BBR (L1). **Effort: M.**
+QUIC's token-bucket pacer (`crates/proto/quic/src/conn/tx.rs`, driving
+`net_cc`'s `pacing_rate()`) is the prior art to port. Pairs with BBR (L1).
+**Effort: M.**
 
 ### L4 — Loss recovery is RTO + 3-dup-ACK only (no RACK-TLP, no SACK)
 
@@ -382,7 +391,9 @@ re-sends more than the holes. Both punish exactly the small-response
 HTTP pattern this server is built for, on a lossy path.
 
 **Fix.** RACK-TLP needs per-segment send timestamps (the retransmit ring
-can carry them); SACK is T7 (needs the T3 reassembly queue). **Effort: L.**
+can carry them); QUIC's RFC 9002 packet-/time-threshold loss detector
+(`crates/proto/quic/src/conn/loss.rs`) is already the RACK model to mirror.
+SACK is T7 (needs the T3 reassembly queue). **Effort: L.**
 
 ### L5 — No receive/send buffer autotuning
 

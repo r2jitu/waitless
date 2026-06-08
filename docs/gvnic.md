@@ -24,16 +24,19 @@ The two TX paths are **not** at feature parity:
   super-segment per 5-page slot), plus TSO (v4/v6) and UDP-GSO via
   the `GVE_TXD_TSO` + `GVE_TXD_SEG` descriptor pair, plus L4-CSUM
   offload. The device segments super-segments host-side.
-- **DQO_RDA** has direct-fill and TSO; UDP-GSO is still GQI-only.
+- **DQO_RDA** has direct-fill, TSO, and UDP-GSO.
   `acquire_tx_buf` hands the caller the next ring slot's bounce buffer
   to fill in place (no scratch→bounce memcpy); `submit_tx` emits the
   general-context + packet descriptor pair carrying that buffer's raw
   DMA address. `acquire_tx_tso_buf` / `submit_tx_tso` emit a
   TSO-context (dtype 0x5) + general-context + scatter-gather packet
   descriptors so the device segments a super-segment host-side (T3,
-  hardware-validated). `acquire_tx_udp_gso_buf` still returns `None` in
-  DQO mode so the QUIC path falls back to the per-datagram loop (T5).
-  L4-CSUM offload is wired (the `DQO_TX_FLAG_CSUM` bit). The
+  hardware-validated). UDP-GSO rides the same TSO descriptor path:
+  `acquire_tx_udp_gso_buf` returns the DQO TSO slot (`tx.rs:54-63`)
+  and the device segments UDP super-buffers host-side, picking UDP
+  from the IP-protocol byte (T5); GQI / virtio / HVF fall back to the
+  per-datagram loop. L4-CSUM offload is wired (the `DQO_TX_FLAG_CSUM`
+  bit). The
   earlier DQO direct-fill stall was root-caused (RE-on-every-descriptor
   + a TX-completion field-decode bug, both long since fixed in the
   slice path) and direct-fill re-landed reusing that proven emission —
@@ -431,13 +434,16 @@ Status legend: `[ ]` not started · `[~]` partial/landed-but-gated ·
   (repost ratio, p99, clean counters, no catastrophe) are robust.
   *Status:* done on branch `t4-dqo-rsc`, merged to main. ([[reference_gve_rsc_investigation]])
 
-- `[ ]` **T5. DQO UDP-GSO (QUIC/H3 TX).**
-  *What:* mirror GQI's UDP-GSO for DQO (currently the DQO branch is
-  a no-op stub). *Why:* one GSO send vs ~10 per-MSS sends on QUIC/H3
-  bulk — +20–50% on `h3_*`/`udp_peak`. Nothing for TCP/`/health`.
-  *Where:* `tx.rs:51` (`submit_tx_udp_gso` early-returns on DQO),
-  `dqo.rs`. *Verify:* `h3_health_max` / `udp_peak` on c3. *Status:*
-  blocked on T1; GQI is the reference impl.
+- `[x]` **T5. DQO UDP-GSO (QUIC/H3 TX).**
+  *What:* DQO segments UDP super-buffers via the same TSO descriptor
+  path (the device reads TCP vs UDP from the IP-protocol byte), so
+  `acquire_tx_udp_gso_buf` returns the DQO TSO slot and
+  `submit_tx_udp_gso` reuses `submit_tx_tso`; GQI / virtio / HVF fall
+  back to the per-datagram loop. *Why:* one GSO send vs ~10 per-MSS
+  sends on QUIC/H3 bulk. *Where:* `tx.rs:54-63`
+  (`acquire_tx_udp_gso_buf` → `dqo::acquire_tx_tso_buf` on DQO),
+  `lib.rs:704-706` (`udp_gso_available: tx::udp_gso_enabled`).
+  *Status:* done, c3-validated.
 
 ### Tier 3 — lower priority / scoped-small
 

@@ -110,7 +110,13 @@ a 100 MB POST) — the H3 `DATA` reassembly is a separate HTTP/3-layer
 effort (see "HTTP/3 streaming body" under Follow-ups). **Item L**
 does cover the UDP RX path up to that point: it removes the
 *datagram*-delivery copy (NIC → per-bind inbox) that precedes QUIC
-AEAD.
+AEAD. *Update:* the OOM hazard is now partly addressed in the QUIC
+layer — RX reassembly is bounded by the flow-control window
+(reorder bound = `recv_max`; `gap_budget` removed) and streaming
+request/response bodies exist; see
+[`quic-golden.md`](quic-golden.md) /
+[`streaming-response.md`](streaming-response.md). This RX doc still
+owns the TCP/TLS path.
 
 ## Items
 
@@ -375,9 +381,12 @@ AEAD.
   return type changes.
 
 ### I. Multi-buf RX chain accumulation in DQO
-- **Status**: [ ]
-- **Where**: [`crates/drivers/gve/src/dqo.rs:479`](crates/drivers/gve/src/dqo.rs#L479)
-  `poll_qp_inner`.
+- **Status**: [x] **landed as T4** — per-qp `RxCoalescer` /
+  `PENDING_CHAINS` accumulator stitches non-EOP completions into a
+  pending chain, delivers on EOP, ~100 ms stuck-chain timeout
+  (`DQO_RX_PENDING_CHAIN_TIMEOUTS`). See gvnic.md T4.
+- **Where**: [`crates/drivers/gve/src/dqo.rs`](crates/drivers/gve/src/dqo.rs)
+  `poll_qp_inner` + `PENDING_CHAINS`.
 - **What**: build IOBufChain across non-EOP completions; emit
   chain on EOP. Stops dropping non-EOP fragments (the Phase-3
   root cause of the previous session's -99.9% regression on
@@ -397,10 +406,13 @@ AEAD.
   deadline gets flushed correctly.
 
 ### J. Enable HW GRO (RSC) on DQO_RDA queues
-- **Status**: [ ]
-- **Where**: [`crates/drivers/gve/src/init.rs`](crates/drivers/gve/src/init.rs)
-  `build_create_rx_queue_cmd`: add `cmd.set_byte(58, 1)` (the
-  `enable_rsc` byte, currently left 0) for DqoRda.
+- **Status**: [x] **landed as T4** — `enable_rsc` byte set to 1 at
+  cmd-offset 58 in `CREATE_RX_QUEUE` (DQO only); c3-validated
+  +14–19% upload RX, repost ratio ~2.5×, clean counters. See
+  gvnic.md T4.
+- **Where**: [`crates/drivers/gve/src/init.rs:1030`](crates/drivers/gve/src/init.rs#L1030)
+  `build_create_rx_queue_cmd`: `cmd.put_u8(58, 1)` (the
+  `enable_rsc` byte) for DqoRda.
 - **What**: the one-line flip that turns RSC on. Lives in this
   plan because items A–I make it safe (multi-buf delivery
   handled, IOBufs auto-repost, pending-chain timeout prevents
