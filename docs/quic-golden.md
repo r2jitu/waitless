@@ -34,7 +34,11 @@ Profile (/obs delta over the bulk sweep): `datagrams_sent ≈ aead_seal_packets`
 
 ## Findings
 
-### HW UDP-GSO is NOT supported on GCE gVNIC (de-risked on n2/GQI)
+### HW UDP-GSO: unsupported on GQI, SUPPORTED on DQO (corrected — see "GSO/GRO" below)
+> CORRECTION: this de-risk tested GQI and the conclusion was wrongly generalized
+> to all of gve. Per Google's gve CHANGELOG, UDP-GSO is a DQO feature; it works
+> on c3/DQO (validated). The GQI result below stands (GQI genuinely can't).
+
 Enabled the fully-implemented GQI UDP-GSO path and ran h3 bulk: **completed=0**;
 client tcpdump showed **only small control packets (45/87 B), zero ~1171 B
 segmented data** — the device silently drops the UDP-segmentation descriptor
@@ -106,19 +110,31 @@ no wedge)**. QUIC works with the change; arm64 build verified.
 ¹ kvm baseline = same 100 Mbps low-RTT cap (env-agnostic QUIC-layer limiter).
 Single-conn plateaus ~1–1.3 Gbps = the per-packet CPU ceiling on every NIC.
 
-## GSO / GRO — hardware offload is unavailable for QUIC/UDP on our NICs
-- **TX GSO:** GCE gVNIC drops UDP-segmentation descriptors (de-risked above);
-  virtio-net doesn't negotiate USO (VIRTIO_NET_F_HOST_USO, a word-1 feature our
-  driver doesn't read); HVF's userspace proxy can't segment. So HW UDP-GSO is
-  off everywhere — the encoder is retained for any future USO-capable NIC.
-- **RX GRO:** the gve RSC coalescer is TCP-only (no UDP-GRO on gVNIC), same
-  hardware gap as TX. Software RX is already batch-drained (the event loop pulls
-  up to MAX_BATCH=64 datagrams/poll), so the RX side is as coalesced as the HW
-  allows. No further RX-coalescing win is available without HW UDP-GRO.
+## GSO / GRO — DQO supports both; GQI/virtio/HVF do not (CORRECTED)
+Per Google's gve CHANGELOG (v1.4.10): "Enable support for UDP GSO when using
+DQO format" + "Optimize and enable HW GRO for DQO" — **UDP segmentation/
+coalescing is DQO-only**. (An earlier de-risk here tested GQI, which genuinely
+doesn't support it, and wrongly generalized to all of gve — corrected.)
+- **TX GSO on DQO (c3): WORKS, enabled.** The DQO device segments the UDP
+  super-buffer host-side (it picks UDP from the IP proto byte, so the TSO
+  descriptor path applies verbatim). GCE-validated: tcpdump shows the device
+  emitting 1122 B segmented packets (33,992 of them) + the client HW-GRO'ing
+  them back into ~18 KB jumbos; 0 failed. Single-conn /static-1m unchanged
+  (1.25 Gbps — the per-conn ceiling is per-packet crypto/encode, which GSO
+  doesn't touch); aggregate +6–11% from freed descriptor/doorbell CPU (partly
+  spot noise). It's the right architecture + frees CPU under load.
+- **GQI (n2): not supported** (de-risked: h3 bulk completed=0, zero segmented
+  data) → per-datagram path. virtio: no USO negotiated → per-datagram. HVF:
+  proxy → per-datagram. `udp_gso_enabled()` is per-format (DQO-only).
+- **RX GRO:** DQO supports HW UDP RX coalescing (the kvm-vm client demonstrated
+  it — received 18 KB coalesced UDP). Our DQO RX already enables RSC (T4,
+  +14-19% TCP upload). Extending/verifying it for QUIC UDP uploads is a
+  characterized follow-up (downloads — the headline — don't exercise server RX
+  beyond ACKs).
 
-→ The optimal QUIC path on every one of our NICs is the per-packet send + the
-raised pacing cap (delivered + validated). GSO/GRO would help only on a NIC
-that advertises USO/UDP-GRO; the code is in place to use it there.
+→ Optimal path: DQO uses HW UDP-GSO + the raised pacing cap; GQI/virtio/HVF use
+per-datagram + the pacing cap. Single-conn bulk is crypto-bound (~1.2 Gbps) on
+all, so GSO's win is aggregate/CPU, not single-conn.
 
 ## Completion
 - **Optimal path validated in all four scenarios** (c3/DQO, n2/GQI, kvm/virtio,
