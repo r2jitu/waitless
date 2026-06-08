@@ -788,13 +788,14 @@ where
         // After wake we figure out which one fired, since `select`
         // is binary: we know the timer fired, then check now()
         // against each deadline independently.
-        let (idle_us, last_recv_us, pto_deadline, pace_deadline) = {
+        let (idle_us, last_recv_us, pto_deadline, pace_deadline, ack_deadline) = {
             let c = conn.borrow();
             (
                 c.idle_timeout_us(),
                 c.last_recv_us(),
                 c.pto_deadline_us(),
                 c.pace_deadline_us(),
+                c.app_ack_deadline_us(),
             )
         };
         let now = tls::ticket::now_us();
@@ -819,6 +820,11 @@ where
             timer_deadline = timer_deadline.min(p);
         }
         if let Some(p) = pace_deadline {
+            timer_deadline = timer_deadline.min(p);
+        }
+        // Delayed-ACK fallback: flush a lone pending 1-RTT ACK by
+        // `max_ack_delay` if no outbound packet carried it first.
+        if let Some(p) = ack_deadline {
             timer_deadline = timer_deadline.min(p);
         }
         let remaining = timer_deadline.saturating_sub(now).max(1);
@@ -876,6 +882,14 @@ where
                     // The token bucket has refilled — emit the next paced
                     // burst of 1-RTT data (and re-arm `pace_deadline_us` if
                     // more remains).
+                    let _ = conn.borrow_mut().flush(&cfg);
+                    shipped_work = true;
+                }
+                if ack_deadline.is_some_and(|p| after >= p) {
+                    // A pending 1-RTT ACK hit max_ack_delay without an
+                    // outbound packet to piggyback it — flush it now
+                    // (`app_ack_due` is true past the deadline, so this
+                    // emits the standalone ACK).
                     let _ = conn.borrow_mut().flush(&cfg);
                     shipped_work = true;
                 }

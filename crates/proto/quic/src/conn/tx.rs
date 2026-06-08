@@ -32,6 +32,44 @@ use tls::TlsServerConfig;
 /// size and the ≥2-packet GSO gate are both derived from this.
 const PACKET_BODY_BUDGET: usize = 1100;
 
+/// Max time a 1-RTT ACK may be held to piggyback an outbound packet
+/// before it's flushed on its own (RFC 9000 §13.2.1 `max_ack_delay`;
+/// 25 ms is the §18.2 default we assume on the peer side too). The
+/// /health response almost always carries the ACK long before this; the
+/// timer only matters for a lone inbound packet with no reply.
+const ACK_MAX_DELAY_US: u64 = 25_000;
+
+/// Cap on Additional ACK Ranges in one ACK frame (after the First
+/// Range). Bounds the frame size; 8 covers normal reorder/loss. Lower
+/// ranges beyond this are dropped — the peer re-reports them on the
+/// next ACK or retransmits, both safe.
+pub(super) const MAX_ACK_ADDITIONAL: usize = 8;
+
+/// Build the ACK-frame range fields from a received-PN range set
+/// (descending by `hi`, disjoint, non-adjacent — the
+/// [`SpaceState::record_recv_pn`] invariant). Returns
+/// `(largest_acknowledged, first_ack_range, n_additional)` and fills
+/// `additional[..n_additional]` with `(gap, length)` pairs per RFC
+/// 9000 §19.3. `None` when nothing has been received yet.
+pub(super) fn ack_ranges_from(
+    recv_ranges: &[(u64, u64)],
+    additional: &mut [(u64, u64); MAX_ACK_ADDITIONAL],
+) -> Option<(u64, u64, usize)> {
+    let (&(top_lo, top_hi), rest) = recv_ranges.split_first()?;
+    let mut n_add = 0;
+    let mut prev_lo = top_lo;
+    for &(lo, hi) in rest {
+        if n_add >= MAX_ACK_ADDITIONAL {
+            break;
+        }
+        // Disjoint + non-adjacent ⇒ prev_lo - hi >= 2, so Gap >= 0.
+        additional[n_add] = (prev_lo - hi - 2, hi - lo);
+        n_add += 1;
+        prev_lo = lo;
+    }
+    Some((top_hi, top_hi - top_lo, n_add))
+}
+
 /// Floor on the spacing between paced sends, µs — a busy-spin guard so a
 /// near-zero computed wait doesn't spin the conn task. The runtime timer is
 /// µs-resolution (serviced once per event-loop iteration), so this is also
@@ -826,9 +864,21 @@ impl Connection {
         // ACK / PADDING / CONNECTION_CLOSE.
         let mut ack_eliciting = false;
 
-        if self.application_space.ack_pending {
+        // Delayed/piggybacked ACK (RFC 9000 §13.2.1): emit the 1-RTT ACK
+        // only when this packet already carries data (free piggyback —
+        // the /health response carries its request's ACK) or the ACK is
+        // due (≥2 ack-eliciting packets since our last ACK, or
+        // max_ack_delay elapsed). Otherwise leave it pending so it rides
+        // the next outbound packet instead of costing a standalone ACK
+        // packet per inbound datagram. `||` short-circuits so `now_us()`
+        // is read only when not piggybacking.
+        if self.application_space.ack_pending
+            && (self.has_pending_one_rtt_data() || self.app_ack_due(tls::ticket::now_us()))
+        {
             self.append_ack_frame(out, &self.application_space);
             self.application_space.ack_pending = false;
+            self.app_ack_eliciting_since_ack = 0;
+            self.app_first_unacked_us = 0;
         }
         if !self.handshake_done_sent {
             out.push(crate::frame::ftype::HANDSHAKE_DONE);
@@ -1483,19 +1533,55 @@ impl Connection {
     }
 
     pub(super) fn append_ack_frame(&self, frames: &mut Vec<u8>, space: &SpaceState) {
-        let largest = match space.largest_recv_pn {
-            Some(x) => x,
-            None => return,
-        };
-        let mut tmp = [0u8; 32];
+        let mut additional = [(0u64, 0u64); MAX_ACK_ADDITIONAL];
+        let (largest, first_range, n_add) =
+            match ack_ranges_from(&space.recv_ranges, &mut additional) {
+                Some(x) => x,
+                None => return,
+            };
+        let mut tmp = [0u8; 192];
         if let Ok(n) = write_ack(
             largest,
             /* delay */ 0,
-            /* first_range */ 0,
-            &[],
+            first_range,
+            &additional[..n_add],
             &mut tmp,
         ) {
             frames.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    /// Record receipt of an ack-eliciting 1-RTT packet: schedule a 1-RTT
+    /// ACK and advance the delayed-ACK counter (RFC 9000 §13.2.1). The
+    /// ACK is held to piggyback the next outbound packet unless
+    /// [`app_ack_due`](Self::app_ack_due) says it must go on its own.
+    pub(super) fn note_app_ack_eliciting(&mut self) {
+        self.application_space.ack_pending = true;
+        self.app_ack_eliciting_since_ack = self.app_ack_eliciting_since_ack.saturating_add(1);
+        if self.app_first_unacked_us == 0 {
+            self.app_first_unacked_us = self.last_recv_us;
+        }
+    }
+
+    /// Whether a pending 1-RTT ACK must be sent now rather than wait to
+    /// piggyback: ≥2 ack-eliciting packets since our last ACK (RFC 9000
+    /// §13.2.1 — keeps a sender's congestion window clocked) or
+    /// `max_ack_delay` since the first un-ACK'd one.
+    pub(super) fn app_ack_due(&self, now_us: u64) -> bool {
+        self.app_ack_eliciting_since_ack >= 2
+            || (self.app_first_unacked_us != 0
+                && now_us.saturating_sub(self.app_first_unacked_us) >= ACK_MAX_DELAY_US)
+    }
+
+    /// Deadline by which a pending 1-RTT ACK must be flushed even with no
+    /// outbound data to carry it (folded into the conn task's timer so a
+    /// lone ACK isn't delayed past `max_ack_delay`). `None` when none
+    /// pending.
+    pub fn app_ack_deadline_us(&self) -> Option<u64> {
+        if self.application_space.ack_pending && self.app_first_unacked_us != 0 {
+            Some(self.app_first_unacked_us + ACK_MAX_DELAY_US)
+        } else {
+            None
         }
     }
 }

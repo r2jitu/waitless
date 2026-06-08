@@ -238,12 +238,8 @@ impl Connection {
 
         // ACKs for 0-RTT live in the application_space PN ring
         // alongside 1-RTT ACKs (RFC 9000 §17.2.3).
-        self.application_space.largest_recv_pn = Some(
-            self.application_space
-                .largest_recv_pn
-                .map_or(pn, |x| x.max(pn)),
-        );
-        self.application_space.ack_pending = true;
+        self.application_space.record_recv_pn(pn);
+        self.note_app_ack_eliciting();
         crate::quic_event!(
             zero_rtt_accepted,
             "pn={} payload_len={} local_cid={}",
@@ -323,8 +319,7 @@ impl Connection {
         let payload = &buf[payload_start..payload_end];
         self.dispatch_frames(CryptoLevel::Initial, payload)?;
 
-        self.initial_space.largest_recv_pn =
-            Some(self.initial_space.largest_recv_pn.map_or(pn, |x| x.max(pn)));
+        self.initial_space.record_recv_pn(pn);
         self.initial_space.ack_pending = true;
         Ok(total_packet_len)
     }
@@ -390,11 +385,7 @@ impl Connection {
             self.time_of_last_ack_eliciting_us[0] = None;
         }
 
-        self.handshake_space.largest_recv_pn = Some(
-            self.handshake_space
-                .largest_recv_pn
-                .map_or(pn, |x| x.max(pn)),
-        );
+        self.handshake_space.record_recv_pn(pn);
         self.handshake_space.ack_pending = true;
         // RFC 9000 §8.1: a successful Handshake-encrypted packet
         // proves the peer holds the source address (they had to
@@ -548,12 +539,8 @@ impl Connection {
             self.time_of_last_ack_eliciting_us[1] = None;
         }
 
-        self.application_space.largest_recv_pn = Some(
-            self.application_space
-                .largest_recv_pn
-                .map_or(pn, |x| x.max(pn)),
-        );
-        self.application_space.ack_pending = true;
+        self.application_space.record_recv_pn(pn);
+        self.note_app_ack_eliciting();
         Ok(total_packet_len)
     }
 
@@ -771,7 +758,7 @@ impl Connection {
                             // bump below also fires for already-
                             // reaped streams so the peer sees an
                             // ACK and stops retransmitting.
-                            self.application_space.ack_pending = true;
+                            self.note_app_ack_eliciting();
                             payload = &payload[consumed..];
                             continue;
                         }
@@ -896,7 +883,7 @@ impl Connection {
                         // Best-effort STREAM-level ack pending so we
                         // schedule a 1-RTT ACK for it on the next
                         // outbound flush.
-                        self.application_space.ack_pending = true;
+                        self.note_app_ack_eliciting();
                     }
                 }
                 Frame::MaxData { maximum } => {

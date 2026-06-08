@@ -171,6 +171,72 @@ pub(super) struct SpaceState {
     /// walked by loss detection to find packets that fell behind
     /// `largest_acked - kPacketThreshold`.
     pub(super) sent_packets: alloc::collections::BTreeMap<u64, SentPacket>,
+    /// Received packet-number ranges, inclusive `(lo, hi)`, sorted
+    /// **descending** by `hi`, disjoint and non-adjacent. Source of
+    /// truth for [`Connection::append_ack_frame`]'s First/Additional
+    /// ACK Range encoding (RFC 9000 §19.3). In-order receive keeps
+    /// this a single range; only loss/reorder splits it. We never
+    /// trim acknowledged PNs off the bottom (no ACK-of-ACK GC) — the
+    /// lone bottom range's `first_range` just grows as a varint, and
+    /// re-reporting it is idempotent for the peer.
+    pub(super) recv_ranges: Vec<(u64, u64)>,
+}
+
+/// Cap on tracked received-PN ranges per space. Bounds the ACK
+/// frame size and memory under pathological reorder/loss; in-order
+/// traffic uses one range. When exceeded we drop the lowest range —
+/// we simply stop acknowledging those PNs, which is safe (the peer
+/// may retransmit them).
+pub(super) const MAX_RECV_RANGES: usize = 32;
+
+impl SpaceState {
+    /// Record receipt of packet number `pn`: advance `largest_recv_pn`
+    /// and merge `pn` into [`recv_ranges`](Self::recv_ranges) so a
+    /// delayed/coalesced ACK reports every PN received since the last
+    /// one (RFC 9000 §13.2.1). In-order arrival hits the O(1) fast
+    /// path (extend the top range); gaps walk the small range list.
+    pub(super) fn record_recv_pn(&mut self, pn: u64) {
+        self.largest_recv_pn = Some(self.largest_recv_pn.map_or(pn, |x| x.max(pn)));
+        let ranges = &mut self.recv_ranges;
+        // Insertion point: first range whose `hi` is below `pn`
+        // (ranges descending by `hi`). The in-order case breaks at
+        // i == 0 immediately.
+        let mut i = 0;
+        while i < ranges.len() {
+            let (lo, hi) = ranges[i];
+            if pn > hi {
+                break;
+            }
+            if pn >= lo {
+                return; // duplicate — already covered
+            }
+            i += 1;
+        }
+        // `ranges[i-1]` (if any) sits above `pn` (hi >= pn, lo > pn);
+        // `ranges[i]` (if any) sits below (`hi < pn`).
+        let touch_above = i > 0 && ranges[i - 1].0 == pn + 1;
+        let touch_below = i < ranges.len() && ranges[i].1 + 1 == pn;
+        match (touch_above, touch_below) {
+            // `pn` bridges the gap between two ranges → merge them.
+            (true, true) => {
+                ranges[i - 1].0 = ranges[i].0;
+                ranges.remove(i);
+            }
+            (true, false) => ranges[i - 1].0 = pn,
+            (false, true) => ranges[i].1 = pn,
+            (false, false) => {
+                if ranges.len() < MAX_RECV_RANGES {
+                    ranges.insert(i, (pn, pn));
+                } else if i < ranges.len() {
+                    // Table full: drop the lowest range to make room
+                    // for this higher one. (If `pn` is below every
+                    // tracked range we simply drop it — safe.)
+                    ranges.pop();
+                    ranges.insert(i.min(ranges.len()), (pn, pn));
+                }
+            }
+        }
+    }
 }
 
 /// One in-flight send. Stored per-PN per-space until the peer
@@ -585,6 +651,20 @@ pub struct Connection {
     pub(super) handshake_space: SpaceState,
     pub(super) application_space: SpaceState,
 
+    /// Delayed-ACK state for the AppData (1-RTT) space (RFC 9000 §13.2.1).
+    /// We don't emit a standalone ACK-only packet for every received
+    /// 1-RTT packet; instead a pending ACK piggybacks the next outbound
+    /// packet (e.g. a /health response — so its request's ACK costs no
+    /// extra packet), and we only force a standalone ACK once two
+    /// ack-eliciting packets have arrived since our last ACK (keeps an
+    /// uploader's cwnd clocked) or `max_ack_delay` elapses. Count of
+    /// ack-eliciting 1-RTT packets received since our last 1-RTT ACK;
+    /// reset to 0 when we emit one.
+    pub(super) app_ack_eliciting_since_ack: u32,
+    /// Receive time (µs) of the first ack-eliciting 1-RTT packet not yet
+    /// acknowledged (0 = none) — the `max_ack_delay` timer base.
+    pub(super) app_first_unacked_us: u64,
+
     pub(super) tls: QuicTls,
 
     /// Whether we've already emitted HANDSHAKE_DONE in 1-RTT.
@@ -954,6 +1034,8 @@ impl Connection {
             initial_space: SpaceState::default(),
             handshake_space: SpaceState::default(),
             application_space: SpaceState::default(),
+            app_ack_eliciting_since_ack: 0,
+            app_first_unacked_us: 0,
             tls: QuicTls::new(seed),
             handshake_done_sent: false,
             peer_bidi_streams_opened: 0,
@@ -1553,5 +1635,132 @@ pub(super) fn append_max_stream_data_into(
     let n = crate::frame::write_max_stream_data(sid, max, &mut tmp)?;
     out.extend_from_slice(&tmp[..n]);
     Ok(())
+}
+
+#[cfg(test)]
+mod recv_ranges_tests {
+    use super::tx::{MAX_ACK_ADDITIONAL, ack_ranges_from};
+    use super::{MAX_RECV_RANGES, SpaceState};
+    use alloc::vec::Vec;
+
+    fn space_with(pns: &[u64]) -> SpaceState {
+        let mut s = SpaceState::default();
+        for &pn in pns {
+            s.record_recv_pn(pn);
+        }
+        s
+    }
+
+    /// The range list invariant must hold after every insert:
+    /// descending by `hi`, inclusive `lo <= hi`, disjoint and with a
+    /// gap of >= 1 PN between consecutive ranges (non-adjacent).
+    fn assert_invariant(ranges: &[(u64, u64)]) {
+        for &(lo, hi) in ranges {
+            assert!(lo <= hi, "range {lo}..={hi} inverted");
+        }
+        for w in ranges.windows(2) {
+            let (hi_lo, _hi_hi) = w[0];
+            let (_lo_lo, lo_hi) = w[1];
+            assert!(hi_lo > lo_hi + 1, "ranges {:?} adjacent/overlapping", w);
+        }
+    }
+
+    #[test]
+    fn in_order_collapses_to_one_range() {
+        let s = space_with(&[0, 1, 2, 3, 4]);
+        assert_eq!(s.recv_ranges, &[(0, 4)]);
+        assert_eq!(s.largest_recv_pn, Some(4));
+        assert_invariant(&s.recv_ranges);
+    }
+
+    #[test]
+    fn reorder_still_collapses() {
+        let s = space_with(&[3, 1, 0, 2, 4]);
+        assert_eq!(s.recv_ranges, &[(0, 4)]);
+        assert_invariant(&s.recv_ranges);
+    }
+
+    #[test]
+    fn gap_then_fill_merges() {
+        let mut s = space_with(&[0, 1, 3, 4]);
+        assert_eq!(s.recv_ranges, &[(3, 4), (0, 1)]); // descending, gap at 2
+        assert_invariant(&s.recv_ranges);
+        s.record_recv_pn(2); // bridges the gap
+        assert_eq!(s.recv_ranges, &[(0, 4)]);
+    }
+
+    #[test]
+    fn duplicates_are_noops() {
+        let s = space_with(&[5, 5, 5, 6, 5]);
+        assert_eq!(s.recv_ranges, &[(5, 6)]);
+        assert_invariant(&s.recv_ranges);
+    }
+
+    #[test]
+    fn isolated_high_then_lower_keeps_two_ranges() {
+        let mut s = space_with(&[10, 5]);
+        assert_eq!(s.recv_ranges, &[(10, 10), (5, 5)]);
+        s.record_recv_pn(9); // grows top range down
+        assert_eq!(s.recv_ranges, &[(9, 10), (5, 5)]);
+        s.record_recv_pn(6); // grows bottom range up
+        assert_eq!(s.recv_ranges, &[(9, 10), (5, 6)]);
+        assert_invariant(&s.recv_ranges);
+    }
+
+    #[test]
+    fn range_table_is_capped_dropping_lowest() {
+        // Receive every-other PN so each is its own range: 0,2,4,...
+        // Far more than the cap. The list must stay bounded and keep
+        // the highest ranges.
+        let mut s = SpaceState::default();
+        for i in 0..(MAX_RECV_RANGES as u64 + 20) {
+            s.record_recv_pn(i * 2);
+        }
+        assert_eq!(s.recv_ranges.len(), MAX_RECV_RANGES);
+        // Highest range retained; lowest dropped.
+        assert_eq!(s.recv_ranges[0].1, (MAX_RECV_RANGES as u64 + 19) * 2);
+        assert_invariant(&s.recv_ranges);
+    }
+
+    /// End-to-end: the encoded ACK frame must decode back to exactly
+    /// the received ranges (gap math is the subtle part).
+    #[test]
+    fn encode_decode_roundtrip_with_gaps() {
+        // Three disjoint ranges: [0,2], [5,7], [10,12].
+        let s = space_with(&[0, 1, 2, 5, 6, 7, 10, 11, 12]);
+        assert_eq!(s.recv_ranges, &[(10, 12), (5, 7), (0, 2)]);
+
+        let mut additional = [(0u64, 0u64); MAX_ACK_ADDITIONAL];
+        let (largest, first, n_add) =
+            ack_ranges_from(&s.recv_ranges, &mut additional).unwrap();
+        assert_eq!(largest, 12);
+        assert_eq!(first, 2); // 12 - 10
+
+        let mut out = [0u8; 192];
+        let n = crate::frame::write_ack(largest, 0, first, &additional[..n_add], &mut out)
+            .unwrap();
+
+        // Parse it back and reconstruct the (lo, hi) ranges.
+        let frame = crate::frame::parse_frame(&out[..n]).unwrap().0;
+        let (largest_dec, first_dec, ranges_iter) = match frame {
+            crate::frame::Frame::Ack {
+                largest_acknowledged,
+                first_ack_range,
+                ack_ranges,
+                ..
+            } => (largest_acknowledged, first_ack_range, ack_ranges),
+            _ => panic!("not an ACK frame"),
+        };
+        let mut decoded: Vec<(u64, u64)> = Vec::new();
+        let mut hi = largest_dec;
+        let mut lo = hi - first_dec;
+        decoded.push((lo, hi));
+        for (gap, len) in ranges_iter {
+            hi = lo - gap - 2;
+            lo = hi - len;
+            decoded.push((lo, hi));
+        }
+        assert_eq!(decoded, s.recv_ranges);
+    }
 }
 
