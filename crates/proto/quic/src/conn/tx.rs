@@ -39,6 +39,22 @@ const PACKET_BODY_BUDGET: usize = 1100;
 /// timer only matters for a lone inbound packet with no reply.
 const ACK_MAX_DELAY_US: u64 = 25_000;
 
+/// Number of ack-eliciting 1-RTT packets received since our last ACK
+/// before a standalone ACK is forced (RFC 9000 §13.2.1 RECOMMENDS 2 to
+/// clock a bulk sender's congestion window). On the h3 request/response
+/// hot path the ACK should instead piggyback the response — but the
+/// response is produced by a SEPARATE handler task microseconds after the
+/// conn task ingests the request, and with threshold=2 the conn task's
+/// RX-time flush hits `app_ack_due` and ships a STANDALONE ACK before the
+/// handler replies (measured: h3 /health = 1.0 response + 1.0 pure-ACK
+/// packet/req = 2.0 outbound, ~2× h1's per-request packet cost at
+/// saturation). A higher threshold lets the imminent response win the
+/// race and carry the ACK (1 packet/req). `max_ack_delay` (25 ms) remains
+/// the upper bound, and a sustained upload still gets ACKs every
+/// `APP_ACK_ELICIT_THRESHOLD` packets — coarser than 2 but well within
+/// what bulk senders tolerate, and the recv-credit flush carries ACKs too.
+const APP_ACK_ELICIT_THRESHOLD: u32 = 8;
+
 /// Cap on Additional ACK Ranges in one ACK frame (after the First
 /// Range). Bounds the frame size; 8 covers normal reorder/loss. Lower
 /// ranges beyond this are dropped — the peer re-reports them on the
@@ -1682,11 +1698,11 @@ impl Connection {
     }
 
     /// Whether a pending 1-RTT ACK must be sent now rather than wait to
-    /// piggyback: ≥2 ack-eliciting packets since our last ACK (RFC 9000
-    /// §13.2.1 — keeps a sender's congestion window clocked) or
+    /// piggyback: `APP_ACK_ELICIT_THRESHOLD` ack-eliciting packets since
+    /// our last ACK (clocks a bulk sender's congestion window) or
     /// `max_ack_delay` since the first un-ACK'd one.
     pub(super) fn app_ack_due(&self, now_us: u64) -> bool {
-        self.app_ack_eliciting_since_ack >= 2
+        self.app_ack_eliciting_since_ack >= APP_ACK_ELICIT_THRESHOLD
             || (self.app_first_unacked_us != 0
                 && now_us.saturating_sub(self.app_first_unacked_us) >= ACK_MAX_DELAY_US)
     }
