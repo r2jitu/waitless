@@ -41,29 +41,25 @@ pub(crate) fn current_qp() -> Option<usize> {
 /// lands. TODO(productionize): make this per-format runtime detection —
 /// on where the device is verified, off for virtio-without-USO / HVF.
 pub(crate) fn udp_gso_enabled() -> bool {
-    // OFF: GCE gVNIC does not honor the UDP-segmentation descriptor
-    // (de-risked on n2/GQI — h3 bulk completed=0, the client received only
-    // small control packets, zero segmented data; matches upstream Linux
-    // gve not advertising NETIF_F_GSO_UDP_L4). The descriptor path + QUIC
-    // encoder are kept for any USO-capable NIC, but gve falls back to the
-    // per-datagram path. Re-enable per-format only once a device is verified.
-    false
+    // HW UDP segmentation is DQO-ONLY on gVNIC. Per Google's gve CHANGELOG
+    // (v1.4.10: "Enable support for UDP GSO when using DQO format") the
+    // device segments UDP super-packets in DQO mode — it infers TCP vs UDP
+    // from the IP-protocol byte, so the TSO descriptor path applies as-is.
+    // GQI does NOT support it (de-risked on n2/GQI: h3 bulk completed=0,
+    // client saw only control packets) → off there, per-datagram fallback.
+    QUEUE_FORMAT_DQO.load(Ordering::Acquire)
 }
 
 pub(crate) fn acquire_tx_udp_gso_buf() -> Option<nic_api::TxUdpGsoBufHandle> {
-    if !udp_gso_enabled() {
-        return None;
-    }
-    // DQO UDP-GSO is not implemented yet; `submit_tx_udp_gso` below is a
-    // no-op on DQO, so don't hand out a (TSO) big slot that would just be
-    // claimed and dropped. GQI shares the big pool with TSO — same slot
-    // shape, rewrapped as the type-distinct handle so the API surface
-    // routes it through `submit_tx_udp_gso`.
+    let qp = current_qp()?;
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
-        return None;
+        // DQO: the UDP-GSO super-packet rides the same big-pool slot +
+        // (TSO-ctx, general-ctx, SG pkt) descriptor burst as TCP TSO; the
+        // device segments by `gso_size` and picks UDP from the proto byte.
+        return dqo::acquire_tx_tso_buf(qp).map(|t| nic_api::TxUdpGsoBufHandle(t.0));
     }
-    let tso = acquire_tx_tso_buf()?;
-    Some(nic_api::TxUdpGsoBufHandle(tso.0))
+    // GQI: unsupported by the device — caller falls back to per-datagram.
+    None
 }
 
 pub(crate) fn submit_tx_udp_gso(
@@ -74,9 +70,22 @@ pub(crate) fn submit_tx_udp_gso(
     gso_size: u16,
 ) {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
+        // Reuse the DQO TSO submit verbatim — `emit_tso_descs` is L4-
+        // protocol-agnostic (the device reads the proto byte); the UDP
+        // super-buffer drives UDP segmentation. The handle's token is the
+        // shared `encode_tso_token` shape, so rewrapping is sound.
+        dqo::submit_tx_tso(
+            nic_api::TxTsoBufHandle(handle.0),
+            frame_len,
+            hdr_len,
+            csum_start,
+            gso_size,
+        );
         return;
     }
-    gqi::submit_tx_udp_gso_inner(handle, frame_len, hdr_len, csum_start, gso_size);
+    // GQI: unsupported; acquire returns None so this is unreachable, but
+    // drop the handle defensively (frees nothing it didn't claim).
+    drop(handle);
 }
 
 /// Public direct-fill TX entry — picks the calling worker's qp and
