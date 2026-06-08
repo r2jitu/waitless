@@ -298,14 +298,28 @@ impl RecvStream {
                 }
             }
         } else if !data.is_empty() {
-            // Out of order — stash until the gap fills. The bound is
-            // the receive flow-control window (`recv_max`), enforced
-            // in `conn::rx` BEFORE this call: the peer can't send past
-            // the window it was granted, so `gap_buffer` holds at most
-            // one window of out-of-order data. (Re-inserting a
-            // retransmitted out-of-order frame just overwrites its
-            // entry — idempotent.)
-            self.gap_buffer.insert(frame_offset, data.to_vec());
+            // Out of order — stash until the gap fills, bounded by the
+            // receive flow-control window (`recv_max`, enforced in
+            // `conn::rx` BEFORE this call: the peer can't send past its
+            // granted window, so `gap_buffer` holds ≤ one window).
+            //
+            // Keep the LONGEST range staged at a given start offset. A
+            // re-fragmented retransmit can deliver a SHORTER frame at
+            // the same offset; blindly overwriting a longer staged
+            // entry would drop its tail — and `conn::rx` already
+            // advanced `recv_high` past that tail and ACK'd the packet,
+            // so the peer never resends it (unfillable hole → handler
+            // wedge, the same dropped-but-acked class as the old fixed
+            // gap cap). Stream bytes are immutable per offset, so the
+            // longer entry is always a superset — keeping it is never
+            // lossy; an equal/shorter duplicate is a no-op.
+            let keep = match self.gap_buffer.get(&frame_offset) {
+                Some(existing) => existing.len() < data.len(),
+                None => true,
+            };
+            if keep {
+                self.gap_buffer.insert(frame_offset, data.to_vec());
+            }
         }
         if fin {
             self.record_fin(frame_offset + data.len() as u64);
@@ -609,6 +623,28 @@ mod tests {
         let (n, _) = s.drain(&mut out);
         assert_eq!(n, 32 * 1024, "all 32 KiB present — nothing dropped");
         assert!(out[..n].iter().all(|&b| b == 0xAB));
+    }
+
+    /// Regression: a shorter re-fragmented retransmit at the SAME start
+    /// offset as a longer staged out-of-order frame must NOT evict the
+    /// longer entry's tail. `conn::rx` has already counted that tail in
+    /// `recv_high` and ACK'd its packet, so dropping it leaves an
+    /// unfillable hole (the dropped-but-acked wedge). `ingest` keeps the
+    /// longest range at a given offset.
+    #[test]
+    fn recv_overlapping_shorter_frame_keeps_longer() {
+        let mut s = RecvStream::default();
+        // Stage [10, 60) out of order (50 bytes).
+        assert!(!s.ingest(10, &[0xAA; 50], false));
+        // A shorter retransmit at the same offset [10, 30) arrives later.
+        assert!(!s.ingest(10, &[0xAA; 20], false));
+        // Fill the head gap [0, 10) → everything folds in.
+        assert!(s.ingest(0, &[0xBB; 10], false));
+        let mut out = [0u8; 128];
+        let (n, _) = s.drain(&mut out);
+        assert_eq!(n, 60, "head 10 + full 50-byte staged range; tail not dropped");
+        assert!(out[..10].iter().all(|&b| b == 0xBB));
+        assert!(out[10..60].iter().all(|&b| b == 0xAA));
     }
 
     #[test]
