@@ -1085,27 +1085,32 @@ impl Connection {
 
         // Drain any 1-RTT-level handshake bytes (NewSessionTicket
         // emitted right after ClientFinished verifies; future
-        // KeyUpdate / NewToken).
-        let mut one_rtt_crypto = [0u8; 1024];
-        let crypto_n = self
-            .tls
-            .pop_handshake(CryptoLevel::OneRtt, &mut one_rtt_crypto);
-        if crypto_n > 0 {
-            let offset = self.one_rtt_crypto_offset;
+        // KeyUpdate / NewToken). Gate on a cheap non-consuming check so
+        // the steady state (no 1-RTT crypto pending — the case on every
+        // post-handshake response packet) skips the 1 KiB stack zero +
+        // the pop call entirely.
+        if self.tls.has_pending_one_rtt_crypto() {
+            let mut one_rtt_crypto = [0u8; 1024];
+            let crypto_n = self
+                .tls
+                .pop_handshake(CryptoLevel::OneRtt, &mut one_rtt_crypto);
+            if crypto_n > 0 {
+                let offset = self.one_rtt_crypto_offset;
             let max_size = crypto_n + 16;
             let start = out.len();
             out.resize(start + max_size, 0);
             let n = write_crypto(offset, &one_rtt_crypto[..crypto_n], &mut out[start..])
                 .map_err(|_| ConnError::Wire)?;
             out.truncate(start + n);
-            self.one_rtt_crypto_offset += crypto_n as u64;
-            ack_eliciting = true;
-            crate::quic_event!(
-                tickets_emitted,
-                "size={} local_cid={}",
-                crypto_n,
-                crate::endpoint::hex8(self.local_cid.as_slice())
-            );
+                self.one_rtt_crypto_offset += crypto_n as u64;
+                ack_eliciting = true;
+                crate::quic_event!(
+                    tickets_emitted,
+                    "size={} local_cid={}",
+                    crypto_n,
+                    crate::endpoint::hex8(self.local_cid.as_slice())
+                );
+            }
         }
 
         // Drain STREAM data into `out` — retransmissions first, then
