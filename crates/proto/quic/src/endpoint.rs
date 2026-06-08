@@ -220,19 +220,12 @@ impl QuicConn {
                 let mut c = self.conn.borrow_mut();
                 let (n, eof) = c.stream_recv(sid, out);
                 if n > 0 || eof {
-                    // Consuming recv data may have reopened the flow-control
-                    // window — flush the replenished MAX_STREAM_DATA/MAX_DATA
-                    // so a flow-control-blocked uploader gets credit without
-                    // waiting for an inbound packet it won't send (the RX
-                    // analog of `send_owned`'s post-queue flush; without it
-                    // an upload past one window deadlocks).
-                    let credit = n > 0 && c.recv_credit_due();
-                    if credit {
-                        let _ = c.flush(&self.cfg);
-                    }
                     drop(c);
-                    if credit {
-                        self.drain_outbound();
+                    // Consuming recv data may have reopened the window —
+                    // flush replenished credit so a blocked uploader can
+                    // proceed (see `flush_recv_credit`).
+                    if n > 0 {
+                        self.flush_recv_credit();
                     }
                     return (n, eof);
                 }
@@ -263,13 +256,9 @@ impl QuicConn {
                 let mut c = self.conn.borrow_mut();
                 let (n, eof) = c.stream_recv(sid, out);
                 if n > 0 || eof {
-                    let credit = n > 0 && c.recv_credit_due();
-                    if credit {
-                        let _ = c.flush(&self.cfg);
-                    }
                     drop(c);
-                    if credit {
-                        self.drain_outbound();
+                    if n > 0 {
+                        self.flush_recv_credit();
                     }
                     return (n, eof);
                 }
@@ -322,6 +311,11 @@ impl QuicConn {
     /// in `recv_streams[sid].buffer` forever.
     pub fn discard_recv(&self, sid: u64) {
         self.conn.borrow_mut().discard_recv(sid);
+        // Discarding advances the consumed offset, which can reopen the
+        // flow-control window — flush the replenished credit so a chatty
+        // long-lived peer uni stream (QPACK encoder/decoder) doesn't
+        // stall at the window edge waiting for an inbound packet.
+        self.flush_recv_credit();
     }
 
     /// Mark stream `sid` as closed (FIN). The next outbound STREAM
@@ -374,6 +368,28 @@ impl QuicConn {
                 }
             }
             self.progress.wait().await;
+        }
+    }
+
+    /// After the app consumes (or discards) recv bytes, flush any
+    /// replenished MAX_STREAM_DATA / MAX_DATA to the wire if the consume
+    /// reopened the flow-control window. Without this, a peer that has
+    /// exhausted its window sends nothing further (no inbound packet to
+    /// piggyback the credit on), so an upload past one window — or a
+    /// long-lived peer uni stream (QPACK) at the window edge — deadlocks.
+    /// The RX analog of `send_owned`'s post-queue flush. Self-gating via
+    /// `recv_credit_due`, so it's cheap to call unconditionally.
+    fn flush_recv_credit(&self) {
+        let due = {
+            let mut c = self.conn.borrow_mut();
+            let due = c.recv_credit_due();
+            if due {
+                let _ = c.flush(&self.cfg);
+            }
+            due
+        };
+        if due {
+            self.drain_outbound();
         }
     }
 
@@ -860,6 +876,13 @@ where
                         };
                         ship_datagram(&sock, &conn, peer_ip.get(), peer_port.get(), pkt);
                     }
+                    // Wake any handler parked in `stream_drain_below`: the
+                    // paced flush may have drained its send buffer below the
+                    // cap, and — unlike the inbound path — no datagram
+                    // arrived to signal progress. Without this the streaming
+                    // handler resumes only at ACK cadence, not pacer
+                    // cadence, throttling h3 streaming to the ACK rate.
+                    progress.set();
                 }
                 continue;
             }
