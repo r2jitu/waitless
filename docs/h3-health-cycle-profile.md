@@ -119,3 +119,44 @@ server design would land at the same number. (The architecture IS heavier than
 h1's inline path, but that weight isn't what caps this benchmark.) To raise the
 number you must lower per-request *latency* (RTT/transport) or offer more clean
 concurrency than a single QUIC-generating loadgen can.
+
+## ROOT CAUSE of the h1/h2-vs-h3 gap: per-request latency, not CPU
+
+Two more experiments closed it out:
+
+- **Client scaling (loadgen-limited?):** scaled the client 8→16→20 cores (1→3
+  c3/n2 loadgen VMs). h3 /health plateaued at ~245-250 K with server busy
+  *pinned* at ~76-79% at every level (512 conns made it worse). **Not
+  loadgen-limited; not CPU-saturated.**
+- **Hop elimination (the cross-task hop?):** a throwaway that drives the h3
+  handler future *inline* in the conn task (no spawn, no `progress`-event wake
+  — `tasks_polled` confirmed the hop was gone). GCE: **236.6 K vs 233 K
+  baseline — unchanged.** So the conn_task↔handler hop is **not** it either.
+
+The decider was measuring **server busy% for both protocols at par=64**:
+
+| | rps | server busy | implied latency (conns/rps) |
+|---|---|---|---|
+| **h1** | 420,917 | **66.0%** | ~152 µs |
+| **h3** | 235,713 | **69.2%** | ~271 µs |
+
+**Neither protocol is CPU-bound — both sit at ~66-69% busy.** So /health is
+**latency-bound** (closed-loop: throughput = concurrency ÷ per-request-latency),
+and **h3's per-request latency (~271 µs) is ~1.8× h1's (~152 µs) — exactly the
+throughput ratio.** That is the root cause: the gap is **latency, not
+throughput/CPU capacity.** Every CPU lever (micro-opts, fast-path pipeline
+removal, hop elimination, more loadgens) failed because the cores are already
+~30% idle waiting on the closed-loop round trip — there is no CPU to reclaim.
+
+h3's extra ~120 µs of latency splits roughly in half:
+- **Server-side (~50 µs):** the QUIC RX→TX path is ~64 µs (`request_latency_us`
+  P50) vs h1's small inline cost — QUIC per-packet decrypt/HP/ACK/flow-control
+  + the **listener→conn-task inbox demux** (`inbox_wait` ~32 µs), where h1's
+  `serve_conn` reads its TCP stream directly in one task.
+- **Client/transport-side (~70 µs):** the QUIC *client* (loadgen) is heavier
+  per request than a TCP client, and the UDP datagram path differs.
+
+So even a perfect (0 µs) server would only close ~half the gap (→ ~290 K); the
+rest is the QUIC client + transport, which the server cannot fix. The h3 stack
+is near its floor for this closed-loop, single-small-response benchmark; the
+gap to h1/h2 is intrinsic to QUIC's per-request latency, not a server defect.
