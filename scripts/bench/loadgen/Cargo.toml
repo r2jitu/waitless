@@ -23,6 +23,9 @@ quinn = { version = "0.11", default-features = false, features = ["rustls-ring",
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http = "1"
+# Request-body buffer type for the h3 `send_data` path (`h3-echo` /
+# `h3-upload`); h3-quinn's send stream takes `bytes::Bytes`.
+bytes = "1"
 # HTTP/2 client for the `http --proto h2` keep-alive workload. The
 # low-level hyperium `h2` crate (mirrors the low-level `h3` crate
 # already used here) over a tokio-rustls TLS stream that negotiates

@@ -16,7 +16,9 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 mod gateway;
+mod h3_echo;
 mod h3_health;
+mod h3_upload;
 mod http_close;
 mod http_load;
 mod http_upload;
@@ -155,6 +157,52 @@ enum Workload {
         #[arg(long, default_value = "4")]
         parallelism: usize,
     },
+    /// HTTP/3 bidirectional (RX+TX) echo throughput. Each worker
+    /// opens its own QUIC connection and loops: POST `--body-bytes`
+    /// to `/echo`, then read the full echoed response body back.
+    /// Exercises BOTH directions per round-trip (QUIC RX reassembly
+    /// of the upload + AEAD/encode/UDP-emit of the echo); a length
+    /// mismatch or read error counts as a failure. Balanced twin of
+    /// `h3-upload` (send-only) and `h3-health` (recv-only GET).
+    H3Echo {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        port: u16,
+        #[arg(long, default_value = "/echo")]
+        endpoint: String,
+        #[arg(long, default_value = "5")]
+        duration_secs: u64,
+        #[arg(long, default_value = "1")]
+        warmup_secs: u64,
+        #[arg(long, default_value = "4")]
+        parallelism: usize,
+        /// Request body size in bytes (echoed back by the server).
+        #[arg(long, default_value = "65536")]
+        body_bytes: usize,
+    },
+    /// HTTP/3 upload-isolated (server-RX) throughput. Same POST as
+    /// `h3-echo` but the rate reflects send-completion (request body
+    /// fully written + FIN) — the response is drained-and-discarded
+    /// after the latency is recorded, so the numbers isolate the
+    /// QUIC RX / upload direction with minimal response handling.
+    H3Upload {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        port: u16,
+        #[arg(long, default_value = "/echo")]
+        endpoint: String,
+        #[arg(long, default_value = "5")]
+        duration_secs: u64,
+        #[arg(long, default_value = "1")]
+        warmup_secs: u64,
+        #[arg(long, default_value = "4")]
+        parallelism: usize,
+        /// Request body size in bytes uploaded to the server.
+        #[arg(long, default_value = "65536")]
+        body_bytes: usize,
+    },
     /// Unified keep-alive HTTP GET throughput across protocol
     /// versions — the keep-alive analogue of `wrk` (h1) and
     /// `h3-health` (h3), plus HTTP/2. `--proto h1|h2|h3` selects the
@@ -280,6 +328,40 @@ fn main() -> std::io::Result<()> {
             Duration::from_secs(duration_secs),
             Duration::from_secs(warmup_secs),
             parallelism,
+        )),
+        Workload::H3Echo {
+            host,
+            port,
+            endpoint,
+            duration_secs,
+            warmup_secs,
+            parallelism,
+            body_bytes,
+        } => runtime.block_on(h3_echo::run(
+            &host,
+            port,
+            &endpoint,
+            Duration::from_secs(duration_secs),
+            Duration::from_secs(warmup_secs),
+            parallelism,
+            body_bytes,
+        )),
+        Workload::H3Upload {
+            host,
+            port,
+            endpoint,
+            duration_secs,
+            warmup_secs,
+            parallelism,
+            body_bytes,
+        } => runtime.block_on(h3_upload::run(
+            &host,
+            port,
+            &endpoint,
+            Duration::from_secs(duration_secs),
+            Duration::from_secs(warmup_secs),
+            parallelism,
+            body_bytes,
         )),
         Workload::HttpClose {
             host,
