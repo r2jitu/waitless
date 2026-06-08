@@ -1251,6 +1251,9 @@ impl Connection {
             }
         }
         self.data_sent = self.data_sent.saturating_add(data_sent_delta);
+        // Diagnostic: did this packet carry any STREAM frame (retx or fresh)?
+        // Captured before `pkt_frames` is moved below.
+        let wrote_stream = !pkt_frames.is_empty();
         // Stage the frames this packet carried so `record_sent_packet`
         // can retain them for retransmission.
         if !pkt_frames.is_empty() {
@@ -1300,6 +1303,17 @@ impl Connection {
             &send_keys,
             false,
         )?;
+        // Diagnostic classification of the emitted 1-RTT packet (h3
+        // /health pkts/req probe): pure-ACK (no ack-eliciting frame) vs
+        // carries-no-STREAM (ACK + control only, e.g. a standalone
+        // MAX_STREAMS). Lets the /obs delta split the 2.0 outbound
+        // pkts/req into response vs ack/control.
+        if !ack_eliciting {
+            crate::diag::COUNTERS.pkts_ack_only.bump();
+        }
+        if !wrote_stream {
+            crate::diag::COUNTERS.pkts_no_stream.bump();
+        }
         self.record_sent_packet(CryptoLevel::OneRtt, pn, ack_eliciting, byte_count);
         Ok(())
     }

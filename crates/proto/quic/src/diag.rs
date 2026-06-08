@@ -373,6 +373,15 @@ pub struct Counters {
     pub aead_seal_bytes: Counter,
     /// Number of packets that went through the AEAD seal.
     pub aead_seal_packets: Counter,
+    /// Of the sealed 1-RTT packets, how many were NOT ack-eliciting —
+    /// i.e. pure ACK / PADDING packets (no STREAM/CRYPTO/MAX_*). A high
+    /// per-request count means standalone ACKs aren't piggybacking the
+    /// response. Temporary diagnostic for the h3 /health pkts/req probe.
+    pub pkts_ack_only: Counter,
+    /// Of the sealed 1-RTT packets, how many carried NO STREAM frame
+    /// (ACK + control only — e.g. a standalone MAX_STREAMS/MAX_DATA). Pairs
+    /// with `pkts_ack_only` to split "pure ACK" from "ack+control" packets.
+    pub pkts_no_stream: Counter,
     /// Cumulative AEAD-opened bytes on inbound packets. Same
     /// semantics as `aead_seal_bytes` for the RX direction.
     pub aead_open_bytes: Counter,
@@ -441,6 +450,8 @@ impl Counters {
             anti_amp_throttled: Counter::new(),
             aead_seal_bytes: Counter::new(),
             aead_seal_packets: Counter::new(),
+            pkts_ack_only: Counter::new(),
+            pkts_no_stream: Counter::new(),
             aead_open_bytes: Counter::new(),
             aead_open_packets: Counter::new(),
         }
@@ -845,7 +856,7 @@ pub fn should_log_event() -> bool {
 /// Snapshot of every drop / event counter, for `/quic_stats`-style
 /// dumps. Returns `(name, value)` pairs in declaration order,
 /// including the four AEAD throughput counters.
-pub fn snapshot() -> [(&'static str, u64); 58] {
+pub fn snapshot() -> [(&'static str, u64); 60] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.get()),
@@ -913,6 +924,8 @@ pub fn snapshot() -> [(&'static str, u64); 58] {
         ("anti_amp_throttled", c.anti_amp_throttled.get()),
         ("aead_seal_bytes", c.aead_seal_bytes.get()),
         ("aead_seal_packets", c.aead_seal_packets.get()),
+        ("pkts_ack_only", c.pkts_ack_only.get()),
+        ("pkts_no_stream", c.pkts_no_stream.get()),
         ("aead_open_bytes", c.aead_open_bytes.get()),
         ("aead_open_packets", c.aead_open_packets.get()),
     ]
