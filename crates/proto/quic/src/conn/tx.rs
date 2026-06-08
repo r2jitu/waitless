@@ -304,11 +304,7 @@ impl Connection {
         // the response, would otherwise build-then-discard an empty
         // datagram. `has_one_rtt_to_send` is the exact complement of
         // `encode_one_rtt_packet`'s emission branches.
-        if matches!(self.state, ConnState::Established)
-            && self.initial_keys_discarded
-            && self.handshake_keys_discarded
-            && !self.has_one_rtt_to_send()
-        {
+        if self.flush_outbound_is_noop() {
             return Ok(());
         }
 
@@ -595,6 +591,24 @@ impl Connection {
         // 1-RTT CRYPTO (NewSessionTicket / KeyUpdate) and STREAM data
         // (fresh + retransmit + pending FIN).
         self.tls.has_pending_one_rtt_crypto() || self.has_pending_one_rtt_data()
+    }
+
+    /// True when `flush_outbound` would produce nothing: an established
+    /// conn (both lower PN spaces discarded) with no close pending and
+    /// nothing 1-RTT to send. Used both as `flush_outbound`'s early-out
+    /// AND to skip the per-inbound-datagram flush call entirely (the
+    /// delayed-ACK leaves the common /health request's
+    /// `process_datagram` flush a no-op — ~1.5 such calls/req that each
+    /// otherwise re-run `apply_peer_flow_control` + the full
+    /// `has_one_rtt_to_send` scan before bailing). Single source of
+    /// truth so the caller-side skip and the in-flush early-out can't
+    /// drift.
+    pub(super) fn flush_outbound_is_noop(&self) -> bool {
+        self.close_pending.is_none()
+            && matches!(self.state, ConnState::Established)
+            && self.initial_keys_discarded
+            && self.handshake_keys_discarded
+            && !self.has_one_rtt_to_send()
     }
 
     fn has_pending_one_rtt_data(&self) -> bool {

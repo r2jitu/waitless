@@ -112,8 +112,15 @@ impl Connection {
         crate::diag::COUNTERS
             .process_rx_cycles
             .add(crate::diag::now_cycles().wrapping_sub(rx_start));
-        crate::diag::COUNTERS.flush_calls.bump();
-        self.flush_outbound(config)?;
+        // Skip the per-datagram flush entirely when it would be a no-op
+        // (established, nothing 1-RTT pending — the common case after the
+        // delayed ACK leaves a /health request's flush empty). Avoids
+        // ~1.5 flush_outbound entries/req, each otherwise re-running
+        // apply_peer_flow_control + the full has_one_rtt_to_send scan.
+        if !self.flush_outbound_is_noop() {
+            crate::diag::COUNTERS.flush_calls.bump();
+            self.flush_outbound(config)?;
+        }
         self.reap_finished_streams();
         crate::diag::COUNTERS.datagrams_processed.bump();
         Ok(())
