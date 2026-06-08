@@ -221,10 +221,41 @@ TX-GSO finding (no single-conn win; QUIC crypto is per-packet). So the
 RX path is left as-is: already zero-copy (items A–L), TCP-RSC-enabled,
 and now reassembly-correct + AEAD-open-bound at ~1 Gb/s/conn.
 
+## G4 — small-resp h3 gap: response-packet coalescing (DONE, branch `quic-crypto-batch`)
+
+The "crypto batching" framing was a red herring: the keyed AEAD/HP ciphers
+are already cached per-`DirKeys` (no per-packet key expansion), and TLS h1/h2
+prove the AEAD primitive is fast. Profiling h3 /health (c3/DQO, c64) found the
+real cost — **packets per request, not per-packet crypto cost**:
+
+| proto | /health rps (c64) | vs h1 |
+|---|---|---|
+| h1.1 | ~419 K | 1.00× |
+| h2 | ~387 K | 0.92× |
+| h3 (before) | ~174 K | 0.41× |
+| **h3 (after G4)** | **~223 K** | **0.53×** |
+
+`/obs` showed a buffered h3 response cost **5.0 sealed packets + 5.0 flushes +
+5.0 datagrams per request** (vs ~1 TLS record for h1/h2) — because
+`write_response` emitted HEADERS, DATA, and FIN as three separate
+flush-and-drain calls, and the encoder popped only one stream chunk per
+packet. Fix (2 commits): a non-flushing `QuicConn::queue_iobuf` so the
+response queues HEADERS+DATA+FIN before a single `close_stream` flush, plus
+draining multiple queued chunks per stream into each packet. Result: the
+response coalesces to **one packet**, per-request packets/seals/flushes
+**5.0 → 2.5**, h3 /health **+28%** (174 K → 223 K). `/static-64k` neutral
+(bandwidth-bound); the `res.write` streaming path keeps per-write flush for
+backpressure. Residual h3<h1 gap is now the irreducible per-packet AEAD+HP
+(QUIC is per-packet where TCP+TLS amortizes over larger records) + the ~2
+inbound-ACK packets/req — folding the ACK into the response packet (defer the
+post-process_datagram flush until after the inline handler) is the next lever,
+but it's delicate ACK-timing work.
+
 ## Characterized future work (profile-justified, not core to this goal)
-- Small-resp /health gap (~5 sealed pkts/req vs TCP's 1): ACK/response coalescing
-  (~1.3×, delicate ACK timing) + the fundamental per-packet AEAD+HP crypto tax.
-  This is the per-packet CPU ceiling that caps single-conn bulk at ~1.2 Gbps.
+- Remaining small-resp h3 gap: the per-packet AEAD+HP crypto tax (QUIC is
+  intrinsically per-packet) + the ~2 ACK packets/req. ACK-into-response
+  coalescing is the next lever (delicate ACK timing). This per-packet cost is
+  also the ceiling that caps single-conn bulk at ~1.2 Gbps.
 - **Server-RX HW UDP-GRO on DQO**: investigated + ruled out (see
   "HW UDP-RX-GRO" above) — no gve knob exists (RSC is TCP-only, verified
   against the upstream driver) and the per-datagram NIC portion it could
