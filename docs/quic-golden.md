@@ -324,6 +324,22 @@ Throughput flat within spot noise — expected, since the cap is latency, not
 CPU. The fix is a real per-request CPU/density win, not a /health throughput
 lever.
 
+**Per-IP connection cap — fixed for NAT / max-concurrency (commit `5137066`),
+but NOT the throughput limiter.** The per-source-IP slot cap (was 64/worker)
+charged *all* connections, so a single public IP — every client behind a NAT /
+CGNAT / VPN egress shares one — was capped at ~64/worker × cores live conns,
+rejecting real users while the table sat empty. Fixed by scoping the cap to
+*unvalidated (half-open)* conns only: once a conn completes QUIC address
+validation (`path_validated`), `SlotTable::mark_validated` drops it from the
+per-IP count, so validated conns are bounded only by the global per-worker
+budget (raised 1024→8192, grow-on-demand). Half-open per-IP cap 64→256.
+**GCE-validated: correct (h3 upload + handshakes `failed=0`), but it did NOT
+raise the /health ceiling** — with one IP's conns admitted past the old cap,
+2-loadgen 256-conn = 231K / 512-conn = 210K, server busy *falling* 74%→71%→68%
+as conns rise (more parked time, not more work). Confirms the cap wasn't the
+bottleneck; the latency bound is. Kept as a real NAT-robustness / max-
+concurrency-design fix, not a throughput lever.
+
 **The actual parity lever (deferred — structural, needs explicit go-ahead):**
 cut the per-request **cross-task latency**. The 48% residual + the latency
 bound both point at the conn-task→h3-handler-task→conn-task hops. Serving a
