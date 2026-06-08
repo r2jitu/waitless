@@ -51,8 +51,8 @@ use alloc::vec::Vec;
 /// starts crediting the peer this many bytes; the limit then slides
 /// forward as the app consumes (MAX_STREAM_DATA emission in
 /// `Connection::encode_app_packet`). Must stay in sync with the
-/// transport-param defaults — both are 256 KiB.
-pub(crate) const INITIAL_MAX_STREAM_DATA: u64 = 256 << 10;
+/// transport-param defaults — both are 2 MiB.
+pub(crate) const INITIAL_MAX_STREAM_DATA: u64 = 2 << 20;
 
 /// QUIC stream type bits (RFC 9000 §2.1).
 pub mod stream_type {

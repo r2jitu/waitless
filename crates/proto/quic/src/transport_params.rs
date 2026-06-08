@@ -56,8 +56,9 @@ pub mod tp_id {
 // Outbound builder — server transport parameters
 // ============================================================================
 
-/// Values the server announces. Defaults match what HTTP/3 needs
-/// for a small request/response: 256 KiB per stream, 1 MiB per
+/// Values the server announces. Defaults size the initial receive
+/// window so a typical upload fits without mid-transfer
+/// MAX_STREAM_DATA replenishment: 2 MiB per stream, 8 MiB per
 /// connection, up to 100 concurrent bidi streams. Override via the
 /// public fields before calling `encode`.
 pub struct ServerParams<'a> {
@@ -81,10 +82,10 @@ impl<'a> ServerParams<'a> {
         ServerParams {
             original_destination_connection_id: odcid,
             initial_source_connection_id: iscid,
-            initial_max_data: 1 << 20,                      // 1 MiB
-            initial_max_stream_data_bidi_local: 256 << 10,  // 256 KiB
-            initial_max_stream_data_bidi_remote: 256 << 10, // 256 KiB
-            initial_max_stream_data_uni: 256 << 10,         // 256 KiB
+            initial_max_data: 8 << 20,                    // 8 MiB
+            initial_max_stream_data_bidi_local: 2 << 20,  // 2 MiB
+            initial_max_stream_data_bidi_remote: 2 << 20, // 2 MiB
+            initial_max_stream_data_uni: 2 << 20,         // 2 MiB
             // Initial bidi-stream credit. The peer can open this
             // many bidirectional streams before they MUST stop and
             // wait for a MAX_STREAMS frame from us. We replenish
@@ -274,8 +275,8 @@ mod tests {
             parsed.initial_source_connection_id.as_deref(),
             Some(&iscid[..])
         );
-        assert_eq!(parsed.initial_max_data, 1 << 20);
-        assert_eq!(parsed.initial_max_stream_data_bidi_remote, 256 << 10);
+        assert_eq!(parsed.initial_max_data, 8 << 20);
+        assert_eq!(parsed.initial_max_stream_data_bidi_remote, 2 << 20);
         assert_eq!(parsed.initial_max_streams_bidi, 1024);
         assert_eq!(parsed.max_idle_timeout_ms, 30_000);
     }

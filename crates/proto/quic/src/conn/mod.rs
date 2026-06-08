@@ -968,8 +968,8 @@ impl Connection {
             peer_max_streams_uni_advertised: 1024,
             data_consumed: 0,
             // Must match `transport_params::ServerParams::defaults`'s
-            // initial_max_data (1 MiB) — the initial conn-level window.
-            max_data_advertised: 1 << 20,
+            // initial_max_data (8 MiB) — the initial conn-level window.
+            max_data_advertised: 8 << 20,
             data_received: 0,
             force_max_data: false,
             force_max_stream_data: false,
@@ -1388,6 +1388,32 @@ impl Connection {
         } else {
             Some(self.opened_streams.remove(0))
         }
+    }
+
+    /// True if consuming recv data has reopened the flow-control window
+    /// enough that a MAX_STREAM_DATA / MAX_DATA frame is now due — i.e.
+    /// the same replenishment thresholds `encode_one_rtt_packet` applies.
+    /// The handler's recv path flushes when this flips so a
+    /// flow-control-blocked uploader gets fresh credit promptly. Without
+    /// it the credit waits for the next inbound packet — which a fully
+    /// blocked peer won't send — so an upload past one window deadlocks.
+    pub(crate) fn recv_credit_due(&self) -> bool {
+        if self.force_max_stream_data || self.force_max_data {
+            return true;
+        }
+        // Mirror the encode's window constants (tx.rs).
+        const STREAM_DATA_WINDOW: u64 = crate::streams::INITIAL_MAX_STREAM_DATA;
+        const MAX_DATA_WINDOW: u64 = 8 << 20;
+        if self
+            .max_data_advertised
+            .saturating_sub(self.data_consumed)
+            <= MAX_DATA_WINDOW / 2
+        {
+            return true;
+        }
+        self.recv_streams.values().any(|rs| {
+            !rs.is_closed() && rs.recv_max.saturating_sub(rs.consumed()) <= STREAM_DATA_WINDOW / 2
+        })
     }
 
     /// Read up to `out.len()` bytes from the head of stream `sid`'s

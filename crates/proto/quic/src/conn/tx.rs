@@ -834,7 +834,7 @@ impl Connection {
         // without a MAX_* frame per packet.
         //
         // MAX_DATA: conn-level ceiling above all per-stream limits.
-        const MAX_DATA_WINDOW: u64 = 1 << 20; // 1 MiB, matches initial_max_data
+        const MAX_DATA_WINDOW: u64 = 8 << 20; // matches initial_max_data
         let max_data_threshold =
             self.max_data_advertised.saturating_sub(self.data_consumed) <= MAX_DATA_WINDOW / 2;
         // Emit on the half-window threshold, or when the peer signalled
@@ -857,7 +857,7 @@ impl Connection {
         // streams (the peer won't send more) and stop once the packet
         // is near full — any stream that misses out this round gets its
         // credit on the next flush.
-        const STREAM_DATA_WINDOW: u64 = crate::streams::INITIAL_MAX_STREAM_DATA; // 256 KiB
+        const STREAM_DATA_WINDOW: u64 = crate::streams::INITIAL_MAX_STREAM_DATA; // 2 MiB
         // STREAM_DATA_BLOCKED doesn't name the stream in our skip path,
         // so re-advertise every open recv stream — re-sending an
         // unchanged MAX_STREAM_DATA is idempotent.

@@ -220,6 +220,20 @@ impl QuicConn {
                 let mut c = self.conn.borrow_mut();
                 let (n, eof) = c.stream_recv(sid, out);
                 if n > 0 || eof {
+                    // Consuming recv data may have reopened the flow-control
+                    // window — flush the replenished MAX_STREAM_DATA/MAX_DATA
+                    // so a flow-control-blocked uploader gets credit without
+                    // waiting for an inbound packet it won't send (the RX
+                    // analog of `send_owned`'s post-queue flush; without it
+                    // an upload past one window deadlocks).
+                    let credit = n > 0 && c.recv_credit_due();
+                    if credit {
+                        let _ = c.flush(&self.cfg);
+                    }
+                    drop(c);
+                    if credit {
+                        self.drain_outbound();
+                    }
                     return (n, eof);
                 }
                 if matches!(c.state(), ConnState::Failed) {
@@ -249,6 +263,14 @@ impl QuicConn {
                 let mut c = self.conn.borrow_mut();
                 let (n, eof) = c.stream_recv(sid, out);
                 if n > 0 || eof {
+                    let credit = n > 0 && c.recv_credit_due();
+                    if credit {
+                        let _ = c.flush(&self.cfg);
+                    }
+                    drop(c);
+                    if credit {
+                        self.drain_outbound();
+                    }
                     return (n, eof);
                 }
                 if matches!(c.state(), ConnState::Failed) {
