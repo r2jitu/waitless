@@ -254,7 +254,21 @@ impl Connection {
 
     // ── TLS state machine drive + outbound flush ────────────────
 
-    pub(super) fn flush_outbound(&mut self, _config: &TlsServerConfig) -> Result<(), ConnError> {
+    /// Cycle-bracketed wrapper over [`flush_outbound_inner`]. The inner
+    /// function is the orchestrator; this just records the TX-phase CPU
+    /// (frame assembly + AEAD-seal + HP add + packet build) into
+    /// `flush_tx_cycles` on every path. Called from `process_datagram`,
+    /// `QuicConn::send*`, and the conn-task timer.
+    pub(super) fn flush_outbound(&mut self, config: &TlsServerConfig) -> Result<(), ConnError> {
+        let tx_start = crate::diag::now_cycles();
+        let r = self.flush_outbound_inner(config);
+        crate::diag::COUNTERS
+            .flush_tx_cycles
+            .add(crate::diag::now_cycles().wrapping_sub(tx_start));
+        r
+    }
+
+    fn flush_outbound_inner(&mut self, _config: &TlsServerConfig) -> Result<(), ConnError> {
         use executor::reactor::MAX_L2_HEADROOM;
 
         // Make sure the peer's send-side flow-control limits are applied

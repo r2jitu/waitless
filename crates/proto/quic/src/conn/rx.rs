@@ -47,6 +47,10 @@ impl Connection {
         if matches!(self.state, ConnState::Failed) {
             return Ok(());
         }
+        // RX-phase cycle bracket (decrypt + dispatch + advance_tls).
+        // Closed just before flush_outbound, which is bracketed
+        // separately as flush_tx_cycles, so the two don't overlap.
+        let rx_start = crate::diag::now_cycles();
         // Refresh the idle-timeout deadline. Any received datagram
         // counts — even one we'll fail to decrypt below — because
         // the peer is clearly still trying. RFC 9000 §10.1 only
@@ -105,6 +109,9 @@ impl Connection {
         // Drive the TLS state machine + queue outbound after
         // consuming all packets in the datagram.
         self.advance_tls(config)?;
+        crate::diag::COUNTERS
+            .process_rx_cycles
+            .add(crate::diag::now_cycles().wrapping_sub(rx_start));
         crate::diag::COUNTERS.flush_calls.bump();
         self.flush_outbound(config)?;
         self.reap_finished_streams();

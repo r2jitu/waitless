@@ -43,6 +43,38 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use obs::{Counter, LastEvent, LatencyHist, ObsRecord};
 
+/// Monotonic cycle counter for the per-phase CPU brackets
+/// (`process_rx_cycles` / `flush_tx_cycles`). TSC on x86_64, CNTVCT_EL0
+/// on arm64 — real cycles on GCE, 24 MHz ticks on native arm64 (ratios
+/// only). Mirrors `http::server::now_cycles`; QUIC sits above
+/// `kernel_core` only via the reactor, so we read the counter inline
+/// rather than thread a dependency.
+#[inline(always)]
+pub fn now_cycles() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let lo: u32;
+        let hi: u32;
+        core::arch::asm!(
+            "rdtsc",
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+        ((hi as u64) << 32) | (lo as u64)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let v: u64;
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack));
+        v
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        0
+    }
+}
+
 /// One counter per drop / event reason. Cheap to read in bulk for a
 /// stats dump, cheap to increment on the hot path.
 ///
@@ -280,6 +312,19 @@ pub struct Counters {
     /// and recv-stream state in `LAST_BUG`.
     pub handler_stuck: Counter,
 
+    // ── Per-phase cycle brackets (CPU decomposition) ─────────────
+    /// Cumulative cycles spent in `process_datagram` — inbound HP
+    /// removal + AEAD-open + frame dispatch + RecvStream feed (the
+    /// RX half of the QUIC hot path). TSC on x86 / CNTVCT ticks on
+    /// arm64. Pair with `datagrams_processed` for cycles/datagram;
+    /// subtract from `runtime.runtime_cycles` to isolate the
+    /// executor + handler residual. See `scripts/profile_obs.py`.
+    pub process_rx_cycles: Counter,
+    /// Cumulative cycles spent in `flush_outbound` — frame assembly +
+    /// AEAD-seal + HP add + packet build (the TX half). Pair with
+    /// `flush_calls`.
+    pub flush_tx_cycles: Counter,
+
     // ── Flush / datagram throughput ──────────────────────────────
     /// One call to `flush_outbound`. Bumps from both
     /// `process_datagram` (once per inbound datagram) and
@@ -363,6 +408,8 @@ impl Counters {
             conn_task_exit_process_error: Counter::new(),
             conn_task_exit_conn_failed: Counter::new(),
             handler_stuck: Counter::new(),
+            process_rx_cycles: Counter::new(),
+            flush_tx_cycles: Counter::new(),
             flush_calls: Counter::new(),
             datagrams_sent: Counter::new(),
             datagrams_processed: Counter::new(),
@@ -773,7 +820,7 @@ pub fn should_log_event() -> bool {
 /// Snapshot of every drop / event counter, for `/quic_stats`-style
 /// dumps. Returns `(name, value)` pairs in declaration order,
 /// including the four AEAD throughput counters.
-pub fn snapshot() -> [(&'static str, u64); 50] {
+pub fn snapshot() -> [(&'static str, u64); 52] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.get()),
@@ -827,6 +874,8 @@ pub fn snapshot() -> [(&'static str, u64); 50] {
             c.conn_task_exit_conn_failed.get(),
         ),
         ("handler_stuck", c.handler_stuck.get()),
+        ("process_rx_cycles", c.process_rx_cycles.get()),
+        ("flush_tx_cycles", c.flush_tx_cycles.get()),
         ("flush_calls", c.flush_calls.get()),
         ("datagrams_sent", c.datagrams_sent.get()),
         ("datagrams_processed", c.datagrams_processed.get()),
