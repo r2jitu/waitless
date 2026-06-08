@@ -268,19 +268,34 @@ stitched output is NIST-KAT- + cross-checked against RustCrypto).
 
 **Residual / next levers.** The remaining h3<h1 gap is per-packet overhead
 (QUIC seals/HP per packet where TCP+TLS amortizes over larger records) plus
-the ~2 inbound-ACK packets/req. Two open levers: (a) fold the ACK into the
-response packet (defer the post-`process_datagram` flush until after the
-inline handler — delicate ACK timing); (b) **VAES/AVX-512** AES-GCM (4 AES
-blocks/instruction on ZMM, up to ~3.8× over AES-NI, ~0.16 c/B theoretical —
-Intel ISA-L, Go #42726) to push the stitched crate further on bulk. Both are
-larger efforts; the current state already closes the crypto asymmetry and the
-small-resp packet-count gap.
+the ~2 inbound-ACK packets/req. Lever (a) — **fold the ACK into the response
+packet** — was implemented (commit `d7a8dcc`, "delayed/piggybacked 1-RTT ACK
++ multi-range ACK frames") and **settles the packet-count question**: a
+delayed ACK (RFC 9000 §13.2.1; piggyback, with a >=2-packet + 25 ms
+`max_ack_delay` safety net) plus proper multi-range ACK encoding (§19.3 — so
+deferral doesn't under-acknowledge an upload) cut h3 /health outbound
+**packets/req 2.5 -> 2.0** (hard `/obs` counter). But throughput moved only
+**223K -> 231K rps — within the GCE spot noise floor**, i.e. throughput-neutral,
+and 1 MiB echo uploads stayed `failed=0` with no retransmit storm. **So
+packets/req is NOT the h3 /health throughput bottleneck** — 20% fewer packets
+bought ~0% throughput. The residual h3<h2 gap (231K vs 387K) is therefore
+diffuse QUIC transport cost (per-packet AEAD+HP, the UDP datagram path, QUIC
+FC accounting), not a single fixable lever — matching the analogous "diffuse,
+below the noise floor" findings for the TLS and h1-vs-h2 gaps. The delayed/
+range ACK is kept for correctness (proper §19.3 ranges) + the real 20%
+packet/CPU reduction, not as a throughput win. Remaining lever: (b)
+**VAES/AVX-512** AES-GCM (4 AES blocks/instruction on ZMM, up to ~3.8× over
+AES-NI — Intel ISA-L, Go #42726) for bulk; blocked on enabling AVX-512 XSAVE
+state in the kernel boot path (`limine_entry.rs` XCR0 mask) — a larger effort,
+and bulk is already egress-bandwidth-capped so the ROI is unclear.
 
 ## Characterized future work (profile-justified, not core to this goal)
-- Remaining small-resp h3 gap: the per-packet AEAD+HP crypto tax (QUIC is
-  intrinsically per-packet) + the ~2 ACK packets/req. ACK-into-response
-  coalescing is the next lever (delicate ACK timing). This per-packet cost is
-  also the ceiling that caps single-conn bulk at ~1.2 Gbps.
+- Remaining small-resp h3 gap: PROVEN (commit `d7a8dcc`, `/obs` packets/req
+  delta) to be diffuse QUIC transport cost, not packet count — cutting
+  packets/req 2.5->2.0 was throughput-neutral within noise. No single lever
+  remains; closing it needs a structural change to the per-request QUIC path
+  (per-packet crypto, UDP datagram emit, FC accounting), profiled first. This
+  per-packet cost is also the ceiling that caps single-conn bulk at ~1.2 Gbps.
 - **Server-RX HW UDP-GRO on DQO**: investigated + ruled out (see
   "HW UDP-RX-GRO" above) — no gve knob exists (RSC is TCP-only, verified
   against the upstream driver) and the per-datagram NIC portion it could

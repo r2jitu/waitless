@@ -27,7 +27,8 @@
 //   * Handshake-packet decode + reply (ACKs)
 //   * Client Finished verification → Established
 //   * HANDSHAKE_DONE emission in 1-RTT
-//   * Single-range ACK frame per outbound packet
+//   * Delayed/piggybacked 1-RTT ACK (RFC 9000 §13.2.1) carrying
+//     multi-range ACK frames built from a received-PN range set
 //   * Coalesced packets (Initial+Handshake in one datagram —
 //     standard rustls / quinn client behavior)
 //
