@@ -92,3 +92,30 @@ shows the executor is already efficient (2.45 polls/req, 1.0 conn-iter/req) and
 the hop is ~10-15 µs. #3 is the same restructure as the pending `net_egress`
 per-core-TX-queue work. Both: large + invariant-breaking for a profile-bounded
 upside. Net: per-request micro-opts banked; architectural levers left open.
+
+## Decisive prototype — "is the architecture the limiter?" → NO
+
+Hypothesis: the layered h3 pipeline (handler task + QPACK + `Request`/`Response`
++ streams) is overly complicated and that's what caps throughput. Test: a
+throwaway flag (`H3_HEALTH_FAST_PATH`, reverted) that answers an h3 request
+with a fixed /health 200 **inline in the accept loop**, skipping the recv
+read-loop + QPACK-decode + `Request`/`Response` + routing + the generic
+handler — i.e. collapsing the whole http3 per-request pipeline (it keeps only
+QUIC RX-decrypt → `write_response` QPACK-encode/framing → SendStream → seal →
+ship, plus the conn_task↔handler hop).
+
+Result: kvm cyc/req confirmed the bypass (`qpack_decode` → 0, `serve` → 0,
+runtime ~50-58K → **44.8K**, ~15-20% less server CPU/req). But **GCE c3/gve
+throughput was UNCHANGED: 231.3 K median (228.9/231.3/232.1) vs the 233.1 K
+baseline** — identical within noise, despite ~20% less server CPU.
+
+**Conclusion: the architecture's per-request complexity is NOT the throughput
+limiter.** Removing ~all of it bought 0 throughput. The ~233 K h3 /health
+ceiling is set by **closed-loop latency (network RTT ~280 µs) × connection
+count, co-limited by the QUIC-client (loadgen) cost** — not server CPU or
+pipeline depth. This is *why* every CPU micro-opt was throughput-neutral: there
+is no server-CPU headroom to reclaim because CPU is not the bind. A simpler
+server design would land at the same number. (The architecture IS heavier than
+h1's inline path, but that weight isn't what caps this benchmark.) To raise the
+number you must lower per-request *latency* (RTT/transport) or offer more clean
+concurrency than a single QUIC-generating loadgen can.
