@@ -241,8 +241,17 @@ impl Connection {
         const K_PACKET_THRESHOLD: u64 = 3;
         const K_GRANULARITY_US: u64 = 1_000;
         // Peer's default max_ack_delay (RFC 9000 §18.2). Added to the time
-        // threshold below.
+        // threshold below — but ONLY for the Application Data space (RFC
+        // 9002 §6.1.2): a peer must not delay ACKs of Initial / Handshake
+        // packets, so including it there would over-extend the threshold
+        // and delay real handshake-loss recovery. We use the RFC default
+        // 25 ms; the peer's advertised value isn't parsed (it would only
+        // lower this, and a compliant peer never delays beyond it).
         const MAX_ACK_DELAY_US: u64 = 25_000;
+        let ack_delay_us = match level {
+            CryptoLevel::OneRtt => MAX_ACK_DELAY_US,
+            CryptoLevel::Initial | CryptoLevel::Handshake => 0,
+        };
         // Cache `max_rtt` and `now` before borrowing through SpaceState.
         // Both `latest_rtt_us` and `smoothed_rtt_us` live on Connection.
         let max_rtt = self
@@ -258,7 +267,7 @@ impl Connection {
         // (~27 % of a clean transfer at 24 ms RTT), collapsing cwnd to the
         // floor — the h3 real-RTT throughput bug. At low RTT the term is
         // irrelevant (packet-threshold dominates; ACKs return in µs).
-        let time_threshold_us = ((max_rtt * 9) / 8).max(K_GRANULARITY_US) + MAX_ACK_DELAY_US;
+        let time_threshold_us = ((max_rtt * 9) / 8).max(K_GRANULARITY_US) + ack_delay_us;
         let now = tls::ticket::now_us();
 
         let space = match level {
