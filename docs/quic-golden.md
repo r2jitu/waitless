@@ -289,13 +289,57 @@ AES-NI — Intel ISA-L, Go #42726) for bulk; blocked on enabling AVX-512 XSAVE
 state in the kernel boot path (`limine_entry.rs` XCR0 mask) — a larger effort,
 and bulk is already egress-bandwidth-capped so the ROI is unclear.
 
+## h3 /health bottleneck — profiled to root cause (branch `quic-h3-health-profile`)
+
+Added per-phase cycle brackets to the QUIC hot path (`process_rx_cycles`,
+`flush_tx_cycles`; commit `02daacb`) and decomposed h3 /health on c3/DQO via
+`/obs` deltas + a 2-loadgen rig (kvm-vm + waitless-peer-nginx):
+
+- **Server-bound at ~230K rps, NOT loadgen-bound.** A single 8-core loadgen
+  saturates at ~235K generating QUIC (92% busy) — so the naive "h3 224K vs h1
+  419K" looked like a loadgen artifact. But **two loadgens sum to the SAME
+  ~236K** (128 conns) and 256 conns also ~230K: adding client capacity doesn't
+  raise it ⇒ the server is the bottleneck.
+- **Latency-bound (Little's Law), not CPU-bound.** At the cap all 4 cores are
+  balanced at **~74% busy with ~26% idle that won't fill**, and throughput is
+  flat from 128→256 conns while P99 grows 486µs→1515µs. QUIC is per-core
+  shared-nothing (per-worker `SlotTable`+inboxes, no global lock — endpoint.rs),
+  so this is per-connection *service latency* capping each closed-loop conn's
+  request rate, not a lock or aggregate CPU.
+- **Per-request CPU split (cyc, % of busy): NIC 12% / quic process_rx 13% /
+  quic flush_tx 27% / h3+executor+stream+ship residual 48%.** Crypto is minor;
+  the cost is per-request *orchestration*, dominated by the cross-task hops
+  (conn task → per-stream h3 handler task → conn task) on the critical path.
+
+**Fix landed on the branch (commit `dcf2cbd`): skip the no-op flush.** Since
+the delayed ACK holds the request's ACK to piggyback the response, the
+post-`process_datagram` flush usually emits nothing yet still heap-allocated a
+~1500 B datagram + ran the full encode scan. Added an established-steady-state
+fast path (`has_one_rtt_to_send`, the exact complement of
+`encode_one_rtt_packet`'s 8 emission branches; gated on Established + both
+lower spaces discarded) that returns before the buffer acquire. Result
+(c3/DQO): **flush_tx 12.9K → 7.8K cyc/req (−40%)**, flush_tx share 27%→25%;
+h3 1 MiB upload `failed=0` (predicate correct, no stall); h1 unaffected.
+Throughput flat within spot noise — expected, since the cap is latency, not
+CPU. The fix is a real per-request CPU/density win, not a /health throughput
+lever.
+
+**The actual parity lever (deferred — structural, needs explicit go-ahead):**
+cut the per-request **cross-task latency**. The 48% residual + the latency
+bound both point at the conn-task→h3-handler-task→conn-task hops. Serving a
+synchronously-ready h3 response (e.g. bodyless GET /health) inline in the conn
+task — instead of waking a per-stream handler task — would shorten the
+critical path and raise the latency-bound ceiling, but it must preserve the
+head-of-line-blocking fix (task #30) for handlers that genuinely await. Larger
++ riskier than a micro-opt; profile-justified but out of scope here.
+
 ## Characterized future work (profile-justified, not core to this goal)
-- Remaining small-resp h3 gap: PROVEN (commit `d7a8dcc`, `/obs` packets/req
-  delta) to be diffuse QUIC transport cost, not packet count — cutting
-  packets/req 2.5->2.0 was throughput-neutral within noise. No single lever
-  remains; closing it needs a structural change to the per-request QUIC path
-  (per-packet crypto, UDP datagram emit, FC accounting), profiled first. This
-  per-packet cost is also the ceiling that caps single-conn bulk at ~1.2 Gbps.
+- Remaining small-resp h3 gap: PROVEN (commits `d7a8dcc` packets/req delta +
+  `dcf2cbd`/`02daacb` cycle profile) to be **latency-bound per-request
+  orchestration** (cross-task hops), not packet count or crypto. Packet/CPU
+  micro-opts are density wins, throughput-neutral within noise. The throughput
+  lever is the inline-dispatch critical-path change above. This per-packet cost
+  is also the ceiling that caps single-conn bulk at ~1.2 Gbps.
 - **Server-RX HW UDP-GRO on DQO**: investigated + ruled out (see
   "HW UDP-RX-GRO" above) — no gve knob exists (RSC is TCP-only, verified
   against the upstream driver) and the per-datagram NIC portion it could
