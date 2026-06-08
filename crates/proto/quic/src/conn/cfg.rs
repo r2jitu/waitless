@@ -479,6 +479,61 @@ fn pure_fin_emitted_at_flow_control_boundary() {
     );
 }
 
+/// Regression: a single ACK that declares MORE than the old fixed
+/// 64-PN scratch capacity worth of losses must recover ALL of them. A
+/// large cumulative-ACK jump after a burst (the gve-storm case) used to
+/// strand the excess in `sent_packets` — pinning `bytes_in_flight` so
+/// the cwnd gate never reopened, and never re-queuing their STREAM
+/// frames until a later ACK / PTO. The lost-PN list is now an unbounded
+/// Vec.
+#[test]
+fn detect_loss_recovers_more_than_64_at_once() {
+    let mut conn = Connection::new_server(ConnectionId::new(&[0xab; 8]), [0x42u8; 32]);
+    // 70 ack-eliciting 1-RTT packets, each carrying a 100-byte STREAM frame.
+    for pn in 0..70u64 {
+        conn.pending_sent_stream_frames = alloc::vec![super::StreamRetx {
+            sid: 0,
+            offset: pn * 100,
+            fin: false,
+            data: alloc::vec![0u8; 100],
+        }];
+        conn.record_sent_packet(crate::CryptoLevel::OneRtt, pn, true, 100);
+    }
+    assert_eq!(conn.application_space.sent_packets.len(), 70);
+    assert_eq!(conn.bytes_in_flight, 7000);
+    // ACK only PN 69 (first range covers [69,69], no additional ranges).
+    let mut ackbuf = [0u8; 16];
+    let n = crate::frame::write_ack(69, 0, 0, &[], &mut ackbuf).unwrap();
+    let (frame, _) = crate::frame::parse_frame(&ackbuf[..n]).unwrap();
+    let crate::frame::Frame::Ack {
+        largest_acknowledged,
+        ack_delay,
+        first_ack_range,
+        ack_ranges,
+        ..
+    } = frame
+    else {
+        panic!("expected ACK frame");
+    };
+    conn.process_ack(
+        crate::CryptoLevel::OneRtt,
+        largest_acknowledged,
+        ack_delay,
+        first_ack_range,
+        ack_ranges,
+    );
+    // PNs 0..=66 cross the packet threshold (pn + 3 <= 69) → all 67 lost;
+    // PN 69 acked; 67 and 68 stay in flight. With the old 64 cap, 3 of the
+    // 67 losses were stranded (sent_packets would be 5, retx_queue 64).
+    assert_eq!(
+        conn.application_space.sent_packets.len(),
+        2,
+        "all >64 losses declared (none stranded)"
+    );
+    assert_eq!(conn.bytes_in_flight, 200, "only PN 67,68 still in flight");
+    assert_eq!(conn.retx_queue.len(), 67, "every lost STREAM frame requeued");
+}
+
 /// PTO exponential backoff (RFC 9002 §6.2.1): the probe period doubles
 /// per `pto_count` and the exponent is capped so an unresponsive peer
 /// probes at a geometric (not fixed) interval. A missing backoff is what

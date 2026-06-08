@@ -256,39 +256,36 @@ impl Connection {
             None => return,
         };
 
-        // Stack-array scratch for the lost-PN list — typical case
-        // is 0 lost; even under heavy loss, more than ~32 packets
-        // declared lost in a single ACK is unusual. Avoiding the
-        // Vec::new() allocations on the common (no loss) path
-        // saves two allocs per ACK processed, and ACKs fire
-        // multiple times per HTTP/3 response.
-        const SCRATCH_CAP: usize = 64;
-        let mut lost_buf: [u64; SCRATCH_CAP] = [0; SCRATCH_CAP];
+        // Lost-PN list. A Vec, not a fixed scratch array, so ALL packets
+        // declared lost in a single ACK are recovered: a large
+        // cumulative-ACK jump after a burst (the gve-storm case) can
+        // declare hundreds lost at once, and any left unprocessed would
+        // stay in `sent_packets` — pinning `bytes_in_flight` so the cwnd
+        // gate never reopens, and never re-queuing their STREAM frames
+        // until a later ACK / PTO — stalling the transfer exactly under
+        // the heavy loss this path exists to handle. `Vec::new()` doesn't
+        // allocate until the first push, so the common (no-loss) ACK —
+        // the vast majority — stays alloc-free.
+        let mut lost_buf: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
         let mut lost_threshold_n: usize = 0;
         let mut lost_time_n: usize = 0;
         // In-flight (unacked) sent-packet count at entry — sizes the
         // cascade for the `last_loss` diagnostic snapshot below.
         let inflight_pkts = space.sent_packets.len() as u64;
-        // Walk in PN order. Threshold-lost PNs come first
-        // (lowest PNs). Time-lost can appear after them. We pack
-        // both into the same buffer with threshold first;
-        // counters track how many of each.
+        // Walk in PN order. Threshold-lost PNs (lowest) naturally come
+        // first; time-lost can appear after. Counters track how many of
+        // each (for the diag); the list itself stays in PN order.
         for (&pn, pkt) in space.sent_packets.iter() {
             if pn >= largest_acked {
                 break; // PN >= largest_acked are still in-flight
             }
             if pn + K_PACKET_THRESHOLD <= largest_acked {
-                if lost_threshold_n + lost_time_n < SCRATCH_CAP {
-                    lost_buf[lost_threshold_n + lost_time_n] = pn;
-                    lost_threshold_n += 1;
-                }
+                lost_buf.push(pn);
+                lost_threshold_n += 1;
                 continue;
             }
-            if max_rtt > 0
-                && now.saturating_sub(pkt.time_sent_us) > time_threshold_us
-                && lost_threshold_n + lost_time_n < SCRATCH_CAP
-            {
-                lost_buf[lost_threshold_n + lost_time_n] = pn;
+            if max_rtt > 0 && now.saturating_sub(pkt.time_sent_us) > time_threshold_us {
+                lost_buf.push(pn);
                 lost_time_n += 1;
             }
         }
@@ -302,7 +299,7 @@ impl Connection {
         // an age well below one RTT means its ACK is still in flight =
         // a spurious threshold declaration.
         let mut min_lost_age_us: u64 = 0;
-        for (i, &pn) in lost_buf[..total_lost].iter().enumerate() {
+        for (i, &pn) in lost_buf.iter().enumerate() {
             if let Some(mut pkt) = space.sent_packets.remove(&pn) {
                 if i == 0 {
                     min_lost_age_us = now.saturating_sub(pkt.time_sent_us);
