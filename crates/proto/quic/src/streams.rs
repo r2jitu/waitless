@@ -20,11 +20,16 @@
 //   * Server-initiated streams (ID & 0b11 == 0b01 / 0b11) — H3
 //     control + QPACK streams the server opens. Created via
 //     `open_uni`.
-//   * In-order STREAM data only. Out-of-order arrival WITHIN a
-//     stream is rare with curl/quinn (loss → retransmit at the
-//     same offset) but not impossible; we buffer frames whose
-//     offset > current recv offset until the gap fills. Cap at
-//     16 KiB per stream — past that we drop.
+//   * Out-of-order arrival WITHIN a stream (loss → retransmit, or
+//     reordering on the wire) is handled by buffering frames whose
+//     offset > the current recv offset until the gap fills. The
+//     out-of-order buffer is bounded by the receive flow-control
+//     window (`recv_max`), enforced in `conn::rx` BEFORE ingest —
+//     the peer can't send past the window it was granted, so
+//     out-of-order data can't exceed one window. (An earlier fixed
+//     16 KiB cap silently dropped in-window frames whose packets we
+//     still ACK'd, leaving an unfillable gap that wedged the recv
+//     handler on any upload reordered past 16 KiB.)
 //
 // Receive flow control IS implemented: each stream advertises
 // `recv_max` (starts at the initial transport-param limit) and the
@@ -112,9 +117,6 @@ pub struct RecvStream {
     pub gap_buffer: BTreeMap<u64, Vec<u8>>,
     /// Lifecycle state — replaces `closed: bool` + `fin_offset`.
     pub state: RecvState,
-    /// Cumulative cap on out-of-order bytes — anything past this
-    /// is dropped (treated as packet loss).
-    pub gap_budget: usize,
     /// Arrival time (µs) of the datagram that opened this stream —
     /// copied from `Connection::cur_rx_us` by `dispatch_frames`.
     /// `ensure_send_stream` carries it onto the matching `SendStream`
@@ -142,7 +144,6 @@ impl Default for RecvStream {
             offset: 0,
             gap_buffer: BTreeMap::new(),
             state: RecvState::Open,
-            gap_budget: 16 * 1024,
             rx_us: 0,
             recv_max: INITIAL_MAX_STREAM_DATA,
             recv_high: 0,
@@ -164,7 +165,6 @@ impl RecvStream {
         self.offset = 0;
         self.gap_buffer.clear();
         self.state = RecvState::Open;
-        self.gap_budget = 16 * 1024;
         self.rx_us = 0;
         self.recv_max = INITIAL_MAX_STREAM_DATA;
         self.recv_high = 0;
@@ -287,10 +287,15 @@ impl RecvStream {
                     produced = true;
                 }
             }
-        } else if data.len() <= self.gap_budget {
-            // Out of order — stash if budget allows.
+        } else if !data.is_empty() {
+            // Out of order — stash until the gap fills. The bound is
+            // the receive flow-control window (`recv_max`), enforced
+            // in `conn::rx` BEFORE this call: the peer can't send past
+            // the window it was granted, so `gap_buffer` holds at most
+            // one window of out-of-order data. (Re-inserting a
+            // retransmitted out-of-order frame just overwrites its
+            // entry — idempotent.)
             self.gap_buffer.insert(frame_offset, data.to_vec());
-            self.gap_budget -= data.len();
         }
         if fin {
             self.record_fin(frame_offset + data.len() as u64);
@@ -603,6 +608,41 @@ mod tests {
         let mut out = [0u8; 16];
         let (n, _) = s.drain(&mut out);
         assert_eq!(&out[..n], b"helloworld");
+    }
+
+    /// Regression: out-of-order data spanning more than the old
+    /// fixed 16 KiB gap budget must still buffer and fold in once the
+    /// leading gap fills — never silently drop. The old cap dropped
+    /// in-window frames whose packets `conn::rx` had already
+    /// processed (and would ACK), so the peer never retransmitted
+    /// them, leaving an unfillable gap that wedged the recv handler
+    /// (`handler_stuck`) on any upload reordered past 16 KiB. The
+    /// reorder bound is now the flow-control window (`recv_max`),
+    /// enforced upstream in `conn::rx`.
+    #[test]
+    fn recv_out_of_order_past_16k_then_fills() {
+        let mut s = RecvStream::default();
+        // 32 KiB of body, default recv_max (2 MiB) covers it. Deliver
+        // the *tail* first (offset 1 KiB .. 32 KiB), in 1 KiB frames,
+        // newest-offset-first so >16 KiB sits out of order at once —
+        // the exact shape the old 16 KiB cap dropped.
+        let chunk = [0xABu8; 1024];
+        let mut off = 31 * 1024u64;
+        loop {
+            assert!(!s.ingest(off, &chunk, false)); // gap → no contiguous bytes yet
+            if off == 1024 {
+                break;
+            }
+            off -= 1024;
+        }
+        // Nothing contiguous drains while the head [0, 1 KiB) is missing.
+        let mut out = [0u8; 64 * 1024];
+        assert_eq!(s.drain(&mut out).0, 0);
+        // Head arrives → the whole 32 KiB folds in (no dropped frame).
+        assert!(s.ingest(0, &chunk, false));
+        let (n, _) = s.drain(&mut out);
+        assert_eq!(n, 32 * 1024, "all 32 KiB present — nothing dropped");
+        assert!(out[..n].iter().all(|&b| b == 0xAB));
     }
 
     #[test]
