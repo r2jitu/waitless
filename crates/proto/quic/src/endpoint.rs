@@ -106,11 +106,17 @@ fn ship_datagram(
     crate::diag::COUNTERS.datagrams_sent.bump();
 }
 
-/// Maximum simultaneous QUIC connections per worker. Each slot
-/// is ~16 bytes (gen + Weak), so 1024 slots ≈ 16 KiB per worker
-/// — comfortably small. Real connection state lives in the conn
-/// task's stack frame, not in the slot.
-pub const SLOTS_PER_WORKER: usize = 1024;
+/// Maximum simultaneous QUIC connections per worker — the ceiling on
+/// a maximal-concurrency deployment (validated conns are bounded only
+/// by this, not the per-IP half-open cap). The `SlotTable` grows its
+/// backing segments on demand (64 slots ≈ 1 KiB each), so this is a
+/// ceiling, not an upfront allocation: an idle worker pays nothing and
+/// memory tracks live conns. Real per-conn state lives in the conn
+/// task's frame, not the slot (~16 B: generation + Weak). 8192/worker
+/// × typical core count gives tens of thousands of live conns headroom
+/// before the slot table — rather than an artificial cap — is the
+/// limit; bounded ultimately by heap (each live conn's TLS + buffers).
+pub const SLOTS_PER_WORKER: usize = 8192;
 
 /// Errors from `quic_listen` — mirrors `udp_listen`'s error
 /// surface so the call site looks the same.
@@ -778,6 +784,10 @@ where
     // — the `state == Failed` exit path, which needs no explicit set.
     let mut exit_reason = crate::diag::ExitReason::ConnFailed;
     let mut iterations: u64 = 0;
+    // Tracks whether we've told the slot table this conn passed QUIC
+    // address validation (RFC 9000 §8.1) so it stops counting against
+    // the per-IP half-open cap. Flips once, on the validation edge.
+    let mut per_ip_promoted = false;
 
     loop {
         crate::diag::COUNTERS.conn_task_iterations.bump();
@@ -984,6 +994,17 @@ where
                 break;
             }
             current = inbox.try_pop();
+        }
+
+        // On the address-validation edge (peer decrypted our Handshake
+        // → controls the source address, RFC 9000 §8.1), release this
+        // conn from the per-IP half-open cap: it's now a proven-legit
+        // client, bounded only by the global slot budget. Lets one NAT
+        // / CGNAT egress IP hold as many live conns as the worker has
+        // slots, instead of being throttled like an Initial flood.
+        if !per_ip_promoted && conn.borrow().path_validated {
+            slots.mark_validated(slot_idx, generation);
+            per_ip_promoted = true;
         }
 
         // Drain outbound packets to the peer. Each iteration

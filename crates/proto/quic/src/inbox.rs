@@ -236,6 +236,16 @@ struct Slot {
     /// `PER_IP_SLOT_LIMIT` slots, leaving room for legitimate
     /// new connections from other peers.
     src_ip: waitless::runtime::IpAddr,
+    /// Whether this slot is currently charged against its `src_ip`'s
+    /// per-IP **half-open** count (`per_ip`). `true` from `allocate`
+    /// until either `mark_validated` (the conn completed QUIC address
+    /// validation — RFC 9000 §8.1) or `free_slot`. Once validated the
+    /// conn is a proven-legitimate client and stops counting, so a
+    /// single NAT / CGNAT egress IP can hold as many *live* conns as
+    /// the global slot budget allows — only *unvalidated* conns are
+    /// per-IP-capped (the Initial-flood threat). Prevents the
+    /// validation + free double-decrement.
+    counted: bool,
     /// Free-list link. `NULL_SLOT` when this slot is allocated;
     /// otherwise the index of the next free slot in the chain
     /// (or `NULL_SLOT` for end-of-list). The pool's `free_head`
@@ -249,6 +259,7 @@ impl Default for Slot {
             generation: 0,
             inbox: None,
             src_ip: waitless::runtime::IpAddr::V4_ANY,
+            counted: false,
             next_free: NULL_SLOT,
         }
     }
@@ -261,6 +272,22 @@ impl Default for Slot {
 /// instead of the previous fixed 80 KiB (1024 slots × ~80 B each).
 const SEGMENT_SIZE: usize = 64;
 const NULL_SLOT: u16 = 0xFFFF;
+
+/// Per-worker, per-source-IP cap on **unvalidated (half-open)**
+/// connections. A conn counts against this only until it completes
+/// QUIC address validation ([`SlotTable::mark_validated`]); validated
+/// conns are bounded solely by the global per-worker `max_capacity`.
+/// So this caps the Initial-flood vector (slots an unauthenticated
+/// source can pin) WITHOUT capping legitimate live connections from a
+/// NAT / CGNAT egress that share one public IP — a single such IP can
+/// hold up to `max_capacity` validated conns per worker.
+///
+/// Sized for a large NAT's simultaneous-handshake burst: half-open is
+/// transient (a conn clears it within ~1 RTT of validating), so the
+/// steady-state charge is `handshake_arrival_rate × RTT`. 256/worker
+/// covers a heavy burst while still reserving the bulk of the table
+/// for other peers and bounding one IP's half-open memory.
+const PER_IP_SLOT_LIMIT: u16 = 256;
 
 /// Pack an `IpAddr` into a u128 so it can key into a `BTreeMap`.
 /// `IpAddr` itself doesn't implement `Ord` (the enum's variant
@@ -434,7 +461,6 @@ impl SlotTable {
     /// allocate to find the first dead slot AND count per-IP
     /// usage in one pass; both walks are gone.
     pub fn allocate(&self, src_ip: waitless::runtime::IpAddr) -> Option<(u16, u16)> {
-        const PER_IP_SLOT_LIMIT: u16 = 64;
         // Global cap — reject before bumping any state.
         if self.live.get() >= self.max_capacity {
             return None;
@@ -470,10 +496,42 @@ impl SlotTable {
         slot.generation = slot.generation.wrapping_add(1);
         slot.inbox = None; // cleared until install
         slot.src_ip = src_ip;
-        // Bump per-IP and global counters.
+        slot.counted = true;
+        // Bump per-IP (half-open) and global counters.
         *self.per_ip.borrow_mut().entry(key).or_insert(0) += 1;
         self.live.set(self.live.get() + 1);
         Some((idx, slot.generation))
+    }
+
+    /// Promote `(idx, gen)` to **address-validated**: stop charging it
+    /// against its source IP's per-IP half-open count. Called once the
+    /// conn completes QUIC address validation (RFC 9000 §8.1 — the peer
+    /// decrypted our Handshake, proving it controls the source
+    /// address), so it's a proven-legitimate client rather than a
+    /// possible Initial-flood. After this only the global per-worker
+    /// `max_capacity` bounds it, letting a single NAT / CGNAT egress IP
+    /// hold as many *live* connections as the slot budget allows.
+    /// Idempotent; a no-op on a stale generation or already-promoted
+    /// slot (so it pairs safely with `free_slot`, which only decrements
+    /// the per-IP count for a slot still `counted`).
+    pub fn mark_validated(&self, idx: u16, generation: u16) {
+        if (idx as usize) >= self.capacity() {
+            return;
+        }
+        // SAFETY: per-worker single-threaded ownership; index in range.
+        let slot = unsafe { &mut *self.slot_ptr(idx) };
+        if slot.generation != generation || !slot.counted {
+            return;
+        }
+        slot.counted = false;
+        let key = ip_key(slot.src_ip);
+        let mut per_ip = self.per_ip.borrow_mut();
+        if let Some(c) = per_ip.get_mut(&key) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                per_ip.remove(&key);
+            }
+        }
     }
 
     /// Install an inbox at `(idx, gen)`. The caller has just
@@ -520,9 +578,14 @@ impl SlotTable {
         if slot.generation != generation {
             return; // stale — slot has already been re-allocated
         }
-        // Decrement per-IP counter; evict the entry on hit-zero
+        // Decrement the per-IP half-open counter — but only if this
+        // slot is still charged to it. A validated conn already
+        // dropped out of the count via `mark_validated`; decrementing
+        // again here would underflow the IP's tally and wrongly free
+        // capacity for half-open floods. Evict the entry on hit-zero
         // to keep the map sparse.
-        {
+        if slot.counted {
+            slot.counted = false;
             let key = ip_key(slot.src_ip);
             let mut per_ip = self.per_ip.borrow_mut();
             if let Some(c) = per_ip.get_mut(&key) {
@@ -736,17 +799,18 @@ mod tests {
         assert!(table.allocate(ip(3)).is_some());
     }
 
-    /// Per-IP cap (PER_IP_SLOT_LIMIT = 64 in the impl). One IP
-    /// can fill at most that many slots; further allocations from
-    /// it are rejected even if there's global headroom.
+    /// Per-IP **half-open** cap. One IP can pin at most
+    /// `PER_IP_SLOT_LIMIT` *unvalidated* slots; further allocations
+    /// from it are rejected even with global headroom.
     #[test]
     fn slot_table_per_ip_cap() {
-        // Use a table larger than PER_IP_SLOT_LIMIT so it's the
-        // per-IP cap, not the global cap, that bites first.
-        let table = SlotTable::new(128);
+        let cap = PER_IP_SLOT_LIMIT as usize;
+        // Table larger than the per-IP cap so the per-IP cap, not the
+        // global cap, bites first.
+        let table = SlotTable::new(cap + 64);
         let attacker = ip(7);
         let mut held: alloc::vec::Vec<Rc<ConnInbox>> = alloc::vec::Vec::new();
-        for _ in 0..64 {
+        for _ in 0..cap {
             let inbox = ConnInbox::new();
             let (i, g) = table
                 .allocate(attacker)
@@ -754,11 +818,49 @@ mod tests {
             table.install(i, g, &inbox);
             held.push(inbox);
         }
-        // 65th from same IP — rejected.
+        // One past the cap from the same IP — rejected.
         assert!(table.allocate(attacker).is_none());
-        // But a different IP can still allocate (table is far
-        // from full globally — 128 slots, 64 used).
+        // A different IP can still allocate (global headroom remains).
         assert!(table.allocate(ip(8)).is_some());
+    }
+
+    /// Address-validated conns drop out of the per-IP half-open count,
+    /// so a single IP (a NAT/CGNAT egress) can hold far more than
+    /// `PER_IP_SLOT_LIMIT` *live* conns — up to the global cap.
+    #[test]
+    fn slot_table_validated_uncaps_per_ip() {
+        let cap = PER_IP_SLOT_LIMIT as usize;
+        let table = SlotTable::new(cap * 2 + 16);
+        let nat = ip(11);
+        let mut ids: alloc::vec::Vec<(u16, u16)> = alloc::vec::Vec::new();
+        // Fill the half-open cap from one IP.
+        for _ in 0..cap {
+            ids.push(table.allocate(nat).expect("under cap"));
+        }
+        assert!(table.allocate(nat).is_none(), "at the half-open cap");
+        // Validate them all → they stop counting against the per-IP cap.
+        for &(i, g) in &ids {
+            table.mark_validated(i, g);
+        }
+        // The same IP can now allocate another full cap's worth of
+        // half-open conns on top of its validated ones.
+        for _ in 0..cap {
+            assert!(
+                table.allocate(nat).is_some(),
+                "validated conns must not count against the per-IP cap"
+            );
+        }
+        // mark_validated is idempotent and freeing a validated slot
+        // doesn't underflow the per-IP tally (the first IP's count is
+        // already at `cap` from the second batch; a spurious decrement
+        // would wrongly admit more).
+        let (i0, g0) = ids[0];
+        table.mark_validated(i0, g0); // no-op (already validated)
+        table.free_slot(i0, g0); // must not decrement (was validated)
+        assert!(
+            table.allocate(nat).is_none(),
+            "freeing a validated slot must not free half-open capacity"
+        );
     }
 
     #[test]
