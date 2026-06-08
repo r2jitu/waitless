@@ -1264,21 +1264,32 @@ impl Connection {
     }
 
     fn reap_finished_streams_inner(&mut self) {
-        let candidates: Vec<u64> = self
-            .send_streams
-            .iter()
-            .filter_map(|(sid, s)| {
-                if !(s.fin_sent() && s.outbound.is_empty()) {
-                    return None;
-                }
-                let recv_done = self
-                    .recv_streams
-                    .get(sid)
-                    .is_some_and(|r| r.is_closed() && r.buffer.is_empty());
-                if recv_done { Some(*sid) } else { None }
-            })
-            .collect();
-        for sid in candidates {
+        // Collect finished sids into a stack buffer instead of a fresh
+        // heap `Vec` per call. The steady state is 0-1 finished streams
+        // per call (one request completing), so the old `.collect()` was
+        // a talc-locked alloc+free on every request's hot path for a
+        // ~1-element list. Overflow past the cap is reaped on the next
+        // call (this runs per inbound datagram), so nothing leaks.
+        const MAX_REAP_PER_CALL: usize = 32;
+        let mut candidates = [0u64; MAX_REAP_PER_CALL];
+        let mut n = 0usize;
+        for (sid, s) in self.send_streams.iter() {
+            if n == MAX_REAP_PER_CALL {
+                break;
+            }
+            if !(s.fin_sent() && s.outbound.is_empty()) {
+                continue;
+            }
+            let recv_done = self
+                .recv_streams
+                .get(sid)
+                .is_some_and(|r| r.is_closed() && r.buffer.is_empty());
+            if recv_done {
+                candidates[n] = *sid;
+                n += 1;
+            }
+        }
+        for &sid in &candidates[..n] {
             // Recycle the SendStream / RecvStream into per-conn
             // pools (capped at STREAM_POOL_CAP) so the next
             // stream on this conn reuses their `outbound` /
