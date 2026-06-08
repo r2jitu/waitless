@@ -160,3 +160,67 @@ So even a perfect (0 µs) server would only close ~half the gap (→ ~290 K); th
 rest is the QUIC client + transport, which the server cannot fix. The h3 stack
 is near its floor for this closed-loop, single-small-response benchmark; the
 gap to h1/h2 is intrinsic to QUIC's per-request latency, not a server defect.
+
+## CORRECTED ROOT CAUSE: at saturation h3 is CPU-bound at ~2× the CPU/req of h1
+
+The "latency-bound, near its floor, no server-side lever" conclusion above was
+an **artifact of measuring at par=64 — below h3's saturation knee.** "Why can't
+concurrency offset the latency?" forced the real answer, measured this time at
+saturating concurrency (par=256, c3-highcpu-4/gve, single loadgen, windowed
+`/obs` deltas). Three facts settle it.
+
+**1. Concurrency *does* offset latency — until the cores saturate, then it
+can't.** h1 scales 419 K (par64) → 529 K (par256) then plateaus; h3 scales
+238 K → ~247 K and plateaus by ~par128. The plateau is where cores hit 100 %.
+
+**2. At the plateau BOTH protocols peg all 4 cores at 100 % — on real work,
+not empty-poll spin.** This is the key correction. Per-core `core_busy_cycles`
+windowed delta = 100 % for both at par=256. The empty-poll trap is ruled out by
+`core_loops`/`core_poll_work`:
+
+| par=256 | rps | device pps | pkts/req | busy | cyc/loop | work-loops | CPU/req |
+|---|---|---|---|---|---|---|---|
+| **h1** | ~520 K | 1.03 M | 2.00 | 100 % | 2,293 | 5 % | **~7.7 µs** |
+| **h3** | ~247 K | 866 K | 3.50 | 100 % | **238,510** | 46 % | **~16.2 µs** |
+
+An empty poll is a few hundred cycles (h1's 2.3 K average, dominated by 95 %
+empty laps, proves it). h3's loops are **238 K cycles each** — ~5 requests of
+genuine work per loop. So h3's 100 % is real per-request work. CPU/req =
+`4 cores × 2.699e9 cyc/s ÷ rps`: h1 ≈ 20.7 K cyc (7.7 µs), h3 ≈ 43.9 K cyc
+(16.2 µs). **Ratio 2.12 = exactly the throughput ratio (520 ÷ 247 = 2.11).**
+
+**3. It is NOT a device packet-rate wall.** The earlier "both at ~840 K pps"
+(par=64) was a coincidence: h1 connection-scaling drives device pps to
+**1.06 M** (par256) — well past 840 K — before h1 itself plateaus. The device
+does ≥1.06 M pps; h3's ~866 K-pps ceiling is its *own* CPU limit, not the NIC's.
+
+**So the root cause is: each h3 request costs ~2× the server CPU of an h1
+request, so the CPU-bound throughput ceiling is ~2× lower.** That ~2× CPU/req
+decomposes into **(a) 1.75× more packets/req** (3.5 vs 2.0) × **(b) ~1.19× more
+CPU/packet** (QUIC's per-packet AEAD-open/seal + HP + framing + FC accounting
+vs a TCP segment); 1.75 × 1.19 = 2.08 ≈ the measured 2.1×.
+
+Why every prior lever read as "throughput-neutral": **they were all A/B'd at
+par=64, where the cores are ~30 % idle (latency/arrival-bound) — cutting CPU
+work there frees idle headroom, not throughput.** At saturation (par≥128) the
+cores are 100 % CPU-bound, so cutting CPU/req *is* a throughput lever. The
+benchmark operating point, not the optimization, was wrong.
+
+**The lever — cut h3 packets/req, validated at saturation.** h3 = 1.5 in +
+**2.0 out**. The /health response (~250 B) fits one QUIC packet, and the
+deferred-ACK logic (tx.rs:568) already holds the ACK — so the +1.0 outbound is
+the **RX-time credit-replenishment flush**: HTTP/3 opens a fresh bidi stream per
+request, so consumed MAX_STREAMS / MAX_DATA / MAX_STREAM_DATA cross the
+`window/2` threshold every request → `has_one_rtt_to_send()` is true at RX → a
+control packet (carrying the deferred ACK) ships *before* the handler's
+response. `flush_calls = 2.0/req` = RX-time control flush + response flush.
+Deferring those credit frames like the delayed ACK (piggyback on the response
+or a deadline, never eager at RX) coalesces ACK + MAX_* + response into ONE
+packet → h3 ~3.5 → ~2.5 pkts/req, freeing ~28 % of the per-packet CPU →
+projected **~+30–40 % h3 throughput at saturation** (and compounding: fewer
+ack-eliciting server packets → client ACKs ~half as often → RX may fall too).
+⚠️ Implement via a deferral *timer* (the delayed-ACK mechanism), NOT a
+flush-deferral — a naive batch-flush coalescing was tried before and **broke h3
+hard** (the handler is a separate task; deferring the flush orphaned the
+response). Validate with a par=256 A/B on `udp.tx_datagrams`/req + rps, not
+par=64.
