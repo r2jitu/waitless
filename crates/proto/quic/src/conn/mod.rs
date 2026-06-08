@@ -1121,6 +1121,7 @@ impl Connection {
     /// inside survive across stream lifecycles. Returns a `&mut`
     /// handle so the caller can immediately write into it.
     pub(super) fn ensure_send_stream(&mut self, sid: u64) -> &mut crate::streams::SendStream {
+        let _ss0 = crate::diag::now_cycles();
         if !self.send_streams.contains_key(&sid) {
             // Make sure the peer's send-side flow-control limits are in
             // hand before seeding the new stream's window.
@@ -1148,6 +1149,9 @@ impl Connection {
             self.send_streams.insert(sid, new_stream);
             crate::diag::COUNTERS.send_streams_created.bump();
         }
+        crate::diag::COUNTERS
+            .stream_setup_cycles
+            .add(crate::diag::now_cycles().wrapping_sub(_ss0));
         self.send_streams.get_mut(&sid).unwrap()
     }
 
@@ -1252,6 +1256,14 @@ impl Connection {
     /// would simply re-create an entry. On a healthy connection
     /// that's not expected.
     pub(super) fn reap_finished_streams(&mut self) {
+        let _rp0 = crate::diag::now_cycles();
+        self.reap_finished_streams_inner();
+        crate::diag::COUNTERS
+            .reap_cycles
+            .add(crate::diag::now_cycles().wrapping_sub(_rp0));
+    }
+
+    fn reap_finished_streams_inner(&mut self) {
         let candidates: Vec<u64> = self
             .send_streams
             .iter()

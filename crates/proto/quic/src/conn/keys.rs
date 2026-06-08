@@ -116,7 +116,12 @@ impl DirKeys {
         // `Aes128GcmFast` (stitched AES-CTR + batched GHASH) seals in
         // place and returns the 16-byte tag — the same fast crate TLS
         // uses, far cheaper per byte than RustCrypto's non-stitched path.
-        self.aead_cipher.seal(nonce, aad, data)
+        let t = crate::diag::now_cycles();
+        let tag = self.aead_cipher.seal(nonce, aad, data);
+        crate::diag::COUNTERS
+            .aead_seal_cycles
+            .add(crate::diag::now_cycles().wrapping_sub(t));
+        tag
     }
 
     pub(super) fn aead_open(
@@ -126,14 +131,23 @@ impl DirKeys {
         data: &mut [u8],
         tag: &[u8; TAG_LEN],
     ) -> Result<(), ()> {
-        self.aead_cipher.open(nonce, aad, data, tag).map_err(|_| ())
+        let t = crate::diag::now_cycles();
+        let r = self.aead_cipher.open(nonce, aad, data, tag).map_err(|_| ());
+        crate::diag::COUNTERS
+            .aead_open_cycles
+            .add(crate::diag::now_cycles().wrapping_sub(t));
+        r
     }
 
     /// AES-128-ECB on `sample`, truncated to `HP_MASK_LEN` (RFC 9001
     /// §5.4.3). Cipher is pre-keyed; cost per call is one AES block.
     pub(super) fn hp_mask(&self, sample: &[u8; HP_SAMPLE_LEN]) -> [u8; HP_MASK_LEN] {
         let mut block = GenericArray::clone_from_slice(sample);
+        let t = crate::diag::now_cycles();
         self.hp_cipher.encrypt_block(&mut block);
+        crate::diag::COUNTERS
+            .hp_cycles
+            .add(crate::diag::now_cycles().wrapping_sub(t));
         let mut mask = [0u8; HP_MASK_LEN];
         mask.copy_from_slice(&block[..HP_MASK_LEN]);
         mask

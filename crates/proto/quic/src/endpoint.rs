@@ -78,6 +78,22 @@ fn ship_datagram(
     peer_port: u16,
     pkt: DatagramBuf,
 ) {
+    // Cycle-bracket the driver TX submit (descriptor fill + doorbell)
+    // for the h3 /health CPU decomposition (`ship_cycles`).
+    let t = crate::diag::now_cycles();
+    ship_datagram_inner(sock, conn, peer_ip, peer_port, pkt);
+    crate::diag::COUNTERS
+        .ship_cycles
+        .add(crate::diag::now_cycles().wrapping_sub(t));
+}
+
+fn ship_datagram_inner(
+    sock: &UdpSocket,
+    conn: &RefCell<Connection>,
+    peer_ip: waitless::runtime::IpAddr,
+    peer_port: u16,
+    pkt: DatagramBuf,
+) {
     if pkt.is_gso_slot() {
         // UDP-GSO super-packet: one descriptor → N UDP datagrams on the
         // wire. Count all N toward datagrams_sent (each is a real QUIC

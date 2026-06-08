@@ -324,6 +324,25 @@ pub struct Counters {
     /// AEAD-seal + HP add + packet build (the TX half). Pair with
     /// `flush_calls`.
     pub flush_tx_cycles: Counter,
+    /// Sub-brackets of the RX/TX cycles, for the h3 /health CPU
+    /// decomposition. `aead_*_cycles` = the GCM primitive alone (no
+    /// HP, no framing); `hp_cycles` = the per-packet header-protection
+    /// mask (one AES block, both directions); `ship_cycles` =
+    /// `ship_datagram` (driver TX descriptor fill + submit). Subtract
+    /// these from `process_rx_cycles` / `flush_tx_cycles` to isolate
+    /// pure framing/dispatch from crypto, and from the runtime
+    /// residual to isolate the executor/scheduling overhead.
+    pub aead_open_cycles: Counter,
+    pub aead_seal_cycles: Counter,
+    pub hp_cycles: Counter,
+    pub ship_cycles: Counter,
+    /// Per-request stream-lifecycle brackets (the suspected bulk of the
+    /// h3 /health "glue"): `reap_cycles` = `reap_finished_streams`
+    /// (scans send_streams + recycles into pools, once/req);
+    /// `stream_setup_cycles` = `ensure_send_stream` (pool-pop or alloc +
+    /// BTreeMap insert of the response SendStream).
+    pub reap_cycles: Counter,
+    pub stream_setup_cycles: Counter,
 
     // ── Flush / datagram throughput ──────────────────────────────
     /// One call to `flush_outbound`. Bumps from both
@@ -410,6 +429,12 @@ impl Counters {
             handler_stuck: Counter::new(),
             process_rx_cycles: Counter::new(),
             flush_tx_cycles: Counter::new(),
+            aead_open_cycles: Counter::new(),
+            aead_seal_cycles: Counter::new(),
+            hp_cycles: Counter::new(),
+            ship_cycles: Counter::new(),
+            reap_cycles: Counter::new(),
+            stream_setup_cycles: Counter::new(),
             flush_calls: Counter::new(),
             datagrams_sent: Counter::new(),
             datagrams_processed: Counter::new(),
@@ -820,7 +845,7 @@ pub fn should_log_event() -> bool {
 /// Snapshot of every drop / event counter, for `/quic_stats`-style
 /// dumps. Returns `(name, value)` pairs in declaration order,
 /// including the four AEAD throughput counters.
-pub fn snapshot() -> [(&'static str, u64); 52] {
+pub fn snapshot() -> [(&'static str, u64); 58] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.get()),
@@ -876,6 +901,12 @@ pub fn snapshot() -> [(&'static str, u64); 52] {
         ("handler_stuck", c.handler_stuck.get()),
         ("process_rx_cycles", c.process_rx_cycles.get()),
         ("flush_tx_cycles", c.flush_tx_cycles.get()),
+        ("aead_open_cycles", c.aead_open_cycles.get()),
+        ("aead_seal_cycles", c.aead_seal_cycles.get()),
+        ("hp_cycles", c.hp_cycles.get()),
+        ("ship_cycles", c.ship_cycles.get()),
+        ("reap_cycles", c.reap_cycles.get()),
+        ("stream_setup_cycles", c.stream_setup_cycles.get()),
         ("flush_calls", c.flush_calls.get()),
         ("datagrams_sent", c.datagrams_sent.get()),
         ("datagrams_processed", c.datagrams_processed.get()),

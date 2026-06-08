@@ -518,12 +518,17 @@ where
         // `qpack_decode_error` and the stream is closed.
         let mut name_scratch = [0u8; 4096];
         let mut value_scratch = [0u8; 4096];
-        if let Err(e) = qpack::decode_field_section_into(
+        let _qd0 = crate::diag::now_cycles();
+        let qd_res = qpack::decode_field_section_into(
             headers_value,
             &mut name_scratch,
             &mut value_scratch,
             &mut sink,
-        ) {
+        );
+        crate::diag::COUNTERS
+            .qpack_decode_cycles
+            .add(crate::diag::now_cycles().wrapping_sub(_qd0));
+        if let Err(e) = qd_res {
             crate::h3_drop!(
                 qpack_decode_error,
                 "sid={} err={:?} header_len={}",
@@ -580,7 +585,15 @@ where
     let status = response.status;
     if !streamed {
         // Buffered response: encode HEADERS + DATA + FIN in one shot.
+        // `serve_cycles` brackets the whole synchronous send-side h3 path
+        // (QPACK encode + H3 framing + queue + close_stream→flush→ship);
+        // it CONTAINS the nested quic `flush_tx`/`ship`/`qpack_encode`
+        // brackets, so in analysis subtract those to isolate h3 framing.
+        let _sv0 = crate::diag::now_cycles();
         write_response(conn, sid, response, &scratch.framing_pool);
+        crate::diag::COUNTERS
+            .serve_cycles
+            .add(crate::diag::now_cycles().wrapping_sub(_sv0));
     }
     crate::diag::COUNTERS.write_response_completed.bump();
     crate::h3_event!(requests_handled, "sid={} status={}", sid, status);
@@ -772,14 +785,19 @@ fn write_response(
         let region = framing
             .extend_uninit(QPACK_BODY_RESERVE)
             .expect("qpack reserve fits in fresh IOBuf");
-        match qpack::encode_field_section_into(
+        let _qe0 = crate::diag::now_cycles();
+        let enc = qpack::encode_field_section_into(
             &[
                 (&b":status"[..], status_str.as_slice()),
                 (&b"content-type"[..], resp.content_type_bytes()),
                 (&b"content-length"[..], &len_buf[len_off..]),
             ],
             region,
-        ) {
+        );
+        crate::diag::COUNTERS
+            .qpack_encode_cycles
+            .add(crate::diag::now_cycles().wrapping_sub(_qe0));
+        match enc {
             Ok(n) => n,
             Err(_) => {
                 crate::h3_drop!(

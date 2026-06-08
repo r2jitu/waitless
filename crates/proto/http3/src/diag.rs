@@ -80,6 +80,17 @@ pub struct Counters {
     /// `user_handler_returned` is "stuck inside the QUIC send
     /// path" (flush_outbound, sock.send_to, etc.).
     pub write_response_completed: Counter,
+    /// Per-phase cycle brackets for the h3 /health CPU decomposition
+    /// (TSC on x86, CNTVCT ticks on arm64 — ratios only). `serve` =
+    /// the whole synchronous `handle_request` body (read + decode +
+    /// route + user handler + write_response, i.e. everything the
+    /// handler task does per request); `qpack_decode` / `qpack_encode`
+    /// are the header-compression sub-spans within it. `serve` minus
+    /// the two qpack spans minus the QUIC flush (`quic.flush_tx`)
+    /// isolates the pure h3 framing + routing + struct overhead.
+    pub serve_cycles: Counter,
+    pub qpack_decode_cycles: Counter,
+    pub qpack_encode_cycles: Counter,
 }
 
 impl Counters {
@@ -99,6 +110,9 @@ impl Counters {
             user_handler_invoked: Counter::new(),
             user_handler_returned: Counter::new(),
             write_response_completed: Counter::new(),
+            serve_cycles: Counter::new(),
+            qpack_decode_cycles: Counter::new(),
+            qpack_encode_cycles: Counter::new(),
         }
     }
 }
@@ -192,9 +206,12 @@ pub fn should_log_event() -> bool {
 }
 
 /// Counter `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 14] {
+pub fn snapshot() -> [(&'static str, u64); 17] {
     let c = &COUNTERS;
     [
+        ("serve_cycles", c.serve_cycles.get()),
+        ("qpack_decode_cycles", c.qpack_decode_cycles.get()),
+        ("qpack_encode_cycles", c.qpack_encode_cycles.get()),
         ("requests_received", c.requests_received.get()),
         ("requests_handled", c.requests_handled.get()),
         ("recv_buffer_overflow", c.recv_buffer_overflow.get()),
@@ -210,6 +227,30 @@ pub fn snapshot() -> [(&'static str, u64); 14] {
         ("user_handler_returned", c.user_handler_returned.get()),
         ("write_response_completed", c.write_response_completed.get()),
     ]
+}
+
+/// Monotonic cycle counter for the per-phase brackets (TSC on x86,
+/// CNTVCT_EL0 on arm64). Mirrors `quic::diag::now_cycles`.
+#[inline(always)]
+pub fn now_cycles() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let lo: u32;
+        let hi: u32;
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+            options(nomem, nostack, preserves_flags));
+        ((hi as u64) << 32) | (lo as u64)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let v: u64;
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack));
+        v
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        0
+    }
 }
 
 /// Render the HTTP/3 observability block as a JSON object — every
