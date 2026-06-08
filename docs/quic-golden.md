@@ -190,10 +190,42 @@ All `failed=0`; `/obs` delta over a 1 MiB×p4 upload: `handler_stuck +0`,
 A regression test (`recv_out_of_order_past_16k_then_fills`) covers the
 >16 KiB out-of-order fold-in.
 
+### n2/GQI upload — env-agnostic confirmation
+The fix is in `proto/quic`, so it holds identically on the other gve
+format (redeployed n2-highcpu-8, GQI): 256 KiB upload 494 rps p1
+(~1.03 Gb/s) / 1,627 p4; 1 MiB 131 p1 / 378 p4; echo 256 KiB 252 p1,
+1 MiB 69 p1; all `failed=0`. Cliff gone on both gve formats.
+
+### HW UDP-RX-GRO: not available on gve, and wouldn't help — VERIFIED
+Checked against the **official Google gve driver source**
+(`GoogleCloudPlatform/compute-virtual-ethernet-linux`), not just our
+header:
+- `gve_adminq_create_rx_queue` has exactly one coalescing field —
+  `enable_rsc` (offset 50). No UDP-GRO / UDP-coalesce / GSO field
+  exists. Our `init.rs` is byte-exact and complete.
+- `gve_rx_compl_desc_dqo` carries only `rsc` (1 bit) + `rsc_seg_len`
+  ("Segment length for **RSC** packets") — RSC is TCP segment
+  coalescing (LRO). There is **no UDP coalescing metadata**; upstream
+  relies on the kernel's *software* GRO for UDP, not a device offload.
+- Measured on c3/DQO with RSC enabled: **packets/datagram = 1.000** —
+  the device delivers UDP 1:1, exactly as the descriptor predicts.
+
+And it couldn't move the needle even if it existed. Upload-RX CPU
+profile (c3/DQO, 1 MiB×p4, `/obs` cycle counters): **94.9% of busy
+cycles is per-packet QUIC work** (`runtime_cycles`: AEAD-open + frame
+parse + ACK), only **5.1% is NIC/classify/inbox** — the per-datagram
+portion any GRO scheme could touch. A 1 MiB×p4 upload runs **1.28 M
+AEAD-opens for 1.78 GB** (~1390 B/pkt); coalescing datagrams can't
+reduce the per-packet AEAD count. This is the exact mirror of the
+TX-GSO finding (no single-conn win; QUIC crypto is per-packet). So the
+RX path is left as-is: already zero-copy (items A–L), TCP-RSC-enabled,
+and now reassembly-correct + AEAD-open-bound at ~1 Gb/s/conn.
+
 ## Characterized future work (profile-justified, not core to this goal)
 - Small-resp /health gap (~5 sealed pkts/req vs TCP's 1): ACK/response coalescing
   (~1.3×, delicate ACK timing) + the fundamental per-packet AEAD+HP crypto tax.
   This is the per-packet CPU ceiling that caps single-conn bulk at ~1.2 Gbps.
-- **Server-RX HW UDP-GRO on DQO** for uploads (the RX analog of T4 RSC):
-  upload single-conn is now reassembly-correct and ~1 Gb/s, bounded by
-  per-packet AEAD-open; HW RX coalescing would cut the per-packet tax.
+- **Server-RX HW UDP-GRO on DQO**: investigated + ruled out (see
+  "HW UDP-RX-GRO" above) — no gve knob exists (RSC is TCP-only, verified
+  against the upstream driver) and the per-datagram NIC portion it could
+  touch is only ~5% of upload CPU. Not pursued.
