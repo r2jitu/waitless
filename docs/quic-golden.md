@@ -221,12 +221,14 @@ TX-GSO finding (no single-conn win; QUIC crypto is per-packet). So the
 RX path is left as-is: already zero-copy (items A–L), TCP-RSC-enabled,
 and now reassembly-correct + AEAD-open-bound at ~1 Gb/s/conn.
 
-## G4 — small-resp h3 gap: response-packet coalescing (DONE, branch `quic-crypto-batch`)
+## G4 — narrowing the h3 gap: response coalescing + stitched AEAD (DONE, branch `quic-crypto-batch`)
 
-The "crypto batching" framing was a red herring: the keyed AEAD/HP ciphers
-are already cached per-`DirKeys` (no per-packet key expansion), and TLS h1/h2
-prove the AEAD primitive is fast. Profiling h3 /health (c3/DQO, c64) found the
-real cost — **packets per request, not per-packet crypto cost**:
+G4 turned out to have TWO distinct levers — one for small responses, one for
+bulk:
+
+**(1) Small responses — packet coalescing (not crypto).** The keyed ciphers
+are already cached per-`DirKeys`, so the cost wasn't key setup; it was
+**packets per request**. Profiling h3 /health (c3/DQO, c64):
 
 | proto | /health rps (c64) | vs h1 |
 |---|---|---|
@@ -243,13 +245,36 @@ packet. Fix (2 commits): a non-flushing `QuicConn::queue_iobuf` so the
 response queues HEADERS+DATA+FIN before a single `close_stream` flush, plus
 draining multiple queued chunks per stream into each packet. Result: the
 response coalesces to **one packet**, per-request packets/seals/flushes
-**5.0 → 2.5**, h3 /health **+28%** (174 K → 223 K). `/static-64k` neutral
-(bandwidth-bound); the `res.write` streaming path keeps per-write flush for
-backpressure. Residual h3<h1 gap is now the irreducible per-packet AEAD+HP
-(QUIC is per-packet where TCP+TLS amortizes over larger records) + the ~2
-inbound-ACK packets/req — folding the ACK into the response packet (defer the
-post-process_datagram flush until after the inline handler) is the next lever,
-but it's delicate ACK-timing work.
+**5.0 → 2.5**, h3 /health **+28%** (174 K → 223 K). The `res.write` streaming
+path keeps per-write flush for backpressure.
+
+**(2) Bulk — stitched AES-GCM (crypto WAS a real lever after all).** QUIC's
+packet AEAD used RustCrypto `aes_gcm::Aes128Gcm` (non-stitched: separate
+AES-CTR then GHASH — measurably slower, RustCrypto/AEADs#243), while TLS
+already used the in-tree `waitless_aes_gcm::Aes128GcmFast` (8-block batched,
+*stitched* CTR+GHASH, AES-NI 8-way + Gueron-2010 deferred reduction). So h3
+paid a QUIC-only crypto tax on every byte. Pointing `DirKeys` at the same
+stitched crate TLS uses:
+
+| h3 bulk | coalescing-only | + stitched GCM |
+|---|---|---|
+| /static-64k c1 | 1,449 (0.76 Gb/s) | **2,519 (1.32 Gb/s, +74%)** |
+| /static-64k c64 | 7,664 | **11,789 (+54%)** |
+| 1 MiB upload p1 / p4 | 722 / 998 | **1,382 / 2,902 (~+90% / +190%)** |
+
+Small /health stays ~223 K (crypto isn't the bottleneck at ~80 B); TCP/TLS
+unchanged (already on the fast crate); real quinn client interops (the
+stitched output is NIST-KAT- + cross-checked against RustCrypto).
+
+**Residual / next levers.** The remaining h3<h1 gap is per-packet overhead
+(QUIC seals/HP per packet where TCP+TLS amortizes over larger records) plus
+the ~2 inbound-ACK packets/req. Two open levers: (a) fold the ACK into the
+response packet (defer the post-`process_datagram` flush until after the
+inline handler — delicate ACK timing); (b) **VAES/AVX-512** AES-GCM (4 AES
+blocks/instruction on ZMM, up to ~3.8× over AES-NI, ~0.16 c/B theoretical —
+Intel ISA-L, Go #42726) to push the stitched crate further on bulk. Both are
+larger efforts; the current state already closes the crypto asymmetry and the
+small-resp packet-count gap.
 
 ## Characterized future work (profile-justified, not core to this goal)
 - Remaining small-resp h3 gap: the per-packet AEAD+HP crypto tax (QUIC is
