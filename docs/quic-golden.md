@@ -144,7 +144,56 @@ all, so GSO's win is aggregate/CPU, not single-conn.
 - **Logic unified:** `write_udp_tx_headers` shared by the per-datagram and GSO
   send paths; pacing/segment-size consts centralized in `conn/tx.rs`.
 
+## Upload / echo direction (server RX) — the reassembly cliff
+
+The download work above never exercised server RX beyond ACKs. Adding
+the `h3-upload` (RX-isolated) and `h3-echo` (bidirectional) loadgen
+workloads surfaced a hard upload cliff on GCE: uploads ≤ 64 KiB ran at
+line rate, but ≥ 256 KiB collapsed to ~0.2 req/s — one body, then the
+connection idle-timed-out.
+
+**Root cause (NOT flow control, despite the 256 KiB coincidence):** the
+per-stream out-of-order reassembly buffer was capped at a fixed 16 KiB
+(`gap_budget`). On GCE's burst-reorder path a large upload puts >16 KiB
+of bytes out of order at once; frames past the cap were silently
+dropped — but `conn::rx` had already processed those packets and ACK'd
+them, so quinn never retransmitted the gap. The recv handler then spun
+on `conn.recv` forever (`/obs handler_stuck`) until the 30 s idle timer
+killed the conn. 64 KiB stayed under the cap, masking the bug as a size
+cliff that *looked* like the old 256 KiB window.
+
+**Fix** (2 commits):
+1. Bound out-of-order reassembly by the receive flow-control window
+   (`recv_max`, already enforced in `conn::rx` before ingest) instead
+   of the fixed 16 KiB — the peer can't send past the window it was
+   granted, so the gap buffer is naturally bounded. Drop `gap_budget`.
+2. Raise the initial recv window 256 KiB/1 MiB → 2 MiB/8 MiB (so a
+   typical upload fits without a mid-body MAX_STREAM_DATA round-trip) +
+   flush replenished credit right after the handler consumes, so an
+   upload past one window can't deadlock waiting to piggyback credit on
+   an inbound packet a blocked peer won't send.
+
+### c3/DQO upload + echo (before → after)
+| workload | before (p1) | after p1 | after p4 |
+|---|---|---|---|
+| h3 upload /discard 64 KiB | 1,770 rps (~0.93 Gb/s) | 1,770 | 4,766 |
+| h3 upload /discard 256 KiB | **0.2 rps (handler_stuck)** | **518 (~1.06 Gb/s)** | **1,329 (~2.79 Gb/s)** |
+| h3 upload /discard 1 MiB | (stuck) | **136 (~1.14 Gb/s)** | **338 (~2.83 Gb/s)** |
+| h3 echo /echo 64 KiB | (stuck >64 K) | 977 (~0.51 Gb/s RX+TX) | 2,589 |
+| h3 echo /echo 256 KiB | (stuck) | 256 (~0.54 Gb/s) | 800 |
+| h3 echo /echo 1 MiB | (stuck) | 73 (~0.61 Gb/s) | 180 |
+
+All `failed=0`; `/obs` delta over a 1 MiB×p4 upload: `handler_stuck +0`,
+`other_wire +0` (no FC drops). TCP/TLS h1 /health unchanged at
+**435,293 rps** (the change is confined to the QUIC RX reassembly path).
+
+A regression test (`recv_out_of_order_past_16k_then_fills`) covers the
+>16 KiB out-of-order fold-in.
+
 ## Characterized future work (profile-justified, not core to this goal)
 - Small-resp /health gap (~5 sealed pkts/req vs TCP's 1): ACK/response coalescing
   (~1.3×, delicate ACK timing) + the fundamental per-packet AEAD+HP crypto tax.
   This is the per-packet CPU ceiling that caps single-conn bulk at ~1.2 Gbps.
+- **Server-RX HW UDP-GRO on DQO** for uploads (the RX analog of T4 RSC):
+  upload single-conn is now reassembly-correct and ~1 Gb/s, bounded by
+  per-packet AEAD-open; HW RX coalescing would cut the per-packet tax.
