@@ -307,6 +307,15 @@ impl QuicTls {
         !self.tx_handshake.is_empty()
     }
 
+    /// Whether any 1-RTT-level CRYPTO bytes (e.g. a NewSessionTicket)
+    /// are still buffered for transmission. The UDP-GSO path checks
+    /// this to stay off a flush that carries a large CRYPTO frame: such
+    /// a frame can push a segment's body past the uniform GSO segment
+    /// size, which the device splits at fixed offsets.
+    pub fn has_pending_one_rtt_crypto(&self) -> bool {
+        !self.tx_one_rtt.is_empty()
+    }
+
     /// Advance the state machine over the bytes currently buffered.
     /// Returns the (possibly unchanged) state. Idempotent on
     /// truncated input — re-call after the next `push_handshake`.

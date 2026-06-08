@@ -494,15 +494,27 @@ impl Connection {
         false
     }
 
-    /// Sum of 1-RTT stream bytes queued to send — fresh outbound across
-    /// open send streams plus the retransmit backlog. Gates UDP-GSO: we
-    /// only coalesce into a super-packet when there's ≥2 packets' worth,
-    /// so a small single-packet response (a 60-byte /health) stays on the
-    /// per-datagram path instead of being padded to a full GSO segment.
-    fn pending_one_rtt_stream_bytes(&self) -> usize {
+    /// 1-RTT stream bytes we may actually send right now — the
+    /// retransmit backlog (already authorized) plus fresh outbound
+    /// bounded by peer flow control (conn-level MAX_DATA shared across
+    /// streams, and each stream's MAX_STREAM_DATA). Gates UDP-GSO: we
+    /// only coalesce into a super-packet when there's ≥2 packets' worth
+    /// of *sendable* data, so a small response (a 60-byte /health) stays
+    /// on the per-datagram path — and, crucially, a flow-control-blocked
+    /// connection (lots buffered but no peer credit) doesn't enter GSO
+    /// only to emit padding-only segments that burn cwnd and packet
+    /// numbers on PADDING.
+    fn sendable_one_rtt_stream_bytes(&self) -> usize {
         let mut n = self.retx_bytes as usize;
+        let mut conn_fc = self.peer_max_data.saturating_sub(self.data_sent) as usize;
         for s in self.send_streams.values() {
-            n = n.saturating_add(s.buffered_len());
+            if conn_fc == 0 {
+                break;
+            }
+            let stream_fc = s.peer_max_stream_data.saturating_sub(s.send_offset) as usize;
+            let sendable = s.buffered_len().min(stream_fc).min(conn_fc);
+            n = n.saturating_add(sendable);
+            conn_fc -= sendable;
         }
         n
     }
@@ -531,13 +543,25 @@ impl Connection {
         if !matches!(self.state, ConnState::Established) {
             return Ok(false);
         }
+        // Stay off the GSO path while a 1-RTT CRYPTO frame is pending
+        // (e.g. a NewSessionTicket right after the handshake): a large
+        // CRYPTO frame can push a segment's body past PACKET_BODY_BUDGET,
+        // so the sealed packet exceeds the uniform `gso_segment_size`.
+        // The device splits the super-buffer at fixed `gso` offsets, so
+        // one oversized segment misaligns — and corrupts — every segment
+        // after it. Let the per-datagram path emit that one flush; GSO
+        // resumes on the next.
+        if self.tls.has_pending_one_rtt_crypto() {
+            return Ok(false);
+        }
         let gso = self.gso_segment_size();
         let window = self.cc.window() as usize;
         let in_flight = self.bytes_in_flight as usize;
-        // Need ≥2 packets of cwnd budget AND ≥2 packets of pending stream
-        // data, else GSO under-fills or wastes padding.
+        // Need ≥2 packets of cwnd budget AND ≥2 packets of *sendable*
+        // (flow-control-permitted) stream data, else GSO under-fills or
+        // — worse — emits padding-only segments when FC-blocked.
         if window.saturating_sub(in_flight) < 2 * gso
-            || self.pending_one_rtt_stream_bytes() < 2 * PACKET_BODY_BUDGET
+            || self.sendable_one_rtt_stream_bytes() < 2 * PACKET_BODY_BUDGET
         {
             return Ok(false);
         }
@@ -563,6 +587,23 @@ impl Connection {
             let produced = buf.len() - before;
             if produced == 0 {
                 break; // nothing emittable (control-only / fc-blocked)
+            }
+            // Every segment must be exactly `gso` so the device splits the
+            // super-buffer at fixed offsets; padding tops each up to `gso`.
+            // The only way to EXCEED it is a control/CRYPTO burst past
+            // PACKET_BODY_BUDGET — the CRYPTO case is gated out at entry,
+            // and a pathological full-window MAX_STREAM_DATA sweep is the
+            // only residual (unreachable for h3). Guard regardless: an
+            // oversized segment would misalign every segment after it, so
+            // drop it from the super-buffer (its STREAM data is retained
+            // for retransmission, recovered via PTO) and ship what's sealed.
+            debug_assert!(
+                produced <= gso,
+                "GSO segment {produced} B > gso_size {gso} B: device split would misalign"
+            );
+            if produced > gso {
+                buf.vec_mut().truncate(before);
+                break;
             }
             self.record_bytes_sent(produced as u64);
             n += 1;
