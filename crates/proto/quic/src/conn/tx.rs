@@ -1031,62 +1031,69 @@ impl Connection {
         let mut conn_fc_budget = self.peer_max_data.saturating_sub(self.data_sent) as usize;
         let mut data_sent_delta: u64 = 0;
         for (sid, s) in self.send_streams.iter_mut() {
-            let body_so_far = out.len() - payload_offset;
-            if body_so_far >= PACKET_BODY_BUDGET {
-                break; // packet full; remaining streams flush next packet
-            }
-            // A `Closing` stream with empty `outbound` has only a
-            // zero-length FIN left to send. A FIN consumes no flow-control
-            // or congestion credit (RFC 9000 §4.1 / §19.8), so it MUST be
-            // emitted regardless of the cc / conn / stream budgets:
-            // gating it on data budget deadlocks the close when the body
-            // exactly filled the send window (or cwnd / conn-FC is
-            // momentarily 0) — the peer would wait forever for stream end.
-            // Only per-packet room matters.
-            let pure_fin =
-                matches!(s.state, crate::streams::SendState::Closing) && s.outbound.is_empty();
-            let max_chunk = if pure_fin {
-                0 // pop_chunk(0) on a Closing+empty stream yields the FIN
-            } else {
-                // DATA is gated by cwnd + send-side flow control. cwnd and
-                // conn-level FC are global; per-stream FC is per stream.
-                // `continue` (not `break`) so a later stream's pending FIN
-                // is still reached even when DATA budget is exhausted.
-                if cc_budget == 0 || conn_fc_budget == 0 {
-                    continue;
+            // Drain as many of this stream's queued chunks into the CURRENT
+            // packet as fit (and as cwnd / flow control allow). Looping here
+            // — rather than one chunk per stream per packet — coalesces a
+            // multi-chunk response (a HEADERS chunk + a body chunk + FIN)
+            // into a single packet instead of one packet per chunk, cutting
+            // the per-request AEAD-seal / datagram count on small responses.
+            loop {
+                let body_so_far = out.len() - payload_offset;
+                if body_so_far >= PACKET_BODY_BUDGET {
+                    break; // packet full
                 }
-                let stream_fc_budget =
-                    s.peer_max_stream_data.saturating_sub(s.send_offset) as usize;
-                let mc = PACKET_BODY_BUDGET
-                    .saturating_sub(body_so_far + 16)
-                    .min(cc_budget)
-                    .min(conn_fc_budget)
-                    .min(stream_fc_budget);
-                if mc == 0 {
-                    // FC- (or packet-) blocked DATA stays queued
-                    // (backpressuring the handler); try the next stream.
-                    continue;
+                // A `Closing` stream with empty `outbound` has only a
+                // zero-length FIN left. A FIN consumes no flow-control or
+                // congestion credit (RFC 9000 §4.1 / §19.8), so emit it
+                // regardless of the cc / conn / stream budgets — gating it on
+                // data budget would deadlock the close at the exact send-
+                // window boundary. Only per-packet room matters.
+                let pure_fin = matches!(s.state, crate::streams::SendState::Closing)
+                    && s.outbound.is_empty();
+                let max_chunk = if pure_fin {
+                    0 // pop_chunk(0) on a Closing+empty stream yields the FIN
+                } else {
+                    // DATA is gated by cwnd + send-side flow control. `break`
+                    // (not `continue`) so the outer loop advances to the next
+                    // stream when this one is budget- or packet-blocked.
+                    if cc_budget == 0 || conn_fc_budget == 0 {
+                        break;
+                    }
+                    let stream_fc_budget =
+                        s.peer_max_stream_data.saturating_sub(s.send_offset) as usize;
+                    let mc = PACKET_BODY_BUDGET
+                        .saturating_sub(body_so_far + 16)
+                        .min(cc_budget)
+                        .min(conn_fc_budget)
+                        .min(stream_fc_budget);
+                    if mc == 0 {
+                        break; // FC- / packet-blocked DATA stays queued
+                    }
+                    mc
+                };
+                // `pop_chunk` returns the owned bytes (the copy retained for
+                // retransmission); we frame them into `out` ourselves. For a
+                // pure FIN it returns `(offset, [], true)`; a drained stream
+                // returns `None` and ends this stream's inner loop.
+                match s.pop_chunk(max_chunk) {
+                    Some((offset, data, fin)) => {
+                        crate::frame::append_stream_header(*sid, offset, fin, data.len(), out)
+                            .map_err(|_| ConnError::Wire)?;
+                        out.extend_from_slice(&data);
+                        ack_eliciting = true;
+                        let data_popped = data.len();
+                        cc_budget = cc_budget.saturating_sub(data_popped);
+                        conn_fc_budget = conn_fc_budget.saturating_sub(data_popped);
+                        data_sent_delta += data_popped as u64;
+                        pkt_frames.push(StreamRetx {
+                            sid: *sid,
+                            offset,
+                            fin,
+                            data,
+                        });
+                    }
+                    None => break,
                 }
-                mc
-            };
-            // `pop_chunk` returns the owned bytes (the copy retained for
-            // retransmission); we frame them into `out` ourselves. For a
-            // pure FIN it returns `(offset, [], true)`.
-            if let Some((offset, data, fin)) = s.pop_chunk(max_chunk) {
-                crate::frame::append_stream_header(*sid, offset, fin, data.len(), out)
-                    .map_err(|_| ConnError::Wire)?;
-                out.extend_from_slice(&data);
-                ack_eliciting = true;
-                let data_popped = data.len();
-                cc_budget = cc_budget.saturating_sub(data_popped);
-                conn_fc_budget = conn_fc_budget.saturating_sub(data_popped);
-                data_sent_delta += data_popped as u64;
-                pkt_frames.push(StreamRetx {
-                    sid: *sid,
-                    offset,
-                    fin,
-                    data,
-                });
             }
         }
         self.data_sent = self.data_sent.saturating_add(data_sent_delta);
