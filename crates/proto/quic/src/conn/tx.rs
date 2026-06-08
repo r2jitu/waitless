@@ -294,6 +294,24 @@ impl Connection {
             return Ok(());
         }
 
+        // Established-steady-state no-op fast path. Once both lower PN
+        // spaces are gone (RFC 9001 §4.9), an established conn only ever
+        // emits 1-RTT packets — so if nothing is 1-RTT-pending we can
+        // skip the datagram-buffer acquire (a ~1500 B heap alloc) and
+        // the full encode scan. This is the common case after the
+        // delayed-ACK change: every inbound request triggers a
+        // `process_datagram` flush that, with the ACK held to piggyback
+        // the response, would otherwise build-then-discard an empty
+        // datagram. `has_one_rtt_to_send` is the exact complement of
+        // `encode_one_rtt_packet`'s emission branches.
+        if matches!(self.state, ConnState::Established)
+            && self.initial_keys_discarded
+            && self.handshake_keys_discarded
+            && !self.has_one_rtt_to_send()
+        {
+            return Ok(());
+        }
+
         // Build outbound packets in a single coalesced datagram.
         // Order matters: Initial first, then Handshake, then 1-RTT
         // (RFC 9000 §12.2). Each packet's tx-side CRYPTO bytes
@@ -304,19 +322,24 @@ impl Connection {
         // Skip if we've discarded our Initial keys per RFC 9001 §4.9.1
         // — `initial_send` is None and the matching `ack_pending`
         // state is conservatively cleared so it doesn't pile up.
-        let mut initial_crypto = [0u8; 1024];
-        let initial_n = self
-            .tls
-            .pop_handshake(CryptoLevel::Initial, &mut initial_crypto);
         if self.initial_keys_discarded {
             self.initial_space.ack_pending = false;
-        } else if initial_n > 0 || self.initial_space.ack_pending {
-            self.encode_initial_packet(
-                datagram.vec_mut(),
-                &initial_crypto[..initial_n],
-                self.initial_space.ack_pending,
-            )?;
-            self.initial_space.ack_pending = false;
+        } else {
+            // Only touch the Initial CRYPTO stream while we still hold
+            // Initial keys — skips a 1 KiB stack zero + a pop call per
+            // flush once they're discarded (the established steady state).
+            let mut initial_crypto = [0u8; 1024];
+            let initial_n = self
+                .tls
+                .pop_handshake(CryptoLevel::Initial, &mut initial_crypto);
+            if initial_n > 0 || self.initial_space.ack_pending {
+                self.encode_initial_packet(
+                    datagram.vec_mut(),
+                    &initial_crypto[..initial_n],
+                    self.initial_space.ack_pending,
+                )?;
+                self.initial_space.ack_pending = false;
+            }
         }
 
         // Handshake packet — first fragment, coalesced into this
@@ -526,6 +549,54 @@ impl Connection {
     /// emit (besides the always-coalescable ACK / HANDSHAKE_DONE,
     /// which we already drain in the first pass). Used by
     /// `flush_outbound` to decide whether to emit another packet.
+    /// Would [`encode_one_rtt_packet`](Self::encode_one_rtt_packet)
+    /// emit any frame right now? This mirrors **every** emission branch
+    /// in that function so the established-steady-state no-op flush (the
+    /// common post-`process_datagram` flush once the 1-RTT ACK is
+    /// delayed — RFC 9000 §13.2.1) can skip the datagram-buffer acquire
+    /// + full encode scan entirely.
+    ///
+    /// CORRECTNESS: must return `true` whenever `encode_one_rtt_packet`
+    /// would produce a frame, or that frame is silently dropped. It is
+    /// fine (just less efficient) to return `true` when nothing would be
+    /// emitted. The branches below are kept 1:1 with the encoder (any
+    /// new frame source there must add a branch here); the only consumer
+    /// gates additionally on `Established` + both lower spaces discarded.
+    /// A missed branch would stall an upload (MAX_DATA / MAX_STREAM_DATA
+    /// / ACK never sent) — covered by the GCE h3-upload + keep-alive A/B.
+    fn has_one_rtt_to_send(&self) -> bool {
+        const REFILL_AT: u64 = 256; // STREAM_CREDIT_REFILL_AT
+        const MAX_DATA_WINDOW: u64 = crate::streams::INITIAL_MAX_DATA;
+        const STREAM_DATA_WINDOW: u64 = crate::streams::INITIAL_MAX_STREAM_DATA;
+        // 1-RTT ACK: piggyback (data present) or standalone-due.
+        if self.application_space.ack_pending
+            && (self.has_pending_one_rtt_data() || self.app_ack_due(tls::ticket::now_us()))
+        {
+            return true;
+        }
+        // HANDSHAKE_DONE, MAX_STREAMS (bidi/uni), MAX_DATA.
+        if !self.handshake_done_sent
+            || self.peer_max_streams_bidi_advertised <= self.peer_bidi_streams_opened + REFILL_AT
+            || self.peer_max_streams_uni_advertised <= self.peer_uni_streams_opened + REFILL_AT
+            || self.force_max_data
+            || self.max_data_advertised.saturating_sub(self.data_consumed) <= MAX_DATA_WINDOW / 2
+        {
+            return true;
+        }
+        // Per-stream MAX_STREAM_DATA replenishment.
+        if self.force_max_stream_data
+            || self.recv_streams.values().any(|rs| {
+                !rs.is_closed()
+                    && rs.recv_max.saturating_sub(rs.consumed()) <= STREAM_DATA_WINDOW / 2
+            })
+        {
+            return true;
+        }
+        // 1-RTT CRYPTO (NewSessionTicket / KeyUpdate) and STREAM data
+        // (fresh + retransmit + pending FIN).
+        self.tls.has_pending_one_rtt_crypto() || self.has_pending_one_rtt_data()
+    }
+
     fn has_pending_one_rtt_data(&self) -> bool {
         // Retransmissions waiting to go out (RFC 9000 §13.3).
         if !self.retx_queue.is_empty() {
