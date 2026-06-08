@@ -48,8 +48,9 @@ const MIN_PACE_INTERVAL_US: u64 = 10;
 const LOW_RTT_CAP_THRESHOLD_US: u64 = 1_000;
 
 /// Fixed paced rate for the ultra-low-RTT / pre-sample regime, bytes/s
-/// (100 Mbps). Conservative + stable; below GCE's per-VM egress policer so
-/// downloads complete. Tunable up toward the policer ceiling once profiled.
+/// (4 Gbps). Stable under GCE's per-VM egress policer (vs the uncapped
+/// `cc.pacing_rate()` thrash at sub-ms SRTT) yet high enough not to throttle
+/// the datacenter path. Tunable toward the policer ceiling once profiled.
 const LOW_RTT_PACE_RATE_BPS: u64 = 500_000_000;
 
 /// Burst-budget ceiling, in bytes. Deliberately BELOW one full data packet
@@ -834,7 +835,7 @@ impl Connection {
         // without a MAX_* frame per packet.
         //
         // MAX_DATA: conn-level ceiling above all per-stream limits.
-        const MAX_DATA_WINDOW: u64 = 8 << 20; // matches initial_max_data
+        const MAX_DATA_WINDOW: u64 = crate::streams::INITIAL_MAX_DATA;
         let max_data_threshold =
             self.max_data_advertised.saturating_sub(self.data_consumed) <= MAX_DATA_WINDOW / 2;
         // Emit on the half-window threshold, or when the peer signalled

@@ -36,10 +36,11 @@ pub(crate) fn current_qp() -> Option<usize> {
 /// `udp_gso_available` flag AND `acquire_tx_udp_gso_buf` so they agree
 /// (QUIC's `take_gso_datagram_buf` gates on acquire returning `Some`;
 /// keeping the two in sync is what lets `udp_gso_available` stay the
-/// single switch). ON for this branch to bench GQI UDP-GSO; the DQO
-/// branch in `acquire` still returns `None` until its descriptor path
-/// lands. TODO(productionize): make this per-format runtime detection —
-/// on where the device is verified, off for virtio-without-USO / HVF.
+/// single switch). Per-format: ON for DQO (the device segments UDP
+/// super-packets — see the body), OFF for GQI (unsupported → per-datagram
+/// fallback). TODO(productionize): extend to per-device runtime detection
+/// so virtio-without-USO / HVF also fall back even if a future format adds
+/// the queue type.
 pub(crate) fn udp_gso_enabled() -> bool {
     // HW UDP segmentation is DQO-ONLY on gVNIC. Per Google's gve CHANGELOG
     // (v1.4.10: "Enable support for UDP GSO when using DQO format") the

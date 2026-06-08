@@ -381,13 +381,13 @@ fn initial_keys_install_on_first_packet_path() {
 
 /// Receive flow control (RFC 9000 §4.1): a STREAM frame one byte past
 /// the per-stream window we advertise (`INITIAL_MAX_STREAM_DATA`,
-/// 256 KiB) must trip FLOW_CONTROL_ERROR and schedule a
+/// 2 MiB) must trip FLOW_CONTROL_ERROR and schedule a
 /// CONNECTION_CLOSE — otherwise a peer that ignores the window grows
 /// our recv buffer without bound (heap-OOM on a fixed-heap unikernel).
 #[test]
 fn recv_flow_control_rejects_over_stream_window() {
     let mut conn = Connection::new_server(ConnectionId::new(&[0xab; 8]), [0x42u8; 32]);
-    let over = crate::streams::INITIAL_MAX_STREAM_DATA; // 256 KiB
+    let over = crate::streams::INITIAL_MAX_STREAM_DATA; // 2 MiB
     let mut buf = [0u8; 32];
     // sid 0, offset == window, 1 byte → frame_end = window + 1 > recv_max.
     let n = crate::frame::write_stream(0, over, false, b"x", &mut buf).unwrap();
@@ -414,15 +414,15 @@ fn recv_flow_control_accepts_within_window() {
 }
 
 /// Connection-level window: the sum of per-stream received high-water
-/// marks must not exceed `initial_max_data` (1 MiB) even when each
-/// stream stays inside its own 256 KiB window. Four client-bidi streams
-/// reaching the per-stream edge total exactly 1 MiB (all accepted); a
+/// marks must not exceed `initial_max_data` (8 MiB) even when each
+/// stream stays inside its own 2 MiB window. Four client-bidi streams
+/// reaching the per-stream edge total exactly 8 MiB (all accepted); a
 /// fifth tips it over → FLOW_CONTROL_ERROR. Flow control is
 /// offset-based, so a single byte at a high offset counts in full.
 #[test]
 fn recv_flow_control_rejects_over_conn_window() {
     let mut conn = Connection::new_server(ConnectionId::new(&[0xab; 8]), [0x42u8; 32]);
-    let edge = crate::streams::INITIAL_MAX_STREAM_DATA - 1; // 256 KiB - 1
+    let edge = crate::streams::INITIAL_MAX_STREAM_DATA - 1; // 2 MiB - 1
     for sid in [0u64, 4, 8, 12] {
         let mut buf = [0u8; 32];
         let n = crate::frame::write_stream(sid, edge, false, b"x", &mut buf).unwrap();

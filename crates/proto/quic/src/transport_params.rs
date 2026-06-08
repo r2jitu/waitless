@@ -82,10 +82,10 @@ impl<'a> ServerParams<'a> {
         ServerParams {
             original_destination_connection_id: odcid,
             initial_source_connection_id: iscid,
-            initial_max_data: 8 << 20,                    // 8 MiB
-            initial_max_stream_data_bidi_local: 2 << 20,  // 2 MiB
-            initial_max_stream_data_bidi_remote: 2 << 20, // 2 MiB
-            initial_max_stream_data_uni: 2 << 20,         // 2 MiB
+            initial_max_data: crate::streams::INITIAL_MAX_DATA,
+            initial_max_stream_data_bidi_local: crate::streams::INITIAL_MAX_STREAM_DATA,
+            initial_max_stream_data_bidi_remote: crate::streams::INITIAL_MAX_STREAM_DATA,
+            initial_max_stream_data_uni: crate::streams::INITIAL_MAX_STREAM_DATA,
             // Initial bidi-stream credit. The peer can open this
             // many bidirectional streams before they MUST stop and
             // wait for a MAX_STREAMS frame from us. We replenish

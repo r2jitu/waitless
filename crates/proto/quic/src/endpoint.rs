@@ -301,7 +301,7 @@ impl QuicConn {
     /// downstream layer (the H3 framing prefix builder, for
     /// example) has already prepended into. The IOBuf moves into
     /// the SendStream's chunk chain; lower layers still don't
-    /// touch the headroom — pop_chunk_into reads only the
+    /// touch the headroom — pop_chunk reads only the
     /// visible payload via `IOBuf::data()`. Callers that want
     /// a per-request IOBuf scratch / pool plumb the `Drop`-on-
     /// chunk-completion pathway (future work).

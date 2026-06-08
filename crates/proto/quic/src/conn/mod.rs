@@ -192,14 +192,11 @@ pub(super) struct SentPacket {
     /// in-flight. RFC 9002 §2: a packet is in flight iff it's ack-
     /// eliciting, or contains PADDING. We piggyback on `ack_eliciting`
     /// for the simple cases — both flags currently coincide for our
-    /// stack (we don't pad-only) but keep them split for clarity and
-    /// to ease future congestion-control work.
-    #[allow(dead_code)] // reserved for the eventual congestion controller
+    /// stack (we don't pad-only) but keep them split for clarity.
+    /// Read by `detect_loss` / `process_ack` to drive `bytes_in_flight`.
     pub(super) in_flight: bool,
-    /// On-the-wire byte count of the sealed packet. Drives bytes-
-    /// in-flight; not used yet but recorded for the eventual
-    /// congestion controller.
-    #[allow(dead_code)] // reserved for the eventual congestion controller
+    /// On-the-wire byte count of the sealed packet. Drives
+    /// `bytes_in_flight` (the cwnd gate) on send/ack/loss.
     pub(super) byte_count: u32,
     /// STREAM frames this packet carried, retained for retransmission
     /// (RFC 9002 §6 / RFC 9000 §13.3). On loss these move to
@@ -876,7 +873,8 @@ pub struct Connection {
 
     /// Egress pacing token bucket (RFC 9002 §7.7). `pace_budget` is send
     /// credit in bytes — it goes negative after a burst and refills at the
-    /// paced rate (`min(cc.pacing_rate(), MAX_PACE_RATE)`), capped at
+    /// paced rate (`pace_rate()`: the srtt-gated `cc.pacing_rate()`, or the
+    /// fixed `LOW_RTT_PACE_RATE_BPS` in the ultra-low-RTT regime), capped at
     /// `MAX_PACE_BURST`. The flush tail loop gates 1-RTT data emission on
     /// it; the conn task arms `pace_deadline_us()` to resume when credit
     /// accrues. This bounds the per-flush microburst so GCE's per-VM egress
@@ -967,9 +965,9 @@ impl Connection {
             peer_max_streams_bidi_advertised: 1024,
             peer_max_streams_uni_advertised: 1024,
             data_consumed: 0,
-            // Must match `transport_params::ServerParams::defaults`'s
-            // initial_max_data (8 MiB) — the initial conn-level window.
-            max_data_advertised: 8 << 20,
+            // The initial conn-level window we advertise (matches the
+            // `initial_max_data` transport param via the shared const).
+            max_data_advertised: crate::streams::INITIAL_MAX_DATA,
             data_received: 0,
             force_max_data: false,
             force_max_stream_data: false,
@@ -1403,7 +1401,7 @@ impl Connection {
         }
         // Mirror the encode's window constants (tx.rs).
         const STREAM_DATA_WINDOW: u64 = crate::streams::INITIAL_MAX_STREAM_DATA;
-        const MAX_DATA_WINDOW: u64 = 8 << 20;
+        const MAX_DATA_WINDOW: u64 = crate::streams::INITIAL_MAX_DATA;
         if self
             .max_data_advertised
             .saturating_sub(self.data_consumed)
@@ -1480,7 +1478,7 @@ impl Connection {
     /// chunk chain by move. Use this when the caller already
     /// holds a built buffer (e.g. an H3 response payload) so
     /// we don't memcpy the whole thing into the SendStream.
-    /// Subsequent `pop_chunk_into` calls drain from this Vec
+    /// Subsequent `pop_chunk` calls drain from this Vec
     /// directly into the datagram payload region.
     pub fn stream_send_owned(&mut self, sid: u64, data: Vec<u8>) {
         self.ensure_send_stream(sid).write_owned(data);
@@ -1492,7 +1490,7 @@ impl Connection {
     /// buffer with reserved headroom (so a layer below can
     /// prepend its header in place) plus the payload bytes
     /// already written. The IOBuf moves into the SendStream's
-    /// VecDeque; subsequent `pop_chunk_into` calls drain its
+    /// VecDeque; subsequent `pop_chunk` calls read its
     /// `data()` slice straight into the packet's frames buffer.
     pub fn stream_send_iobuf(&mut self, sid: u64, data: iobuf::IOBuf) {
         self.ensure_send_stream(sid).write_iobuf(data);

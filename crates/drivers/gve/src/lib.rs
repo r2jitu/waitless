@@ -696,12 +696,11 @@ static GVE_OPS: NicOps = NicOps {
     // UDP-GSO via the same TSO descriptor shape with
     // l4_csum_offset = 3 (UDP cksum at byte 6 of UDP header). The
     // device picks TCP vs UDP segmentation from the IP-header
-    // protocol field. Upstream Linux gve doesn't currently
-    // advertise `NETIF_F_GSO_UDP_L4`, so live device support on
-    // GCE is unverified — the descriptor path is wired and
-    // bench-validatable by flipping `udp_gso_available` to
-    // `|| true`. Default off keeps callers on the per-datagram
-    // small-pool path until we confirm.
+    // protocol field. DQO-only (`udp_gso_enabled`): per Google's gve
+    // CHANGELOG (v1.4.10) the device segments UDP super-packets in
+    // DQO mode — c3/DQO-validated (tcpdump: device emitted segmented
+    // packets, client HW-GRO'd them; 0 failed). GQI doesn't support
+    // it → per-datagram fallback there.
     udp_gso_available: tx::udp_gso_enabled,
     acquire_tx_udp_gso_buf: Some(tx::acquire_tx_udp_gso_buf),
     submit_tx_udp_gso: Some(tx::submit_tx_udp_gso),

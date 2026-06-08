@@ -50,9 +50,19 @@ use alloc::vec::Vec;
 /// `transport_params::ServerParams::defaults`). A fresh `RecvStream`
 /// starts crediting the peer this many bytes; the limit then slides
 /// forward as the app consumes (MAX_STREAM_DATA emission in
-/// `Connection::encode_app_packet`). Must stay in sync with the
-/// transport-param defaults — both are 2 MiB.
+/// `Connection::encode_app_packet`). The transport-param defaults seed
+/// from this single value.
 pub(crate) const INITIAL_MAX_STREAM_DATA: u64 = 2 << 20;
+
+/// Initial connection-level receive limit (summed across all streams)
+/// we advertise (= `initial_max_data` in
+/// `transport_params::ServerParams::defaults`). The conn-level analog of
+/// [`INITIAL_MAX_STREAM_DATA`]: it slides forward as the app consumes
+/// (MAX_DATA emission in `Connection::encode_app_packet`). Single source
+/// for the advertised value, the encode-side replenish window, and the
+/// recv-credit gate — they must agree or the peer sees a window go
+/// backwards (FLOW_CONTROL_ERROR) or an upload deadlocks.
+pub(crate) const INITIAL_MAX_DATA: u64 = 8 << 20;
 
 /// QUIC stream type bits (RFC 9000 §2.1).
 pub mod stream_type {
@@ -345,12 +355,12 @@ pub enum SendState {
 }
 
 /// Per-stream send state. The connection layer drives
-/// `pop_chunk_into` on each outbound 1-RTT packet build.
+/// `pop_chunk` on each outbound 1-RTT packet build.
 ///
 /// Outbound bytes are held as a chain of [`iobuf::IOBuf`]
 /// chunks — static-borrowed, heap-owned, or (in future) shared
 /// with refcount. `head_consumed` tracks how many bytes of the
-/// FRONT chunk have already been emitted in prior pop_chunk_into
+/// FRONT chunk have already been emitted in prior pop_chunk
 /// calls; only the head needs a cursor (later chunks are
 /// untouched until they reach the front). Once the head is
 /// fully consumed it's `pop_front`'d and the cursor resets to 0.
@@ -371,7 +381,7 @@ pub struct SendStream {
     /// each time we pop_front.
     pub head_consumed: usize,
     /// Offset of the next byte to send. Increments by chunk size
-    /// per `pop_chunk_into` call.
+    /// per `pop_chunk` call.
     pub send_offset: u64,
     /// Lifecycle — replaces (`close_after_drain`, `fin_sent`).
     pub state: SendState,
@@ -506,10 +516,11 @@ impl SendStream {
         }
     }
 
-    /// Pop up to `max_bytes` from the front of the chunk chain
-    /// as an owned Vec. Used by callers that want an owned
-    /// chunk back; the hot path is `pop_chunk_into` which
-    /// avoids the intermediate allocation.
+    /// Pop up to `max_bytes` from the front of the chunk chain as an
+    /// owned Vec, returning `(offset, bytes, fin)`. The owned copy is
+    /// what the encode path retains as a `StreamRetx` for
+    /// retransmission (RFC 9002 §6), so this is the live drain path. A
+    /// `Closing` stream with empty `outbound` yields a zero-length FIN.
     pub fn pop_chunk(&mut self, max_bytes: usize) -> Option<(u64, Vec<u8>, bool)> {
         match self.state {
             SendState::FinSent => return None,
@@ -535,51 +546,6 @@ impl SendStream {
             self.enter_fin_sent();
         }
         Some((offset, chunk, fin))
-    }
-
-    /// Allocation-free variant of `pop_chunk`: appends the
-    /// STREAM frame (header + body + FIN bit) directly into
-    /// `frames_out` by reading bytes from the head IOBuf via
-    /// its `data()` slice.
-    pub fn pop_chunk_into(
-        &mut self,
-        stream_id: u64,
-        max_bytes: usize,
-        frames_out: &mut Vec<u8>,
-    ) -> Result<bool, crate::frame::FrameError> {
-        match self.state {
-            SendState::FinSent => return Ok(false),
-            SendState::Open if self.outbound.is_empty() => return Ok(false),
-            _ => {}
-        }
-        let offset = self.send_offset;
-
-        if self.outbound.is_empty() {
-            // Closing with no queued data → zero-byte FIN.
-            crate::frame::append_stream_header(stream_id, offset, true, 0, frames_out)?;
-            self.enter_fin_sent();
-            return Ok(true);
-        }
-
-        let head_remaining = self.head_remaining_len();
-        let n = head_remaining.min(max_bytes);
-        // FIN iff: closing AND this drain empties the entire
-        // chain (head fully consumed AND no chunks behind it).
-        let fin = matches!(self.state, SendState::Closing)
-            && n == head_remaining
-            && self.outbound.len() == 1;
-
-        crate::frame::append_stream_header(stream_id, offset, fin, n, frames_out)?;
-        {
-            let head = self.outbound.front().unwrap();
-            frames_out.extend_from_slice(&head.data()[self.head_consumed..self.head_consumed + n]);
-        }
-        self.advance_head(n);
-        self.send_offset += n as u64;
-        if fin {
-            self.enter_fin_sent();
-        }
-        Ok(true)
     }
 }
 
