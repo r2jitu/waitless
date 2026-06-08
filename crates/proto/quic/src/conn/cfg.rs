@@ -534,6 +534,35 @@ fn detect_loss_recovers_more_than_64_at_once() {
     assert_eq!(conn.retx_queue.len(), 67, "every lost STREAM frame requeued");
 }
 
+/// Persistent congestion (RFC 9002 §7.6): once several consecutive PTO
+/// periods elapse with no ACK, the congestion window collapses to the
+/// minimum and slow start restarts. Regression for the gap where
+/// `on_rto`/`on_loss(persistent)` were implemented in the controller but
+/// never invoked from the QUIC path, so cwnd never backed off on a path
+/// outage.
+#[test]
+fn repeated_pto_triggers_persistent_congestion_collapse() {
+    use net_cc::CongestionControl;
+    let mut conn = Connection::new_server(ConnectionId::new(&[0xab; 8]), [0x42u8; 32]);
+    let secrets = derive_initial_secrets(&[0xcd; 8]);
+    conn.application_send = Some(super::keys::DirKeys::from_aes128(&derive_initial_keys(
+        &secrets.server,
+    )));
+    // An in-flight ack-eliciting packet so `send_pto_probe` has a space
+    // to probe.
+    conn.record_sent_packet(crate::CryptoLevel::OneRtt, 0, true, 1200);
+    let cwnd_before = conn.cc.window();
+    // First PTO probe: backoff only, no collapse.
+    assert!(conn.send_pto_probe(), "probe emitted");
+    assert_eq!(conn.cc.window(), cwnd_before, "single PTO must not collapse cwnd");
+    // Second consecutive PTO (no ACK in between) → persistent congestion.
+    assert!(conn.send_pto_probe(), "probe emitted");
+    assert!(
+        conn.cc.window() < cwnd_before,
+        "repeated PTO collapses cwnd toward the minimum window"
+    );
+}
+
 /// PTO exponential backoff (RFC 9002 §6.2.1): the probe period doubles
 /// per `pto_count` and the exponent is capped so an unresponsive peer
 /// probes at a geometric (not fixed) interval. A missing backoff is what

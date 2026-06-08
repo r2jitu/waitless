@@ -88,6 +88,21 @@ impl Connection {
             // Back off the next PTO (RFC 9002 §6.2.1). Reset in `process_ack`
             // when an ACK acknowledges new data.
             self.pto_count = self.pto_count.saturating_add(1);
+            // Persistent congestion (RFC 9002 §7.6): once several
+            // consecutive PTO periods have elapsed with no ACK, the path
+            // is genuinely congested/down, not just bursty — collapse the
+            // window to the minimum and restart slow start. We use the
+            // PTO count as the trigger (rather than the §7.6.1 lost-time-
+            // span test) because it CANNOT false-fire on transient burst
+            // loss: `pto_count` only grows while the peer is silent and
+            // resets to 0 on any newly-acked data. At the threshold the
+            // peer has been quiet across ~PTO·(1+2)=3 PTO periods — the
+            // ~3× span §7.6.1 looks for. Fire once at the crossing
+            // (`==`), not on every later probe.
+            const PERSISTENT_CONGESTION_PTO_THRESHOLD: u32 = 2;
+            if self.pto_count == PERSISTENT_CONGESTION_PTO_THRESHOLD {
+                self.cc.on_rto();
+            }
             return true;
         }
         false
