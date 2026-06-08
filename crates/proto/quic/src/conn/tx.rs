@@ -741,7 +741,9 @@ impl Connection {
     /// follow, AEAD seals in place. Saves one full memcpy of the
     /// packet body per emitted packet vs. the old "build frames in
     /// scratch, then extend_from_slice into datagram" path.
-    fn encode_one_rtt_packet(&mut self, out: &mut Vec<u8>) -> Result<(), ConnError> {
+    // `pub(super)` so the conn::cfg unit tests can drive a single 1-RTT
+    // packet build directly (e.g. the FIN-at-FC-boundary regression).
+    pub(super) fn encode_one_rtt_packet(&mut self, out: &mut Vec<u8>) -> Result<(), ConnError> {
         self.encode_one_rtt_packet_padded(out, None)
     }
 
@@ -988,30 +990,47 @@ impl Connection {
         let mut conn_fc_budget = self.peer_max_data.saturating_sub(self.data_sent) as usize;
         let mut data_sent_delta: u64 = 0;
         for (sid, s) in self.send_streams.iter_mut() {
-            // cwnd / conn-level FC are global — once exhausted no stream
-            // can send this packet.
-            if cc_budget == 0 || conn_fc_budget == 0 {
-                break;
-            }
             let body_so_far = out.len() - payload_offset;
             if body_so_far >= PACKET_BODY_BUDGET {
-                break;
+                break; // packet full; remaining streams flush next packet
             }
-            // Per-stream send FC: bytes still authorized on this stream.
-            let stream_fc_budget = s.peer_max_stream_data.saturating_sub(s.send_offset) as usize;
-            let max_chunk = PACKET_BODY_BUDGET
-                .saturating_sub(body_so_far + 16)
-                .min(cc_budget)
-                .min(conn_fc_budget)
-                .min(stream_fc_budget);
-            if max_chunk == 0 {
-                // This stream is flow-control- (or packet-) blocked; its
-                // data stays queued (backpressuring the handler). Other
-                // streams may still have credit, so try the next.
-                continue;
-            }
+            // A `Closing` stream with empty `outbound` has only a
+            // zero-length FIN left to send. A FIN consumes no flow-control
+            // or congestion credit (RFC 9000 §4.1 / §19.8), so it MUST be
+            // emitted regardless of the cc / conn / stream budgets:
+            // gating it on data budget deadlocks the close when the body
+            // exactly filled the send window (or cwnd / conn-FC is
+            // momentarily 0) — the peer would wait forever for stream end.
+            // Only per-packet room matters.
+            let pure_fin =
+                matches!(s.state, crate::streams::SendState::Closing) && s.outbound.is_empty();
+            let max_chunk = if pure_fin {
+                0 // pop_chunk(0) on a Closing+empty stream yields the FIN
+            } else {
+                // DATA is gated by cwnd + send-side flow control. cwnd and
+                // conn-level FC are global; per-stream FC is per stream.
+                // `continue` (not `break`) so a later stream's pending FIN
+                // is still reached even when DATA budget is exhausted.
+                if cc_budget == 0 || conn_fc_budget == 0 {
+                    continue;
+                }
+                let stream_fc_budget =
+                    s.peer_max_stream_data.saturating_sub(s.send_offset) as usize;
+                let mc = PACKET_BODY_BUDGET
+                    .saturating_sub(body_so_far + 16)
+                    .min(cc_budget)
+                    .min(conn_fc_budget)
+                    .min(stream_fc_budget);
+                if mc == 0 {
+                    // FC- (or packet-) blocked DATA stays queued
+                    // (backpressuring the handler); try the next stream.
+                    continue;
+                }
+                mc
+            };
             // `pop_chunk` returns the owned bytes (the copy retained for
-            // retransmission); we frame them into `out` ourselves.
+            // retransmission); we frame them into `out` ourselves. For a
+            // pure FIN it returns `(offset, [], true)`.
             if let Some((offset, data, fin)) = s.pop_chunk(max_chunk) {
                 crate::frame::append_stream_header(*sid, offset, fin, data.len(), out)
                     .map_err(|_| ConnError::Wire)?;

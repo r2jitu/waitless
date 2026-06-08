@@ -441,6 +441,44 @@ fn recv_flow_control_rejects_over_conn_window() {
     assert_eq!(close.0, 0x03, "FLOW_CONTROL_ERROR");
 }
 
+/// Regression: a stream whose body exactly fills the granted send
+/// window (or whose conn-level credit is momentarily 0) must still emit
+/// its zero-length FIN. A FIN consumes no flow-control / congestion
+/// credit (RFC 9000 §4.1 / §19.8); gating it on data budget deadlocked
+/// the close — the peer waited forever for stream end → idle timeout.
+#[test]
+fn pure_fin_emitted_at_flow_control_boundary() {
+    use crate::streams::SendState;
+    let mut conn = Connection::new_server(ConnectionId::new(&[0xab; 8]), [0x42u8; 32]);
+    // 1-RTT send keys so `encode_one_rtt_packet` produces an app packet
+    // (it no-ops without them); the key bytes are irrelevant here.
+    let secrets = derive_initial_secrets(&[0xcd; 8]);
+    conn.application_send = Some(super::keys::DirKeys::from_aes128(&derive_initial_keys(
+        &secrets.server,
+    )));
+    // A response on client-bidi stream 0 whose body exactly fills the
+    // granted windows (stream + conn both == body length).
+    conn.stream_send_owned(0, alloc::vec![0xABu8; 100]);
+    conn.send_streams.get_mut(&0).unwrap().peer_max_stream_data = 100;
+    conn.peer_max_data = 100;
+    // First flush drains the whole 100-byte body (within window).
+    let mut out = alloc::vec::Vec::new();
+    conn.encode_one_rtt_packet(&mut out).unwrap();
+    assert_eq!(conn.send_streams[&0].send_offset, 100, "body fully sent");
+    // Close → only a zero-length FIN remains, at the exact FC boundary
+    // (send_offset == peer_max_stream_data, data_sent == peer_max_data).
+    conn.send_streams.get_mut(&0).unwrap().close();
+    assert_eq!(conn.send_streams[&0].state, SendState::Closing);
+    // Second flush MUST emit the FIN despite zero stream/conn DATA budget.
+    let mut out2 = alloc::vec::Vec::new();
+    conn.encode_one_rtt_packet(&mut out2).unwrap();
+    assert_ne!(
+        conn.send_streams.get(&0).map(|s| s.state),
+        Some(SendState::Closing),
+        "FIN must be emitted at the FC boundary (was deadlocked in Closing)"
+    );
+}
+
 /// PTO exponential backoff (RFC 9002 §6.2.1): the probe period doubles
 /// per `pto_count` and the exponent is capped so an unresponsive peer
 /// probes at a geometric (not fixed) interval. A missing backoff is what
