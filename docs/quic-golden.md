@@ -340,14 +340,28 @@ as conns rise (more parked time, not more work). Confirms the cap wasn't the
 bottleneck; the latency bound is. Kept as a real NAT-robustness / max-
 concurrency-design fix, not a throughput lever.
 
-**The actual parity lever (deferred — structural, needs explicit go-ahead):**
-cut the per-request **cross-task latency**. The 48% residual + the latency
-bound both point at the conn-task→h3-handler-task→conn-task hops. Serving a
-synchronously-ready h3 response (e.g. bodyless GET /health) inline in the conn
-task — instead of waking a per-stream handler task — would shorten the
-critical path and raise the latency-bound ceiling, but it must preserve the
-head-of-line-blocking fix (task #30) for handlers that genuinely await. Larger
-+ riskier than a micro-opt; profile-justified but out of scope here.
+**Inline-dispatch lever — investigated and FALSIFIED by latency decomposition.**
+The hypothesis was that the conn_task→handler cross-task hop added ~100 µs to
+each request (the h3-vs-h1 P50 delta of ~125 µs). The server's own
+`request_latency_us` histogram (listener-recv → response encoded+shipped, the
+full server-side path *including* the hop) settles it: **P50 64 µs / mean
+120 µs**, of which **`inbox_wait_us` is P50 32 µs / mean 52 µs** (datagram
+queued behind other work — load-dependent, not a fixed hop). So the entire
+server contribution is ~64 µs and the conn_task→handler hop is only ~10–15 µs
+of it; the ~280 µs the client sees is dominated by network RTT + the heavier
+QUIC client (the loadgen saturates generating QUIC at ~235 K — it, plus path
+RTT, sets the observed latency, not a server stall). Reading the code also
+corrected the model: h3 requests are *already* dispatched inline within
+`handle_conn` (task #30's per-request spawn was reverted — the conn's
+`progress` `AsyncEvent` is single-waiter), and the handler ships its own
+response (`drain_outbound`), so there is no spawn-per-request and no
+wait-for-conn_task-to-ship hop to remove. Inline-merging the generic async
+handler into the conn task would shave ~10–15 µs (<5 %, below the ±15 % spot
+floor) while fighting the deliberate wire/handler isolation (a slow handler
+must not stall wire service) and the single-waiter event — a bad trade. Not
+pursued. **Net: the h3 /health server path is already near its floor (~64 µs
+RX→TX); the residual gap to h1 is the QUIC client cost + per-packet transport,
+not a fixable server-side hop.**
 
 ## Characterized future work (profile-justified, not core to this goal)
 - Remaining small-resp h3 gap: PROVEN (commits `d7a8dcc` packets/req delta +
