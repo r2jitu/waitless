@@ -195,32 +195,53 @@ genuine work per loop. So h3's 100 % is real per-request work. CPU/req =
 does ≥1.06 M pps; h3's ~866 K-pps ceiling is its *own* CPU limit, not the NIC's.
 
 **So the root cause is: each h3 request costs ~2× the server CPU of an h1
-request, so the CPU-bound throughput ceiling is ~2× lower.** That ~2× CPU/req
-decomposes into **(a) 1.75× more packets/req** (3.5 vs 2.0) × **(b) ~1.19× more
-CPU/packet** (QUIC's per-packet AEAD-open/seal + HP + framing + FC accounting
-vs a TCP segment); 1.75 × 1.19 = 2.08 ≈ the measured 2.1×.
+request, so the CPU-bound throughput ceiling is ~2× lower.** The remaining
+question — and the part this section originally got wrong — is *what* that 2×
+CPU/req is spent on.
 
-Why every prior lever read as "throughput-neutral": **they were all A/B'd at
-par=64, where the cores are ~30 % idle (latency/arrival-bound) — cutting CPU
-work there frees idle headroom, not throughput.** At saturation (par≥128) the
-cores are 100 % CPU-bound, so cutting CPU/req *is* a throughput lever. The
-benchmark operating point, not the optimization, was wrong.
+### The packets/req hypothesis — and why it's WRONG (measured)
 
-**The lever — cut h3 packets/req, validated at saturation.** h3 = 1.5 in +
-**2.0 out**. The /health response (~250 B) fits one QUIC packet, and the
-deferred-ACK logic (tx.rs:568) already holds the ACK — so the +1.0 outbound is
-the **RX-time credit-replenishment flush**: HTTP/3 opens a fresh bidi stream per
-request, so consumed MAX_STREAMS / MAX_DATA / MAX_STREAM_DATA cross the
-`window/2` threshold every request → `has_one_rtt_to_send()` is true at RX → a
-control packet (carrying the deferred ACK) ships *before* the handler's
-response. `flush_calls = 2.0/req` = RX-time control flush + response flush.
-Deferring those credit frames like the delayed ACK (piggyback on the response
-or a deadline, never eager at RX) coalesces ACK + MAX_* + response into ONE
-packet → h3 ~3.5 → ~2.5 pkts/req, freeing ~28 % of the per-packet CPU →
-projected **~+30–40 % h3 throughput at saturation** (and compounding: fewer
-ack-eliciting server packets → client ACKs ~half as often → RX may fall too).
-⚠️ Implement via a deferral *timer* (the delayed-ACK mechanism), NOT a
-flush-deferral — a naive batch-flush coalescing was tried before and **broke h3
-hard** (the handler is a separate task; deferring the flush orphaned the
-response). Validate with a par=256 A/B on `udp.tx_datagrams`/req + rps, not
-par=64.
+The tempting decomposition was **(a) 1.75× more packets/req** (h3 3.5 vs h1
+2.0) × **(b) ~1.19× CPU/packet** (QUIC per-packet AEAD/HP/framing) = 2.08 ≈ the
+2.1×. The arithmetic fits, so I tested the (a) half directly. h3's +1.0
+outbound packet/req is **not** the response (~250 B fits one packet) and **not**
+MAX_STREAMS (deferring that changed nothing); instrumenting with `pkts_ack_only`
+/ `pkts_no_stream` showed it is a **standalone pure ACK** (1.0/req): the
+conn-task's RX flush hits the "≥2 ack-eliciting" rule (`app_ack_due`)
+microseconds *before* the separate handler task produces the response, so the
+ACK can't piggyback.
+
+Raising the ACK threshold (`APP_ACK_ELICIT_THRESHOLD` 2 → 8) makes the imminent
+response win the race and carry the ACK: **outbound packets dropped 2.0 → 1.0/req,
+pure-ACK 1.0 → 0.0** (hard `/obs` counters), uploads stayed correct (failed=0,
+no stall). **But throughput at par=256 was flat: 247 K → 254 K (within the
+±15 % spot noise), still 100 % CPU.** Halving the outbound packets at 100 % CPU
+bought ~0 throughput — because the standalone ACK is a *cheap* ~36 B packet, so
+its seal/ship is a tiny slice of per-request CPU.
+
+**Conclusion: packets/req is NOT what makes h3 cost 2× the CPU.** The packet-
+count decomposition was a coincidental fit. The real 2× is the **diffuse
+per-request QUIC + h3 *processing*** — per-packet AEAD-open on the request and
+AEAD-seal on the response, QPACK decode/encode, the async conn-task↔handler
+orchestration, and H3 framing — none of which the packet count touches. This is
+the same "no single hotspot, diffuse orchestration" the cycle decomposition
+found earlier (§ Per-request decomposition), now confirmed at *saturation* with
+the packet-count red herring ruled out.
+
+So the par=64 "throughput-neutral to every lever" result was NOT just a
+wrong-operating-point artifact: even at saturation, cutting per-request packets
+is throughput-neutral. **There is no cheap server-side throughput lever for h3
+/health — the ~2× CPU/req gap is intrinsic to QUIC+HTTP/3's per-request work.**
+Moving it needs a structural reduction in per-request processing (e.g. fewer
+AEAD passes, lighter framing), not packet-count or ACK-timing tweaks.
+
+### What was kept
+
+The ACK-coalescing (`APP_ACK_ELICIT_THRESHOLD` = 8) is kept as an **efficiency**
+improvement, not a throughput one: it halves h3 small-response egress packets
+(1 packet/response, like h1/h2), is RFC 9000 §13.2.1-compliant (the "every 2"
+is a SHOULD; `max_ack_delay` still bounds it), reduces NIC egress pps and the
+standalone-ACK amplification under real multi-client load, and is upload-safe
+(1 MiB / 8 MiB h3 uploads complete failed=0, `handler_stuck`/`idle_timeouts`/
+loss all 0). The `pkts_ack_only` / `pkts_no_stream` counters are kept as
+permanent obs. The MAX_STREAMS-deferral experiment was reverted (ineffective).
