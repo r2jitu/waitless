@@ -1,6 +1,6 @@
 # TCP backlog — RFC conformance + Linux performance parity
 
-Last updated 2026-05-31.
+Last updated 2026-06-09.
 
 The authoritative TCP work queue: *pending* RFC-conformance gaps (T-items)
 and the performance features Linux's kernel TCP has that ours doesn't
@@ -97,6 +97,18 @@ future ACK (`ack > snd_nxt`); assert `snd_una` is unchanged and the
 retransmit ring is intact, and that the future ACK elicits a bare ACK.
 
 ### T2 — Received MSS option ignored; send MSS hardcoded; no PMTUD
+
+> **Status (2026-06-09):** the receive half is ✅ done (`74e53e1`): the
+> SYN's MSS option is parsed (`parse_syn_options`) and the negotiated
+> `snd_mss = min(local, peer).max(536)` drives every segmentation site
+> including retransmit re-segmentation. It fixed a live production
+> failure — a 5G/NAT64 path MSS-clamped the SYN to ~1220, our 1460-byte
+> TLS cert flight was silently dropped, and cold (incognito) h2 loads
+> stalled deterministically. Still open, tracked as the follow-up
+> hardening task: *sending* our MSS option in the SYN-ACK (peers
+> currently assume 536 toward us, shrinking upload segments) and PMTUD
+> (ICMP Packet-Too-Big) for the advertise-large-but-path-small case.
+
 
 **What.** The SYN handler never parses the peer's `MSS` option and
 `send_segment` never emits one (`data_offset` is hardcoded to a
@@ -449,7 +461,9 @@ Dependency-ordered, test-first per item:
 1. ✅ **T1** (ACK validation) — done.
 2. ✅ **T6 window scaling** (RFC 7323 Window Scale) — done & GCE-validated.
    Timestamps + PAWS remain (the rest of T6).
-3. **T2** (MSS option + clamp) — removes the sub-1500-MTU blackhole.
+3. ✅ **T2** (peer-MSS honor + clamp) — done (`74e53e1`); fixed the live
+   5G/NAT64 cert-flight blackhole. SYN-ACK MSS advertise + PMTUD remain
+   (follow-up hardening).
 4. **T4 + T5** (SYN-on-sync + RFC 5961 challenge ACKs) — one coherent
    hardening change.
 5. **T3** (out-of-order reassembly) — the big one; unblocks T7/T8.

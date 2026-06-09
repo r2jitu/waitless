@@ -43,6 +43,16 @@ pub(crate) static TX_LOCK: sync::Spinlock<()> = sync::Spinlock::new(());
 /// 0 = not stalled. One global cell: a real stall only ever arises on
 /// the contended/coherence-starved ring, so cross-worker coupling under
 /// healthy load (where it's never armed) is a non-issue.
+///
+/// KNOWN LIMITATION: this predicate is claim-based — the budget is time
+/// since *this call* started without getting a slot — so it would
+/// misfire under sustained pool-full saturation with a live device
+/// (gve/gqi measured exactly that at NIC line rate and uses a
+/// progress-based predicate instead: budget restarts whenever
+/// `done_cnt` advances; see `gqi::acquire_tx_buf_for_qp`). Harmless
+/// here today because no virtio workload fills the pool (~30.8M pkts →
+/// 0 full-pool spins on the kvm bench); adopt the progress predicate
+/// if that changes, or when the two breakers are unified.
 static TX_STALL_UNTIL: AtomicU64 = AtomicU64::new(0);
 
 // ---- TX drain ---------------------------------------------------------------
@@ -268,8 +278,8 @@ pub(crate) fn acquire_tx_buf() -> Option<nic_api::TxBufHandle> {
     // budget is ~1000× a healthy free latency, so it never trips under
     // normal saturation. While the cooldown is armed every full-pool
     // acquire fast-fails after one cheap drain — keeping each call O(µs)
-    // so even a sender that floods the dead ring (QUIC has no congestion
-    // controller yet, so a stalled stream keeps producing) drains as a
+    // so even a sender that floods the dead ring (retransmission / PTO
+    // timers keep firing into a stalled path) drains as a
     // brief burst and the event loop stays live. Callers honor the `None`
     // contract: QUIC falls back to a Heap datagram (then `submit_tx` drops
     // on full) and retransmits; TCP resends. The cooldown self-clears on

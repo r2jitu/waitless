@@ -47,9 +47,9 @@ one is in good shape:
 | RX buffer | **owned `Chain<OwnedIOBuf>`**, zero-copy, retainable | **borrowed `&[u8]`**, must be consumed synchronously |
 | RX copies to app | 1 (0 on the `recv_chunk` stash fast path) | 4–5 (inbox → conn inbox → RecvStream → h3 chunk → h3 scratch) |
 | byte-sequence type | `Chain<IOBuf>` + `Cursor` | `VecDeque<IOBuf>` + hand-rolled `head_consumed` cursor |
-| stream abstraction | `HttpStream` trait (clean, generic) | none — `NullStream` stub + bespoke sid-keyed `QuicConn` API |
-| HTTP body | streamed lazily through `BodyReader` | **fully buffered** (16 KiB `RECV_CAP`), then replayed |
-| handler signature | `(&Request, &mut BodyReader<S>)` | `(Request, &mut BodyReader<NullStream>)` + `Clone` |
+| stream abstraction | `HttpStream` trait (clean, generic) | shared `ResponseSink`/`BodyReader` at the handler seam (`NullStream` deleted, 2026-06); transport internals still sid-keyed — the `ByteStream` trait (Contract 2) remains open |
+| HTTP body | streamed lazily through `BodyReader` | streamed both directions (2026-06): bounded request-body streaming + `res.write()` response streaming under QUIC stream flow control |
+| handler signature | unified `(&mut Request, &mut Response<'_>)` | same — converged (streaming-response, 2026-06) |
 
 Stack B is the stated differentiator (QUIC-over-async — see
 [`conformance-roadmap.md`](conformance-roadmap.md)), yet it runs the slower,
@@ -183,9 +183,11 @@ that gets harder to change the longer h3 ships with a stub.
 - `HttpStream` (`//crates/proto/http/src/stream.rs`) is the shared byte-I/O
   trait — but only Stack A fits it. It is `&mut self`, one-object-per-connection.
 - QUIC is `&self`, sid-multiplexed (one `QuicConn` multiplexes N streams), so h3
-  **bypasses the trait**: it uses a `NullStream` stub whose `send` panics, and
-  does real I/O through `QuicConn::{accept_stream, recv(sid,&mut [u8]), send_iobuf,
-  close_stream}` (`//crates/proto/quic/src/endpoint.rs`).
+  **bypasses the trait** and does real I/O through `QuicConn::{accept_stream,
+  recv(sid,&mut [u8]), send_iobuf, close_stream}`
+  (`//crates/proto/quic/src/endpoint.rs`). (The `NullStream` stub it once used
+  to satisfy the trait was deleted when streaming-response landed, 2026-06; the
+  trait bypass itself — Contract 2 — is still open.)
 - **Layering inversion (verified):** `HttpStream::recv_chunk` returns
   `waitless::runtime::RecvChunkGuard` — a type defined in the *reactor*. So
   `proto/http`'s transport-agnostic trait and `proto/tls` both reach *down* into
@@ -503,11 +505,12 @@ exactly this work.
 
 ### Sequencing implication
 
-QUIC already has its NewReno controller wired (RFC 9002 step 5 is closed on the
-QUIC side); TCP's CUBIC/BBR + pacing are still pending, and TCP still hasn't
-delegated to the shared `net_cc`. **Do the remaining CC work as one shared
-module, not twice** — the controller core and trait already exist in `net_cc`;
-what remains is TCP delegating to it and the CUBIC/BBR algorithms. Gate the L1
+Both stacks now delegate to the shared `net_cc::NewReno` (QUIC closed RFC 9002
+step 5; TCP's hand-rolled RFC 5681 cwnd was replaced 2026-06-08, netem + GCE
+validated). **Do the remaining CC work as one shared module, not twice** — the
+controller core and trait already exist in `net_cc`; what remains is the
+CUBIC/BBR algorithms (and a TCP-side pacer; QUIC's RFC 9002 token-bucket pacer
+landed 2026-06). Gate the L1
 work behind the `SendProgress` contract (so the CC has a clean backpressure
 signal) and, for the L4 half, behind SACK (T7).
 
@@ -515,8 +518,10 @@ signal) and, for the L4 half, behind SACK (T7).
   [`crates/net/cc`](../crates/net/cc) has the `CongestionControl` trait (this
   exact signature) + a `NewReno` controller + unit tests; see
   [`tx-backpressure.md`](tx-backpressure.md) (stage 1) for how it fits the
-  end-to-end backpressure chain. **Pending**: `net/tcp/src/state.rs` delegating
-  its embedded `cwnd`/`ssthresh` to it, and `proto/quic/src/conn` adopting it.
+  end-to-end backpressure chain. **Done since**: `net/tcp/src/state.rs` delegates its
+  `cwnd`/`ssthresh` to it (`congestion_init`, 2026-06-08) and
+  `proto/quic/src/conn` adopted it + the RFC 9002 pacer. **Pending**: CUBIC/BBR,
+  TCP-side pacing.
   **Win**: CUBIC/BBR + pacing written once; QUIC gets its first controller; the
   L1/L3 Linux-parity gap closes for both transports together. **Effort**:
   large (the wiring; the controller core is done). **Risk**: medium — CC is
