@@ -241,7 +241,8 @@ pub fn drain_current_core() {
                 }
             };
 
-            // Pull whole packets, ≤ grant bytes, and ship in DRR order.
+            // Phase 1 — ship eagerly-built datagrams (handshake / UDP-GSO
+            // super-buffers) the conn task queued in `outbound`.
             let mut sent = 0u32;
             loop {
                 let pkt = {
@@ -259,10 +260,35 @@ pub fn drain_current_core() {
                     break;
                 }
             }
+
+            // Phase 2 — build-at-drain the steady-state 1-RTT packets: acquire
+            // a driver TX slot, encode one packet straight into it, and submit
+            // it SYNCHRONOUSLY (zero-copy direct-fill; the synchronous
+            // acquire→submit pairing is what makes that aliasing-safe, unlike
+            // the eager/`outbound` path). Stops at the DRR grant, the pacer /
+            // anti-amp gate, or when nothing more is pending.
+            while sent < grant {
+                let pkt = {
+                    let mut c = conn.borrow_mut();
+                    c.build_next_one_rtt_datagram()
+                };
+                match pkt {
+                    Ok(Some(p)) => {
+                        let len = p.len() as u32;
+                        ship_datagram(&sock, &conn, peer_ip, peer_port, p);
+                        sent = sent.saturating_add(len);
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
             e.drr.charge(flow, sent);
 
-            // Nothing left queued? Go idle until the conn re-activates.
-            if !conn.borrow().has_outbound() {
+            // Deactivate when fully drained, OR when nothing shipped this pass
+            // (pacing / anti-amp blocked) — the latter avoids re-selecting the
+            // flow in a tight spin. Either way the conn task re-activates it on
+            // its next wake (inbound datagram or pacing/ACK timer) as long as
+            // `has_pending_tx`.
+            if sent == 0 || !conn.borrow().has_pending_tx() {
                 e.drr.deactivate(flow);
             }
         }

@@ -698,6 +698,13 @@ pub struct Connection {
     /// §4.9.2). Gates `process_handshake_pkt` against late
     /// retransmits.
     pub(super) handshake_keys_discarded: bool,
+    /// When true, the per-core egress owner (docs/tx-backpressure.md stage 3)
+    /// drives steady-state 1-RTT packet emission build-at-drain — so `flush`
+    /// must NOT also build per-packet 1-RTT into `outbound` (that would
+    /// double-send). Set by the conn task iff this conn registered with the
+    /// owner. Default false ⇒ the eager build path (unchanged). The handshake
+    /// + GSO paths build into `outbound` regardless (the owner ships those).
+    pub(super) tx_owner_driven: bool,
     /// 0-RTT (early-data) packet-protection keys for *receiving*.
     /// `Some` only on a resumed handshake whose PSK validated;
     /// derived from `QuicTls::client_early_traffic_secret` once the
@@ -1123,6 +1130,7 @@ impl Connection {
             application_recv: None,
             initial_keys_discarded: false,
             handshake_keys_discarded: false,
+            tx_owner_driven: false,
             initial_space: SpaceState::default(),
             handshake_space: SpaceState::default(),
             application_space: SpaceState::default(),
@@ -1446,6 +1454,22 @@ impl Connection {
     /// the encoder captures `header_start = out.len()` after the
     /// resize.
     pub(super) fn take_datagram_buf(&mut self, fallback_capacity: usize) -> DatagramBuf {
+        // Eager build path: always heap. Direct-fill would alias here (see the
+        // inner fn). The synchronous build-at-drain owner path uses
+        // `take_datagram_buf_direct` instead.
+        self.take_datagram_buf_inner(fallback_capacity, false)
+    }
+
+    /// Like [`take_datagram_buf`] but prefers a zero-copy driver TX slot.
+    /// ONLY safe when the caller submits the returned datagram SYNCHRONOUSLY
+    /// before acquiring another — the per-core egress owner's build-at-drain
+    /// loop (acquire→encode→submit paired). Concurrent un-submitted slots
+    /// would otherwise alias the same un-advanced ring position.
+    pub(crate) fn take_datagram_buf_direct(&mut self, fallback_capacity: usize) -> DatagramBuf {
+        self.take_datagram_buf_inner(fallback_capacity, true)
+    }
+
+    fn take_datagram_buf_inner(&mut self, fallback_capacity: usize, allow_direct: bool) -> DatagramBuf {
         use executor::reactor::MAX_L2_HEADROOM;
 
         // The driver DQO direct-fill path (`acquire_tx_buf`) requires
@@ -1466,11 +1490,14 @@ impl Connection {
         // Vec until ship, so concurrent queued packets can't alias. Direct-fill
         // can return here once the driver reserves a slot per handle (acquire
         // advances; submit targets the handle's own slot, not `fill_cnt`).
-        const QUIC_TX_DIRECT_FILL_SAFE: bool = false;
+        // `allow_direct` gates the zero-copy slot: safe only on the
+        // synchronous build-at-drain path (acquire→encode→submit paired); the
+        // eager/`outbound` path passes `false` because deferred submit aliases
+        // the un-advanced ring slot.
         // Hot path: acquire a slot from the driver's TX pool and
         // write packet bytes straight into it (no driver-side
         // memcpy at submit time).
-        if QUIC_TX_DIRECT_FILL_SAFE
+        if allow_direct
             && let Some(handle) = executor::reactor::acquire_tx_buf()
         {
             // The `TxSlot` datagram wraps the driver slot in a

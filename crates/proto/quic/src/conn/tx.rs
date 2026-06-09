@@ -399,7 +399,7 @@ impl Connection {
         // only reached once Established — strictly after the whole
         // Handshake flight has been sent — so it never shares a
         // datagram with the large multi-fragment flight.
-        if matches!(self.state, ConnState::Established) {
+        if matches!(self.state, ConnState::Established) && !self.tx_owner_driven {
             // Pace the first 1-RTT packet too, not just the tail loop. The
             // conn task batches many inbound datagrams and flushes after
             // each, then ships all queued packets together; an unmetered
@@ -515,7 +515,11 @@ impl Connection {
         if matches!(self.state, ConnState::Established) && self.try_flush_gso()? {
             return Ok(());
         }
-        if matches!(self.state, ConnState::Established) {
+        // Steady-state 1-RTT per-packet emission. When the per-core egress
+        // owner is driving this conn, it builds these packets build-at-drain
+        // (acquire→encode→submit synchronously, zero-copy) via
+        // `build_next_one_rtt_datagram`; skip them here so we don't double-send.
+        if matches!(self.state, ConnState::Established) && !self.tx_owner_driven {
             const MAX_FLUSH_PACKETS: usize = 32;
             for _ in 0..MAX_FLUSH_PACKETS {
                 if !self.one_rtt_tail_ready() {
@@ -530,6 +534,58 @@ impl Connection {
             }
         }
         Ok(())
+    }
+
+    /// Mark whether the per-core egress owner drives this conn's steady-state
+    /// 1-RTT emission (build-at-drain). Set once by the conn task when it
+    /// registers the conn with the owner.
+    pub(crate) fn set_tx_owner_driven(&mut self, on: bool) {
+        self.tx_owner_driven = on;
+    }
+
+    /// Anything for the egress owner to ship: an eagerly-built `outbound`
+    /// datagram (handshake / GSO), or steady-state 1-RTT data to build at
+    /// drain. Side-effect-free (no pacer touch) — used to decide whether to
+    /// keep the flow active in the per-core scheduler.
+    pub(crate) fn has_pending_tx(&self) -> bool {
+        if self.has_outbound() {
+            return true;
+        }
+        matches!(self.state, ConnState::Established)
+            && self.handshake_keys_discarded
+            && self.has_one_rtt_to_send()
+    }
+
+    /// Build the next steady-state 1-RTT datagram into a fresh driver TX slot
+    /// (zero-copy direct-fill) and return it for the owner to submit
+    /// **immediately** (synchronous acquire→encode→submit, so no slot
+    /// aliasing — the reason the eager path can't use direct-fill). Returns
+    /// `None` when there's nothing to emit, the anti-amp/pacing gate blocks,
+    /// or the conn isn't in steady state (Established, handshake keys
+    /// discarded — the handshake + coalesced-first-packet path stays eager).
+    /// Pacing applies only to stream-data-carrying packets (an ACK-only
+    /// packet ships unmetered), mirroring the eager first-packet rule.
+    pub(crate) fn build_next_one_rtt_datagram(
+        &mut self,
+    ) -> Result<Option<super::DatagramBuf>, ConnError> {
+        if !matches!(self.state, ConnState::Established) || !self.handshake_keys_discarded {
+            return Ok(None);
+        }
+        if !self.has_one_rtt_to_send() || self.anti_amp_remaining() == 0 {
+            return Ok(None);
+        }
+        // Pace only when this packet would carry congestion-controlled stream
+        // data; an ACK-/control-only packet is unmetered (and pacing it could
+        // strand an ACK — `pace_deadline_us` only re-arms while data pends).
+        if self.has_pending_one_rtt_data() && !self.pace_gate() {
+            return Ok(None);
+        }
+        let mut buf = self.take_datagram_buf_direct(1500);
+        if self.emit_one_rtt_datagram(&mut buf)? {
+            Ok(Some(buf))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Pre-acquire gate for one more standalone 1-RTT tail packet: there's

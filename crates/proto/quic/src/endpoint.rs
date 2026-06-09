@@ -136,7 +136,10 @@ fn flush_to_wire(
     peer_port: &Rc<Cell<u16>>,
 ) {
     if let Some(g) = egress_guard {
-        if conn.borrow().has_outbound() {
+        // Owner-driven: mark ready if anything is pending — an eagerly-built
+        // `outbound` datagram (handshake / GSO) OR steady-state 1-RTT data the
+        // owner will build at drain. The drain ships both.
+        if conn.borrow().has_pending_tx() {
             crate::egress::activate(g.flow());
         }
         return;
@@ -828,6 +831,11 @@ where
         Rc::clone(&peer_ip),
         Rc::clone(&peer_port),
     );
+    if egress_guard.is_some() {
+        // The owner drives steady-state 1-RTT build-at-drain → `flush` must
+        // not also build per-packet 1-RTT into `outbound` (double-send).
+        conn.borrow_mut().set_tx_owner_driven(true);
+    }
     let mut handler_spawned = false;
     // Observability (principle 3 — every exit is traced): each break
     // site below classifies the teardown; the post-loop
