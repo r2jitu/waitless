@@ -793,15 +793,24 @@ pub(crate) struct RxBuf {
     /// — i.e. the next stream-offset that would extend it.
     consumed: u64,
     /// Out-of-order chunks keyed by their start offset. Folded into
-    /// `contiguous` as the gap fills.
+    /// `contiguous` as the gap fills. Bounded by [`PENDING_BYTE_CAP`]
+    /// and [`PENDING_ENTRY_CAP`] (see `ingest`) so a peer flooding
+    /// non-contiguous CRYPTO can't grow it without bound.
     pending: alloc::collections::BTreeMap<u64, Vec<u8>>,
-    /// Soft cap on pending bytes — anything past this is dropped to
-    /// prevent a malicious peer flooding us with non-contiguous
-    /// chunks. ClientHello + ServerHello flights are well under
-    /// 4 KiB; cert-only paths might push higher; 64 KiB is a
-    /// generous overhead.
-    pending_budget: usize,
 }
+
+/// Cap on total buffered out-of-order CRYPTO bytes. A ClientHello
+/// flight is well under 4 KiB; a multi-cert path might push higher;
+/// 64 KiB is generous overhead. Past this, late chunks are dropped —
+/// CRYPTO is reliable, so the peer retransmits and by then the gap
+/// may have filled in order.
+const PENDING_BYTE_CAP: usize = 64 * 1024;
+
+/// Cap on the number of distinct out-of-order gaps. A real flight
+/// arrives near-contiguous (a handful of frames); thousands of tiny
+/// sparse chunks is an attack, and each map entry costs map-node +
+/// allocation overhead the byte cap doesn't count.
+const PENDING_ENTRY_CAP: usize = 256;
 
 impl RxBuf {
     /// Total contiguous bytes available right now.
@@ -823,7 +832,11 @@ impl RxBuf {
         if data.is_empty() {
             return;
         }
-        let end = offset + data.len() as u64;
+        // `offset` is an attacker-controlled varint (up to 2^62-1) and
+        // `data.len()` is bounded by the packet, so this can't actually
+        // overflow u64 — but saturate defensively rather than rely on
+        // that invariant holding under future changes.
+        let end = offset.saturating_add(data.len() as u64);
         // Frame entirely before what we've already delivered →
         // duplicate retransmit; ignore.
         if end <= self.consumed {
@@ -845,22 +858,23 @@ impl RxBuf {
                     break;
                 }
                 let v = self.pending.remove(&next_off).unwrap();
-                self.pending_budget = self.pending_budget.saturating_add(v.len());
                 let skip = self.consumed.saturating_sub(next_off) as usize;
                 if skip < v.len() {
                     self.contiguous.extend_from_slice(&v[skip..]);
                     self.consumed += (v.len() - skip) as u64;
                 }
             }
-        } else if data.len() <= self.pending_budget.saturating_sub(0) + (64 * 1024) {
-            // Stash for later. We initialise with a 0 budget on
-            // Default and grow it lazily — that quirk lets us cap
-            // the amount we'd buffer for a misbehaving peer with
-            // a single check below.
-            const PENDING_CAP: usize = 64 * 1024;
-            let pending_total: usize =
-                self.pending.values().map(|v| v.len()).sum::<usize>() + data.len();
-            if pending_total <= PENDING_CAP {
+        } else {
+            // Ahead-of-order: stash for later, but only within both
+            // the byte and entry budgets. Past either, drop the chunk
+            // (the peer will retransmit). Inserting a duplicate offset
+            // overwrites rather than grows, so re-counting the total
+            // each time is correct.
+            let pending_bytes: usize = self.pending.values().map(|v| v.len()).sum();
+            let fits_bytes = pending_bytes + data.len() <= PENDING_BYTE_CAP;
+            let fits_entries =
+                self.pending.contains_key(&offset) || self.pending.len() < PENDING_ENTRY_CAP;
+            if fits_bytes && fits_entries {
                 self.pending.insert(offset, data.to_vec());
             }
         }
@@ -883,6 +897,118 @@ impl core::ops::Deref for RxBuf {
 // ============================================================================
 // Tests — feed a synthetic ClientHello, verify state transitions
 // ============================================================================
+
+#[cfg(test)]
+mod rxbuf_tests {
+    use super::{RxBuf, PENDING_BYTE_CAP, PENDING_ENTRY_CAP};
+
+    fn pending_bytes(rx: &RxBuf) -> usize {
+        rx.pending.values().map(|v| v.len()).sum()
+    }
+
+    #[test]
+    fn in_order_chunks_concatenate() {
+        let mut rx = RxBuf::default();
+        rx.ingest(0, b"hello ");
+        rx.ingest(6, b"world");
+        assert_eq!(&rx[..], b"hello world");
+        assert!(rx.pending.is_empty());
+    }
+
+    #[test]
+    fn out_of_order_then_gap_fill_folds_in() {
+        let mut rx = RxBuf::default();
+        rx.ingest(6, b"world"); // ahead-of-order → pending
+        assert_eq!(&rx[..], b"");
+        assert_eq!(pending_bytes(&rx), 5);
+        rx.ingest(0, b"hello "); // fills the gap → folds the tail
+        assert_eq!(&rx[..], b"hello world");
+        assert!(rx.pending.is_empty());
+    }
+
+    #[test]
+    fn duplicate_and_overlapping_retransmits_are_trimmed() {
+        let mut rx = RxBuf::default();
+        rx.ingest(0, b"hello world");
+        // Fully-duplicate frame: ignored, no growth.
+        rx.ingest(0, b"hello");
+        assert_eq!(&rx[..], b"hello world");
+        // Partially-overlapping retransmit: only the new tail appends.
+        rx.ingest(6, b"world AGAIN");
+        assert_eq!(&rx[..], b"hello world AGAIN");
+    }
+
+    #[test]
+    fn pending_byte_budget_drops_excess() {
+        let mut rx = RxBuf::default();
+        // Flood non-contiguous chunks (offset 1 onward never fills the
+        // offset-0 gap), each a distinct offset so the entry cap is not
+        // what bites. Past PENDING_BYTE_CAP, chunks are dropped.
+        let chunk = vec![0u8; 1024];
+        let mut off = 1u64;
+        for _ in 0..200 {
+            rx.ingest(off, &chunk);
+            off += 100_000; // huge sparse gaps, distinct offsets
+        }
+        assert!(
+            pending_bytes(&rx) <= PENDING_BYTE_CAP,
+            "pending {} exceeded byte cap {}",
+            pending_bytes(&rx),
+            PENDING_BYTE_CAP
+        );
+        // Contiguous stays empty — the offset-0 gap was never filled.
+        assert_eq!(&rx[..], b"");
+    }
+
+    #[test]
+    fn pending_entry_budget_caps_sparse_one_byte_flood() {
+        let mut rx = RxBuf::default();
+        // Tiny 1-byte chunks at distinct offsets: total bytes stay
+        // small, but the entry cap must bound the map (each entry costs
+        // far more than its byte).
+        for k in 0..(PENDING_ENTRY_CAP as u64 + 5_000) {
+            rx.ingest(1 + k * 4, b"x"); // offset 0 never filled
+        }
+        assert!(
+            rx.pending.len() <= PENDING_ENTRY_CAP,
+            "pending entries {} exceeded entry cap {}",
+            rx.pending.len(),
+            PENDING_ENTRY_CAP
+        );
+    }
+
+    #[test]
+    fn huge_offset_does_not_overflow_or_panic() {
+        let mut rx = RxBuf::default();
+        // offset near u64::MAX: end = offset + len must not overflow
+        // (saturating), and end <= consumed(0) is false so it's stashed
+        // — within budget. No panic.
+        rx.ingest(u64::MAX - 2, b"ab");
+        assert_eq!(pending_bytes(&rx), 2);
+        // A frame whose end saturates is still handled without panic.
+        rx.ingest(u64::MAX, b"zz");
+    }
+
+    #[test]
+    fn empty_frame_is_ignored() {
+        let mut rx = RxBuf::default();
+        rx.ingest(0, b"");
+        rx.ingest(100, b"");
+        assert_eq!(&rx[..], b"");
+        assert!(rx.pending.is_empty());
+    }
+
+    #[test]
+    fn drain_advances_the_contiguous_window() {
+        let mut rx = RxBuf::default();
+        rx.ingest(0, b"ABCDEF");
+        rx.drain(..3);
+        assert_eq!(&rx[..], b"DEF");
+        // Further in-order data still appends at the right place.
+        rx.ingest(6, b"GHI");
+        assert_eq!(&rx[..], b"DEFGHI");
+    }
+}
 
 #[cfg(test)]
 mod tests {
