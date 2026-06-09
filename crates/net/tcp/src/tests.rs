@@ -959,7 +959,7 @@ fn slow_start_grows_cwnd_by_bytes_acked_abc() {
     let smss = 1460u32; // MSS_V4 — `new()` leaves `local_ip` IPv4.
 
     assert_eq!(c.cwnd, 14600, "the initial window is the RFC 6928 IW10 (10·SMSS)");
-    assert!(c.cwnd < c.ssthresh, "a fresh connection opens in slow start");
+    assert!(c.cwnd < c.cc.ssthresh(), "a fresh connection opens in slow start");
 
     // An ACK of one segment opens the window by one segment.
     let before = c.cwnd;
@@ -987,85 +987,38 @@ fn slow_start_grows_cwnd_by_bytes_acked_abc() {
     assert_eq!(c.cwnd, before + 2 * smss, "stretch-ACK increment capped at 2·SMSS");
 }
 
-/// RFC 5681 §3.1: at `cwnd == ssthresh` the controller switches from
-/// slow start to congestion avoidance — growth drops from one SMSS
-/// per ACK to roughly one SMSS per RTT.
+/// The congestion window now delegates to `net_cc::NewReno` — the controller
+/// shared with QUIC. The slow-start / congestion-avoidance / loss-recovery
+/// FORMULAS (byte-counting slow start with the L=2·SMSS cap, CA increment,
+/// halve-into-recovery, persistent-congestion collapse) are unit-tested in
+/// net_cc's own `cc_test`; here we only assert TCP wires its wire events
+/// through to the controller. NOTE: adopting net_cc's RFC-9002 model changes
+/// three TCP behaviours from RFC 5681 — RTO collapses to the 2·SMSS floor (was
+/// 1·SMSS), ssthresh derives from cwnd/2 (was FlightSize/2), and fast recovery
+/// holds cwnd rather than inflating per dup-ACK. These deltas are deliberate
+/// (see project_net_cc_tcp) and are validated under GCE netem-loss before the
+/// branch lands.
 #[test]
-fn cwnd_switches_to_congestion_avoidance_at_ssthresh() {
+fn congestion_window_delegates_to_net_cc() {
     let mut c = TcpConnection::new();
     c.congestion_init();
     let smss = 1460u32;
-    c.ssthresh = 8 * smss;
-    c.cwnd = 7 * smss;
+    assert_eq!(c.cwnd, 14600, "init = RFC 6928 IW10 via net_cc::initial_window");
 
-    // Still below ssthresh — slow start, one SMSS per ACK.
-    c.cwnd_on_ack(smss);
-    assert_eq!(c.cwnd, 8 * smss, "slow start runs up to ssthresh");
+    // Slow start opens the window (capped at 2·SMSS/ACK).
+    for _ in 0..4 {
+        c.cwnd_on_ack(2 * smss);
+    }
+    let opened = c.cwnd;
+    assert!(opened > 14600, "slow start grew the window: {opened}");
 
-    // At ssthresh — congestion avoidance, sub-SMSS per ACK.
-    let before = c.cwnd;
-    c.cwnd_on_ack(smss);
-    let inc = c.cwnd - before;
-    assert!(inc >= 1 && inc < smss, "congestion avoidance is sub-SMSS per ACK");
-    // SMSS·SMSS/cwnd, with cwnd == 8·SMSS, is SMSS/8.
-    assert_eq!(inc, smss * smss / (8 * smss));
-}
-
-/// RFC 5681 §3.1: an RTO collapses `cwnd` to one segment and drops
-/// `ssthresh` to half the flight size; a second RTO with no
-/// intervening progress collapses `cwnd` again but does not re-halve
-/// `ssthresh`.
-#[test]
-fn rto_collapses_cwnd_and_halves_ssthresh() {
-    let mut c = TcpConnection::new();
-    c.congestion_init();
-    let smss = 1460u32;
-
-    // A wide-open window with 20·SMSS in flight.
-    c.cwnd = 20 * smss;
-    c.ssthresh = 16 * smss;
-    c.snd_una = 1000;
-    c.snd_nxt = 1000u32.wrapping_add(20 * smss);
-    c.rtx_backoff = 0; // the first RTO of this loss episode
-
+    // An RTO collapses cwnd toward the net_cc floor (~2·SMSS) and re-enters
+    // slow start.
     c.congestion_on_rto();
-    assert_eq!(c.cwnd, smss, "an RTO collapses cwnd to one segment");
-    assert_eq!(
-        c.ssthresh,
-        (20 * smss) / 2,
-        "ssthresh drops to half the flight size",
-    );
-
-    // A second RTO before any data is acknowledged.
-    c.cwnd = 5 * smss;
-    c.rtx_backoff = 1;
-    let ssthresh_after_first = c.ssthresh;
-    c.congestion_on_rto();
-    assert_eq!(c.cwnd, smss, "every RTO re-collapses cwnd");
-    assert_eq!(
-        c.ssthresh, ssthresh_after_first,
-        "ssthresh is not re-halved by a back-to-back RTO",
-    );
-}
-
-/// RFC 5681 §3.1: `ssthresh` has a 2·SMSS floor — a tiny flight size
-/// at RTO time cannot drive it below two segments.
-#[test]
-fn rto_ssthresh_has_a_two_segment_floor() {
-    let mut c = TcpConnection::new();
-    c.congestion_init();
-    let smss = 1460u32;
-
-    // Only one segment in flight when the RTO fires.
-    c.snd_una = 1000;
-    c.snd_nxt = 1000 + smss;
-    c.rtx_backoff = 0;
-
-    c.congestion_on_rto();
-    assert_eq!(
-        c.ssthresh,
-        2 * smss,
-        "ssthresh is floored at 2·SMSS, not flight/2 = SMSS/2",
+    assert!(
+        c.cwnd < opened && c.cwnd <= 2 * smss + 1 && c.cwnd >= smss,
+        "RTO collapses cwnd to the net_cc minimum window, was {opened} now {}",
+        c.cwnd,
     );
 }
 
@@ -1129,27 +1082,22 @@ fn three_dup_acks_trigger_fast_retransmit() {
         "the fast retransmit carries the original payload",
     );
 
-    // RFC 5681 §3.2: ssthresh halved against the flight size (floored
-    // at 2·SMSS), cwnd inflated to ssthresh + 3·SMSS.
-    let smss = 1460u32;
-    let expect_ssthresh = ((body.len() as u32) / 2).max(2 * smss);
+    // net_cc (RFC 6582/9002) halves the window INTO recovery — ssthresh =
+    // cwnd/2, cwnd = ssthresh — and does NOT inflate to ssthresh + 3·SMSS the
+    // way RFC 5681 §3.2 did. The fast RETRANSMIT above still fires (the part
+    // that matters); only the cwnd bookkeeping differs (delta #4, netem-
+    // gated). cwnd here is the untouched IW10 (no acks grew it), so both
+    // land at IW10/2.
     let (cwnd, ssthresh) = conn_cwnd_ssthresh(CP, SP);
-    assert_eq!(
-        ssthresh, expect_ssthresh,
-        "ssthresh drops to flight/2, floored at 2·SMSS",
-    );
-    assert_eq!(
-        cwnd,
-        expect_ssthresh + 3 * smss,
-        "cwnd is inflated to ssthresh + 3·SMSS",
-    );
+    assert_eq!(ssthresh, 14600 / 2, "halve cwnd into recovery (cwnd/2)");
+    assert_eq!(cwnd, ssthresh, "no RFC 5681 +3·SMSS inflation");
 }
 
-/// In fast recovery each extra duplicate ACK inflates `cwnd` by one
-/// SMSS; the recovering ACK (covering new data) deflates `cwnd` back
-/// to `ssthresh` and exits recovery — RFC 5681 §3.2 steps 4 and 6.
+/// net_cc's recovery model (RFC 6582/9002): the 3rd dup-ACK halves cwnd to
+/// ssthresh; extra dup-ACKs do NOT inflate it, and it stays at ssthresh
+/// through the recovery episode (no RFC 5681 §3.2 inflate/deflate dance).
 #[test]
-fn fast_recovery_inflates_then_deflates_cwnd() {
+fn fast_recovery_halves_cwnd_without_inflation() {
     let _g = harness();
     const SP: u16 = 9122;
     const CP: u16 = 50122;
@@ -1176,25 +1124,23 @@ fn fast_recovery_inflates_then_deflates_cwnd() {
     deliver(&dup);
     deliver(&dup);
     deliver(&dup);
-    let smss = 1460u32;
     let (cwnd_at_entry, ssthresh) = conn_cwnd_ssthresh(CP, SP);
-    assert_eq!(
-        cwnd_at_entry,
-        ssthresh + 3 * smss,
-        "fast retransmit inflates cwnd to ssthresh + 3·SMSS",
-    );
+    // net_cc halves cwnd into recovery (cwnd == ssthresh); no RFC 5681
+    // ssthresh + 3·SMSS inflation.
+    assert_eq!(cwnd_at_entry, ssthresh, "cwnd halved into recovery, not inflated");
 
-    // A fourth duplicate ACK inflates cwnd by one more SMSS.
+    // A fourth duplicate ACK does NOT inflate cwnd — net_cc holds it through
+    // the recovery episode.
     deliver(&dup);
-    let (cwnd_inflated, _) = conn_cwnd_ssthresh(CP, SP);
+    let (cwnd_after_extra_dup, _) = conn_cwnd_ssthresh(CP, SP);
     assert_eq!(
-        cwnd_inflated,
-        cwnd_at_entry + smss,
-        "an extra duplicate ACK in recovery inflates cwnd by one SMSS",
+        cwnd_after_extra_dup, cwnd_at_entry,
+        "an extra dup-ACK in recovery does not inflate cwnd",
     );
 
-    // The recovering ACK covers the retransmitted data — cwnd
-    // deflates to ssthresh and recovery ends.
+    // The recovering ACK covers the retransmitted data; net_cc holds cwnd at
+    // ssthresh through the recovery window (it resumes growth only after ~one
+    // window of new data is acked, not on the first recovering ACK).
     deliver(&Seg {
         src_port: CP,
         dst_port: SP,
@@ -1207,7 +1153,7 @@ fn fast_recovery_inflates_then_deflates_cwnd() {
     let (cwnd_final, ssthresh_final) = conn_cwnd_ssthresh(CP, SP);
     assert_eq!(
         cwnd_final, ssthresh_final,
-        "the recovering ACK deflates cwnd back to ssthresh",
+        "cwnd stays at ssthresh through the recovery episode",
     );
 }
 
@@ -2232,7 +2178,7 @@ fn send_window_ramps_with_slow_start() {
     assert_eq!(round2, 2 * round1, "slow start doubled the send window over one RTT");
 }
 
-/// After an RTO collapses `cwnd` to one segment, the send path's
+/// After an RTO collapses `cwnd` to the minimum window, the send path's
 /// window follows: it offers only the collapsed `cwnd` minus the
 /// still-unacked flight.
 #[test]
@@ -2250,18 +2196,19 @@ fn send_window_tracks_cwnd_after_rto() {
     let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
     assert_eq!(sent, 1000, "the small send fits the initial window");
 
-    // Cross the RTO — `congestion_on_rto` collapses cwnd to 1·SMSS.
+    // Cross the RTO — `congestion_on_rto` collapses cwnd to the net_cc
+    // minimum window (2·SMSS, the RFC 9002 floor — was RFC 5681's 1·SMSS).
     kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 + 1);
     super::on_tcp_tick();
     let (cwnd, _) = conn_cwnd_ssthresh(CP, SP);
-    assert_eq!(cwnd, 1460, "the RTO collapsed cwnd to one segment");
+    assert_eq!(cwnd, 2 * 1460, "the RTO collapsed cwnd to the 2·SMSS floor");
 
     // 1000 bytes are still in flight; the collapsed window offers
-    // only cwnd − flight = 1460 − 1000 = 460 bytes.
+    // only cwnd − flight = 2920 − 1000 = 1920 bytes.
     let mut more = iobuf::IOBufChain::from(vec![0u8; 5000]);
     let after_rto = super::async_try_send_chain(handle, generation, &mut more).unwrap();
     assert_eq!(
-        after_rto, 460,
+        after_rto, 2 * 1460 - 1000,
         "the send window is the collapsed cwnd minus the in-flight bytes",
     );
 }
@@ -2832,11 +2779,12 @@ fn lossy_windowed_transfer_completes() {
     }
 
     let (cwnd_at_loss, ssthresh_at_loss) = at_loss.expect("recovery ran at least one RTO");
-    assert_eq!(cwnd_at_loss, 1460, "the RTO collapsed cwnd to one SMSS");
-    assert_eq!(
-        ssthresh_at_loss,
-        (w2 as u32 / 2).max(2 * 1460),
-        "ssthresh dropped to half the lost flight (2·SMSS floor)",
+    assert_eq!(cwnd_at_loss, 2 * 1460, "the RTO collapsed cwnd to the net_cc 2·SMSS floor");
+    // net_cc derives ssthresh from cwnd/2 (RFC 9002), not RFC 5681's
+    // FlightSize/2, and floors it at 2·SMSS.
+    assert!(
+        ssthresh_at_loss >= 2 * 1460,
+        "ssthresh halved into recovery, floored at 2·SMSS: {ssthresh_at_loss}",
     );
     assert_eq!(cycles as usize, w2_frames, "one RTO cycle per lost segment");
     assert_eq!(
@@ -2999,7 +2947,7 @@ fn conn_cwnd_ssthresh(client_port: u16, server_port: u16) -> (u32, u32) {
             && c.local_port == server_port
             && c.remote_port == client_port
         {
-            return (c.cwnd, c.ssthresh);
+            return (c.cwnd, c.cc.ssthresh());
         }
     }
     panic!("no live connection for ports {client_port} -> {server_port}");

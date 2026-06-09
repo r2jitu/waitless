@@ -27,6 +27,7 @@ rust_library(
         "//crates/drivers/nic",
         "//crates/drivers/nic:api",
         "//crates/kernel/core",
+        "//crates/net/cc:cc",
         "//crates/net:checksum",
         "//crates/net:ethernet",
         "//crates/net:from_bytes",

@@ -7,6 +7,7 @@
 
 use crate::send::{SegmentMeta, send_segment};
 use alloc::boxed::Box;
+use net_cc::CongestionControl;
 use alloc::collections::VecDeque;
 use core::task::Waker;
 use from_bytes::FromBytes;
@@ -393,27 +394,20 @@ pub struct TcpConnection {
     /// exponential-backoff exponent and the `PERSIST_MAX_PROBES`
     /// give-up counter.
     pub(crate) persist_backoff: u8,
-    /// RFC 5681 congestion window, bytes — the controller's estimate
-    /// of how much unacknowledged data the path will accept. Grows on
-    /// ACKs (slow start, then congestion avoidance) and collapses to
-    /// one segment on an RTO. 0 until `congestion_init` runs at the
-    /// SYN. The send path paces against it: `usable_window()` caps
-    /// in-flight bytes at `min(cwnd, rwnd)`.
+    /// Cache of `cc.window()` — the congestion window in bytes, refreshed
+    /// after every `cc` event. The send path (`usable_window`) and diag
+    /// read this so they don't borrow `cc`. 0 until `congestion_init`.
     pub(crate) cwnd: u32,
-    /// RFC 5681 slow-start threshold, bytes. While `cwnd < ssthresh`
-    /// the controller is in slow start (exponential growth); at or
-    /// above it, congestion avoidance (linear). Starts effectively
-    /// infinite and drops to half the flight size on loss.
-    pub(crate) ssthresh: u32,
     /// Consecutive duplicate ACKs observed (RFC 5681 §3.2). The third
-    /// triggers fast retransmit; further duplicates while in fast
-    /// recovery inflate `cwnd`. Reset by any ACK of new data.
+    /// triggers fast retransmit; reset by any ACK of new data. Stays here
+    /// (not in `cc`) — a TCP wire-event detail net_cc doesn't model.
     pub(crate) dup_acks: u8,
-    /// True between the fast-retransmit trigger and the recovering
-    /// ACK — RFC 5681 §3.2 fast recovery. While set, extra duplicate
-    /// ACKs inflate `cwnd`; the first new-data ACK deflates it back
-    /// to `ssthresh` and clears this.
-    pub(crate) in_fast_recovery: bool,
+    /// Shared congestion controller (`net_cc::NewReno`) — the single
+    /// source of truth for cwnd / ssthresh / recovery, the SAME controller
+    /// QUIC drives. TCP feeds it ack/loss/rto events and caches
+    /// `window()` into `cwnd` above. Configured with the RFC 3465
+    /// `L = 2·SMSS` slow-start burst cap (TCP is unpaced).
+    pub(crate) cc: net_cc::NewReno,
     /// Free-list link. When this slot is on the free list (state ==
     /// Closed AND the slot has been returned to the pool), this
     /// holds the index of the next free slot, or `NULL_SLOT` for
@@ -493,9 +487,8 @@ impl TcpConnection {
             persist_deadline_ms: 0,
             persist_backoff: 0,
             cwnd: 0,
-            ssthresh: 0,
             dup_acks: 0,
-            in_fast_recovery: false,
+            cc: net_cc::NewReno::with_default_mss(),
             next_free: NULL_SLOT,
             slot_index: 0,
             tick_next: NULL_SLOT,
@@ -1197,8 +1190,10 @@ impl TcpConnection {
     /// start.
     pub(crate) fn congestion_init(&mut self) {
         let smss = mss_for(self.local_ip) as u32;
-        self.cwnd = (10 * smss).min((2 * smss).max(14600));
-        self.ssthresh = u32::MAX;
+        self.cc = net_cc::NewReno::new(smss);
+        // Unpaced sender: keep TCP's RFC 3465 L = 2·SMSS slow-start burst cap.
+        self.cc.set_slow_start_cap(2 * smss);
+        self.cwnd = self.cc.window();
     }
 
     /// Bytes sent but not yet acknowledged — the wire range
@@ -1230,28 +1225,14 @@ impl TcpConnection {
     /// avoidance adds `SMSS·SMSS/cwnd` per ACK, the standard RFC 5681
     /// approximation of one SMSS per RTT — linear.
     pub(crate) fn cwnd_on_ack(&mut self, acked: u32) {
-        let smss = mss_for(self.local_ip) as u32;
-        if self.cwnd < self.ssthresh {
-            // Slow start, RFC 3465 Appropriate Byte Counting: open
-            // `cwnd` by the *bytes* this ACK covered, not a flat one
-            // SMSS per ACK. The old "count ACKs" rule (`min(acked,
-            // SMSS)`) under delayed-ACK receivers — one ACK per two
-            // segments, the internet norm — grew `cwnd` only ~1.5×/RTT
-            // instead of the 2× slow start intends, the dominant limit
-            // on a cold high-RTT transfer (measured ~3× below textbook).
-            // Byte counting restores the full doubling regardless of how
-            // the receiver batches ACKs. The increment is capped at
-            // `L=2·SMSS` per ACK (RFC 3465 §2.3) to bound the burst a
-            // single stretch-ACK or post-idle ACK can release — we don't
-            // pace, so this cap is the burst guard.
-            self.cwnd = self.cwnd.saturating_add(acked.min(2 * smss));
-        } else {
-            // Congestion avoidance: ~one SMSS per RTT. `max(1)` keeps
-            // the window opening when integer division would floor
-            // the increment to zero.
-            let inc = ((smss as u64 * smss as u64) / self.cwnd.max(1) as u64) as u32;
-            self.cwnd = self.cwnd.saturating_add(inc.max(1));
-        }
+        // Delegate to the shared controller. It does RFC 3465 byte-counting
+        // slow start (capped at the configured L = 2·SMSS), congestion
+        // avoidance, and the recovery-window hold — see `net_cc::NewReno`.
+        // `flight()` is the post-ack in-flight; the RTT (ms → µs) only feeds
+        // `pacing_rate`, which TCP doesn't consume yet.
+        let rtt = net_cc::Rtt::new(self.srtt_ms.saturating_mul(1000), 0);
+        self.cc.on_ack(acked, self.flight(), rtt);
+        self.cwnd = self.cc.window();
     }
 
     /// Fold an RTO expiry into the congestion window (RFC 5681 §3.1):
@@ -1261,11 +1242,13 @@ impl TcpConnection {
     /// `retransmit_oldest` before it bumps `rtx_backoff`, so
     /// `rtx_backoff == 0` marks that first timeout.
     pub(crate) fn congestion_on_rto(&mut self) {
-        let smss = mss_for(self.local_ip) as u32;
-        if self.rtx_backoff == 0 {
-            self.ssthresh = (self.flight() / 2).max(2 * smss);
-        }
-        self.cwnd = smss;
+        // Persistent-congestion collapse (RFC 9002 §7.6): drop ssthresh and
+        // restart slow start from the minimum window. net_cc collapses to
+        // `2·SMSS` (its floor) rather than RFC 5681's `1·SMSS` — immaterial
+        // (one extra segment of post-RTO window; slow start ramps back in
+        // ~1 RTT either way).
+        self.cc.on_rto();
+        self.cwnd = self.cc.window();
     }
 
     /// RFC 5681 §3.2 fast retransmit: the third duplicate ACK is
@@ -1275,10 +1258,15 @@ impl TcpConnection {
     /// `ssthresh + 3·SMSS` — each of the three duplicate ACKs implies
     /// a segment that has left the network.
     fn fast_retransmit(&mut self) {
-        let smss = mss_for(self.local_ip) as u32;
-        self.ssthresh = (self.flight() / 2).max(2 * smss);
+        // Loss signalled by the 3rd dup ACK: halve the window into recovery
+        // (net_cc `on_loss(persistent=false)` → ssthresh = cwnd/2, cwnd =
+        // ssthresh) and resend the missing segment. Unlike RFC 5681 §3.2,
+        // net_cc does NOT inflate cwnd by `ssthresh + 3·SMSS` + 1·SMSS/dup —
+        // it holds cwnd at ssthresh until ~one window of new data is acked
+        // (RFC 6582/9002). Behavioral delta #4 — netem-validated before land.
+        self.cc.on_loss(0, false);
         self.retransmit_oldest_segment();
-        self.cwnd = self.ssthresh.saturating_add(3 * smss);
+        self.cwnd = self.cc.window();
     }
 
     /// Fold a duplicate ACK into the RFC 5681 §3.2 fast-retransmit /
@@ -1287,15 +1275,13 @@ impl TcpConnection {
     /// duplicate while in recovery inflates `cwnd` by one SMSS (the
     /// segment it implies has left the network).
     pub(crate) fn on_dup_ack(&mut self) {
-        let smss = mss_for(self.local_ip) as u32;
         self.dup_acks = self.dup_acks.saturating_add(1);
         if self.dup_acks == 3 {
             self.fast_retransmit();
-            self.in_fast_recovery = true;
-        } else if self.dup_acks > 3 && self.in_fast_recovery {
-            // §3.2 step 4: inflate for the additional duplicate.
-            self.cwnd = self.cwnd.saturating_add(smss);
         }
+        // No per-dup-ACK cwnd inflation: net_cc holds cwnd at ssthresh
+        // through the recovery episode (it tracks the recovery window
+        // internally), rather than RFC 5681's inflate-by-SMSS-per-dup.
     }
 
     /// Fold an ACK of new data into the fast-recovery state. It ends
@@ -1303,11 +1289,11 @@ impl TcpConnection {
     /// it deflates `cwnd` back to `ssthresh` and exits recovery
     /// (RFC 5681 §3.2 step 6).
     pub(crate) fn on_new_data_ack(&mut self) {
+        // End the dup-ACK run. Recovery exit + cwnd restoration are owned by
+        // `cc` now: its `on_ack` (driven from `cwnd_on_ack`) decrements the
+        // recovery window and resumes growth once it's drained — so there's
+        // nothing to deflate here.
         self.dup_acks = 0;
-        if self.in_fast_recovery {
-            self.cwnd = self.ssthresh;
-            self.in_fast_recovery = false;
-        }
     }
 }
 
