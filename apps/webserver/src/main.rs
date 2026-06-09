@@ -46,11 +46,15 @@ const GATEWAY_PORT: u16 = 9000;
 const GATEWAY_BACKEND_PORT: u16 = 7777;
 const GATEWAY_MSG_SIZE: usize = 32;
 
-/// Per-core QUIC egress scheduler (docs/tx-backpressure.md stage 3, the
-/// QUIC arm). Default OFF — the inline-ship baseline. Flip to `true` and
-/// rebuild to A/B the per-core DRR fair-queue ownership of the QUIC TX
-/// ring. See `quic::egress`.
-const QUIC_EGRESS_SCHED: bool = false;
+/// Per-core QUIC egress owner (docs/tx-backpressure.md stage 3). The owner
+/// build-at-drains steady-state 1-RTT packets (synchronous acquire→encode→
+/// submit), which re-enables per-packet zero-copy (deletes the small-response
+/// heap memcpy) and is the sole-ring-owner architecture. Default ON: a GCE
+/// c3/gVNIC A/B measured +3.9% h3 /health rps + lower p99 vs the heap path,
+/// 0 loss, and the 24 ms-RTT slot-aliasing failure mode (the reason direct-
+/// fill was off) does not recur. Set `false` for the legacy eager/heap path.
+/// See `quic::egress`.
+const QUIC_EGRESS_SCHED: bool = true;
 
 // TLS certificate material, baked in at build time. The default
 // build uses the checked-in self-signed dev cert (ECDSA P-256 +
