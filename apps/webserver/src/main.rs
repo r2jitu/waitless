@@ -313,7 +313,10 @@ async fn handle_request(req: &mut Request<'_>, res: &mut Response<'_>) -> Result
             .unwrap_or_else(|| b"application/octet-stream".to_vec());
         res.content_type(ct);
         while let Some(chunk) = req.read_chunk().await {
-            res.write(chunk.data()).await?;
+            // Splice: move the received body IOBuf straight to the response —
+            // no copy on the way out (full zero-copy on plain HTTP; one fewer
+            // copy on TLS/h3, where the AEAD encrypt is the only transform).
+            res.write(chunk.into_owned()).await?;
         }
         return res.finish().await;
     }

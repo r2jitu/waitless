@@ -910,8 +910,16 @@ impl ResponseSink for H3Sink<'_> {
         })
     }
 
-    fn write_chunk(&mut self, buf: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
-        let frame = build_h3_data_frame(buf);
+    fn write_chunk(&mut self, buf: IOBuf) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
+        // Frame the body chunk WITHOUT copying its payload: emit the H3 DATA
+        // frame header (type + length varint) as its own small IOBuf, then
+        // move the payload IOBuf in. Two appends to the same stream
+        // concatenate into one DATA frame on the QUIC byte stream — so a
+        // spliced RX `IOBuf` reaches the AEAD sealer without a payload copy.
+        let mut hdr = [0u8; H3_FRAME_HEADER_MAX];
+        let hlen = frame::write_frame_header(h3_ftype::DATA, buf.data().len(), &mut hdr)
+            .expect("data hdr fits");
+        let header = IOBuf::from_slice_with_headroom(0, &hdr[..hlen], 0);
         Box::pin(async move {
             // Stop if the peer closed: `stream_drain_below` returns
             // immediately on a failed conn, so without this an app
@@ -924,7 +932,8 @@ impl ResponseSink for H3Sink<'_> {
             }
             // `send_iobuf` appends + flushes what the stream window allows
             // straight to the socket; only window-blocked bytes linger.
-            self.conn.send_iobuf(self.sid, frame);
+            self.conn.send_iobuf(self.sid, header);
+            self.conn.send_iobuf(self.sid, buf);
             if self.conn.stream_buffered(self.sid) > H3_SEND_BUF_CAP {
                 self.conn.stream_drain_below(self.sid, H3_SEND_BUF_CAP).await;
             }
@@ -965,18 +974,6 @@ fn build_h3_headers_frame(
     out.extend_from_slice(&hdr[..hlen]);
     out.extend_from_slice(&qpack[..qlen]);
     Some(IOBuf::from(out))
-}
-
-/// Build an H3 DATA frame (`type 0x00` + length varint + payload) as an
-/// owned IOBuf for one streamed body chunk.
-fn build_h3_data_frame(buf: &[u8]) -> IOBuf {
-    let mut hdr = [0u8; H3_FRAME_HEADER_MAX];
-    let hlen =
-        frame::write_frame_header(h3_ftype::DATA, buf.len(), &mut hdr).expect("data hdr fits");
-    let mut out = Vec::with_capacity(hlen + buf.len());
-    out.extend_from_slice(&hdr[..hlen]);
-    out.extend_from_slice(buf);
-    IOBuf::from(out)
 }
 
 fn status_to_bytes(status: i32) -> [u8; 3] {

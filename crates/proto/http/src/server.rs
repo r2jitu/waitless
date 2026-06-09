@@ -103,11 +103,13 @@ impl<S: HttpStream> ResponseSink for CellSink<'_, '_, S> {
     }
 
     #[allow(clippy::await_holding_refcell_ref)]
-    fn write_chunk(&mut self, buf: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
-        let chunk = IOBuf::from_slice_with_headroom(0, buf, 0);
+    fn write_chunk(&mut self, buf: IOBuf) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
+        // Close-delimited h1 stream: the chunk's IOBuf moves straight into the
+        // TX chain (no copy) — a borrowed `&'static` body or a spliced RX
+        // `IOBuf` reaches the wire as-is.
         Box::pin(async move {
             self.out.clear();
-            self.out.push_back(chunk);
+            self.out.push_back(buf);
             let mut g = self.cell.borrow_mut();
             g.send(&mut self.out).await
         })
@@ -770,7 +772,8 @@ mod serve_conn_tests {
     async fn echo_handler(req: &mut Request<'_>, res: &mut Response<'_>) -> Result<(), ()> {
         res.content_type(b"application/octet-stream".as_slice());
         while let Some(chunk) = req.read_chunk().await {
-            res.write(chunk.data()).await?;
+            // Splice: move the received IOBuf straight to TX (no copy).
+            res.write(chunk.into_owned()).await?;
         }
         res.finish().await
     }

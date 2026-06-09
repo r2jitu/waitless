@@ -292,12 +292,17 @@ impl<'s> Response<'s> {
     /// (backpressure), so peak memory is `O(chunk)`. With no sink it
     /// appends to the buffered `body` instead (correct, `O(body)`). Set
     /// the head (status / content-type / headers) before the first `write`.
-    pub async fn write(&mut self, buf: &[u8]) -> Result<(), ()> {
+    pub async fn write(&mut self, buf: impl Into<IOBuf>) -> Result<(), ()> {
+        // IOBuf is the currency: `&'static [u8]` borrows (zero-copy), `Vec`/
+        // `String`/an owned `IOBuf` (e.g. `chunk.into_owned()` from the
+        // request body — an RX→TX splice) move in. A transient `&[u8]` has no
+        // `Into<IOBuf>`, so the caller makes ownership (and the copy) explicit.
+        let buf = buf.into();
         if self.sink.is_some() {
             self.flush_head().await?;
             self.sink.as_mut().unwrap().write_chunk(buf).await
         } else {
-            self.body.push_back(IOBuf::from_slice_with_headroom(0, buf, 0));
+            self.body.push_back(buf);
             Ok(())
         }
     }

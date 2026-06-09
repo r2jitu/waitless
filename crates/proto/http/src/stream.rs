@@ -161,8 +161,12 @@ pub trait ResponseSink {
         extra_headers: &[(&[u8], &[u8])],
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>>;
 
-    /// Write one body chunk to the wire (awaited → backpressure).
-    fn write_chunk(&mut self, buf: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>>;
+    /// Write one body chunk to the wire (awaited → backpressure). Takes an
+    /// owned [`IOBuf`](crate::IOBuf) so the chunk **moves** to the transport
+    /// — an `IOBuf` carrying received bytes (an RX→TX splice / proxy) reaches
+    /// the wire without a copy. `Response::write` converts `&'static [u8]`,
+    /// `Vec<u8>`, etc. via `Into<IOBuf>` (borrow or move as the source allows).
+    fn write_chunk(&mut self, buf: crate::IOBuf) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>>;
 
     /// End the response body.
     fn finish(&mut self) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>>;

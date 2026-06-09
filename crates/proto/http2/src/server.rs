@@ -755,8 +755,11 @@ impl ResponseSink for H2Sink {
         })
     }
 
-    fn write_chunk(&mut self, buf: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
-        let chunk = IOBuf::from_slice_with_headroom(0, buf, 0);
+    fn write_chunk(&mut self, buf: IOBuf) -> Pin<Box<dyn Future<Output = Result<(), ()>> + '_>> {
+        // The chunk's IOBuf moves into the per-stream TX queue (no copy); the
+        // demux frames it into a DATA frame zero-copy when the window opens.
+        let len = buf.data().len();
+        let mut chunk = Some(buf);
         Box::pin(async move {
             loop {
                 // Arm the wakeup BEFORE the cap check so a demux drain
@@ -767,9 +770,9 @@ impl ResponseSink for H2Sink {
                     if d.reset {
                         return Err(());
                     }
-                    if d.buffered == 0 || d.buffered + chunk.data().len() <= STREAM_SEND_BUF_CAP {
-                        d.buffered += chunk.data().len();
-                        d.chunks.push_back(chunk);
+                    if d.buffered == 0 || d.buffered + len <= STREAM_SEND_BUF_CAP {
+                        d.buffered += len;
+                        d.chunks.push_back(chunk.take().expect("write_chunk polled once"));
                         drop(d);
                         self.demux_wake.set();
                         return Ok(());
