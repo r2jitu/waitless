@@ -104,6 +104,12 @@ type IdleFn = fn(u32, u32);
 /// cores when they observe the slot.
 static NET_POLL: AtomicFn<PollFn> = AtomicFn::null();
 static NET_DRAIN: AtomicFn<PollFn> = AtomicFn::null();
+/// Per-core egress drain (docs/tx-backpressure.md stage 3): when a per-core
+/// egress scheduler owns the TX ring, this ships its queued flows in fair
+/// order. Runs just before `NET_FLUSH` (which kicks the doorbell) so the
+/// packets it submits get flushed in the same pass. Null unless an egress
+/// scheduler is installed at boot — zero cost otherwise.
+static EGRESS_DRAIN: AtomicFn<VoidFn> = AtomicFn::null();
 static NET_FLUSH: AtomicFn<VoidFn> = AtomicFn::null();
 static SERVICE: AtomicFn<PollFn> = AtomicFn::null();
 static CHECK_SHUTDOWN: AtomicFn<BoolFn> = AtomicFn::null();
@@ -143,6 +149,13 @@ pub fn set_net_drain(f: PollFn) {
 
 pub fn set_net_flush(f: VoidFn) {
     NET_FLUSH.store(f);
+}
+
+/// Install the per-core egress drain (docs/tx-backpressure.md stage 3).
+/// Called once at boot when an egress scheduler is enabled; runs each pass
+/// just before `NET_FLUSH`.
+pub fn set_egress_drain(f: VoidFn) {
+    EGRESS_DRAIN.store(f);
 }
 
 pub fn set_service(f: PollFn) {
@@ -360,12 +373,18 @@ pub fn run(core_id: u32) -> ! {
             runtime_work += 1;
         }
 
-        // 3b. Flush TX after service — responses must be sent immediately
-        // so keep-alive follow-up requests arrive promptly.
-        if did_work
-            && let Some(f) = NET_FLUSH.load()
-        {
-            f();
+        // 3b. Drain the per-core egress scheduler (if installed) into the
+        // ring, then flush TX — responses must be sent immediately so
+        // keep-alive follow-up requests arrive promptly. The drain runs
+        // before the flush so the packets it submits get doorbell-kicked
+        // this pass.
+        if did_work {
+            if let Some(f) = EGRESS_DRAIN.load() {
+                f();
+            }
+            if let Some(f) = NET_FLUSH.load() {
+                f();
+            }
         }
 
         // 4. Check for shutdown (every 64 iterations to avoid MMIO overhead).
@@ -435,7 +454,11 @@ pub fn run(core_id: u32) -> ! {
                 continue;
             }
 
-            // Flush before sleeping (responses may be staged).
+            // Drain egress + flush before sleeping (responses may be
+            // staged, and a flow may have activated without yet shipping).
+            if let Some(f) = EGRESS_DRAIN.load() {
+                f();
+            }
             if let Some(f) = NET_FLUSH.load() {
                 f();
             }
