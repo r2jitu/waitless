@@ -777,8 +777,8 @@ pub fn num_workers() -> u32 {
 /// runner and the OS owns scheduling decisions anyway. Return zeros;
 /// `/obs` `event_loop` consumers should treat zeros as "not
 /// available on this backend" rather than "core is idle".
-pub fn core_stats(_core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
-    (0, 0, 0, 0, 0, 0, 0, 0)
+pub fn core_stats(_core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64) {
+    (0, 0, 0, 0, 0, 0, 0)
 }
 
 /// Native has no easy cycle-rate accessor (we don't read TSC

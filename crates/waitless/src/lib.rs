@@ -396,14 +396,14 @@ pub mod diagnostics {
     }
 
     /// Per-core event-loop stats: `(loops, poll_work, drain_work,
-    /// service_work, idle_enters, busy_cycles, idle_cycles)`.
+    /// runtime_work, idle_enters, busy_cycles, idle_cycles)`.
     ///
     /// `busy_cycles + idle_cycles` ≈ wall-clock cycles since boot
     /// on this core; `idle_cycles / total` is the per-core idle
     /// fraction. The work counters tell whether the busy time was
-    /// going to net poll / inbox drain / app service. All zeros
-    /// on native (the OS owns scheduling).
-    pub fn core_stats(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    /// going to net poll / inbox drain / async-runtime ticks. All
+    /// zeros on native (the OS owns scheduling).
+    pub fn core_stats(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64) {
         waitless_backend::core_stats(core_id)
     }
 

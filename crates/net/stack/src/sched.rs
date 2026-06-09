@@ -234,17 +234,16 @@ fn poll_tier2(num_cores: u32) -> bool {
 /// Register network callbacks with the kernel event loop.
 /// Called during boot after virtio-net is initialized.
 pub fn init_eventloop() {
-    kernel_bare::eventloop::set_net_poll(net_poll_cb);
-    kernel_bare::eventloop::set_net_drain(net_drain_cb);
-    kernel_bare::eventloop::set_net_flush(net_flush_cb);
-    // NAPI re-arm: right before the event loop HLTs, re-enable RX
-    // notifications on this core's queue pair and re-check the ring.
-    kernel_bare::eventloop::set_net_rearm_rx(nic::rearm_rx_napi);
-    // A core with an armed TCP timer must not sleep past the
-    // deadline. The event loop bounds its idle when this reports true
-    // — a connection awaiting a lost segment's ACK, or a half-closed
-    // connection retransmitting its FIN, gets no RX event otherwise.
-    kernel_bare::eventloop::set_net_has_timers(crate::tcp::has_armed_timers);
+    // One-shot registration of the loop's whole net surface; field
+    // docs (and the registration map + ordering invariants) live on
+    // `kernel_bare::eventloop::NetHooks`.
+    kernel_bare::eventloop::set_net_hooks(kernel_bare::eventloop::NetHooks {
+        poll: net_poll_cb,
+        drain: net_drain_cb,
+        flush: net_flush_cb,
+        rearm_rx: nic::rearm_rx_napi,
+        has_timers: crate::tcp::has_armed_timers,
+    });
     // Batch TX kicks: defer MMIO writes until `net_flush_cb` fires at
     // the end of each event-loop tick. Correct for the whole boot
     // because DHCP now runs as an async task polled by the event loop

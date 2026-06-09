@@ -75,7 +75,6 @@ pub use kernel_bare::percpu::num_cores as num_workers;
 ///   * `loops`         — total event-loop iterations on this core
 ///   * `poll_work`     — iterations where the net-poll callback returned true
 ///   * `drain_work`    — iterations where the net-drain callback returned true
-///   * `service_work`  — iterations where the app-service callback returned true
 ///   * `runtime_work`  — iterations where `executor::tick` polled a ready task
 ///     (the webserver's TCP/TLS/QUIC accept loops live here)
 ///   * `idle_enters`   — number of times the core actually slept (HLT/WFI)
@@ -85,7 +84,7 @@ pub use kernel_bare::percpu::num_cores as num_workers;
 /// Idle-percent on core `c` is then
 /// `idle_cycles / (busy_cycles + idle_cycles)`. Caller computes
 /// rates from two snapshots a known interval apart.
-pub fn core_stats(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+pub fn core_stats(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64) {
     kernel_bare::eventloop::core_stats_snapshot(core_id)
 }
 

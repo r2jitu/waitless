@@ -271,7 +271,6 @@ fn write_event_loop_obs<W: core::fmt::Write>(w: &mut W) {
     let mut loops = [0u64; 8];
     let mut poll_work = [0u64; 8];
     let mut drain_work = [0u64; 8];
-    let mut svc_work = [0u64; 8];
     let mut rt_work = [0u64; 8];
     let mut idle_enters = [0u64; 8];
     let mut busy_cyc = [0u64; 8];
@@ -281,11 +280,10 @@ fn write_event_loop_obs<W: core::fmt::Write>(w: &mut W) {
         loops[i] = s.0;
         poll_work[i] = s.1;
         drain_work[i] = s.2;
-        svc_work[i] = s.3;
-        rt_work[i] = s.4;
-        idle_enters[i] = s.5;
-        busy_cyc[i] = s.6;
-        idle_cyc[i] = s.7;
+        rt_work[i] = s.3;
+        idle_enters[i] = s.4;
+        busy_cyc[i] = s.5;
+        idle_cyc[i] = s.6;
     }
     let _ = w.write_str("{");
     emit_json_array(w, "core_loops", &loops[..nc]);
@@ -293,8 +291,6 @@ fn write_event_loop_obs<W: core::fmt::Write>(w: &mut W) {
     emit_json_array(w, "core_poll_work", &poll_work[..nc]);
     let _ = w.write_str(",");
     emit_json_array(w, "core_drain_work", &drain_work[..nc]);
-    let _ = w.write_str(",");
-    emit_json_array(w, "core_service_work", &svc_work[..nc]);
     let _ = w.write_str(",");
     emit_json_array(w, "core_runtime_work", &rt_work[..nc]);
     let _ = w.write_str(",");

@@ -1,8 +1,23 @@
 // kernel/eventloop.rs — Unified per-core event loop.
 //
-// Every core runs the same loop: poll IO → drain inbox → service app →
-// flush TX → idle if no work. All callbacks are registered via function
-// pointers to avoid circular crate dependencies.
+// Every core runs the same loop: poll IO → drain inbox → tick the
+// async runtime → drain egress + flush TX → idle if no work. All
+// callbacks are registered via function pointers to avoid circular
+// crate dependencies.
+//
+// REGISTRATION MAP (who installs what, and when — ordering is
+// load-bearing):
+//   1. `set_net_hooks`      — net/stack `sched::init_eventloop()`, at
+//      boot after the NIC driver is up. MUST run before `set_ready()`
+//      releases the AP cores or RX frames race a null poll hook.
+//   2. `set_check_shutdown` + `set_idle` — boot entry, before
+//      `set_ready()`. (`set_service` — bare-kernel per-core hook —
+//      is kernel-test plumbing only; apps spawn async tasks.)
+//   3. `set_on_shutdown`    — `waitless::run`, before `set_ready()`.
+//   4. `set_egress_drain`   — the app, AFTER workers are up but BEFORE
+//      any QUIC listener spawns (a flow registered before the hook is
+//      installed would queue packets nothing drains).
+//   5. `set_ready()`        — last: releases the APs into the loop.
 //
 // All cores enter eventloop::run() after boot. Core 0 drives the
 // spawned init task (see `#[waitless::init]`); APs wait for `set_ready`
@@ -30,13 +45,11 @@ pub struct CoreStats {
     pub loops: AtomicU64,
     pub poll_work: AtomicU64,
     pub drain_work: AtomicU64,
-    pub service_work: AtomicU64,
     /// Iterations where `executor::tick` reported work — the
     /// async executor polled a ready task. On apps like the
     /// webserver that route accepted conns through async-task
     /// spawns this is where the bulk of real work shows up
-    /// (`NET_POLL`/`NET_DRAIN` only fire on actual NIC traffic,
-    /// `SERVICE` is unused by the webserver).
+    /// (`NET_POLL`/`NET_DRAIN` only fire on actual NIC traffic).
     pub runtime_work: AtomicU64,
     pub idle_enters: AtomicU64,
     pub busy_cycles: AtomicU64,
@@ -49,7 +62,6 @@ impl CoreStats {
             loops: AtomicU64::new(0),
             poll_work: AtomicU64::new(0),
             drain_work: AtomicU64::new(0),
-            service_work: AtomicU64::new(0),
             runtime_work: AtomicU64::new(0),
             idle_enters: AtomicU64::new(0),
             busy_cycles: AtomicU64::new(0),
@@ -70,17 +82,16 @@ static CORE_STATS: [CoreStats; MAX_CORE_STATS] = [const { CoreStats::new() }; MA
 /// Snapshot the stats for `core_id`. Returns zeros for ids ≥ the
 /// fixed cap. Live readers should sample two snapshots a known
 /// interval apart and difference them to compute rates / idle %.
-pub fn core_stats_snapshot(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+pub fn core_stats_snapshot(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64) {
     let i = core_id as usize;
     if i >= MAX_CORE_STATS {
-        return (0, 0, 0, 0, 0, 0, 0, 0);
+        return (0, 0, 0, 0, 0, 0, 0);
     }
     let s = &CORE_STATS[i];
     (
         s.loops.load(Ordering::Relaxed),
         s.poll_work.load(Ordering::Relaxed),
         s.drain_work.load(Ordering::Relaxed),
-        s.service_work.load(Ordering::Relaxed),
         s.runtime_work.load(Ordering::Relaxed),
         s.idle_enters.load(Ordering::Relaxed),
         s.busy_cycles.load(Ordering::Relaxed),
@@ -88,7 +99,11 @@ pub fn core_stats_snapshot(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64, 
     )
 }
 
-/// Callback types. All receive core_id, return true if work was done.
+/// Callback types. `PollFn` receives the core id and returns true iff
+/// it did USEFUL work this call. The return value feeds the idle
+/// backoff: a spurious `true` (e.g. "polled but the ring was empty")
+/// delays HLT and burns idle CPU; a `false` despite real work makes
+/// the core sleep prematurely and adds an IRQ round-trip of latency.
 type PollFn = fn(u32) -> bool;
 type VoidFn = fn();
 type BoolFn = fn() -> bool;
@@ -104,6 +119,7 @@ type IdleFn = fn(u32, u32);
 /// cores when they observe the slot.
 static NET_POLL: AtomicFn<PollFn> = AtomicFn::null();
 static NET_DRAIN: AtomicFn<PollFn> = AtomicFn::null();
+
 /// Per-core egress drain (docs/tx-backpressure.md stage 3): when a per-core
 /// egress scheduler owns the TX ring, this ships its queued flows in fair
 /// order. Runs just before `NET_FLUSH` (which kicks the doorbell) so the
@@ -111,6 +127,12 @@ static NET_DRAIN: AtomicFn<PollFn> = AtomicFn::null();
 /// scheduler is installed at boot — zero cost otherwise.
 static EGRESS_DRAIN: AtomicFn<VoidFn> = AtomicFn::null();
 static NET_FLUSH: AtomicFn<VoidFn> = AtomicFn::null();
+/// Bare-kernel per-core service hook: code run on every loop pass on
+/// every core, BELOW the async runtime. Apps never use this (they
+/// spawn async tasks; `executor::tick` is their service step) — its
+/// users are kernel-layer integration tests that must run on each
+/// core without depending on the executor (e.g.
+/// tests/integration/percpu). Null and zero-cost otherwise.
 static SERVICE: AtomicFn<PollFn> = AtomicFn::null();
 static CHECK_SHUTDOWN: AtomicFn<BoolFn> = AtomicFn::null();
 /// Reports whether the net stack has a timer that needs servicing
@@ -138,17 +160,41 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
 
 // ---- Registration API (called during boot/app init) ----
+// See the REGISTRATION MAP in the module header for who installs
+// what and the ordering invariants.
 
-pub fn set_net_poll(f: PollFn) {
-    NET_POLL.store(f);
+/// The network stack's event-loop callbacks, registered together in
+/// one shot by `net_stack::sched::init_eventloop()` once the NIC
+/// driver is up (and before `set_ready()` releases the AP cores).
+/// One struct rather than five setters so a registrant can't forget
+/// a hook and so the loop's net surface is visible in one place.
+pub struct NetHooks {
+    /// Step 1 — distribute RX + rotate the distributor. True iff
+    /// frames were dispatched.
+    pub poll: PollFn,
+    /// Step 2 — drain this core's RX inbox into handlers. True iff
+    /// frames were delivered.
+    pub drain: PollFn,
+    /// Runs after the egress drain on every did-work pass and before
+    /// any idle: kick the TX doorbell for batched submissions.
+    pub flush: VoidFn,
+    /// Whether the net stack has a timer due soon (chiefly a TCP
+    /// RFC 6298 retransmit). Consulted before a fully-idle HLT/WFI so
+    /// a core with a lost segment to resend doesn't sleep past the
+    /// RTO deadline (no RX event would wake it).
+    pub has_timers: BoolFn,
+    /// NAPI-style RX re-arm, called right before HLT/WFI. Returns
+    /// true if a packet landed in the arming window — the loop then
+    /// skips the idle and goes around again.
+    pub rearm_rx: ArmFn,
 }
 
-pub fn set_net_drain(f: PollFn) {
-    NET_DRAIN.store(f);
-}
-
-pub fn set_net_flush(f: VoidFn) {
-    NET_FLUSH.store(f);
+pub fn set_net_hooks(h: NetHooks) {
+    NET_POLL.store(h.poll);
+    NET_DRAIN.store(h.drain);
+    NET_FLUSH.store(h.flush);
+    NET_HAS_TIMERS.store(h.has_timers);
+    NET_REARM_RX.store(h.rearm_rx);
 }
 
 /// Install the per-core egress drain (docs/tx-backpressure.md stage 3).
@@ -158,16 +204,14 @@ pub fn set_egress_drain(f: VoidFn) {
     EGRESS_DRAIN.store(f);
 }
 
+/// Install the bare-kernel per-core service hook (see [`SERVICE`]) —
+/// kernel-test plumbing, not an app API; apps spawn async tasks.
 pub fn set_service(f: PollFn) {
     SERVICE.store(f);
 }
 
 pub fn set_check_shutdown(f: BoolFn) {
     CHECK_SHUTDOWN.store(f);
-}
-
-pub fn set_net_has_timers(f: BoolFn) {
-    NET_HAS_TIMERS.store(f);
 }
 
 pub fn set_idle(f: IdleFn) {
@@ -179,10 +223,6 @@ pub fn set_idle(f: IdleFn) {
 /// `App::destroy` with the heap still live.
 pub fn set_on_shutdown(f: VoidFn) {
     ON_SHUTDOWN.store(f);
-}
-
-pub fn set_net_rearm_rx(f: ArmFn) {
-    NET_REARM_RX.store(f);
 }
 
 /// Signal that the app has finished initialization and the event loop
@@ -235,7 +275,7 @@ pub fn run(core_id: u32) -> ! {
     let mut loops: u64 = 0;
     let mut poll_work: u64 = 0;
     let mut drain_work: u64 = 0;
-    let mut service_work: u64 = 0;
+
     let mut idle_count: u64 = 0;
     // Consecutive iterations with did_work == false. Used to spin for
     // a short window before we commit to HLT/WFI, so back-to-back
@@ -288,7 +328,7 @@ pub fn run(core_id: u32) -> ! {
 
     // How many no-work iterations to spin through before arming the
     // next RX IRQ and going idle. Each iteration is a full poll +
-    // drain + service cycle and costs ~200ns.
+    // drain + tick cycle and costs ~200ns.
     //
     // 64 (~13 µs) was the original; comments-of-record had it
     // verified on HVF udp_peak as no-difference vs 1024 / u32::MAX,
@@ -357,12 +397,12 @@ pub fn run(core_id: u32) -> ! {
             drain_work += 1;
         }
 
-        // 3. App service (connections, handlers)
+        // 3. Bare-kernel service hook (kernel integration tests only;
+        // null in apps — see `SERVICE`).
         if let Some(f) = SERVICE.load()
             && f(core_id)
         {
             did_work = true;
-            service_work += 1;
         }
 
         // 3a. Async runtime: advance timers (drain pending MPSC + fire
@@ -373,7 +413,7 @@ pub fn run(core_id: u32) -> ! {
             runtime_work += 1;
         }
 
-        // 3b. Drain the per-core egress scheduler (if installed) into the
+        // 4. Drain the per-core egress scheduler (if installed) into the
         // ring, then flush TX — responses must be sent immediately so
         // keep-alive follow-up requests arrive promptly. The drain runs
         // before the flush so the packets it submits get doorbell-kicked
@@ -387,7 +427,7 @@ pub fn run(core_id: u32) -> ! {
             }
         }
 
-        // 4. Check for shutdown (every 64 iterations to avoid MMIO overhead).
+        // 5. Check for shutdown (every 64 iterations to avoid MMIO overhead).
         if loops & 63 == 0 {
             if let Some(f) = CHECK_SHUTDOWN.load()
                 && f()
@@ -536,7 +576,6 @@ pub fn run(core_id: u32) -> ! {
         stats.loops.store(loops, Ordering::Relaxed);
         stats.poll_work.store(poll_work, Ordering::Relaxed);
         stats.drain_work.store(drain_work, Ordering::Relaxed);
-        stats.service_work.store(service_work, Ordering::Relaxed);
         stats.runtime_work.store(runtime_work, Ordering::Relaxed);
         let now = crate::time::now_cycles();
         let delta = now.wrapping_sub(iter_start_cycles);
@@ -589,8 +628,6 @@ pub fn run(core_id: u32) -> ! {
     print_u64(poll_work);
     crate::serial::puts(b" drain=");
     print_u64(drain_work);
-    crate::serial::puts(b" svc=");
-    print_u64(service_work);
     crate::serial::puts(b" idle=");
     print_u64(idle_count);
     crate::serial::puts(b"\n");
