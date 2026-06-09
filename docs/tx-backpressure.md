@@ -126,13 +126,11 @@ Ordered by foundational-ness; each is separable and testable.
    + `activate` when they have queued outbound; the per-core `EGRESS_DRAIN`
    event-loop hook is the sole `ship_datagram` caller, granting a bounded
    quantum per round so one bulk flow can't monopolise a core's TX queue.
-   Gated by the app's `QUIC_EGRESS_SCHED` flag; OFF ⇒ the byte-for-byte
-   inline-ship path. *Next, in order:* (a) just-in-time ring **admission** —
-   QUIC acquires its ring slot at *build* time, so today the drain arbitrates
-   ship order over already-acquired packets; moving the build into the drain
-   ("freshest cwnd, no stale packets") makes it the true ring owner;
-   (b) the **TCP arm** (the golden path) behind the same hook;
-   (c) a single cross-protocol per-core queue.
+   Gated by the app's `QUIC_EGRESS_SCHED` flag (now default-ON). The drain
+   evolved from ship-ordering to **build-at-drain** (build each 1-RTT packet
+   into the slot at drain time, submit synchronously) — see "The convergence"
+   below for the result and why the cross-protocol/TCP/sole-owner extensions
+   stop here.
 4. **Admission control.** Cap concurrency / global byte budget → bounds total
    memory. (Per-IP conn caps exist in the QUIC slot table; generalize.)
 
@@ -143,22 +141,47 @@ primitives as standalone, host-unit-tested, `no_std` crates — `net_cc` (1) and
 `net_egress` (3). These are the abstractions `stack-architecture.md` marked "not
 started."
 
-**Since wired into the hot path:** `net_cc` now backs TCP's congestion control
-(2) and QUIC has its first controller. `net_egress` owns QUIC ship ordering (3,
-the QUIC arm) behind the default-OFF `QUIC_EGRESS_SCHED` flag — host-tested,
-HVF-validated functional (h3 small + large + conn churn, no panics, heap_oom=0).
-A GCE c3/gVNIC h3 A/B (OFF vs ON) found it **throughput-neutral-to-slightly-
-negative** (within spot variance; bulk `download_64k` ~2–8 % lower under ON — the
-DRR-drain cost) with **no upside** on single-flow benches: as
+**Wired into the hot path:** `net_cc` now backs both TCP's and QUIC's
+congestion control (2). For the egress owner (3), the QUIC arm went through two
+iterations: a *ship-ordering* DRR (reorder already-built packets) measured
+throughput-neutral-to-slightly-negative with no upside — because, as
 [`h3-health-cycle-profile.md`](h3-health-cycle-profile.md) found, TX isn't the
-throughput lever, and the *fairness* benefit this buys (N flows oversubscribing
-one core's TX queue) isn't exercised by a single dominant flow. So it ships
-**default-OFF** — a proven opt-in lever, not a default (the per-core-magazine
-precedent). Building the primitives in isolation first made each integration a
-wiring exercise against a tested core, not a design-and-build in the hot path.
+throughput lever and the fairness it buys isn't exercised by a single flow. The
+*build-at-drain* iteration that replaced it **is** a win: the owner builds each
+steady-state 1-RTT packet at drain time — acquire a slot, encode into it, submit
+synchronously — which restores the acquire→submit pairing the deferred/`outbound`
+model broke, so **per-packet direct-fill (zero-copy) is safe again** and the
+small-response heap memcpy is gone. GCE c3/gVNIC h3 `/health`: **+3.9 % rps,
+lower p99, 0 loss**; a 24 ms-RTT re-test of the exact slot-aliasing failure that
+forced `QUIC_TX_DIRECT_FILL_SAFE=false` showed **0 AEAD failures** — it doesn't
+recur. Default-ON (`QUIC_EGRESS_SCHED`).
 
-**Still ahead:** the higher-value, higher-risk parts of (3) — just-in-time ring
-*admission* (vs today's ship-ordering), the golden-path TCP arm, and a unified
-cross-protocol per-core queue — plus admission control (4).
+### The convergence — and where it stops
+
+Build-at-drain makes QUIC's TX **the same shape as TCP's**: build one frame
+straight into a ring slot and submit it immediately, zero-copy, one at a time.
+TCP was always shaped that way (`tcp::send::build_and_send_frame`), which is why
+it never had QUIC's heap detour. The two paths now share their genuinely common
+layer — the `nic` ring API and the `net_cc` window — and that's the sharing that
+was worth doing.
+
+They are deliberately **not** merged into one runtime owner or one code trait:
+
+- A **runtime sole-owner** (route both protocols through one component) buys
+  cross-flow fairness (measured ≈ 0 here — per-flow pacing + DQO back-pressure
+  keep the ring loss-free) and a single ring-writer (the breaker it would delete
+  lives only on virtio/GQI; gve-DQO, the production path, already does
+  non-blocking acquire). All cost (golden-TCP-path risk), no measured benefit.
+- A **shared egress *trait*** would be a leaky abstraction: the two loops differ
+  in granularity (TCP sends a byte-window via one TSO/per-MSS call, ring-full =
+  `actually_sent < sendable`; QUIC builds packet-by-packet, ring-full =
+  `build_next → None`), in fill interface (slice closure vs `Vec` encoder), and
+  in driver (async send-future vs per-core drain). The interface would have no
+  shared body behind it — naming, not dedup.
+
+So the convergence is in **shape + shared primitives**, documented here as the
+egress contract both implementations satisfy, rather than forced into a common
+type. The cross-protocol unification, golden-TCP arm, and admission control (4)
+remain available but are not currently justified by measurement.
 
 [`reference_hvf_h3_stream_wedge`]: # "agent memory note — the wedge root-cause"
