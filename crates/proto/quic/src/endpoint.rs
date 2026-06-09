@@ -71,7 +71,7 @@ use tls::TlsServerConfig;
 ///     the conn's `outbound_pool`.
 ///
 /// Always bumps `COUNTERS.datagrams_sent`.
-fn ship_datagram(
+pub(crate) fn ship_datagram(
     sock: &UdpSocket,
     conn: &RefCell<Connection>,
     peer_ip: waitless::runtime::IpAddr,
@@ -120,6 +120,34 @@ fn ship_datagram_inner(
         conn.borrow_mut().recycle_packet(pkt);
     }
     crate::diag::COUNTERS.datagrams_sent.bump();
+}
+
+/// Flush a connection's queued outbound packets to the wire. With egress
+/// scheduling on (`egress_guard` is `Some`), just mark the flow ready — the
+/// per-core drain ships it in DRR order at the FLUSH step. Off, drain the
+/// `outbound` queue inline via the ownership-transfer pop + ship pattern
+/// (the original behavior). The single chokepoint every former inline-ship
+/// site now routes through, so the on/off split lives in exactly one place.
+fn flush_to_wire(
+    egress_guard: &Option<Rc<crate::egress::FlowGuard>>,
+    sock: &UdpSocket,
+    conn: &Rc<RefCell<Connection>>,
+    peer_ip: &Rc<Cell<waitless::runtime::IpAddr>>,
+    peer_port: &Rc<Cell<u16>>,
+) {
+    if let Some(g) = egress_guard {
+        if conn.borrow().has_outbound() {
+            crate::egress::activate(g.flow());
+        }
+        return;
+    }
+    loop {
+        let pkt = match conn.borrow_mut().pop_packet_owned() {
+            Some(p) => p,
+            None => break,
+        };
+        ship_datagram(sock, conn, peer_ip.get(), peer_port.get(), pkt);
+    }
 }
 
 /// Maximum simultaneous QUIC connections per worker — the ceiling on
@@ -185,6 +213,12 @@ pub struct QuicConn {
     /// log it as a connection identifier. Stored as bytes since
     /// `ConnectionId` itself is internal.
     pub local_cid: [u8; SERVER_CID_LEN],
+    /// Shared egress flow guard (clone of the conn task's). `Some` ⇒ this
+    /// connection's outbound is shipped by the per-core egress drain, so the
+    /// handler's send path `activate`s the flow instead of shipping inline.
+    /// `None` ⇒ egress scheduling off / table full ⇒ ship inline. Holding a
+    /// clone keeps the flow id reserved until the handler is also gone.
+    egress_guard: Option<Rc<crate::egress::FlowGuard>>,
 }
 
 impl QuicConn {
@@ -429,23 +463,13 @@ impl QuicConn {
     }
 
     fn drain_outbound(&self) {
-        loop {
-            let pkt = {
-                let mut c = self.conn.borrow_mut();
-                c.pop_packet_owned()
-            };
-            let pkt = match pkt {
-                Some(p) => p,
-                None => break,
-            };
-            ship_datagram(
-                &self.sock,
-                &self.conn,
-                self.peer_ip.get(),
-                self.peer_port.get(),
-                pkt,
-            );
-        }
+        flush_to_wire(
+            &self.egress_guard,
+            &self.sock,
+            &self.conn,
+            &self.peer_ip,
+            &self.peer_port,
+        );
     }
 }
 
@@ -792,6 +816,18 @@ where
     let progress = Rc::new(AsyncEvent::new());
     let peer_ip: Rc<Cell<waitless::runtime::IpAddr>> = Rc::new(Cell::new(waitless::runtime::IpAddr::V4_ANY));
     let peer_port: Rc<Cell<u16>> = Rc::new(Cell::new(0));
+    // Per-core egress scheduling (docs/tx-backpressure.md stage 3). When
+    // enabled, register this connection as a flow; the per-core drain ships
+    // its packets in DRR order instead of the inline `ship_datagram` loops
+    // below. `None` (the default / table-full) ⇒ keep shipping inline. The
+    // guard is shared with the handler's `QuicConn` so the flow id is
+    // reclaimed only when both halves are gone (see `egress::FlowGuard`).
+    let egress_guard = crate::egress::register(
+        Rc::downgrade(&conn),
+        Arc::clone(&sock),
+        Rc::clone(&peer_ip),
+        Rc::clone(&peer_port),
+    );
     let mut handler_spawned = false;
     // Observability (principle 3 — every exit is traced): each break
     // site below classifies the teardown; the post-loop
@@ -920,15 +956,9 @@ where
                     shipped_work = true;
                 }
                 if shipped_work {
-                    // Drain to the wire via the ownership-transfer pop +
-                    // recycle pattern.
-                    loop {
-                        let pkt = match conn.borrow_mut().pop_packet_owned() {
-                            Some(p) => p,
-                            None => break,
-                        };
-                        ship_datagram(&sock, &conn, peer_ip.get(), peer_port.get(), pkt);
-                    }
+                    // Hand off to the wire: inline drain, or (egress on)
+                    // mark the flow ready for the per-core DRR drain.
+                    flush_to_wire(&egress_guard, &sock, &conn, &peer_ip, &peer_port);
                     // Wake any handler parked in `stream_drain_below`: the
                     // paced flush may have drained its send buffer below the
                     // cap, and — unlike the inbound path — no datagram
@@ -1030,14 +1060,9 @@ where
         // `send_via_tx_handle` (driver fills the L2/L3/L4 headers
         // in the slot's headroom in place), `Heap` falls back to
         // `send_to_with_l2_headroom` and recycles the Vec into
-        // the conn's pool.
-        loop {
-            let pkt = match conn.borrow_mut().pop_packet_owned() {
-                Some(p) => p,
-                None => break,
-            };
-            ship_datagram(&sock, &conn, peer_ip.get(), peer_port.get(), pkt);
-        }
+        // the conn's pool. With egress scheduling on, `flush_to_wire`
+        // instead marks the flow ready for the per-core DRR drain.
+        flush_to_wire(&egress_guard, &sock, &conn, &peer_ip, &peer_port);
         if tearing_down {
             break;
         }
@@ -1062,6 +1087,7 @@ where
                 peer_port: Rc::clone(&peer_port),
                 progress: Rc::clone(&progress),
                 local_cid: local_cid_bytes,
+                egress_guard: egress_guard.clone(),
             };
             let handler_fn = handler.clone();
             let _ = spawn(async move {

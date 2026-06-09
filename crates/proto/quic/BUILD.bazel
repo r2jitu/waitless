@@ -48,6 +48,9 @@ rust_library(
         "src/conn/loss.rs",
         "src/conn/rx.rs",
         "src/conn/tx.rs",
+        # Per-core egress scheduler (DRR fair queue) — docs/tx-backpressure.md
+        # stage 3, the QUIC arm.
+        "src/egress.rs",
         "src/endpoint.rs",
         "src/inbox.rs",
         "src/streams.rs",
@@ -65,8 +68,13 @@ rust_library(
     deps = [
         "//crates/drivers/nic:api",
         "//crates/net/cc",
+        # Per-core egress scheduler (DRR fair queue) — docs/tx-backpressure.md
+        # stage 3, the QUIC arm (see src/egress.rs).
+        "//crates/net/egress",
         "//crates/proto/tls",
         "//crates/runtime/executor",
+        # `WorkerLocal` / `CurrentWorker` for the per-core egress state.
+        "//crates/runtime/worker",
         "//crates/waitless",
         "//crates/util/iobuf",
         # `obs::{Counter, LastEvent, LatencyHist}` — the shared
