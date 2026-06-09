@@ -1,5 +1,9 @@
-// net/egress — per-core egress scheduler (the second back-pressure source
-// from docs/tx-backpressure.md: many flows saturating ONE NIC TX queue).
+// drr — the Deficit-Round-Robin fair queue behind `quic::egress` (the
+// second back-pressure source from docs/tx-backpressure.md: many flows
+// saturating ONE NIC TX queue). Formerly its own crate (`net_egress`)
+// on the theory TCP would adopt it too; #43 settled that the TCP arm
+// stays direct-submit ("convergence stops here" in the doc), so the
+// scheduler folded into its only consumer.
 //
 // Where `net_cc`'s `CongestionControl` bounds a *single* flow against a slow
 // path/peer, this arbitrates *between* flows competing for one shared egress.
@@ -18,7 +22,6 @@
 // Fixed capacity `N` (max concurrent flows on this core's queue), no alloc,
 // O(1) per operation — host-unit-testable.
 
-#![cfg_attr(not(test), no_std)]
 
 /// A Deficit-Round-Robin fair-queue scheduler over up to `N` flows, each
 /// identified by an index in `0..N` (e.g. a per-core connection slot). A
@@ -155,6 +158,9 @@ impl<const N: usize> DeficitRoundRobin<N> {
     }
 
     /// Is `flow` currently active?
+    // Used by the unit tests below; no hot-path caller (`egress`
+    // tracks activity via its own shipper slots).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_active(&self, flow: usize) -> bool {
         flow < N && self.active[flow]
     }

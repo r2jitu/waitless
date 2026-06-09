@@ -30,6 +30,8 @@ rust_library(
         # `quic_drop!` / `quic_event!` macros that wrap every
         # silent-drop site so failures are visible to the operator.
         "src/diag.rs",
+        # DRR fair queue behind src/egress.rs (former crates/net/egress).
+        "src/drr.rs",
         # Sans-io QUIC primitives (formerly //crates/net:quic_{wire,frame,crypto}).
         "src/crypto.rs",
         "src/frame.rs",
@@ -70,7 +72,6 @@ rust_library(
         "//crates/net/cc",
         # Per-core egress scheduler (DRR fair queue) — docs/tx-backpressure.md
         # stage 3, the QUIC arm (see src/egress.rs).
-        "//crates/net/egress",
         "//crates/proto/tls",
         "//crates/runtime/executor",
         # `WorkerLocal` / `CurrentWorker` for the per-core egress state.

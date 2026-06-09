@@ -1,7 +1,7 @@
 //! Per-core QUIC egress scheduler — docs/tx-backpressure.md stage 3, the
 //! QUIC arm.
 //!
-//! A Deficit-Round-Robin fair queue ([`net_egress`]) becomes the per-core
+//! A Deficit-Round-Robin fair queue ([`crate::drr`]) becomes the per-core
 //! owner of QUIC *ship ordering*. Today every `conn_task` / handler ships
 //! its connection's packets inline (`ship_datagram` straight to the NIC),
 //! so when N connections each have a response ready in one event-loop pass
@@ -38,7 +38,7 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use net_egress::DeficitRoundRobin;
+use crate::drr::DeficitRoundRobin;
 use waitless::runtime::{IpAddr, UdpSocket};
 use worker::{CurrentWorker, WorkerLocal};
 

@@ -57,6 +57,7 @@ pub mod conn;
 pub mod crypto;
 pub mod diag;
 pub mod egress;
+mod drr;
 pub mod endpoint;
 pub mod frame;
 pub mod inbox;
