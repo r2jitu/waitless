@@ -255,6 +255,14 @@ pub struct TcpConnection {
     /// capped at 14. 0 (with `wscale_ok == false`) when the peer didn't
     /// offer scaling — then `snd_wnd` is the raw 16-bit field.
     pub(crate) snd_wscale: u8,
+    /// The negotiated maximum segment size for *our* sends, in bytes:
+    /// `min(our local MSS, the peer's advertised MSS).max(536)`. Set
+    /// from the SYN's MSS option (RFC 9293 §3.7.1); defaults to our
+    /// local MSS when the peer offered none. All data-segmentation uses
+    /// this (not the raw `mss_for(local_ip)`) so a peer on a small-MTU
+    /// path — cellular / NAT64 — gets segments that fit and the TLS
+    /// handshake doesn't stall.
+    pub(crate) snd_mss: u16,
     /// True once both ends negotiated window scaling (the peer sent a
     /// WS option in its SYN and we echoed one in the SYN-ACK). Gates the
     /// `snd_wnd` left-shift; per RFC 7323 the SYN/SYN-ACK windows
@@ -454,6 +462,9 @@ impl TcpConnection {
             snd_una: 0,
             snd_wnd: 0,
             snd_wscale: 0,
+            // Re-negotiated from the SYN's MSS option at connect; the
+            // safe default is our largest segment (clamped only down).
+            snd_mss: MSS_MAX as u16,
             wscale_ok: false,
             snd_wl1: 0,
             snd_wl2: 0,
@@ -1026,7 +1037,11 @@ impl TcpConnection {
     /// the SG-TX follow-up will swap the scratch copy below for a
     /// driver descriptor pointing at the same bytes.
     fn retransmit_oldest_segment(&mut self) {
-        let mss = mss_for(self.local_ip);
+        // Re-segment at the negotiated `snd_mss`, not the raw local MSS:
+        // a queue entry can span a whole TSO super-segment, and a
+        // retransmit chunked at 1460 would be dropped again on a
+        // small-MTU peer (cellular / NAT64) just like the original.
+        let mss = self.snd_mss as usize;
         let Some(head) = self.rtx_queue.front_mut() else {
             return;
         };

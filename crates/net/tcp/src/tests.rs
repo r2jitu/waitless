@@ -1892,6 +1892,101 @@ fn window_scale_shift_capped_at_14() {
     assert_eq!(snd_wscale, 14, "shift clamped to the RFC 7323 maximum of 14");
 }
 
+/// RFC 9293 §3.7.1: a SYN's MSS option clamps our send segment size.
+/// A peer on a small-MTU path (cellular / NAT64, ~1220) must not be
+/// sent 1460-byte segments — the regression for the 5G-incognito
+/// handshake stall, where the dropped TLS cert flight never arrives.
+#[test]
+fn peer_mss_clamps_send_segment_size() {
+    let _g = harness();
+    const SP: u16 = 9311;
+    const CP: u16 = 50311;
+    const CLIENT_ISN: u32 = 0xB000;
+    super::listen_on_core(0, SP);
+
+    // SYN with an MSS option: kind=2, len=4, value=1220 (0x04C4).
+    deliver_opts(
+        &Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN,
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            payload: Vec::new(),
+        },
+        &[2, 4, 0x04, 0xC4],
+    );
+
+    assert_eq!(
+        conn_snd_mss(CP, SP),
+        1220,
+        "send segment size clamped to the peer's advertised MSS",
+    );
+}
+
+/// An absent MSS option keeps our local default (IPv4 = 1460) — the
+/// common Wi-Fi / Ethernet path is unchanged, so the fix only ever
+/// shrinks segments for a peer that actually asked for it.
+#[test]
+fn snd_mss_defaults_to_local_when_peer_offers_none() {
+    let _g = harness();
+    const SP: u16 = 9312;
+    const CP: u16 = 50312;
+    const CLIENT_ISN: u32 = 0xC000;
+    super::listen_on_core(0, SP);
+    handshake(SP, CP, CLIENT_ISN); // plain SYN, no options
+
+    assert_eq!(
+        conn_snd_mss(CP, SP),
+        1460,
+        "no MSS option → keep our local IPv4 default",
+    );
+}
+
+/// A peer advertising more than our local MSS can't inflate our
+/// segments past it (we send no larger than we can frame), and a
+/// pathological tiny MSS is floored at 536 (the universal IPv4
+/// minimum) so it can't force 1-byte-segment amplification.
+#[test]
+fn snd_mss_is_bounded_above_by_local_and_floored_at_536() {
+    let _g = harness();
+    const SP: u16 = 9313;
+    const CP: u16 = 50313;
+    super::listen_on_core(0, SP);
+
+    // Oversized advertisement (9000) → capped at our local 1460.
+    deliver_opts(
+        &Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: 0xD000,
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            payload: Vec::new(),
+        },
+        &[2, 4, 0x23, 0x28], // 0x2328 = 9000
+    );
+    assert_eq!(conn_snd_mss(CP, SP), 1460, "capped at our local MSS");
+
+    // Pathological tiny advertisement (200) → floored at 536.
+    const CP2: u16 = 50413;
+    deliver_opts(
+        &Seg {
+            src_port: CP2,
+            dst_port: SP,
+            seq: 0xE000,
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            payload: Vec::new(),
+        },
+        &[2, 4, 0x00, 0xC8], // 200
+    );
+    assert_eq!(conn_snd_mss(CP2, SP), 536, "floored at the 536 minimum");
+}
+
 /// A fresh `Established` connection opens at the RFC 6928 initial
 /// window (IW10 = 10·SMSS) — and exactly that. The 3-way handshake
 /// ACK acknowledges the SYN's sequence number, but the SYN is not
@@ -3007,6 +3102,25 @@ fn conn_window(client_port: u16, server_port: u16) -> (u32, bool, u8) {
             && c.remote_port == client_port
         {
             return (c.snd_wnd, c.wscale_ok, c.snd_wscale);
+        }
+    }
+    panic!("no live connection for ports {client_port} -> {server_port}");
+}
+
+/// The negotiated send MSS recorded for the live `(client, server)`
+/// connection — what data segmentation actually uses.
+fn conn_snd_mss(client_port: u16, server_port: u16) -> u16 {
+    let core = 0u32;
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        // SAFETY: single worker, test-serialised by `TEST_LOCK`.
+        let c = unsafe { &*conn_ptr(core, i) };
+        if c.state != TcpState::Closed
+            && c.state != TcpState::Listen
+            && c.local_port == server_port
+            && c.remote_port == client_port
+        {
+            return c.snd_mss;
         }
     }
     panic!("no live connection for ports {client_port} -> {server_port}");

@@ -9,7 +9,7 @@ use crate::pool::{
 };
 use crate::send::{SegmentMeta, send_rst, send_segment, send_segment_opts};
 use crate::state::{
-    RX_RING_BYTES, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN, TcpHeader, TcpState, seq_lt,
+    RX_RING_BYTES, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN, TcpHeader, TcpState, mss_for, seq_lt,
 };
 use from_bytes::FromBytes;
 use iobuf::{Chain, IOBuf, OwnedIOBuf};
@@ -47,8 +47,8 @@ impl Drop for RxGuard {
 
 /// Walk a TCP options blob (`bytes [20, data_offset)` of the header)
 /// and return the RFC 7323 Window-Scale shift, capped at 14 per §2.3.
-/// `None` if absent or malformed. Only `WS` is parsed — MSS/SACK/TS
-/// aren't negotiated by this stack and are skipped by length.
+/// `None` if absent or malformed. WS and MSS ([`parse_mss`]) are the
+/// only options this stack negotiates; SACK/TS are skipped by length.
 fn parse_window_scale(opts: &[u8]) -> Option<u8> {
     let mut i = 0;
     while i < opts.len() {
@@ -59,6 +59,44 @@ fn parse_window_scale(opts: &[u8]) -> Option<u8> {
                 // Window Scale: kind=3, len=3, 1-byte shift count.
                 if opts.get(i + 1) == Some(&3) {
                     return opts.get(i + 2).map(|&s| s.min(14));
+                }
+                break; // malformed
+            }
+            _ => {
+                // Any other option: skip by its length byte.
+                let len = *opts.get(i + 1)? as usize;
+                if len < 2 {
+                    break; // malformed (length must cover kind+len)
+                }
+                i += len;
+            }
+        }
+    }
+    None
+}
+
+/// Walk a TCP options blob and return the peer's advertised MSS
+/// (RFC 9293 §3.7.1 — kind 2, len 4, 2-byte value). `None` if absent
+/// or malformed, in which case the caller keeps its local default.
+///
+/// We honor this (clamp our *send* segment size to it) so a peer on a
+/// small-MTU path — cellular / NAT64, where the effective MTU is the
+/// IPv6 minimum 1280 and the advertised MSS is ~1220 — isn't sent
+/// 1460-byte segments that the path silently drops. Without it a full
+/// TLS handshake (the certificate flight) stalls on 5G; tiny requests
+/// fit, so it only bites a cold connection that has to send the cert.
+fn parse_mss(opts: &[u8]) -> Option<u16> {
+    let mut i = 0;
+    while i < opts.len() {
+        match opts[i] {
+            0 => break,         // End of Option List
+            1 => i += 1,        // No-Operation (1 byte, no length)
+            2 => {
+                // Maximum Segment Size: kind=2, len=4, 2-byte value.
+                if opts.get(i + 1) == Some(&4) {
+                    let hi = *opts.get(i + 2)?;
+                    let lo = *opts.get(i + 3)?;
+                    return Some(u16::from_be_bytes([hi, lo]));
                 }
                 break; // malformed
             }
@@ -118,19 +156,21 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
     let data_offset = ((hdr.data_offset >> 4) as usize) * 4;
     let payload_len = segment.total_len().saturating_sub(data_offset);
 
-    // RFC 7323: parse the peer's Window-Scale option from a SYN's TCP
-    // options (bytes [20, data_offset) of the contiguous first part) —
-    // the last read of `first`, so its borrow ends here before the
-    // segment is mutated/narrowed downstream. `None` for non-SYN
-    // segments and SYNs without the option.
-    let syn_wscale: Option<u8> = if flags & TCP_SYN != 0 && data_offset > 20 {
-        first
-            .data()
-            .get(20..data_offset)
-            .and_then(parse_window_scale)
-    } else {
-        None
-    };
+    // Parse the peer's Window-Scale (RFC 7323) and MSS (RFC 9293)
+    // options from a SYN's TCP options (bytes [20, data_offset) of the
+    // contiguous first part) — the last reads of `first`, so its borrow
+    // ends here before the segment is mutated/narrowed downstream.
+    // `None` for non-SYN segments and SYNs without the option.
+    let (syn_wscale, syn_mss): (Option<u8>, Option<u16>) =
+        if flags & TCP_SYN != 0 && data_offset > 20 {
+            let opts = first.data().get(20..data_offset);
+            (
+                opts.and_then(parse_window_scale),
+                opts.and_then(parse_mss),
+            )
+        } else {
+            (None, None)
+        };
 
     // Determine which core owns this packet.
     let core = kernel_core::cpu_id();
@@ -293,6 +333,18 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             // 64 KiB and a high-RTT download run at full speed.
             c.wscale_ok = syn_wscale.is_some();
             c.snd_wscale = syn_wscale.unwrap_or(0);
+            // RFC 9293 §3.7.1: honor the peer's advertised MSS. Clamp our
+            // send segment size to min(our MSS, peer's) so a peer on a
+            // small-MTU path (cellular / NAT64, ~1220) isn't sent
+            // 1460-byte segments the path drops — the full-TLS-handshake-
+            // stalls-on-5G bug. Floor at 536 (the universal IPv4 minimum)
+            // so a malformed/hostile tiny MSS can't force pathological
+            // segmentation. Absent option → keep our local default.
+            let local_mss = mss_for(c.local_ip) as u16;
+            c.snd_mss = match syn_mss {
+                Some(peer) => local_mss.min(peer).max(536),
+                None => local_mss,
+            };
             c.rcv_nxt = seq + 1;
             c.listener_port = dst_port;
             c.accepted = false;

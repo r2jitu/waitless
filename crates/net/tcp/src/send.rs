@@ -7,7 +7,7 @@
 
 use crate::pool::{conn_ptr, decode_handle};
 use crate::state::{
-    MSS_MAX, MSS_V4, TCP_ACK, TCP_PSH, TCP_RST, TcpHeader, TcpState, mss_for,
+    MSS_MAX, MSS_V4, TCP_ACK, TCP_PSH, TCP_RST, TcpHeader, TcpState,
 };
 use core::ptr;
 use types::{IpAddr, MacAddr, htonl, htons};
@@ -328,6 +328,7 @@ fn send_super_segment_from_cursor(
     meta: &SegmentMeta,
     cursor: &mut iobuf::Cursor<'_>,
     payload_len: usize,
+    mss: usize,
 ) -> usize {
     let dst_mac = match mac_resolve::resolve(meta.dst_ip) {
         Some(m) => m,
@@ -342,7 +343,7 @@ fn send_super_segment_from_cursor(
     // Falls back to per-MSS when the big pool is full or TSO
     // isn't supported on this driver.
     let Some(mut handle) = nic::acquire_tx_tso_buf() else {
-        return send_per_mss_fallback(meta, cursor, payload_len);
+        return send_per_mss_fallback(meta, cursor, payload_len, mss);
     };
     let cap = handle.data_cap() as usize;
     debug_assert!(frame_len <= cap);
@@ -375,7 +376,9 @@ fn send_super_segment_from_cursor(
     frame[tcp_off + 16] = 0; // TCP checksum field, big-endian high byte
     frame[tcp_off + 17] = 0; //                              low byte
 
-    let mss = mss_for(meta.local_ip);
+    // `mss` is the negotiated send segment size (caller's `c.snd_mss`),
+    // which is what the device splits the super-segment into — so on a
+    // small-MTU peer every emitted segment fits the path.
     let hdr_len = (payload_off) as u16;
     let csum_start = (tcp_off) as u16;
     nic::submit_tx_tso(handle, frame_len, hdr_len, csum_start, mss as u16);
@@ -427,8 +430,9 @@ pub fn try_send_tso(
     // `async_try_send_chain`'s `total > mss` check, but applied
     // to the pre-fill estimate so we don't run the encrypt
     // closure for a single-segment send. Caller falls back to
-    // its scratch path on `None`.
-    let mss = mss_for(c.local_ip);
+    // its scratch path on `None`. Uses the negotiated `snd_mss` so the
+    // gate matches the actual segment size on a small-MTU peer.
+    let mss = c.snd_mss as usize;
     if min_payload <= mss {
         return None;
     }
@@ -542,8 +546,8 @@ fn send_per_mss_fallback(
     meta: &SegmentMeta,
     cursor: &mut iobuf::Cursor<'_>,
     payload_len: usize,
+    mss: usize,
 ) -> usize {
-    let mss = mss_for(meta.local_ip);
     let mut sent = 0usize;
     let mut chunk_meta = *meta;
     while sent < payload_len {
@@ -679,7 +683,7 @@ pub fn async_try_send_chain(
         return Ok(0);
     }
 
-    let mss = mss_for(c.local_ip);
+    let mss = c.snd_mss as usize;
     let mut cursor = chain.cursor();
     // TSO fast path: when the driver advertises TSOv4, hand the
     // whole chain to the driver in a single super-segment. The
@@ -732,9 +736,9 @@ pub fn async_try_send_chain(
         && sendable > mss
         && payload_offset(c.local_ip) + sendable <= TSO_FRAME_BUF_LEN
     {
-        send_super_segment_from_cursor(&meta, &mut cursor, sendable)
+        send_super_segment_from_cursor(&meta, &mut cursor, sendable, mss)
     } else {
-        send_per_mss_fallback(&meta, &mut cursor, sendable)
+        send_per_mss_fallback(&meta, &mut cursor, sendable, mss)
     };
     c.snd_nxt = c.snd_nxt.wrapping_add(actually_sent as u32);
 
