@@ -702,8 +702,12 @@ pub struct Connection {
     /// drives steady-state 1-RTT packet emission build-at-drain — so `flush`
     /// must NOT also build per-packet 1-RTT into `outbound` (that would
     /// double-send). Set by the conn task iff this conn registered with the
-    /// owner. Default false ⇒ the eager build path (unchanged). The handshake
-    /// + GSO paths build into `outbound` regardless (the owner ships those).
+    /// owner. False — the eager/heap build path — is NOT dead code: it is
+    /// the live fallback when the embedding app never enabled the egress
+    /// scheduler (tests, other apps) and when `egress::register` finds this
+    /// core's flow table full (the 1025th concurrent conn on a core ships
+    /// inline). The handshake + GSO paths build into `outbound` regardless
+    /// (the owner ships those).
     pub(super) tx_owner_driven: bool,
     /// 0-RTT (early-data) packet-protection keys for *receiving*.
     /// `Some` only on a resumed handshake whose PSK validated;
@@ -1437,14 +1441,21 @@ impl Connection {
         buf.recycle_into(&mut self.outbound_pool, POOL_MAX);
     }
 
-    /// Take a datagram-sized buffer for the encoder. Tries the
-    /// driver's TX pool first (zero-copy hot path: encoder
-    /// writes packet bytes directly into a slot's `data` region,
-    /// and the bare-metal UDP backend fills the L2/L3/L4 headers
-    /// in the headroom in place at submit time). Falls back to a
-    /// heap-allocated `Vec` when the pool is full, the backend
-    /// doesn't expose the SG TX surface (native), or the driver
-    /// doesn't (GVE today).
+    /// Take a heap-backed datagram buffer for the encoder, recycled
+    /// through `outbound_pool`.
+    ///
+    /// Always heap, never a driver TX slot: packets built here are
+    /// DEFERRED through the `outbound` queue (drained later by
+    /// `drain_outbound`), and the driver's direct-fill slots require
+    /// acquire→submit to be SYNCHRONOUSLY PAIRED — a second acquire
+    /// before the first submit returns the SAME un-advanced ring slot,
+    /// so two queued packets alias it and the stale one ships with
+    /// corrupted ciphertext. GCE-confirmed at 24 ms RTT: ~79 client
+    /// "failed to authenticate packet" per transfer → cwnd collapse →
+    /// ~0.3 rps; this heap path = 0 auth failures, ~66× throughput.
+    /// The heap `DatagramBuf` owns its Vec until ship, so concurrent
+    /// queued packets can't alias. The synchronous build-at-drain
+    /// owner path uses [`take_datagram_buf_direct`] instead.
     ///
     /// The returned buf has its length pre-set to
     /// `MAX_L2_HEADROOM` (62 bytes) so subsequent encoder writes
@@ -1454,52 +1465,38 @@ impl Connection {
     /// the encoder captures `header_start = out.len()` after the
     /// resize.
     pub(super) fn take_datagram_buf(&mut self, fallback_capacity: usize) -> DatagramBuf {
-        // Eager build path: always heap. Direct-fill would alias here (see the
-        // inner fn). The synchronous build-at-drain owner path uses
-        // `take_datagram_buf_direct` instead.
-        self.take_datagram_buf_inner(fallback_capacity, false)
+        use executor::reactor::MAX_L2_HEADROOM;
+        let total_capacity = MAX_L2_HEADROOM + fallback_capacity;
+        let mut v = match self.outbound_pool.pop() {
+            Some(mut v) => {
+                v.clear();
+                if v.capacity() < total_capacity {
+                    v.reserve(total_capacity - v.capacity());
+                }
+                v
+            }
+            None => Vec::with_capacity(total_capacity),
+        };
+        v.resize(MAX_L2_HEADROOM, 0);
+        DatagramBuf::Heap(v)
     }
 
-    /// Like [`take_datagram_buf`] but prefers a zero-copy driver TX slot.
-    /// ONLY safe when the caller submits the returned datagram SYNCHRONOUSLY
-    /// before acquiring another — the per-core egress owner's build-at-drain
-    /// loop (acquire→encode→submit paired). Concurrent un-submitted slots
-    /// would otherwise alias the same un-advanced ring position.
+    /// Like [`take_datagram_buf`] but prefers a zero-copy driver TX slot
+    /// (the encoder writes packet bytes straight into the slot's data
+    /// region; the bare-metal UDP backend fills the L2/L3/L4 headers in
+    /// the headroom at submit time — no driver-side memcpy). ONLY safe
+    /// when the caller submits the returned datagram SYNCHRONOUSLY
+    /// before acquiring another — the per-core egress owner's
+    /// build-at-drain loop (acquire→encode→submit paired). Concurrent
+    /// un-submitted slots would otherwise alias the same un-advanced
+    /// ring position (see [`take_datagram_buf`] for the measured
+    /// failure). Falls back to the heap when the pool is full, the
+    /// backend doesn't expose the SG TX surface (native), or the slot
+    /// can't fit a worst-case datagram.
     pub(crate) fn take_datagram_buf_direct(&mut self, fallback_capacity: usize) -> DatagramBuf {
-        self.take_datagram_buf_inner(fallback_capacity, true)
-    }
-
-    fn take_datagram_buf_inner(&mut self, fallback_capacity: usize, allow_direct: bool) -> DatagramBuf {
         use executor::reactor::MAX_L2_HEADROOM;
 
-        // The driver DQO direct-fill path (`acquire_tx_buf`) requires
-        // acquire→submit to be SYNCHRONOUSLY PAIRED: acquire returns the next
-        // ring slot's bounce buffer WITHOUT advancing `fill_cnt`, and submit
-        // emits the descriptor for the slot at the *current* `fill_cnt`. So a
-        // second acquire before the first is submitted returns the SAME slot.
-        //
-        // QUIC's flush violates that: it seals each packet into a DatagramBuf
-        // and DEFERS submission through the `outbound` queue (drained later by
-        // `drain_outbound`), and under pacing a packet sits there for ms. Two
-        // packets then acquire the same un-advanced slot before either ships;
-        // the second seal overwrites the first, and the stale packet goes out
-        // with corrupted ciphertext → the peer drops it on AEAD auth failure.
-        // GCE-confirmed at 24 ms RTT: ~79 client "failed to authenticate
-        // packet" per transfer → cwnd collapse → ~0.3 rps; the heap path below
-        // = 0 auth failures, ~66× throughput. The heap DatagramBuf owns its
-        // Vec until ship, so concurrent queued packets can't alias. Direct-fill
-        // can return here once the driver reserves a slot per handle (acquire
-        // advances; submit targets the handle's own slot, not `fill_cnt`).
-        // `allow_direct` gates the zero-copy slot: safe only on the
-        // synchronous build-at-drain path (acquire→encode→submit paired); the
-        // eager/`outbound` path passes `false` because deferred submit aliases
-        // the un-advanced ring slot.
-        // Hot path: acquire a slot from the driver's TX pool and
-        // write packet bytes straight into it (no driver-side
-        // memcpy at submit time).
-        if allow_direct
-            && let Some(handle) = executor::reactor::acquire_tx_buf()
-        {
+        if let Some(handle) = executor::reactor::acquire_tx_buf() {
             // The `TxSlot` datagram wraps the driver slot in a
             // `Vec` that MUST NOT reallocate: a realloc would free
             // `handle.data_ptr` — a NIC TX-pool / DMA address, not
@@ -1534,7 +1531,6 @@ impl Connection {
                 // past it, but the backend fills the headers there
                 // at submit time and may read them for checksum.
                 vec.resize(MAX_L2_HEADROOM, 0);
-                let _ = fallback_capacity; // unused on this path
                 return DatagramBuf::TxSlot {
                     handle,
                     vec: ManuallyDrop::new(vec),
@@ -1546,21 +1542,7 @@ impl Connection {
             drop(handle);
         }
 
-        // Fallback: heap-allocated Vec, recycled through
-        // `outbound_pool`.
-        let total_capacity = MAX_L2_HEADROOM + fallback_capacity;
-        let mut v = match self.outbound_pool.pop() {
-            Some(mut v) => {
-                v.clear();
-                if v.capacity() < total_capacity {
-                    v.reserve(total_capacity - v.capacity());
-                }
-                v
-            }
-            None => Vec::with_capacity(total_capacity),
-        };
-        v.resize(MAX_L2_HEADROOM, 0);
-        DatagramBuf::Heap(v)
+        self.take_datagram_buf(fallback_capacity)
     }
 
     /// Acquire a UDP-GSO big-pool slot and wrap it as a `GsoSlot`
