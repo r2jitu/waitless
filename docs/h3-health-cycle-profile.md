@@ -245,3 +245,32 @@ standalone-ACK amplification under real multi-client load, and is upload-safe
 (1 MiB / 8 MiB h3 uploads complete failed=0, `handler_stuck`/`idle_timeouts`/
 loss all 0). The `pkts_ack_only` / `pkts_no_stream` counters are kept as
 permanent obs. The MAX_STREAMS-deferral experiment was reverted (ineffective).
+
+### RX-side ACK reduction IS a real lever — but it's TX vs RX, not packets-in-general
+
+The "no packet-count lever" conclusion above is for the **TX** direction. The
+**RX** direction is different. Prototyped the QUIC ACK-Frequency extension
+(`draft-ietf-quic-ack-frequency`): the server sends an `ACK_FREQUENCY` frame
+asking the peer (quinn — it advertises `min_ack_delay`) to ACK far less often,
+cutting the ~0.5 standalone client-ACK datagrams/req. Result: **server RX dropped
+1.50 → 1.05 packets/req and /health par=256 rose ~247–254 K → ~284 K (+12–15 %,
+3 consistent runs)** — the FIRST lever in this whole investigation to move
+throughput at saturation. Why RX ≠ TX: a TX ACK is a cheap ~36 B *seal*, but an
+inbound ACK runs the **entire RX pipeline** — NIC poll, listener→conn `SlotTable`
+demux + inbox hop, AEAD-open, frame parse, and **range-ACK processing**
+(`BTreeMap<pn,SentPacket>` lookup/prune + RTT/cc update). Cutting inbound packets
+removes all of that; cutting an outbound ACK removes only a seal.
+
+**But the aggressive static config broke bulk uploads** (1 MiB: ~1952 → ~60
+completed, failed=0/no-loss — complete-but-44×-slow; 64 KiB fine). A peer ACKing
+only every ~10 ms gates the multi-window upload's pacing/credit loop (suspected
+SRTT inflation → `pacing_rate` collapse → credit starvation; couldn't confirm —
+`/obs` has no per-conn RTT). Aggressive ACK reduction helps request/response but
+starves bulk-receive, and no single static value wins both. The safe form is
+*adaptive* (send aggressive ACK_FREQUENCY at handshake, then a corrective one
+restoring frequent ACKs when a large inbound stream is detected) — real but
+fragile to tune. **Reverted** the ACK_FREQUENCY commit; the +12–15 % finding is
+banked here. (An external review independently rated ACK-Frequency low-ROI for a
+single small request/response — it under-weighted that quinn does send a
+standalone ACK/2-responses here, but it's right that the win is workload-specific
+and not worth the upload fragility.)
