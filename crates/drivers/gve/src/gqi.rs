@@ -259,24 +259,16 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8], csum: nic_api::CsumOffload) -> 
 /// fallback) and by the public `acquire_tx_buf` (which picks the
 /// worker's qp). Spin-drains on full pool — the caller is the qp's
 /// owning worker (Tier 1) so this is cooperative scheduling, not
-/// deadlock-prone — but the spin is BOUNDED by a *progress-aware*
-/// stall breaker: if the device stops draining the ring, an
-/// unbounded spin hard-hangs the whole core synchronously (no
-/// executor yield, no RX, no timers) — the same shape as the
-/// Apple-HVF h3-`/stream` wedge in virtio-net (see
-/// reference_hvf_h3_stream_wedge).
-///
-/// The stall predicate is "no forward progress" (`done_cnt` frozen
-/// for the whole budget), NOT "this call didn't get a slot": at NIC
-/// line rate the pool is legitimately full while the device drains
-/// (n2/GQI A/B measured 452M full-pool laps at 15 Gbps with the
-/// ring perfectly healthy), and spot-host scheduling gaps of 1-3 ms
-/// between completion write-backs are routine. Saturation-with-
-/// progress therefore spins losslessly (back-pressure, the old
-/// behavior); only a frozen ring trips the breaker, arming a per-qp
-/// fast-fail cooldown that self-clears the instant completions
-/// resume. Callers treat `None` as ring-full back-pressure (chain
-/// sends requeue the unsent tail; control/rtx segments RTO-recover).
+/// deadlock-prone — but the spin is BOUNDED by the shared
+/// progress-aware stall breaker ([`tx_pool::TxStallBreaker`], where
+/// the predicate, budgets, and the measured rationale live): if the
+/// device stops draining the ring, an unbounded spin hard-hangs the
+/// whole core synchronously (no executor yield, no RX, no timers) —
+/// the same shape as the Apple-HVF h3-`/stream` wedge (see
+/// reference_hvf_h3_stream_wedge). Saturation-with-progress spins
+/// losslessly; only a frozen `done_cnt` trips. Callers treat `None`
+/// as ring-full back-pressure (chain sends requeue the unsent tail;
+/// control/rtx segments RTO-recover).
 pub(crate) fn acquire_tx_buf_for_qp(qp: usize) -> Option<nic_api::TxBufHandle> {
     if qp >= MAX_QUEUE_PAIRS {
         return None;
@@ -327,82 +319,38 @@ pub(crate) fn acquire_tx_buf_for_qp(qp: usize) -> Option<nic_api::TxBufHandle> {
         return Some(h);
     }
 
+    // Pool/ring full — run the shared progress-aware breaker
+    // (`tx_pool::TxStallBreaker`; policy + rationale live there).
+    // Progress = this qp's `done_cnt` (device completions drive slot
+    // recycling); one lap = count the saturation event, force any
+    // deferred kick so the host sees pending descriptors, then
+    // drain + re-claim.
     let cycles_per_us = kernel_bare::time::cycles_per_us();
-    let now = kernel_bare::time::now_cycles();
-
-    // Cooldown check: a prior call found the ring frozen. If the
-    // device has produced even one completion since (done_cnt moved
-    // off the stamped value), the ring is alive — clear the cooldown
-    // and fall through to the normal spin. Otherwise fast-fail (the
-    // try_claim above was the one cheap attempt).
-    let stall_until = tx.stall_until.load(Ordering::Relaxed);
-    if stall_until != 0 {
-        let frozen =
-            tx.done_cnt.load(Ordering::Relaxed) == tx.stall_done_snap.load(Ordering::Relaxed);
-        if frozen && now < stall_until {
-            GQI_TX_STALL_DROPS.bump();
-            TX_SMALL_SCAN_ITERS.add(local_iters);
-            return None;
-        }
-        tx.stall_until.store(0, Ordering::Relaxed);
-    }
-
-    // Pool/ring full — spin-drain, bounded by lack of PROGRESS: the
-    // ~5 ms budget restarts every time `done_cnt` advances, so a
-    // saturated-but-draining ring spins losslessly exactly like the
-    // pre-breaker code, and only a ring with zero completions for the
-    // whole window trips.
-    let spin_budget = cycles_per_us.saturating_mul(5_000); // ~5 ms of NO completions
-    let mut window_start = now;
-    let mut done_seen = tx.done_cnt.load(Ordering::Relaxed);
-
-    loop {
-        // No capacity. Force any deferred kick so the host sees
-        // pending descriptors and can produce completions. Each
-        // lap counts as one saturation event.
-        TX_SMALL_FULL_SPINS.bump();
-        let bar2_va = BAR2_VA.load(Ordering::Acquire);
-        if bar2_va != 0 {
-            let fill = tx.fill_cnt.load(Ordering::Relaxed);
-            let last = tx.last_kicked.load(Ordering::Relaxed);
-            if fill != last {
-                doorbell_write(bar2_va, tx.db_offset, fill);
-                tx.last_kicked.store(fill, Ordering::Relaxed);
+    let got = tx.breaker.spin(
+        tx_pool::STALL_BUDGET_US,
+        cycles_per_us,
+        kernel_bare::time::now_cycles,
+        || tx.done_cnt.load(Ordering::Relaxed) as u64,
+        || {
+            TX_SMALL_FULL_SPINS.bump();
+            let bar2_va = BAR2_VA.load(Ordering::Acquire);
+            if bar2_va != 0 {
+                let fill = tx.fill_cnt.load(Ordering::Relaxed);
+                let last = tx.last_kicked.load(Ordering::Relaxed);
+                if fill != last {
+                    doorbell_write(bar2_va, tx.db_offset, fill);
+                    tx.last_kicked.store(fill, Ordering::Relaxed);
+                }
             }
-        }
-        compiler_fence(Ordering::SeqCst);
-        // Re-claim after the kick+drain so a freshly freed slot isn't
-        // missed on the exit path.
-        if let Some(h) = try_claim(&mut local_iters) {
-            return Some(h);
-        }
-        let done_now = tx.done_cnt.load(Ordering::Relaxed);
-        let now2 = kernel_bare::time::now_cycles();
-        if done_now != done_seen {
-            // Forward progress — the device is draining (claim can
-            // still fail when e.g. only big-pool slots completed).
-            // Re-arm the budget and keep spinning: this is ordinary
-            // line-rate back-pressure, not a stall.
-            done_seen = done_now;
-            window_start = now2;
-            continue;
-        }
-        if now2.wrapping_sub(window_start) > spin_budget {
-            // Zero completions for the whole window: the ring is dead.
-            // Arm the per-qp fast-fail cooldown, stamped with the
-            // frozen done_cnt so it self-clears on the first
-            // completion after recovery.
-            const COOLDOWN_US: u64 = 10_000; // ~10 ms between re-probes
-            tx.stall_done_snap.store(done_seen, Ordering::Relaxed);
-            tx.stall_until.store(
-                now2.wrapping_add(cycles_per_us.saturating_mul(COOLDOWN_US)),
-                Ordering::Relaxed,
-            );
-            GQI_TX_STALL_DROPS.bump();
-            TX_SMALL_SCAN_ITERS.add(local_iters);
-            return None;
-        }
+            compiler_fence(Ordering::SeqCst);
+            try_claim(&mut local_iters)
+        },
+    );
+    if got.is_none() {
+        GQI_TX_STALL_DROPS.bump();
+        TX_SMALL_SCAN_ITERS.add(local_iters);
     }
+    got
 }
 
 /// Acquire a big-pool TX slot for a specific qp. Returns `None`

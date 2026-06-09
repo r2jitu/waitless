@@ -271,18 +271,12 @@ pub(crate) struct TxQueue {
     pub(crate) last_kicked: AtomicU32,
 
     // ---- GQI TX-stall circuit breaker (see gqi::acquire_tx_buf_for_qp) ----
-    /// Fast-fail deadline in `now_cycles()` units; 0 = not stalled.
-    /// Armed when the ring goes ~5 ms without a single completion
-    /// (`done_cnt` frozen) — a dead ring, not mere saturation. While
-    /// armed, full-pool acquires fast-fail instead of spinning so the
-    /// core stays live. Per-qp (not global) so a healthy qp is never
-    /// throttled by a sibling's stall.
-    pub(crate) stall_until: AtomicU64,
-    /// `done_cnt` value stamped when `stall_until` was armed. The
-    /// cooldown self-clears the moment `done_cnt` moves off this value
-    /// (completions resumed), so a recovered ring drops at most the
-    /// sends attempted while it was actually frozen.
-    pub(crate) stall_done_snap: AtomicU32,
+    /// Shared progress-aware breaker (policy + rationale in
+    /// `tx_pool::TxStallBreaker`): trips only when this qp's
+    /// `done_cnt` freezes for the whole budget window — a dead ring,
+    /// not mere saturation. Per-qp (not global) so a healthy qp is
+    /// never throttled by a sibling's stall.
+    pub(crate) breaker: tx_pool::TxStallBreaker,
 
     // ---- DQO_RDA-only fields ----
     /// TX completion ring (DQO only). Each entry is 8 bytes,

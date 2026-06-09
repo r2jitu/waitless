@@ -16,6 +16,9 @@
 
 #![cfg_attr(not(test), no_std)]
 
+mod stall;
+pub use stall::{STALL_BUDGET_US, STALL_COOLDOWN_US, TxStallBreaker};
+
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Pool identifier packed into a driver token: TX slots split into a

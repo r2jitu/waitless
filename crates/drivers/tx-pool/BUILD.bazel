@@ -12,7 +12,10 @@ package(default_visibility = ["//visibility:public"])
 # helper for one pool *pattern*, not part of the NIC interface.
 rust_library(
     name = "tx-pool",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/lib.rs",
+        "src/stall.rs",
+    ],
     crate_name = "tx_pool",
 )
 
