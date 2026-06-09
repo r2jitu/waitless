@@ -782,6 +782,44 @@ impl Connection {
                         // for this `process_datagram` pass.
                         let cur_rx_us = self.cur_rx_us;
                         if was_new {
+                            // RFC 9000 §4.6: a peer-initiated stream id
+                            // past the MAX_STREAMS limit we advertised is
+                            // a STREAM_LIMIT_ERROR. `count` is how many
+                            // streams of this type the id implies (ids
+                            // step by 4; low 2 bits = initiator+type).
+                            // Without this a peer can send STREAM frames
+                            // for arbitrary high ids and grow
+                            // `recv_streams` unbounded → heap OOM. Plus a
+                            // concurrency backstop: the advertised limit
+                            // climbs with the peer's monotonic stream
+                            // high-watermark (tx::append_max_streams_into),
+                            // so enforcing it alone wouldn't bound a peer
+                            // that opens streams and never closes them. A
+                            // legit peer finishes streams (removed in
+                            // `reap_finished_streams`) so its LIVE count
+                            // stays small — far under this cap; a peer
+                            // holding thousands open is the attack.
+                            if exceeds_stream_limit(
+                                stream_id,
+                                self.peer_max_streams_bidi_advertised,
+                                self.peer_max_streams_uni_advertised,
+                                self.recv_streams.len(),
+                            ) {
+                                crate::diag::COUNTERS.stream_limit_exceeded.bump();
+                                crate::quic_drop!(
+                                    other_wire,
+                                    "stream limit: sid={} bidi_adv={} uni_adv={} live={}",
+                                    stream_id,
+                                    self.peer_max_streams_bidi_advertised,
+                                    self.peer_max_streams_uni_advertised,
+                                    self.recv_streams.len()
+                                );
+                                self.close_with_error(
+                                    0x04, /* STREAM_LIMIT_ERROR */
+                                    b"stream limit",
+                                );
+                                return Ok(());
+                            }
                             // Pull from the per-conn recycle pool so
                             // a recycled stream's `buffer` Vec keeps
                             // its capacity across stream lifecycles
@@ -936,5 +974,107 @@ impl Connection {
             payload = &payload[consumed..];
         }
         Ok(())
+    }
+}
+
+/// Largest number of concurrently-live peer-initiated recv streams a
+/// connection will hold. Far above any real client's concurrency
+/// (browsers cap at ~100-256) yet bounds the `recv_streams` map: the
+/// advertised MAX_STREAMS limit climbs with the peer's monotonic
+/// stream high-watermark, so it alone cannot stop a peer that opens
+/// streams and never closes them.
+const MAX_CONCURRENT_RECV_STREAMS: usize = 8192;
+
+/// Should a newly-seen peer-initiated `stream_id` be rejected
+/// (RFC 9000 §4.6 `STREAM_LIMIT_ERROR`)? Pure decision so it is
+/// exhaustively unit-testable apart from the connection state.
+///
+/// * `bidi_adv` / `uni_adv` — the MAX_STREAMS *counts* (not ids) we
+///   have advertised for client-bidi / client-uni streams.
+/// * `live` — current `recv_streams` map size (the concurrency
+///   backstop).
+///
+/// A stream id encodes `(initiator, type)` in its low 2 bits and
+/// steps by 4, so id `4*(k-1)+kind` is the k-th stream of its kind:
+/// `count = (id >> 2) + 1`. Reject when `count` exceeds the advertised
+/// limit for that kind, or when the live map is already at the cap.
+/// Server-initiated ids (0x1 / 0x3) get a 0 limit — we never grant the
+/// peer credit to open those, so any such id is rejected.
+fn exceeds_stream_limit(stream_id: u64, bidi_adv: u64, uni_adv: u64, live: usize) -> bool {
+    let count = (stream_id >> 2) + 1;
+    let limit = match stream_id & 0x3 {
+        0x0 => bidi_adv,
+        0x2 => uni_adv,
+        _ => 0,
+    };
+    count > limit || live >= MAX_CONCURRENT_RECV_STREAMS
+}
+
+#[cfg(test)]
+mod stream_limit_tests {
+    use super::{exceeds_stream_limit, MAX_CONCURRENT_RECV_STREAMS};
+
+    // Stream-id kinds (low 2 bits): 0x0 client-bidi, 0x1 server-bidi,
+    // 0x2 client-uni, 0x3 server-uni.
+    const ADV: u64 = 1024; // a typical advertised limit per kind.
+
+    #[test]
+    fn within_advertised_limit_is_allowed() {
+        // k-th client-bidi stream id = 4*(k-1). The 1024th (count
+        // 1024 == ADV) is the last allowed; everything below passes.
+        assert!(!exceeds_stream_limit(0, ADV, ADV, 0)); // 1st
+        assert!(!exceeds_stream_limit(4 * 1023, ADV, ADV, 0)); // 1024th, count==ADV
+        // client-uni (0x2): ids 2, 6, 10, ...
+        assert!(!exceeds_stream_limit(2, ADV, ADV, 0));
+        assert!(!exceeds_stream_limit(4 * 1023 + 2, ADV, ADV, 0)); // 1024th uni
+    }
+
+    #[test]
+    fn one_past_advertised_limit_is_rejected() {
+        // count == ADV+1 → rejected for each client-initiated kind.
+        assert!(exceeds_stream_limit(4 * 1024, ADV, ADV, 0)); // 1025th bidi
+        assert!(exceeds_stream_limit(4 * 1024 + 2, ADV, ADV, 0)); // 1025th uni
+    }
+
+    #[test]
+    fn huge_stream_id_is_rejected_without_allocation() {
+        // The instant-OOM attack: one STREAM frame with an enormous
+        // id. count is astronomically over any limit → rejected before
+        // a map entry is ever created.
+        let huge = 1u64 << 60;
+        assert!(exceeds_stream_limit(huge, ADV, ADV, 0));
+        assert!(exceeds_stream_limit(huge | 0x2, ADV, ADV, 0)); // uni variant
+    }
+
+    #[test]
+    fn server_initiated_ids_are_always_rejected() {
+        // We never grant the peer credit to open server-initiated
+        // streams (0x1 server-bidi, 0x3 server-uni); any such id, even
+        // the very first, is a protocol violation.
+        assert!(exceeds_stream_limit(0x1, ADV, ADV, 0)); // 1st server-bidi
+        assert!(exceeds_stream_limit(0x3, ADV, ADV, 0)); // 1st server-uni
+    }
+
+    #[test]
+    fn concurrency_backstop_rejects_when_map_full() {
+        // Even a low, in-limit id is rejected once the live map is at
+        // the cap — the open-and-hold attack the advertised limit
+        // (which climbs with the watermark) cannot stop on its own.
+        assert!(exceeds_stream_limit(0, u64::MAX, u64::MAX, MAX_CONCURRENT_RECV_STREAMS));
+        // One below the cap still passes (id 0 within an infinite adv).
+        assert!(!exceeds_stream_limit(
+            0,
+            u64::MAX,
+            u64::MAX,
+            MAX_CONCURRENT_RECV_STREAMS - 1
+        ));
+    }
+
+    #[test]
+    fn uni_and_bidi_limits_are_independent() {
+        // A generous bidi limit must not let an over-limit uni id
+        // through, and vice-versa.
+        assert!(exceeds_stream_limit(4 * 10 + 2, /*bidi*/ u64::MAX, /*uni*/ 5, 0));
+        assert!(exceeds_stream_limit(4 * 10, /*bidi*/ 5, /*uni*/ u64::MAX, 0));
     }
 }
