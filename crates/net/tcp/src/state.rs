@@ -1263,7 +1263,8 @@ impl TcpConnection {
         // ssthresh) and resend the missing segment. Unlike RFC 5681 §3.2,
         // net_cc does NOT inflate cwnd by `ssthresh + 3·SMSS` + 1·SMSS/dup —
         // it holds cwnd at ssthresh until ~one window of new data is acked
-        // (RFC 6582/9002). Behavioral delta #4 — netem-validated before land.
+        // (RFC 6582/9002). Behavioral delta #4 vs RFC 5681 — GCE netem-loss
+        // A/B confirmed no recovery-throughput regression.
         self.cc.on_loss(0, false);
         self.retransmit_oldest_segment();
         self.cwnd = self.cc.window();

@@ -122,6 +122,12 @@ concurrency than a single QUIC-generating loadgen can.
 
 ## ROOT CAUSE of the h1/h2-vs-h3 gap: per-request latency, not CPU
 
+> ⚠️ **SUPERSEDED — read "CORRECTED ROOT CAUSE" below.** This section's
+> "latency-bound, not CPU" conclusion was an artifact of measuring at par=64
+> (below h3's saturation knee). At the true ceiling (par≥256) both protocols
+> are 100% CPU-bound; h3 costs ~2× the CPU/req. Kept for the investigation
+> record, not as the answer.
+
 Two more experiments closed it out:
 
 - **Client scaling (loadgen-limited?):** scaled the client 8→16→20 cores (1→3

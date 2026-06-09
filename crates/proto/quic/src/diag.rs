@@ -376,7 +376,8 @@ pub struct Counters {
     /// Of the sealed 1-RTT packets, how many were NOT ack-eliciting —
     /// i.e. pure ACK / PADDING packets (no STREAM/CRYPTO/MAX_*). A high
     /// per-request count means standalone ACKs aren't piggybacking the
-    /// response. Temporary diagnostic for the h3 /health pkts/req probe.
+    /// response — the signal that found h3 /health's 2nd outbound packet.
+    /// Kept as permanent egress-composition obs.
     pub pkts_ack_only: Counter,
     /// Of the sealed 1-RTT packets, how many carried NO STREAM frame
     /// (ACK + control only — e.g. a standalone MAX_STREAMS/MAX_DATA). Pairs

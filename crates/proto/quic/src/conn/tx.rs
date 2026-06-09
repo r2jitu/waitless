@@ -1319,11 +1319,10 @@ impl Connection {
             &send_keys,
             false,
         )?;
-        // Diagnostic classification of the emitted 1-RTT packet (h3
-        // /health pkts/req probe): pure-ACK (no ack-eliciting frame) vs
-        // carries-no-STREAM (ACK + control only, e.g. a standalone
-        // MAX_STREAMS). Lets the /obs delta split the 2.0 outbound
-        // pkts/req into response vs ack/control.
+        // Egress-composition obs: classify each emitted 1-RTT packet as
+        // pure-ACK (no ack-eliciting frame) vs carries-no-STREAM (ACK +
+        // control only, e.g. a standalone MAX_STREAMS). Lets the /obs delta
+        // split outbound pkts/req into response vs ack/control.
         if !ack_eliciting {
             crate::diag::COUNTERS.pkts_ack_only.bump();
         }
