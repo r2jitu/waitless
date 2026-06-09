@@ -171,7 +171,7 @@ pub(super) struct SpaceState {
     /// RFC 9002 §A.1 names this `sent_packets`. Removed on ACK;
     /// walked by loss detection to find packets that fell behind
     /// `largest_acked - kPacketThreshold`.
-    pub(super) sent_packets: alloc::collections::BTreeMap<u64, SentPacket>,
+    pub(super) sent_packets: SentPackets,
     /// Received packet-number ranges, inclusive `(lo, hi)`, sorted
     /// **descending** by `hi`, disjoint and non-adjacent. Source of
     /// truth for [`Connection::append_ack_frame`]'s First/Additional
@@ -287,6 +287,97 @@ pub(super) struct StreamRetx {
     pub(super) data: alloc::vec::Vec<u8>,
 }
 
+/// Per-space record of sent-but-unresolved packets (RFC 9002 §A.1
+/// `sent_packets`). Packet numbers are monotonic and contiguous within a
+/// space, so instead of a `BTreeMap<pn, _>` (a heap node + `O(log n)` per
+/// op) this is a ring of slots indexed by `pn - base_pn`: `O(1)` insert
+/// (push_back), `O(1)` lookup/remove by pn, alloc-free amortized (the
+/// `VecDeque` reuses its buffer). A removed PN leaves a `None` hole for an
+/// out-of-order ACK/loss; the hole is reclaimed (and `base_pn` advanced)
+/// once it reaches the front. Length is bounded by the in-flight PN span
+/// (≈ cwnd), exactly like the map it replaces. The ACK path removes a
+/// whole range in `O(range)` instead of `O(range·log n)`.
+#[derive(Default, Debug)]
+pub(super) struct SentPackets {
+    base_pn: u64,
+    slots: alloc::collections::VecDeque<Option<SentPacket>>,
+    /// Count of live (`Some`) slots — `O(1)` `len`/`is_empty`.
+    live: usize,
+}
+
+impl SentPackets {
+    /// Record a freshly-sent packet. PNs arrive monotonically; the common
+    /// case is `idx == slots.len()` (a plain push_back). A skipped PN
+    /// (never happens — PNs are contiguous per space) pads with holes.
+    pub(super) fn insert(&mut self, pn: u64, pkt: SentPacket) {
+        if self.slots.is_empty() {
+            self.base_pn = pn;
+        }
+        debug_assert!(pn >= self.base_pn, "sent_packets: pn < base_pn");
+        if pn < self.base_pn {
+            return; // guard against underflow; unreachable in practice
+        }
+        let idx = (pn - self.base_pn) as usize;
+        while self.slots.len() <= idx {
+            self.slots.push_back(None);
+        }
+        if self.slots[idx].is_none() {
+            self.live += 1;
+        }
+        self.slots[idx] = Some(pkt);
+    }
+
+    /// Remove and return the packet with number `pn` (if still tracked),
+    /// then reclaim any leading resolved holes so `base_pn` tracks the
+    /// oldest unresolved PN and the deque stays bounded.
+    pub(super) fn remove(&mut self, pn: u64) -> Option<SentPacket> {
+        if pn < self.base_pn {
+            return None;
+        }
+        let idx = (pn - self.base_pn) as usize;
+        let taken = self.slots.get_mut(idx).and_then(|s| s.take());
+        if taken.is_some() {
+            self.live -= 1;
+        }
+        while matches!(self.slots.front(), Some(None)) {
+            self.slots.pop_front();
+            self.base_pn += 1;
+        }
+        taken
+    }
+
+    /// Iterate `(pn, &SentPacket)` over live packets in ascending PN order
+    /// (matches the old `BTreeMap::iter`, on which loss detection relies to
+    /// break at the first PN ≥ `largest_acked`).
+    pub(super) fn iter(&self) -> impl Iterator<Item = (u64, &SentPacket)> + '_ {
+        let base = self.base_pn;
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(move |(i, s)| s.as_ref().map(|p| (base + i as u64, p)))
+    }
+
+    /// Iterate `&SentPacket` over live packets (order-agnostic callers —
+    /// e.g. `discard_sent_packets` summing in-flight bytes).
+    pub(super) fn values(&self) -> impl Iterator<Item = &SentPacket> + '_ {
+        self.slots.iter().filter_map(|s| s.as_ref())
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.live
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.slots.clear();
+        self.live = 0;
+        self.base_pn = 0;
+    }
+}
+
 /// Pop every PN in `[low, high]` (inclusive) from `sent_packets`,
 /// stashing the entry whose PN equals `target_pn` (the ACK's
 /// `largest_acknowledged`) into `largest_out` so the caller can use
@@ -308,7 +399,7 @@ pub(super) fn ack_remove_range(
     // explicit loop is still O((high-low) * log n) which is fine.
     let mut pn = high;
     loop {
-        if let Some(pkt) = space.sent_packets.remove(&pn) {
+        if let Some(pkt) = space.sent_packets.remove(pn) {
             // Release its congestion-control bytes-in-flight (RFC 9002
             // §7.8 OnPacketAcked); accumulated for the caller's `on_ack`.
             if pkt.in_flight {
@@ -1785,6 +1876,94 @@ mod recv_ranges_tests {
             decoded.push((lo, hi));
         }
         assert_eq!(decoded, s.recv_ranges);
+    }
+
+    // ── SentPackets ring ─────────────────────────────────────────────
+    use super::{SentPacket, SentPackets};
+
+    fn sp(byte_count: u32) -> SentPacket {
+        SentPacket {
+            time_sent_us: 1,
+            ack_eliciting: true,
+            in_flight: true,
+            byte_count,
+            stream_frames: Vec::new(),
+        }
+    }
+
+    fn pns(s: &SentPackets) -> Vec<u64> {
+        s.iter().map(|(pn, _)| pn).collect()
+    }
+
+    #[test]
+    fn ring_insert_len_and_ascending_iter() {
+        let mut s = SentPackets::default();
+        assert!(s.is_empty());
+        for pn in 5..=9 {
+            s.insert(pn, sp(pn as u32));
+        }
+        assert_eq!(s.len(), 5);
+        assert_eq!(pns(&s), &[5, 6, 7, 8, 9]); // ascending, starts at base=5
+        assert_eq!(s.values().map(|p| p.byte_count).sum::<u32>(), 5 + 6 + 7 + 8 + 9);
+    }
+
+    #[test]
+    fn ring_in_order_remove_advances_base() {
+        let mut s = SentPackets::default();
+        for pn in 0..=4 {
+            s.insert(pn, sp(1));
+        }
+        // Remove the front in order; base advances and len shrinks.
+        assert!(s.remove(0).is_some());
+        assert_eq!(pns(&s), &[1, 2, 3, 4]);
+        assert!(s.remove(1).is_some());
+        assert_eq!(pns(&s), &[2, 3, 4]);
+        assert_eq!(s.len(), 3);
+        assert!(s.remove(0).is_none()); // already gone
+    }
+
+    #[test]
+    fn ring_out_of_order_remove_holes_then_compact() {
+        let mut s = SentPackets::default();
+        for pn in 0..=5 {
+            s.insert(pn, sp(1));
+        }
+        // Remove a middle PN — leaves a hole, base stays at 0.
+        assert!(s.remove(3).is_some());
+        assert_eq!(pns(&s), &[0, 1, 2, 4, 5]);
+        assert_eq!(s.len(), 5);
+        // Remove the front range; compaction must skip the 3-hole and stop
+        // at the first live slot (4).
+        for pn in 0..=2 {
+            assert!(s.remove(pn).is_some());
+        }
+        assert_eq!(pns(&s), &[4, 5]);
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn ring_high_to_low_range_remove_then_reuse() {
+        // Mirrors ack_remove_range (removes high..=low descending).
+        let mut s = SentPackets::default();
+        for pn in 10..=15 {
+            s.insert(pn, sp(1));
+        }
+        let mut pn = 15;
+        loop {
+            assert!(s.remove(pn).is_some());
+            if pn == 10 {
+                break;
+            }
+            pn -= 1;
+        }
+        assert!(s.is_empty());
+        // Reuse after fully draining: a far-higher PN must reset the base,
+        // not allocate a giant hole run.
+        s.insert(1_000_000, sp(7));
+        assert_eq!(s.len(), 1);
+        assert_eq!(pns(&s), &[1_000_000]);
+        assert!(s.remove(1_000_000).is_some());
+        assert!(s.is_empty());
     }
 }
 

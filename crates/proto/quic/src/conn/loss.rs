@@ -302,7 +302,7 @@ impl Connection {
         // Walk in PN order. Threshold-lost PNs (lowest) naturally come
         // first; time-lost can appear after. Counters track how many of
         // each (for the diag); the list itself stays in PN order.
-        for (&pn, pkt) in space.sent_packets.iter() {
+        for (pn, pkt) in space.sent_packets.iter() {
             if pn >= largest_acked {
                 break; // PN >= largest_acked are still in-flight
             }
@@ -327,7 +327,7 @@ impl Connection {
         // a spurious threshold declaration.
         let mut min_lost_age_us: u64 = 0;
         for (i, &pn) in lost_buf.iter().enumerate() {
-            if let Some(mut pkt) = space.sent_packets.remove(&pn) {
+            if let Some(mut pkt) = space.sent_packets.remove(pn) {
                 if i == 0 {
                     min_lost_age_us = now.saturating_sub(pkt.time_sent_us);
                 }
