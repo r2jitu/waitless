@@ -73,8 +73,9 @@ mod tx;
 // them as `gve::…`.
 pub use diag::{GQI_RECYCLE_POOL_EXHAUSTED, RX_BUF_REPOST_COUNT, TxDescLogEntry, tx_desc_log_snapshot};
 pub(crate) use diag::{
-    RX_BYTES_PER_QP, TX_BIG_ACQUIRES, TX_BIG_FULL_RETURNS, TX_BYTES_PER_QP, TX_PACKETS_PER_QP,
-    TX_SMALL_ACQUIRES, TX_SMALL_FULL_SPINS, TX_SMALL_SCAN_ITERS, record_tx_desc, tx_desc_kind,
+    GQI_TX_STALL_DROPS, RX_BYTES_PER_QP, TX_BIG_ACQUIRES, TX_BIG_FULL_RETURNS, TX_BYTES_PER_QP,
+    TX_PACKETS_PER_QP, TX_SMALL_ACQUIRES, TX_SMALL_FULL_SPINS, TX_SMALL_SCAN_ITERS, record_tx_desc,
+    tx_desc_kind,
 };
 
 use bus::{log, mmio_read32, mmio_write32};
@@ -268,6 +269,20 @@ pub(crate) struct TxQueue {
     /// to stall. Batching doorbell writes across a poll iteration
     /// cuts the per-packet MMIO-exit count on GCE.
     pub(crate) last_kicked: AtomicU32,
+
+    // ---- GQI TX-stall circuit breaker (see gqi::acquire_tx_buf_for_qp) ----
+    /// Fast-fail deadline in `now_cycles()` units; 0 = not stalled.
+    /// Armed when the ring goes ~5 ms without a single completion
+    /// (`done_cnt` frozen) — a dead ring, not mere saturation. While
+    /// armed, full-pool acquires fast-fail instead of spinning so the
+    /// core stays live. Per-qp (not global) so a healthy qp is never
+    /// throttled by a sibling's stall.
+    pub(crate) stall_until: AtomicU64,
+    /// `done_cnt` value stamped when `stall_until` was armed. The
+    /// cooldown self-clears the moment `done_cnt` moves off this value
+    /// (completions resumed), so a recovered ring drops at most the
+    /// sends attempted while it was actually frozen.
+    pub(crate) stall_done_snap: AtomicU32,
 
     // ---- DQO_RDA-only fields ----
     /// TX completion ring (DQO only). Each entry is 8 bytes,

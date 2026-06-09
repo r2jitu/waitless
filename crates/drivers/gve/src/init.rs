@@ -15,7 +15,7 @@
 // command (opcode + status + 56 bytes of per-command data).
 
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use bus::{log, pci};
 use iobuf::IOBufPool;
@@ -1058,6 +1058,8 @@ fn finalize_tx_queue(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) {
             fill_cnt: AtomicU32::new(0),
             done_cnt: AtomicU32::new(0),
             last_kicked: AtomicU32::new(0),
+            stall_until: AtomicU64::new(0),
+            stall_done_snap: AtomicU32::new(0),
             tx_compl_va: alloc.tx_compl_va,
             tx_compl_entries: match fmt {
                 QueueFormat::DqoRda => TX_RING_ENTRIES,

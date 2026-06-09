@@ -54,6 +54,12 @@ pub(crate) static TX_SMALL_SCAN_ITERS: Counter = Counter::new();
 pub(crate) static TX_SMALL_ACQUIRES: Counter = Counter::new();
 pub(crate) static TX_BIG_FULL_RETURNS: Counter = Counter::new();
 pub(crate) static TX_BIG_ACQUIRES: Counter = Counter::new();
+/// GQI small-pool acquires abandoned by the TX-stall circuit breaker
+/// (spin budget elapsed, or fast-fail cooldown active — see
+/// `gqi::acquire_tx_buf_for_qp`). Always 0 on a healthy ring; nonzero
+/// flags a TX ring the device stopped draining, where the old
+/// unbounded spin would have hard-hung the whole core.
+pub(crate) static GQI_TX_STALL_DROPS: Counter = Counter::new();
 
 // ---- TX descriptor capture ring -------------------------------------------
 //
@@ -323,6 +329,7 @@ pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
          \"rx_compl_skipped\":{},\"rx_pending_chain_timeouts\":{},\
          \"rx_buf_reposts\":{},\"gqi_recycle_exhausted\":{},\
          \"tx_packets\":{},\"tx_bytes\":{},\"rx_bytes\":{},\"tx_small_full_spins\":{},\
+         \"gqi_tx_stall_drops\":{},\
          \"tx_big_full_returns\":{},\"rx_irq\":{},\
          \"tx_desc_fill\":{},\"tx_desc_done\":{},",
         crate::dqo::DQO_TX_MISS_COMPL.load(Ordering::Relaxed),
@@ -337,6 +344,7 @@ pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
         sum(&TX_BYTES_PER_QP),
         sum(&RX_BYTES_PER_QP),
         TX_SMALL_FULL_SPINS.get(),
+        GQI_TX_STALL_DROPS.get(),
         TX_BIG_FULL_RETURNS.get(),
         // RX MSI-X interrupts handled (T7 wake-on-packet idle). Nonzero
         // confirms the IRQ path fires; 0 on a busy server (never arms)
