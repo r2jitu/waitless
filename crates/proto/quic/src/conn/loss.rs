@@ -79,7 +79,7 @@ impl Connection {
             1 => CryptoLevel::Handshake,
             _ => CryptoLevel::OneRtt,
         };
-        use executor::reactor::MAX_L2_HEADROOM;
+        use nic_api::MAX_L2_HEADROOM;
         let mut datagram = self.take_datagram_buf(64);
         if self.encode_ping_probe(datagram.vec_mut(), level).is_ok()
             && datagram.len() > MAX_L2_HEADROOM

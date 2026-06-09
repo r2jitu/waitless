@@ -524,7 +524,7 @@ impl HttpStream for TlsStream {
     /// `guard.data()` reads the plaintext in place (zero copy);
     /// `guard.into_owned()` is a no-op (the IOBuf already owns —
     /// `Shared` or `Heap` — its bytes).
-    async fn recv_chunk(&mut self) -> Option<waitless::runtime::RecvChunkGuard<'_>> {
+    async fn recv_chunk(&mut self) -> Option<iobuf::RecvChunkGuard<'_>> {
         // Drive the conn until a plaintext record is queued.
         // Handshake records produce none, so early iterations just
         // advance the handshake.
@@ -534,7 +534,7 @@ impl HttpStream for TlsStream {
             }
         }
         let iobuf = self.tls.pop_plaintext()?;
-        Some(waitless::runtime::RecvChunkGuard::new(iobuf))
+        Some(iobuf::RecvChunkGuard::new(iobuf))
     }
 
     async fn send(&mut self, src: &mut IOBufChain) -> Result<(), ()> {

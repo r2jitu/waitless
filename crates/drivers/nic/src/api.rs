@@ -10,6 +10,19 @@ pub use iobuf::{Chain, IOBuf, IOBufChain, OwnedIOBuf};
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
+// ---- TX frame layout contract ----------------------------------------------
+
+/// Bytes a TX-frame builder must reserve at the FRONT of any
+/// driver/TX-pool buffer for the Ethernet + IP + UDP headers the
+/// backend fills in at submit time. Sized for the largest case
+/// (ETH 14 + IPv6 40 + UDP 8 = 62); IPv4 senders use the trailing 42
+/// and leave the leading 20 untouched. Callers write payload bytes at
+/// `data[MAX_L2_HEADROOM..]`. This is part of the handle contract
+/// ([`TxBufHandle`] and friends), which is why it lives in this leaf:
+/// the net stack, the QUIC encoder, and the reactor all share it
+/// without any of them depending on the others.
+pub const MAX_L2_HEADROOM: usize = 14 + 40 + 8;
+
 // ---- Core ops --------------------------------------------------------------
 
 /// Handle returned by [`NicOps::acquire_tx_buf`]. Wraps a writable

@@ -216,7 +216,7 @@ fn end_to_end_self_handshake() {
     let pkt = conn
         .pop_packet_owned()
         .expect("server reply datagram queued");
-    let reply = &pkt.vec()[executor::reactor::MAX_L2_HEADROOM..];
+    let reply = &pkt.vec()[nic_api::MAX_L2_HEADROOM..];
     assert!(!reply.is_empty(), "non-empty reply datagram");
 
     // First packet should be Initial. Re-derive server-side
@@ -273,7 +273,7 @@ fn end_to_end_self_handshake() {
 #[test]
 fn handshake_flight_fragments_across_mtu_datagrams() {
     use super::MAX_QUIC_DATAGRAM;
-    let headroom = executor::reactor::MAX_L2_HEADROOM;
+    let headroom = nic_api::MAX_L2_HEADROOM;
 
     let mut packet = make_client_initial();
     let local_cid = ConnectionId::new(&[0xab; 8]);

@@ -144,7 +144,7 @@ impl Connection {
     /// No-op when no close is pending.
     pub fn flush_close(&mut self) {
         if let Some((error_code, reason)) = self.close_pending.take() {
-            use executor::reactor::MAX_L2_HEADROOM;
+            use nic_api::MAX_L2_HEADROOM;
             let mut datagram = self.take_datagram_buf(256);
             if self
                 .encode_close_packet(datagram.vec_mut(), error_code, &reason)
@@ -285,7 +285,7 @@ impl Connection {
     }
 
     fn flush_outbound_inner(&mut self, _config: &TlsServerConfig) -> Result<(), ConnError> {
-        use executor::reactor::MAX_L2_HEADROOM;
+        use nic_api::MAX_L2_HEADROOM;
 
         // Make sure the peer's send-side flow-control limits are applied
         // before the 1-RTT STREAM-data gate consults `peer_max_data`
@@ -614,7 +614,7 @@ impl Connection {
     /// The buffer-agnostic core the egress owner reuses to build into a
     /// driver TX slot directly.
     fn emit_one_rtt_datagram(&mut self, buf: &mut super::DatagramBuf) -> Result<bool, ConnError> {
-        use executor::reactor::MAX_L2_HEADROOM;
+        use nic_api::MAX_L2_HEADROOM;
         self.encode_one_rtt_packet(buf.vec_mut())?;
         if buf.len() <= MAX_L2_HEADROOM {
             return Ok(false);

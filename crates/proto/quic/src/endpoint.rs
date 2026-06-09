@@ -102,7 +102,7 @@ fn ship_datagram_inner(
         let (handle, frame_len, gso_size) = pkt
             .into_gso_handle()
             .unwrap_or_else(|_| unreachable!("is_gso_slot() guarded"));
-        let payload = frame_len.saturating_sub(executor::reactor::MAX_L2_HEADROOM);
+        let payload = frame_len.saturating_sub(nic_api::MAX_L2_HEADROOM);
         let n = (payload / gso_size.max(1) as usize).max(1) as u64;
         let _ = sock.send_gso_via_tx_handle(peer_ip, peer_port, handle, frame_len, gso_size);
         crate::diag::COUNTERS.datagrams_sent.add(n);

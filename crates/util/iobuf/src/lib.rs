@@ -75,6 +75,10 @@ pub use chain::{Chain, Cursor, IOBufChain};
 mod iobuf;
 pub use iobuf::IOBuf;
 
+/// Zero-copy chunk-read guard shared by every `recv_chunk` surface.
+mod recv_chunk;
+pub use recv_chunk::RecvChunkGuard;
+
 // `OwnedIOBuf` — the `Send`-by-derivation flat enum over the two
 // owning variants. Carries `From<OwnedIOBuf> for IOBuf` widening.
 mod owned;

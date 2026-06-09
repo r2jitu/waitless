@@ -1465,7 +1465,7 @@ impl Connection {
     /// the encoder captures `header_start = out.len()` after the
     /// resize.
     pub(super) fn take_datagram_buf(&mut self, fallback_capacity: usize) -> DatagramBuf {
-        use executor::reactor::MAX_L2_HEADROOM;
+        use nic_api::MAX_L2_HEADROOM;
         let total_capacity = MAX_L2_HEADROOM + fallback_capacity;
         let mut v = match self.outbound_pool.pop() {
             Some(mut v) => {
@@ -1494,7 +1494,7 @@ impl Connection {
     /// backend doesn't expose the SG TX surface (native), or the slot
     /// can't fit a worst-case datagram.
     pub(crate) fn take_datagram_buf_direct(&mut self, fallback_capacity: usize) -> DatagramBuf {
-        use executor::reactor::MAX_L2_HEADROOM;
+        use nic_api::MAX_L2_HEADROOM;
 
         if let Some(handle) = executor::reactor::acquire_tx_buf() {
             // The `TxSlot` datagram wraps the driver slot in a
@@ -1552,7 +1552,7 @@ impl Connection {
     /// full, or the slot can't hold ≥2 segments — caller falls back to
     /// the per-datagram path.
     pub(super) fn take_gso_datagram_buf(&mut self, gso_size: u16) -> Option<DatagramBuf> {
-        use executor::reactor::MAX_L2_HEADROOM;
+        use nic_api::MAX_L2_HEADROOM;
         let handle = executor::reactor::acquire_tx_udp_gso_buf()?;
         let cap = handle.data_cap() as usize;
         if cap < MAX_L2_HEADROOM + 2 * gso_size as usize {

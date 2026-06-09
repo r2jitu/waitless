@@ -592,11 +592,11 @@ pub struct UdpBackend {
     pub send_udp_gso_via_tx_handle: Option<UdpSendUdpGsoViaTxHandleFn>,
 }
 
-/// Max bytes a caller of `UdpSocket::send_to_with_l2_headroom`
-/// must reserve at the front of its frame buffer for the
-/// Ethernet + IP + UDP headers. Sized for v6 (14 + 40 + 8); v4
-/// uses 42 of these, the leading 20 are unused.
-pub const MAX_L2_HEADROOM: usize = 14 + 40 + 8;
+/// Re-export of the TX frame-layout contract — the constant lives
+/// with the TX-handle types in `nic_api` (see its doc); kept visible
+/// here because `UdpSocket::send_to_with_l2_headroom` callers
+/// historically imported it from this module.
+pub use nic_api::MAX_L2_HEADROOM;
 
 /// Acquire a writable frame buffer drawn from the driver's TX
 /// pool. Free function (no `UdpSocket` needed) — used by the

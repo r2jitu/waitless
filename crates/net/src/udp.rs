@@ -167,7 +167,7 @@ const UDP_HDR_LEN: usize = 8;
 /// frame ([14 + 40 + 8 + 1452]) fits; v4 uses fewer header bytes
 /// so its payload slot is larger.
 const FRAME_BUF_LEN: usize =
-    executor::reactor::MAX_L2_HEADROOM + (1500 - IPV6_HDR_LEN - UDP_HDR_LEN);
+    nic_api::MAX_L2_HEADROOM + (1500 - IPV6_HDR_LEN - UDP_HDR_LEN);
 // = 62 + 1452 = 1514. Same total bound for both families.
 
 /// Fill the ETH + IP + UDP headers of `frame` in place — the UDP
@@ -244,7 +244,7 @@ unsafe fn fill_udp_frame_headers(
 }
 
 /// Zero-copy UDP send. Caller pre-supplies a frame buffer where
-/// the first [`executor::reactor::MAX_L2_HEADROOM`] (= 62) bytes
+/// the first [`nic_api::MAX_L2_HEADROOM`] (= 62) bytes
 /// are reserved for the L2/L3/L4 headers and the UDP payload
 /// starts at `frame[MAX_L2_HEADROOM..]`. Fills the headers in
 /// place and ships the contiguous frame to the driver — no
@@ -260,7 +260,7 @@ unsafe fn fill_udp_frame_headers(
 /// miss drops the packet — UDP is fire-and-forget; the application
 /// layer (QUIC retransmits, DNS retries) handles loss.
 pub fn send_with_l2_headroom(dst: IpAddr, src_port: u16, dst_port: u16, frame: &mut [u8]) {
-    use executor::reactor::MAX_L2_HEADROOM;
+    use nic_api::MAX_L2_HEADROOM;
     debug_assert!(frame.len() >= MAX_L2_HEADROOM);
 
     let payload_len = frame.len() - MAX_L2_HEADROOM;
@@ -358,7 +358,7 @@ unsafe fn write_udp_tx_headers(
     dst_port: u16,
     payload_len: usize,
 ) -> (usize, u16, u16) {
-    use executor::reactor::MAX_L2_HEADROOM;
+    use nic_api::MAX_L2_HEADROOM;
     let ip_hdr_len = match dst {
         IpAddr::V4(_) => IPV4_HDR_LEN,
         IpAddr::V6(_) => IPV6_HDR_LEN,
@@ -395,7 +395,7 @@ pub fn send_via_tx_handle(
     handle: nic_api::TxBufHandle,
     frame_len: usize,
 ) {
-    use executor::reactor::MAX_L2_HEADROOM;
+    use nic_api::MAX_L2_HEADROOM;
     debug_assert!(frame_len >= MAX_L2_HEADROOM);
     debug_assert!(frame_len <= handle.data_cap as usize);
 
@@ -448,7 +448,7 @@ pub fn send_udp_gso_via_tx_handle(
     frame_len: usize,
     gso_size: u16,
 ) {
-    use executor::reactor::MAX_L2_HEADROOM;
+    use nic_api::MAX_L2_HEADROOM;
     debug_assert!(frame_len > MAX_L2_HEADROOM);
     debug_assert!(frame_len <= handle.data_cap() as usize);
 
@@ -496,7 +496,7 @@ pub fn send_udp_gso_via_tx_handle(
 /// and as the native-backend fallback for callers that opted
 /// into `send_to_with_l2_headroom`.
 pub fn send_to_addr(dst: IpAddr, src_port: u16, dst_port: u16, data: &[u8]) {
-    use executor::reactor::MAX_L2_HEADROOM;
+    use nic_api::MAX_L2_HEADROOM;
     if data.len() > 1500 - IPV4_HDR_LEN - UDP_HDR_LEN {
         diag::COUNTERS.tx_invalid.bump();
         return;

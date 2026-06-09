@@ -31,6 +31,7 @@ rust_library(
         # RFC 7541 Huffman (shared with proto/http3 — HPACK == QPACK table).
         "//crates/proto/field-huffman",
         "//crates/proto/http",
+        "//crates/util/iobuf",
         # The TLS state machine the listener drives (listen.rs only).
         "//crates/proto/tls",
         "//crates/runtime/worker",

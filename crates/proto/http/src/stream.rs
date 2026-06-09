@@ -61,8 +61,8 @@ pub trait HttpStream {
     /// the transport cannot re-read (hence overwrite) the surfaced
     /// buffer while the chunk is still held. See item F's write-up.
     ///
-    /// [`RecvChunkGuard`]: waitless::runtime::RecvChunkGuard
-    async fn recv_chunk(&mut self) -> Option<waitless::runtime::RecvChunkGuard<'_>> {
+    /// [`RecvChunkGuard`]: iobuf::RecvChunkGuard
+    async fn recv_chunk(&mut self) -> Option<iobuf::RecvChunkGuard<'_>> {
         None
     }
 

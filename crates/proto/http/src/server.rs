@@ -537,7 +537,7 @@ mod serve_conn_tests {
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     use iobuf::{IOBuf, IOBufChain};
-    use waitless::runtime::RecvChunkGuard;
+    use iobuf::RecvChunkGuard;
 
     /// Pre-canned-chunk transport. `recv_chunk` pops entries from
     /// `chunks` (`Some(bytes)` -> wrap in a guard, `None` -> signal

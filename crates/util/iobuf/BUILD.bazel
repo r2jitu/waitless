@@ -26,6 +26,7 @@ rust_library(
         "src/lib.rs",
         "src/owned.rs",
         "src/pool.rs",
+        "src/recv_chunk.rs",
         "src/storage.rs",
     ],
     crate_name = "iobuf",
