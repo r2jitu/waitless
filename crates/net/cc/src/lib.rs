@@ -133,6 +133,12 @@ pub struct NewReno {
     /// Upper bound on `cwnd` (and thus bytes-in-flight). See
     /// [`DEFAULT_MAX_WINDOW`].
     max_window: u32,
+    /// Per-ACK slow-start increment cap, bytes — RFC 3465 ABC's `L`
+    /// (`min(bytes_acked, L)` per ACK). `0` = uncapped. The cap bounds the
+    /// burst a single stretch-ACK / post-idle ACK releases on an *unpaced*
+    /// sender (TCP sets `L = 2·MSS`); a paced sender (QUIC) leaves it 0
+    /// because the pacer is the burst guard.
+    slow_start_cap: u32,
 }
 
 impl NewReno {
@@ -148,6 +154,7 @@ impl NewReno {
             recovery_rem_bytes: 0,
             srtt_us: 0,
             max_window: max_u32(DEFAULT_MAX_WINDOW, initial_window(mss)),
+            slow_start_cap: 0,
         }
     }
 
@@ -160,6 +167,13 @@ impl NewReno {
     /// Clamped to at least the initial window.
     pub fn set_max_window(&mut self, max: u32) {
         self.max_window = max_u32(max, initial_window(self.mss));
+    }
+
+    /// Set the per-ACK slow-start increment cap (RFC 3465 ABC `L`); `0`
+    /// disables it. Unpaced senders (TCP) set `2·MSS`; paced senders leave
+    /// it 0.
+    pub fn set_slow_start_cap(&mut self, cap: u32) {
+        self.slow_start_cap = cap;
     }
 
     pub fn ssthresh(&self) -> u32 {
@@ -205,9 +219,15 @@ impl CongestionControl for NewReno {
         }
         if self.in_slow_start() {
             // Slow start: exponential — one window per RTT. Byte-counting
-            // (RFC 9002 §7.3.1), capped so we land exactly on ssthresh.
+            // (RFC 9002 §7.3.1), capped so we land exactly on ssthresh, and
+            // — for an unpaced sender — by the optional RFC 3465 `L` burst
+            // cap (`slow_start_cap`, 0 = off).
             let room = self.ssthresh.saturating_sub(self.cwnd);
-            self.cwnd = self.cwnd.saturating_add(min_u32(bytes_acked, room));
+            let mut inc = min_u32(bytes_acked, room);
+            if self.slow_start_cap != 0 {
+                inc = min_u32(inc, self.slow_start_cap);
+            }
+            self.cwnd = self.cwnd.saturating_add(inc);
             // If room was 0 (already at ssthresh) we fall through to CA on
             // the next ack; nothing more to do here.
         } else {
@@ -447,5 +467,23 @@ mod tests {
             after > minimum_window(MSS),
             "cwnd collapsed to the floor: {after} (regression)"
         );
+    }
+
+    #[test]
+    fn slow_start_cap_bounds_the_per_ack_increment() {
+        // Unpaced-sender cap (RFC 3465 L = 2·MSS): a stretch-ACK acking 10
+        // segments must open cwnd by at most 2·MSS, not 10·MSS.
+        let mut cc = NewReno::new(MSS);
+        cc.set_slow_start_cap(2 * MSS);
+        let before = cc.window();
+        cc.on_ack(10 * MSS, 0, rtt());
+        assert_eq!(cc.window(), before + 2 * MSS, "stretch-ACK capped at 2·MSS");
+        // Uncapped (paced default): the same stretch-ACK opens by the full
+        // bytes acked (still bounded by room-to-ssthresh, here effectively
+        // infinite at start).
+        let mut paced = NewReno::new(MSS);
+        let before = paced.window();
+        paced.on_ack(10 * MSS, 0, rtt());
+        assert_eq!(paced.window(), before + 10 * MSS, "uncapped grows by bytes acked");
     }
 }
