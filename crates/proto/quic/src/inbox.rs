@@ -351,6 +351,38 @@ pub struct SlotTable {
     /// Live allocation count. Bumped on `allocate`, decremented
     /// on `free_slot`. Used to enforce `max_capacity` in O(1).
     live: Cell<u16>,
+    /// Admission control (docs/tx-backpressure.md stage 4): cached
+    /// "kernel heap over the pressure threshold" flag. `true` ⇒ new
+    /// connections are refused so the heap headroom is reserved for
+    /// the conns already established (which still need to allocate to
+    /// finish their work) rather than spent admitting more. Refreshed
+    /// every `HEAP_SAMPLE_INTERVAL` admits — `heap_stats()` takes the
+    /// global allocator lock, too heavy to call on every Initial under
+    /// a flood, but a stale flag only over/under-admits by at most the
+    /// interval's worth of (idle-sized) half-open slots.
+    heap_pressure: Cell<bool>,
+    /// Down-counter to the next `heap_pressure` refresh.
+    heap_sample_countdown: Cell<u16>,
+}
+
+/// Refuse new-connection admission once the kernel heap is at least
+/// this percent full. Leaves headroom for the response path and for
+/// already-established conns to keep allocating; combined with the
+/// per-IP and global-count caps it bounds total per-worker memory
+/// against a connection flood. A dropped Initial just makes a
+/// legitimate peer retry, by which time pressure may have cleared.
+const HEAP_ADMIT_THRESHOLD_PCT: usize = 90;
+
+/// Admits between `heap_pressure` refreshes (see the field).
+const HEAP_SAMPLE_INTERVAL: u16 = 64;
+
+/// Pure threshold decision: is `allocated / claimed` at or past
+/// [`HEAP_ADMIT_THRESHOLD_PCT`]? `claimed == 0` (native / not-yet-
+/// initialised heap) reads as "no pressure" so the gate is inert
+/// where there is no real heap to protect.
+fn heap_over_admit_threshold(allocated: usize, claimed: usize) -> bool {
+    claimed != 0
+        && allocated.saturating_mul(100) >= claimed.saturating_mul(HEAP_ADMIT_THRESHOLD_PCT)
 }
 
 impl SlotTable {
@@ -363,7 +395,27 @@ impl SlotTable {
             initial_dcids: RefCell::new(alloc::collections::BTreeMap::new()),
             max_capacity,
             live: Cell::new(0),
+            heap_pressure: Cell::new(false),
+            heap_sample_countdown: Cell::new(0),
         }
+    }
+
+    /// Admission gate: refresh the cached heap-pressure flag once per
+    /// [`HEAP_SAMPLE_INTERVAL`] calls (amortising the allocator lock),
+    /// and return whether a new connection should be refused. Hoisted
+    /// out of `allocate` so the sampling cadence is testable apart from
+    /// the slot machinery.
+    fn under_heap_pressure(&self) -> bool {
+        let countdown = self.heap_sample_countdown.get();
+        if countdown == 0 {
+            let h = waitless::diagnostics::heap_stats();
+            self.heap_pressure
+                .set(heap_over_admit_threshold(h.allocated_bytes, h.claimed_bytes));
+            self.heap_sample_countdown.set(HEAP_SAMPLE_INTERVAL);
+        } else {
+            self.heap_sample_countdown.set(countdown - 1);
+        }
+        self.heap_pressure.get()
     }
 
     /// Resolve a slot index into a `*mut Slot`. The pointer is
@@ -461,6 +513,14 @@ impl SlotTable {
     /// allocate to find the first dead slot AND count per-IP
     /// usage in one pass; both walks are gone.
     pub fn allocate(&self, src_ip: waitless::runtime::IpAddr) -> Option<(u16, u16)> {
+        // Admission control (docs/tx-backpressure.md stage 4): under
+        // kernel-heap pressure, refuse new conns so the headroom goes
+        // to the ones already established. Checked first — the cheapest
+        // rejection, and the one that protects everything downstream.
+        if self.under_heap_pressure() {
+            crate::diag::COUNTERS.conn_admit_pressure.bump();
+            return None;
+        }
         // Global cap — reject before bumping any state.
         if self.live.get() >= self.max_capacity {
             return None;
@@ -677,6 +737,47 @@ pub fn parse_local_cid(dcid: &[u8]) -> Option<(u16, u16)> {
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod admission_tests {
+    use super::{heap_over_admit_threshold, HEAP_ADMIT_THRESHOLD_PCT};
+
+    #[test]
+    fn no_pressure_below_threshold() {
+        // 89% of a 1000-byte heap — below the 90% line.
+        assert!(!heap_over_admit_threshold(890, 1000));
+        assert!(!heap_over_admit_threshold(0, 1000)); // empty heap
+    }
+
+    #[test]
+    fn pressure_at_and_above_threshold() {
+        assert!(heap_over_admit_threshold(900, 1000)); // exactly 90%
+        assert!(heap_over_admit_threshold(999, 1000)); // nearly full
+        assert!(heap_over_admit_threshold(1000, 1000)); // full
+    }
+
+    #[test]
+    fn uninitialised_heap_reads_as_no_pressure() {
+        // claimed == 0 (native backend / pre-init) must never gate —
+        // there's no real heap to protect, and 0/0 is undefined.
+        assert!(!heap_over_admit_threshold(0, 0));
+        assert!(!heap_over_admit_threshold(123, 0));
+    }
+
+    #[test]
+    fn threshold_holds_at_realistic_heap_scale() {
+        // ~2 GiB heap (the GCE e2-small shape). The scaled-integer
+        // comparison must not overflow and must track the percentage
+        // (use values clearly either side of the 90% line so integer
+        // rounding at the exact boundary doesn't matter).
+        const CLAIMED: usize = 2 * 1024 * 1024 * 1024;
+        // One percent either side of the threshold (it's 90%).
+        let above = CLAIMED / 100 * (HEAP_ADMIT_THRESHOLD_PCT + 1);
+        let below = CLAIMED / 100 * (HEAP_ADMIT_THRESHOLD_PCT - 1);
+        assert!(heap_over_admit_threshold(above, CLAIMED));
+        assert!(!heap_over_admit_threshold(below, CLAIMED));
+    }
+}
 
 #[cfg(test)]
 mod tests {

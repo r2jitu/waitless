@@ -257,6 +257,14 @@ pub struct Counters {
     /// streams than allowed — a misbehaving client or a memory-DoS
     /// attempt; the connection is closed with STREAM_LIMIT_ERROR.
     pub stream_limit_exceeded: Counter,
+    /// New QUIC connections refused at admission because the kernel
+    /// heap was over the pressure threshold (admission control —
+    /// docs/tx-backpressure.md stage 4). Sheds new conns to protect
+    /// the ones already established; nonzero means the worker hit a
+    /// memory ceiling (a conn flood, or genuine load). The peer's
+    /// Initial is dropped, so a legitimate client simply retries once
+    /// pressure clears.
+    pub conn_admit_pressure: Counter,
     /// Total SendStream entries ever created (one per stream the app
     /// or H3 layer wrote to). For HTTP/3 servers each request creates
     /// one of these.
@@ -435,6 +443,7 @@ impl Counters {
             pto_probes_sent: Counter::new(),
             recv_streams_created: Counter::new(),
             stream_limit_exceeded: Counter::new(),
+            conn_admit_pressure: Counter::new(),
             send_streams_created: Counter::new(),
             streams_reaped: Counter::new(),
             inbox_full_drops: Counter::new(),
@@ -864,7 +873,7 @@ pub fn should_log_event() -> bool {
 /// Snapshot of every drop / event counter, for `/quic_stats`-style
 /// dumps. Returns `(name, value)` pairs in declaration order,
 /// including the four AEAD throughput counters.
-pub fn snapshot() -> [(&'static str, u64); 61] {
+pub fn snapshot() -> [(&'static str, u64); 62] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.get()),
@@ -901,6 +910,7 @@ pub fn snapshot() -> [(&'static str, u64); 61] {
         ("pto_probes_sent", c.pto_probes_sent.get()),
         ("recv_streams_created", c.recv_streams_created.get()),
         ("stream_limit_exceeded", c.stream_limit_exceeded.get()),
+        ("conn_admit_pressure", c.conn_admit_pressure.get()),
         ("send_streams_created", c.send_streams_created.get()),
         ("streams_reaped", c.streams_reaped.get()),
         ("inbox_full_drops", c.inbox_full_drops.get()),

@@ -135,8 +135,23 @@ Ordered by foundational-ness; each is separable and testable.
    result and why the cross-protocol/TCP/sole-owner extensions stop here. The
    app-side enable flag (`QUIC_EGRESS_SCHED`) was retired once GCE-validated;
    conns past the per-core flow table degrade to the inline eager path.
-4. **Admission control.** Cap concurrency / global byte budget → bounds total
-   memory. (Per-IP conn caps exist in the QUIC slot table; generalize.)
+4. **Admission control.** ✅ *floor landed (2026-06-09):* the QUIC slot table
+   already capped conn count per-worker (`SLOTS_PER_WORKER`) and per-IP
+   half-open (`PER_IP_SLOT_LIMIT`), but those don't bound the
+   conn-count × per-conn-window *product* (8192 × 8 MiB ≫ heap). The new
+   **heap-pressure admission gate** closes that against a connection flood:
+   `SlotTable::allocate` refuses new conns once kernel-heap usage crosses
+   `HEAP_ADMIT_THRESHOLD_PCT` (90%), reserving the headroom for conns already
+   established (sampled every 64 admits so the allocator lock stays off the
+   per-Initial path; `conn_admit_pressure` /obs counter). The QUIC recv-stream
+   COUNT is separately capped (8192 live/conn + RFC 9000 §4.6 MAX_STREAMS,
+   landed in the #67 hardening). *Residual, deferred:* a true **aggregate
+   recv-byte budget** (the partial-upload-fill case — a handful of conns each
+   filling large windows isn't bounded by an admission gate that only sheds
+   *new* conns) and **concurrency-based MAX_STREAMS credit** (grant on
+   closed-count, not the monotonic opened high-watermark, so the advertised
+   limit itself stays bounded — today the 8192 live-stream cap is the
+   backstop).
 
 ## What this branch delivers vs. leaves
 
