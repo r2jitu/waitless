@@ -223,8 +223,8 @@ pub(crate) fn tx_desc_totals() -> (u64, u64) {
     let mut fill = 0u64;
     let mut done = 0u64;
     let n = (NUM_QP.load(Ordering::Acquire) as usize).min(MAX_QUEUE_PAIRS);
-    for qp in 0..n {
-        let p = TX_QUEUES[qp].load(Ordering::Acquire);
+    for slot in TX_QUEUES.iter().take(n) {
+        let p = slot.load(Ordering::Acquire);
         if !p.is_null() {
             let tx = unsafe { &*p };
             fill += tx.fill_cnt.load(Ordering::Relaxed) as u64;
