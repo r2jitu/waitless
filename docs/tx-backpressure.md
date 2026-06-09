@@ -117,11 +117,22 @@ Ordered by foundational-ness; each is separable and testable.
    *packetize* and ring-full spills to a `Heap` datagram (unbounded). *Next:*
    release on ACK + gate packetization on cwnd / a fixed in-flight cap; ring-full
    ⇒ stop, no heap spill.
-3. **Per-core egress scheduler.** ✅ *foundation landed (this branch):*
+3. **Per-core egress scheduler.** ✅ *foundation landed:*
    [`crates/net/egress`](../crates/net/egress) — a `DeficitRoundRobin` fair
    queue, pull-based + lossless, unit-tested for weighted fairness and
-   backpressure retention. *Next:* make it the sole owner of the per-core TX
-   queue; connections register readiness instead of calling `acquire_tx_buf`.
+   backpressure retention. ✅ *QUIC arm wired (switchable, default-OFF):*
+   [`crates/proto/quic/src/egress.rs`](../crates/proto/quic/src/egress.rs) —
+   a per-core DRR owns QUIC **ship ordering**. Connections register a shipper
+   + `activate` when they have queued outbound; the per-core `EGRESS_DRAIN`
+   event-loop hook is the sole `ship_datagram` caller, granting a bounded
+   quantum per round so one bulk flow can't monopolise a core's TX queue.
+   Gated by the app's `QUIC_EGRESS_SCHED` flag; OFF ⇒ the byte-for-byte
+   inline-ship path. *Next, in order:* (a) just-in-time ring **admission** —
+   QUIC acquires its ring slot at *build* time, so today the drain arbitrates
+   ship order over already-acquired packets; moving the build into the drain
+   ("freshest cwnd, no stale packets") makes it the true ring owner;
+   (b) the **TCP arm** (the golden path) behind the same hook;
+   (c) a single cross-protocol per-core queue.
 4. **Admission control.** Cap concurrency / global byte budget → bounds total
    memory. (Per-IP conn caps exist in the QUIC slot table; generalize.)
 
@@ -132,11 +143,22 @@ primitives as standalone, host-unit-tested, `no_std` crates — `net_cc` (1) and
 `net_egress` (3). These are the abstractions `stack-architecture.md` marked "not
 started."
 
-**Deliberately not yet wired into the hot path:** integrating `net_cc` into
-TCP/QUIC (2) and making `net_egress` the ring's sole owner (3) are the risky
-cross-layer steps and want GCE A/B validation; they are the next increments, not
-this one. The primitives are built and proven in isolation first so the
-integration is a wiring exercise against a tested core, not a design-and-build in
-the hot path.
+**Since wired into the hot path:** `net_cc` now backs TCP's congestion control
+(2) and QUIC has its first controller. `net_egress` owns QUIC ship ordering (3,
+the QUIC arm) behind the default-OFF `QUIC_EGRESS_SCHED` flag — host-tested,
+HVF-validated functional (h3 small + large + conn churn, no panics, heap_oom=0).
+A GCE c3/gVNIC h3 A/B (OFF vs ON) found it **throughput-neutral-to-slightly-
+negative** (within spot variance; bulk `download_64k` ~2–8 % lower under ON — the
+DRR-drain cost) with **no upside** on single-flow benches: as
+[`h3-health-cycle-profile.md`](h3-health-cycle-profile.md) found, TX isn't the
+throughput lever, and the *fairness* benefit this buys (N flows oversubscribing
+one core's TX queue) isn't exercised by a single dominant flow. So it ships
+**default-OFF** — a proven opt-in lever, not a default (the per-core-magazine
+precedent). Building the primitives in isolation first made each integration a
+wiring exercise against a tested core, not a design-and-build in the hot path.
+
+**Still ahead:** the higher-value, higher-risk parts of (3) — just-in-time ring
+*admission* (vs today's ship-ordering), the golden-path TCP arm, and a unified
+cross-protocol per-core queue — plus admission control (4).
 
 [`reference_hvf_h3_stream_wedge`]: # "agent memory note — the wedge root-cause"
