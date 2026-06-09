@@ -101,10 +101,13 @@ producers racing one ring with no arbiter.
 
 Ordered by foundational-ness; each is separable and testable.
 
-0. **Floor — bound `acquire_tx_buf`.** ✅ *(this branch)* A stall circuit breaker
-   so a stuck ring can't hang the core. Scaffolding that holds the roof up until
-   (3); deleted once the scheduler owns the ring. See the
-   `virtio-net: bound acquire_tx_buf …` commit.
+0. **Floor — bound `acquire_tx_buf`.** ✅ A stall circuit breaker so a stuck
+   ring can't hang the core. Originally virtio-only scaffolding "to be deleted
+   once the scheduler owns the ring" — the convergence verdict below KEPT it
+   (the sole-owner that would have subsumed it was rejected), and it has since
+   grown up: one shared progress-aware `tx_pool::TxStallBreaker` (trips on a
+   frozen completion counter, never on mere line-rate saturation; per-driver
+   spin budgets) covers virtio-net and gve-GQI, fake-clock unit-tested.
 1. **Shared `CongestionControl` core.** ✅ *foundation landed (this branch):*
    [`crates/net/cc`](../crates/net/cc) — the `CongestionControl` trait (exact
    signature from `stack-architecture.md`) + a `NewReno` controller + unit
@@ -117,29 +120,30 @@ Ordered by foundational-ness; each is separable and testable.
    *packetize* and ring-full spills to a `Heap` datagram (unbounded). *Next:*
    release on ACK + gate packetization on cwnd / a fixed in-flight cap; ring-full
    ⇒ stop, no heap spill.
-3. **Per-core egress scheduler.** ✅ *foundation landed:*
-   [`crates/net/egress`](../crates/net/egress) — a `DeficitRoundRobin` fair
-   queue, pull-based + lossless, unit-tested for weighted fairness and
-   backpressure retention. ✅ *QUIC arm wired (switchable, default-OFF):*
-   [`crates/proto/quic/src/egress.rs`](../crates/proto/quic/src/egress.rs) —
-   a per-core DRR owns QUIC **ship ordering**. Connections register a shipper
-   + `activate` when they have queued outbound; the per-core `EGRESS_DRAIN`
-   event-loop hook is the sole `ship_datagram` caller, granting a bounded
-   quantum per round so one bulk flow can't monopolise a core's TX queue.
-   Gated by the app's `QUIC_EGRESS_SCHED` flag (now default-ON). The drain
-   evolved from ship-ordering to **build-at-drain** (build each 1-RTT packet
-   into the slot at drain time, submit synchronously) — see "The convergence"
-   below for the result and why the cross-protocol/TCP/sole-owner extensions
-   stop here.
+3. **Per-core egress scheduler.** ✅ *shipped, always on:* a `DeficitRoundRobin`
+   fair queue — pull-based + lossless, unit-tested for weighted fairness and
+   backpressure retention — wired as
+   [`crates/proto/quic/src/egress.rs`](../crates/proto/quic/src/egress.rs)
+   (the DRR itself is its sibling `drr.rs`; it began life as a standalone
+   `net_egress` crate and folded into its only consumer once the TCP arm was
+   ruled out). Connections register a shipper + `activate` when they have
+   queued outbound; the per-core `EGRESS_DRAIN` event-loop hook is the sole
+   `ship_datagram` caller, granting a bounded quantum per round so one bulk
+   flow can't monopolise a core's TX queue. The drain evolved from
+   ship-ordering to **build-at-drain** (build each 1-RTT packet into the slot
+   at drain time, submit synchronously) — see "The convergence" below for the
+   result and why the cross-protocol/TCP/sole-owner extensions stop here. The
+   app-side enable flag (`QUIC_EGRESS_SCHED`) was retired once GCE-validated;
+   conns past the per-core flow table degrade to the inline eager path.
 4. **Admission control.** Cap concurrency / global byte budget → bounds total
    memory. (Per-IP conn caps exist in the QUIC slot table; generalize.)
 
 ## What this branch delivers vs. leaves
 
 **Delivered + tested:** the circuit-breaker floor (0), and the two keystone
-primitives as standalone, host-unit-tested, `no_std` crates — `net_cc` (1) and
-`net_egress` (3). These are the abstractions `stack-architecture.md` marked "not
-started."
+primitives as host-unit-tested `no_std` modules — `net_cc` (1, a shared crate:
+both transports delegate to it) and the DRR (3, now `quic/src/drr.rs`). These
+are the abstractions `stack-architecture.md` marked "not started."
 
 **Wired into the hot path:** `net_cc` now backs both TCP's and QUIC's
 congestion control (2). For the egress owner (3), the QUIC arm went through two
@@ -154,7 +158,7 @@ model broke, so **per-packet direct-fill (zero-copy) is safe again** and the
 small-response heap memcpy is gone. GCE c3/gVNIC h3 `/health`: **+3.9 % rps,
 lower p99, 0 loss**; a 24 ms-RTT re-test of the exact slot-aliasing failure that
 forced `QUIC_TX_DIRECT_FILL_SAFE=false` showed **0 AEAD failures** — it doesn't
-recur. Default-ON (`QUIC_EGRESS_SCHED`).
+recur. Always on (the app flag was retired once validated).
 
 ### The convergence — and where it stops
 

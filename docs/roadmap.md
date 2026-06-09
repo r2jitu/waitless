@@ -24,12 +24,13 @@ depth and performance**, not new subsystems:
   STREAM-frame retransmission, and a NewReno congestion controller (cwnd-gated
   packetization + pacing) all ship → [`conformance-roadmap.md`](conformance-roadmap.md)
   step 5. The controller landed as the **shared TCP+QUIC congestion core**
-  (`crates/net/cc` — the `CongestionControl` trait + NewReno) — but it is
-  **wired into QUIC only** today; **delegating TCP onto it** (and the CUBIC/BBR
-  + pacer that serve TCP's Linux-parity gaps) is the remaining transport work →
+  (`crates/net/cc` — the `CongestionControl` trait + NewReno), and **both
+  transports now delegate to it** (TCP's hand-rolled RFC 5681 cwnd replaced
+  2026-06-08, netem + GCE validated). The remaining transport work is the
+  CUBIC/BBR algorithms + a TCP-side pacer →
   [`stack-architecture.md`](stack-architecture.md) *Transport reliability*. One
   QUIC residual: CRYPTO-frame retx still rides a bare PTO PING.
-- **TCP conformance + Linux performance parity** — window scaling (RFC 7323) ✅ shipped & GCE-validated; SACK, out-of-order reassembly, and the Linux-parity gaps (Reno→CUBIC/BBR, ABC, pacing, RACK-TLP) remain → [`tcp-backlog.md`](tcp-backlog.md).
+- **TCP conformance + Linux performance parity** — window scaling (RFC 7323), ABC, and peer-MSS honor (the 5G/NAT64 cert-flight fix) ✅ shipped & validated; SACK, out-of-order reassembly, and the Linux-parity gaps (Reno→CUBIC/BBR, pacing, RACK-TLP) remain → [`tcp-backlog.md`](tcp-backlog.md).
 - **RX/TX datapath** — RX offload (HW GRO/RSC), conn-state / conn-future pools, owned-UDP zero-copy → [`rx-path-optimizations.md`](rx-path-optimizations.md) / [`tx-path-optimizations.md`](tx-path-optimizations.md).
 - **Inter-layer contracts** — converging the TCP/TLS/HTTP-1.1 and UDP/QUIC/HTTP-3 stacks onto one golden path (the `ByteStream` trait, the owned buffer currency, the NIC/reactor vtable→trait migrations) → [`stack-architecture.md`](stack-architecture.md).
 
@@ -74,8 +75,8 @@ path, session resumption, the h3-on-gve fix, bare-metal TCP corners) — live in
 - **Real wall-clock time source** — only monotonic ticks today; ~30 lines for absolute time. *Trigger: cert validity windows / ticket lifetimes / QUIC key-update guidance.*
 - **TLS panic-strategy host unit tests** — crates with `-Cpanic=abort` deps can't host-test; coverage currently lives in bare-metal integration tests. *Trigger: when an integration test catches something a host unit test would have caught faster.*
 - **Cooperative-drain shutdown** — today's shutdown force-aborts in-flight handlers (peer sees RST mid-response); add a bounded cooperative drain phase. *Trigger: long-running RPCs, or QUIC clean CONNECTION_CLOSE.*
-- **Lift `tcp` / `udp` above `executor`** — make L4 an app-space library (swap in smoltcp / custom congestion control). The vtable seam already exists; "lift, don't refactor." Closely tied to the NIC/reactor backend-trait migration and the **shared TCP+QUIC congestion core** (`crates/net/cc` — the `CongestionControl` trait + NewReno, now built and **wired into QUIC**; the open half is delegating TCP's embedded `cwnd`/`ssthresh` onto it, then CUBIC/BBR + pacing once) in [`stack-architecture.md`](stack-architecture.md). *Trigger: QUIC wants to share `tcp`'s per-core scaffolding or needs its RFC 9002 controller, or a consumer wants to swap L4.*
-- **Wire the per-core egress scheduler** — `crates/net/egress` is a built, host-unit-tested Deficit-Round-Robin fair queue (the per-NIC-egress back-pressure source from [`stack-architecture.md`](stack-architecture.md)), but it has **zero consumers** today — the per-core TX queue is still first-caller-wins `acquire_tx_buf`. *Trigger: many flows contending one NIC TX queue starve each other, or the QUIC pacer needs a fair arbiter between connections.*
+- **Lift `tcp` / `udp` above `executor`** — make L4 an app-space library (swap in smoltcp / custom congestion control). The vtable seam already exists; "lift, don't refactor." Closely tied to the NIC/reactor backend-trait migration and the **shared TCP+QUIC congestion core** (`crates/net/cc` — the `CongestionControl` trait + NewReno, now backing **both** transports; what remains is CUBIC/BBR + TCP-side pacing, written once) in [`stack-architecture.md`](stack-architecture.md). *Trigger: QUIC wants to share `tcp`'s per-core scaffolding or needs its RFC 9002 controller, or a consumer wants to swap L4.*
+- ✅ **Per-core egress scheduler — shipped (2026-06).** The DRR fair queue now owns QUIC's steady-state TX (build-at-drain, per-packet zero-copy, +3.9% h3 rps) and lives in its only consumer as `proto/quic/src/drr.rs`; TCP deliberately stays direct-submit ("the convergence — and where it stops" in [`tx-backpressure.md`](tx-backpressure.md)).
 - **Hermit pivot option** — target `x86_64-unknown-hermit` + build-std to unlock libstd (quinn-proto unchanged). Spiked (~16 syscalls, ~1–2 days of shim); parked in favour of the own-QUIC path. *Trigger: an ecosystem wall that requires std, or the own-QUIC work stalls.*
 - **macOS delayed-ACK regression check** — immediate-ACK shipped (fixed a GCP KVM handshake stall); only re-add a timer-based ACK coalescer if the macOS ~250 ms keep-alive p99 resurfaces. *Trigger: HVF `health_max` shows that p99.*
 - **Work stealing (2d)** and **perf regression tests (2h)** — parked Phase-2 items → see `design-history.md` Phase 2.

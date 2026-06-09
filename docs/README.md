@@ -18,7 +18,7 @@ dispatches packets today) and [`stack-architecture.md`](stack-architecture.md)
 | [`networking.md`](networking.md) | The RX/TX dispatch model as it works *today*: Tier 1 (per-core queue) vs Tier 2 (rotating distributor). The current-reality counterpart to `stack-architecture.md`. |
 | [`iobuf-type-model.md`](iobuf-type-model.md) | The `iobuf` ownership / `Send` type model (`OwnedIOBuf`, `Chain<B>`, `IOBufRead`, the uniform drop/free + refcount-share contracts). |
 | [`streaming-response.md`](streaming-response.md) | Write-as-you-read streaming response bodies: the `(&mut Request, &mut Response)` handler API + per-transport `ResponseSink` backpressure (h1 RefCell-duplex / h2 demux TX queue / h3 QUIC stream flow control). The implemented half of stack-architecture's handler-API contract. |
-| [`tx-backpressure.md`](tx-backpressure.md) | TX backpressure & egress architecture: the two backpressure sources (per-flow CC vs shared-NIC saturation), the one ACK-released send buffer, and the staged path to a per-core DRR egress scheduler (`net_cc` / `net_egress`). |
+| [`tx-backpressure.md`](tx-backpressure.md) | TX backpressure & egress architecture: the two backpressure sources (per-flow CC vs shared-NIC saturation), the one ACK-released send buffer, and the staged path to a per-core DRR egress scheduler (`net_cc` / `quic/src/drr.rs`) — all stages shipped; the doc records where the convergence deliberately stops. |
 
 ## Performance
 

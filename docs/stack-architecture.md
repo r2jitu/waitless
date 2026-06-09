@@ -188,17 +188,17 @@ that gets harder to change the longer h3 ships with a stub.
   (`//crates/proto/quic/src/endpoint.rs`). (The `NullStream` stub it once used
   to satisfy the trait was deleted when streaming-response landed, 2026-06; the
   trait bypass itself — Contract 2 — is still open.)
-- **Layering inversion (verified):** `HttpStream::recv_chunk` returns
-  `waitless::runtime::RecvChunkGuard` — a type defined in the *reactor*. So
-  `proto/http`'s transport-agnostic trait and `proto/tls` both reach *down* into
-  a specific transport crate for their read type.
-
-The reactor location of the guard was a **deliberate** choice (rx item G): the
-guard had to be name-able by both the reactor and `proto/tls`, and the
-dependency runs `proto/tls → runtime/executor`, so the guard was put in
-`runtime/executor` to avoid a cross-crate `Drop`. The recommendation below does
-not call that a mistake — it **resolves the dependency direction item G worked
-around** by introducing a crate *below* all of them.
+- **Layering inversion — RESOLVED (2026-06-09):** `HttpStream::recv_chunk`
+  used to return a type *defined in the reactor*
+  (`waitless::runtime::RecvChunkGuard`), so `proto/http`'s transport-agnostic
+  trait and `proto/tls` reached *down* into a specific transport crate for
+  their read type. The guard is a pure `IOBuf` wrapper, so it now lives in
+  `iobuf` itself (the existing buffer leaf — no new `net_io` crate needed);
+  the reactor re-exports it for compatibility, and `MAX_L2_HEADROOM` moved to
+  `nic_api` next to the TX-handle contract it describes. The reactor location
+  had been a deliberate workaround (rx item G) for the `proto/tls →
+  runtime/executor` dependency direction; homing the types in crates *below*
+  all parties resolves what item G worked around.
 
 ### Target
 
@@ -233,7 +233,11 @@ This keeps `HttpStream`'s connection==stream conflation (correct for TCP) and
 moves multiplexing *above* the trait, which is the only structural reason QUIC
 didn't fit.
 
-- **Status**: [ ] not started. **Where**: new `//crates/net-io`; impls in
+- **Status**: [~] seam types landed 2026-06-09 — the read guard lives in
+  `iobuf` (reused the existing leaf instead of minting `net-io`) and
+  `MAX_L2_HEADROOM` in `nic_api`; protocol signatures no longer name reactor
+  types. REMAINING: the trait itself + the h3 per-stream impl below.
+  **Where** (original proposal): new `//crates/net-io`; impls in
   `runtime/executor`, `proto/tls`, `proto/quic`. **Win**: one read/write
   surface across all transports; removes the layering inversion and the
   `NullStream` stub; unblocks the handler-API unification and h3 streaming.

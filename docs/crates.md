@@ -111,6 +111,8 @@ external `@crates//:...` deps are omitted for readability.
 | `net_types` | `net/` (shared) | Wire-format type defs (load-bearing — see [cycle break](#why-net_types-is-a-separate-crate-the-cycle-break)) |
 | `net_from_bytes` | `net/` (shared) | `try_ref_from(&[u8])` for packed packet headers |
 | `waitless_aes_gcm` | `crypto/aes-gcm` | Hand-rolled AES-128-GCM (external `aes` only) |
+| `net_cc` | `net/cc` | Shared TCP+QUIC congestion core (`CongestionControl` trait + NewReno); both transports delegate to it |
+| `tx_pool` | `drivers/tx-pool` | Two-tier TX slot-pool primitives + the progress-aware `TxStallBreaker` shared by virtio-net and gve-GQI |
 
 ### Tier 1 — primitives
 
@@ -129,6 +131,7 @@ external `@crates//:...` deps are omitted for readability.
 | Crate | Deps |
 | --- | --- |
 | `nic_api` | `iobuf` |
+| `rx_coalesce` | `iobuf` (host-testable RX super-frame accumulator; first user gve DQO/RSC) |
 | `obs` | `sync` (shared observability primitives — `Counter`, `LastEvent`, `LatencyHist`. A near-leaf so even sub-`kernel_core` crates depend on it directly) |
 | `executor` | `net_types`, `iobuf`, `nic_api`, `platform`, `worker`, `obs` |
 
