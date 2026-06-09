@@ -46,6 +46,12 @@ const GATEWAY_PORT: u16 = 9000;
 const GATEWAY_BACKEND_PORT: u16 = 7777;
 const GATEWAY_MSG_SIZE: usize = 32;
 
+/// Per-core QUIC egress scheduler (docs/tx-backpressure.md stage 3, the
+/// QUIC arm). Default OFF — the inline-ship baseline. Flip to `true` and
+/// rebuild to A/B the per-core DRR fair-queue ownership of the QUIC TX
+/// ring. See `quic::egress`.
+const QUIC_EGRESS_SCHED: bool = false;
+
 // TLS certificate material, baked in at build time. The default
 // build uses the checked-in self-signed dev cert (ECDSA P-256 +
 // SHA-256, `apps/webserver/dev_certs/`, regenerated via `regen.sh`);
@@ -170,6 +176,17 @@ async fn init() {
     );
     http::listen(HTTP_PORT, handle_request).expect("http bind");
     waitless::println!("listen tcp://:{} (http)", HTTP_PORT);
+
+    // Per-core egress scheduler (docs/tx-backpressure.md stage 3). Off by
+    // default; when on, QUIC connections' outbound is shipped by a per-core
+    // DRR drain (installed as the event loop's egress-drain hook) instead of
+    // inline — fairly arbitrating one core's TX queue across many flows.
+    // Must run before any QUIC listener spawns (workers are already up).
+    if QUIC_EGRESS_SCHED {
+        quic::egress::enable();
+        kernel_bare::eventloop::set_egress_drain(quic::egress::drain_current_core);
+        waitless::println!("quic egress scheduler: ON (per-core DRR fair queue)");
+    }
 
     // One call brings up all of HTTPS: h1.1 + h2 over TLS/TCP and h3
     // over QUIC/UDP on the same port, with the `Alt-Svc` h3

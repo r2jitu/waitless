@@ -88,6 +88,9 @@ rust_library(
         # `tls_profile_*` diagnostics endpoints.
         "//crates/proto/tls",
         "//crates/waitless",
+        # Direct dep for installing the per-core egress-drain hook
+        # (`eventloop::set_egress_drain`) — docs/tx-backpressure.md stage 3.
+        "//crates/kernel/bare",
     ],
 )
 
