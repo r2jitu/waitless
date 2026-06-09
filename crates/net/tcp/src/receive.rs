@@ -45,72 +45,66 @@ impl Drop for RxGuard {
     }
 }
 
-/// Walk a TCP options blob (`bytes [20, data_offset)` of the header)
-/// and return the RFC 7323 Window-Scale shift, capped at 14 per §2.3.
-/// `None` if absent or malformed. WS and MSS ([`parse_mss`]) are the
-/// only options this stack negotiates; SACK/TS are skipped by length.
-fn parse_window_scale(opts: &[u8]) -> Option<u8> {
-    let mut i = 0;
-    while i < opts.len() {
-        match opts[i] {
-            0 => break,         // End of Option List
-            1 => i += 1,        // No-Operation (1 byte, no length)
-            3 => {
-                // Window Scale: kind=3, len=3, 1-byte shift count.
-                if opts.get(i + 1) == Some(&3) {
-                    return opts.get(i + 2).map(|&s| s.min(14));
-                }
-                break; // malformed
-            }
-            _ => {
-                // Any other option: skip by its length byte.
-                let len = *opts.get(i + 1)? as usize;
-                if len < 2 {
-                    break; // malformed (length must cover kind+len)
-                }
-                i += len;
-            }
-        }
-    }
-    None
+/// The SYN options this stack negotiates, collected in one walk of
+/// the TCP options blob (`bytes [20, data_offset)` of the header).
+/// Everything else (SACK-permitted, Timestamps, ...) is skipped by
+/// its length byte.
+#[derive(Default)]
+struct SynOptions {
+    /// RFC 7323 Window-Scale shift, capped at 14 per §2.3. `None`
+    /// if absent or malformed.
+    wscale: Option<u8>,
+    /// RFC 9293 §3.7.1 Maximum Segment Size. `None` if absent or
+    /// malformed — the caller then keeps our local default.
+    ///
+    /// We honor this (clamp our *send* segment size to it) so a peer
+    /// on a small-MTU path — cellular / NAT64, where the effective
+    /// MTU is the IPv6 minimum 1280 and the advertised MSS is ~1220
+    /// — isn't sent 1460-byte segments the path silently drops.
+    /// Without it a full TLS handshake (the certificate flight)
+    /// stalls on 5G; tiny requests fit, so it only bites a cold
+    /// connection that has to send the cert.
+    mss: Option<u16>,
 }
 
-/// Walk a TCP options blob and return the peer's advertised MSS
-/// (RFC 9293 §3.7.1 — kind 2, len 4, 2-byte value). `None` if absent
-/// or malformed, in which case the caller keeps its local default.
-///
-/// We honor this (clamp our *send* segment size to it) so a peer on a
-/// small-MTU path — cellular / NAT64, where the effective MTU is the
-/// IPv6 minimum 1280 and the advertised MSS is ~1220 — isn't sent
-/// 1460-byte segments that the path silently drops. Without it a full
-/// TLS handshake (the certificate flight) stalls on 5G; tiny requests
-/// fit, so it only bites a cold connection that has to send the cert.
-fn parse_mss(opts: &[u8]) -> Option<u16> {
+/// Single walk over a SYN's TCP options. First occurrence of each
+/// negotiated option wins; an option with a wrong length is left
+/// `None` (its bytes are still skipped so the *other* option can be
+/// found after it); a length byte < 2 ends the walk (the blob is no
+/// longer parseable).
+fn parse_syn_options(opts: &[u8]) -> SynOptions {
+    let mut out = SynOptions::default();
     let mut i = 0;
     while i < opts.len() {
         match opts[i] {
-            0 => break,         // End of Option List
-            1 => i += 1,        // No-Operation (1 byte, no length)
-            2 => {
-                // Maximum Segment Size: kind=2, len=4, 2-byte value.
-                if opts.get(i + 1) == Some(&4) {
-                    let hi = *opts.get(i + 2)?;
-                    let lo = *opts.get(i + 3)?;
-                    return Some(u16::from_be_bytes([hi, lo]));
-                }
-                break; // malformed
-            }
-            _ => {
-                // Any other option: skip by its length byte.
-                let len = *opts.get(i + 1)? as usize;
+            0 => break,  // End of Option List
+            1 => i += 1, // No-Operation (1 byte, no length)
+            kind => {
+                let Some(&len) = opts.get(i + 1) else { break };
+                let len = len as usize;
                 if len < 2 {
                     break; // malformed (length must cover kind+len)
+                }
+                match (kind, len) {
+                    // Maximum Segment Size: kind=2, len=4, 2-byte value.
+                    (2, 4) => {
+                        if let (Some(&hi), Some(&lo)) = (opts.get(i + 2), opts.get(i + 3)) {
+                            out.mss.get_or_insert(u16::from_be_bytes([hi, lo]));
+                        }
+                    }
+                    // Window Scale: kind=3, len=3, 1-byte shift count.
+                    (3, 3) => {
+                        if let Some(&s) = opts.get(i + 2) {
+                            out.wscale.get_or_insert(s.min(14));
+                        }
+                    }
+                    _ => {} // unknown option, or known kind with wrong len
                 }
                 i += len;
             }
         }
     }
-    None
+    out
 }
 
 /// Process an incoming TCP packet. Called on the owning core (via flow hash).
@@ -158,19 +152,21 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
 
     // Parse the peer's Window-Scale (RFC 7323) and MSS (RFC 9293)
     // options from a SYN's TCP options (bytes [20, data_offset) of the
-    // contiguous first part) — the last reads of `first`, so its borrow
+    // contiguous first part) — the last read of `first`, so its borrow
     // ends here before the segment is mutated/narrowed downstream.
     // `None` for non-SYN segments and SYNs without the option.
-    let (syn_wscale, syn_mss): (Option<u8>, Option<u16>) =
-        if flags & TCP_SYN != 0 && data_offset > 20 {
-            let opts = first.data().get(20..data_offset);
-            (
-                opts.and_then(parse_window_scale),
-                opts.and_then(parse_mss),
-            )
-        } else {
-            (None, None)
-        };
+    let SynOptions {
+        wscale: syn_wscale,
+        mss: syn_mss,
+    } = if flags & TCP_SYN != 0 && data_offset > 20 {
+        first
+            .data()
+            .get(20..data_offset)
+            .map(parse_syn_options)
+            .unwrap_or_default()
+    } else {
+        SynOptions::default()
+    };
 
     // Determine which core owns this packet.
     let core = kernel_core::cpu_id();
