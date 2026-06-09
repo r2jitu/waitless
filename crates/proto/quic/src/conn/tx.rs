@@ -518,43 +518,60 @@ impl Connection {
         if matches!(self.state, ConnState::Established) {
             const MAX_FLUSH_PACKETS: usize = 32;
             for _ in 0..MAX_FLUSH_PACKETS {
-                if !self.has_pending_one_rtt_data() {
-                    break;
-                }
-                // Same anti-amp gate for the multi-packet flush
-                // tail. Dropping additional packets pre-validation
-                // is fine — the peer will get the first packet
-                // (which moves them to Handshake) and we'll send
-                // the rest after validation.
-                if self.anti_amp_remaining() == 0 {
-                    break;
-                }
-                // Pacing gate (RFC 9002 §7.7): stop the tail burst once the
-                // token bucket is spent; the conn task re-flushes at
-                // `pace_deadline_us()`. Bounds the per-flush microburst the
-                // GCE egress policer would otherwise drop. The first 1-RTT
-                // packet above is unmetered, so HEADERS / a small response
-                // still ship immediately and every flush makes ≥1 pkt of
-                // progress (no pacer-induced deadlock).
-                if !self.pace_gate() {
+                if !self.one_rtt_tail_ready() {
                     break;
                 }
                 let mut more = self.take_datagram_buf(1500);
-                self.encode_one_rtt_packet(more.vec_mut())?;
-                if more.len() <= MAX_L2_HEADROOM {
+                if self.emit_one_rtt_datagram(&mut more)? {
+                    self.outbound.push_back(more);
+                } else {
                     break;
                 }
-                let n = (more.len() - MAX_L2_HEADROOM) as u64;
-                if n > self.anti_amp_remaining() {
-                    crate::diag::COUNTERS.anti_amp_throttled.bump();
-                    break;
-                }
-                self.pace_consume(n);
-                self.record_bytes_sent(n);
-                self.outbound.push_back(more);
             }
         }
         Ok(())
+    }
+
+    /// Pre-acquire gate for one more standalone 1-RTT tail packet: there's
+    /// 1-RTT data pending, the anti-amplification budget (RFC 9000 §8.1.2)
+    /// isn't exhausted, and the egress pacer (RFC 9002 §7.7) has a token.
+    /// `&mut` because [`pace_gate`](Self::pace_gate) refills + reads the
+    /// token bucket. Short-circuits in that order so the pacer is only
+    /// consulted (and refilled) when there's actually data to pace.
+    ///
+    /// Extracted with [`emit_one_rtt_datagram`](Self::emit_one_rtt_datagram)
+    /// so the per-core egress owner can drive the same gate→acquire→encode
+    /// loop build-at-drain (acquire a real ring slot, encode into it, submit
+    /// synchronously — zero-copy, no `outbound` deferral) instead of this
+    /// eager build-into-`outbound`. Behavior here is unchanged.
+    fn one_rtt_tail_ready(&mut self) -> bool {
+        self.has_pending_one_rtt_data()
+            && self.anti_amp_remaining() > 0
+            && self.pace_gate()
+    }
+
+    /// Encode one standalone 1-RTT packet into `buf` (pre-sized to
+    /// `MAX_L2_HEADROOM`), applying the post-encode anti-amp gate and
+    /// debiting the pacer + bytes-in-flight. Returns `Ok(true)` if a packet
+    /// was emitted (caller ships / queues `buf`), `Ok(false)` if nothing was
+    /// produced or the anti-amp budget would be exceeded (caller stops).
+    /// The buffer-agnostic core the egress owner reuses to build into a
+    /// driver TX slot directly.
+    fn emit_one_rtt_datagram(&mut self, buf: &mut super::DatagramBuf) -> Result<bool, ConnError> {
+        use executor::reactor::MAX_L2_HEADROOM;
+        self.encode_one_rtt_packet(buf.vec_mut())?;
+        if buf.len() <= MAX_L2_HEADROOM {
+            return Ok(false);
+        }
+        // `n` is the *wire* size (excluding the L2/L3/L4 headroom prefix).
+        let n = (buf.len() - MAX_L2_HEADROOM) as u64;
+        if n > self.anti_amp_remaining() {
+            crate::diag::COUNTERS.anti_amp_throttled.bump();
+            return Ok(false);
+        }
+        self.pace_consume(n);
+        self.record_bytes_sent(n);
+        Ok(true)
     }
 
     /// Whether any 1-RTT-level frame source has data ready to
