@@ -12,11 +12,12 @@ use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU32, Ordering};
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 
 use worker::{CurrentWorker, PerWorker, num_workers};
 
 use super::{SpinLock, install_worker_task, register_net_launcher, release_launcher_slot};
+use crate::waker_slot::{Parked, WakerSlot};
 
 // ---- Sizing -----------------------------------------------------------------
 
@@ -120,14 +121,11 @@ struct WorkerInbox {
     /// instead of a runtime modulo. Stored on the inbox itself so
     /// different bindings can use different capacities.
     mask: AtomicU32,
-    /// Hot-path gate for the producer's "wake the receiver" step.
-    /// `false` means there is no parked task to wake — the producer
-    /// can skip the `waker.lock()` round-trip entirely. Skipping
-    /// the lock is the single biggest win on the udp_peak hot path:
-    /// at ~700k pps, two atomic ops on the spinlock cache line per
-    /// packet was costing ~half the throughput.
-    waker_present: core::sync::atomic::AtomicBool,
-    waker: SpinLock<Option<Waker>>,
+    /// The parked receiver, behind the shared slot (its `present`
+    /// gate keeps the producer's hot path lock-free — at ~700k pps,
+    /// two atomic ops on the spinlock cache line per packet was
+    /// costing ~half the throughput; see `WakerSlot::wake_gated`).
+    waker: WakerSlot,
 }
 
 unsafe impl Sync for WorkerInbox {}
@@ -140,8 +138,7 @@ impl WorkerInbox {
             tail: AtomicU32::new(0),
             slots: AtomicPtr::new(core::ptr::null_mut()),
             mask: AtomicU32::new(0),
-            waker_present: core::sync::atomic::AtomicBool::new(false),
-            waker: SpinLock::new(None),
+            waker: WakerSlot::new(),
         }
     }
 
@@ -256,51 +253,16 @@ impl WorkerInbox {
     fn reset(&self) {
         self.head.store(0, Ordering::Relaxed);
         self.tail.store(0, Ordering::Relaxed);
-        *self.waker.lock() = None;
-        self.waker_present.store(false, Ordering::Release);
+        self.waker.unpark();
     }
 
-    /// Receiver-side: park `w` for the producer to wake when the next
-    /// datagram arrives. Sets the `waker_present` gate so the
-    /// producer's hot path knows there's work to do.
-    fn park_waker(&self, w: &Waker) {
-        let mut slot = self.waker.lock();
-        let need_store = match &*slot {
-            Some(existing) => !existing.will_wake(w),
-            None => true,
-        };
-        if need_store {
-            *slot = Some(w.clone());
-        }
-        // Release ordering so the producer's Acquire-load sees the
-        // waker store before the gate flips on.
-        self.waker_present.store(true, Ordering::Release);
-    }
-
-    /// Receiver-side: drop any parked waker. Called when the receiver
-    /// picks up a datagram via the slow-path's re-check (i.e., we
-    /// parked, but the producer-side store landed before our
-    /// re-pop), so the producer can short-circuit the next packet.
-    fn unpark(&self) {
-        self.waker_present.store(false, Ordering::Release);
-        *self.waker.lock() = None;
-    }
-
-    /// Producer-side: wake the parked receiver if any. The
-    /// `waker_present` gate makes this branch-free in the steady-state
-    /// `recv_from` loop where the receiver pops in the fast path and
-    /// never parks.
+    /// Producer-side: wake the parked receiver if any. Gated — the
+    /// steady-state `recv_from` loop (receiver pops in the fast path,
+    /// never parks) pays one load. The gate's park race is covered by
+    /// the receiver's post-park re-pop and, failing that, the next
+    /// datagram (`WakerSlot::wake_gated`'s contract).
     fn wake_if_parked(&self) {
-        // Acquire so we observe the receiver's prior waker store
-        // before reading the slot.
-        if !self.waker_present.load(Ordering::Acquire) {
-            return;
-        }
-        let taken = self.waker.lock().take();
-        if let Some(w) = taken {
-            self.waker_present.store(false, Ordering::Release);
-            w.wake();
-        }
+        self.waker.wake_gated();
     }
 }
 
@@ -1035,6 +997,7 @@ impl UdpSocket {
     /// `Ready`. Oversized payloads truncate to `buf.len()`.
     pub fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> UdpRecv<'a> {
         UdpRecv {
+            parked: None,
             sock: self,
             buf,
             _not_send: PhantomData,
@@ -1058,6 +1021,7 @@ impl UdpSocket {
         F: FnOnce(&[u8], IpAddr, u16) -> R + Unpin,
     {
         UdpRecvInplace {
+            parked: None,
             sock: self,
             f: Some(f),
             _not_send: PhantomData,
@@ -1376,6 +1340,12 @@ impl Drop for UdpHandle {
 pub struct UdpRecv<'a> {
     sock: &'a UdpSocket,
     buf: &'a mut [u8],
+    /// Live waker registration; the field's drop deregisters it
+    /// (structural cancel-safety — a `select!`-canceled recv no
+    /// longer strands a stale waker in the inbox). `'static` because
+    /// both inbox homes (the registry array, leaked ephemeral chunks)
+    /// are.
+    parked: Option<Parked<'static>>,
     _not_send: PhantomData<*mut ()>,
 }
 
@@ -1406,9 +1376,12 @@ impl<'a> Future for UdpRecv<'a> {
         // Slow path: register the waker, then re-check — closes the
         // race where `deliver_udp` pushed between the fast-path pop
         // and the waker registration.
-        inbox.park_waker(cx.waker());
+        match &mut this.parked {
+            Some(p) => p.repark(cx.waker()),
+            None => this.parked = Some(inbox.waker.park_guard(cx.waker())),
+        }
         if let Some(r) = inbox.pop_into(this.buf) {
-            inbox.unpark();
+            this.parked = None; // deregister eagerly; we have the data
             return Poll::Ready(r);
         }
         Poll::Pending
@@ -1426,6 +1399,8 @@ where
 {
     sock: &'a UdpSocket,
     f: Option<F>,
+    /// See [`UdpRecv::parked`].
+    parked: Option<Parked<'static>>,
     _not_send: PhantomData<*mut ()>,
 }
 
@@ -1459,10 +1434,13 @@ where
         };
 
         // Slow path: park, re-check.
-        inbox.park_waker(cx.waker());
+        match &mut this.parked {
+            Some(p) => p.repark(cx.waker()),
+            None => this.parked = Some(inbox.waker.park_guard(cx.waker())),
+        }
         match inbox.pop_with(f) {
             Ok(r) => {
-                inbox.unpark();
+                this.parked = None; // deregister eagerly; we have the data
                 Poll::Ready(r)
             }
             Err(f) => {

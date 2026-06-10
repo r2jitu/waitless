@@ -22,6 +22,7 @@ rust_library(
         "src/select.rs",
         "src/sleep.rs",
         "src/task.rs",
+        "src/waker_slot.rs",
     ],
     crate_name = "executor",
     deps = [

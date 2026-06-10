@@ -30,6 +30,7 @@ pub mod reactor;
 pub mod select;
 mod sleep;
 mod task;
+pub mod waker_slot;
 
 /// Initialise both the task arena and the timer wheel for `num_workers`
 /// slots. BSP-only, after `mm::init()`, before any worker touches the

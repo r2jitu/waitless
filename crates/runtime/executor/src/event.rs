@@ -14,25 +14,19 @@
 // closer to a Notify / CondVar and should be added as a separate
 // primitive rather than complicating this one.
 
-use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
+
+use crate::waker_slot::{Parked, WakerSlot};
 
 pub struct AsyncEvent {
     set: AtomicBool,
-    /// `waker_locked` guards `waker` as a spinlock — producer and
-    /// consumer can both touch it (producer clears + wakes on set,
-    /// consumer writes on poll). Held briefly; no async work under
-    /// the lock.
-    waker_locked: AtomicBool,
-    waker: UnsafeCell<Option<Waker>>,
+    /// The parked waiter. Producer takes-and-wakes on `set()`;
+    /// consumer parks on poll. See `waker_slot` for the discipline.
+    waker: WakerSlot,
 }
-
-// SAFETY: `waker` is only accessed under the `waker_locked`
-// spinlock; `set` is atomic.
-unsafe impl Sync for AsyncEvent {}
 
 impl Default for AsyncEvent {
     fn default() -> Self {
@@ -44,8 +38,7 @@ impl AsyncEvent {
     pub const fn new() -> Self {
         AsyncEvent {
             set: AtomicBool::new(false),
-            waker_locked: AtomicBool::new(false),
-            waker: UnsafeCell::new(None),
+            waker: WakerSlot::new(),
         }
     }
 
@@ -57,14 +50,14 @@ impl AsyncEvent {
 
     /// Flip the flag and wake any parked waiter. Cheap on the
     /// already-set path (swap returns true → the earlier setter
-    /// already woke whoever was parked).
+    /// already woke whoever was parked). Uses the ungated
+    /// `WakerSlot::wake` — a one-shot signal must not race a
+    /// just-parking waiter past the gate.
     pub fn set(&self) {
         if self.set.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Some(w) = self.take_waker() {
-            w.wake();
-        }
+        self.waker.wake();
     }
 
     /// Clear the flag so the next `wait()` re-arms. Usually called
@@ -80,69 +73,21 @@ impl AsyncEvent {
     pub fn wait(&self) -> WaitEvent<'_> {
         WaitEvent {
             event: self,
-            registered: None,
+            parked: None,
         }
-    }
-
-    fn lock(&self) {
-        while self
-            .waker_locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-    }
-
-    fn unlock(&self) {
-        self.waker_locked.store(false, Ordering::Release);
-    }
-
-    fn take_waker(&self) -> Option<Waker> {
-        self.lock();
-        // SAFETY: lock held → exclusive access to `waker`.
-        let out = unsafe { (*self.waker.get()).take() };
-        self.unlock();
-        out
-    }
-
-    fn store_waker(&self, w: &Waker) {
-        self.lock();
-        // SAFETY: lock held → exclusive access.
-        unsafe {
-            let slot = &mut *self.waker.get();
-            match slot {
-                Some(existing) if existing.will_wake(w) => {}
-                _ => *slot = Some(w.clone()),
-            }
-        }
-        self.unlock();
-    }
-
-    /// Clear the parked waker iff it is `w` (by `will_wake`). The
-    /// cancel-safety half of the single-waiter contract: a `WaitEvent`
-    /// dropped while parked removes exactly its own registration —
-    /// never a successor's (a later waiter's waker fails the
-    /// `will_wake` test and is left intact).
-    fn clear_waker_if(&self, w: &Waker) {
-        self.lock();
-        // SAFETY: lock held → exclusive access.
-        unsafe {
-            let slot = &mut *self.waker.get();
-            if slot.as_ref().is_some_and(|s| s.will_wake(w)) {
-                *slot = None;
-            }
-        }
-        self.unlock();
     }
 }
 
 pub struct WaitEvent<'a> {
     event: &'a AsyncEvent,
-    /// The waker this future last parked, kept so `Drop` can
-    /// deregister exactly it (structural cancel-safety — see
-    /// `clear_waker_if`). `None` until the first `Pending` poll.
-    registered: Option<Waker>,
+    /// The live registration. Its drop — future completed, canceled
+    /// by `select!`, or task aborted — deregisters exactly the waker
+    /// this future parked (structural cancel-safety, `will_wake`-
+    /// precise): a successor waiter that legitimately overwrote the
+    /// slot (the documented sequential-waiter pattern) is untouched,
+    /// and a wait resolved by `set()` finds the slot already taken —
+    /// both no-ops. `None` until the first `Pending`-bound poll.
+    parked: Option<Parked<'a>>,
 }
 
 impl<'a> Future for WaitEvent<'a> {
@@ -155,26 +100,13 @@ impl<'a> Future for WaitEvent<'a> {
         }
         // Register waker then re-check — closes the race where
         // `set()` lands between our fast-path load and the store.
-        this.event.store_waker(cx.waker());
-        this.registered = Some(cx.waker().clone());
+        match &mut this.parked {
+            Some(p) => p.repark(cx.waker()),
+            None => this.parked = Some(this.event.waker.park_guard(cx.waker())),
+        }
         if this.event.is_set() {
             return Poll::Ready(());
         }
         Poll::Pending
-    }
-}
-
-impl Drop for WaitEvent<'_> {
-    fn drop(&mut self) {
-        // Cancel-safety, structural rather than by-convention: a wait
-        // dropped while parked (`select!` losing branch, task abort)
-        // deregisters its own waker so no stale registration lingers.
-        // Precise via `will_wake`: a successor waiter that legitimately
-        // overwrote the slot (the documented sequential-waiter pattern)
-        // is untouched, and a wait resolved by `set()` finds the slot
-        // already taken — both no-ops.
-        if let Some(w) = self.registered.take() {
-            self.event.clear_waker_if(&w);
-        }
     }
 }
