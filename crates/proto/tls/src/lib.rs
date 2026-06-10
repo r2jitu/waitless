@@ -27,6 +27,8 @@
 //   record.rs    TLS record framing (TCP-specific)
 //   server.rs    TlsServer connection state machine + state enum +
 //                  ALPN result
+//   client.rs    TlsClient connection state machine (client role):
+//                  SPKI-pin server auth + the minimal X.509 DER walk
 //   handlers.rs  do_client_hello / do_client_finished / do_app_data
 //   keys.rs      finished_key derivation + ct_eq_32 + HMAC helpers
 //                  (small protocol math used by handlers + ticket)
@@ -70,6 +72,11 @@ pub mod schedule;
 // `//crates/proto/http2` drives this state machine over a TcpStream.)
 pub mod server;
 
+// TLS-over-TCP CLIENT state machine — the sans-io mirror of `server`
+// for outbound connections. Server auth is by SPKI pin (or loudly
+// skipped); see `client.rs` for the v1 scope.
+pub mod client;
+
 // Submodules of the server stack. `pub` so `//crates/proto/quic` can reuse
 // `keys::{ct_eq_32, derive_finished_key, hmac_sha256}` (RFC 8446
 // §4.4.4 finished-key + helpers) and `profile` for the shared
@@ -81,6 +88,9 @@ pub mod replay;
 pub mod ticket;
 pub mod trace;
 
+pub use client::{
+    ClientHandshakeError, ServerAuth, TlsClient, TlsClientConfig, spki_pin_from_cert_der,
+};
 pub use server::{AlpnProtocol, TlsServerConfig};
 
 /// Cert / key parse failure. Apps treat this as "TLS not

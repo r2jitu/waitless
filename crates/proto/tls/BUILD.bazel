@@ -37,6 +37,8 @@ rust_library(
         # TLS-over-TCP server state machine + helpers.
         "src/handlers.rs",
         "src/keys.rs",
+        # TLS-over-TCP client state machine (mirror of server.rs).
+        "src/client.rs",
         "src/profile.rs",
         "src/replay.rs",
         "src/server.rs",
