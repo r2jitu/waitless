@@ -35,11 +35,12 @@ depth and performance**, not new subsystems:
   [`stack-architecture.md`](stack-architecture.md) *Transport reliability*.
 - **TCP conformance + Linux performance parity** — window scaling (RFC 7323),
   ABC, peer-MSS honor + PMTUD (the 5G/NAT64 cert-flight fix), SACK (RFC 2018 +
-  RFC 6675 sender), out-of-order reassembly, CUBIC (RFC 8312), and the Tail
-  Loss Probe (RFC 8985 — eliminates the tail-loss RTO stall, GCE-validated)
-  ✅ all shipped & validated. Remaining Linux-parity gaps: **BBR**, a
-  **TCP-side pacer**, **RACK** time-based loss detection (TLP's other half,
-  for mid-stream multi-hole loss), and **Timestamps/PAWS** (RFC 7323) →
+  RFC 6675 sender), out-of-order reassembly, CUBIC (RFC 8312), the Tail
+  Loss Probe (RFC 8985 — eliminates the tail-loss RTO stall, GCE-validated),
+  and RACK time-based loss detection (RFC 8985, consuming the shared
+  `net_cc::loss` core) ✅ all shipped & validated. Remaining Linux-parity
+  gaps: **BBR**, a **TCP-side pacer**, RACK's **adaptive reo_wnd**
+  (min_rtt/4 + DSACK growth), and **Timestamps/PAWS** (RFC 7323) →
   [`tcp-backlog.md`](tcp-backlog.md).
 - **RX/TX datapath** — RX offload (HW GRO/RSC), conn-state / conn-future pools, owned-UDP zero-copy → [`rx-path-optimizations.md`](rx-path-optimizations.md) / [`tx-path-optimizations.md`](tx-path-optimizations.md).
 - **Inter-layer contracts** — converging the TCP/TLS/HTTP-1.1 and UDP/QUIC/HTTP-3 stacks onto one golden path (the `ByteStream` trait, the owned buffer currency, the NIC/reactor vtable→trait migrations) → [`stack-architecture.md`](stack-architecture.md).
@@ -57,7 +58,7 @@ audit and are documented here (some also in their backlog).
 | Area | Open item | Sev | Doc |
 |---|---|---|---|
 | TCP CC | **BBR** + a **TCP-side pacer** | S2 | tcp-backlog L1/L3 |
-| TCP loss | **RACK** time-based detection (TLP's mid-stream half) | S1 | tcp-backlog L4 |
+| TCP loss | RACK **adaptive reo_wnd** (min_rtt/4, DSACK-grown) — detection itself ✅ landed on the shared `net_cc::loss` core | S2 | tcp-backlog L4 |
 | TCP | **Timestamps + PAWS** (RFC 7323) — deliberately deferred | S2 | tcp-backlog T6 |
 | TCP CUBIC | under TCP, CUBIC uses SRTT not min-RTT (TCP passes `min_us=0`) † | S2 | tcp-backlog L1 |
 | TCP PMTUD | cross-core route of the ICMP report to the flow's core; no immediate re-send of the in-flight oversized segment (waits for RTO/TLP) | S2 | tcp-backlog T2 |

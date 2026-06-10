@@ -908,6 +908,14 @@ fn tcp_receive_inner(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOB
         } else if c.snd_una != old_una {
             c.on_new_data_ack();
         }
+        // RACK (RFC 8985) time-based loss detection, on the scoreboard
+        // this ACK just updated (cum-ACK drop + SACK marks): an
+        // un-SACKed segment older than the reordering window while a
+        // later-sent segment is SACKed is lost — catching what the
+        // count-based paths above can't see (too few dup-ACKs for the
+        // RFC 6675 trigger) without waiting for TLP/RTO. Cheap no-op
+        // unless SACKed evidence is present (a loss episode).
+        c.rack_detect(kernel_core::clock::now_ms());
         // A reopened (non-zero) advertised window retires the
         // RFC 9293 §3.8.6.1 zero-window persist timer.
         if c.snd_wnd > 0 {

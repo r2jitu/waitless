@@ -3718,6 +3718,294 @@ fn tail_loss_probe_fires_before_rto_then_caps() {
     );
 }
 
+/// Shared setup for the RACK (RFC 8985) time-based loss-detection
+/// scenarios: SACK-negotiated handshake, SRTT seeded at 25 ms (→ the
+/// RACK reordering window is 9/8·25 = 28 ms), then a five-×-100-byte
+/// flight sent at the t = 25 ms mark, followed by ONE dup-ACK SACKing
+/// only the LAST segment. That is delivered evidence ABOVE four
+/// un-SACKed segments — but a single dup-ACK can never trip the
+/// RFC 6675 3-dup-ACK fast retransmit, so only time-based detection
+/// can recover the four holes before TLP/RTO. Returns
+/// `(data_base, sack_opts)` — the flight's first sequence number and
+/// the SACK option blob (for re-delivering the same dup-ACK) — with
+/// the TX capture left empty.
+fn rack_setup(server_port: u16, client_port: u16, client_isn: u32) -> (u32, Vec<u8>) {
+    super::listen_on_core(0, server_port);
+    // Handshake WITH SACK-Permitted so `sack_ok` is set.
+    deliver_opts(
+        &Seg {
+            src_port: client_port,
+            dst_port: server_port,
+            seq: client_isn,
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            payload: Vec::new(),
+        },
+        &[4, 2, 1, 1],
+    );
+    let server_isn = tcp_hdr(&tx()[0]).seq;
+    deliver(&Seg {
+        src_port: client_port,
+        dst_port: server_port,
+        seq: client_isn.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    let (handle, generation) = conn_handle(client_port, server_port);
+    let base = server_isn.wrapping_add(1);
+
+    // Seed the RTT estimator: 100 bytes ACKed 25 ms later → SRTT = 25 ms.
+    {
+        let mut chain = iobuf::IOBufChain::from(alloc::vec![b'x'; 100]);
+        super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    }
+    kernel_core::clock::mock::advance(25);
+    deliver(&Seg {
+        src_port: client_port,
+        dst_port: server_port,
+        seq: client_isn.wrapping_add(1),
+        ack: base.wrapping_add(100),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+
+    // The flight: five 100-byte segments at data_base..+500, all
+    // transmitted at t = 25 ms.
+    let data_base = base.wrapping_add(100);
+    for i in 0..5 {
+        let mut chain = iobuf::IOBufChain::from(alloc::vec![b'a' + i as u8; 100]);
+        super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    }
+
+    // ONE dup-ACK at snd_una SACKing only the last segment
+    // [data_base+400, +500).
+    let sack_opts = {
+        let mut o = alloc::vec![1u8, 1, 5, 10]; // NOP,NOP,kind=5,len=2+8
+        o.extend_from_slice(&data_base.wrapping_add(400).to_be_bytes());
+        o.extend_from_slice(&data_base.wrapping_add(500).to_be_bytes());
+        o
+    };
+    deliver_opts(
+        &Seg {
+            src_port: client_port,
+            dst_port: server_port,
+            seq: client_isn.wrapping_add(1),
+            ack: data_base,
+            flags: TCP_ACK,
+            window: 65535,
+            payload: Vec::new(),
+        },
+        &sack_opts,
+    );
+    clear_tx();
+    (data_base, sack_opts)
+}
+
+/// RACK (RFC 8985) time-based detection — the ACK-driven path: with a
+/// later-sent segment SACKed and the clock past the 9/8·SRTT
+/// reordering window, the next ACK (a 2nd dup-ACK — still below the
+/// RFC 6675 3-dup-ACK trigger) marks every aged un-SACKed segment
+/// lost: all four holes are retransmitted, `rack_marked` counts them,
+/// and cwnd takes exactly ONE halving (net_cc's RecoveryEpisode dedups
+/// per-window reductions) — with no RTO and no TLP involved.
+#[test]
+fn rack_marks_aged_unsacked_segments_below_dupack_threshold() {
+    let _g = harness();
+    const SP: u16 = 9192;
+    const CP: u16 = 50192;
+    let (data_base, sack_opts) = rack_setup(SP, CP, 0xF100);
+    let rack_before = super::diag::COUNTERS.rack_marked.get();
+    let rto_before = super::diag::COUNTERS.data_retransmits.get();
+    let tlp_before = super::diag::COUNTERS.tlp_probes.get();
+    let (cwnd_before, ssthresh_before) = conn_cwnd_ssthresh(CP, SP);
+    assert_eq!(ssthresh_before, u32::MAX, "no loss signal yet — still slow start");
+
+    // Past the 28 ms reordering window; the second dup-ACK (2 < 3)
+    // re-runs detection on arrival.
+    kernel_core::clock::mock::advance(40);
+    deliver_opts(
+        &Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: 0xF100u32.wrapping_add(1),
+            ack: data_base,
+            flags: TCP_ACK,
+            window: 65535,
+            payload: Vec::new(),
+        },
+        &sack_opts,
+    );
+
+    let rtx = tx();
+    let seqs: Vec<u32> = rtx.iter().map(|f| tcp_hdr(f).seq).collect();
+    assert_eq!(rtx.len(), 4, "all four aged un-SACKed segments retransmit, got {seqs:?}");
+    for off in [0u32, 100, 200, 300] {
+        assert!(
+            seqs.contains(&data_base.wrapping_add(off)),
+            "hole at data_base+{off} retransmitted",
+        );
+    }
+    assert!(
+        !seqs.contains(&data_base.wrapping_add(400)),
+        "the SACKed (delivered) segment is not retransmitted",
+    );
+    assert_eq!(
+        super::diag::COUNTERS.rack_marked.get() - rack_before,
+        4,
+        "RACK (not 6675) declared the four losses",
+    );
+    assert_eq!(
+        super::diag::COUNTERS.data_retransmits.get(),
+        rto_before,
+        "no RTO fired",
+    );
+    assert_eq!(super::diag::COUNTERS.tlp_probes.get(), tlp_before, "no TLP fired");
+    let (cwnd_after, ssthresh_after) = conn_cwnd_ssthresh(CP, SP);
+    assert_eq!(
+        (cwnd_after, ssthresh_after),
+        (cwnd_before / 2, cwnd_before / 2),
+        "exactly one halving for the whole marked batch",
+    );
+}
+
+/// RACK negative: identical evidence (last segment SACKed) but the
+/// clock has NOT passed the reordering window — nothing is marked, no
+/// retransmission, no cwnd reduction. Young reordering must not be
+/// treated as loss (the same §52 guarantee QUIC's detector carries).
+#[test]
+fn rack_holds_fire_inside_the_reordering_window() {
+    let _g = harness();
+    const SP: u16 = 9193;
+    const CP: u16 = 50193;
+    let (data_base, sack_opts) = rack_setup(SP, CP, 0xF200);
+    let rack_before = super::diag::COUNTERS.rack_marked.get();
+
+    // 20 ms < the 28 ms window: the un-SACKed segments are young.
+    kernel_core::clock::mock::advance(20);
+    deliver_opts(
+        &Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: 0xF200u32.wrapping_add(1),
+            ack: data_base,
+            flags: TCP_ACK,
+            window: 65535,
+            payload: Vec::new(),
+        },
+        &sack_opts,
+    );
+
+    assert!(tx().is_empty(), "inside the window nothing is retransmitted");
+    assert_eq!(
+        super::diag::COUNTERS.rack_marked.get(),
+        rack_before,
+        "no RACK mark inside the window",
+    );
+    let (_, ssthresh) = conn_cwnd_ssthresh(CP, SP);
+    assert_eq!(ssthresh, u32::MAX, "no congestion response either");
+}
+
+/// RACK reordering tolerance: the "hole" was reordering, not loss —
+/// the peer's cumulative ACK for the whole flight arrives before the
+/// window elapses. No spurious retransmit, no cwnd reduction, and the
+/// armed reordering deadline disarms itself (a later tick past the old
+/// deadline emits nothing).
+#[test]
+fn rack_late_fill_cancels_the_pending_mark() {
+    let _g = harness();
+    const SP: u16 = 9194;
+    const CP: u16 = 50194;
+    let (data_base, _sack_opts) = rack_setup(SP, CP, 0xF300);
+    let rack_before = super::diag::COUNTERS.rack_marked.get();
+
+    // 10 ms in (inside the window) the late segments land at the peer:
+    // a cumulative ACK covering the whole flight.
+    kernel_core::clock::mock::advance(10);
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: 0xF300u32.wrapping_add(1),
+        ack: data_base.wrapping_add(500),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert!(tx().is_empty(), "the filled hole triggers no retransmit");
+    assert_eq!(
+        conn_snd_una(CP, SP),
+        data_base.wrapping_add(500),
+        "the cumulative ACK retired the flight",
+    );
+
+    // Run the tick well past the previously armed reordering deadline:
+    // it was disarmed by the cumulative ACK's re-detection, so the
+    // aged-out marking never fires on the now-empty queue.
+    kernel_core::clock::mock::advance(60);
+    super::on_tcp_tick();
+    assert!(tx().is_empty(), "stale RACK deadline disarmed — tick emits nothing");
+    assert_eq!(
+        super::diag::COUNTERS.rack_marked.get(),
+        rack_before,
+        "reordering never became a loss verdict",
+    );
+    let (_, ssthresh) = conn_cwnd_ssthresh(CP, SP);
+    assert_eq!(ssthresh, u32::MAX, "no spurious congestion response");
+}
+
+/// RACK timer path: after the single SACK-bearing dup-ACK, NO further
+/// ACKs arrive. The reordering-window deadline armed by detection
+/// (sent 25 ms + window 28 ms + 1) fires on `on_tcp_tick` and marks
+/// the aged segments lost — before the TLP PTO (t = 75 ms) and far
+/// before the RTO (~1 s), with the same one-halving congestion
+/// response as the ACK path.
+#[test]
+fn rack_timer_marks_aged_segments_without_further_acks() {
+    let _g = harness();
+    const SP: u16 = 9195;
+    const CP: u16 = 50195;
+    let (data_base, _sack_opts) = rack_setup(SP, CP, 0xF400);
+    let rack_before = super::diag::COUNTERS.rack_marked.get();
+    let rto_before = super::diag::COUNTERS.data_retransmits.get();
+    let tlp_before = super::diag::COUNTERS.tlp_probes.get();
+    let (cwnd_before, _) = conn_cwnd_ssthresh(CP, SP);
+
+    // t = 60 ms: past the RACK deadline (54 ms), before the TLP PTO
+    // (75 ms) and the RTO (~1025 ms) — only RACK can act here.
+    kernel_core::clock::mock::advance(35);
+    super::on_tcp_tick();
+
+    let rtx = tx();
+    let seqs: Vec<u32> = rtx.iter().map(|f| tcp_hdr(f).seq).collect();
+    assert_eq!(rtx.len(), 4, "the tick aged all four holes into loss, got {seqs:?}");
+    for off in [0u32, 100, 200, 300] {
+        assert!(
+            seqs.contains(&data_base.wrapping_add(off)),
+            "hole at data_base+{off} retransmitted by the timer path",
+        );
+    }
+    assert_eq!(
+        super::diag::COUNTERS.rack_marked.get() - rack_before,
+        4,
+        "four RACK marks from the timer",
+    );
+    assert_eq!(super::diag::COUNTERS.tlp_probes.get(), tlp_before, "TLP did not fire");
+    assert_eq!(
+        super::diag::COUNTERS.data_retransmits.get(),
+        rto_before,
+        "the RTO did not fire",
+    );
+    let (cwnd_after, ssthresh_after) = conn_cwnd_ssthresh(CP, SP);
+    assert_eq!(
+        (cwnd_after, ssthresh_after),
+        (cwnd_before / 2, cwnd_before / 2),
+        "one halving, same as the ACK-driven path",
+    );
+}
+
 /// RFC 1191/8201 Path MTU Discovery: an ICMP Path-MTU report (decoded by
 /// the stack into `note_path_mtu`) lowers `snd_mss` — but only for a report
 /// that quotes an in-window sequence of a live flow (RFC 5927 anti-spoof),

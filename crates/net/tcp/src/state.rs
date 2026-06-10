@@ -230,6 +230,12 @@ pub(crate) struct RtxEntry {
     /// `rtx_anchor_*` fields on `TcpConnection` serve this role).
     #[allow(dead_code)]
     pub(crate) first_tx_ms: u64,
+    /// Wall-clock ms of the LATEST transmission of these bytes —
+    /// equal to `first_tx_ms` until a retransmission, then refreshed
+    /// by every `emit_rtx_entry`. RACK (RFC 8985) measures a
+    /// segment's age from its most recent transmission, so a
+    /// just-retransmitted segment is not instantly re-marked lost.
+    pub(crate) last_tx_ms: u64,
     /// Number of transmissions this entry has been through. >0 means
     /// retransmitted (Karn's rule: don't sample RTT from this entry).
     pub(crate) tx_count: u8,
@@ -431,6 +437,22 @@ pub struct TcpConnection {
     /// capped at `TLP_MAX_PROBES`, after which the RTO is the backstop.
     /// Reset to 0 whenever new data is acknowledged.
     pub(crate) tlp_count: u8,
+    /// Absolute deadline (`kernel_core::clock::now_ms`) at which the
+    /// oldest un-SACKed segment below the highest SACKed one will age
+    /// past the RACK reordering window (RFC 8985) — `on_tcp_tick`
+    /// re-runs `rack_detect` then, so segments age into loss without
+    /// needing another ACK. Armed by `rack_detect` whenever delivered
+    /// evidence exists above un-SACKed data that is not yet old enough
+    /// to mark; 0 = disarmed.
+    pub(crate) rack_deadline_ms: u64,
+    /// True while some `rtx_queue` entry MAY be SACKed — `rack_detect`'s
+    /// O(1) clean-path gate. Set by `apply_sack` when it marks an entry;
+    /// cleared by the next `rack_detect` whose scan finds none left
+    /// (they were cum-ACKed off the queue, or an RTO dropped the
+    /// scoreboard). May read stale-true for one scan after the evidence
+    /// drains — never stale-false, so detection is never skipped while
+    /// evidence exists.
+    pub(crate) rack_sack_hint: bool,
     /// Cache of `cc.window()` — the congestion window in bytes, refreshed
     /// after every `cc` event. The send path (`usable_window`) and diag
     /// read this so they don't borrow `cc`. 0 until `congestion_init`.
@@ -684,6 +706,8 @@ impl TcpConnection {
             persist_backoff: 0,
             tlp_deadline_ms: 0,
             tlp_count: 0,
+            rack_deadline_ms: 0,
+            rack_sack_hint: false,
             cwnd: 0,
             dup_acks: 0,
             cc: net_cc::Controller::with_default_mss(),
@@ -970,6 +994,7 @@ impl TcpConnection {
             seq_start,
             len,
             first_tx_ms: now_ms,
+            last_tx_ms: now_ms,
             tx_count: 1,
             sacked: false,
         });
@@ -1566,6 +1591,11 @@ impl TcpConnection {
                 }
             }
         }
+        if changed {
+            // Delivered-out-of-order evidence now exists — open the
+            // RACK time-detection gate (see `rack_sack_hint`).
+            self.rack_sack_hint = true;
+        }
         changed
     }
 
@@ -1585,6 +1615,9 @@ impl TcpConnection {
             let mut scratch = [0u8; MSS_MAX];
             scratch[..n].copy_from_slice(&e.iobuf.data()[..n]);
             e.tx_count = e.tx_count.saturating_add(1);
+            // RACK ages a segment from its LATEST transmission — refresh
+            // it so the segment just re-sent isn't instantly re-marked.
+            e.last_tx_ms = kernel_core::clock::now_ms();
             (n, e.seq_start, scratch)
         };
         send_segment(
@@ -1685,6 +1718,117 @@ impl TcpConnection {
         // recovery window and resumes growth once it's drained — so there's
         // nothing to deflate here.
         self.dup_acks = 0;
+    }
+
+    // ─── RACK time-based loss detection (RFC 8985, detection half) ───────
+
+    /// RACK (RFC 8985) time-based loss marking, driven by the shared
+    /// `net_cc::loss` decision core — the same detector QUIC's RFC 9002
+    /// loss detection runs on (architecture-audit direction #4).
+    ///
+    /// Count-based detection is already covered: RFC 6675 SACK-hole
+    /// filling (3 dup-ACKs) and the RTO/TLP timers. What they miss is
+    /// the TIME signal — when the peer has SACKed a LATER-sent segment,
+    /// an earlier un-SACKed segment whose latest transmission is older
+    /// than a reordering window has been lost, even if too few dup-ACKs
+    /// ever arrive to trip fast retransmit (e.g. losses near the end of
+    /// a flight, or a lost retransmission). Called after every ACK's
+    /// SACK/cum-ACK scoreboard update, and re-run by `on_tcp_tick` when
+    /// the armed `rack_deadline_ms` fires so segments age into loss
+    /// without needing another ACK.
+    ///
+    /// Mapping onto the core: unit id = the entry's sequence offset
+    /// from `snd_una` (wrap-safe, ascending in queue order; u64 so the
+    /// core's integer math never wraps), sent time = `last_tx_ms`
+    /// (milliseconds — ticks are the caller's unit). The PACKET
+    /// threshold is disabled (`u64::MAX`): ids here are byte offsets,
+    /// not packet counts, and the count-based analog is RFC 6675's job.
+    /// The time threshold is the QUIC-proven conservative
+    /// `9/8·max(srtt, latest)` window via [`net_cc::loss::LossParams::rfc9002`]
+    /// (granularity 1 ms; no ack_delay term — SRTT already includes the
+    /// peer's delayed-ACK time, RFC 6298 measures ACK arrival directly).
+    /// RFC 8985's adaptive reo_wnd (start `min_rtt/4`, grow on DSACK) is
+    /// a deliberate follow-up, not landed here.
+    ///
+    /// A marked segment routes through the SAME retransmit-emission +
+    /// `cc.on_loss` path RFC 6675 hole-filling uses; net_cc's
+    /// `RecoveryEpisode` dedups the cwnd reduction to once per window
+    /// however many segments (or repeat detections) mark.
+    pub(crate) fn rack_detect(&mut self, now_ms: u64) {
+        // Re-derived from scratch on every run — a stale armed deadline
+        // (evidence since cum-ACKed away, scoreboard cleared by an RTO)
+        // simply disarms here.
+        self.rack_deadline_ms = 0;
+        // Clean-path gate, O(1): no possibly-SACKed entry (see
+        // `rack_sack_hint`), no RTT sample (no reordering window — the
+        // core would disable time detection anyway), or nothing queued.
+        if !self.rack_sack_hint || self.srtt_ms == 0 || self.rtx_queue.is_empty() {
+            return;
+        }
+        // Delivered evidence: the highest SACKed entry. Cumulatively
+        // acked entries leave the queue (and sit below every remaining
+        // entry), so SACKed entries are the only "delivered LATER than
+        // un-delivered data" evidence; with none, skip detection —
+        // exactly RFC 8985's "RACK needs SACK" precondition.
+        let base = self.snd_una;
+        let Some(largest_acked) = self
+            .rtx_queue
+            .iter()
+            .filter(|e| e.sacked)
+            .map(|e| e.seq_start.wrapping_sub(base) as u64)
+            .max()
+        else {
+            // The hint was stale — the SACKed entries have all been
+            // cum-ACKed off the queue (or an RTO cleared the
+            // scoreboard). Close the gate until fresh SACK evidence.
+            self.rack_sack_hint = false;
+            return;
+        };
+        let mut params =
+            net_cc::loss::LossParams::rfc9002(self.srtt_ms as u64, 0, 1, 0);
+        params.packet_threshold = u64::MAX; // time-only; see doc above
+        // The closure only collects (it can't re-borrow `self` while the
+        // units iterator holds the queue) — emission happens below. The
+        // Vec is empty (never allocates) unless something actually marks,
+        // and this path only runs at all while SACKed evidence exists,
+        // i.e. inside a loss/reordering episode — never the clean path.
+        let mut lost_offs: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+        let deadline = params.detect(
+            largest_acked,
+            now_ms,
+            self.rtx_queue
+                .iter()
+                .filter(|e| !e.sacked)
+                .map(|e| (e.seq_start.wrapping_sub(base) as u64, e.last_tx_ms)),
+            |id, _by| lost_offs.push(id as u32),
+        );
+        if !lost_offs.is_empty() {
+            // Same loss path as `fast_retransmit`: one (deduped) cwnd
+            // reduction for the event, then re-send each marked segment.
+            self.cc.on_loss(0, false);
+            // `lost_offs` and the queue are both ascending by offset —
+            // a two-cursor merge finds each marked entry's index.
+            let mut cursor = 0usize;
+            for i in 0..self.rtx_queue.len() {
+                if cursor == lost_offs.len() {
+                    break;
+                }
+                let off = self.rtx_queue[i].seq_start.wrapping_sub(base);
+                if off == lost_offs[cursor] {
+                    cursor += 1;
+                    crate::diag::COUNTERS.rack_marked.bump();
+                    self.emit_rtx_entry(i);
+                }
+            }
+            self.cwnd = self.cc.window();
+        }
+        // Un-SACKed data still inside the reordering window: arm the
+        // RACK timer at the first tick a segment will age out, so the
+        // tick re-runs this even if no further ACK arrives.
+        if let Some(dl) = deadline {
+            self.rack_deadline_ms = dl;
+            self.arm_for_tick();
+        }
     }
 }
 

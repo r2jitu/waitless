@@ -113,6 +113,12 @@ pub struct Counters {
     /// RFC 8985 Tail Loss Probes — `snd_una` resent at the PTO (before
     /// the RTO) to recover a tail loss without a backed-off RTO stall.
     pub tlp_probes: Counter,
+    /// Segments marked lost by RACK time-based detection (RFC 8985):
+    /// un-SACKed data older than the reordering window while a
+    /// later-sent segment was SACKed — losses the 3-dup-ACK / RFC 6675
+    /// count-based path can't see. Each marked segment was retransmitted
+    /// through the same path SACK hole-filling uses.
+    pub rack_marked: Counter,
     /// ICMP Path-MTU reports that lowered a connection's `snd_mss`
     /// (RFC 1191 Frag-Needed / RFC 8201 Packet-Too-Big).
     pub pmtu_applied: Counter,
@@ -176,6 +182,7 @@ impl Counters {
             rtx_alloc_fail: Counter::new(),
             data_retransmits: Counter::new(),
             tlp_probes: Counter::new(),
+            rack_marked: Counter::new(),
             pmtu_applied: Counter::new(),
             pmtu_dropped: Counter::new(),
             fin_retransmits: Counter::new(),
@@ -570,7 +577,7 @@ pub fn record_teardown(reason: TeardownReason, state: TcpState) {
 
 /// Counter `(name, value)` pairs in declaration order — the flat
 /// half of the `/obs` `"tcp"` block.
-pub fn snapshot() -> [(&'static str, u64); 31] {
+pub fn snapshot() -> [(&'static str, u64); 32] {
     let c = &COUNTERS;
     [
         ("syn_rx", c.syn_rx.get()),
@@ -592,6 +599,7 @@ pub fn snapshot() -> [(&'static str, u64); 31] {
         ("rtx_alloc_fail", c.rtx_alloc_fail.get()),
         ("data_retransmits", c.data_retransmits.get()),
         ("tlp_probes", c.tlp_probes.get()),
+        ("rack_marked", c.rack_marked.get()),
         ("pmtu_applied", c.pmtu_applied.get()),
         ("pmtu_dropped", c.pmtu_dropped.get()),
         ("fin_retransmits", c.fin_retransmits.get()),

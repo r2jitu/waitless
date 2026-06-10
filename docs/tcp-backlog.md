@@ -488,7 +488,7 @@ QUIC's token-bucket pacer (`crates/proto/quic/src/conn/tx.rs`, driving
 `net_cc`'s `pacing_rate()`) is the prior art to port. Pairs with BBR (L1).
 **Effort: M.**
 
-### L4 — TLP ✅ done + GCE-validated (the tail-loss-RTO fix); RACK time-detection still open
+### L4 — TLP ✅ done + GCE-validated (the tail-loss-RTO fix); RACK time-detection ✅ done
 
 **What (original).** We detected loss via 3 duplicate ACKs (fast
 retransmit) or the RTO only. SACK (T7) lands — block generation + RFC 6675
@@ -528,11 +528,27 @@ unit-test `tail_loss_probe_fires_before_rto_then_caps`.
 The multi-second stalls are gone; the good-cluster max is unchanged
 (clean-path neutral).
 
-**Open — RACK time-based detection.** TLP fixes the *tail*; full RACK
-(per-segment send timestamps + a reordering window replacing the 3-dup-ACK
-heuristic for *mid-stream* multi-hole loss) is the remaining half. QUIC's
-RFC 9002 detector (`crates/proto/quic/src/conn/loss.rs`) is the model to
-mirror. **Effort: M.**
+**Status — RACK time-based detection ✅ done (shared-core consumer).**
+TCP now consumes `net_cc::loss::LossParams` — the same RFC 9002/RACK
+decision core QUIC's detector runs on (architecture-audit #4). After every
+ACK's SACK/cum-ACK scoreboard update (`TcpConnection::rack_detect`), an
+un-SACKed segment whose **latest** transmission (`RtxEntry::last_tx_ms`,
+refreshed on every retransmit) is older than the `9/8·SRTT` reordering
+window while a later-sent segment is SACKed is marked lost and routed
+through the same retransmit-emission + `cc.on_loss` path RFC 6675
+hole-filling uses (one deduped cwnd reduction per window). The core's
+returned deadline arms a per-conn RACK reordering timer
+(`rack_deadline_ms`, serviced by `on_tcp_tick`) so segments age into loss
+without needing another ACK. The packet threshold is disabled for TCP
+(ids are byte offsets; count-based detection stays RFC 6675's job). /obs
+`rack_marked`; scenarios `rack_marks_aged_unsacked_segments_below_dupack_threshold`,
+`rack_holds_fire_inside_the_reordering_window`,
+`rack_late_fill_cancels_the_pending_mark`,
+`rack_timer_marks_aged_segments_without_further_acks`.
+
+**Open (follow-up).** RFC 8985's *adaptive* reo_wnd (start `min_rtt/4`,
+grow on DSACK-detected spurious marks) — deliberately not landed; the
+conservative QUIC-proven `9/8·SRTT` window is used instead. **Effort: S.**
 
 ### L5 — No receive/send buffer autotuning
 

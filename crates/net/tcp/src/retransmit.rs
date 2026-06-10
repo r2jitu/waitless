@@ -84,6 +84,17 @@ pub fn on_tcp_tick() {
             }
         }
 
+        // RACK (RFC 8985) reordering-window timer: an armed deadline
+        // means un-SACKed data was still inside the reordering window
+        // at the last ACK — re-run detection now so those segments age
+        // into loss (and are retransmitted) even if the peer sends no
+        // further ACKs. `rack_detect` re-derives everything from the
+        // live scoreboard, so a deadline made stale by an intervening
+        // cum-ACK or RTO scoreboard-clear simply disarms.
+        if c.rack_deadline_ms != 0 && now >= c.rack_deadline_ms {
+            c.rack_detect(now);
+        }
+
         // RFC 9293 §3.8.6.1 zero-window persist. Probe a peer that
         // has kept its receive window shut; abort the connection once
         // `PERSIST_MAX_PROBES` probes go unanswered.
@@ -145,6 +156,7 @@ pub fn on_tcp_tick() {
         // accurate for the steady-state re-arm case.
         let still_armed = c.rtx_deadline_ms != 0
             || c.tlp_deadline_ms != 0
+            || c.rack_deadline_ms != 0
             || c.persist_deadline_ms != 0
             || c.lifecycle_deadline_ms != 0;
         if still_armed {
@@ -170,10 +182,10 @@ pub fn on_tcp_tick() {
 }
 
 /// True if any connection on the current core has an armed timer — an
-/// RFC 6298 retransmission deadline, a zero-window persist deadline,
-/// or a connection-lifecycle deadline. The event loop consults this
-/// before going fully idle so a core with a pending timer does not
-/// sleep past its deadline.
+/// RFC 6298 retransmission deadline, a TLP or RACK (RFC 8985)
+/// deadline, a zero-window persist deadline, or a connection-lifecycle
+/// deadline. The event loop consults this before going fully idle so a
+/// core with a pending timer does not sleep past its deadline.
 pub fn has_armed_timers() -> bool {
     // O(1): the armed-timer list head is non-`NULL_SLOT` iff some
     // slot has at least one deadline set. Previously this scanned
