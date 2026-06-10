@@ -103,6 +103,17 @@ const HEADER_BLOCK_CAP: usize = 64 * 1024;
 /// the H2-1 Rapid-Reset (CVE-2023-44487) guard.
 const RST_FLOOD_CAP: u32 = 200;
 
+/// Connection is torn down once this many consecutive control / non-
+/// request-advancing frames (SETTINGS / PING / WINDOW_UPDATE / empty
+/// DATA / PRIORITY / unknown) arrive with no intervening request — the
+/// H2-3 control-flood guard. A control frame is cheap to process but
+/// elicits ACKs / flow-control churn and keeps the connection (and its
+/// slot) occupied; a peer that floods them without ever sending a
+/// request is shed with `GOAWAY(ENHANCE_YOUR_CALM)`. A legitimate
+/// connection interleaves the occasional control frame with requests,
+/// which resets the counter, so the bound (1024) is never approached.
+const CONTROL_FLOOD_CAP: u32 = 1024;
+
 /// Steady-state cycle counter for the per-phase profiling brackets
 /// (HPACK decode / encode / framing). Same rdtsc / cntvct instruction
 /// the `http` + `tls` profilers use; zero on unsupported targets.
@@ -297,6 +308,10 @@ struct H2Conn {
     last_stream_id: u32,
     /// Cumulative RST_STREAM count (rapid-reset guard).
     streams_reset: u32,
+    /// Consecutive control / non-request-advancing frames since the
+    /// last productive frame — the H2-3 control-flood guard. Reset by a
+    /// request's HEADERS or body DATA; trips `CONTROL_FLOOD_CAP`.
+    ctrl_since_progress: u32,
     /// Set once we've decided to wind the connection down.
     closing: bool,
 }
@@ -321,8 +336,35 @@ impl H2Conn {
             peer_max_frame_size: MAX_FRAME_SIZE,
             last_stream_id: 0,
             streams_reset: 0,
+            ctrl_since_progress: 0,
             closing: false,
         }
+    }
+
+    /// H2-3 control-flood accounting. A productive frame — a request's
+    /// HEADERS, or DATA carrying body bytes — resets the budget; every
+    /// other frame type (SETTINGS / PING / WINDOW_UPDATE / empty DATA /
+    /// PRIORITY / GOAWAY / unknown) is control churn. Returns
+    /// `Err(ENHANCE_YOUR_CALM)` once `CONTROL_FLOOD_CAP` consecutive
+    /// control frames arrive with no intervening request. (RST_STREAM
+    /// has its own dedicated rapid-reset cap; counting it as churn here
+    /// only tightens the bound.)
+    fn note_frame_for_flood_guard(&mut self, ty: u8, length: u32) -> Result<(), u32> {
+        let productive = ty == ftype::HEADERS || (ty == ftype::DATA && length > 0);
+        if productive {
+            self.ctrl_since_progress = 0;
+        } else {
+            self.ctrl_since_progress += 1;
+            if self.ctrl_since_progress > CONTROL_FLOOD_CAP {
+                crate::h2_drop!(
+                    control_flood_abort,
+                    "control-frame flood={} (no request progress)",
+                    self.ctrl_since_progress
+                );
+                return Err(error::ENHANCE_YOUR_CALM);
+            }
+        }
+        Ok(())
     }
 
     /// Streams that count against `MAX_CONCURRENT_STREAMS`: streaming
@@ -1053,6 +1095,11 @@ where
         // CONTINUATION with no preceding HEADERS.
         return Err(error::PROTOCOL_ERROR);
     }
+
+    // H2-3 control-flood guard, checked BEFORE dispatch so a frame past
+    // the cap is never processed and never queues a response (bounding
+    // `ctrl_out` growth too).
+    conn.note_frame_for_flood_guard(hdr.ty, hdr.length)?;
 
     match hdr.ty {
         ftype::SETTINGS => process_settings(conn, hdr, payload),
@@ -2051,5 +2098,56 @@ mod tests {
         assert_eq!(fr.len(), 1);
         assert_eq!(fr[0].0, ftype::RST_STREAM);
         assert!(conn.streams.is_empty(), "reset stream retired");
+    }
+
+    // ── H2-3 control-flood guard ──────────────────────────────────
+    use crate::frame::{error, ftype};
+
+    #[test]
+    fn control_flood_trips_enhance_your_calm() {
+        let mut conn = H2Conn::new();
+        // A pure-control flood (PING) with no request: the first
+        // CONTROL_FLOOD_CAP frames are accepted, the next one trips
+        // ENHANCE_YOUR_CALM.
+        // The first CONTROL_FLOOD_CAP frames are accepted.
+        for _ in 0..super::CONTROL_FLOOD_CAP {
+            conn.note_frame_for_flood_guard(ftype::PING, 8)
+                .expect("under the cap");
+        }
+        // The next one trips ENHANCE_YOUR_CALM.
+        let code = conn
+            .note_frame_for_flood_guard(ftype::PING, 8)
+            .expect_err("trips one past the cap");
+        assert_eq!(code, error::ENHANCE_YOUR_CALM);
+    }
+
+    #[test]
+    fn request_progress_resets_the_flood_budget() {
+        let mut conn = H2Conn::new();
+        // Interleave: many control frames, but a request HEADERS before
+        // the cap keeps resetting the budget, so it never trips — the
+        // legitimate-connection pattern.
+        for _round in 0..10 {
+            for _ in 0..(super::CONTROL_FLOOD_CAP - 1) {
+                conn.note_frame_for_flood_guard(ftype::WINDOW_UPDATE, 4)
+                    .expect("under cap");
+            }
+            // A request resets the counter.
+            conn.note_frame_for_flood_guard(ftype::HEADERS, 100)
+                .expect("HEADERS resets");
+            assert_eq!(conn.ctrl_since_progress, 0);
+        }
+    }
+
+    #[test]
+    fn body_data_counts_as_progress_but_empty_data_is_control() {
+        let mut conn = H2Conn::new();
+        // DATA with payload (request body) resets; empty DATA (a
+        // keep-the-conn-busy frame) is control churn.
+        conn.ctrl_since_progress = 5;
+        conn.note_frame_for_flood_guard(ftype::DATA, 1).unwrap();
+        assert_eq!(conn.ctrl_since_progress, 0, "body DATA resets");
+        conn.note_frame_for_flood_guard(ftype::DATA, 0).unwrap();
+        assert_eq!(conn.ctrl_since_progress, 1, "empty DATA is control churn");
     }
 }

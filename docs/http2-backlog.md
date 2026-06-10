@@ -121,11 +121,15 @@ landed this session; the rate-limit-flood guard is still open.
   `SETTINGS_MAX_HEADER_LIST_SIZE` (64 KiB) on the decompressed list and
   bounds the dynamic table at the advertised `SETTINGS_HEADER_TABLE_SIZE`
   (4 KiB).
-- **H2-3 — Frame floods.** SETTINGS flood, PING flood, empty-DATA flood,
-  WINDOW_UPDATE flood, 0-length-HEADERS flood. **Still open:** no
-  rate-limit on control frames yet (we ACK/answer each as it arrives).
-  Bound outstanding control frames / per-RTT churn. The CONTINUATION-flood
-  half is covered by `HEADER_BLOCK_CAP` (see H2-5).
+- [x] **H2-3 — Frame floods.** SETTINGS / PING / empty-DATA /
+  WINDOW_UPDATE / 0-length-HEADERS floods are bounded by a
+  consecutive-control-frame counter (`ctrl_since_progress`): a productive
+  frame (request HEADERS or body DATA) resets it; past `CONTROL_FLOOD_CAP`
+  (1024) consecutive control frames with no request, the connection is
+  shed with `GOAWAY(ENHANCE_YOUR_CALM)`. Checked BEFORE dispatch, so it
+  also bounds `ctrl_out` growth. (`ctrl_out` is in any case flushed every
+  demux iteration, so it never accumulates across frames.) The
+  CONTINUATION-flood half is covered by `HEADER_BLOCK_CAP` (see H2-5).
 - [x] **H2-4 — `MAX_CONCURRENT_STREAMS` enforcement.** Advertised (100)
   and enforced — a new stream past `active_count()` (pending bodies +
   in-flight responses) is refused with `RST_STREAM(REFUSED_STREAM)`.

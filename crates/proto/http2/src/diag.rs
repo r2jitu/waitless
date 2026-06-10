@@ -43,6 +43,9 @@ pub struct Counters {
     /// The connection was torn down for excessive stream resets /
     /// open-then-cancel churn (H2-1 Rapid Reset / CVE-2023-44487).
     pub rapid_reset_abort: Counter,
+    /// H2-3: connections shed for a control-frame flood (no request
+    /// progress past `CONTROL_FLOOD_CAP`). Nonzero = a flood was cut off.
+    pub control_flood_abort: Counter,
     /// A flow-control window was violated by the peer → conn error.
     pub flow_control_error: Counter,
     /// A GOAWAY frame was emitted (graceful or error shutdown).
@@ -74,6 +77,7 @@ impl Counters {
             header_block_too_large: Counter::new(),
             stream_refused: Counter::new(),
             rapid_reset_abort: Counter::new(),
+            control_flood_abort: Counter::new(),
             flow_control_error: Counter::new(),
             goaway_sent: Counter::new(),
             decode_cycles: Counter::new(),
@@ -170,7 +174,7 @@ pub fn should_log_event() -> bool {
 }
 
 /// Counter `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 16] {
+pub fn snapshot() -> [(&'static str, u64); 17] {
     let c = &COUNTERS;
     [
         ("connections_served", c.connections_served.get()),
@@ -184,6 +188,7 @@ pub fn snapshot() -> [(&'static str, u64); 16] {
         ("header_block_too_large", c.header_block_too_large.get()),
         ("stream_refused", c.stream_refused.get()),
         ("rapid_reset_abort", c.rapid_reset_abort.get()),
+        ("control_flood_abort", c.control_flood_abort.get()),
         ("flow_control_error", c.flow_control_error.get()),
         ("goaway_sent", c.goaway_sent.get()),
         ("decode_cycles", c.decode_cycles.get()),

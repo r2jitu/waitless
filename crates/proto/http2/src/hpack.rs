@@ -247,7 +247,14 @@ impl Decoder {
     fn evict_to(&mut self, target: usize) {
         while self.size > target {
             match self.dynamic.pop_back() {
-                Some((n, v)) => self.size -= n.len() + v.len() + ENTRY_OVERHEAD,
+                // `saturating_sub` defends against any accounting drift:
+                // an entry's measured size on eviction should always
+                // equal what was added on insert, but a raw `-=` would
+                // panic (debug) / wrap to a huge size (release) if that
+                // invariant were ever broken on an attacker-fed stream.
+                Some((n, v)) => {
+                    self.size = self.size.saturating_sub(n.len() + v.len() + ENTRY_OVERHEAD)
+                }
                 None => {
                     self.size = 0;
                     break;
