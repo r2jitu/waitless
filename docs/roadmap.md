@@ -78,6 +78,7 @@ audit and are documented here (some also in their backlog).
 | HPACK/QPACK | field-huffman 16 KiB scratch → a >16 KiB literal returns a mis-named `BadPadding` (a resource limit reported as a wire error) † | S3 | http2/http3-backlog |
 | Drivers | virtio-net **MMIO** path negotiates `MRG_RXBUF` but its RX can't handle multi-buffer frames (the modern-PCI path strips it) — unsafe-but-benign on current hosts † | S1 | rx-path-optimizations |
 | Drivers | gve **DQO cross-core RX repost** ordering (a higher-slot doorbell can race a lower-slot descriptor write — needs a contiguous-publish cursor) † | S1 | gvnic |
+| Kernel | x86 BSP boot stack (`limine_stack`, 256 KiB in `.bss`) has **no guard page** — overflow corrupts adjacent `.bss` silently (AP stacks are guarded; found 2026-06-10 via an 11 KiB future overflow) | S1 | — |
 | Kernel | aarch64 `CNTFRQ_EL0` trusted as a single source — a 0/sub-MHz emulator value silently corrupts every cycle budget † | S3 | — |
 | Kernel | aarch64 **PL031 RTC** backend (wall-clock returns 0 on aarch64) | S3 | roadmap (deferred) |
 | Runtime | `TcpRecv`/`TcpSendChain` have no `Drop` → a cancelled (`select`/`timeout`) future leaves a stale waker (relies on the "never both recv+recv_chunk parked" convention) † | S2 | stack-architecture |

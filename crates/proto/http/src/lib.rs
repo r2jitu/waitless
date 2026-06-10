@@ -18,6 +18,11 @@ extern crate alloc;
 pub use iobuf::{Cursor as IOBufCursor, IOBuf, IOBufChain, IOBufError, IOBufWriter, OwnedIOBuf};
 
 mod body;
+/// HTTP/1.1 CLIENT: streaming response parser, chunked decoder,
+/// `ClientBodyReader`, request writer, and the transport-generic
+/// `http1_fetch` / one-shot `http_get`. The server types stay at the
+/// crate root; the client surface lives under `http::client::*`.
+pub mod client;
 pub mod diag;
 mod request;
 mod response;

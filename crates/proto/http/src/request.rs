@@ -29,7 +29,10 @@ pub struct Header {
 }
 
 impl Header {
-    const fn new() -> Self {
+    /// `pub(crate)` so the client-side response parser
+    /// (`client::ResponseHead`) can reuse the same fixed-buffer
+    /// header slot type for its own table.
+    pub(crate) const fn new() -> Self {
         Header {
             name: [0; 64],
             name_len: 0,

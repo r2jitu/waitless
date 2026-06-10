@@ -3,13 +3,17 @@ load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# HTTP/1.1 server. Also hosts the `Tls` / `TlsConn` traits that
+# HTTP/1.1 server + client. Also hosts the `Tls` / `TlsConn` traits that
 # `//crates/proto/tls` implements — keeps the HTTP path TLS-unaware so apps
-# without `tls` link zero TLS / crypto code.
+# without `tls` link zero TLS / crypto code. The client half
+# (`src/client.rs`: response parser, chunked decoder, request writer,
+# `http1_fetch`) is transport-generic over `HttpStream`; the TLS client
+# stream that feeds it lives in //crates/proto/http2 (`connect.rs`).
 rust_library(
     name = "http",
     srcs = [
         "src/body.rs",
+        "src/client.rs",
         "src/diag.rs",
         "src/lib.rs",
         "src/request.rs",

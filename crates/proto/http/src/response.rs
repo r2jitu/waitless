@@ -372,7 +372,7 @@ pub(crate) fn flatten_extra_headers<'a>(
 /// Hot path (once per request): the manual byte-level appends + a small
 /// itoa for `Content-Length` measurably outperform `write!(...)`'s
 /// format-walker / Display-vtable / padding machinery.
-fn hpush(buf: &mut IOBuf, data: &[u8]) {
+pub(crate) fn hpush(buf: &mut IOBuf, data: &[u8]) {
     let r = buf.append_slice(data);
     debug_assert!(r.is_ok(), "response header overflow (raise HEADER_CAP)");
     let _ = r;
@@ -458,7 +458,7 @@ fn write_status_code(out: &mut [u8; 4], status: i32) -> usize {
 /// returns the number of bytes written. Avoids `core::fmt::Display`'s
 /// padding/precision machinery, which dominates the per-request
 /// formatting cost on the static-body path.
-fn write_usize(out: &mut [u8; 20], mut n: usize) -> usize {
+pub(crate) fn write_usize(out: &mut [u8; 20], mut n: usize) -> usize {
     if n == 0 {
         out[0] = b'0';
         return 1;
