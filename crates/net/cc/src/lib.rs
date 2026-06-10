@@ -20,6 +20,10 @@
 
 #![cfg_attr(not(test), no_std)]
 
+/// Shared loss-detection decision core (packet/time thresholds) — the
+/// other half of the transport-reliability plane. See `loss.rs`.
+pub mod loss;
+
 /// Round-trip-time inputs the controller needs. Transports keep their own
 /// RTT *estimators* (TCP RFC 6298, QUIC RFC 9002 with `ack_delay`/`min_rtt`
 /// differ enough that sharing is low-value) and hand the controller just

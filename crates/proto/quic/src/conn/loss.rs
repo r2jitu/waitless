@@ -232,13 +232,9 @@ impl Connection {
                 .on_ack(acked_bytes, self.bytes_in_flight, rtt, now_ms);
         }
         // Loss detection — runs after each ACK in the same space.
-        // RFC 9002 §6.1: declare lost any sent packet that's both
-        //   (a) lower than `largest_acked - kPacketThreshold` (3),
-        //   AND
-        //   (b) older than the time threshold
-        //       `max(9/8 * max(SRTT, latest_rtt), kGranularity)`.
-        // Either condition alone is sufficient on its own per the
-        // RFC; we apply them as separate counters.
+        // RFC 9002 §6.1: a sent packet is lost when it crosses the
+        // packet threshold OR the time threshold; the decision logic
+        // (and its arithmetic) lives in the shared `net_cc::loss` core.
         self.detect_loss(level);
         if space_now_empty {
             self.time_of_last_ack_eliciting_us[space_idx] = None;
@@ -259,35 +255,29 @@ impl Connection {
     /// `send_pto_probe`. The per-PN counters give accurate "in flight"
     /// numbers and loss visibility.
     fn detect_loss(&mut self, level: CryptoLevel) {
-        const K_PACKET_THRESHOLD: u64 = 3;
         const K_GRANULARITY_US: u64 = 1_000;
         // Peer's max_ack_delay (RFC 9000 §18.2) — the value advertised in
         // its transport params, cached as `peer_max_ack_delay_us` (25 ms
-        // RFC default until applied). Added to the time threshold below —
+        // RFC default until applied). Folded into the time threshold below —
         // but ONLY for the Application Data space (RFC 9002 §6.1.2): a
         // peer must not delay ACKs of Initial / Handshake packets, so
         // including it there would over-extend the threshold and delay
-        // real handshake-loss recovery.
+        // real handshake-loss recovery. This OneRtt-only rule is transport
+        // policy, so it stays here; the threshold ARITHMETIC (packet
+        // threshold K=3; time threshold 9/8·max(SRTT, latest_rtt) floored
+        // at kGranularity, + max_ack_delay — incl. the §52 h3-real-RTT
+        // spurious-collapse rationale) lives once in the shared core,
+        // `net_cc::loss` (architecture-audit #4). QUIC passes µs ticks.
         let ack_delay_us = match level {
             CryptoLevel::OneRtt => self.peer_max_ack_delay_us,
             CryptoLevel::Initial | CryptoLevel::Handshake => 0,
         };
-        // Cache `max_rtt` and `now` before borrowing through SpaceState.
-        // Both `latest_rtt_us` and `smoothed_rtt_us` live on Connection.
-        let max_rtt = self
-            .smoothed_rtt_us
-            .map(|s| s.max(self.latest_rtt_us.unwrap_or(0)))
-            .unwrap_or(self.latest_rtt_us.unwrap_or(0));
-        // Time threshold = 9/8·max(SRTT, latest_rtt) + max_ack_delay. The
-        // `+ max_ack_delay` is essential on a real-RTT path: SRTT is computed
-        // with the peer's ack_delay SUBTRACTED (RFC 9002 §5.3), but a peer may
-        // legitimately hold an ACK up to max_ack_delay, so an in-order
-        // delivered packet's ACK can arrive ~max_ack_delay after 9/8·SRTT.
-        // Without this term those packets were declared time-lost spuriously
-        // (~27 % of a clean transfer at 24 ms RTT), collapsing cwnd to the
-        // floor — the h3 real-RTT throughput bug. At low RTT the term is
-        // irrelevant (packet-threshold dominates; ACKs return in µs).
-        let time_threshold_us = ((max_rtt * 9) / 8).max(K_GRANULARITY_US) + ack_delay_us;
+        let params = net_cc::loss::LossParams::rfc9002(
+            self.smoothed_rtt_us.unwrap_or(0),
+            self.latest_rtt_us.unwrap_or(0),
+            K_GRANULARITY_US,
+            ack_delay_us,
+        );
         let now = crate::time::now_us();
 
         let space = match level {
@@ -316,23 +306,25 @@ impl Connection {
         // In-flight (unacked) sent-packet count at entry — sizes the
         // cascade for the `last_loss` diagnostic snapshot below.
         let inflight_pkts = space.sent_packets.len() as u64;
-        // Walk in PN order. Threshold-lost PNs (lowest) naturally come
+        // Walk in PN order; the shared core classifies each PN against
+        // the thresholds. Threshold-lost PNs (lowest) naturally come
         // first; time-lost can appear after. Counters track how many of
-        // each (for the diag); the list itself stays in PN order.
-        for (pn, pkt) in space.sent_packets.iter() {
-            if pn >= largest_acked {
-                break; // PN >= largest_acked are still in-flight
-            }
-            if pn + K_PACKET_THRESHOLD <= largest_acked {
+        // each (for the diag); the list itself stays in PN order. The
+        // returned loss-time deadline is dropped: QUIC re-runs detection
+        // on the next ACK and the PTO probe covers a silent tail, so no
+        // loss timer is armed (TCP RACK is the consumer that arms it).
+        let _next_loss_deadline = params.detect(
+            largest_acked,
+            now,
+            space.sent_packets.iter().map(|(pn, pkt)| (pn, pkt.time_sent_us)),
+            |pn, by| {
                 lost_buf.push(pn);
-                lost_threshold_n += 1;
-                continue;
-            }
-            if max_rtt > 0 && now.saturating_sub(pkt.time_sent_us) > time_threshold_us {
-                lost_buf.push(pn);
-                lost_time_n += 1;
-            }
-        }
+                match by {
+                    net_cc::loss::LostBy::PacketThreshold => lost_threshold_n += 1,
+                    net_cc::loss::LostBy::Time => lost_time_n += 1,
+                }
+            },
+        );
         let total_lost = lost_threshold_n + lost_time_n;
         let mut lost_bytes: u32 = 0;
         // Lost STREAM frames, collected in PN order (lowest offset first)
