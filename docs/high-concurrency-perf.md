@@ -1,9 +1,21 @@
 # High-Concurrency Performance
 
-A working document for the "how do we serve 10K+ concurrent HTTP/TLS
-conns competitively" investigation. Captures the measurements and
-fixes from the `bench/pareto-rig` work and ranks the remaining gaps
-we believe matter most for the next round.
+> **Status: investigation complete; findings banked.** The headline
+> outcome — the high-conc cliff is gone (load-shedding + per-core
+> structure), and waitless runs ~2x tokio-hyper at the same conn counts
+> — is published in [`benchmark-results.md`](benchmark-results.md) and
+> the README. This doc is the **record of how that was found**: the
+> CPU-collapse anatomy, the heap-OOM root-cause (H1-H6), the
+> graceful-OOM audit, and the load-shedding design. The dated
+> measurement tables are a point-in-time snapshot (May 2026) — kept for
+> the reasoning they support, not as live numbers; re-measure before
+> acting on an absolute figure. Genuinely-open items live in
+> [`roadmap.md`](roadmap.md)'s gaps index and the rx/tx trackers; this
+> doc is a record, not an open work queue.
+
+A record of the "how do we serve 10K+ concurrent HTTP/TLS conns
+competitively" investigation — the measurements and fixes from the
+`bench/pareto-rig` work, and the analysis of where the ceiling sits.
 
 ## How this fits with the other perf docs
 
@@ -1519,6 +1531,8 @@ Vegas need is itself too expensive on this workload.
   saturation, not data-structure waste
 
 ## Prioritized gaps
+
+> Historical ranking from the investigation. For *live* open status see [`roadmap.md`](roadmap.md)'s "Known gaps at a glance" index and the rx/tx trackers — several P0/P1 items below have since shipped (load-shedding, the accept-ring, per-core counters, the intrusive timer list). Kept here for the ranking rationale.
 
 The data-structure scans are fixed. Remaining ceiling is cycles
 per poll and graceful degradation past CPU saturation. In rough
