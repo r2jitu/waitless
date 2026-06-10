@@ -534,6 +534,62 @@ fn detect_loss_recovers_more_than_64_at_once() {
     assert_eq!(conn.retx_queue.len(), 67, "every lost STREAM frame requeued");
 }
 
+/// Deterministic time-threshold loss under the mock clock
+/// (architecture-audit direction #2's pattern-setter, unlocked by the
+/// `crate::time` seam): the RFC 9002 §6.1.2 RACK-style detector —
+/// "older than 9/8·max(SRTT, latest_rtt)" — is driven entirely by
+/// virtual time, the class of behavior that previously needed
+/// GCE + netem to observe. Timeline: pn0 at T+0 ms (carrying a STREAM
+/// frame), pn1 at T+50 ms, ACK of pn1-only at T+100 ms → the RTT sample
+/// is 50 ms, the time threshold 56.25 ms, and pn0 (age 100 ms, below
+/// the packet threshold at only 1 PN behind) is declared lost by TIME,
+/// its frame re-queued for retransmission.
+#[test]
+fn mock_clock_drives_time_threshold_loss() {
+    let mut conn = Connection::new_server(ConnectionId::new(&[0x77; 8]), [0x55u8; 32]);
+    crate::time::mock::set(1_000_000);
+    conn.pending_sent_stream_frames = alloc::vec![super::StreamRetx {
+        sid: 0,
+        offset: 0,
+        fin: false,
+        data: iobuf::IOBuf::from(alloc::vec![0xAAu8; 100]),
+    }];
+    conn.record_sent_packet(crate::CryptoLevel::OneRtt, 0, true, 100);
+    crate::time::mock::set(1_050_000);
+    conn.record_sent_packet(crate::CryptoLevel::OneRtt, 1, true, 100);
+    crate::time::mock::set(1_100_000);
+    // ACK covering pn1 only (largest=1, first_ack_range=0).
+    let mut ackbuf = [0u8; 16];
+    let n = crate::frame::write_ack(1, 0, 0, &[], &mut ackbuf).unwrap();
+    let (frame, _) = crate::frame::parse_frame(&ackbuf[..n]).unwrap();
+    let crate::frame::Frame::Ack {
+        largest_acknowledged,
+        ack_delay,
+        first_ack_range,
+        ack_ranges,
+        ..
+    } = frame
+    else {
+        panic!("expected ACK frame");
+    };
+    conn.process_ack(
+        crate::CryptoLevel::OneRtt,
+        largest_acknowledged,
+        ack_delay,
+        first_ack_range,
+        ack_ranges,
+    );
+    assert_eq!(conn.smoothed_rtt_us, Some(50_000), "RTT sampled from pn1");
+    assert_eq!(
+        conn.application_space.sent_packets.len(),
+        0,
+        "pn1 acked; pn0 time-threshold-lost (age 100ms > 56.25ms)"
+    );
+    assert_eq!(conn.retx_queue.len(), 1, "pn0's STREAM frame requeued");
+    assert_eq!(conn.retx_queue[0].data.len(), 100);
+    assert_eq!(conn.bytes_in_flight, 0, "both packets released from flight");
+}
+
 /// RFC 9002 §6.2: a lost Handshake packet's CRYPTO fragment is
 /// re-queued (at its original offset) for retransmission, not just
 /// papered over by a PTO PING. Regression for the long-standing gap

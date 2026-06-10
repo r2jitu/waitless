@@ -78,7 +78,10 @@ impl AsyncEvent {
     /// owns the lifecycle so they can observe multiple sets without
     /// a race losing one.
     pub fn wait(&self) -> WaitEvent<'_> {
-        WaitEvent { event: self }
+        WaitEvent {
+            event: self,
+            registered: None,
+        }
     }
 
     fn lock(&self) {
@@ -115,10 +118,31 @@ impl AsyncEvent {
         }
         self.unlock();
     }
+
+    /// Clear the parked waker iff it is `w` (by `will_wake`). The
+    /// cancel-safety half of the single-waiter contract: a `WaitEvent`
+    /// dropped while parked removes exactly its own registration —
+    /// never a successor's (a later waiter's waker fails the
+    /// `will_wake` test and is left intact).
+    fn clear_waker_if(&self, w: &Waker) {
+        self.lock();
+        // SAFETY: lock held → exclusive access.
+        unsafe {
+            let slot = &mut *self.waker.get();
+            if slot.as_ref().is_some_and(|s| s.will_wake(w)) {
+                *slot = None;
+            }
+        }
+        self.unlock();
+    }
 }
 
 pub struct WaitEvent<'a> {
     event: &'a AsyncEvent,
+    /// The waker this future last parked, kept so `Drop` can
+    /// deregister exactly it (structural cancel-safety — see
+    /// `clear_waker_if`). `None` until the first `Pending` poll.
+    registered: Option<Waker>,
 }
 
 impl<'a> Future for WaitEvent<'a> {
@@ -132,9 +156,25 @@ impl<'a> Future for WaitEvent<'a> {
         // Register waker then re-check — closes the race where
         // `set()` lands between our fast-path load and the store.
         this.event.store_waker(cx.waker());
+        this.registered = Some(cx.waker().clone());
         if this.event.is_set() {
             return Poll::Ready(());
         }
         Poll::Pending
+    }
+}
+
+impl Drop for WaitEvent<'_> {
+    fn drop(&mut self) {
+        // Cancel-safety, structural rather than by-convention: a wait
+        // dropped while parked (`select!` losing branch, task abort)
+        // deregisters its own waker so no stale registration lingers.
+        // Precise via `will_wake`: a successor waiter that legitimately
+        // overwrote the slot (the documented sequential-waiter pattern)
+        // is untouched, and a wait resolved by `set()` finds the slot
+        // already taken — both no-ops.
+        if let Some(w) = self.registered.take() {
+            self.event.clear_waker_if(&w);
+        }
     }
 }
