@@ -377,18 +377,31 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
                 flags: TCP_SYN | TCP_ACK,
                 window: RX_RING_BYTES as u16,
             };
-            // RFC 7323 §2.3: echo a Window-Scale option in the SYN-ACK
+            // SYN-ACK options. We always advertise our own MSS
+            // (RFC 9293 §3.7.1) — it tells the peer the largest segment
+            // *we* can receive, so the peer sizes its uploads to us. A
+            // peer that gets no MSS option must assume the 536 (IPv4) /
+            // 1220 (IPv6) default and would send us needlessly small
+            // segments; this is the upload-side complement of honoring
+            // the peer's MSS (which sizes our downloads — see
+            // `parse_syn_options`). We advertise our local receive MSS;
+            // a small-MTU path's MSS-clamping middlebox rewrites it down
+            // in flight, exactly as it does the peer's.
+            //
+            // RFC 7323 §2.3: additionally echo a Window-Scale option
             // only when the peer's SYN carried one. We advertise
-            // `rcv_wscale = 0` — our 16 KiB RX ring never needs a scale
-            // factor — but emitting the option is what authorises the
-            // peer to scale the window *it* advertises, lifting `snd_wnd`
-            // past 64 KiB so a high-RTT download isn't capped at
-            // 64 KiB/RTT. Layout: NOP(1) + kind=3 + len=3 + shift=0,
-            // padded to a 4-byte boundary by the leading NOP.
+            // `rcv_wscale = 0` (our 16 KiB RX ring never needs a scale
+            // factor), but emitting it authorises the peer to scale the
+            // window *it* advertises, lifting `snd_wnd` past 64 KiB so a
+            // high-RTT download isn't capped at 64 KiB/RTT.
+            let [mss_hi, mss_lo] = (mss_for(c.local_ip) as u16).to_be_bytes();
             if c.wscale_ok {
-                send_segment_opts(&meta, &[], &[1u8, 3, 3, 0]);
+                // MSS(kind 2,len 4) + NOP(pad) + WS(kind 3,len 3) = 8 B
+                // (two 32-bit option words).
+                send_segment_opts(&meta, &[], &[2, 4, mss_hi, mss_lo, 1, 3, 3, 0]);
             } else {
-                send_segment(&meta, &[]);
+                // MSS only — 4 bytes (one option word).
+                send_segment_opts(&meta, &[], &[2, 4, mss_hi, mss_lo]);
             }
             crate::diag::COUNTERS.synack_tx.bump();
         }

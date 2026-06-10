@@ -1844,9 +1844,13 @@ fn no_window_scale_when_peer_does_not_offer() {
     super::listen_on_core(0, SP);
     let server_isn = handshake(SP, CP, CLIENT_ISN); // plain SYN, no options
 
-    assert!(
-        tcp_options(&tx()[0]).is_empty(),
-        "no WS echo in the SYN-ACK when the peer never offered scaling",
+    // The SYN-ACK always advertises our MSS (RFC 9293), but with no
+    // peer Window-Scale there is no WS option — just the 4-byte MSS.
+    // Harness is IPv4 ⇒ MSS_V4 = 1460 = 0x05B4.
+    assert_eq!(
+        tcp_options(&tx()[0]),
+        vec![2, 4, 0x05, 0xB4],
+        "SYN-ACK carries the MSS option only (no WS echo)",
     );
     let (_, wscale_ok, snd_wscale) = conn_window(CP, SP);
     assert!(!wscale_ok, "scaling stays disabled");
@@ -1922,6 +1926,41 @@ fn peer_mss_clamps_send_segment_size() {
         conn_snd_mss(CP, SP),
         1220,
         "send segment size clamped to the peer's advertised MSS",
+    );
+}
+
+/// RFC 9293 §3.7.1: the SYN-ACK advertises our own receive MSS so the
+/// peer sizes its uploads to us (the complement of honoring the peer's
+/// MSS for our downloads). Always present, even when the peer offered
+/// a Window-Scale option — then the blob is MSS + NOP + WS.
+#[test]
+fn synack_advertises_our_mss() {
+    let _g = harness();
+    const SP: u16 = 9321;
+    const CP: u16 = 50321;
+    const CLIENT_ISN: u32 = 0xBE00;
+    super::listen_on_core(0, SP);
+
+    // SYN with a Window-Scale option so the SYN-ACK carries both.
+    deliver_opts(
+        &Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN,
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            payload: Vec::new(),
+        },
+        &[1, 3, 3, 7],
+    );
+
+    // MSS(2,4,0x05,0xB4=1460) + NOP(1) + WS(3,3,0) — 8 bytes, 2 words.
+    let opts = tcp_options(&tx()[0]);
+    assert_eq!(
+        opts,
+        vec![2, 4, 0x05, 0xB4, 1, 3, 3, 0],
+        "SYN-ACK advertises MSS 1460 then echoes the WS option",
     );
 }
 
