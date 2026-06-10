@@ -200,6 +200,11 @@ pub enum HandshakeError {
     BadClientFinished,
     /// We received a record in a state that doesn't expect it.
     UnexpectedRecord,
+    /// The application traffic key has sealed its full RFC 8446 §5.5
+    /// AES-GCM record budget (`TrafficKey::SEAL_RECORD_LIMIT`); without
+    /// send-side KeyUpdate the connection must close rather than keep
+    /// encrypting past the confidentiality bound.
+    KeyExhausted,
     /// Internal bug: a buffer was too small (shouldn't happen with our
     /// fixed limits, but we return it instead of panicking so fuzzing
     /// input can't crash the server).
@@ -619,6 +624,12 @@ impl TlsServer {
             return Err(HandshakeError::UnexpectedRecord);
         }
         let tk = self.server_ap_tk.as_mut().ok_or(HandshakeError::Internal)?;
+        // RFC 8446 §5.5: refuse to seal past the AES-GCM per-key record
+        // budget — the caller treats this like any other TLS send failure
+        // and closes the connection (see `TrafficKey::SEAL_RECORD_LIMIT`).
+        if tk.seal_exhausted() {
+            return Err(HandshakeError::KeyExhausted);
+        }
         record::seal_chain(tk, content_type::APPLICATION_DATA, src_chain, dst).map_err(|e| e.into())
     }
 

@@ -92,6 +92,7 @@ fn error_str(e: &HandshakeError) -> &'static str {
         HandshakeError::TxBufTooSmall => "tx_buf_too_small",
         HandshakeError::BadClientFinished => "bad_client_finished",
         HandshakeError::UnexpectedRecord => "unexpected_record",
+        HandshakeError::KeyExhausted => "key_exhausted",
         HandshakeError::Internal => "internal",
     }
 }

@@ -246,6 +246,24 @@ impl Drop for TrafficKey {
 }
 
 impl TrafficKey {
+    /// RFC 8446 §5.5 confidentiality bound for AES-GCM: at most
+    /// ~2^24.5 full-size records may be encrypted under one key while
+    /// keeping a ~2^-57 safety margin. We cap at 2^24 (16.7M records —
+    /// conservative, margin ≈ 2^-58). With no send-side KeyUpdate
+    /// (tls-backlog TL-2) the conformant action at the cap is to stop
+    /// encrypting — `seal_app_data` refuses and the connection closes —
+    /// rather than erode the bound silently. 16.7M × 16 KiB ≈ 256 GiB
+    /// on one connection before this trips; a long-lived bulk conn can
+    /// legitimately get there, a request/response conn cannot.
+    pub const SEAL_RECORD_LIMIT: u64 = 1 << 24;
+
+    /// True once this key has sealed its full RFC 8446 §5.5 budget —
+    /// the caller must stop encrypting under it (close, or once TL-2
+    /// lands, KeyUpdate).
+    pub fn seal_exhausted(&self) -> bool {
+        self.seq >= Self::SEAL_RECORD_LIMIT
+    }
+
     /// Derive `(key, iv)` from a 32-byte traffic secret via
     /// `HKDF-Expand-Label(secret, "key"/"iv", "", …)`, then
     /// instantiate the `Aes128Gcm` cipher and discard the raw key.
@@ -684,5 +702,23 @@ mod tests {
         t.update(b"ServerHello");
         let s2 = t.snapshot();
         assert_ne!(s1, s2);
+    }
+
+    /// RFC 8446 §5.5: a traffic key reports exhaustion exactly at the
+    /// AES-GCM per-key record budget, and a key at the cap still seals
+    /// nothing implicitly — the *caller* enforces the refusal (see
+    /// `TlsServer::seal_app_data`), this pins the predicate they use.
+    #[test]
+    fn traffic_key_reports_seal_budget_exhaustion() {
+        let secret = [7u8; HASH_LEN];
+        let mut tk = TrafficKey::from_secret(&secret);
+        assert!(!tk.seal_exhausted(), "fresh key has full budget");
+        tk.seq = TrafficKey::SEAL_RECORD_LIMIT - 1;
+        assert!(!tk.seal_exhausted(), "one seal left at limit-1");
+        // The last in-budget seal pushes seq to the limit.
+        let mut data = [0u8; 16];
+        let _ = tk.seal(b"aad", &mut data);
+        assert_eq!(tk.seq, TrafficKey::SEAL_RECORD_LIMIT);
+        assert!(tk.seal_exhausted(), "budget spent after 2^24 seals");
     }
 }

@@ -310,6 +310,7 @@ fn err_name(e: &HandshakeError) -> &'static [u8] {
         HandshakeError::TxBufTooSmall => b"TxBufTooSmall",
         HandshakeError::BadClientFinished => b"BadClientFinished",
         HandshakeError::UnexpectedRecord => b"UnexpectedRecord",
+        HandshakeError::KeyExhausted => b"KeyExhausted",
         HandshakeError::Internal => b"Internal",
     }
 }
