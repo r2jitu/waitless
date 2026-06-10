@@ -872,6 +872,9 @@ impl Connection {
                             return Ok(());
                         }
                         self.data_received = self.data_received.saturating_add(conn_delta);
+                        // Track the newly-buffered bytes in the global
+                        // aggregate recv budget (#75 admission control).
+                        super::recv_buffered_add(conn_delta);
                         let s = self.recv_streams.get_mut(&stream_id).unwrap();
                         if frame_end > s.recv_high {
                             s.recv_high = frame_end;

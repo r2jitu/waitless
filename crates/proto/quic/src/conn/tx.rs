@@ -664,7 +664,12 @@ impl Connection {
             || self.peer_max_streams_bidi_advertised <= self.peer_bidi_streams_opened + REFILL_AT
             || self.peer_max_streams_uni_advertised <= self.peer_uni_streams_opened + REFILL_AT
             || self.force_max_data
-            || self.max_data_advertised.saturating_sub(self.data_consumed) <= MAX_DATA_WINDOW / 2
+            // MAX_DATA slide is gated on the aggregate recv budget (#75):
+            // while over budget we deliberately DON'T grant new credit,
+            // so don't claim 1-RTT work for it either (a `force_max_data`
+            // recovery still fires above). Mirrors the encode-side gate.
+            || (self.max_data_advertised.saturating_sub(self.data_consumed) <= MAX_DATA_WINDOW / 2
+                && !super::recv_buffer_over_budget())
         {
             return true;
         }
@@ -1119,17 +1124,25 @@ impl Connection {
         const MAX_DATA_WINDOW: u64 = crate::streams::INITIAL_MAX_DATA;
         let max_data_threshold =
             self.max_data_advertised.saturating_sub(self.data_consumed) <= MAX_DATA_WINDOW / 2;
-        // Emit on the half-window threshold, or when the peer signalled
-        // DATA_BLOCKED (re-advertise the current ceiling to recover a
-        // lost MAX_DATA). Only slide the ceiling on the threshold path.
-        if max_data_threshold || self.force_max_data {
-            if max_data_threshold {
-                // Clamp to the QUIC max varint (2^62-1) so a runaway
-                // ceiling can't make `write_varint` fail and tear the
-                // conn down — unreachable in practice (4.6 EB/conn).
-                self.max_data_advertised =
-                    (self.data_consumed + MAX_DATA_WINDOW).min((1u64 << 62) - 1);
-            }
+        // Slide the ceiling on the half-window threshold — but gated on
+        // the aggregate recv budget (#75 admission control): while the
+        // GLOBAL buffered-recv total is over budget we deliberately do
+        // NOT grant new credit, so the peer's remaining window shrinks
+        // toward zero as the app drains and it stops sending (graceful
+        // back-pressure), bounding total recv memory across all conns.
+        let slid = max_data_threshold && !super::recv_buffer_over_budget();
+        if slid {
+            // Clamp to the QUIC max varint (2^62-1) so a runaway
+            // ceiling can't make `write_varint` fail and tear the
+            // conn down — unreachable in practice (4.6 EB/conn).
+            self.max_data_advertised =
+                (self.data_consumed + MAX_DATA_WINDOW).min((1u64 << 62) - 1);
+        }
+        // Emit MAX_DATA when we slid, or when the peer signalled
+        // DATA_BLOCKED (`force_max_data` — re-advertise the *current*
+        // ceiling to recover a lost frame, no new credit). Over budget
+        // without a force ⇒ no frame, no churn.
+        if slid || self.force_max_data {
             append_max_data_into(out, self.max_data_advertised).map_err(|_| ConnError::Wire)?;
             self.force_max_data = false;
             ack_eliciting = true;

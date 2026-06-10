@@ -82,6 +82,99 @@ mod cfg;
 use keys::DirKeys;
 
 // ============================================================================
+// Aggregate receive-buffer budget (admission control, the #75 residual)
+// ============================================================================
+//
+// Per-conn receive flow control caps EACH connection's buffered (received-
+// but-undrained) bytes at the connection MAX_DATA window (8 MiB). The
+// per-worker conn-admission heap gate (inbox.rs) sheds NEW connections under
+// memory pressure. Neither bounds the AGGREGATE of already-established
+// connections each filling their window: 8192 conns × 8 MiB = 64 GiB ≫ heap.
+//
+// This is the global byte budget that closes that: one relaxed counter of
+// buffered recv bytes summed across all live QUIC connections. When it
+// exceeds `AGGREGATE_RECV_BUDGET`, the MAX_DATA grant stops sliding the
+// window forward, so peers' connection windows drain toward zero and they
+// stop sending (graceful flow-control back-pressure) — instead of growing
+// our buffers until the heap gate hard-refuses or OOM. As other connections
+// drain, the budget frees and crediting resumes.
+//
+// One global atomic, not per-worker: recv STREAM frames are not the hottest
+// path (per stream-frame, not per packet), the budget is soft, and a global
+// counter avoids any per-worker plumbing while still bounding total memory.
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Global ceiling on bytes buffered (received-but-undrained) across every
+/// live QUIC connection. ~256 MiB leaves generous room for a high upload
+/// fan-in (32 simultaneous full 8 MiB windows) while bounding total recv
+/// memory well under any production heap. Over budget ⇒ MAX_DATA stops
+/// sliding ⇒ back-pressure.
+pub(crate) const AGGREGATE_RECV_BUDGET: u64 = 256 * 1024 * 1024;
+
+static RECV_BUFFERED: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+mod recv_budget_tests {
+    use super::{
+        recv_buffer_over_budget, recv_buffered_add, recv_buffered_now, recv_buffered_sub,
+        AGGREGATE_RECV_BUDGET,
+    };
+
+    // The counter is a process-global static; one test (not several)
+    // so parallel test threads don't race on it. Nothing else in the
+    // suite touches `RECV_BUFFERED`, so starting from 0 is sound.
+    #[test]
+    fn add_sub_threshold_and_saturation() {
+        assert_eq!(recv_buffered_now(), 0, "no other test touches the budget");
+        // Exactly at budget is NOT over; one past trips.
+        recv_buffered_add(AGGREGATE_RECV_BUDGET);
+        assert!(!recv_buffer_over_budget(), "exactly at budget is not over");
+        recv_buffered_add(1);
+        assert!(recv_buffer_over_budget(), "one past budget trips");
+        // Release everything; back to 0, not over.
+        recv_buffered_sub(AGGREGATE_RECV_BUDGET + 1);
+        assert_eq!(recv_buffered_now(), 0);
+        assert!(!recv_buffer_over_budget());
+        // Over-subtracting floors at 0 (no wrap to u64::MAX).
+        recv_buffered_sub(1_000_000);
+        assert_eq!(recv_buffered_now(), 0);
+    }
+}
+
+/// Add `n` newly-buffered recv bytes to the global aggregate.
+#[inline]
+pub(crate) fn recv_buffered_add(n: u64) {
+    RECV_BUFFERED.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Remove `n` bytes from the global aggregate (drained by the app, or
+/// freed when a connection holding them is dropped). Saturating so a
+/// double-subtract can't wrap the counter into a huge value.
+#[inline]
+pub(crate) fn recv_buffered_sub(n: u64) {
+    if n != 0 {
+        // `fetch_update` with a saturating floor at 0 — relaxed is fine
+        // (soft budget; single-writer-per-conn keeps drift bounded).
+        let _ = RECV_BUFFERED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(n))
+        });
+    }
+}
+
+/// Whether the aggregate recv buffer is over budget — the gate read by the
+/// MAX_DATA grant.
+#[inline]
+pub(crate) fn recv_buffer_over_budget() -> bool {
+    RECV_BUFFERED.load(Ordering::Relaxed) > AGGREGATE_RECV_BUDGET
+}
+
+/// Current aggregate (for `/obs`).
+#[inline]
+pub(crate) fn recv_buffered_now() -> u64 {
+    RECV_BUFFERED.load(Ordering::Relaxed)
+}
+
+// ============================================================================
 // Errors
 // ============================================================================
 
@@ -1070,6 +1163,12 @@ pub struct Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // Release any still-buffered (received-but-undrained) bytes from
+        // the global aggregate recv budget — their `recv_streams` buffers
+        // are freed with this connection. `data_received - data_consumed`
+        // is exactly what `recv_buffered_add` charged and `..._sub` hasn't
+        // released yet.
+        recv_buffered_sub(self.data_received.saturating_sub(self.data_consumed));
         // Bump the counter unconditionally, log only at events
         // verbosity (matches the existing `conns_allocated` event).
         // Pairing those two log lines line-for-line in the serial
@@ -1629,8 +1728,10 @@ impl Connection {
             Some(s) => {
                 let r = s.drain(out);
                 // Count drained bytes toward conn-level flow control so
-                // the MAX_DATA pull-emission can slide the window up.
+                // the MAX_DATA pull-emission can slide the window up, and
+                // release them from the global aggregate recv budget.
                 self.data_consumed += r.0 as u64;
+                recv_buffered_sub(r.0 as u64);
                 r
             }
             None => (0, false),
@@ -1659,8 +1760,10 @@ impl Connection {
             }
             // Discarded bytes are consumed too — credit them at the
             // conn level so a chatty peer uni stream (QPACK encoder)
-            // can't exhaust the connection window over a long session.
+            // can't exhaust the connection window over a long session,
+            // and release them from the global aggregate recv budget.
             self.data_consumed += total;
+            recv_buffered_sub(total);
         }
     }
 

@@ -873,7 +873,7 @@ pub fn should_log_event() -> bool {
 /// Snapshot of every drop / event counter, for `/quic_stats`-style
 /// dumps. Returns `(name, value)` pairs in declaration order,
 /// including the four AEAD throughput counters.
-pub fn snapshot() -> [(&'static str, u64); 62] {
+pub fn snapshot() -> [(&'static str, u64); 63] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.get()),
@@ -911,6 +911,10 @@ pub fn snapshot() -> [(&'static str, u64); 62] {
         ("recv_streams_created", c.recv_streams_created.get()),
         ("stream_limit_exceeded", c.stream_limit_exceeded.get()),
         ("conn_admit_pressure", c.conn_admit_pressure.get()),
+        // Gauge (not a counter): current aggregate buffered recv bytes
+        // across all live conns — nonzero-and-near-AGGREGATE_RECV_BUDGET
+        // means the #75 flow-control back-pressure is engaging.
+        ("recv_buffered_bytes", crate::conn::recv_buffered_now()),
         ("send_streams_created", c.send_streams_created.get()),
         ("streams_reaped", c.streams_reaped.get()),
         ("inbox_full_drops", c.inbox_full_drops.get()),

@@ -145,13 +145,18 @@ Ordered by foundational-ness; each is separable and testable.
    established (sampled every 64 admits so the allocator lock stays off the
    per-Initial path; `conn_admit_pressure` /obs counter). The QUIC recv-stream
    COUNT is separately capped (8192 live/conn + RFC 9000 §4.6 MAX_STREAMS,
-   landed in the #67 hardening). *Residual, deferred:* a true **aggregate
-   recv-byte budget** (the partial-upload-fill case — a handful of conns each
-   filling large windows isn't bounded by an admission gate that only sheds
-   *new* conns) and **concurrency-based MAX_STREAMS credit** (grant on
-   closed-count, not the monotonic opened high-watermark, so the advertised
-   limit itself stays bounded — today the 8192 live-stream cap is the
-   backstop).
+   landed in the #67 hardening). ✅ *aggregate recv-byte budget landed (2026-06-09):* one global
+   relaxed counter of buffered (received-but-undrained) bytes across all live
+   QUIC conns (`conn::RECV_BUFFERED`, fed at ingest / drain / conn-drop). Over
+   `AGGREGATE_RECV_BUDGET` (256 MiB) the MAX_DATA grant stops sliding the
+   conn window forward, so peers' windows drain to zero and they stop sending
+   (graceful flow-control back-pressure) — bounding the partial-upload-fill
+   case the admission gate (which only sheds *new* conns) can't. Inert under
+   normal load (a single upload buffers ≤ 8 MiB ≪ 256 MiB); `recv_buffered_bytes`
+   gauge in /obs. *Still deferred:* **concurrency-based MAX_STREAMS credit**
+   (grant on closed-count, not the monotonic opened high-watermark) — a
+   refinement of the advertised-limit honesty, not a memory hole, since the
+   #67 8192 live-recv-stream cap already bounds stream-count memory.
 
 ## What this branch delivers vs. leaves
 
