@@ -530,6 +530,11 @@ impl Connection {
             .aead_open_bytes
             .add((payload_end - payload_start) as u64);
         crate::diag::COUNTERS.aead_open_packets.bump();
+        // This 1-RTT packet authenticated — bump the per-conn counter
+        // the conn task uses to gate connection migration (RFC 9000
+        // §9.3). Placed after the AEAD `?` above so it can never
+        // advance on a forged/undecryptable datagram.
+        self.authenticated_pkts = self.authenticated_pkts.wrapping_add(1);
 
         let payload = &buf[payload_start..payload_end];
         self.dispatch_frames(CryptoLevel::OneRtt, payload)?;

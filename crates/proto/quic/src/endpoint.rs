@@ -122,6 +122,23 @@ fn ship_datagram_inner(
     crate::diag::COUNTERS.datagrams_sent.bump();
 }
 
+/// RFC 9000 §9.3 connection-migration gate: is a datagram whose source
+/// is (`src_ip`, `src_port`) arriving on a *different* path than the
+/// current TX target (`cur_ip`, `cur_port`)? `false` for the very first
+/// datagram (`cur_ip == V4_ANY` — we haven't learned where to reply
+/// yet) and for the established path. When `true`, the conn task must
+/// NOT redirect TX to the new source until a packet from it
+/// authenticates — otherwise an off-path attacker who knows the
+/// cleartext DCID could redirect our traffic by spoofing the source.
+fn is_path_migration(
+    cur_ip: waitless::runtime::IpAddr,
+    cur_port: u16,
+    src_ip: waitless::runtime::IpAddr,
+    src_port: u16,
+) -> bool {
+    cur_ip != waitless::runtime::IpAddr::V4_ANY && (cur_ip != src_ip || cur_port != src_port)
+}
+
 /// Flush a connection's queued outbound packets to the wire. With egress
 /// scheduling on (`egress_guard` is `Some`), just mark the flow ready — the
 /// per-core drain ships it in DRR order at the FLUSH step. Off, drain the
@@ -992,8 +1009,19 @@ where
         let mut current = Some(dgram);
         let mut processed = 0usize;
         while let Some(d) = current.take() {
-            peer_ip.set(d.src_ip);
-            peer_port.set(d.src_port);
+            // RFC 9000 §9.3: follow the peer's source address for TX on
+            // the established path or the first datagram (we must learn
+            // where to reply); for a *new* source, defer the switch
+            // until a packet from it authenticates — see below. This
+            // closes an off-path traffic-redirection: the DCID is
+            // cleartext, so a spoofed undecryptable datagram must not be
+            // able to point our TX at the attacker.
+            let migrating = is_path_migration(peer_ip.get(), peer_port.get(), d.src_ip, d.src_port);
+            if !migrating {
+                peer_ip.set(d.src_ip);
+                peer_port.set(d.src_port);
+            }
+            let auth_before = conn.borrow().authenticated_pkts;
             // Performance pillar: how long this datagram waited in
             // the inbox (listener `recv_from` → here), and the
             // arrival time the conn carries forward so a request's
@@ -1012,6 +1040,15 @@ where
                 c.set_cur_rx_us(rx_us);
                 c.process_datagram(&mut bytes, &cfg)
             };
+            // RFC 9000 §9.3: now that the datagram has been processed,
+            // migrate TX to the new source ONLY if a 1-RTT packet from
+            // it authenticated (the per-conn counter advanced) — a
+            // forged datagram can't bump it, so it can't redirect us.
+            if migrating && conn.borrow().authenticated_pkts > auth_before {
+                peer_ip.set(d.src_ip);
+                peer_port.set(d.src_port);
+                crate::diag::COUNTERS.path_migrations.bump();
+            }
             // Hand the buffer back to the listener's recycle pool
             // — kept-alive QUIC conns under refresh-spam pattern see
             // 5-8 inbound datagrams per fetch, each 1500 B; without
@@ -1221,6 +1258,25 @@ mod tests {
         buf.push(0x01);
         let dcid = extract_dcid(&buf).unwrap();
         assert_eq!(&dcid[..], &[0xa1; 8]);
+    }
+
+    /// RFC 9000 §9.3 migration gate: the established path and the very
+    /// first datagram are never treated as migrations (so the TX address
+    /// is set normally); any genuinely-new source IS, so the conn task
+    /// defers the TX switch until a packet from it authenticates.
+    #[test]
+    fn path_migration_gate_classifies_new_sources() {
+        use waitless::runtime::{IpAddr, Ipv4Addr};
+        let a = IpAddr::V4(Ipv4Addr::from(10, 0, 0, 1));
+        let b = IpAddr::V4(Ipv4Addr::from(10, 0, 0, 2));
+        // First datagram — no current path yet — is not a migration.
+        assert!(!is_path_migration(IpAddr::V4_ANY, 0, a, 1111));
+        // The established path (same ip+port) is not a migration.
+        assert!(!is_path_migration(a, 1111, a, 1111));
+        // A different source IP is a migration.
+        assert!(is_path_migration(a, 1111, b, 1111));
+        // Same IP, different source port is also a path change.
+        assert!(is_path_migration(a, 1111, a, 2222));
     }
 
     #[test]

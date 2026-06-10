@@ -408,6 +408,11 @@ pub struct Counters {
     /// (successful decrypts only; failed opens bump
     /// `aead_decrypt_failed`).
     pub aead_open_packets: Counter,
+    /// Connection migrations (RFC 9000 §9.3): the TX peer address was
+    /// switched to a new source after a packet from it authenticated
+    /// (NAT rebind / network change). Gated on authentication, so a
+    /// spoofed datagram can't trigger it.
+    pub path_migrations: Counter,
 }
 
 impl Counters {
@@ -476,6 +481,7 @@ impl Counters {
             pkts_no_stream: Counter::new(),
             aead_open_bytes: Counter::new(),
             aead_open_packets: Counter::new(),
+            path_migrations: Counter::new(),
         }
     }
 }
@@ -878,7 +884,7 @@ pub fn should_log_event() -> bool {
 /// Snapshot of every drop / event counter, for `/quic_stats`-style
 /// dumps. Returns `(name, value)` pairs in declaration order,
 /// including the four AEAD throughput counters.
-pub fn snapshot() -> [(&'static str, u64); 64] {
+pub fn snapshot() -> [(&'static str, u64); 65] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.get()),
@@ -957,6 +963,7 @@ pub fn snapshot() -> [(&'static str, u64); 64] {
         ("pkts_no_stream", c.pkts_no_stream.get()),
         ("aead_open_bytes", c.aead_open_bytes.get()),
         ("aead_open_packets", c.aead_open_packets.get()),
+        ("path_migrations", c.path_migrations.get()),
     ]
 }
 

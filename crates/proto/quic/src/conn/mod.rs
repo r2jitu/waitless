@@ -988,6 +988,15 @@ pub struct Connection {
     /// `true` once the peer has proven they hold the source
     /// address (received a Handshake packet from them).
     pub(super) path_validated: bool,
+    /// Count of 1-RTT packets we've successfully AEAD-opened. Bumped
+    /// only *after* a packet authenticates, so it cannot advance on a
+    /// forged/spoofed datagram. The conn task gates connection
+    /// migration (following the peer's source address for TX) on this
+    /// advancing — RFC 9000 §9.3: an endpoint MUST NOT change the
+    /// address it sends to based on an unauthenticated packet, or an
+    /// off-path attacker who knows the (cleartext) DCID could redirect
+    /// our traffic by spoofing the source address.
+    pub(super) authenticated_pkts: u64,
 
     // ── RTT estimator (RFC 9002 §5) ───────────────────────────────
     //
@@ -1320,6 +1329,7 @@ impl Connection {
             bytes_received_pre_validation: 0,
             bytes_sent_pre_validation: 0,
             path_validated: false,
+            authenticated_pkts: 0,
             latest_rtt_us: None,
             min_rtt_us: None,
             smoothed_rtt_us: None,
