@@ -1278,7 +1278,7 @@ fn accept_listen_backlog(
                     let mut maxsockbuf: i32 = 0;
                     let mut msz = std::mem::size_of::<i32>();
                     let have_max = libc::sysctlbyname(
-                        b"kern.ipc.maxsockbuf\0".as_ptr() as *const _,
+                        c"kern.ipc.maxsockbuf".as_ptr(),
                         &mut maxsockbuf as *mut _ as *mut _,
                         &mut msz,
                         std::ptr::null_mut(),

@@ -431,7 +431,6 @@ pub(super) fn handle_tcp(family: IpFamily, tcp: &[u8]) {
         port: u16,
         guest_port: u16,
         seq: u32,
-        ack: u32,
         state: ConnState,
     }
     let snap = {
@@ -473,7 +472,6 @@ pub(super) fn handle_tcp(family: IpFamily, tcp: &[u8]) {
             port: c.src_port,
             guest_port: c.guest_port,
             seq: c.my_seq,
-            ack: c.peer_ack,
             state: c.state,
         };
         // Update state eagerly (before dropping lock).
@@ -582,8 +580,8 @@ pub(super) fn handle_tcp(family: IpFamily, tcp: &[u8]) {
                 // ACK the guest's FIN *and* any data the same segment
                 // carried. The server coalesces FIN onto the last data
                 // segment for a small `Connection: close` response, so
-                // the ack must cover `payload.len() + 1`. `snap.ack`
-                // predates this segment, so `snap.ack + 1` under-acks a
+                // the ack must cover `payload.len() + 1`. A `peer_ack`
+                // snapshot taken before this segment would under-ack a
                 // data+FIN by the payload length — leaving the guest in
                 // FinWait waiting for an ack that never comes, so the
                 // conn never frees (fresh-conn workloads then leaked
