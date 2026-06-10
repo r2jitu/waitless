@@ -3733,6 +3733,196 @@ fn enter_timewait(server_port: u16, client_port: u16, client_isn: u32) -> u32 {
     server_isn
 }
 
+// ── .pkt mini-DSL — packetdrill-style scenario interpreter ───────────
+//
+// A line-based text format for scripting a TCP conformance scenario
+// against this harness, so a case can be written as readable text
+// rather than hand-built `Seg` structs. One directive per line:
+//
+//   # comment            — ignored (also blank lines)
+//   listen               — start listening on the server port
+//   send <flags> [seq=E] [ack=E] [win=N] [data=ascii]
+//                        — deliver one client→server segment
+//   recv <flags> [ack=E] [win=N]
+//                        — assert the server sent exactly one matching
+//                          segment; captures its seq into $isn
+//   recv-none            — assert the server sent nothing
+//   advance <N>ms        — advance the mock clock N milliseconds
+//
+// `<flags>` is `|`-joined SYN/ACK/FIN/RST/PSH. A numeric expr `E` is a
+// decimal or `0x`hex literal, the symbol `$isn` (the server's last
+// captured seq), or either of those `+N`. `run_pkt(cp, sp, script)`
+// executes it, panicking with the 1-based line number on the first
+// mismatch — the panic IS the test failure.
+
+/// Interpreter state: the two ports the script operates on, plus the
+/// last seq the server sent (captured by `recv`, referenced as `$isn`).
+struct PktState {
+    cp: u16,
+    sp: u16,
+    isn: u32,
+}
+
+/// Parse a TCP flag list like `SYN|ACK` into the wire bits.
+fn pkt_flags(s: &str, line: usize) -> u8 {
+    let mut f = 0u8;
+    for part in s.split('|') {
+        f |= match part.trim() {
+            "SYN" => TCP_SYN,
+            "ACK" => TCP_ACK,
+            "FIN" => TCP_FIN,
+            "RST" => TCP_RST,
+            "PSH" => TCP_PSH,
+            other => panic!(".pkt line {line}: unknown flag {other:?}"),
+        };
+    }
+    f
+}
+
+/// Parse a bare numeric literal — decimal or `0x`-prefixed hex.
+fn pkt_num(s: &str, line: usize) -> u32 {
+    let s = s.trim();
+    let r = if let Some(hex) = s.strip_prefix("0x") {
+        u32::from_str_radix(hex, 16)
+    } else {
+        s.parse::<u32>()
+    };
+    r.unwrap_or_else(|_| panic!(".pkt line {line}: bad number {s:?}"))
+}
+
+/// Evaluate a numeric expression: `$isn`, a literal, or either `+N`.
+fn pkt_eval(tok: &str, st: &PktState, line: usize) -> u32 {
+    let (base_s, add) = match tok.split_once('+') {
+        Some((a, b)) => (a, pkt_num(b, line)),
+        None => (tok, 0),
+    };
+    let base = if base_s.trim() == "$isn" {
+        st.isn
+    } else {
+        pkt_num(base_s, line)
+    };
+    base.wrapping_add(add)
+}
+
+/// Run a `.pkt` script against the harness. Caller holds `harness()`.
+fn run_pkt(cp: u16, sp: u16, script: &str) {
+    let mut st = PktState { cp, sp, isn: 0 };
+    for (idx, raw) in script.lines().enumerate() {
+        let line = idx + 1;
+        // Strip a trailing comment, then trim.
+        let text = raw.split('#').next().unwrap().trim();
+        if text.is_empty() {
+            continue;
+        }
+        let mut words = text.split_whitespace();
+        let cmd = words.next().unwrap();
+        match cmd {
+            "listen" => {
+                super::listen_on_core(0, sp);
+            }
+            "advance" => {
+                let arg = words.next().unwrap_or_else(|| panic!(".pkt line {line}: advance needs <N>ms"));
+                let ms = arg
+                    .strip_suffix("ms")
+                    .unwrap_or_else(|| panic!(".pkt line {line}: advance arg must end in ms"));
+                kernel_core::clock::mock::advance(pkt_num(ms, line) as u64);
+            }
+            "recv-none" => {
+                let frames = tx();
+                assert!(frames.is_empty(), ".pkt line {line}: expected no segment, got {}", frames.len());
+            }
+            "send" => {
+                let flags = pkt_flags(words.next().unwrap_or_else(|| panic!(".pkt line {line}: send needs flags")), line);
+                let mut seg = Seg {
+                    src_port: st.cp,
+                    dst_port: st.sp,
+                    seq: 0,
+                    ack: 0,
+                    flags,
+                    window: 65535,
+                    payload: Vec::new(),
+                };
+                for kv in words {
+                    let (k, v) = kv.split_once('=').unwrap_or_else(|| panic!(".pkt line {line}: bad arg {kv:?}"));
+                    match k {
+                        "seq" => seg.seq = pkt_eval(v, &st, line),
+                        "ack" => seg.ack = pkt_eval(v, &st, line),
+                        "win" => seg.window = pkt_num(v, line) as u16,
+                        "data" => seg.payload = v.as_bytes().to_vec(),
+                        other => panic!(".pkt line {line}: unknown send field {other:?}"),
+                    }
+                }
+                clear_tx();
+                deliver(&seg);
+            }
+            "recv" => {
+                let want = pkt_flags(words.next().unwrap_or_else(|| panic!(".pkt line {line}: recv needs flags")), line);
+                let frames = tx();
+                assert_eq!(frames.len(), 1, ".pkt line {line}: expected exactly one segment, got {}", frames.len());
+                let h = tcp_hdr(&frames[0]);
+                assert_eq!(h.flags, want, ".pkt line {line}: flags mismatch");
+                for kv in words {
+                    let (k, v) = kv.split_once('=').unwrap_or_else(|| panic!(".pkt line {line}: bad arg {kv:?}"));
+                    match k {
+                        "ack" => assert_eq!(h.ack, pkt_eval(v, &st, line), ".pkt line {line}: ack mismatch"),
+                        "seq" => assert_eq!(h.seq, pkt_eval(v, &st, line), ".pkt line {line}: seq mismatch"),
+                        other => panic!(".pkt line {line}: unknown recv field {other:?}"),
+                    }
+                }
+                // Capture the server's seq for later `$isn` references.
+                st.isn = h.seq;
+            }
+            other => panic!(".pkt line {line}: unknown directive {other:?}"),
+        }
+    }
+}
+
+/// A full three-way handshake + a data exchange, expressed entirely in
+/// the `.pkt` DSL and run through `run_pkt` — proves the interpreter
+/// drives the real stack (handshake, ISN capture via `$isn`, data ACK).
+#[test]
+fn pkt_handshake_and_data() {
+    let _g = harness();
+    const CP: u16 = 50190;
+    const SP: u16 = 9190;
+    run_pkt(
+        CP,
+        SP,
+        r#"
+        # Three-way handshake.
+        listen
+        send SYN seq=0x1000
+        recv SYN|ACK ack=0x1001      # captures the server ISN into $isn
+        send ACK seq=0x1001 ack=$isn+1
+        # A data segment is acknowledged past its bytes.
+        send ACK|PSH seq=0x1001 ack=$isn+1 data=hello
+        recv ACK ack=0x1006          # 0x1001 + len("hello")
+        "#,
+    );
+}
+
+/// The DSL's `advance` + `recv-none` directives: a bare ACK on an idle
+/// established connection elicits nothing, and the clock can be moved.
+#[test]
+fn pkt_advance_and_recv_none() {
+    let _g = harness();
+    const CP: u16 = 50191;
+    const SP: u16 = 9191;
+    run_pkt(
+        CP,
+        SP,
+        r#"
+        listen
+        send SYN seq=0x2000
+        recv SYN|ACK ack=0x2001
+        send ACK seq=0x2001 ack=$isn+1
+        advance 200ms
+        send ACK seq=0x2001 ack=$isn+1   # bare dup ACK, no data
+        recv-none
+        "#,
+    );
+}
+
 // ---- rtx_queue per-entry behaviour --------------------------------------
 //
 // Pin the queue's per-entry behaviour — head-pop, partial-narrow,
