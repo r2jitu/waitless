@@ -276,7 +276,7 @@ TSecr into the RTT estimator, and add the PAWS drop check.
 **Test.** Assert Timestamps are echoed; a wrapped-sequence old segment is
 dropped by PAWS; the RTT estimator consumes TSecr.
 
-### T7 — SACK (RFC 2018) + RFC 6675 loss recovery — receiver-side ✅ done; sender-side RFC 6675 pending
+### T7 — SACK (RFC 2018) + RFC 6675 loss recovery ✅ done (correctness; netem throughput A/B pending)
 
 **Status — receiver-side (RFC 2018) done.** `SACK-Permitted` is now
 negotiated (parsed from the peer's SYN, echoed in the SYN-ACK only when
@@ -289,18 +289,17 @@ us retransmits only the holes. Hot-path-neutral: no SACK option unless
 `sack_permitted_negotiated_and_blocks_emitted` and
 `no_sack_when_peer_does_not_permit`.
 
-**Pending — sender-side (RFC 6675).** We do not yet *parse* SACK blocks
-off incoming ACKs to drive our own selective retransmit — when **we**
-send (the common server case) and the peer SACKs, recovery still falls
-back to RTO / fast-retransmit one hole at a time. This is the
-golden-path-risky half (it changes the retransmit queue's
-hole-detection) and wants `tc netem` multi-hole-loss validation, so it
-is split out as the follow-up. **Effort: M (down from L — receiver
-half landed).**
-
-**Test (done).** Out-of-order arrival → assert correct SACK blocks.
-**Test (pending).** Scripted multi-hole loss → assert only the holes
-are retransmitted.
+**Status — sender-side (RFC 6675) done (correctness).** We now parse
+the peer's SACK blocks off incoming ACKs (`parse_sack_blocks`), mark the
+covered retransmit-queue entries (`RtxEntry::sacked` / `apply_sack`),
+and on the 3rd-dup-ACK fast retransmit fill every un-SACKed hole below
+the highest SACK in one pass (`sack_retransmit_holes`) — skipping SACKed
+ranges and data above the highest SACK. RTO clears the scoreboard
+(reneging safety). Bounded by the window + gated on `sack_ok` &
+SACK-present, so the clean path is byte-identical. Deterministically
+unit-tested (`sack_fast_retransmit_fills_only_the_holes`). **GCE/netem
+multi-hole-loss THROUGHPUT A/B still pending** (correctness is unit-
+pinned, like T3).
 
 ### T8 — An out-of-window segment should be ACKed, not dropped silently ✅ done
 
