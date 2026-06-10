@@ -260,6 +260,10 @@ struct H2Conn {
     out_chain: IOBufChain,
     /// Responses being framed onto the wire, FIFO.
     out_queue: VecDeque<StreamOut>,
+    /// Recycled `header_block` backings from retired `StreamOut`s (≤
+    /// [`HEADER_BLOCK_POOL_CAP`]) — `queue_response` pops one instead of
+    /// allocating per response.
+    header_block_pool: Vec<Vec<u8>>,
     /// Streaming request streams — one spawned handler task each, fed by
     /// a `StreamBody` the demux pushes DATA into. The body path for
     /// every request that carries one.
@@ -294,17 +298,49 @@ struct H2Conn {
     closing: bool,
 }
 
+/// Size of the lazily-allocated HPACK value scratch — one max-size
+/// header value (matches the 16 KiB the buffer always was).
+const VALUE_SCRATCH_LEN: usize = 16 * 1024;
+
+/// Cap on the recycled `header_block` Vec backings (one per retired
+/// `StreamOut`); beyond it the Vec just drops. A keep-alive conn holds
+/// ~one block per in-flight response.
+const HEADER_BLOCK_POOL_CAP: usize = 8;
+
 impl H2Conn {
+    /// Ensure the HPACK value scratch exists (lazy — see `new`). `Err` on
+    /// heap exhaustion; the caller maps it to a connection error instead
+    /// of aborting the kernel via the alloc-error handler.
+    fn ensure_value_scratch(&mut self) -> Result<(), ()> {
+        if self.value_scratch.is_empty() {
+            if self
+                .value_scratch
+                .try_reserve_exact(VALUE_SCRATCH_LEN)
+                .is_err()
+            {
+                return Err(());
+            }
+            self.value_scratch.resize(VALUE_SCRATCH_LEN, 0);
+        }
+        Ok(())
+    }
+
     fn new() -> Self {
         H2Conn {
             hpack: hpack::Decoder::new(HEADER_TABLE_SIZE, MAX_HEADER_LIST_SIZE),
             inbuf: Vec::with_capacity(4096),
             name_scratch: alloc::vec![0u8; 256],
-            value_scratch: alloc::vec![0u8; 16 * 1024],
+            // Lazy: the 16 KiB value scratch is the single biggest piece of
+            // the eager per-conn h2 heap, and the unified `https` listener
+            // constructs an `H2Conn` for *every* TLS connection — including
+            // the h1.1-ALPN majority that never decodes a HEADERS frame.
+            // Sized on first decode (`ensure_value_scratch`).
+            value_scratch: Vec::new(),
             ctrl_out: Vec::new(),
             frame_buf: Vec::new(),
             out_chain: IOBufChain::new(),
             out_queue: VecDeque::new(),
+            header_block_pool: Vec::new(),
             streams: Vec::new(),
             resp_sink: Rc::new(RefCell::new(VecDeque::new())),
             demux_wake: Rc::new(AsyncEvent::new()),
@@ -392,10 +428,22 @@ impl H2Conn {
         }
     }
 
+    /// Return a retired `StreamOut`'s header-block backing to the pool
+    /// so the next response reuses it instead of allocating.
+    fn recycle_header_block(&mut self, mut block: Vec<u8>) {
+        if block.capacity() > 0 && self.header_block_pool.len() < HEADER_BLOCK_POOL_CAP {
+            block.clear();
+            self.header_block_pool.push(block);
+        }
+    }
+
     /// Frame a finished `Response` onto `out_queue` (headers + body),
     /// honouring the per-stream initial send window.
     fn queue_response(&mut self, sid: u32, resp: Response<'static>) {
-        let mut header_block = Vec::with_capacity(64);
+        let mut header_block = self
+            .header_block_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(64));
         let __e0 = now_cycles();
         encode_response_headers(&resp, &mut header_block);
         crate::diag::COUNTERS
@@ -452,8 +500,10 @@ impl H2Conn {
                 let fl = flags::END_HEADERS | if end_stream { flags::END_STREAM } else { 0 };
                 frame::push_frame(hdr_buf, ftype::HEADERS, fl, item.id, &item.header_block);
                 item.headers_sent = true;
-                if end_stream {
-                    self.out_queue.remove(idx);
+                if end_stream
+                    && let Some(so) = self.out_queue.remove(idx)
+                {
+                    self.recycle_header_block(so.header_block);
                 }
                 continue;
             }
@@ -488,13 +538,17 @@ impl H2Conn {
                 }
                 item.send_window -= n as i64;
                 self.conn_send_window -= n as i64;
-                if finishes {
-                    self.out_queue.remove(idx);
+                if finishes
+                    && let Some(so) = self.out_queue.remove(idx)
+                {
+                    self.recycle_header_block(so.header_block);
                 }
                 continue;
             }
             // Headers sent and no body left — shouldn't linger; drop it.
-            self.out_queue.remove(idx);
+            if let Some(so) = self.out_queue.remove(idx) {
+                self.recycle_header_block(so.header_block);
+            }
         }
     }
 
@@ -1035,9 +1089,22 @@ async fn flush<S: HttpStream>(conn: &mut H2Conn, stream: &mut S) -> Result<(), (
     // buffered ones — independent streams, so wire order is free.
     conn.drain_streaming(&mut hdr_buf);
     // Trailing accumulated header / inline-body bytes become the final
-    // (and, for an all-small flush, only) contiguous chain part.
+    // (and, for an all-small flush, only) contiguous chain part — shipped
+    // as a Borrowed view over `frame_buf` itself (the `record_scratch`
+    // pattern from `listen.rs::send_one_record`), not a heap copy.
+    //
+    // SAFETY: `hdr_buf` IS `conn.frame_buf` (taken above, restored just
+    // below — moving the Vec does not move its heap storage). Nothing
+    // writes `frame_buf` again until the next `flush` call, and the
+    // borrow ends inside THIS call: `send` is awaited to completion and
+    // `chain.clear()` below drops any undrained part (the send-error
+    // case) before `flush` returns. On the TLS path the bytes are sealed
+    // (copied) into the record scratch; on a plain-TCP path the rtx
+    // retain `into_owned`s the Borrowed part before `send` returns.
     if !hdr_buf.is_empty() {
-        chain.push_back(IOBuf::from_slice_with_headroom(0, &hdr_buf[..], 0));
+        let n = hdr_buf.len() as u32;
+        let ptr = unsafe { core::ptr::NonNull::new_unchecked(hdr_buf.as_mut_ptr()) };
+        chain.push_back(unsafe { IOBuf::borrow(ptr, n, 0, n) });
     }
     conn.frame_buf = hdr_buf;
     crate::diag::COUNTERS
@@ -1048,6 +1115,10 @@ async fn flush<S: HttpStream>(conn: &mut H2Conn, stream: &mut S) -> Result<(), (
         return Ok(());
     }
     let r = stream.send(&mut chain).await;
+    // End the frame_buf borrow before returning — on success `send`
+    // drained the chain (this is a no-op); on error it drops the
+    // residual parts so no Borrowed view outlives this flush.
+    chain.clear();
     conn.out_chain = chain;
     r
 }
@@ -1253,6 +1324,11 @@ where
 {
     let mut req = RequestHead::new();
     let __d0 = now_cycles();
+    // First HEADERS on this conn materializes the 16 KiB value scratch
+    // (lazy — the h1.1-ALPN majority of TLS conns never get here).
+    if conn.ensure_value_scratch().is_err() {
+        return Err(error::INTERNAL_ERROR);
+    }
     let malformed = {
         let mut sink = RequestSink {
             req: &mut req,
