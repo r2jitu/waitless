@@ -337,6 +337,19 @@ async fn handle_request(req: &mut Request<'_>, res: &mut Response<'_>) -> Result
         res.set(probe);
         return Ok(());
     }
+    // The h1-CLIENT truth endpoint: a real fetch (request writer →
+    // response parser → body framing) over plain TCP or client TLS.
+    // `/fetch-probe?ip=A.B.C.D&port=N[&path=/x][&tls=0|1][&pin=hex64]`.
+    // Boxed: the fetch future stacks a whole client connection
+    // (TLS client state pump + parser + body reader) — keeping it
+    // inline would bloat EVERY handler invocation's state machine
+    // (and the stack temporaries that build it) for the sake of a
+    // cold dev probe. `Box::pin` confines that to the probe path.
+    if let Some(query) = req.path().strip_prefix(b"/fetch-probe") {
+        let probe = alloc::boxed::Box::pin(fetch_probe_response(query)).await;
+        res.set(probe);
+        return Ok(());
+    }
     res.set(match req.path() {
         // ── HTML pages ───────────────────────────────────────────
         b"/" => page_home(),

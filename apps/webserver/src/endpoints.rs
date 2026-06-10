@@ -543,6 +543,18 @@ fn parse_decimal(s: &[u8], max: u32) -> Option<u32> {
     Some(v)
 }
 
+/// Parse a dotted-quad `A.B.C.D` into octets. `None` on any
+/// missing/malformed/extra part. Shared by `/connect-probe` and
+/// `/fetch-probe`.
+fn parse_ipv4(v: &[u8]) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut parts = v.split(|&b| b == b'.');
+    for slot in &mut out {
+        *slot = parse_decimal(parts.next()?, 255)? as u8;
+    }
+    parts.next().is_none().then_some(out)
+}
+
 /// Parse `?ip=A.B.C.D&port=N` (fields in either order; unknown keys
 /// ignored). `None` on any missing/malformed field or port 0.
 fn parse_probe_query(query: &[u8]) -> Option<(waitless::runtime::IpAddr, u16)> {
@@ -551,19 +563,7 @@ fn parse_probe_query(query: &[u8]) -> Option<(waitless::runtime::IpAddr, u16)> {
     let mut port: Option<u16> = None;
     for kv in query.split(|&b| b == b'&') {
         if let Some(v) = kv.strip_prefix(b"ip=") {
-            let mut out = [0u8; 4];
-            let mut parts = v.split(|&b| b == b'.');
-            let mut ok = true;
-            for slot in &mut out {
-                match parts.next().and_then(|p| parse_decimal(p, 255)) {
-                    Some(o) => *slot = o as u8,
-                    None => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            octets = (ok && parts.next().is_none()).then_some(out);
+            octets = parse_ipv4(v);
         } else if let Some(v) = kv.strip_prefix(b"port=") {
             port = parse_decimal(v, 65535).and_then(|p| (p > 0).then_some(p as u16));
         }
@@ -618,6 +618,215 @@ pub(crate) async fn connect_probe_response(query: &[u8]) -> Response<'static> {
             None => {
                 status = 502;
                 let _ = w.write_str("probe failed at deadline: no verdict within 4s\n");
+            }
+        }
+    }
+    let mut res = Response::ok(&b"text/plain; charset=utf-8"[..], body);
+    res.status(status);
+    res
+}
+
+// ---- /fetch-probe — real h1-client truth endpoint ----------------------------
+//
+// Where `/connect-probe` proves the raw TCP client path (connect +
+// hand-rolled bytes), `/fetch-probe` proves the REAL HTTP/1.1 client:
+// `http::client::http_get` over plain TCP, or `http2::https_get` over
+// the client TLS stream (SPKI pin via `&pin=hex64`, else the loudly-
+// named `InsecureSkipVerify` — acceptable for a dev probe, never for
+// production fetches). Reports `status= bytes= sha256=` of the bounded
+// body on success, or `502` naming the failing stage
+// (`resolve` / `connect` / `tls` / `parse` / `io` / `deadline`).
+
+/// Body cap for the probe fetch.
+const FETCH_BODY_CAP: usize = 256 * 1024;
+/// Overall fetch deadline — connect (incl. the 3 s ARP budget) +
+/// handshake + transfer of up to 256 KiB.
+const FETCH_DEADLINE_US: u64 = 8_000_000;
+/// Cap on the probed path length.
+const FETCH_PATH_MAX: usize = 128;
+
+struct FetchProbeQuery {
+    ip: waitless::runtime::IpAddr,
+    port: u16,
+    path_buf: [u8; FETCH_PATH_MAX],
+    path_len: usize,
+    tls: bool,
+    pin: Option<[u8; 32]>,
+}
+
+impl FetchProbeQuery {
+    fn path(&self) -> &[u8] {
+        &self.path_buf[..self.path_len]
+    }
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parse a 64-hex-char SPKI pin into 32 bytes.
+fn parse_hex32(s: &[u8]) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = (hex_nibble(s[2 * i])? << 4) | hex_nibble(s[2 * i + 1])?;
+    }
+    Some(out)
+}
+
+/// Parse `?ip=A.B.C.D&port=N[&path=/x][&tls=0|1][&pin=hex64]`.
+/// `path` defaults to `/` and must be origin-form (leading `/`); no
+/// percent-decoding (dev probe). `None` on any malformed field.
+fn parse_fetch_query(query: &[u8]) -> Option<FetchProbeQuery> {
+    let query = query.strip_prefix(b"?")?;
+    let mut octets: Option<[u8; 4]> = None;
+    let mut port: Option<u16> = None;
+    let mut path_buf = [0u8; FETCH_PATH_MAX];
+    path_buf[0] = b'/';
+    let mut path_len = 1usize;
+    let mut tls = false;
+    let mut pin: Option<[u8; 32]> = None;
+    for kv in query.split(|&b| b == b'&') {
+        if let Some(v) = kv.strip_prefix(b"ip=") {
+            octets = parse_ipv4(v);
+        } else if let Some(v) = kv.strip_prefix(b"port=") {
+            port = parse_decimal(v, 65535).and_then(|p| (p > 0).then_some(p as u16));
+        } else if let Some(v) = kv.strip_prefix(b"path=") {
+            if v.is_empty() || v.len() > FETCH_PATH_MAX || v[0] != b'/' {
+                return None;
+            }
+            path_buf[..v.len()].copy_from_slice(v);
+            path_len = v.len();
+        } else if let Some(v) = kv.strip_prefix(b"tls=") {
+            tls = match v {
+                b"0" => false,
+                b"1" => true,
+                _ => return None,
+            };
+        } else if let Some(v) = kv.strip_prefix(b"pin=") {
+            pin = Some(parse_hex32(v)?);
+        }
+    }
+    Some(FetchProbeQuery {
+        ip: waitless::runtime::IpAddr::V4(waitless::runtime::Ipv4Addr {
+            addr: u32::from_ne_bytes(octets?),
+        }),
+        port: port?,
+        path_buf,
+        path_len,
+        tls,
+        pin,
+    })
+}
+
+/// Map a connect error to the probe stage name (`resolve` covers the
+/// pre-connect routing/ARP half, like `/connect-probe`).
+fn connect_stage(e: &waitless::runtime::TcpConnectError) -> &'static str {
+    use waitless::runtime::TcpConnectError as E;
+    match e {
+        E::NoRoute | E::HostUnreachable => "resolve",
+        E::Refused | E::TimedOut | E::Failed => "connect",
+    }
+}
+
+fn fetch_stage(e: &http::client::FetchError) -> &'static str {
+    use http::client::FetchError as F;
+    match e {
+        F::Parse(_) | F::Interim => "parse",
+        F::Send | F::ClosedBeforeResponse => "io",
+    }
+}
+
+fn body_stage(e: &http::client::BodyError) -> &'static str {
+    use http::client::BodyError as B;
+    match e {
+        B::Chunked(_) => "parse",
+        B::Truncated | B::TooLarge => "io",
+    }
+}
+
+/// Run the fetch: `(status, body_len, sha256)` on success, or the
+/// failing `(stage, detail)` pair.
+async fn run_fetch(
+    q: &FetchProbeQuery,
+) -> Result<(u16, usize, [u8; 32]), (&'static str, alloc::string::String)> {
+    let (head, bytes) = if q.tls {
+        // Entropy by value, like every TLS connection we originate.
+        let mut seed = [0u8; 32];
+        waitless::rng::fill_bytes(&mut seed);
+        // No pin ⇒ InsecureSkipVerify: this is a dev probe — the
+        // point is reachability + protocol truth, not authentication.
+        let auth = match q.pin {
+            Some(p) => tls::ServerAuth::PinnedSpki(p),
+            None => tls::ServerAuth::InsecureSkipVerify,
+        };
+        http2::https_get(q.ip, q.port, b"probe", q.path(), auth, seed, FETCH_BODY_CAP)
+            .await
+            .map_err(|e| match e {
+                http2::HttpsGetError::Connect(c) => (connect_stage(&c), alloc::format!("{c:?}")),
+                http2::HttpsGetError::Tls(t) => ("tls", alloc::format!("{t:?}")),
+                http2::HttpsGetError::Fetch(f) => (fetch_stage(&f), alloc::format!("{f:?}")),
+                http2::HttpsGetError::Body(b) => (body_stage(&b), alloc::format!("{b:?}")),
+            })?
+    } else {
+        http::client::http_get(q.ip, q.port, b"probe", q.path(), FETCH_BODY_CAP)
+            .await
+            .map_err(|e| match e {
+                http::client::GetError::Connect(c) => {
+                    (connect_stage(&c), alloc::format!("{c:?}"))
+                }
+                http::client::GetError::Fetch(f) => (fetch_stage(&f), alloc::format!("{f:?}")),
+                http::client::GetError::Body(b) => (body_stage(&b), alloc::format!("{b:?}")),
+            })?
+    };
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok((head.status, bytes.len(), digest))
+}
+
+/// `GET /fetch-probe?ip=A.B.C.D&port=N[&path=/x][&tls=0|1][&pin=hex64]`
+/// — issue a REAL HTTP/1.1 request with the client stack (plain TCP,
+/// or TLS via the client handshake + SPKI pin). `200` with
+/// `status=<code> bytes=<n> sha256=<hex16-prefix>` of the (≤ 256 KiB)
+/// body, or `502` naming the failing stage.
+pub(crate) async fn fetch_probe_response(query: &[u8]) -> Response<'static> {
+    let Some(q) = parse_fetch_query(query) else {
+        let mut res = Response::ok(
+            &b"text/plain; charset=utf-8"[..],
+            &b"usage: /fetch-probe?ip=A.B.C.D&port=N[&path=/x][&tls=0|1][&pin=hex64]\n"[..],
+        );
+        res.status(400);
+        return res;
+    };
+    let outcome = waitless::runtime::timeout_us(FETCH_DEADLINE_US, run_fetch(&q)).await;
+    let mut body = http::body_iobuf(512);
+    let mut status = 200;
+    {
+        let mut w = body.writer();
+        match outcome {
+            Some(Ok((code, n, digest))) => {
+                let _ = write!(w, "status={code} bytes={n} sha256=");
+                for b in &digest[..8] {
+                    let _ = write!(w, "{b:02x}");
+                }
+                let _ = w.write_str("\n");
+            }
+            Some(Err((stage, detail))) => {
+                status = 502;
+                let _ = write!(w, "fetch failed at {stage}: {detail}\n");
+            }
+            None => {
+                status = 502;
+                let _ = w.write_str("fetch failed at deadline: no verdict within 8s\n");
             }
         }
     }

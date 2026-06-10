@@ -16,6 +16,7 @@ launcher hides the per-runner specifics.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import socket
 import ssl
@@ -24,6 +25,7 @@ import sys
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from scripts.test_helpers import (
     PtyLauncher,
@@ -89,11 +91,41 @@ if not (LAUNCHER.is_file() and os.access(LAUNCHER, os.X_OK)):
     sys.exit(f"ERROR: launcher missing / not executable: {LAUNCHER}")
 
 
+# ---- /fetch-probe fixture server --------------------------------------------
+# A tiny host-side HTTP server the guest's REAL h1 client fetches from
+# via `/fetch-probe`. Multi-segment (~7 KiB) but modest, so the HVF
+# runner's toy outbound-TCP proxy handles it comfortably.
+FETCH_FIXTURE_BODY = b"waitless-fetch-probe-fixture\n" * 256
+
+
+class _FetchFixtureHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(FETCH_FIXTURE_BODY)))
+        self.end_headers()
+        self.wfile.write(FETCH_FIXTURE_BODY)
+
+    def log_message(self, *args) -> None:
+        pass  # keep test output clean
+
+
 class WebserverServiceTest(unittest.TestCase):
     """Boot once, probe the HTTP / HTTPS / UDP paths while the server stays up."""
 
     @classmethod
     def setUpClass(cls) -> None:
+        # Host-side fixture server for `/fetch-probe` (guest-outbound
+        # real-h1-client fetches). Bound to an ephemeral loopback port;
+        # the guest reaches it via the gateway mapping (10.0.2.2 →
+        # host loopback) on VM runners, or directly on native.
+        cls.fetch_srv = ThreadingHTTPServer(("127.0.0.1", 0), _FetchFixtureHandler)
+        cls.fetch_srv_port = cls.fetch_srv.server_address[1]
+        cls.fetch_srv_thread = threading.Thread(
+            target=cls.fetch_srv.serve_forever, daemon=True
+        )
+        cls.fetch_srv_thread.start()
+
         cls.launcher = spawn_backgrounded(
             LAUNCHER,
             env=_launcher_env(PORT, TLS_PORT, UDP_PORT, TCP_ECHO_PORT),
@@ -110,6 +142,9 @@ class WebserverServiceTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls.launcher.cleanup()
+        cls.fetch_srv.shutdown()
+        cls.fetch_srv.server_close()
+        cls.fetch_srv_thread.join(timeout=3.0)
 
     # ── HTTP ─────────────────────────────────────────────────────
     def test_http_root(self) -> None:
@@ -163,6 +198,90 @@ class WebserverServiceTest(unittest.TestCase):
         # The server must still be fully alive afterwards.
         status, _ = http_get("/health", port=PORT)
         self.assertEqual(status, 200)
+
+    # ── /fetch-probe — the REAL h1 client (client arc phase C) ──
+    def _fetch_probe_target_ip(self) -> str:
+        """Where the guest finds the host-side fixture server: VM
+        runners route via the gateway (10.0.2.2 maps to host loopback
+        in both the HVF runner's outbound-TCP proxy and QEMU slirp);
+        the native binary IS on the host."""
+        return "127.0.0.1" if "native" in LAUNCHER_NAME else "10.0.2.2"
+
+    def _skip_unless_outbound_fetch_runner(self) -> None:
+        # Success-path guest-outbound fetches are validated on the
+        # representative runners (HVF's outbound proxy + native's host
+        # stack). TCG is slow and its slirp outbound path isn't part
+        # of the supported test topology.
+        if "qemu" in LAUNCHER_NAME or "iso" in LAUNCHER_NAME:
+            self.skipTest(
+                f"guest-outbound fetch covered on hvf/native; launcher={LAUNCHER_NAME}"
+            )
+
+    def test_fetch_probe_bad_query_is_400(self) -> None:
+        status, body = http_get("/fetch-probe?ip=1.2.3&port=80", port=PORT)
+        self.assertEqual(status, 400, body)
+        self.assertIn(b"usage:", body)
+
+    def test_fetch_probe_plain_real_fetch(self) -> None:
+        """End-to-end REAL HTTP/1.1 client: the guest connects out to
+        the host fixture server, writes a real request, parses the
+        real response (status line + headers + Content-Length body),
+        and reports the body hash. Pins the whole client stack —
+        request writer → response parser → body framing — against a
+        real, foreign HTTP server (python's http.server)."""
+        self._skip_unless_outbound_fetch_runner()
+        ip = self._fetch_probe_target_ip()
+        status, body = http_get(
+            f"/fetch-probe?ip={ip}&port={self.fetch_srv_port}&path=/fixture",
+            port=PORT,
+            timeout=12.0,
+        )
+        self.assertEqual(status, 200, body)
+        digest = hashlib.sha256(FETCH_FIXTURE_BODY).hexdigest()[:16]
+        expect = f"status=200 bytes={len(FETCH_FIXTURE_BODY)} sha256={digest}".encode()
+        self.assertEqual(body.strip(), expect)
+
+    def test_fetch_probe_tls_against_plain_port_fails_at_tls(self) -> None:
+        """`tls=1` against a NON-TLS port must fail cleanly at the
+        `tls` stage (the python server answers the ClientHello with
+        HTTP bytes / a close — either way the handshake dies, never
+        wedges, and the unikernel stays healthy). No TLS peer is
+        reachable from the HVF guest, so this clean-502 is the locally
+        testable half; REAL TLS E2E (tls=1 + pin against a live TLS
+        server) is the GCE step — see the native-only test below for
+        the in-tree full-TLS path."""
+        self._skip_unless_outbound_fetch_runner()
+        ip = self._fetch_probe_target_ip()
+        status, body = http_get(
+            f"/fetch-probe?ip={ip}&port={self.fetch_srv_port}&path=/fixture&tls=1",
+            port=PORT,
+            timeout=12.0,
+        )
+        self.assertEqual(status, 502, body)
+        self.assertTrue(body.startswith(b"fetch failed at tls"), body)
+        # The serving side must still be fully alive afterwards.
+        status, _ = http_get("/health", port=PORT)
+        self.assertEqual(status, 200)
+
+    def test_fetch_probe_tls_e2e_against_self_native(self) -> None:
+        """Full h1-over-TLS client E2E: on the native runner the
+        webserver can dial its own HTTPS port over host loopback, so
+        `tls=1` (insecure — dev probe, no pin passed) runs the real
+        client handshake + ALPN http/1.1 + fetch against the real
+        server. VM runners can't reach their own listener (the HVF
+        proxy refuses loop-back-through-the-host flows), hence
+        native-only; cross-machine TLS E2E is the GCE step."""
+        if "native" not in LAUNCHER_NAME:
+            self.skipTest(
+                f"self-fetch over TLS needs host loopback; launcher={LAUNCHER_NAME}"
+            )
+        status, body = http_get(
+            f"/fetch-probe?ip=127.0.0.1&port={TLS_PORT}&path=/health&tls=1",
+            port=PORT,
+            timeout=12.0,
+        )
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body.startswith(b"status=200 bytes="), body)
 
     # ── HTTPS ────────────────────────────────────────────────────
     # The HTML pages all flow through `shell_body` in main.rs, which
