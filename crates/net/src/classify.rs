@@ -161,7 +161,23 @@ pub fn owner(parsed: &ParsedL3, frame: &[u8], num_cores: u32) -> u32 {
     } else {
         (0, 0)
     };
-    match (parsed.src, parsed.dst) {
+    flow_owner(parsed.src, parsed.dst, src_port, dst_port, num_cores)
+}
+
+/// Map a raw TCP/UDP 4-tuple to its owning core — THE software flow
+/// hash, shared by the Tier-2 RX distributor ([`owner`], which feeds
+/// it the parsed inbound frame) and TCP's client-side ephemeral-port
+/// picker (`tcp::ephemeral`, which iterates candidate local ports
+/// until the tuple hashes back to the connecting core). One function
+/// so the two can never disagree: a port chosen at connect time is
+/// guaranteed to route the peer's replies to the connecting core on
+/// every software-distributed (single-queue) path.
+///
+/// The tuple is oriented as an INBOUND frame carries it: `src` = the
+/// remote peer, `dst` = us, `src_port` = the peer's port, `dst_port`
+/// = our local port.
+pub fn flow_owner(src: IpAddr, dst: IpAddr, src_port: u16, dst_port: u16, num_cores: u32) -> u32 {
+    match (src, dst) {
         (IpAddr::V4(s), IpAddr::V4(d)) => {
             flow_hash_v4(s.addr, d.addr, src_port, dst_port, num_cores)
         }
