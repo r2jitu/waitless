@@ -111,7 +111,8 @@ res.finish().await
 connection** — the read and the write both need the stream. The serve
 loop resolves that without a read/write split (unsound on TLS): it wraps
 the borrowed stream in a per-connection `RefCell` shared by the body
-source and the response sink (see [Phase 1d]). The handler uses them
+source and the response sink (the `CellSource`/`CellSink` duplex,
+phase 1d in the ledger below). The handler uses them
 sequentially — `read_chunk` returns *owned* bytes, releasing the stream
 before `res.write` re-borrows it — so the two never overlap, and a
 single per-conn task is the cell's only borrower. Bounded `O(chunk)`
@@ -223,7 +224,7 @@ path and (b) a multi-waiter conn wakeup for h3.
 
 The bounded-memory + large-transfer-correctness proof must run on GCE —
 HVF's userspace TCP proxy lies about both. The standing recipe (used for
-Phase 1c above, scriptable as `scripts/bounded-stream-validate.sh` driven from
+the bounded-stream phases, scriptable as `scripts/bounded-stream-validate.sh` driven from
 `kvm-vm`): for the h1 path, stream/echo a payload far larger than any
 per-request budget while sampling `/obs` `heap_allocated_bytes`
 mid-transfer — a bounded path grows live heap by `O(chunk)` (kilobytes
@@ -237,4 +238,3 @@ the work counters are the tie-breaker). h2/h3 bounded streaming
 (correct, `O(body)`), so don't point the >RAM `/stream` at them.
 
 [Contract 3]: stack-architecture.md (One handler API)
-[Phase 1d]: #phased-plan
