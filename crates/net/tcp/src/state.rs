@@ -224,6 +224,10 @@ pub(crate) struct RtxEntry {
     /// Number of transmissions this entry has been through. >0 means
     /// retransmitted (Karn's rule: don't sample RTT from this entry).
     pub(crate) tx_count: u8,
+    /// RFC 6675: the peer SACKed this segment's range, so it has been
+    /// delivered out of order — don't retransmit it; it's not a hole.
+    /// Set by `apply_sack`, cleared when the entry is (re)sent or on RTO.
+    pub(crate) sacked: bool,
 }
 
 pub struct TcpConnection {
@@ -943,6 +947,7 @@ impl TcpConnection {
             len,
             first_tx_ms: now_ms,
             tx_count: 1,
+            sacked: false,
         });
         self.rtx_bytes_in_flight = self.rtx_bytes_in_flight.saturating_add(len as u32);
         if was_empty && self.rtx_deadline_ms == 0 {
@@ -1285,6 +1290,12 @@ impl TcpConnection {
         // to one segment. Done before the `rtx_backoff` bump below so
         // `rtx_backoff == 0` still marks that first timeout.
         self.congestion_on_rto();
+        // RFC 6675: an RTO means deep loss (or the peer reneged on its
+        // SACKs). Drop the SACK scoreboard so recovery re-learns it from
+        // fresh ACKs rather than skipping a range the peer no longer has.
+        for e in self.rtx_queue.iter_mut() {
+            e.sacked = false;
+        }
         self.retransmit_oldest_segment();
         // §5.5: back the RTO off exponentially, capped at the ceiling.
         self.rtx_backoff = self.rtx_backoff.saturating_add(1);
@@ -1464,6 +1475,102 @@ impl TcpConnection {
     /// duplicates are missing, and inflate `cwnd` to
     /// `ssthresh + 3·SMSS` — each of the three duplicate ACKs implies
     /// a segment that has left the network.
+    /// RFC 6675: mark every retransmit-queue entry fully covered by an
+    /// inbound SACK block as delivered, so loss recovery doesn't waste a
+    /// retransmit on it. `blocks` are absolute `[left, right)` sequence
+    /// ranges (above `snd_una`). Returns `true` if any entry was newly
+    /// marked. Only fully-covered entries are marked (a partial overlap
+    /// is left un-SACKed — conservative, and segments are usually block-
+    /// aligned anyway).
+    pub(crate) fn apply_sack(&mut self, blocks: &[(u32, u32)]) -> bool {
+        let mut changed = false;
+        for e in self.rtx_queue.iter_mut() {
+            if e.sacked {
+                continue;
+            }
+            let e_end = e.seq_start.wrapping_add(e.len as u32);
+            for &(l, r) in blocks {
+                // [seq_start, e_end) ⊆ [l, r): seq_start >= l AND r >= e_end.
+                if !seq_lt(e.seq_start, l) && !seq_lt(r, e_end) {
+                    e.sacked = true;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Retransmit one queue entry (≤ `snd_mss` bytes from its own
+    /// `seq_start`) — the SACK-recovery analogue of
+    /// `retransmit_oldest_segment` for an arbitrary, non-head entry.
+    fn emit_rtx_entry(&mut self, idx: usize) {
+        let mss = self.snd_mss as usize;
+        let (n, seq, scratch) = {
+            let Some(e) = self.rtx_queue.get_mut(idx) else {
+                return;
+            };
+            let n = (e.len as usize).min(mss);
+            if n == 0 {
+                return;
+            }
+            let mut scratch = [0u8; MSS_MAX];
+            scratch[..n].copy_from_slice(&e.iobuf.data()[..n]);
+            e.tx_count = e.tx_count.saturating_add(1);
+            (n, e.seq_start, scratch)
+        };
+        send_segment(
+            &SegmentMeta {
+                local_ip: self.local_ip,
+                dst_ip: self.remote_ip,
+                src_port: self.local_port,
+                dst_port: self.remote_port,
+                seq,
+                ack: self.rcv_nxt,
+                flags: TCP_ACK | TCP_PSH,
+                window: self.rx_free() as u16,
+            },
+            &scratch[..n],
+        );
+        // Karn's algorithm: a retransmit makes the outstanding RTT
+        // sample ambiguous.
+        self.rtt_anchor_active = false;
+    }
+
+    /// RFC 6675 loss recovery: retransmit every un-SACKed hole *below*
+    /// the highest SACKed sequence in one pass — filling all the holes
+    /// in ~one RTT instead of one per RTT. Entries above the highest
+    /// SACK are left alone (they may still be in flight). Bounded by the
+    /// window, so it can't storm; RTO remains the backstop.
+    fn sack_retransmit_holes(&mut self) {
+        let base = self.snd_una;
+        // Highest SACKed right edge, as an offset from snd_una so the
+        // comparison is wrapping-safe (all offsets are small + positive
+        // within the send window).
+        let Some(highest_off) = self
+            .rtx_queue
+            .iter()
+            .filter(|e| e.sacked)
+            .map(|e| e.seq_start.wrapping_add(e.len as u32).wrapping_sub(base))
+            .max()
+        else {
+            return;
+        };
+        for i in 0..self.rtx_queue.len() {
+            let e = &self.rtx_queue[i];
+            if e.sacked {
+                continue;
+            }
+            let off = e.seq_start.wrapping_sub(base);
+            // Only entries that start before the highest SACK are
+            // inferred-lost holes; the high bit set means below snd_una
+            // (shouldn't happen for a live entry) — skip it.
+            if off & 0x8000_0000 == 0 && off < highest_off {
+                self.emit_rtx_entry(i);
+            }
+        }
+    }
+
     fn fast_retransmit(&mut self) {
         // Loss signalled by the 3rd dup ACK: halve the window into recovery
         // (net_cc `on_loss(persistent=false)` → ssthresh = cwnd/2, cwnd =
@@ -1473,7 +1580,15 @@ impl TcpConnection {
         // (RFC 6582/9002). Behavioral delta #4 vs RFC 5681 — GCE netem-loss
         // A/B confirmed no recovery-throughput regression.
         self.cc.on_loss(0, false);
-        self.retransmit_oldest_segment();
+        // RFC 6675: when the peer has SACKed data, fill ALL the holes
+        // below the highest SACK in one pass; otherwise the classic
+        // single-segment fast retransmit. SACK-present only, so the
+        // clean (no-loss) path is untouched.
+        if self.sack_ok && self.rtx_queue.iter().any(|e| e.sacked) {
+            self.sack_retransmit_holes();
+        } else {
+            self.retransmit_oldest_segment();
+        }
         self.cwnd = self.cc.window();
     }
 

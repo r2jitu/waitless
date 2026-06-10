@@ -252,6 +252,46 @@ fn parse_syn_options(opts: &[u8]) -> SynOptions {
     out
 }
 
+/// Extract the RFC 2018 SACK blocks (option kind 5) the peer reported
+/// in an ACK's options into `out` as `(left, right)` absolute-sequence
+/// pairs; returns the count. Used by RFC 6675 sender-side loss recovery.
+fn parse_sack_blocks(opts: &[u8], out: &mut [(u32, u32)]) -> usize {
+    let mut i = 0;
+    while i < opts.len() {
+        match opts[i] {
+            0 => break,  // End of Option List
+            1 => i += 1, // No-Operation
+            5 => {
+                let Some(&len) = opts.get(i + 1) else { break };
+                let len = len as usize;
+                if len < 2 {
+                    break;
+                }
+                let end = (i + len).min(opts.len());
+                let mut j = i + 2;
+                let mut n = 0;
+                while j + 8 <= end && n < out.len() {
+                    let l = u32::from_be_bytes([opts[j], opts[j + 1], opts[j + 2], opts[j + 3]]);
+                    let r = u32::from_be_bytes([opts[j + 4], opts[j + 5], opts[j + 6], opts[j + 7]]);
+                    out[n] = (l, r);
+                    n += 1;
+                    j += 8;
+                }
+                return n;
+            }
+            _ => {
+                let Some(&len) = opts.get(i + 1) else { break };
+                let len = len as usize;
+                if len < 2 {
+                    break;
+                }
+                i += len;
+            }
+        }
+    }
+    0
+}
+
 /// Process an incoming TCP packet. Called on the owning core (via flow hash).
 /// `src_ip` and `dst_ip` are family-tagged so v4 and v6 connections
 /// share the same TCB pool, hash table, and dispatch path.
@@ -744,6 +784,22 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
         // `LastAck` branch above already `return`ed — the connection
         // is gone, so it is correctly skipped here.)
         c.rtx_on_ack(old_una);
+        // RFC 6675: fold any SACK blocks the peer reported into the
+        // retransmit scoreboard BEFORE the dup-ACK handling below, so a
+        // fast retransmit triggered by the 3rd dup-ACK fills every hole
+        // below the highest SACK (and skips already-delivered ranges).
+        if c.sack_ok && data_offset > 20 {
+            let mut blocks = [(0u32, 0u32); 4];
+            let n = segment
+                .iter()
+                .next()
+                .and_then(|first| first.data().get(20..data_offset))
+                .map(|opts| parse_sack_blocks(opts, &mut blocks))
+                .unwrap_or(0);
+            if n > 0 {
+                c.apply_sack(&blocks[..n]);
+            }
+        }
         // RFC 5681 §3.2 fast retransmit / fast recovery: a duplicate
         // ACK advances the dup-ACK count (the third triggers an
         // immediate retransmit without waiting for the RTO); any ACK

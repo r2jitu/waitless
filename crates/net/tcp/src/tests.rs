@@ -908,6 +908,96 @@ fn no_sack_when_peer_does_not_permit() {
     );
 }
 
+/// RFC 6675 (T7 sender-side SACK): with SACK negotiated, the dup-ACK
+/// path folds the peer's SACK blocks into the retransmit scoreboard, so
+/// the fast retransmit fills *every* un-SACKed hole below the highest
+/// SACK in one pass and skips the ranges the peer already has.
+#[test]
+fn sack_fast_retransmit_fills_only_the_holes() {
+    let _g = harness();
+    const SP: u16 = 9178;
+    const CP: u16 = 50178;
+    const CLIENT_ISN: u32 = 0xC100;
+    super::listen_on_core(0, SP);
+
+    // Handshake WITH SACK-Permitted so `sack_ok` is set.
+    deliver_opts(
+        &Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN,
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            payload: Vec::new(),
+        },
+        &[4, 2, 1, 1],
+    );
+    let server_isn = tcp_hdr(&tx()[0]).seq;
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    let (handle, generation) = conn_handle(CP, SP);
+    let base = server_isn.wrapping_add(1); // snd_una / first data seq
+
+    // Send five 100-byte segments → five retransmit-queue entries at
+    // base+0, +100, +200, +300, +400.
+    clear_tx();
+    for i in 0..5 {
+        let mut chain = iobuf::IOBufChain::from(alloc::vec![b'a' + i as u8; 100]);
+        super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    }
+    assert_eq!(tx().len(), 5, "five distinct segments on the wire");
+
+    // A dup-ACK at snd_una carrying a SACK option covering segments 2
+    // ([base+100,+200)) and 4 ([base+300,+400)) — so 1, 3, 5 are holes.
+    let sack = {
+        let mut o = alloc::vec![1u8, 1, 5, 18]; // NOP,NOP,kind=5,len=2+16
+        for (l, r) in [
+            (base.wrapping_add(100), base.wrapping_add(200)),
+            (base.wrapping_add(300), base.wrapping_add(400)),
+        ] {
+            o.extend_from_slice(&l.to_be_bytes());
+            o.extend_from_slice(&r.to_be_bytes());
+        }
+        o
+    };
+    let dup = Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: base,
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    };
+    deliver_opts(&dup, &sack);
+    deliver_opts(&dup, &sack);
+    clear_tx();
+    deliver_opts(&dup, &sack); // 3rd dup-ACK → SACK fast retransmit
+
+    // Exactly the two un-SACKed holes below the highest SACK (base+400)
+    // are retransmitted: segment 1 (seq base) and segment 3 (base+200).
+    // Segments 2 and 4 (SACKed) and 5 (above the highest SACK) are not.
+    let rtx = tx();
+    let seqs: Vec<u32> = rtx.iter().map(|f| tcp_hdr(f).seq).collect();
+    assert_eq!(rtx.len(), 2, "only the two holes are retransmitted, got {seqs:?}");
+    assert!(seqs.contains(&base), "hole at segment 1 retransmitted");
+    assert!(seqs.contains(&base.wrapping_add(200)), "hole at segment 3 retransmitted");
+    assert!(!seqs.contains(&base.wrapping_add(100)), "SACKed segment 2 not retransmitted");
+    assert!(!seqs.contains(&base.wrapping_add(300)), "SACKed segment 4 not retransmitted");
+    assert!(
+        !seqs.contains(&base.wrapping_add(400)),
+        "segment 5 above the highest SACK not retransmitted",
+    );
+}
+
 /// A duplicate segment wholly below `rcv_nxt` (the peer never saw
 /// our ACK and retransmitted) elicits an immediate bare ACK still
 /// pointing at `rcv_nxt` — the fast-retransmit signal, with no
