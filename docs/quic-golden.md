@@ -1,5 +1,22 @@
 # QUIC golden-path revamp — zero-copy, GSO/GRO, crypto
 
+> **Status: shipped.** This is the QUIC **bulk-throughput** results doc:
+> the pacing-cap fix (~8–10× h3 downloads), HW UDP-GSO on DQO, the
+> upload-reassembly cliff fix, and the cross-env before/after matrix.
+> The **small-response** (h3 /health) cost is root-caused separately and
+> more thoroughly in [`h3-health-cycle-profile.md`](h3-health-cycle-profile.md)
+> — that doc owns the latency/CPU/refutation story; the duplicate
+> write-up that used to live here was removed. Per-mechanism plan state:
+> the rx/tx trackers + [`gvnic.md`](gvnic.md) (which owns the
+> GSO-is-DQO-only device fact).
+>
+> **The one durable ceiling fact:** QUIC single-conn bulk plateaus at
+> **~1.2 Gbps on every NIC** = the per-packet AEAD+HP CPU cost (QUIC has
+> no TSO equivalent on gve); the 8–10× win came from raising the
+> low-RTT **pacing cap**, not from GSO (GSO is an aggregate/CPU win, not
+> single-conn). So bulk is crypto-bound, small-response is
+> orchestration-bound — two different ceilings.
+
 Goal: make QUIC/HTTP3 a throughput-competitive golden path alongside TCP/TLS/HTTP1.1,
 across gve-DQO (c3), gve-GQI (n2), virtio-net (kvm-qemu + HVF), without regressing
 TCP/TLS, unifying the TX-offload machinery for maintainability.
@@ -289,87 +306,22 @@ AES-NI — Intel ISA-L, Go #42726) for bulk; blocked on enabling AVX-512 XSAVE
 state in the kernel boot path (`limine_entry.rs` XCR0 mask) — a larger effort,
 and bulk is already egress-bandwidth-capped so the ROI is unclear.
 
-## h3 /health bottleneck — profiled to root cause (branch `quic-h3-health-profile`)
+## h3 /health small-response cost — see h3-health-cycle-profile.md
 
-Added per-phase cycle brackets to the QUIC hot path (`process_rx_cycles`,
-`flush_tx_cycles`; commit `02daacb`) and decomposed h3 /health on c3/DQO via
-`/obs` deltas + a 2-loadgen rig (kvm-vm + waitless-peer-nginx):
-
-- **Server-bound at ~230K rps, NOT loadgen-bound.** A single 8-core loadgen
-  saturates at ~235K generating QUIC (92% busy) — so the naive "h3 224K vs h1
-  419K" looked like a loadgen artifact. But **two loadgens sum to the SAME
-  ~236K** (128 conns) and 256 conns also ~230K: adding client capacity doesn't
-  raise it ⇒ the server is the bottleneck.
-- **Latency-bound (Little's Law), not CPU-bound.** At the cap all 4 cores are
-  balanced at **~74% busy with ~26% idle that won't fill**, and throughput is
-  flat from 128→256 conns while P99 grows 486µs→1515µs. QUIC is per-core
-  shared-nothing (per-worker `SlotTable`+inboxes, no global lock — endpoint.rs),
-  so this is per-connection *service latency* capping each closed-loop conn's
-  request rate, not a lock or aggregate CPU.
-- **Per-request CPU split (cyc, % of busy): NIC 12% / quic process_rx 13% /
-  quic flush_tx 27% / h3+executor+stream+ship residual 48%.** Crypto is minor;
-  the cost is per-request *orchestration*, dominated by the cross-task hops
-  (conn task → per-stream h3 handler task → conn task) on the critical path.
-
-**Fix landed on the branch (commit `dcf2cbd`): skip the no-op flush.** Since
-the delayed ACK holds the request's ACK to piggyback the response, the
-post-`process_datagram` flush usually emits nothing yet still heap-allocated a
-~1500 B datagram + ran the full encode scan. Added an established-steady-state
-fast path (`has_one_rtt_to_send`, the exact complement of
-`encode_one_rtt_packet`'s 8 emission branches; gated on Established + both
-lower spaces discarded) that returns before the buffer acquire. Result
-(c3/DQO): **flush_tx 12.9K → 7.8K cyc/req (−40%)**, flush_tx share 27%→25%;
-h3 1 MiB upload `failed=0` (predicate correct, no stall); h1 unaffected.
-Throughput flat within spot noise — expected, since the cap is latency, not
-CPU. The fix is a real per-request CPU/density win, not a /health throughput
-lever.
-
-**Per-IP connection cap — fixed for NAT / max-concurrency (commit `5137066`),
-but NOT the throughput limiter.** The per-source-IP slot cap (was 64/worker)
-charged *all* connections, so a single public IP — every client behind a NAT /
-CGNAT / VPN egress shares one — was capped at ~64/worker × cores live conns,
-rejecting real users while the table sat empty. Fixed by scoping the cap to
-*unvalidated (half-open)* conns only: once a conn completes QUIC address
-validation (`path_validated`), `SlotTable::mark_validated` drops it from the
-per-IP count, so validated conns are bounded only by the global per-worker
-budget (raised 1024→8192, grow-on-demand). Half-open per-IP cap 64→256.
-**GCE-validated: correct (h3 upload + handshakes `failed=0`), but it did NOT
-raise the /health ceiling** — with one IP's conns admitted past the old cap,
-2-loadgen 256-conn = 231K / 512-conn = 210K, server busy *falling* 74%→71%→68%
-as conns rise (more parked time, not more work). Confirms the cap wasn't the
-bottleneck; the latency bound is. Kept as a real NAT-robustness / max-
-concurrency-design fix, not a throughput lever.
-
-**Inline-dispatch lever — investigated and FALSIFIED by latency decomposition.**
-The hypothesis was that the conn_task→handler cross-task hop added ~100 µs to
-each request (the h3-vs-h1 P50 delta of ~125 µs). The server's own
-`request_latency_us` histogram (listener-recv → response encoded+shipped, the
-full server-side path *including* the hop) settles it: **P50 64 µs / mean
-120 µs**, of which **`inbox_wait_us` is P50 32 µs / mean 52 µs** (datagram
-queued behind other work — load-dependent, not a fixed hop). So the entire
-server contribution is ~64 µs and the conn_task→handler hop is only ~10–15 µs
-of it; the ~280 µs the client sees is dominated by network RTT + the heavier
-QUIC client (the loadgen saturates generating QUIC at ~235 K — it, plus path
-RTT, sets the observed latency, not a server stall). Reading the code also
-corrected the model: h3 requests are *already* dispatched inline within
-`handle_conn` (task #30's per-request spawn was reverted — the conn's
-`progress` `AsyncEvent` is single-waiter), and the handler ships its own
-response (`drain_outbound`), so there is no spawn-per-request and no
-wait-for-conn_task-to-ship hop to remove. Inline-merging the generic async
-handler into the conn task would shave ~10–15 µs (<5 %, below the ±15 % spot
-floor) while fighting the deliberate wire/handler isolation (a slow handler
-must not stall wire service) and the single-waiter event — a bad trade. Not
-pursued. **Net: the h3 /health server path is already near its floor (~64 µs
-RX→TX); the residual gap to h1 is the QUIC client cost + per-packet transport,
-not a fixable server-side hop.**
+The h3-vs-h1 small-response (/health) gap was profiled to root cause and
+is owned by [`h3-health-cycle-profile.md`](h3-health-cycle-profile.md):
+~2.1× CPU/req, **diffuse per-request orchestration** (not crypto, QPACK,
+packet count, or any single hotspot), near the literature floor for a
+correct userspace QUIC+H3 stack. Every CPU/packet micro-lever (packet
+coalescing, ACK-folding, the no-op-flush skip, the per-IP cap fix, the
+`SentPackets` ring, inline-dispatch) was A/B-validated as
+throughput-neutral at saturation and is recorded there; the one lever
+that moved throughput (ACK-Frequency, +12–15%) was upload-unsafe and
+reverted. The blow-by-blow that used to live here is in git + that doc.
 
 ## Characterized future work (profile-justified, not core to this goal)
-- Remaining small-resp h3 gap: PROVEN (commits `d7a8dcc` packets/req delta +
-  `dcf2cbd`/`02daacb` cycle profile) to be **latency-bound per-request
-  orchestration** (cross-task hops), not packet count or crypto. Packet/CPU
-  micro-opts are density wins, throughput-neutral within noise. The throughput
-  lever is the inline-dispatch critical-path change above. This per-packet cost
-  is also the ceiling that caps single-conn bulk at ~1.2 Gbps.
+- Remaining small-resp h3 gap: orchestration-bound, not a single fixable
+  lever — see [`h3-health-cycle-profile.md`](h3-health-cycle-profile.md).
 - **Server-RX HW UDP-GRO on DQO**: investigated + ruled out (see
   "HW UDP-RX-GRO" above) — no gve knob exists (RSC is TCP-only, verified
   against the upstream driver) and the per-datagram NIC portion it could
