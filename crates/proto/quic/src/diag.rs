@@ -236,6 +236,10 @@ pub struct Counters {
     /// past `max(9/8 * max(SRTT, latest_rtt), kGranularity)`.
     /// Same caveat as `packets_lost_threshold` w.r.t. retx.
     pub packets_lost_time: Counter,
+    /// CRYPTO fragments re-queued for retransmission after their packet
+    /// was declared lost (RFC 9002 §6.2). Nonzero means handshake-packet
+    /// loss was recovered by resending the bytes (not just a PTO PING).
+    pub crypto_frames_retransmitted: Counter,
     /// One PTO probe packet was emitted because the PTO timer
     /// fired before any ACK confirmed our most-recent ack-eliciting
     /// send (RFC 9002 §6.2). The probe is a PING-only packet at
@@ -440,6 +444,7 @@ impl Counters {
             conn_closes_received: Counter::new(),
             packets_lost_threshold: Counter::new(),
             packets_lost_time: Counter::new(),
+            crypto_frames_retransmitted: Counter::new(),
             pto_probes_sent: Counter::new(),
             recv_streams_created: Counter::new(),
             stream_limit_exceeded: Counter::new(),
@@ -873,7 +878,7 @@ pub fn should_log_event() -> bool {
 /// Snapshot of every drop / event counter, for `/quic_stats`-style
 /// dumps. Returns `(name, value)` pairs in declaration order,
 /// including the four AEAD throughput counters.
-pub fn snapshot() -> [(&'static str, u64); 63] {
+pub fn snapshot() -> [(&'static str, u64); 64] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.get()),
@@ -907,6 +912,7 @@ pub fn snapshot() -> [(&'static str, u64); 63] {
         ("conn_closes_received", c.conn_closes_received.get()),
         ("packets_lost_threshold", c.packets_lost_threshold.get()),
         ("packets_lost_time", c.packets_lost_time.get()),
+        ("crypto_frames_retransmitted", c.crypto_frames_retransmitted.get()),
         ("pto_probes_sent", c.pto_probes_sent.get()),
         ("recv_streams_created", c.recv_streams_created.get()),
         ("stream_limit_exceeded", c.stream_limit_exceeded.get()),

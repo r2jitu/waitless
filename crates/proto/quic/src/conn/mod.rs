@@ -365,6 +365,28 @@ pub(super) struct SentPacket {
     /// PING probes, CRYPTO). The retained bytes are bounded by
     /// bytes-in-flight (≤ cwnd), so this can't grow without bound.
     pub(super) stream_frames: alloc::vec::Vec<StreamRetx>,
+    /// CRYPTO frames this packet carried, retained for retransmission
+    /// (RFC 9002 §6.2 / RFC 9000 §13.3). On loss these move to
+    /// `Connection::crypto_retx_queue` and are re-emitted at their
+    /// original offset in the same packet-number space; on ACK the
+    /// packet (and these copies) are dropped. Empty for non-CRYPTO
+    /// packets. A handshake flight is bounded, so this can't grow
+    /// without bound.
+    pub(super) crypto_frames: alloc::vec::Vec<CryptoRetx>,
+}
+
+/// One CRYPTO frame's retransmittable contents — the packet-number
+/// space it belongs to (Initial vs Handshake have independent CRYPTO
+/// streams and offsets), the offset in that stream, and a copy of the
+/// fragment bytes. Held in a [`SentPacket`] until acked (dropped) or
+/// lost (moved to [`Connection::crypto_retx_queue`] and re-emitted at
+/// `offset`). Each fragment is ≤ one packet's CRYPTO payload, so
+/// re-emitting fits one packet.
+#[derive(Clone, Debug)]
+pub(super) struct CryptoRetx {
+    pub(super) level: crate::tls::CryptoLevel,
+    pub(super) offset: u64,
+    pub(super) data: alloc::vec::Vec<u8>,
 }
 
 /// One STREAM frame's retransmittable contents — the offset, FIN bit,
@@ -1147,6 +1169,17 @@ pub struct Connection {
     /// sites that carry no stream data need no signature change.
     pub(super) pending_sent_stream_frames: alloc::vec::Vec<StreamRetx>,
 
+    /// CRYPTO fragments declared lost and awaiting retransmission (RFC
+    /// 9002 §6.2). `detect_loss` moves a lost Initial/Handshake packet's
+    /// `crypto_frames` here; `flush_outbound` re-emits each at its
+    /// original offset before draining fresh handshake CRYPTO, so a lost
+    /// handshake packet no longer stalls the handshake (the PTO PING
+    /// only forced an ACK, never resent the missing bytes).
+    pub(super) crypto_retx_queue: alloc::collections::VecDeque<CryptoRetx>,
+    /// Staging for the CRYPTO frame the packet currently being encoded
+    /// carries — `record_sent_packet` moves it into the `SentPacket`.
+    pub(super) pending_sent_crypto_frames: alloc::vec::Vec<CryptoRetx>,
+
     /// Egress pacing token bucket (RFC 9002 §7.7). `pace_budget` is send
     /// credit in bytes — it goes negative after a burst and refills at the
     /// paced rate (`pace_rate()`: the srtt-gated `cc.pacing_rate()`, or the
@@ -1290,6 +1323,8 @@ impl Connection {
             peer_initial_max_stream_data_uni: 0,
             peer_fc_applied: false,
             retx_queue: alloc::collections::VecDeque::new(),
+            crypto_retx_queue: alloc::collections::VecDeque::new(),
+            pending_sent_crypto_frames: alloc::vec::Vec::new(),
             retx_bytes: 0,
             pending_sent_stream_frames: alloc::vec::Vec::new(),
             pace_budget: 0,
@@ -2000,6 +2035,7 @@ mod recv_ranges_tests {
             in_flight: true,
             byte_count,
             stream_frames: Vec::new(),
+            crypto_frames: Vec::new(),
         }
     }
 

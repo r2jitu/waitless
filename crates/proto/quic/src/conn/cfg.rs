@@ -534,6 +534,61 @@ fn detect_loss_recovers_more_than_64_at_once() {
     assert_eq!(conn.retx_queue.len(), 67, "every lost STREAM frame requeued");
 }
 
+/// RFC 9002 §6.2: a lost Handshake packet's CRYPTO fragment is
+/// re-queued (at its original offset) for retransmission, not just
+/// papered over by a PTO PING. Regression for the long-standing gap
+/// where CRYPTO retransmission was unwired and handshake-packet loss
+/// stalled the handshake.
+#[test]
+fn lost_crypto_fragment_is_requeued_for_retransmission() {
+    let mut conn = Connection::new_server(ConnectionId::new(&[0xab; 8]), [0x42u8; 32]);
+    // 5 Handshake packets, each carrying a CRYPTO fragment at a distinct
+    // offset in the Handshake CRYPTO stream.
+    for pn in 0..5u64 {
+        conn.pending_sent_crypto_frames = alloc::vec![super::CryptoRetx {
+            level: crate::CryptoLevel::Handshake,
+            offset: pn * 100,
+            data: alloc::vec![pn as u8; 100],
+        }];
+        conn.record_sent_packet(crate::CryptoLevel::Handshake, pn, true, 120);
+    }
+    assert_eq!(conn.handshake_space.sent_packets.len(), 5);
+    assert!(conn.crypto_retx_queue.is_empty());
+
+    // ACK only PN 4 → PNs 0 and 1 cross the packet threshold
+    // (pn + 3 <= 4) and are declared lost; PN 2,3 stay in flight.
+    let mut ackbuf = [0u8; 16];
+    let n = crate::frame::write_ack(4, 0, 0, &[], &mut ackbuf).unwrap();
+    let (frame, _) = crate::frame::parse_frame(&ackbuf[..n]).unwrap();
+    let crate::frame::Frame::Ack {
+        largest_acknowledged,
+        ack_delay,
+        first_ack_range,
+        ack_ranges,
+        ..
+    } = frame
+    else {
+        panic!("expected ACK frame");
+    };
+    conn.process_ack(
+        crate::CryptoLevel::Handshake,
+        largest_acknowledged,
+        ack_delay,
+        first_ack_range,
+        ack_ranges,
+    );
+
+    assert_eq!(conn.crypto_retx_queue.len(), 2, "both lost CRYPTO fragments requeued");
+    let offsets: alloc::vec::Vec<u64> = conn.crypto_retx_queue.iter().map(|c| c.offset).collect();
+    assert_eq!(offsets, alloc::vec![0, 100], "requeued at their original offsets");
+    assert!(
+        conn.crypto_retx_queue
+            .iter()
+            .all(|c| matches!(c.level, crate::CryptoLevel::Handshake)),
+        "requeued in the Handshake space",
+    );
+}
+
 /// Persistent congestion (RFC 9002 §7.6): once several consecutive PTO
 /// periods elapse with no ACK, the congestion window collapses to the
 /// minimum and slow start restarts. Regression for the gap where

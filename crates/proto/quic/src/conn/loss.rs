@@ -235,10 +235,12 @@ impl Connection {
     /// `SentPacket` at send time) are re-queued into `retx_queue` for
     /// retransmission (RFC 9000 §13.3) at the end of this function;
     /// their bytes are released from flight and the congestion window
-    /// is shrunk once per loss episode. CRYPTO/handshake retransmission
-    /// is NOT yet wired here — those rely on the PTO PING forcer in
-    /// `send_pto_probe` (a follow-up would track offsets through
-    /// `pop_handshake`). The per-PN counters give accurate "in flight"
+    /// is shrunk once per loss episode. A lost Initial/Handshake packet's
+    /// CRYPTO fragments are likewise re-queued into `crypto_retx_queue`
+    /// (RFC 9002 §6.2) and re-emitted at their original offset by
+    /// `flush_outbound` — so handshake-packet loss is recovered by
+    /// resending the bytes, not just by the PTO PING forcer in
+    /// `send_pto_probe`. The per-PN counters give accurate "in flight"
     /// numbers and loss visibility.
     fn detect_loss(&mut self, level: CryptoLevel) {
         const K_PACKET_THRESHOLD: u64 = 3;
@@ -321,6 +323,9 @@ impl Connection {
         // Lost STREAM frames, collected in PN order (lowest offset first)
         // and re-queued for retransmission after the `space` borrow ends.
         let mut lost_frames: alloc::vec::Vec<super::StreamRetx> = alloc::vec::Vec::new();
+        // Lost CRYPTO fragments, re-queued (at their original offsets) for
+        // retransmission after the `space` borrow ends (RFC 9002 §6.2).
+        let mut lost_crypto: alloc::vec::Vec<super::CryptoRetx> = alloc::vec::Vec::new();
         // Age of the lowest-PN lost packet (lost_buf is filled in PN
         // order, so [0] is the smallest). Captured for `last_loss`:
         // an age well below one RTT means its ACK is still in flight =
@@ -335,6 +340,7 @@ impl Connection {
                     lost_bytes = lost_bytes.saturating_add(pkt.byte_count);
                 }
                 lost_frames.append(&mut pkt.stream_frames);
+                lost_crypto.append(&mut pkt.crypto_frames);
             }
         }
         let lost_threshold_n = lost_threshold_n as u64;
@@ -374,6 +380,16 @@ impl Connection {
             self.retx_bytes = self.retx_bytes.saturating_add(f.data.len() as u32);
         }
         self.retx_queue.extend(lost_frames);
+        // Re-queue lost CRYPTO fragments. Unlike STREAM bytes these are
+        // not congestion-controlled separately (the handshake flight is
+        // tiny and bounded), so no `retx_bytes`-style accounting; the
+        // flush re-emits them ahead of fresh handshake CRYPTO.
+        if !lost_crypto.is_empty() {
+            crate::diag::COUNTERS
+                .crypto_frames_retransmitted
+                .add(lost_crypto.len() as u64);
+            self.crypto_retx_queue.extend(lost_crypto);
+        }
     }
 
     /// RFC 9002 §5.3: SRTT/RTTvar EWMA update. Called once per
@@ -429,12 +445,14 @@ impl Connection {
         // for ACK-only / PING / CRYPTO packets) so they ride along for
         // retransmission on loss.
         let stream_frames = core::mem::take(&mut self.pending_sent_stream_frames);
+        let crypto_frames = core::mem::take(&mut self.pending_sent_crypto_frames);
         let pkt = SentPacket {
             time_sent_us: now,
             ack_eliciting,
             in_flight: ack_eliciting,
             byte_count,
             stream_frames,
+            crypto_frames,
         };
         let (space, idx) = match level {
             CryptoLevel::Initial => (&mut self.initial_space, 0usize),

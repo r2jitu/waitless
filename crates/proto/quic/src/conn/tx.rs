@@ -13,8 +13,8 @@
 // timer in `loss.rs`.
 
 use super::{
-    ConnError, ConnState, Connection, HS_CRYPTO_BUDGET, MAX_QUIC_DATAGRAM, SpaceState, StreamRetx,
-    append_max_data_into, append_max_stream_data_into, append_max_streams_into,
+    ConnError, ConnState, Connection, CryptoRetx, HS_CRYPTO_BUDGET, MAX_QUIC_DATAGRAM, SpaceState,
+    StreamRetx, append_max_data_into, append_max_stream_data_into, append_max_streams_into,
 };
 use net_cc::CongestionControl;
 
@@ -308,6 +308,57 @@ impl Connection {
             }
             self.state = ConnState::Failed;
             return Ok(());
+        }
+
+        // RFC 9002 §6.2: re-emit any CRYPTO fragments declared lost,
+        // each in its own datagram at its original offset / PN space,
+        // before the fresh handshake CRYPTO below. A lost handshake
+        // packet otherwise stalls the handshake indefinitely — the PTO
+        // PING forced an ACK but never resent the missing bytes. Bounded
+        // by the queue length (a handshake flight is a handful of
+        // packets); anti-amplification gated like every other datagram.
+        while let Some(rtx) = self.crypto_retx_queue.pop_front() {
+            // Keys for this level discarded (RFC 9001 §4.9) → the peer
+            // has moved on; drop the stale fragment.
+            let discarded = match rtx.level {
+                CryptoLevel::Initial => self.initial_keys_discarded,
+                CryptoLevel::Handshake => self.handshake_keys_discarded,
+                CryptoLevel::OneRtt => true, // 1-RTT CRYPTO retx not handled here
+            };
+            if discarded {
+                continue;
+            }
+            if self.anti_amp_remaining() == 0 {
+                // Address not yet validated for more bytes — keep the
+                // fragment for the next flush.
+                self.crypto_retx_queue.push_front(rtx);
+                break;
+            }
+            let mut dg = self.take_datagram_buf(1500);
+            match rtx.level {
+                CryptoLevel::Initial => {
+                    self.encode_initial_packet(dg.vec_mut(), &rtx.data, false)?;
+                }
+                CryptoLevel::Handshake => {
+                    // Re-emit at the lost fragment's offset: park the
+                    // fresh-data offset, encode, restore it.
+                    let saved = self.handshake_crypto_offset;
+                    self.handshake_crypto_offset = rtx.offset;
+                    self.encode_handshake_packet(dg.vec_mut(), &rtx.data, false)?;
+                    self.handshake_crypto_offset = saved;
+                }
+                CryptoLevel::OneRtt => continue,
+            }
+            if dg.len() <= MAX_L2_HEADROOM {
+                continue;
+            }
+            let n = (dg.len() - MAX_L2_HEADROOM) as u64;
+            if n > self.anti_amp_remaining() {
+                crate::diag::COUNTERS.anti_amp_throttled.bump();
+                continue;
+            }
+            self.record_bytes_sent(n);
+            self.outbound.push_back(dg);
         }
 
         // Established-steady-state no-op fast path. Once both lower PN
@@ -877,6 +928,13 @@ impl Connection {
             let mut tmp = vec![0u8; crypto_bytes.len() + 16];
             let n = write_crypto(0, crypto_bytes, &mut tmp).map_err(|_| ConnError::Wire)?;
             frames.extend_from_slice(&tmp[..n]);
+            // Retain for retransmission (RFC 9002 §6.2). The Initial
+            // CRYPTO stream is a single frame at offset 0.
+            self.pending_sent_crypto_frames.push(CryptoRetx {
+                level: CryptoLevel::Initial,
+                offset: 0,
+                data: crypto_bytes.to_vec(),
+            });
         }
 
         // Reserve tail = TAG_LEN bytes for the AEAD tag at the end.
@@ -955,11 +1013,21 @@ impl Connection {
             // (RFC 9001 §4.1.3). `+ 24` covers the CRYPTO frame
             // header (type byte + offset varint + length varint)
             // for any offset/length we emit.
+            let frag_offset = self.handshake_crypto_offset;
             let mut tmp = vec![0u8; crypto_bytes.len() + 24];
-            let n = write_crypto(self.handshake_crypto_offset, crypto_bytes, &mut tmp)
-                .map_err(|_| ConnError::Wire)?;
+            let n =
+                write_crypto(frag_offset, crypto_bytes, &mut tmp).map_err(|_| ConnError::Wire)?;
             frames.extend_from_slice(&tmp[..n]);
             self.handshake_crypto_offset += crypto_bytes.len() as u64;
+            // Retain this fragment (at its offset) for retransmission
+            // (RFC 9002 §6.2). On a retx re-emit the caller has set
+            // `handshake_crypto_offset` to the lost fragment's offset, so
+            // `frag_offset` records the correct stream position.
+            self.pending_sent_crypto_frames.push(CryptoRetx {
+                level: CryptoLevel::Handshake,
+                offset: frag_offset,
+                data: crypto_bytes.to_vec(),
+            });
         }
 
         let pn_length: usize = 4;
