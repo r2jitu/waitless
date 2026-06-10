@@ -16,6 +16,7 @@ extern crate alloc;
 pub mod clock;
 pub mod deque;
 pub mod diag;
+pub mod entropy_health;
 pub mod mmio;
 pub mod once;
 pub mod percpu;

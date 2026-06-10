@@ -15,6 +15,7 @@ rust_library(
         "src/clock.rs",
         "src/deque.rs",
         "src/diag.rs",
+        "src/entropy_health.rs",
         "src/lib.rs",
         "src/mmio.rs",
         "src/once.rs",
