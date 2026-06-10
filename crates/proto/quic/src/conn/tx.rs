@@ -1114,7 +1114,10 @@ impl Connection {
         // via `out.truncate(header_start)` if no frames are due.
         let pn_length: usize = 4;
         let header_start = out.len();
-        let first_byte: u8 = FIXED_BIT | ((pn_length as u8) - 1);
+        // KEY_PHASE bit (0x04) reflects our current send key generation
+        // (RFC 9001 §6.1) — toggled by `rotate_send_keys` when we
+        // respond to a peer key update. 0 until the first rotation.
+        let first_byte: u8 = FIXED_BIT | (self.send_key_phase << 2) | ((pn_length as u8) - 1);
         out.push(first_byte);
         out.extend_from_slice(self.peer_cid.as_slice());
         let pn_offset = out.len();

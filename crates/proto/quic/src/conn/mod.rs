@@ -861,9 +861,19 @@ pub struct Connection {
     pub(super) client_app_secret: Option<[u8; 32]>,
     /// Peer's current KEY_PHASE bit value (0 or 1). Toggled when
     /// we successfully open a packet with `application_recv_next`.
-    /// We never initiate KU ourselves on the send side; our own
-    /// send packets stay at KP=0 for now.
     pub(super) recv_key_phase: u8,
+    /// Latest SERVER application-traffic secret — the send-side mirror
+    /// of `client_app_secret`. `next_traffic_secret(server_ap)` derives
+    /// the next-generation send keys when we respond to a peer-initiated
+    /// key update (RFC 9001 §6.1).
+    pub(super) server_app_secret: Option<[u8; 32]>,
+    /// Our current KEY_PHASE bit value (0 or 1) stamped on the 1-RTT
+    /// short header. Toggled in lock-step with `recv_key_phase` when we
+    /// respond to a peer key update by rotating our send keys, so
+    /// subsequent packets are protected with — and labelled as — the new
+    /// generation (RFC 9001 §6.1: "the recipient also updates its
+    /// sending keys").
+    pub(super) send_key_phase: u8,
 
     pub(super) initial_space: SpaceState,
     pub(super) handshake_space: SpaceState,
@@ -1268,6 +1278,8 @@ impl Connection {
             application_recv_next: None,
             client_app_secret: None,
             recv_key_phase: 0,
+            server_app_secret: None,
+            send_key_phase: 0,
             handshake_send: None,
             handshake_recv: None,
             application_send: None,

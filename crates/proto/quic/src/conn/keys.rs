@@ -184,6 +184,27 @@ impl Connection {
                 self.application_recv_next = Some(DirKeys::from_aes128_reuse_hp(&next_aes128, cur));
             }
         }
+        // RFC 9001 §6.1: respond to the peer's key update by also
+        // rotating our SEND keys, so subsequent packets we send use the
+        // new generation. Without this our packets would stay at the old
+        // phase and the peer could only open them via its one-rotation
+        // prev-key window — the connection breaks once that closes.
+        self.rotate_send_keys();
+    }
+
+    /// Advance our send keys to the next generation and toggle the
+    /// KEY_PHASE bit we stamp on the 1-RTT short header (RFC 9001 §6.1).
+    /// The HP key is invariant across key phases, so it carries over.
+    fn rotate_send_keys(&mut self) {
+        if let Some(secret) = self.server_app_secret.as_ref() {
+            let next_secret = next_traffic_secret(secret);
+            self.server_app_secret = Some(next_secret);
+            let next_aes128 = derive_aes128_keys(&next_secret);
+            if let Some(cur) = self.application_send.as_ref() {
+                self.application_send = Some(DirKeys::from_aes128_reuse_hp(&next_aes128, cur));
+                self.send_key_phase ^= 1;
+            }
+        }
     }
 
     pub(super) fn advance_tls(&mut self, config: &TlsServerConfig) -> Result<(), ConnError> {
@@ -249,6 +270,10 @@ impl Connection {
             let cur_recv = self.application_recv.as_ref().unwrap();
             self.application_recv_next =
                 Some(DirKeys::from_aes128_reuse_hp(&next_aes128, cur_recv));
+            // Remember the server secret too, so `rotate_send_keys` can
+            // derive the next-generation send keys when we respond to a
+            // peer-initiated key update (RFC 9001 §6.1).
+            self.server_app_secret = Some(ap.server_ap);
         }
         // `Failed` is terminal — never resurrect it. Without this
         // guard, a peer-initiated CONNECTION_CLOSE (handled in

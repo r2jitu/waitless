@@ -69,9 +69,9 @@ impl Connection {
             // Per-packet drop on AEAD failure (RFC 9000 §9.7:
             // endpoints MUST NOT abandon the connection on
             // packets they cannot decrypt). Most common causes:
-            //   * client did a key update (KEY_PHASE bit flipped)
-            //     and we don't track key phase yet — pending
-            //     follow-up.
+            //   * a key update we couldn't open with the current or
+            //     pre-derived next-phase keys (the common cases ARE
+            //     handled — see `rotate_recv_keys` / `rotate_send_keys`).
             //   * stale-keys retransmit straggler.
             //   * unrelated traffic addressed to our DCID.
             // For long-header packets we know the packet length

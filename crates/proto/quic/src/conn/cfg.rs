@@ -618,6 +618,42 @@ fn streams_blocked_forces_max_streams_readvertise() {
     );
 }
 
+/// RFC 9001 §6.1: responding to a peer key update must also rotate our
+/// SEND keys to the next generation and toggle the KEY_PHASE bit we
+/// stamp on 1-RTT packets — otherwise our packets stay at the old phase
+/// and the connection breaks once the peer's prev-key window closes.
+#[test]
+fn key_update_rotates_send_keys_and_toggles_phase() {
+    let mut conn = Connection::new_server(ConnectionId::new(&[0xab; 8]), [0x42u8; 32]);
+    let secret0 = [0x11u8; 32];
+    conn.server_app_secret = Some(secret0);
+    let secrets = derive_initial_secrets(&[0xcd; 8]);
+    conn.application_send = Some(super::keys::DirKeys::from_aes128(&derive_initial_keys(
+        &secrets.server,
+    )));
+    assert_eq!(conn.send_key_phase, 0);
+
+    // First peer key update.
+    conn.rotate_recv_keys();
+    assert_eq!(conn.send_key_phase, 1, "send KEY_PHASE bit toggled to 1");
+    assert_eq!(conn.recv_key_phase, 1, "recv KEY_PHASE bit toggled in lock-step");
+    assert_eq!(
+        conn.server_app_secret.unwrap(),
+        crate::crypto::next_traffic_secret(&secret0),
+        "send secret advanced one generation",
+    );
+
+    // A second key update toggles the phase bit back and advances again.
+    let secret1 = conn.server_app_secret.unwrap();
+    conn.rotate_recv_keys();
+    assert_eq!(conn.send_key_phase, 0, "second KU toggles the phase bit back to 0");
+    assert_eq!(
+        conn.server_app_secret.unwrap(),
+        crate::crypto::next_traffic_secret(&secret1),
+        "send secret advanced again",
+    );
+}
+
 /// Persistent congestion (RFC 9002 §7.6): once several consecutive PTO
 /// periods elapse with no ACK, the congestion window collapses to the
 /// minimum and slow start restarts. Regression for the gap where
