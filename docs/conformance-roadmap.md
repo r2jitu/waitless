@@ -116,15 +116,18 @@ This is the right tool for RFC-level behaviour: it sees internal
 state, runs in milliseconds, and (once the clock seam lands) controls
 time deterministically.
 
-### Borrowing the packetdrill DSL
+### Borrowing the packetdrill DSL ✅ first cut landed
 
-Worth doing once the scenario count grows: a small interpreter for the
-packetdrill `.pkt` script language feeding the harness. Benefits — a
-documented DSL, readable scripts, and the ability to *cherry-pick*
-individual corpus scripts that are feature-agnostic (basic handshake,
-RST, FIN, simple duplicate-data). The bulk of the Linux corpus stays
-out of scope; scripts that need SACK / timestamps do not apply until
-those features land (window-scaling scripts now do).
+A small packetdrill-style `.pkt` interpreter now feeds the `tcp_test`
+harness (`run_pkt` in `tests.rs`): line-based `listen` / `send` / `recv`
+/ `recv-none` / `advance <N>ms` directives, `|`-joined flags, and
+numeric exprs with `$isn` capture (so a script completes a handshake
+despite the random server ISN) + `+N` offsets. Two scenarios
+(`pkt_handshake_and_data`, `pkt_advance_and_recv_none`) are written
+entirely in the DSL. Benefits — readable scripts, and the ability to
+*cherry-pick* feature-agnostic corpus cases (handshake, RST, FIN,
+duplicate-data). Still room to grow: a standalone `.pkt`-file runner,
+and directives for SACK / timestamps once those land.
 
 ### Black-box axis (secondary, for QUIC)
 
