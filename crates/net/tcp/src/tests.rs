@@ -5060,3 +5060,447 @@ fn rtx_push_oom_suspends_coverage_until_full_drain() {
     assert_eq!(sent, 300);
     assert_eq!(conn_rtx_queue_bytes(CP, SP), body4);
 }
+
+// ── Active open (client connect) scenarios ───────────────────────────
+//
+// The harness plays the REMOTE SERVER here: `connect_on_core` opens
+// from SERVER_IP (our local address in this fixture) to CLIENT_IP
+// (the peer), the mock NIC captures our SYN/ACK/data, and
+// `deliver`/`deliver_opts` injects the peer's SYN-ACK / RST / data
+// segments. Same 4-tuple discipline as the passive scenarios —
+// distinct remote ports per test.
+
+/// Drive a full active-open handshake to `remote_port`: connect, read
+/// the captured SYN, inject the peer's SYN-ACK (with `peer_opts`),
+/// and return `(handle, generation, local_port, iss, peer_isn)`.
+/// Leaves the TX capture cleared.
+fn client_handshake(
+    remote_port: u16,
+    peer_isn: u32,
+    peer_window: u16,
+    peer_opts: &[u8],
+) -> (*mut (), u16, u16, u32) {
+    let (handle, generation) =
+        super::connect_on_core(v4(SERVER_IP), v4(CLIENT_IP), remote_port).expect("connect starts");
+    let syn = tcp_hdr(&tx()[0]);
+    let local_port = syn.src_port;
+    let iss = syn.seq;
+    let synack = Seg {
+        src_port: remote_port,
+        dst_port: local_port,
+        seq: peer_isn,
+        ack: iss.wrapping_add(1),
+        flags: TCP_SYN | TCP_ACK,
+        window: peer_window,
+        payload: Vec::new(),
+    };
+    if peer_opts.is_empty() {
+        deliver(&synack);
+    } else {
+        deliver_opts(&synack, peer_opts);
+    }
+    clear_tx();
+    (handle, generation, local_port, iss)
+}
+
+/// Active open, happy path: `connect` emits a SYN occupying one
+/// sequence number and carrying MSS + Window-Scale + SACK-Permitted;
+/// the peer's SYN-ACK completes the handshake — final ACK on the
+/// wire, `Established`, the peer's MSS honored on data segmentation,
+/// and the peer's window scale applied to post-handshake updates.
+#[test]
+fn active_open_handshake_establishes() {
+    use executor::reactor::TcpConnectStatus;
+    let _g = harness();
+    const RP: u16 = 9301; // remote (peer) port
+    const PEER_ISN: u32 = 0x7000;
+
+    let (handle, generation) =
+        super::connect_on_core(v4(SERVER_IP), v4(CLIENT_IP), RP).expect("connect starts");
+    let frames = tx();
+    assert_eq!(frames.len(), 1, "connect puts exactly one SYN on the wire");
+    let syn = tcp_hdr(&frames[0]);
+    assert_eq!(syn.flags, TCP_SYN, "a bare SYN, no ACK");
+    assert_eq!(syn.dst_port, RP, "SYN addressed to the remote port");
+    assert_eq!(syn.ack, 0, "a SYN carries no acknowledgement");
+    assert_eq!(
+        tcp_options(&frames[0]),
+        // MSS 1460 + NOP + WS(0) + SACK-Permitted + 2·NOP — the same
+        // blob the SYN-ACK builder emits with both options on.
+        vec![2, 4, 0x05, 0xB4, 1, 3, 3, 0, 4, 2, 1, 1],
+        "the SYN offers MSS + Window-Scale + SACK-Permitted",
+    );
+    let local_port = syn.src_port;
+    let iss = syn.seq;
+    assert_eq!(
+        super::connect_status(handle, generation),
+        TcpConnectStatus::InProgress,
+        "pre-SYN-ACK the connect is in progress",
+    );
+
+    // The peer's SYN-ACK: MSS 600 (small-MTU peer), wscale 7, SACK ok.
+    clear_tx();
+    deliver_opts(
+        &Seg {
+            src_port: RP,
+            dst_port: local_port,
+            seq: PEER_ISN,
+            ack: iss.wrapping_add(1),
+            flags: TCP_SYN | TCP_ACK,
+            window: 65535,
+            payload: Vec::new(),
+        },
+        &[2, 4, 0x02, 0x58, 1, 3, 3, 7, 4, 2, 1, 1],
+    );
+
+    // The final ACK of the three-way handshake.
+    let frames = tx();
+    assert_eq!(frames.len(), 1, "the SYN-ACK elicits exactly one frame");
+    let ack = tcp_hdr(&frames[0]);
+    assert_eq!(ack.flags, TCP_ACK, "the handshake completes with a bare ACK");
+    assert_eq!(ack.seq, iss.wrapping_add(1), "the SYN consumed one sequence number");
+    assert_eq!(ack.ack, PEER_ISN.wrapping_add(1), "the ACK covers the peer's SYN");
+    assert_eq!(
+        super::connect_status(handle, generation),
+        TcpConnectStatus::Established,
+        "the connect resolved",
+    );
+    assert_eq!(conn_state(RP, local_port), Some(TcpState::Established));
+
+    // Peer MSS honored: a 1000-byte send clamps at 600 per segment.
+    assert_eq!(conn_snd_mss(RP, local_port), 600, "snd_mss = min(ours, peer's)");
+    clear_tx();
+    let body = vec![0xC1u8; 1000];
+    let mut chain = iobuf::IOBufChain::from(body.clone());
+    let sent = super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    assert_eq!(sent, 1000, "the whole body is accepted");
+    let data = tx();
+    assert_eq!(data.len(), 2, "1000 bytes segment as 600 + 400 at the peer's MSS");
+    assert_eq!(data[0].len() - 34 - TCP_HDR_LEN, 600, "first segment clamped to peer MSS");
+    assert_eq!(data[1].len() - 34 - TCP_HDR_LEN, 400, "remainder in the second segment");
+    assert_eq!(
+        tcp_hdr(&data[0]).seq,
+        iss.wrapping_add(1),
+        "data starts right after the SYN's sequence number",
+    );
+
+    // Window scale applied: the SYN-ACK's window seeds unscaled
+    // (RFC 7323 §2.2), a post-handshake ACK's window shifts by the
+    // peer's offered scale.
+    let (wnd, wscale_ok, wscale) = conn_window(RP, local_port);
+    assert_eq!((wnd, wscale_ok, wscale), (65535, true, 7), "SYN-ACK window unscaled; scale recorded");
+    deliver(&Seg {
+        src_port: RP,
+        dst_port: local_port,
+        seq: PEER_ISN.wrapping_add(1),
+        ack: iss.wrapping_add(1 + 1000),
+        flags: TCP_ACK,
+        window: 8,
+        payload: Vec::new(),
+    });
+    let (wnd, _, _) = conn_window(RP, local_port);
+    assert_eq!(wnd, 8 << 7, "post-handshake windows scale by the peer's shift");
+}
+
+/// Active open, refused: an RST whose ACK acknowledges our SYN
+/// (RFC 9293 §3.10.7.3 second check) resolves the connect as
+/// `Refused` — distinguishable from a timeout — and elicits nothing
+/// on the wire.
+#[test]
+fn active_open_connection_refused() {
+    use executor::reactor::TcpConnectStatus;
+    let _g = harness();
+    const RP: u16 = 9302;
+
+    let (handle, generation) =
+        super::connect_on_core(v4(SERVER_IP), v4(CLIENT_IP), RP).expect("connect starts");
+    let syn = tcp_hdr(&tx()[0]);
+    let (local_port, iss) = (syn.src_port, syn.seq);
+    let refused_before = super::diag::COUNTERS.connect_refused.get();
+
+    clear_tx();
+    deliver(&Seg {
+        src_port: RP,
+        dst_port: local_port,
+        seq: 0,
+        ack: iss.wrapping_add(1),
+        flags: TCP_RST | TCP_ACK,
+        window: 0,
+        payload: Vec::new(),
+    });
+    assert!(tx().is_empty(), "an accepted RST elicits no reply");
+    assert_eq!(
+        super::connect_status(handle, generation),
+        TcpConnectStatus::Refused,
+        "RST acking our SYN = connection refused",
+    );
+    assert_eq!(
+        super::diag::COUNTERS.connect_refused.get(),
+        refused_before + 1,
+        "the refusal was counted",
+    );
+    // The connect future releases the embryo slot on the error path.
+    super::close(handle, generation);
+}
+
+/// Active open, no answer: the SYN is retransmitted with exponential
+/// backoff (same ISS every time), and after `SYN_RETX_MAX` attempts
+/// the connect resolves `TimedOut`.
+#[test]
+fn active_open_syn_retransmits_then_times_out() {
+    use executor::reactor::TcpConnectStatus;
+    let _g = harness();
+    const RP: u16 = 9303;
+
+    let (handle, generation) =
+        super::connect_on_core(v4(SERVER_IP), v4(CLIENT_IP), RP).expect("connect starts");
+    let first = tcp_hdr(&tx()[0]);
+    let iss = first.seq;
+    let syn_opts = tcp_options(&tx()[0]);
+
+    // Before the initial RTO elapses the tick does nothing.
+    clear_tx();
+    kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64 - 1);
+    super::on_tcp_tick();
+    assert!(tx().is_empty(), "no SYN retransmit before the RTO elapses");
+
+    // Crossing it retransmits the SYN — same ISS, same options.
+    kernel_core::clock::mock::advance(1);
+    super::on_tcp_tick();
+    let rtx = tx();
+    assert_eq!(rtx.len(), 1, "exactly one SYN retransmit at the RTO");
+    let r = tcp_hdr(&rtx[0]);
+    assert_eq!(r.flags, TCP_SYN, "the retransmit is still a bare SYN");
+    assert_eq!(r.seq, iss, "the retransmit reuses the original ISS");
+    assert_eq!(tcp_options(&rtx[0]), syn_opts, "the retransmit reoffers the same options");
+
+    // The interval doubled: one initial-RTO of further wait is no
+    // longer enough for the second retransmit.
+    clear_tx();
+    kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64);
+    super::on_tcp_tick();
+    assert!(tx().is_empty(), "the backed-off (2x) interval has not elapsed yet");
+    kernel_core::clock::mock::advance(RTO_INITIAL_MS as u64);
+    super::on_tcp_tick();
+    assert_eq!(tx().len(), 1, "the second retransmit fires after the doubled interval");
+    assert_eq!(tcp_hdr(&tx()[0]).seq, iss, "still the same ISS");
+
+    // Burn the remaining budget: retransmits 3..SYN_RETX_MAX, each
+    // after its doubled interval.
+    for i in 2..SYN_RETX_MAX as u64 {
+        clear_tx();
+        kernel_core::clock::mock::advance((RTO_INITIAL_MS as u64) << i);
+        super::on_tcp_tick();
+        assert_eq!(tx().len(), 1, "retransmit {} fires after its interval", i + 1);
+        assert_eq!(tcp_hdr(&tx()[0]).seq, iss);
+        assert_eq!(
+            super::connect_status(handle, generation),
+            TcpConnectStatus::InProgress,
+            "still in progress while budget remains",
+        );
+    }
+
+    // Budget exhausted — the next expiry resolves the connect as
+    // timed out, with no further SYN.
+    let timeouts_before = super::diag::COUNTERS.connect_timeouts.get();
+    clear_tx();
+    kernel_core::clock::mock::advance((RTO_INITIAL_MS as u64) << SYN_RETX_MAX);
+    super::on_tcp_tick();
+    assert!(tx().is_empty(), "no SYN past the retry cap");
+    assert_eq!(
+        super::connect_status(handle, generation),
+        TcpConnectStatus::TimedOut,
+        "the connect timed out after SYN_RETX_MAX retransmits",
+    );
+    assert_eq!(
+        super::diag::COUNTERS.connect_timeouts.get(),
+        timeouts_before + 1,
+        "the timeout was counted",
+    );
+    super::close(handle, generation);
+}
+
+/// RFC 9293 §3.10.7.3 (SYN-SENT, first check): a SYN-ACK whose ACK
+/// does not acknowledge our SYN (`SEG.ACK =< ISS or SEG.ACK >
+/// SND.NXT`) draws `<SEQ=SEG.ACK><CTL=RST>` and is dropped — the
+/// connection REMAINS in SYN-SENT, so the genuine SYN-ACK can still
+/// complete the handshake.
+#[test]
+fn wrong_ack_syn_ack_draws_rst_and_stays_syn_sent() {
+    use executor::reactor::TcpConnectStatus;
+    let _g = harness();
+    const RP: u16 = 9304;
+    const PEER_ISN: u32 = 0x8100;
+
+    let (handle, generation) =
+        super::connect_on_core(v4(SERVER_IP), v4(CLIENT_IP), RP).expect("connect starts");
+    let syn = tcp_hdr(&tx()[0]);
+    let (local_port, iss) = (syn.src_port, syn.seq);
+
+    // A SYN-ACK acking the wrong sequence number.
+    let wrong_ack = iss.wrapping_add(1000);
+    clear_tx();
+    deliver(&Seg {
+        src_port: RP,
+        dst_port: local_port,
+        seq: PEER_ISN,
+        ack: wrong_ack,
+        flags: TCP_SYN | TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    let frames = tx();
+    assert_eq!(frames.len(), 1, "the bad ACK draws exactly one reset");
+    let rst = tcp_hdr(&frames[0]);
+    assert_eq!(rst.flags, TCP_RST, "<CTL=RST> — no ACK flag (RFC 9293 §3.10.7.3)");
+    assert_eq!(rst.seq, wrong_ack, "<SEQ=SEG.ACK>");
+    assert_eq!(rst.ack, 0, "the reset carries no acknowledgement");
+    assert_eq!(
+        super::connect_status(handle, generation),
+        TcpConnectStatus::InProgress,
+        "the connection remains in SYN-SENT",
+    );
+
+    // The genuine SYN-ACK still establishes.
+    clear_tx();
+    deliver(&Seg {
+        src_port: RP,
+        dst_port: local_port,
+        seq: PEER_ISN,
+        ack: iss.wrapping_add(1),
+        flags: TCP_SYN | TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert_eq!(
+        super::connect_status(handle, generation),
+        TcpConnectStatus::Established,
+        "the genuine SYN-ACK completes the handshake after the forgery",
+    );
+}
+
+/// Simultaneous open (a bare SYN crossing ours): deliberately
+/// deferred in v1 — dropped and counted, the connection stays in
+/// SYN-SENT awaiting the peer's SYN-ACK to OUR SYN.
+#[test]
+fn bare_syn_in_syn_sent_is_dropped_and_counted() {
+    use executor::reactor::TcpConnectStatus;
+    let _g = harness();
+    const RP: u16 = 9305;
+
+    let (handle, generation) =
+        super::connect_on_core(v4(SERVER_IP), v4(CLIENT_IP), RP).expect("connect starts");
+    let local_port = tcp_hdr(&tx()[0]).src_port;
+    let drops_before = super::diag::COUNTERS.simultaneous_open_drops.get();
+
+    clear_tx();
+    deliver(&Seg {
+        src_port: RP,
+        dst_port: local_port,
+        seq: 0x9100,
+        ack: 0,
+        flags: TCP_SYN,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    assert!(tx().is_empty(), "the crossing SYN elicits nothing (v1 deferral)");
+    assert_eq!(
+        super::diag::COUNTERS.simultaneous_open_drops.get(),
+        drops_before + 1,
+        "the drop was counted",
+    );
+    assert_eq!(
+        super::connect_status(handle, generation),
+        TcpConnectStatus::InProgress,
+        "the active open is unaffected",
+    );
+    super::close(handle, generation);
+}
+
+/// Ephemeral-port allocation: two connects to the same destination
+/// pick distinct local ports, and each chosen port's inbound 4-tuple
+/// maps to the calling core under the SAME flow hash Tier-2 RX
+/// classify uses (`net_classify::flow_owner`) — so the peer's replies
+/// land on the connecting core on every software-distributed path.
+#[test]
+fn ephemeral_ports_are_distinct_and_core_affine() {
+    let _g = harness();
+    const RP: u16 = 9306;
+
+    let (h1, g1) =
+        super::connect_on_core(v4(SERVER_IP), v4(CLIENT_IP), RP).expect("first connect starts");
+    let p1 = tcp_hdr(&tx()[0]).src_port;
+    clear_tx();
+    let (h2, g2) =
+        super::connect_on_core(v4(SERVER_IP), v4(CLIENT_IP), RP).expect("second connect starts");
+    let p2 = tcp_hdr(&tx()[0]).src_port;
+
+    assert_ne!(p1, p2, "two connects to one destination get distinct local ports");
+    let num_cores = kernel_core::percpu::num_cores();
+    for port in [p1, p2] {
+        assert!((49152..=65535).contains(&port), "port {port} is in the IANA dynamic range");
+        assert_eq!(
+            net_classify::flow_owner(v4(CLIENT_IP), v4(SERVER_IP), RP, port, num_cores),
+            0,
+            "the chosen port's 4-tuple flow-hashes to the calling core",
+        );
+    }
+    super::close(h1, g1);
+    super::close(h2, g2);
+}
+
+/// Data after establish: the client conn sends with correct sequence
+/// numbers and receives the peer's bytes — the full bidirectional
+/// exchange on an actively-opened connection.
+#[test]
+fn active_open_bidirectional_data_exchange() {
+    let _g = harness();
+    const RP: u16 = 9307;
+    const PEER_ISN: u32 = 0x9300;
+
+    let (handle, generation, local_port, iss) =
+        client_handshake(RP, PEER_ISN, 65535, &[2, 4, 0x05, 0xB4, 1, 3, 3, 0, 4, 2, 1, 1]);
+
+    // Client → peer: the request bytes ride at ISS+1.
+    let request = b"hello-from-client";
+    let mut chain = iobuf::IOBufChain::from(request.to_vec());
+    let sent = super::async_try_send_chain(handle, generation, &mut chain)
+        .expect("an established client conn accepts the send");
+    assert_eq!(sent, request.len());
+    let frames = tx();
+    assert_eq!(frames.len(), 1);
+    let seg = tcp_hdr(&frames[0]);
+    assert_eq!(seg.src_port, local_port);
+    assert_eq!(seg.dst_port, RP);
+    assert_eq!(seg.seq, iss.wrapping_add(1), "data follows the SYN's sequence number");
+    assert_eq!(seg.ack, PEER_ISN.wrapping_add(1), "we acknowledge the peer's SYN");
+    assert_eq!(&frames[0][34 + TCP_HDR_LEN..], request, "the payload rides intact");
+
+    // Peer → client: the response is delivered, acknowledged, and
+    // readable through the async recv hook.
+    clear_tx();
+    let response = b"world";
+    deliver(&Seg {
+        src_port: RP,
+        dst_port: local_port,
+        seq: PEER_ISN.wrapping_add(1),
+        ack: iss.wrapping_add(1 + request.len() as u32),
+        flags: TCP_ACK | TCP_PSH,
+        window: 65535,
+        payload: response.to_vec(),
+    });
+    let acks = tx();
+    assert!(!acks.is_empty(), "inbound data elicits an ACK");
+    assert_eq!(
+        tcp_hdr(acks.last().unwrap()).ack,
+        PEER_ISN.wrapping_add(1 + response.len() as u32),
+        "the ACK covers the peer's payload",
+    );
+    assert!(
+        super::is_readable_or_closed(handle, generation),
+        "the conn reports readable",
+    );
+    let mut buf = [0u8; 64];
+    let n = super::async_recv(handle, generation, &mut buf);
+    assert_eq!(&buf[..n], response, "the peer's bytes are readable on the client conn");
+}

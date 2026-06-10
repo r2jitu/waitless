@@ -12,7 +12,9 @@ rust_library(
     name = "tcp",
     srcs = [
         "src/lib.rs",
+        "src/connect.rs",
         "src/diag.rs",
+        "src/ephemeral.rs",
         "src/listener.rs",
         "src/pool.rs",
         "src/receive.rs",
@@ -29,6 +31,7 @@ rust_library(
         "//crates/kernel/core",
         "//crates/net/cc:cc",
         "//crates/net:checksum",
+        "//crates/net:classify",
         "//crates/net:ethernet",
         "//crates/net:from_bytes",
         "//crates/net:ipv4",

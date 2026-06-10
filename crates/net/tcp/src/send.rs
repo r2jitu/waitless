@@ -273,6 +273,50 @@ pub(crate) fn send_segment(meta: &SegmentMeta, payload: &[u8]) {
     send_segment_opts(meta, payload, &[]);
 }
 
+/// Maximum byte length of the SYN-shaped option blob
+/// [`syn_option_blob`] assembles — MSS + NOP + WS + SACK-Perm + 2·NOP.
+pub(crate) const SYN_OPTS_MAX: usize = 12;
+
+/// Assemble the TCP option blob for a SYN-shaped segment — the
+/// passive path's SYN-ACK (which echoes Window-Scale / SACK-Permitted
+/// only when the peer offered them) and the active-open SYN (which
+/// always offers all three). One builder so the two flights can never
+/// drift; the blobs stay 4-byte aligned (NOP-padded), as
+/// `send_segment_opts` requires. Writes into `out` and returns the
+/// filled length.
+///
+///   * MSS (kind=2, len=4) — always present (RFC 9293 §3.7.1).
+///   * Window-Scale (kind=3, len=3, shift 0) when `wscale` — we never
+///     need to scale our own 16 KiB window, but emitting the option
+///     is what authorises the *peer* to scale the window it
+///     advertises (RFC 7323 §2.3).
+///   * SACK-Permitted (kind=4, len=2) when `sack` (RFC 2018 §2).
+pub(crate) fn syn_option_blob(mss: u16, wscale: bool, sack: bool, out: &mut [u8; SYN_OPTS_MAX]) -> usize {
+    let [mss_hi, mss_lo] = mss.to_be_bytes();
+    match (wscale, sack) {
+        // MSS + NOP + WS = 8 B.
+        (true, false) => {
+            out[..8].copy_from_slice(&[2, 4, mss_hi, mss_lo, 1, 3, 3, 0]);
+            8
+        }
+        // MSS + NOP + WS + SACK-Perm + 2·NOP = 12 B.
+        (true, true) => {
+            out.copy_from_slice(&[2, 4, mss_hi, mss_lo, 1, 3, 3, 0, 4, 2, 1, 1]);
+            12
+        }
+        // MSS + SACK-Perm + 2·NOP = 8 B.
+        (false, true) => {
+            out[..8].copy_from_slice(&[2, 4, mss_hi, mss_lo, 4, 2, 1, 1]);
+            8
+        }
+        // MSS only — 4 bytes (one option word).
+        (false, false) => {
+            out[..4].copy_from_slice(&[2, 4, mss_hi, mss_lo]);
+            4
+        }
+    }
+}
+
 /// As [`send_segment`] but with a TCP `options` blob (4-byte aligned)
 /// between the 20-byte header and the payload. Used for the SYN-ACK's
 /// RFC 7323 Window-Scale option. The data offset, segment length, and

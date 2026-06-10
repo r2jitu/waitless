@@ -53,6 +53,8 @@ static BARE_TCP_BACKEND: executor::reactor::TcpBackend = executor::reactor::TcpB
     listen: tcp_backend_listen,
     accept: tcp_backend_accept,
     unlisten: None,
+    connect: tcp_backend_connect,
+    connect_status: tcp::connect_status,
     has_data: tcp::is_readable_or_closed,
     do_recv: tcp::async_recv,
     register_recv_waker: tcp::register_recv_waker,
@@ -130,6 +132,23 @@ fn tcp_backend_listen(port: u16) -> Result<(), ()> {
 
 fn tcp_backend_accept(port: u16) -> executor::reactor::TcpStream {
     tcp::accept_on_port(port)
+}
+
+fn tcp_backend_connect(ip: types::IpAddr, port: u16) -> executor::reactor::TcpStream {
+    use executor::reactor::TcpStream;
+    // Source-address selection. IPv4: the DHCP/static-configured
+    // address. IPv6 active open is deferred — picking a correct v6
+    // source (SLAAC global vs link-local, scope rules) needs the
+    // `ipv6_nd` address table plumbed through; nothing client-side
+    // needs v6 yet.
+    let local_ip = match ip {
+        types::IpAddr::V4(_) => types::IpAddr::V4(types::CONFIG.ip()),
+        types::IpAddr::V6(_) => return TcpStream::NULL,
+    };
+    match tcp::connect_on_core(local_ip, ip, port) {
+        Some((handle, generation)) => TcpStream::from_raw(handle, generation),
+        None => TcpStream::NULL,
+    }
 }
 
 // ============================================================================

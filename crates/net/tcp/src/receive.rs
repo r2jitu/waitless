@@ -475,6 +475,27 @@ fn tcp_receive_inner(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOB
                 && c.local_port == dst_port
                 && c.remote_port == src_port
             {
+                // Active open: in `SynSent` an RST is judged by its
+                // ACK, not its seq — `rcv_nxt` is still unknown
+                // (RFC 9293 §3.10.7.3 second check). Acceptable
+                // (ACK set, acking our SYN: SEG.ACK == ISS+1 ==
+                // SND.NXT) ⇒ connection refused: flag the conn
+                // errored + wake the parked connect waiter; the slot
+                // is released when the future observes the failure.
+                // Anything else is a blind injection — drop.
+                if c.state == TcpState::SynSent {
+                    let acceptable = flags & TCP_ACK != 0 && ack == c.snd_nxt;
+                    let state = c.state;
+                    crate::diag::record_rst(src_port, dst_port, seq, c.rcv_nxt, acceptable, state);
+                    if acceptable {
+                        crate::connect::fail_connect(
+                            core,
+                            i,
+                            crate::state::ConnectFailure::Refused,
+                        );
+                    }
+                    return;
+                }
                 // RFC 5961 §3.2: only an in-sequence RST tears the
                 // connection down. Trace it either way — an
                 // out-of-window RST is a blind off-path injection we
@@ -543,6 +564,25 @@ fn tcp_receive_inner(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOB
             if c.state == TcpState::Established {
                 let (snd_nxt, rcv_nxt, win) = (c.snd_nxt, c.rcv_nxt, c.rx_free() as u16);
                 send_challenge_ack(core, dst_ip, src_ip, dst_port, src_port, snd_nxt, rcv_nxt, win);
+                return;
+            }
+        }
+
+        // Active open: a bare SYN on a `SynSent` 4-tuple is a
+        // simultaneous open — the peer's SYN crossing ours on the
+        // wire (RFC 9293 §3.10.7.3). The RFC prescribes moving to
+        // SynReceived + a SYN-ACK, but that arm would contort the
+        // listener-oriented SynReceived path (listener_port routing,
+        // accept-ring delivery) for a case no real client workload
+        // hits — v1 drops the SYN and counts it; the peer's SYN-ACK
+        // to OUR SYN still completes the handshake. Deliberate
+        // deferral, not an oversight. Must intercept BEFORE the
+        // stale-twin filter below, which would otherwise free the
+        // live embryo conn.
+        if let Some(s) = hit {
+            let c = unsafe { &*conn_ptr(core, s) };
+            if c.state == TcpState::SynSent {
+                crate::diag::COUNTERS.simultaneous_open_drops.bump();
                 return;
             }
         }
@@ -709,25 +749,14 @@ fn tcp_receive_inner(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOB
             // us to send, and the peer to act on, SACK blocks. The
             // blobs stay 4-byte aligned (NOP-padded), as
             // `send_segment_opts` requires.
-            let [mss_hi, mss_lo] = (mss_for(c.local_ip) as u16).to_be_bytes();
-            match (c.wscale_ok, c.sack_ok) {
-                // MSS + NOP + WS = 8 B (unchanged from the WS-only path).
-                (true, false) => {
-                    send_segment_opts(&meta, &[], &[2, 4, mss_hi, mss_lo, 1, 3, 3, 0]);
-                }
-                // MSS + NOP + WS + SACK-Perm + 2·NOP = 12 B.
-                (true, true) => {
-                    send_segment_opts(&meta, &[], &[2, 4, mss_hi, mss_lo, 1, 3, 3, 0, 4, 2, 1, 1]);
-                }
-                // MSS + SACK-Perm + 2·NOP = 8 B.
-                (false, true) => {
-                    send_segment_opts(&meta, &[], &[2, 4, mss_hi, mss_lo, 4, 2, 1, 1]);
-                }
-                // MSS only — 4 bytes (one option word).
-                (false, false) => {
-                    send_segment_opts(&meta, &[], &[2, 4, mss_hi, mss_lo]);
-                }
-            }
+            let mut opts = [0u8; crate::send::SYN_OPTS_MAX];
+            let n = crate::send::syn_option_blob(
+                mss_for(c.local_ip) as u16,
+                c.wscale_ok,
+                c.sack_ok,
+                &mut opts,
+            );
+            send_segment_opts(&meta, &[], &opts[..n]);
             crate::diag::COUNTERS.synack_tx.bump();
         }
         unsafe {
@@ -755,7 +784,21 @@ fn tcp_receive_inner(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOB
         Some(s) => s,
         None => match tcp_linear_find(core, src_ip, src_port, dst_port) {
             Some(s) => s,
-            None => return,
+            None => {
+                // A SYN-ACK with no matching conn on this core is
+                // (almost certainly) the reply to OUR active-open SYN
+                // delivered to the wrong core — a server never
+                // receives one otherwise. On Tier-1 multi-queue NICs
+                // the hardware RSS hash need not match the software
+                // flow hash the ephemeral-port picker used, so the
+                // reply can land on a sibling core and drop here;
+                // client conns on those paths need the A3 steering
+                // phase. Counted for that phase's observability.
+                if flags & TCP_SYN != 0 && flags & TCP_ACK != 0 {
+                    crate::diag::COUNTERS.client_wrong_core_drops.bump();
+                }
+                return;
+            }
         },
     };
     {
@@ -766,6 +809,19 @@ fn tcp_receive_inner(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOB
     }
 
     let c = unsafe { &mut *conn_ptr(core, slot) };
+
+    // Active open: a conn in `SynSent` follows the RFC 9293
+    // §3.10.7.3 SYN-SENT checks, which differ from the synchronized-
+    // state processing below (acceptability is judged by the ACK
+    // field alone; the window/seq machinery isn't initialised yet).
+    // Dispatched whole — the segment never falls through.
+    if c.state == TcpState::SynSent {
+        handle_syn_sent(
+            c, src_ip, dst_ip, src_port, dst_port, seq, ack, flags, window, syn_wscale, syn_mss,
+            syn_sack,
+        );
+        return;
+    }
 
     // State on entry, before this segment drives any transition —
     // the TimeWait retransmitted-FIN branch below needs to know the
@@ -1183,6 +1239,139 @@ fn tcp_receive_inner(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOB
         {
             w.wake();
         }
+    }
+}
+
+/// RFC 9293 §3.10.7.3 — segment arrival in SYN-SENT (active open).
+/// The RST case never reaches here (the RST branch at the top of
+/// `tcp_receive_inner` owns it); what remains is the ACK
+/// acceptability check, the SYN-ACK that completes our handshake,
+/// and the drop cases.
+#[allow(clippy::too_many_arguments)]
+fn handle_syn_sent(
+    c: &mut TcpConnection,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    syn_wscale: Option<u8>,
+    syn_mss: Option<u16>,
+    syn_sack: bool,
+) {
+    // First check: an ACK is acceptable only if it acknowledges our
+    // SYN exactly — `SND.UNA < SEG.ACK <= SND.NXT`, i.e. SEG.ACK ==
+    // ISS+1 == SND.NXT. Anything else (SEG.ACK =< ISS, or beyond
+    // SND.NXT) draws `<SEQ=SEG.ACK><CTL=RST>` and the segment is
+    // dropped; the connection REMAINS in SynSent (the real SYN-ACK
+    // may still arrive). Not a challenge ACK — RFC 5961's machinery
+    // is for synchronized states.
+    let ack_acceptable = flags & TCP_ACK != 0 && ack == c.snd_nxt;
+    if flags & TCP_ACK != 0 && !ack_acceptable {
+        crate::diag::COUNTERS.rst_sent.bump();
+        send_segment(
+            &SegmentMeta {
+                local_ip: dst_ip,
+                dst_ip: src_ip,
+                src_port: dst_port,
+                dst_port: src_port,
+                seq: ack,
+                ack: 0,
+                flags: TCP_RST,
+                window: 0,
+            },
+            &[],
+        );
+        return;
+    }
+    // Fourth/fifth check: no SYN (and no RST — handled earlier) ⇒
+    // drop the segment and return.
+    if flags & TCP_SYN == 0 {
+        return;
+    }
+    if flags & TCP_ACK == 0 {
+        // Simultaneous open: a bare SYN crossing ours on the wire.
+        // Unreachable in practice — the bare-SYN dispatch at the top
+        // of `tcp_receive_inner` intercepts it (drop +
+        // `simultaneous_open_drops`; see the comment there for the
+        // v1 deferral rationale) before the conn lookup. Kept as a
+        // backstop so a bare SYN can never fall into the SYN-ACK
+        // establish path below.
+        return;
+    }
+
+    // A valid SYN-ACK — complete the three-way handshake.
+    //
+    // Record the peer's ISN and seed the receive side.
+    c.rcv_nxt = seq.wrapping_add(1);
+    c.snd_una = ack;
+    // RFC 9293: seed the peer's advertised window from the SYN-ACK.
+    // RFC 7323 §2.2: a SYN-shaped segment's window is NOT scaled.
+    c.snd_wnd = window as u32;
+    c.snd_wl1 = seq;
+    c.snd_wl2 = ack;
+    // Option negotiation — the SAME rules the passive path applies
+    // to a client SYN (`parse_syn_options` already ran on this
+    // segment at the top of `tcp_receive_inner`). Our SYN offered
+    // Window-Scale + SACK-Permitted unconditionally (`send_syn`), so
+    // each is in effect iff the peer echoed it.
+    c.wscale_ok = syn_wscale.is_some();
+    c.snd_wscale = syn_wscale.unwrap_or(0);
+    c.sack_ok = syn_sack;
+    // RFC 9293 §3.7.1: honor the peer's MSS — clamp our send
+    // segment size to min(ours, peer's), floored at 536 so a
+    // hostile tiny MSS can't force pathological segmentation.
+    let local_mss = mss_for(c.local_ip) as u16;
+    c.snd_mss = match syn_mss {
+        Some(peer) => local_mss.min(peer).max(536),
+        None => local_mss,
+    };
+    c.state = TcpState::Established;
+    crate::diag::COUNTERS.conns_established.bump();
+    // Disarm the SYN-retransmit (lifecycle) timer — the SYN is
+    // acknowledged.
+    c.lifecycle_deadline_ms = 0;
+    c.fin_retx_count = 0;
+    // RFC 5681 §3.1 / RFC 6928: open the congestion window at the
+    // initial window — exactly as the passive path does once the
+    // segment size is known.
+    c.congestion_init();
+    // RTT sample from the SYN round trip (RFC 6298 §3). The anchor
+    // was set at `connect_on_core`; `retransmit_syn` invalidates it
+    // (Karn's rule — a retransmitted SYN's ACK is ambiguous).
+    if c.rtt_anchor_active && !seq_lt(c.snd_una, c.rtt_anchor_seq) {
+        let elapsed = kernel_core::clock::now_ms().saturating_sub(c.rtt_anchor_ms);
+        c.sample_rtt(elapsed.min(u32::MAX as u64) as u32);
+        c.rtt_anchor_active = false;
+        c.rto_ms = c.estimated_rto();
+    }
+    // The final ACK of the three-way handshake. Any payload riding
+    // the SYN-ACK (TCP Fast Open-style) is not consumed — `rcv_nxt`
+    // covers only the SYN, so a real peer retransmits the bytes.
+    send_segment(
+        &SegmentMeta {
+            local_ip: dst_ip,
+            dst_ip: src_ip,
+            src_port: dst_port,
+            dst_port: src_port,
+            seq: c.snd_nxt,
+            ack: c.rcv_nxt,
+            flags: TCP_ACK,
+            window: c.rx_free() as u16,
+        },
+        &[],
+    );
+    // Wake the connect waiter parked on the send-waker slot (unused
+    // pre-Established — see `connect::connect_status`), plus any
+    // recv waiter that raced in.
+    if let Some(w) = c.send_waker.take() {
+        w.wake();
+    }
+    if let Some(w) = c.recv_waker.take() {
+        w.wake();
     }
 }
 

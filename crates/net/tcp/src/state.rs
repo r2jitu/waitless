@@ -42,6 +42,29 @@ pub enum TcpState {
     CloseWait,
     LastAck,
     TimeWait,
+    /// Active open (client connect): our SYN is on the wire, the
+    /// peer's SYN-ACK hasn't arrived. Appended after the passive
+    /// states so their `repr(u8)` discriminants are unchanged.
+    SynSent,
+}
+
+/// Why an active open (client connect) failed — the terminal flag
+/// the parked connect future reads via `connect_status` after the
+/// slot has gone wire-inert (`state == Closed`, 4-tuple removed from
+/// the hash). The slot itself is NOT freed at failure time: it stays
+/// allocated, generation intact, until the future observes the
+/// failure and releases it (`close`), so `Refused` and `TimedOut`
+/// stay distinguishable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectFailure {
+    /// No failure recorded (the default; also every passive conn).
+    None,
+    /// RST with an acceptable ACK arrived in `SynSent` — the peer
+    /// actively refused the connection (RFC 9293 §3.10.7.3).
+    Refused,
+    /// The SYN went unanswered through `SYN_RETX_MAX`
+    /// retransmissions.
+    TimedOut,
 }
 
 #[repr(C, packed)]
@@ -183,6 +206,11 @@ pub(crate) const FIN_RETX_MAX: u8 = 5;
 /// reopens its window across this many exponentially-backed-off
 /// probes is treated as dead. Matches `RTX_MAX_RETRIES`.
 pub(crate) const PERSIST_MAX_PROBES: u8 = 8;
+/// SYN retransmissions in `SynSent` (active open) before the connect
+/// is declared timed out. Matches Linux's `tcp_syn_retries` default
+/// (5 retries, 1+2+4+8+16 s of exponential backoff ≈ 31 s before the
+/// final wait expires).
+pub(crate) const SYN_RETX_MAX: u8 = 5;
 /// `TimeWait` hold time: 2×MSL (RFC 9293 §3.10.7.4) with MSL taken as
 /// 30 s. After an active close completes the TCB lingers here so a
 /// delayed duplicate from the old 4-tuple cannot be delivered into a
@@ -341,6 +369,9 @@ pub struct TcpConnection {
     pub(crate) pending_chunk: Option<IOBuf>,
     pub(crate) listener_port: u16,
     pub(crate) accepted: bool,
+    /// Active-open failure flag — see [`ConnectFailure`]. `None` for
+    /// every passive conn and every successful connect.
+    pub(crate) connect_failure: ConnectFailure,
     /// Incremented every time `free_connection` resets this slot, so
     /// a stale async handle that survived a close+reuse sees a
     /// generation mismatch on its next hook call and short-circuits
@@ -414,7 +445,9 @@ pub struct TcpConnection {
     /// Consecutive FIN retransmissions with no acknowledgement — the
     /// exponential-backoff exponent and the `FIN_RETX_MAX` give-up
     /// counter. Meaningful only while `lifecycle_deadline_ms` is armed
-    /// in `FinWait1` / `LastAck`.
+    /// in `FinWait1` / `LastAck` — or, for an active open, in
+    /// `SynSent`, where it counts SYN retransmissions against
+    /// `SYN_RETX_MAX`.
     pub(crate) fin_retx_count: u8,
     /// Absolute deadline (`kernel_core::clock::now_ms`) for the next
     /// RFC 9293 §3.8.6.1 zero-window probe. Armed by
@@ -685,6 +718,7 @@ impl TcpConnection {
             pending_chunk: None,
             listener_port: 0,
             accepted: false,
+            connect_failure: ConnectFailure::None,
             generation: 0,
             recv_waker: None,
             send_waker: None,
@@ -1398,6 +1432,10 @@ impl TcpConnection {
     /// Arm (or re-arm) the FIN-retransmit timer. The interval backs
     /// off exponentially with `fin_retx_count` (RFC 6298 §5.5-style)
     /// off the connection's RTO estimate, capped at `RTO_MAX_MS`.
+    /// In `SynSent` the same deadline + counter drive the active-open
+    /// SYN retransmit (`connect::retransmit_syn`) — the SYN is the
+    /// same phantom-byte control-segment shape as the FIN, outside
+    /// the data `rtx_queue`.
     pub(crate) fn arm_fin_timer(&mut self, now: u64) {
         let interval = ((self.estimated_rto() as u64) << self.fin_retx_count.min(16))
             .min(RTO_MAX_MS as u64);

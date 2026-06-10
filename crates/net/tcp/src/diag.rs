@@ -60,6 +60,31 @@ pub struct Counters {
     /// the gap fills rather than dropped and RTO-retransmitted.
     pub ooo_queued: Counter,
 
+    // ── Active open (client connect) ─────────────────────────────
+    /// Active opens started — a `tcp_connect` that allocated a slot
+    /// and put a SYN on the wire. Compare against
+    /// `conns_established` + the two failure counters below.
+    pub connect_attempts: Counter,
+    /// SYN retransmissions in `SynSent` — the active-open analogue
+    /// of `fin_retransmits`.
+    pub syn_retransmits: Counter,
+    /// Active opens refused — an RST with an acceptable ACK arrived
+    /// in `SynSent` (RFC 9293 §3.10.7.3).
+    pub connect_refused: Counter,
+    /// Active opens timed out — the SYN went unanswered through
+    /// `SYN_RETX_MAX` retransmissions.
+    pub connect_timeouts: Counter,
+    /// Bare SYNs received in `SynSent` (simultaneous open) and
+    /// dropped — a deliberate v1 deferral; see
+    /// `receive::handle_syn_sent`.
+    pub simultaneous_open_drops: Counter,
+    /// SYN-ACK segments dropped at the conn-lookup miss — almost
+    /// certainly the reply to OUR active-open SYN delivered to the
+    /// wrong core by a Tier-1 multi-queue NIC's hardware RSS (which
+    /// need not match the software flow hash the ephemeral-port
+    /// picker used). Observability for the A3 steering phase.
+    pub client_wrong_core_drops: Counter,
+
     // ── Teardown ─────────────────────────────────────────────────
     /// Connections freed, all reasons. Equals the sum of the
     /// per-reason teardown counters below plus the graceful closes
@@ -170,6 +195,12 @@ impl Counters {
             challenge_ack_sent: Counter::new(),
             challenge_ack_throttled: Counter::new(),
             ooo_queued: Counter::new(),
+            connect_attempts: Counter::new(),
+            syn_retransmits: Counter::new(),
+            connect_refused: Counter::new(),
+            connect_timeouts: Counter::new(),
+            simultaneous_open_drops: Counter::new(),
+            client_wrong_core_drops: Counter::new(),
             conns_freed: Counter::new(),
             rst_received: Counter::new(),
             rst_sent: Counter::new(),
@@ -372,6 +403,10 @@ pub enum TeardownReason {
     /// A SYN's RX-ring allocation failed; the just-allocated slot
     /// was freed again.
     RxRingOom,
+    /// Active open refused — RST with an acceptable ACK in `SynSent`.
+    ConnectRefused,
+    /// Active open timed out — `SYN_RETX_MAX` SYNs went unanswered.
+    ConnectTimeout,
 }
 
 impl TeardownReason {
@@ -386,6 +421,8 @@ impl TeardownReason {
             TeardownReason::PersistGiveup => "persist_giveup",
             TeardownReason::PoolReclaim => "pool_reclaim",
             TeardownReason::RxRingOom => "rx_ring_oom",
+            TeardownReason::ConnectRefused => "connect_refused",
+            TeardownReason::ConnectTimeout => "connect_timeout",
         }
     }
 }
@@ -478,6 +515,7 @@ pub fn state_name(s: TcpState) -> &'static str {
         TcpState::CloseWait => "close_wait",
         TcpState::LastAck => "last_ack",
         TcpState::TimeWait => "time_wait",
+        TcpState::SynSent => "syn_sent",
     }
 }
 
@@ -564,6 +602,8 @@ pub fn record_teardown(reason: TeardownReason, state: TcpState) {
         TeardownReason::PersistGiveup => COUNTERS.persist_giveups.bump(),
         TeardownReason::PoolReclaim => COUNTERS.pool_reclaimed.bump(),
         TeardownReason::RxRingOom => COUNTERS.rx_ring_oom.bump(),
+        TeardownReason::ConnectRefused => COUNTERS.connect_refused.bump(),
+        TeardownReason::ConnectTimeout => COUNTERS.connect_timeouts.bump(),
         TeardownReason::PeerReset
         | TeardownReason::PassiveClose
         | TeardownReason::TimeWaitExpiry => {}
@@ -577,7 +617,7 @@ pub fn record_teardown(reason: TeardownReason, state: TcpState) {
 
 /// Counter `(name, value)` pairs in declaration order — the flat
 /// half of the `/obs` `"tcp"` block.
-pub fn snapshot() -> [(&'static str, u64); 32] {
+pub fn snapshot() -> [(&'static str, u64); 38] {
     let c = &COUNTERS;
     [
         ("syn_rx", c.syn_rx.get()),
@@ -587,6 +627,12 @@ pub fn snapshot() -> [(&'static str, u64); 32] {
         ("challenge_ack_sent", c.challenge_ack_sent.get()),
         ("challenge_ack_throttled", c.challenge_ack_throttled.get()),
         ("ooo_queued", c.ooo_queued.get()),
+        ("connect_attempts", c.connect_attempts.get()),
+        ("syn_retransmits", c.syn_retransmits.get()),
+        ("connect_refused", c.connect_refused.get()),
+        ("connect_timeouts", c.connect_timeouts.get()),
+        ("simultaneous_open_drops", c.simultaneous_open_drops.get()),
+        ("client_wrong_core_drops", c.client_wrong_core_drops.get()),
         ("conns_freed", c.conns_freed.get()),
         ("rst_received", c.rst_received.get()),
         ("rst_sent", c.rst_sent.get()),

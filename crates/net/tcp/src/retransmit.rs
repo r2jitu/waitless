@@ -7,7 +7,10 @@
 // `state.rs`); this module just drives the per-core poll cadence.
 
 use crate::pool::{conn_ptr, free_connection, tick_head_get, tick_head_publish, tick_head_take};
-use crate::state::{FIN_RETX_MAX, NULL_SLOT, PERSIST_MAX_PROBES, RTX_MAX_RETRIES, TcpState};
+use crate::state::{
+    ConnectFailure, FIN_RETX_MAX, NULL_SLOT, PERSIST_MAX_PROBES, RTX_MAX_RETRIES, SYN_RETX_MAX,
+    TcpState,
+};
 
 /// Drive the per-core TCP timers for the current core's connection
 /// pool. Called from the net poll loop (`sched::poll`) at a coarse
@@ -24,6 +27,10 @@ use crate::state::{FIN_RETX_MAX, NULL_SLOT, PERSIST_MAX_PROBES, RTX_MAX_RETRIES,
 ///     (passive close) connection whose FIN went unacknowledged gets
 ///     it retransmitted with exponential backoff, or is forced shut
 ///     after `FIN_RETX_MAX` attempts.
+///   * SYN retransmission — a `SynSent` (active open) connection
+///     whose SYN went unanswered gets it retransmitted with the same
+///     backoff, or is flagged timed-out after `SYN_RETX_MAX`
+///     attempts (the connect future observes + releases it).
 ///   * `TimeWait` expiry — a connection that completed its active
 ///     close is freed once the 2×MSL hold has elapsed.
 pub fn on_tcp_tick() {
@@ -142,6 +149,23 @@ pub fn on_tcp_tick() {
                         TcpState::TimeWait,
                     );
                     free_connection(core, i);
+                }
+                TcpState::SynSent => {
+                    // Active open: retransmit the unanswered SYN with
+                    // backoff, or declare the connect timed out once
+                    // the `SYN_RETX_MAX` budget is spent. The timeout
+                    // marks + wakes (`fail_connect`) rather than
+                    // freeing — the slot is held until the connect
+                    // future observes the failure (see `connect.rs`)
+                    // — and falls through with every deadline zeroed,
+                    // so the lazy unlink below drops it from the list
+                    // (the same fall-through shape as the FIN giveup
+                    // above).
+                    if c.fin_retx_count >= SYN_RETX_MAX {
+                        crate::connect::fail_connect(core, i, ConnectFailure::TimedOut);
+                    } else {
+                        c.retransmit_syn(now);
+                    }
                 }
                 // A lifecycle deadline armed on a state that no longer
                 // owns one — disarm defensively.
