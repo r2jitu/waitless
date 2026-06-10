@@ -43,6 +43,51 @@ depth and performance**, not new subsystems:
 - **RX/TX datapath** — RX offload (HW GRO/RSC), conn-state / conn-future pools, owned-UDP zero-copy → [`rx-path-optimizations.md`](rx-path-optimizations.md) / [`tx-path-optimizations.md`](tx-path-optimizations.md).
 - **Inter-layer contracts** — converging the TCP/TLS/HTTP-1.1 and UDP/QUIC/HTTP-3 stacks onto one golden path (the `ByteStream` trait, the owned buffer currency, the NIC/reactor vtable→trait migrations) → [`stack-architecture.md`](stack-architecture.md).
 
+## Known gaps & open items — at a glance
+
+The single index of what's *not* done. The per-subsystem backlogs hold the
+detail (the "doc" column); this table is the cross-cutting view so a reader
+needn't open six files to see the open set. Severity: **S0** correctness/
+safety reachable in normal operation, **S1** impact under adverse/hostile
+conditions, **S2** performance ceiling or feature breadth, **S3** low-impact
+/ near-non-goal. Items marked † were surfaced by the 2026-06-09 whole-codebase
+audit and are documented here (some also in their backlog).
+
+| Area | Open item | Sev | Doc |
+|---|---|---|---|
+| TCP CC | **BBR** + a **TCP-side pacer** | S2 | tcp-backlog L1/L3 |
+| TCP loss | **RACK** time-based detection (TLP's mid-stream half) | S1 | tcp-backlog L4 |
+| TCP | **Timestamps + PAWS** (RFC 7323) — deliberately deferred | S2 | tcp-backlog T6 |
+| TCP CUBIC | under TCP, CUBIC uses SRTT not min-RTT (TCP passes `min_us=0`) † | S2 | tcp-backlog L1 |
+| TCP PMTUD | cross-core route of the ICMP report to the flow's core; no immediate re-send of the in-flight oversized segment (waits for RTO/TLP) | S2 | tcp-backlog T2 |
+| TCP | **FinWait2 / half-closed** has no time-based idle reap (only reclaimed on pool-full) † | S2 | tcp-backlog |
+| L3 (IPv4) | inbound **IP fragments** aren't reassembled (a non-first fragment is fed to L4); no inbound IP/TCP **checksum verify** (relies on NIC RX-csum offload) † | S1 | networking |
+| L3 (NDP/ARP) | learn-only: no active solicitation on miss, no RFC 4861 reachability state, FIFO eviction only † | S3 | networking |
+| QUIC | peer **`ack_delay_exponent` / `max_ack_delay`** unparsed → wrong RTT/PTO scaling for a non-default peer † | S1 | conformance-roadmap |
+| QUIC | **RESET_STREAM / STOP_SENDING** not generated/honored (per-stream abort) † | S1 | conformance-roadmap |
+| QUIC | **CID rotation** (NEW/RETIRE_CONNECTION_ID) + WE-initiated PATH_CHALLENGE on a migrated path | S2 | conformance-roadmap |
+| QUIC | CONNECTION_CLOSE emitted in only the highest-keys PN space (RFC 9000 §10.2.3) † | S3 | conformance-roadmap |
+| QUIC interop | QUIC Interop Runner (external Docker) not wired | S2 | conformance-roadmap |
+| TLS | **record sequence wraps with no nonce-reuse guard** — must terminate before the AES-GCM record limit (RFC 8446 §5.5) † | S1 | tls-backlog |
+| TLS | HelloRetryRequest, full key-update, ticket-key rotation, cipher/curve breadth, 0-RTT (replay-sensitive) | S2 | tls-backlog |
+| TLS | AES round-keys not zeroized on drop (single-tenant bare-metal) † | S3 | tls-backlog |
+| HTTP/2 | **h2spec** run (external tool); §7 error-code audit; two-GOAWAY drain; receive-window overrun not strictly rejected; request **trailers** dropped (no §8.1.2 validation) † | S1/S2 | http2-backlog |
+| HTTP/3 | QPACK dynamic table; `SETTINGS_MAX_FIELD_SECTION_SIZE` parsed but unenforced †; header truncation past the slot cap † | S2 | http3-backlog |
+| HPACK/QPACK | field-huffman 16 KiB scratch → a >16 KiB literal returns a mis-named `BadPadding` (a resource limit reported as a wire error) † | S3 | http2/http3-backlog |
+| Drivers | virtio-net **MMIO** path negotiates `MRG_RXBUF` but its RX can't handle multi-buffer frames (the modern-PCI path strips it) — unsafe-but-benign on current hosts † | S1 | rx-path-optimizations |
+| Drivers | gve **DQO cross-core RX repost** ordering (a higher-slot doorbell can race a lower-slot descriptor write — needs a contiguous-publish cursor) † | S1 | gvnic |
+| Kernel | aarch64 `CNTFRQ_EL0` trusted as a single source — a 0/sub-MHz emulator value silently corrupts every cycle budget † | S3 | — |
+| Kernel | aarch64 **PL031 RTC** backend (wall-clock returns 0 on aarch64) | S3 | roadmap (deferred) |
+| Runtime | `TcpRecv`/`TcpSendChain` have no `Drop` → a cancelled (`select`/`timeout`) future leaves a stale waker (relies on the "never both recv+recv_chunk parked" convention) † | S2 | stack-architecture |
+| Runtime | `AsyncEvent` is single-waiter (second waker silently overwrites); native idle worker wakes on a 10 ms kqueue timeout | S3 | stack-architecture |
+
+Refactor opportunities the audit logged but didn't action (each tracked in
+its area's notes): split the 1.7-KLOC `tcp/state.rs` retransmit/timer cluster
+into its own module; factor the `net_cc` one-reduction-per-episode recovery
+hold shared by NewReno+CUBIC; a shared `SegmentMeta`/4-tuple builder in TCP;
+generic TCP/UDP fanout-handle machinery in the reactor; consolidate the
+reactor's bespoke waker-spinlock onto `util/sync::Spinlock`.
+
 ## Phase 6 — advanced features (future)
 
 Net-new subsystems, none started.

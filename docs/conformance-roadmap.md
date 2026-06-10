@@ -311,10 +311,25 @@ on top (RFC 9114 framing + RFC 9204 QPACK) is tracked in
   packetization gates STREAM emission on the peer's `peer_max_data`
   (conn level) and per-stream `peer_max_stream_data`, so a large
   response can't outrun the peer's advertised credit.
-- **Missing**: connection migration and the full transport-parameter
-  set. Lost MAX_* frames aren't retransmitted (shared with the
-  frame-retx gap below); a newer credit supersedes a lost one as
-  consumption advances.
+- **Missing** (the live transport gaps; migration itself landed — see
+  §8.2.2/§9.3 below):
+  - the **full transport-parameter set** — in particular the peer's
+    `ack_delay_exponent` (0x0a) and `max_ack_delay` (0x0b) are not parsed,
+    so a peer advertising non-default values gets the wrong ACK-delay
+    scaling in our RTT sample and PTO/time-threshold-loss timing (the
+    code hard-codes exponent 3 + a 25 ms `max_ack_delay`).
+  - **RESET_STREAM / STOP_SENDING** (RFC 9000 §19.4-5) — parsed past but
+    never *generated* (a handler erroring mid-response can only tear the
+    whole connection down, not abort the one stream) nor *honored* (a
+    received STOP_SENDING doesn't stop our send).
+  - **CID rotation** — NEW_CONNECTION_ID / RETIRE_CONNECTION_ID are
+    skip-only; we advertise no spare CIDs, so a CID-rotating/migrating
+    peer has none to use.
+  - Lost MAX_* frames aren't *proactively* retransmitted (recovered
+    reactively when the peer sends a *_BLOCKED frame); an idle peer never
+    recovers a lost final credit. CONNECTION_CLOSE is emitted in only the
+    highest-keys packet-number space (RFC 9000 §10.2.3 wants it replicated
+    when the peer may lack those keys).
 - **Conformance test**: extend `quic_test` with scripted-packet
   cases — the harness already exists; this is additive.
 
