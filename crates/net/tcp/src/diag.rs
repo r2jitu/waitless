@@ -54,6 +54,11 @@ pub struct Counters {
     /// Nonzero means a flood of triggers (forged SYNs / ACKs) was capped
     /// so we don't become a reflector or burn CPU.
     pub challenge_ack_throttled: Counter,
+    /// Out-of-order segments buffered in the RFC 9293 reassembly queue
+    /// (`seq > rcv_nxt`, a gap before them). Nonzero means packet loss
+    /// or reordering on the path; they are drained into the RX ring as
+    /// the gap fills rather than dropped and RTO-retransmitted.
+    pub ooo_queued: Counter,
 
     // ── Teardown ─────────────────────────────────────────────────
     /// Connections freed, all reasons. Equals the sum of the
@@ -148,6 +153,7 @@ impl Counters {
             ack_unsent: Counter::new(),
             challenge_ack_sent: Counter::new(),
             challenge_ack_throttled: Counter::new(),
+            ooo_queued: Counter::new(),
             conns_freed: Counter::new(),
             rst_received: Counter::new(),
             rst_sent: Counter::new(),
@@ -551,7 +557,7 @@ pub fn record_teardown(reason: TeardownReason, state: TcpState) {
 
 /// Counter `(name, value)` pairs in declaration order — the flat
 /// half of the `/obs` `"tcp"` block.
-pub fn snapshot() -> [(&'static str, u64); 27] {
+pub fn snapshot() -> [(&'static str, u64); 28] {
     let c = &COUNTERS;
     [
         ("syn_rx", c.syn_rx.get()),
@@ -560,6 +566,7 @@ pub fn snapshot() -> [(&'static str, u64); 27] {
         ("ack_unsent", c.ack_unsent.get()),
         ("challenge_ack_sent", c.challenge_ack_sent.get()),
         ("challenge_ack_throttled", c.challenge_ack_throttled.get()),
+        ("ooo_queued", c.ooo_queued.get()),
         ("conns_freed", c.conns_freed.get()),
         ("rst_received", c.rst_received.get()),
         ("rst_sent", c.rst_sent.get()),

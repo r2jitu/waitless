@@ -764,10 +764,16 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
                 pushed
             };
             c.rcv_nxt = c.rcv_nxt.wrapping_add(pushed as u32);
+            // T3: this in-order segment may have filled the gap before
+            // one or more buffered out-of-order segments — pull every
+            // now-contiguous segment into the ring, advancing `rcv_nxt`
+            // further so the cumulative ACK below covers them all. The
+            // clean in-order path (no buffered segments) skips this.
+            let drained = if !c.ooo.is_empty() { c.drain_ooo() } else { 0 };
             c.rcv_wnd = c.rx_free() as u16;
             // Wake any `TcpRecvReady` parked on this conn. Same core
             // owns the waker and the rx ring, so no cross-core hop.
-            if pushed > 0
+            if pushed + drained > 0
                 && let Some(w) = c.recv_waker.take()
             {
                 w.wake();
@@ -810,6 +816,45 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
         } else if seq_lt(seq, c.rcv_nxt) {
             // Duplicate/retransmitted segment — send ACK immediately so the
             // sender knows we already have this data (fast retransmit signal).
+            send_segment(
+                &SegmentMeta {
+                    local_ip: dst_ip,
+                    dst_ip: src_ip,
+                    src_port: dst_port,
+                    dst_port: src_port,
+                    seq: c.snd_nxt,
+                    ack: c.rcv_nxt,
+                    flags: TCP_ACK,
+                    window: c.rx_free() as u16,
+                },
+                &[],
+            );
+        } else {
+            // T3: a wholly-future segment (`seq > rcv_nxt`) — there is a
+            // gap before it. Buffer it in the out-of-order reassembly
+            // queue (bounded; dropped if over budget, the peer
+            // retransmits) so a single lost segment no longer forces the
+            // sender to RTO-retransmit the whole window. Gather the
+            // payload into an owned buffer — the device IOBuf is
+            // reclaimed when this call returns, long before the gap
+            // fills. Send an immediate duplicate ACK either way
+            // (RFC 5681 §4.2) to drive the sender's fast retransmit.
+            let mut buf = alloc::vec::Vec::new();
+            if buf.try_reserve_exact(payload_len).is_ok() {
+                let mut skip = data_offset;
+                for part in segment.iter() {
+                    let bytes = part.data();
+                    if skip >= bytes.len() {
+                        skip -= bytes.len();
+                        continue;
+                    }
+                    buf.extend_from_slice(&bytes[skip..]);
+                    skip = 0;
+                }
+                if c.ooo.insert(c.rcv_nxt, seq, buf) {
+                    crate::diag::COUNTERS.ooo_queued.bump();
+                }
+            }
             send_segment(
                 &SegmentMeta {
                     local_ip: dst_ip,

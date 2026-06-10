@@ -798,7 +798,7 @@ fn duplicate_data_elicits_an_immediate_dup_ack() {
 /// bytes are neither buffered nor acknowledged. Pinned so a future
 /// reassembly feature has to update this deliberately.
 #[test]
-fn out_of_order_segment_is_not_buffered() {
+fn out_of_order_segment_is_reassembled() {
     let _g = harness();
     const SP: u16 = 9106;
     const CP: u16 = 50106;
@@ -807,39 +807,192 @@ fn out_of_order_segment_is_not_buffered() {
     let server_isn = handshake(SP, CP, CLIENT_ISN);
     let rcv_nxt = CLIENT_ISN.wrapping_add(1);
 
-    // A segment 100 bytes past rcv_nxt — there is a gap before it.
+    // Segment B arrives first, 4 bytes past rcv_nxt — a gap before it.
+    // It is buffered (not dropped) and elicits an immediate duplicate
+    // ACK still pointing at rcv_nxt (RFC 5681 §4.2 fast-retransmit
+    // signal).
     clear_tx();
+    let ooo_before = super::diag::COUNTERS.ooo_queued.get();
     deliver(&Seg {
         src_port: CP,
         dst_port: SP,
-        seq: rcv_nxt.wrapping_add(100),
+        seq: rcv_nxt.wrapping_add(4),
         ack: server_isn.wrapping_add(1),
         flags: TCP_ACK | TCP_PSH,
+        payload: b"BBBB".to_vec(),
         window: 65535,
-        payload: vec![0xAB; 10],
     });
-    assert!(
-        tx().is_empty(),
-        "an out-of-order segment is silently dropped — no reassembly queue",
+    let frames = tx();
+    assert_eq!(frames.len(), 1, "an out-of-order segment elicits one immediate dup-ACK");
+    assert_eq!(
+        tcp_hdr(&frames[0]).ack,
+        rcv_nxt,
+        "the dup-ACK still points at rcv_nxt — the gap is not yet filled",
+    );
+    assert_eq!(
+        super::diag::COUNTERS.ooo_queued.get(),
+        ooo_before + 1,
+        "the out-of-order segment was buffered, not dropped",
     );
 
-    // The gap-filling in-order segment is accepted at the
-    // *original* rcv_nxt; the 10 out-of-order bytes were dropped.
+    // Segment A fills the gap. The ACK now jumps past *both* segments —
+    // A was delivered in order and B was drained from the reassembly
+    // queue behind it.
     clear_tx();
-    let body = b"in-order";
     deliver(&Seg {
         src_port: CP,
         dst_port: SP,
         seq: rcv_nxt,
         ack: server_isn.wrapping_add(1),
         flags: TCP_ACK | TCP_PSH,
+        payload: b"AAAA".to_vec(),
         window: 65535,
-        payload: body.to_vec(),
     });
     assert_eq!(
         tcp_hdr(tx().last().unwrap()).ack,
-        rcv_nxt.wrapping_add(body.len() as u32),
-        "ACK covers only the in-order bytes — the out-of-order segment was not reassembled",
+        rcv_nxt.wrapping_add(8),
+        "the cumulative ACK covers the gap-filler AND the reassembled segment",
+    );
+    assert_eq!(
+        conn_rx_drain(CP, SP),
+        b"AAAABBBB",
+        "the consumer reads the reassembled stream in order",
+    );
+}
+
+/// Direct coverage of the `OooQueue` reject/bound paths the wire-level
+/// scenarios don't exercise: an overlapping segment is dropped (first
+/// copy wins), an in-order or out-of-window segment is refused, the
+/// segment-count cap holds, and `take_at` returns `None` while a gap
+/// remains.
+#[test]
+fn ooo_queue_rejects_overlap_and_enforces_bounds() {
+    use super::state::{OOO_MAX_BYTES, OOO_MAX_SEGS, OooQueue};
+    let base = 1000u32;
+    let mut q = OooQueue::new();
+
+    // A wholly-future segment [base+4, base+8) is buffered.
+    assert!(q.insert(base, base + 4, b"BBBB".to_vec()), "future segment buffered");
+    // One overlapping it is rejected — the first copy wins.
+    assert!(!q.insert(base, base + 6, b"XXXX".to_vec()), "overlap rejected");
+    // An in-order segment (offset 0) is not the queue's job.
+    assert!(!q.insert(base, base, b"AAAA".to_vec()), "in-order rejected");
+    // One past the receive window is rejected.
+    assert!(
+        !q.insert(base, base + OOO_MAX_BYTES as u32, b"Z".to_vec()),
+        "out-of-window rejected",
+    );
+
+    // While the gap before base+4 remains, nothing is deliverable.
+    assert!(q.take_at(base).is_none(), "gap remains → take_at None");
+    // Once rcv_nxt reaches base+4 the segment is released.
+    let seg = q.take_at(base + 4).expect("contiguous segment released");
+    assert_eq!(seg.bytes, b"BBBB");
+    assert!(q.is_empty(), "queue drained");
+
+    // The segment-count cap holds: fill it with non-overlapping
+    // future segments, then the next insert is refused.
+    let mut q = OooQueue::new();
+    for i in 0..OOO_MAX_SEGS as u32 {
+        assert!(q.insert(base, base + 4 + i * 4, b"cccc".to_vec()), "segment {i} fits");
+    }
+    assert!(
+        !q.insert(base, base + 4 + OOO_MAX_SEGS as u32 * 4, b"over".to_vec()),
+        "segment past the count cap is refused",
+    );
+}
+
+/// Several segments arriving out of order are all buffered and released
+/// in sequence once the gap-filler arrives — the reassembly queue keeps
+/// them sorted regardless of arrival order.
+#[test]
+fn multiple_out_of_order_segments_reassemble_in_order() {
+    let _g = harness();
+    const SP: u16 = 9173;
+    const CP: u16 = 50173;
+    const CLIENT_ISN: u32 = 0x7000;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let rcv_nxt = CLIENT_ISN.wrapping_add(1);
+
+    // Deliver C then B (both out of order, C ahead of B), then the
+    // in-order A.
+    for (off, body) in [(8u32, b"CCCC"), (4, b"BBBB")] {
+        deliver(&Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: rcv_nxt.wrapping_add(off),
+            ack: server_isn.wrapping_add(1),
+            flags: TCP_ACK | TCP_PSH,
+            payload: body.to_vec(),
+            window: 65535,
+        });
+    }
+    clear_tx();
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: rcv_nxt,
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK | TCP_PSH,
+        payload: b"AAAA".to_vec(),
+        window: 65535,
+    });
+    assert_eq!(
+        tcp_hdr(tx().last().unwrap()).ack,
+        rcv_nxt.wrapping_add(12),
+        "the ACK covers all three reassembled segments",
+    );
+    assert_eq!(
+        conn_rx_drain(CP, SP),
+        b"AAAABBBBCCCC",
+        "all three segments are delivered in sequence",
+    );
+}
+
+/// A gap-filling segment that overlaps a buffered out-of-order segment
+/// from below delivers only the non-overlapping tail of the buffered
+/// segment — `drain_ooo` skips the already-covered prefix.
+#[test]
+fn gap_fill_overlapping_buffered_segment_delivers_tail() {
+    let _g = harness();
+    const SP: u16 = 9174;
+    const CP: u16 = 50174;
+    const CLIENT_ISN: u32 = 0x8000;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let rcv_nxt = CLIENT_ISN.wrapping_add(1);
+
+    // B = [rcv_nxt+4, rcv_nxt+10): buffered out of order.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: rcv_nxt.wrapping_add(4),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK | TCP_PSH,
+        payload: b"BBBBBB".to_vec(),
+        window: 65535,
+    });
+    // A = [rcv_nxt, rcv_nxt+8): overlaps B's first 4 bytes.
+    clear_tx();
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: rcv_nxt,
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK | TCP_PSH,
+        payload: b"AAAAAAAA".to_vec(),
+        window: 65535,
+    });
+    assert_eq!(
+        tcp_hdr(tx().last().unwrap()).ack,
+        rcv_nxt.wrapping_add(10),
+        "the ACK covers A plus B's non-overlapping tail",
+    );
+    assert_eq!(
+        conn_rx_drain(CP, SP),
+        b"AAAAAAAABB",
+        "only B's two tail bytes follow A — its overlapping prefix was skipped",
     );
 }
 
@@ -3249,6 +3402,35 @@ fn conn_snd_una(client_port: u16, server_port: u16) -> u32 {
             && c.remote_port == client_port
         {
             return c.snd_una;
+        }
+    }
+    panic!("no live connection for ports {client_port} -> {server_port}");
+}
+
+/// Drain every byte the live connection has delivered into its RX ring
+/// (in order) — lets a reassembly scenario assert the *bytes* the
+/// consumer would read, not just that `rcv_nxt` advanced.
+fn conn_rx_drain(client_port: u16, server_port: u16) -> Vec<u8> {
+    let core = 0u32;
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        // SAFETY: single worker, test-serialised by `TEST_LOCK`.
+        let c = unsafe { &mut *conn_ptr(core, i) };
+        if c.state != TcpState::Closed
+            && c.state != TcpState::Listen
+            && c.local_port == server_port
+            && c.remote_port == client_port
+        {
+            let mut out = Vec::new();
+            let mut tmp = [0u8; 256];
+            loop {
+                let n = c.rx_pop(&mut tmp);
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&tmp[..n]);
+            }
+            return out;
         }
     }
     panic!("no live connection for ports {client_port} -> {server_port}");

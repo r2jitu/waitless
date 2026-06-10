@@ -448,6 +448,134 @@ pub struct TcpConnection {
     /// deadlines are all zero (lazy unlink) and on `free_connection`
     /// reset.
     pub(crate) tick_in_list: bool,
+
+    /// RFC 9293 out-of-order reassembly queue. A data segment that
+    /// arrives with a gap before it (`seq > rcv_nxt`) is buffered here
+    /// instead of dropped, so a single lost segment no longer forces
+    /// the sender to RTO-retransmit the whole window. Drained into
+    /// `rx_ring` (and `rcv_nxt` advanced) the moment the gap fills.
+    pub(crate) ooo: OooQueue,
+}
+
+/// One buffered out-of-order segment: its starting sequence number and
+/// an owned copy of its payload bytes. Owned (not the device `IOBuf`)
+/// because the segment may sit here across many later arrivals before
+/// the gap fills, long after the RX path returns the device buffer.
+pub(crate) struct OooSeg {
+    pub(crate) seq_start: u32,
+    pub(crate) bytes: alloc::vec::Vec<u8>,
+}
+
+/// At most this many buffered out-of-order segments per connection.
+pub(crate) const OOO_MAX_SEGS: usize = 32;
+/// At most this many buffered out-of-order bytes per connection — one
+/// receive window. Excess is dropped (the peer retransmits); this is
+/// the memory backstop against a peer that streams future data without
+/// ever filling the gap.
+pub(crate) const OOO_MAX_BYTES: usize = RX_RING_BYTES;
+
+/// A bounded, sorted, non-overlapping set of out-of-order segments.
+/// Segments are kept ascending by sequence number; `insert` rejects an
+/// overlapping or out-of-window segment outright (the peer retransmits)
+/// so the non-overlap invariant holds trivially, and `take_at` releases
+/// the segment that fills the gap at a given `rcv_nxt`.
+#[derive(Default)]
+pub(crate) struct OooQueue {
+    /// Sorted ascending by window-relative offset from the live
+    /// `rcv_nxt`. Small (`OOO_MAX_SEGS`), so linear scans are cheap.
+    segs: alloc::vec::Vec<OooSeg>,
+    total_bytes: usize,
+}
+
+impl OooQueue {
+    pub(crate) const fn new() -> Self {
+        OooQueue { segs: alloc::vec::Vec::new(), total_bytes: 0 }
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.segs.is_empty()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.segs.clear();
+        self.total_bytes = 0;
+    }
+
+    /// Buffer a wholly-future segment starting at `seq_start`
+    /// (`seq_start` already known `> rcv_nxt`), taking ownership of its
+    /// already-gathered `bytes`. Returns `true` if it was buffered.
+    /// Rejected — and `bytes` dropped, the peer retransmits — when the
+    /// segment falls outside the receive window, overlaps an
+    /// already-buffered segment, or would exceed the per-conn segment /
+    /// byte cap.
+    pub(crate) fn insert(&mut self, rcv_nxt: u32, seq_start: u32, mut bytes: alloc::vec::Vec<u8>) -> bool {
+        if bytes.is_empty() || self.segs.len() >= OOO_MAX_SEGS {
+            return false;
+        }
+        // Window-relative offset. A future segment sits at a small
+        // positive offset; anything at/below `rcv_nxt` or beyond the
+        // window (high bit set = wrapped-negative, or ≥ cap) is not
+        // ours to buffer.
+        let off = seq_start.wrapping_sub(rcv_nxt) as usize;
+        if off == 0 || off >= OOO_MAX_BYTES {
+            return false;
+        }
+        // Clamp the tail to the window; drop the suffix past the cap.
+        let avail = OOO_MAX_BYTES - off;
+        if bytes.len() > avail {
+            bytes.truncate(avail);
+        }
+        let take = bytes.len();
+        let end = off + take;
+        // Reject any overlap with an existing buffered segment — keep
+        // the first copy, the peer retransmits the rest. Preserves the
+        // non-overlap invariant without a merge step.
+        for s in &self.segs {
+            let s_off = s.seq_start.wrapping_sub(rcv_nxt) as usize;
+            let s_end = s_off + s.bytes.len();
+            if off < s_end && s_off < end {
+                return false;
+            }
+        }
+        if self.total_bytes + take > OOO_MAX_BYTES {
+            return false;
+        }
+        self.total_bytes += take;
+        // Insert keeping `segs` sorted ascending by window-relative
+        // offset (so `take_at` can stop at the first gap).
+        let pos = self
+            .segs
+            .iter()
+            .position(|s| (s.seq_start.wrapping_sub(rcv_nxt) as usize) > off)
+            .unwrap_or(self.segs.len());
+        self.segs.insert(pos, OooSeg { seq_start, bytes });
+        true
+    }
+
+    /// Remove and return the buffered segment that reaches `rcv_nxt`
+    /// (i.e. `seq_start <= rcv_nxt < seq_start + len`), so the caller
+    /// can deliver its `[rcv_nxt..]` tail in order. Segments wholly
+    /// below `rcv_nxt` (already delivered via a retransmit) are dropped
+    /// in passing. Returns `None` once the lowest remaining segment
+    /// still has a gap before it.
+    pub(crate) fn take_at(&mut self, rcv_nxt: u32) -> Option<OooSeg> {
+        while let Some(s) = self.segs.first() {
+            let rel = s.seq_start.wrapping_sub(rcv_nxt) as i32;
+            if rel > 0 {
+                return None; // gap remains before the lowest segment
+            }
+            let seg = self.segs.remove(0);
+            self.total_bytes -= seg.bytes.len();
+            // `rel <= 0`: starts at/below rcv_nxt. Deliverable iff it
+            // extends past rcv_nxt; otherwise it is wholly old — drop
+            // it and look at the next.
+            if (rel + seg.bytes.len() as i32) > 0 {
+                return Some(seg);
+            }
+        }
+        None
+    }
 }
 
 impl TcpConnection {
@@ -504,6 +632,7 @@ impl TcpConnection {
             slot_index: 0,
             tick_next: NULL_SLOT,
             tick_in_list: false,
+            ooo: OooQueue::new(),
         }
     }
 
@@ -522,11 +651,16 @@ impl TcpConnection {
         // same "reuse capacity, lose contents" shape as `rx_ring`.
         let mut rtx_queue = core::mem::take(&mut self.rtx_queue);
         rtx_queue.clear();
+        // Same "reuse capacity, lose contents" shape for the OOO queue:
+        // drop the buffered segments' bytes but keep the deque backing.
+        let mut ooo = core::mem::take(&mut self.ooo);
+        ooo.clear();
         let slot = self.slot_index;
         *self = TcpConnection::new();
         self.generation = next_gen;
         self.rx_ring = ring;
         self.rtx_queue = rtx_queue;
+        self.ooo = ooo;
         self.slot_index = slot;
     }
 
@@ -615,6 +749,33 @@ impl TcpConnection {
     /// much, and the segment trim happens at the caller.
     pub(crate) fn deliver_payload(&mut self, payload: &[u8]) -> usize {
         self.rx_ring_push(payload)
+    }
+
+    /// Drain out-of-order segments that have become contiguous with
+    /// `rcv_nxt` into the RX ring, advancing `rcv_nxt` by what the ring
+    /// absorbs. Returns the total bytes delivered. Call after any
+    /// in-order delivery advances `rcv_nxt` (and only when `ooo` is
+    /// non-empty — the clean in-order path never touches this).
+    pub(crate) fn drain_ooo(&mut self) -> usize {
+        let mut delivered = 0usize;
+        while let Some(seg) = self.ooo.take_at(self.rcv_nxt) {
+            // The segment reaches rcv_nxt; skip the already-covered
+            // prefix (non-zero only when an in-order segment overlapped
+            // this buffered one from below).
+            let skip = self.rcv_nxt.wrapping_sub(seg.seq_start) as usize;
+            let tail = &seg.bytes[skip..];
+            let pushed = self.rx_ring_push(tail);
+            self.rcv_nxt = self.rcv_nxt.wrapping_add(pushed as u32);
+            delivered += pushed;
+            if pushed < tail.len() {
+                // Ring filled mid-segment. The unconsumed tail is now
+                // in-order but there's no room — drop it as the
+                // in-order path does; the peer retransmits from the new
+                // rcv_nxt once the window reopens. Stop draining.
+                break;
+            }
+        }
+        delivered
     }
 
     /// Drain bytes from the ring into `out`. Returns the number
