@@ -276,21 +276,31 @@ TSecr into the RTT estimator, and add the PAWS drop check.
 **Test.** Assert Timestamps are echoed; a wrapped-sequence old segment is
 dropped by PAWS; the RTT estimator consumes TSecr.
 
-### T7 — SACK (RFC 2018) + RFC 6675 loss recovery
+### T7 — SACK (RFC 2018) + RFC 6675 loss recovery — receiver-side ✅ done; sender-side RFC 6675 pending
 
-**What.** No `SACK-Permitted` negotiation, no SACK blocks, no
-SACK-driven loss recovery.
+**Status — receiver-side (RFC 2018) done.** `SACK-Permitted` is now
+negotiated (parsed from the peer's SYN, echoed in the SYN-ACK only when
+offered; `TcpConnection::sack_ok`), and every ACK sent while the T3
+reassembly queue holds out-of-order data carries SACK blocks built from
+that queue (`OooQueue::sack_blocks`, up to 4 blocks, abutting segments
+coalesced) via a single `emit_ack` helper — so a peer **uploading** to
+us retransmits only the holes. Hot-path-neutral: no SACK option unless
+`sack_ok && !ooo.is_empty()`. Covered by
+`sack_permitted_negotiated_and_blocks_emitted` and
+`no_sack_when_peer_does_not_permit`.
 
-**Triggers when.** Multi-segment loss — recovery falls back to
-RTO/fast-retransmit one hole at a time instead of retransmitting only
-the missing ranges.
+**Pending — sender-side (RFC 6675).** We do not yet *parse* SACK blocks
+off incoming ACKs to drive our own selective retransmit — when **we**
+send (the common server case) and the peer SACKs, recovery still falls
+back to RTO / fast-retransmit one hole at a time. This is the
+golden-path-risky half (it changes the retransmit queue's
+hole-detection) and wants `tc netem` multi-hole-loss validation, so it
+is split out as the follow-up. **Effort: M (down from L — receiver
+half landed).**
 
-**Fix.** Depends on T3 (the reassembly queue is what SACK blocks are
-generated from). Add option negotiation, block generation, and
-sender-side RFC 6675. **Effort: L.**
-
-**Test.** Out-of-order arrival → assert correct SACK blocks; scripted
-multi-hole loss → assert only the holes are retransmitted.
+**Test (done).** Out-of-order arrival → assert correct SACK blocks.
+**Test (pending).** Scripted multi-hole loss → assert only the holes
+are retransmitted.
 
 ### T8 — An out-of-window segment should be ACKed, not dropped silently ✅ done
 
