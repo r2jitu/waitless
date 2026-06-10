@@ -286,6 +286,10 @@ pub fn run(core_id: u32) -> ! {
     // work (full window), growing as the core stays idle. Reset on
     // any `did_work`.
     let mut idle_rounds: u32 = 0;
+    // Cooperative-drain deadline (cycle-counter value); 0 until shutdown
+    // is signalled, then `now + DRAIN_GRACE_MS` — the loop keeps running
+    // until it passes so in-flight requests can finish before power-off.
+    let mut drain_deadline: u64 = 0;
 
     // Cycle-counter snapshot from the start of the *current* loop
     // iteration. Busy cycles (loop body) and idle cycles (HLT/WFI)
@@ -372,10 +376,31 @@ pub fn run(core_id: u32) -> ! {
     // so a just-missed packet is still caught without an IRQ/HLT
     // round-trip.
     const SPIN_FLOOR: u32 = 16;
+    // Graceful-shutdown grace window: how long the event loop keeps
+    // servicing in-flight work after shutdown is signalled before it
+    // powers off. Kept under 1 s so an idle shutdown (the common case)
+    // is still prompt — the host's `recv` returns within the second the
+    // `test_open_conn_resets_promptly_on_shutdown` regression allows.
+    const DRAIN_GRACE_MS: u64 = 750;
 
     loop {
         if loops & 63 == 0 && is_shutdown() {
-            break;
+            // Cooperative drain (RFC-agnostic graceful shutdown): once
+            // shutdown is signalled, keep servicing in-flight requests
+            // (and flushing their responses) for up to DRAIN_GRACE_MS
+            // before powering off + the per-conn RST sweep, instead of
+            // cutting the loop the instant the signal lands. A bounded
+            // deadline — never a hang. An idle core sees no in-flight
+            // work, so its responses are already out and the only effect
+            // is the short grace before the RST sweep the host observes.
+            if drain_deadline == 0 {
+                drain_deadline = crate::time::now_cycles().saturating_add(
+                    crate::time::cycles_per_us().saturating_mul(DRAIN_GRACE_MS * 1000),
+                );
+            }
+            if crate::time::now_cycles() >= drain_deadline {
+                break;
+            }
         }
         loops += 1;
 
@@ -432,8 +457,10 @@ pub fn run(core_id: u32) -> ! {
             if let Some(f) = CHECK_SHUTDOWN.load()
                 && f()
             {
+                // Latch the global shutdown flag; the cooperative-drain
+                // logic at the top of the loop then runs the grace window
+                // and powers off (so we don't cut in-flight work here).
                 request_shutdown();
-                break;
             }
 
             // Periodic scheduling window for the host. With PL011 the
