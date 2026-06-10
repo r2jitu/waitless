@@ -590,4 +590,48 @@ mod tests {
         assert_eq!(fields[0].0, b"alt-svc"); // name lowercased on the wire.
         assert_eq!(fields[0].1, b"h3=\":443\"");
     }
+
+    /// Fuzz-smoke (architecture-audit direction #2): the HPACK decoder
+    /// (and the `field-huffman` decode beneath it) consumes attacker-
+    /// controlled header blocks — pin panic-freedom over fixed-seed
+    /// random inputs and single-byte mutations of two valid blocks (a
+    /// plain RFC 7541 C.3 request and a Huffman-coded C.4 one, so both
+    /// literal paths and the dynamic-table insert arm get exercised
+    /// near-validity). Fresh decoder per input for reproducibility.
+    #[test]
+    fn decode_fuzz_smoke_never_panics() {
+        let mut seed: u64 = 0xA076_1D64_78BD_642F;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // (a) Raw random inputs.
+        for _ in 0..20_000 {
+            let len = (rnd() % 128) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| rnd() as u8).collect();
+            let _ = decode_all(&mut new_dec(), &buf); // must return, never panic
+        }
+        // (b) Mutations of valid blocks. RFC 7541 C.3.1 (plain literal,
+        // inserts into the dynamic table) and C.4.1 (Huffman literal).
+        let c3: &[u8] = &[
+            0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77, 0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70,
+            0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+        ];
+        let c4: &[u8] = &[
+            0x82, 0x86, 0x84, 0x41, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab,
+            0x90, 0xf4, 0xff,
+        ];
+        for valid in [c3, c4] {
+            assert!(decode_all(&mut new_dec(), valid).is_ok(), "fixture must decode");
+            for pos in 0..valid.len() {
+                for _ in 0..32 {
+                    let mut m = valid.to_vec();
+                    m[pos] = rnd() as u8;
+                    let _ = decode_all(&mut new_dec(), &m);
+                }
+            }
+        }
+    }
 }

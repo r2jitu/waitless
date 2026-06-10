@@ -514,6 +514,62 @@ mod tests {
         assert!(ClientHello::parse(&buf).is_err());
     }
 
+    /// Fuzz-smoke (architecture-audit direction #2): `ClientHello::parse`
+    /// consumes fully untrusted pre-handshake bytes — pin its
+    /// panic-freedom over fixed-seed random buffers, single-byte
+    /// mutations of a valid hello (length-field / vector-bound arms
+    /// near-validity), and every truncation. Deterministic, so a failure
+    /// reproduces; a tripwire, not coverage-guided fuzzing.
+    #[test]
+    fn parse_client_hello_fuzz_smoke_never_panics() {
+        // A minimal valid TLS 1.3 hello, mirroring the synthetic test.
+        let mut ext = [0u8; 256];
+        let mut p = 0usize;
+        p = write_ext(&mut ext, p, ext_type::SUPPORTED_VERSIONS, &[0x02, 0x03, 0x04]);
+        p = write_ext(&mut ext, p, ext_type::SUPPORTED_GROUPS, &[0x00, 0x02, 0x00, 0x1d]);
+        let mut ks_body = [0u8; 38];
+        ks_body[0..2].copy_from_slice(&36u16.to_be_bytes());
+        ks_body[2..4].copy_from_slice(&named_group::X25519.to_be_bytes());
+        ks_body[4..6].copy_from_slice(&32u16.to_be_bytes());
+        p = write_ext(&mut ext, p, ext_type::KEY_SHARE, &ks_body);
+        let mut valid = alloc::vec::Vec::new();
+        valid.extend_from_slice(&LEGACY_VERSION_TLS12.to_be_bytes());
+        valid.extend_from_slice(&[0x11u8; 32]); // random
+        valid.push(0); // session_id len
+        valid.extend_from_slice(&2u16.to_be_bytes());
+        valid.extend_from_slice(&cipher_suite::TLS_AES_128_GCM_SHA256.to_be_bytes());
+        valid.extend_from_slice(&[1, 0]); // compression: 1 method, null
+        valid.extend_from_slice(&(p as u16).to_be_bytes());
+        valid.extend_from_slice(&ext[..p]);
+        assert!(ClientHello::parse(&valid).is_ok(), "fixture must parse");
+
+        let mut seed: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // (a) Raw random buffers, varied lengths incl. empty.
+        for _ in 0..20_000 {
+            let len = (rnd() % 256) as usize;
+            let buf: alloc::vec::Vec<u8> = (0..len).map(|_| rnd() as u8).collect();
+            let _ = ClientHello::parse(&buf); // must return, never panic
+        }
+        // (b) Single-byte mutations at every position of the valid hello.
+        for pos in 0..valid.len() {
+            for _ in 0..32 {
+                let mut m = valid.clone();
+                m[pos] = rnd() as u8;
+                let _ = ClientHello::parse(&m);
+            }
+        }
+        // (c) Truncations of the valid hello at every length.
+        for end in 0..valid.len() {
+            let _ = ClientHello::parse(&valid[..end]);
+        }
+    }
+
     // ── PSK / session-resumption parsing & builders ────────────────────────
 
     /// Helper used by the resumption tests: writes one extension

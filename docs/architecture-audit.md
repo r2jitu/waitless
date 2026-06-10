@@ -265,7 +265,7 @@ It is the change that compounds.
 |---|---|---|---|
 | 7 | Cancel-safety | `Drop`-clears-waker on TcpRecv/RecvChunk/TcpSendChain | ✅ landed 2026-06-10; `WaitEvent` Drop-deregistration open |
 | 1 | Capabilities | `Time` facade; QUIC off `tls::ticket` time | open |
-| 2 | Simulation | parser fuzz targets; two-endpoint QUIC sim | QUIC frame-parser fuzz-smoke ✅ 2026-06-10 (`parse_frame_fuzz_smoke_never_panics`); TLS-record + HPACK targets and the sim itself open |
+| 2 | Simulation | parser fuzz targets; two-endpoint QUIC sim | fuzz-smoke ✅ 2026-06-10 on all three attacker-facing parsers (QUIC `parse_frame`, TLS `ClientHello::parse`, HPACK `decode` incl. the field-huffman path); the sim itself open |
 | 3 | Completion reactor | `trait Nic` (completion-shaped); DQO TX waker | open |
 | 4 | Transport engine | TCP RACK built as the shared core | open |
 | 5 | Flow steering | PMTUD ICMP cross-core routing via generalized inbox | open |
