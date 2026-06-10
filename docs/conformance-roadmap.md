@@ -170,10 +170,12 @@ optional feature.
 
 - **Have**: full state set (`Closed`…`TimeWait`), three-way handshake,
   in-order data transfer, FIN/close, RST generation + RFC 5961 RST
-  acceptance check, per-core connection pool.
-- **Missing**: the MSS option is never sent or parsed, the ACK field
+  acceptance check, per-core connection pool. The SYN's MSS option is
+  parsed (`receive.rs` `parse_syn_options`/`parse_mss`) and the SYN-ACK
+  advertises our MSS (test `synack_advertises_our_mss`).
+- **Missing**: the ACK field
   is not range-checked, and a SYN on a synchronized connection is
-  mishandled — see `tcp-backlog.md` (T1, T2, T4). No
+  mishandled — see `tcp-backlog.md` (T2, T4). No
   delayed-ACK coalescing (we ACK immediately — correct, just not
   optimal). Zero-window persist is now implemented; the TIME-WAIT /
   FIN-WAIT timeouts are closed too — see the lifecycle-corners note.
@@ -232,9 +234,11 @@ optional feature.
   RFC 9293 SND.WL1/WL2 rule; a zero-window stall is recovered by the
   §3.8.6.1 persist timer. The former "controller computed but
   ignored" gap is closed.
-- **Missing**: nothing for RFC 5681 *conformance*. But this is the Reno
-  baseline only — the performance features Linux layers on top (CUBIC/BBR,
-  ABC, pacing, RACK-TLP) are real gaps on adverse paths, inventoried under
+- **Missing**: nothing for RFC 5681 *conformance*. This is the Reno
+  baseline by default, but CUBIC (`net_cc::Cubic`), TLP (`send_tlp_probe`),
+  and PMTUD (`note_path_mtu`) have landed; the remaining performance
+  features Linux layers on top (BBR, ABC, a TCP-side pacer) are real gaps
+  on adverse paths, inventoried under
   *Performance parity with the Linux TCP stack* in
   [`tcp-backlog.md`](tcp-backlog.md).
 - **Conformance test**: done — pure controller-arithmetic scenarios
@@ -378,12 +382,12 @@ on top (RFC 9114 framing + RFC 9204 QPACK) is tracked in
   `crypto_frames_retransmitted`. **Remaining**: the wider loss-recovery
   audit items (ECN, the §7.6.1 lost-time-span persistent-congestion
   test — we trigger collapse off `pto_count` instead).
-  **Note (shared core, QUIC-wired only)**: the controller landed as the
+  **Note (shared core, both transports wired)**: the controller landed as the
   **shared TCP+QUIC `net_cc` core** (`crates/net/cc`, the `CongestionControl`
-  trait + NewReno) — but it is wired into **QUIC only** today. TCP still
-  uses its own embedded `cwnd`/`ssthresh`; delegating TCP onto the trait,
-  and the CUBIC/BBR + pacer that serve TCP's L1/L3 Linux-parity gaps, are
-  the remaining work — see *Transport reliability* in
+  trait + NewReno) and **both transports delegate to it** today (TCP via
+  `state.rs` `cc: net_cc::Controller` / `congestion_init` / `cwnd_on_ack`).
+  The BBR algorithm and a TCP-side pacer that serve TCP's L1/L3 Linux-parity
+  gaps are the remaining work — see *Transport reliability* in
   [`stack-architecture.md`](stack-architecture.md) and *Performance parity*
   in [`tcp-backlog.md`](tcp-backlog.md). Conversely QUIC's threshold loss
   detector + token-bucket pacer are already the reference TCP's L4 wants.
@@ -412,9 +416,10 @@ Dependency-ordered. Each step is test-first on the harness.
    retransmit coverage — followed and is merged to main.
 5. ✅ **QUIC RFC 9002 loss recovery + congestion** — the PTO timer (with
    exponential backoff), RTT estimator, loss detection, STREAM-frame
-   retransmission, and the shared `net_cc` NewReno congestion controller
-   (cwnd-gated packetization + pacing) have all landed. The one residual
-   is CRYPTO-frame retx via the PTO probe (still a bare PING).
+   retransmission, CRYPTO-frame retx (lost fragments are re-emitted at
+   their original offset, not just a PTO PING), and the shared `net_cc`
+   NewReno congestion controller (cwnd-gated packetization + pacing) have
+   all landed.
 6. **TCP RFC 7323 (window scaling + timestamps)** — widen `rcv_wnd`,
    negotiate and apply the options, PAWS.
 7. **TCP RFC 2018 (SACK)** — reassembly queue, SACK blocks, RFC 6675
@@ -424,10 +429,9 @@ Dependency-ordered. Each step is test-first on the harness.
 10. **QUIC Interop Runner** — cross-implementation validation, after
     step 5.
 
-Steps 1–5 are complete (step 5's residual is CRYPTO-frame retx). Steps
+Steps 1–5 are complete. Steps
 6–8 are feature breadth; 9–10 are tooling. The remaining headline
-transport work is now the *shared-core* follow-through — delegating TCP
-onto the `net_cc` trait and the CUBIC/BBR + TCP-pacing parity gaps — not
+transport work is now the BBR + TCP-pacing parity gaps — not
 QUIC loss recovery.
 
 ## Non-goals

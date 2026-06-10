@@ -6,8 +6,8 @@ This tracks the **HTTP/3 application layer** — the RFC 9114 framing /
 control-stream / request mapping and the RFC 9204 QPACK header
 compression in `crates/proto/http3/`. The **QUIC transport** underneath
 (RFC 9000/9001/9002 — streams, flow control, loss detection, the
-`net_cc` NewReno congestion controller, and STREAM-frame retransmission,
-all now landed; CRYPTO-frame retx via the PTO probe is the one residual)
+`net_cc` NewReno congestion controller, STREAM-frame retransmission, and
+CRYPTO-frame retx, all now landed)
 is tracked separately in [`conformance-roadmap.md`](conformance-roadmap.md)
 Part 3; this doc cross-refs it rather than duplicating it.
 
@@ -49,7 +49,7 @@ handshake (Required Insert Count, blocked streams) is the complexity QUIC
 makes necessary that HPACK avoids — see [`http2-backlog.md`](http2-backlog.md)
 H2-7 for the simpler HPACK cousin. **Effort: L.**
 
-### H3-2 — Lost CRYPTO frames are never re-queued — P1 (correctness)
+### H3-2 — Lost STREAM/CRYPTO frames are re-queued — ✅ done (correctness)
 
 **STREAM half: ✅ done.** `detect_loss` now moves a lost packet's retained
 `StreamRetx` frames to `Connection::retx_queue`, and `encode_one_rtt_packet`
@@ -57,9 +57,10 @@ drains that before fresh data (`pop_chunk` hands out an owned copy so the
 offset bytes survive for replay — RFC 9000 §13.3). So lost request/response
 STREAM data is replayed without leaning on client retransmits.
 
-**Residual — CRYPTO.** The PTO probe is still a bare PING rather than a
-replay of lost CRYPTO frames, so handshake-loss recovery leans on the
-peer's PING-elicited ACK.
+**CRYPTO half: ✅ done.** A lost packet's CRYPTO fragments are re-queued
+(`crypto_retx_queue`) and re-emitted at their original offset before fresh
+handshake CRYPTO, so handshake-loss recovery resends the bytes rather than
+leaning on a bare PTO PING.
 
 **Where tracked.** This is a QUIC-transport gap owned by
 [`conformance-roadmap.md`](conformance-roadmap.md) Part 3 (RFC 9002). Listed
@@ -124,7 +125,7 @@ rx-path item I. **Where**: rx-path-optimizations.md.
 
 - [`conformance-roadmap.md`](conformance-roadmap.md) — QUIC transport
   (9000/9001/9002), incl. the landed congestion controller + STREAM retx
-  and the residual CRYPTO-frame-retx gap.
+  and CRYPTO-frame retx.
 - [`http2-backlog.md`](http2-backlog.md) — sibling app layer; HPACK is the
   QPACK cousin, shared Huffman lives between them.
 - [`stack-architecture.md`](stack-architecture.md) — H3's place in the

@@ -12,7 +12,7 @@ hand-rolled, sans-io TLS 1.3 implementation; its build history is in
 
 Full TLS 1.3 handshake over **X25519** KEX with an **ECDSA P-256 + SHA-256**
 server cert; **TLS_AES_128_GCM_SHA256** record protection; **ALPN**
-negotiation (`handlers.rs`, currently selecting `http/1.1`); **1-RTT
+negotiation (`handlers.rs`, prefers `h2`, falls back to `http/1.1`); **1-RTT
 session resumption** — NewSessionTicket issued every handshake, returning
 PSK resumed via `try_resume` with binder verification, skipping the
 Certificate/CertVerify flight (`test_https_session_resumption`); a 0-RTT
@@ -49,14 +49,20 @@ browsers / curl / openssl in production.
 
 ### Production-readiness (cross-cut, owned by roadmap "Deferred")
 
-- **TL-5 — Production CSPRNG — P1 before any real-cert/ticket deploy.** The
-  dev `kernel::rng` (jitter entropy + ChaCha20 expansion) is not a
-  production CSPRNG. Needs an entropy-rate estimate, periodic reseed, and
-  virtio-rng / aarch64 RNDR sources. Gates real key/ticket generation.
-  → [`roadmap.md`](roadmap.md).
-- **TL-6 — Real wall-clock time — P2.** Only monotonic ticks today; ticket
-  lifetimes and (future) cert validity windows want absolute time (~30
-  lines). → [`roadmap.md`](roadmap.md).
+- **TL-5 — Production CSPRNG — mostly landed.** `kernel::rng`
+  (`crates/kernel/bare/src/rng.rs`) is now a SHA-256 Hash_DRBG with
+  **periodic reseed** (fresh entropy folded every 1 MiB of output) and
+  **multi-source HW** (RDSEED/RDRAND on x86_64, aarch64 RNDR);
+  `kernel_core::entropy_health` runs the NIST SP 800-90B startup health
+  tests + an MCV min-entropy estimate, surfaced via `/obs`
+  (`rng_min_entropy_mbits` / `rng_rct_pass` / `rng_apt_pass`). What
+  remains is a virtio-rng / aarch64 RNDRRS collector and a certified
+  offline min-entropy bound. → [`roadmap.md`](roadmap.md).
+- **TL-6 — Real wall-clock time — landed (x86).** `kernel_core::clock`
+  reads the x86 CMOS RTC at boot and exposes `wall_unix_secs()` /
+  `civil_to_unix_secs`, surfaced via `/obs` (`wall_unix_secs`); ticket
+  lifetimes and (future) cert validity windows now have absolute time.
+  aarch64 PL031 is the only remainder. → [`roadmap.md`](roadmap.md).
 - **TL-7 — Faster ECDSA — P3 (perf, not conformance).** `cv_sign` is the
   cold-handshake hotspot; `fiat-p256` (~2×) or `ring` (5–10×, build pain)
   are the levers. Less urgent now that resumption skips the signature on

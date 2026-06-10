@@ -96,7 +96,7 @@ otherwise accept. **Effort: S.**
 future ACK (`ack > snd_nxt`); assert `snd_una` is unchanged and the
 retransmit ring is intact, and that the future ACK elicits a bare ACK.
 
-### T2 — MSS option + PMTUD ✅ done (SYN-ACK advertise is the remaining sliver)
+### T2 — MSS option + PMTUD ✅ done (only minor PMTUD slivers remain)
 
 > **Status (2026-06-09):** the receive half is ✅ done (`74e53e1`): the
 > SYN's MSS option is parsed (`parse_syn_options`) and the negotiated
@@ -106,17 +106,25 @@ retransmit ring is intact, and that the future ACK elicits a bare ACK.
 > TLS cert flight was silently dropped, and cold (incognito) h2 loads
 > stalled deterministically.
 >
+> **SYN-ACK MSS advertise ✅ done** — we emit our own MSS option in the
+> SYN-ACK (test `synack_advertises_our_mss`), so peers no longer assume 536
+> toward us.
+>
 > **PMTUD ✅ done (`be7ad67`)** — the mid-path half. We decode ICMPv4
 > Destination-Unreachable/Fragmentation-Needed (RFC 1191) and ICMPv6
 > Packet-Too-Big (RFC 8201) in the RX dispatch, and `tcp::note_path_mtu`
 > lowers the flow's `snd_mss` to fit the next-hop MTU. RFC 5927 anti-spoof:
 > the quoted seq must be in the live send window, the result is floored at
-> the IP minimum and only ever lowers. Same-core only (race-free: a hit in
-> this core's pool ⇒ we own the flow) — cross-core routing on a multi-queue
-> NIC is the follow-up. /obs `pmtu_applied`/`pmtu_dropped`.
+> the IP minimum and only ever lowers. /obs `pmtu_applied`/`pmtu_dropped`.
 >
-> Remaining sliver: *advertising* our own MSS option in the SYN-ACK (peers
-> currently assume 536 toward us, shrinking their upload segments).
+> **PMTUD remaining slivers** (both minor): (1) the update applies on the
+> *receiving* core only — an ICMP error RSS-hashes by its own header, so on
+> a multi-queue NIC it's often delivered to a core that doesn't own the flow
+> and dropped (`pmtu_dropped`); routing it to the owning core is a follow-up.
+> (2) `note_path_mtu` lowers `snd_mss` but does **not** immediately re-send
+> the already-in-flight oversized segment that triggered the ICMP — it waits
+> for the RTO/TLP to re-segment at the new MSS (one recovery cycle of delay
+> per MTU drop).
 
 
 **What.** The SYN handler never parses the peer's `MSS` option and

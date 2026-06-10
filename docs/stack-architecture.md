@@ -455,9 +455,9 @@ handlers). Congestion control, loss recovery, and pacing are a separate
 share is planned now. State today:
 
 - **TCP** has a working RFC 5681 controller (slow start, AIMD, fast retransmit,
-  RTO) plus RFC 3465 ABC — but it's **embedded as methods on `TcpConnection`**
-  (`cwnd_on_ack` / `congestion_on_rto` / `fast_retransmit` in
-  `net/tcp/src/state.rs`), not a reusable unit.
+  RTO) plus RFC 3465 ABC, and it now **delegates to the shared `net_cc::Controller`**
+  (`cc: net_cc::Controller` set in `congestion_init`; `cwnd_on_ack` drives
+  `cc.on_ack` in `net/tcp/src/state.rs`).
 - **QUIC** has the RFC 9002 **loss detector** (packet-threshold + `9/8·RTT`
   time-threshold — i.e. RACK), the RTT estimator, and the PTO timer
   (`proto/quic/src/conn/loss.rs`), **plus a wired `net_cc::NewReno` congestion
@@ -466,12 +466,12 @@ share is planned now. State today:
   lost STREAM frames for retransmission and runs a timer-driven token-bucket
   pacer. See [`quic-golden.md`](quic-golden.md) +
   [`tx-backpressure.md`](tx-backpressure.md) for the landed detail.
-- The CC code now lives in the **shared `net_cc` crate** — but only QUIC drives
-  it today; TCP's controller is still embedded (the extraction is the open work).
+- The CC code now lives in the **shared `net_cc` crate**, and **both transports
+  delegate to `net_cc::Controller`** today — the extraction is done.
 
 Three of the [`tcp-backlog.md`](tcp-backlog.md)
-Linux-parity items (L1 CUBIC/BBR, L3 pacing, L4 RACK-TLP) are the TCP half of
-exactly this work.
+Linux-parity items (L1 BBR, L3 pacing, L4 RACK-TLP) are the TCP half of
+remaining performance work (CUBIC has landed).
 
 ### What converges (build once, drive from both)
 
@@ -528,9 +528,9 @@ exactly this work.
 Both stacks now delegate to the shared `net_cc::NewReno` (QUIC closed RFC 9002
 step 5; TCP's hand-rolled RFC 5681 cwnd was replaced 2026-06-08, netem + GCE
 validated). **Do the remaining CC work as one shared module, not twice** — the
-controller core and trait already exist in `net_cc`; what remains is the
-CUBIC/BBR algorithms (and a TCP-side pacer; QUIC's RFC 9002 token-bucket pacer
-landed 2026-06). Gate the L1
+controller core and trait already exist in `net_cc`; what remains is
+BBR (CUBIC done, Reno default until a netem A/B flips it) + a TCP-side pacer
+(QUIC's RFC 9002 token-bucket pacer landed 2026-06). Gate the L1
 work behind the `SendProgress` contract (so the CC has a clean backpressure
 signal) and, for the L4 half, behind SACK (T7).
 
@@ -540,9 +540,9 @@ signal) and, for the L4 half, behind SACK (T7).
   [`tx-backpressure.md`](tx-backpressure.md) (stage 1) for how it fits the
   end-to-end backpressure chain. **Done since**: `net/tcp/src/state.rs` delegates its
   `cwnd`/`ssthresh` to it (`congestion_init`, 2026-06-08) and
-  `proto/quic/src/conn` adopted it + the RFC 9002 pacer. **Pending**: CUBIC/BBR,
-  TCP-side pacing.
-  **Win**: CUBIC/BBR + pacing written once; QUIC gets its first controller; the
+  `proto/quic/src/conn` adopted it + the RFC 9002 pacer. **Pending**: BBR
+  (CUBIC done, Reno default until a netem A/B flips it) + a TCP-side pacer.
+  **Win**: BBR + pacing written once; QUIC gets its first controller; the
   L1/L3 Linux-parity gap closes for both transports together. **Effort**:
   large (the wiring; the controller core is done). **Risk**: medium — CC is
   subtle; keep the existing TCP controller's `tcp_test` scenarios
@@ -651,7 +651,7 @@ ergonomics follow. Each phase routes its cost-bearing items to the owning doc.
    items).** Extract `CongestionControl` + the pacer; delegate `TcpConnection` to
    it; give QUIC its first controller through it (closes RFC 9002 step 5). Gated
    on Phase 4's `SendProgress` signal, and (for the L4 loss-detection half) on
-   SACK/T7. *The CUBIC/BBR + pacing work, built once for both transports.*
+   SACK/T7. *The BBR + pacing work, built once for both transports (CUBIC done).*
 
 Phases 1–2 are the "right API" work; 3 is the perf payoff (owned by the cost
 docs); 0 and 4 are cleanup/ergonomics; 5 is the transport-reliability convergence
@@ -672,11 +672,12 @@ where it reuses an existing tracker item it names the item.
 - **TCP receive-window-update deadlock** on streamed uploads — **fixed in
   `ce562ff`**; preserve the recovery (see the regression hazard in the
   backpressure section).
-- **Congestion-control parity with Linux** — RFC 7323 window scaling and
-  RFC 3465 ABC have **shipped** (the 64 KiB/RTT cap and the delayed-ACK
-  slow-start penalty are gone); what remains is CUBIC/BBR, pacing, and RACK-TLP,
-  which should be built as the **shared TCP+QUIC congestion core** above →
-  [`tcp-backlog.md`](tcp-backlog.md) (L1–L5).
+- **Congestion-control parity with Linux** — RFC 7323 window scaling,
+  RFC 3465 ABC, CUBIC (`net_cc::Cubic`), and TLP (`send_tlp_probe`) have
+  **shipped** (the 64 KiB/RTT cap and the delayed-ACK
+  slow-start penalty are gone); what remains is BBR, pacing, and the SACK-based
+  RACK half, which should be built as the **shared TCP+QUIC congestion core**
+  above → [`tcp-backlog.md`](tcp-backlog.md) (L1–L5).
 
 ## Explicitly out of scope (defer to siblings)
 
