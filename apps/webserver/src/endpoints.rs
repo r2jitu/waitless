@@ -457,3 +457,171 @@ pub(crate) fn tls_profile_response() -> Response<'static> {
     buf.truncate(n);
     Response::ok(b"text/plain; charset=utf-8", buf)
 }
+
+// ---- /connect-probe — TCP client-path truth endpoint ------------------------
+
+/// Wire bytes sent once the probe connection is up: a minimal
+/// HTTP/1.0 request (no keep-alive, so a well-behaved peer closes
+/// after the response and the probe's single read sees data or EOF
+/// promptly).
+const PROBE_REQUEST: &[u8] = b"GET / HTTP/1.0\r\nHost: probe\r\n\r\n";
+/// Overall probe deadline — resolve + connect + send + first read.
+/// Just past the resolver's own 3×1 s solicitation budget, so an ARP
+/// timeout reports as the more specific `resolve` stage instead of
+/// racing this deadline to a tie.
+const PROBE_DEADLINE_US: u64 = 4_000_000;
+/// First-bytes capture cap.
+const PROBE_READ_MAX: usize = 256;
+
+/// Which client-path stage a probe failed at.
+enum ProbeFailure {
+    Resolve(&'static str),
+    Connect(&'static str),
+    Io(&'static str),
+}
+
+/// Dial `ip:port`, send [`PROBE_REQUEST`], read the first run of
+/// response bytes into `buf` — one `recv`, so the probe never hangs
+/// on a peer that answers and then keeps the conn open. `Ok(0)`
+/// means connected-then-EOF, which still proves the handshake.
+async fn probe_target(
+    ip: waitless::runtime::IpAddr,
+    port: u16,
+    buf: &mut [u8],
+) -> Result<usize, ProbeFailure> {
+    use waitless::runtime::TcpConnectError as E;
+    let mut stream = waitless::tcp_connect(ip, port).await.map_err(|e| match e {
+        E::NoRoute => ProbeFailure::Resolve("no-route"),
+        E::HostUnreachable => ProbeFailure::Resolve("host-unreachable"),
+        E::Refused => ProbeFailure::Connect("refused"),
+        E::TimedOut => ProbeFailure::Connect("timed-out"),
+        E::Failed => ProbeFailure::Connect("failed"),
+    })?;
+    stream
+        .send_bytes(PROBE_REQUEST)
+        .await
+        .map_err(|_| ProbeFailure::Io("send"))?;
+    Ok(stream.recv(buf).await)
+}
+
+/// Escape `bytes` into `w`: printable ASCII passes through,
+/// backslash doubles, everything else renders `\xHH`. Output is
+/// bounded at 4× the input (and the input at [`PROBE_READ_MAX`]).
+fn write_escaped(w: &mut impl core::fmt::Write, bytes: &[u8]) {
+    for &b in bytes {
+        match b {
+            b'\\' => {
+                let _ = w.write_str("\\\\");
+            }
+            0x20..=0x7e => {
+                let _ = w.write_char(b as char);
+            }
+            _ => {
+                let _ = write!(w, "\\x{b:02x}");
+            }
+        }
+    }
+}
+
+/// Bounded ASCII-decimal parse, rejecting empty / non-digit /
+/// overflowing input. Shared by the octet (`max=255`) and port
+/// (`max=65535`) fields.
+fn parse_decimal(s: &[u8], max: u32) -> Option<u32> {
+    if s.is_empty() || s.len() > 5 {
+        return None;
+    }
+    let mut v: u32 = 0;
+    for &b in s {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + (b - b'0') as u32;
+        if v > max {
+            return None;
+        }
+    }
+    Some(v)
+}
+
+/// Parse `?ip=A.B.C.D&port=N` (fields in either order; unknown keys
+/// ignored). `None` on any missing/malformed field or port 0.
+fn parse_probe_query(query: &[u8]) -> Option<(waitless::runtime::IpAddr, u16)> {
+    let query = query.strip_prefix(b"?")?;
+    let mut octets: Option<[u8; 4]> = None;
+    let mut port: Option<u16> = None;
+    for kv in query.split(|&b| b == b'&') {
+        if let Some(v) = kv.strip_prefix(b"ip=") {
+            let mut out = [0u8; 4];
+            let mut parts = v.split(|&b| b == b'.');
+            let mut ok = true;
+            for slot in &mut out {
+                match parts.next().and_then(|p| parse_decimal(p, 255)) {
+                    Some(o) => *slot = o as u8,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            octets = (ok && parts.next().is_none()).then_some(out);
+        } else if let Some(v) = kv.strip_prefix(b"port=") {
+            port = parse_decimal(v, 65535).and_then(|p| (p > 0).then_some(p as u16));
+        }
+    }
+    Some((
+        waitless::runtime::IpAddr::V4(waitless::runtime::Ipv4Addr {
+            addr: u32::from_ne_bytes(octets?),
+        }),
+        port?,
+    ))
+}
+
+/// `GET /connect-probe?ip=A.B.C.D&port=N` — dial the target, send a
+/// minimal HTTP/1.0 request, report the first response bytes. The
+/// E2E truth endpoint for the TCP client path (next-hop resolve →
+/// active ARP → SYN → data) on HVF/GCE: `200` with
+/// `connected; first-bytes: …` on success, `502` naming the failing
+/// stage (`resolve` / `connect` / `io` / `deadline`) otherwise.
+/// Dev-grade but bounded: one 256-byte read, a ~1 KiB response
+/// buffer, and a ~4 s overall deadline.
+pub(crate) async fn connect_probe_response(query: &[u8]) -> Response<'static> {
+    let Some((ip, port)) = parse_probe_query(query) else {
+        let mut res = Response::ok(
+            &b"text/plain; charset=utf-8"[..],
+            &b"usage: /connect-probe?ip=A.B.C.D&port=N\n"[..],
+        );
+        res.status(400);
+        return res;
+    };
+    let mut buf = [0u8; PROBE_READ_MAX];
+    let outcome =
+        waitless::runtime::timeout_us(PROBE_DEADLINE_US, probe_target(ip, port, &mut buf)).await;
+    let mut body = http::body_iobuf(PROBE_READ_MAX * 4 + 128);
+    let mut status = 200;
+    {
+        let mut w = body.writer();
+        match outcome {
+            Some(Ok(n)) => {
+                let _ = w.write_str("connected; first-bytes: ");
+                write_escaped(&mut w, &buf[..n]);
+                let _ = w.write_str("\n");
+            }
+            Some(Err(failure)) => {
+                status = 502;
+                let (stage, detail) = match failure {
+                    ProbeFailure::Resolve(d) => ("resolve", d),
+                    ProbeFailure::Connect(d) => ("connect", d),
+                    ProbeFailure::Io(d) => ("io", d),
+                };
+                let _ = write!(w, "probe failed at {stage}: {detail}\n");
+            }
+            None => {
+                status = 502;
+                let _ = w.write_str("probe failed at deadline: no verdict within 4s\n");
+            }
+        }
+    }
+    let mut res = Response::ok(&b"text/plain; charset=utf-8"[..], body);
+    res.status(status);
+    res
+}

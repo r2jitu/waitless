@@ -490,6 +490,7 @@ fn status_text(status: i32) -> &'static str {
         405 => "Method Not Allowed",
         500 => "Internal Server Error",
         501 => "Not Implemented",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Unknown",
     }

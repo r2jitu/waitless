@@ -327,6 +327,16 @@ async fn handle_request(req: &mut Request<'_>, res: &mut Response<'_>) -> Result
         res.set(Response::ok(b"application/json", b"{\"status\":\"discarded\"}"));
         return Ok(());
     }
+    // E2E truth endpoint for the TCP client path (next-hop resolve →
+    // ARP → SYN → first bytes). Prefix match: the target rides in the
+    // query string, `/connect-probe?ip=A.B.C.D&port=N`. Async (it
+    // awaits a connect with a deadline), so it can't sit inside the
+    // sync `match` below.
+    if let Some(query) = req.path().strip_prefix(b"/connect-probe") {
+        let probe = connect_probe_response(query).await;
+        res.set(probe);
+        return Ok(());
+    }
     res.set(match req.path() {
         // ── HTML pages ───────────────────────────────────────────
         b"/" => page_home(),

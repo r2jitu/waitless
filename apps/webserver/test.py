@@ -125,6 +125,45 @@ class WebserverServiceTest(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertIn(b"Not Found", body)
 
+    def test_connect_probe_bad_query_is_400(self) -> None:
+        status, body = http_get("/connect-probe?ip=999.0.0.1&port=80", port=PORT)
+        self.assertEqual(status, 400, body)
+        self.assertIn(b"usage:", body)
+
+    def test_connect_probe_unreachable_fails_clean(self) -> None:
+        """`/connect-probe` to an ARP-silent on-link IP must fail *cleanly*.
+
+        The target is the guest's OWN address (10.0.2.15 in the
+        HVF/QEMU usermode topology): both userspace proxies answer
+        ARP for every other destination (HVF proxy-ARPs the whole
+        subnet for outbound flows) but deliberately never for the
+        guest's own IP — duplicate-address detection depends on that
+        silence. So this is the one deterministic ARP-no-reply
+        target: the active resolver solicits 3× ~1 s apart, then
+        reports the resolve stage — the E2E proof a client connect
+        can't wedge a serving core (~3 s by design, hence the bumped
+        client timeout). On native the host stack handles the
+        self-connect instead; the probe must still come back as a
+        clean non-200 within its own deadline, just at a different
+        stage — so the stage word is asserted only on the VM runners
+        with the known topology.
+        """
+        status, body = http_get(
+            "/connect-probe?ip=10.0.2.15&port=80", port=PORT, timeout=10.0
+        )
+        if "native" in LAUNCHER_NAME:
+            # Self-connect on the host either fails or, if something
+            # is listening on host port 80, even succeeds — only
+            # assert the endpoint answered coherently.
+            self.assertIn(status, (200, 502), body)
+        else:
+            self.assertEqual(status, 502, body)
+            self.assertTrue(body.startswith(b"probe failed at "), body)
+            self.assertIn(b"resolve", body)
+        # The server must still be fully alive afterwards.
+        status, _ = http_get("/health", port=PORT)
+        self.assertEqual(status, 200)
+
     # ── HTTPS ────────────────────────────────────────────────────
     # The HTML pages all flow through `shell_body` in main.rs, which
     # builds a 9-part `Body` chain (mostly borrowed-static slices,
