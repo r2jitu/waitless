@@ -80,6 +80,55 @@ pub fn now_cycles() -> u64 {
     mock::now_ms()
 }
 
+// ── Wall-clock (Unix time) ───────────────────────────────────────────
+//
+// `now_ms` above is *monotonic* (since-boot) — perfect for RTO / RTT /
+// timeouts, but it has no relation to civil time. The wall clock adds a
+// real Unix-epoch time source for log timestamps, TLS-ticket absolute
+// age, and a cert-expiry self-check. It is read once from the platform
+// RTC at boot (`//crates/kernel/bare`), converted to a Unix-epoch base
+// via the pure `civil_to_unix_secs` below, and combined with `now_ms`'s
+// monotonic offset at read time.
+
+/// Convert a civil UTC date-time to seconds since the Unix epoch
+/// (1970-01-01 00:00:00). Pure integer math — the days-from-civil
+/// algorithm (H. Hinnant), valid for any Gregorian date the RTC reports
+/// (year ≥ 1970 for our use). Leap years and centuries are handled
+/// exactly. Host-unit-tested against known epoch values.
+pub fn civil_to_unix_secs(year: u32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> u64 {
+    // Shift March-based so the leap day falls at the end of the year.
+    let y = year as i64 - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let m = month as i64;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + day as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146097 + doe - 719468; // days since 1970-01-01
+    let secs = days * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64;
+    secs.max(0) as u64
+}
+
+/// Wall-clock time in seconds since the Unix epoch, or `0` when no RTC
+/// is available (e.g. an aarch64 platform whose RTC we don't map). `0`
+/// is an unambiguous "unknown" sentinel — a real boot is never in 1970.
+#[cfg(target_os = "none")]
+#[inline]
+pub fn wall_unix_secs() -> u64 {
+    unsafe extern "Rust" {
+        fn __kernel_bare_wall_unix_secs() -> u64;
+    }
+    // SAFETY: `//crates/kernel/bare` defines this symbol, same link
+    // contract as `__kernel_bare_now_ms`.
+    unsafe { __kernel_bare_wall_unix_secs() }
+}
+
+/// Host build: no platform RTC — wall time is unavailable (`0`).
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn wall_unix_secs() -> u64 {
+    0
+}
+
 /// Host-only test clock. Compiled out of every `os:none` build, so
 /// production code can neither reach nor advance it — exactly as the
 /// rng seam's host stream is unreachable on bare metal.
@@ -138,5 +187,32 @@ mod tests {
 
         mock::reset();
         assert_eq!(now_ms(), 0, "reset returns the clock to zero");
+    }
+
+    #[test]
+    fn civil_to_unix_matches_known_epochs() {
+        // The Unix epoch itself.
+        assert_eq!(civil_to_unix_secs(1970, 1, 1, 0, 0, 0), 0);
+        // Y2K midnight UTC.
+        assert_eq!(civil_to_unix_secs(2000, 1, 1, 0, 0, 0), 946_684_800);
+        // 2021-01-01 00:00:00 UTC.
+        assert_eq!(civil_to_unix_secs(2021, 1, 1, 0, 0, 0), 1_609_459_200);
+        // The Y2038 boundary: 2038-01-19 03:14:07 UTC = i32::MAX seconds.
+        assert_eq!(civil_to_unix_secs(2038, 1, 19, 3, 14, 7), 2_147_483_647);
+        // A leap day — 2024-02-29 12:00:00 UTC.
+        assert_eq!(civil_to_unix_secs(2024, 2, 29, 12, 0, 0), 1_709_208_000);
+        // Time-of-day adds correctly (epoch + 1h 1m 1s).
+        assert_eq!(civil_to_unix_secs(1970, 1, 1, 1, 1, 1), 3661);
+        // The day after a leap day is contiguous.
+        assert_eq!(
+            civil_to_unix_secs(2024, 3, 1, 0, 0, 0),
+            civil_to_unix_secs(2024, 2, 29, 0, 0, 0) + 86_400,
+        );
+    }
+
+    #[test]
+    fn wall_clock_unavailable_on_host() {
+        // No platform RTC on the host build → the `0` sentinel.
+        assert_eq!(wall_unix_secs(), 0);
     }
 }

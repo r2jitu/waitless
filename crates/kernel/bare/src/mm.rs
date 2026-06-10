@@ -569,6 +569,13 @@ pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
         h.map(|r| r.min_entropy_mbits).unwrap_or(0),
         h.map(|r| r.samples).unwrap_or(0),
     )?;
+    // Wall-clock (Unix-epoch seconds) read from the platform RTC at
+    // boot, 0 = unavailable (e.g. aarch64 where we don't map the RTC).
+    write!(
+        w,
+        "\"wall_unix_secs\":{},",
+        kernel_core::clock::wall_unix_secs(),
+    )?;
     LAST_OOM.write_json(w, "last_oom")?;
     w.write_str("}")
 }

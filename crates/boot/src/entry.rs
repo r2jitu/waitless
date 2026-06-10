@@ -410,6 +410,10 @@ unsafe fn kernel_boot(info: &BootInfo) {
         // takes a few hundred microseconds (UART config + FIFO drain) and
         // we want every subsequent log line's timestamp to include it.
         kernel_bare::time::mark_boot_start();
+        // Read the platform RTC once into the Unix-epoch wall-clock base
+        // (x86 CMOS; aarch64 leaves it unavailable). Independent port I/O
+        // — safe before serial is up.
+        kernel_bare::time::init_wall_clock();
         serial::init();
 
         // Force TSC calibration BEFORE the first log line. On x86 without

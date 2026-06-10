@@ -287,6 +287,126 @@ pub extern "Rust" fn __kernel_bare_now_cycles() -> u64 {
     now_cycles()
 }
 
+// ── Wall clock (Unix time from the platform RTC) ─────────────────────
+//
+// `now_ms`/`now_cycles` are monotonic since-boot. The wall clock adds a
+// real Unix-epoch time source for log timestamps / TLS-ticket absolute
+// age / cert-expiry checks. We read the platform RTC ONCE at boot,
+// convert to a Unix-epoch base, and add the monotonic since-boot offset
+// at read time — so we touch the (slow, possibly update-racing) RTC
+// exactly once. `kernel_core::clock::wall_unix_secs()` resolves to the
+// seam below; `0` means no RTC was read (wall time unknown).
+
+/// Unix-epoch seconds captured at boot from the RTC, or 0 if no RTC was
+/// read. The live wall time is this plus `since_boot_us()`.
+static BOOT_UNIX_SECS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Read the platform RTC once and record the boot Unix-epoch base.
+/// Call from boot after `mark_boot_start`. Leaves the base at 0 (wall
+/// time unavailable) on a platform whose RTC we don't read.
+pub fn init_wall_clock() {
+    let secs = read_rtc_unix_secs();
+    BOOT_UNIX_SECS.store(secs, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Link-seam definition for `kernel_core::clock::wall_unix_secs()`.
+/// Boot base + monotonic offset; 0 until [`init_wall_clock`] runs (or
+/// permanently 0 where no RTC is read).
+#[unsafe(no_mangle)]
+pub extern "Rust" fn __kernel_bare_wall_unix_secs() -> u64 {
+    let base = BOOT_UNIX_SECS.load(core::sync::atomic::Ordering::Relaxed);
+    if base == 0 {
+        return 0;
+    }
+    base + since_boot_us() / 1_000_000
+}
+
+/// Read the x86 CMOS / RTC (ports 0x70/0x71) into Unix-epoch seconds.
+/// Handles BCD vs binary and 12h vs 24h per Status Register B, and
+/// re-reads until two consecutive snapshots agree to avoid an
+/// update-in-progress tear. QEMU/KVM emulate this faithfully.
+#[cfg(target_arch = "x86_64")]
+fn read_rtc_unix_secs() -> u64 {
+    use core::arch::asm;
+    unsafe fn cmos(reg: u8) -> u8 {
+        let v: u8;
+        // Select the register (NMI-disable bit 0x80 left clear), read it.
+        // 0x70/0x71 are < 256, so the immediate `in`/`out` form is valid.
+        unsafe {
+            asm!("out 0x70, al", in("al") reg, options(nomem, nostack, preserves_flags));
+            asm!("in al, 0x71", out("al") v, options(nomem, nostack, preserves_flags));
+        }
+        v
+    }
+    // [sec, min, hour, day, month, year(2-digit), status-B]. Wait out an
+    // update-in-progress (Status A bit 7) before each snapshot.
+    unsafe fn snapshot() -> [u8; 7] {
+        unsafe {
+            while cmos(0x0A) & 0x80 != 0 {}
+            [
+                cmos(0x00),
+                cmos(0x02),
+                cmos(0x04),
+                cmos(0x07),
+                cmos(0x08),
+                cmos(0x09),
+                cmos(0x0B),
+            ]
+        }
+    }
+    // Re-read until two consecutive snapshots agree (no tear across an
+    // RTC update tick).
+    let mut last = unsafe { snapshot() };
+    for _ in 0..16 {
+        let cur = unsafe { snapshot() };
+        if cur == last {
+            break;
+        }
+        last = cur;
+    }
+    let [sec, min, hour_raw, day, month, year, statb] = last;
+    let bcd = statb & 0x04 == 0; // Status B bit 2 clear ⇒ values are BCD
+    let h12 = statb & 0x02 == 0; // bit 1 clear ⇒ 12-hour clock
+    let decode = |v: u8| -> u32 {
+        if bcd {
+            ((v >> 4) as u32) * 10 + (v & 0x0f) as u32
+        } else {
+            v as u32
+        }
+    };
+    let pm = h12 && (hour_raw & 0x80 != 0); // PM flag is bit 7 of the hour byte
+    let s = decode(sec);
+    let mi = decode(min);
+    let mut h = decode(hour_raw & 0x7f); // strip the PM bit before decode
+    let d = decode(day);
+    let mo = decode(month);
+    let y = decode(year);
+    if h12 {
+        // 12 AM → 0, 12 PM → 12, otherwise +12 for PM.
+        h %= 12;
+        if pm {
+            h += 12;
+        }
+    }
+    // 2-digit year → 2000-relative (the RTC century register is
+    // unreliable across firmwares; 20xx is correct for any real deploy).
+    let full_year = 2000 + y;
+    // Sanity-clamp: an implausible read (dead/garbage RTC) → unavailable.
+    if !(2020..=2099).contains(&full_year) || mo == 0 || mo > 12 || d == 0 || d > 31 {
+        return 0;
+    }
+    kernel_core::clock::civil_to_unix_secs(full_year, mo, d, h, mi, s)
+}
+
+/// aarch64: the PL031 RTC isn't mapped by our boot path (and the HVF
+/// runner doesn't emulate one), so wall time is unavailable here for
+/// now. Reading an unmapped MMIO address would fault, so we don't try.
+#[cfg(target_arch = "aarch64")]
+fn read_rtc_unix_secs() -> u64 {
+    0
+}
+
 /// Print `[TIME] LABEL: N ms` (since boot) on the serial console.
 /// Cheap: one cycle counter read, one TSC-rate read (cached after the
 /// first x86 PIT calibration), and a few `serial::puts`. Not on a hot
