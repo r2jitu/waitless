@@ -229,29 +229,10 @@ pub fn snapshot() -> [(&'static str, u64); 17] {
     ]
 }
 
-/// Monotonic cycle counter for the per-phase brackets (TSC on x86,
-/// CNTVCT_EL0 on arm64). Mirrors `quic::diag::now_cycles`.
-#[inline(always)]
-pub fn now_cycles() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let lo: u32;
-        let hi: u32;
-        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
-            options(nomem, nostack, preserves_flags));
-        ((hi as u64) << 32) | (lo as u64)
-    }
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let v: u64;
-        core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack));
-        v
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        0
-    }
-}
+/// Monotonic cycle counter for the per-phase brackets — the shared
+/// [`obs::now_cycles`] (TSC on x86, CNTVCT_EL0 on arm64), re-exported so
+/// `crate::diag::now_cycles()` call sites are unchanged.
+pub use obs::now_cycles;
 
 /// Render the HTTP/3 observability block as a JSON object — every
 /// counter flat, then the `LAST_DROP` snapshot. This is http3's

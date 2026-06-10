@@ -1315,47 +1315,15 @@ impl TcpConnection {
     /// Reads the wire payload directly from the queue's head IOBuf —
     /// the SG-TX follow-up will swap the scratch copy below for a
     /// driver descriptor pointing at the same bytes.
+    /// Retransmit the oldest unacked segment — the head of the rtx queue,
+    /// the RFC 6298 RTO and RFC 5681 fast-retransmit entry point. This is
+    /// exactly `emit_rtx_entry(0)`: the head entry's `seq_start` is `snd_una`
+    /// by the rtx-queue invariant (`rtx_ack` advances `seq_start` in lock-step
+    /// with `snd_una` on a partial ack), so re-sending the head from its
+    /// `seq_start` is re-sending from `snd_una`. Kept as a named wrapper for
+    /// the call sites that read better as "retransmit the oldest".
     fn retransmit_oldest_segment(&mut self) {
-        // Re-segment at the negotiated `snd_mss`, not the raw local MSS:
-        // a queue entry can span a whole TSO super-segment, and a
-        // retransmit chunked at 1460 would be dropped again on a
-        // small-MTU peer (cellular / NAT64) just like the original.
-        let mss = self.snd_mss as usize;
-        let Some(head) = self.rtx_queue.front_mut() else {
-            return;
-        };
-        let n = (head.len as usize).min(mss);
-        if n == 0 {
-            return;
-        }
-        // Copy out of the head IOBuf into a stack scratch — the
-        // bytes remain owned by the queue. ≤ MSS bytes off the
-        // steady-state path so the copy is not a hot-path cost; the
-        // SG-TX follow-up replaces it with a driver descriptor that
-        // points at `head.iobuf.data()` directly.
-        let mut scratch = [0u8; MSS_MAX];
-        scratch[..n].copy_from_slice(&head.iobuf.data()[..n]);
-        // Bump the entry's tx_count for Karn's rule. >0 marks the
-        // entry as "retransmitted"; a future RTT-sampling commit
-        // refuses to take samples from such entries.
-        head.tx_count = head.tx_count.saturating_add(1);
-        send_segment(
-            &SegmentMeta {
-                local_ip: self.local_ip,
-                dst_ip: self.remote_ip,
-                src_port: self.local_port,
-                dst_port: self.remote_port,
-                seq: self.snd_una,
-                ack: self.rcv_nxt,
-                flags: TCP_ACK | TCP_PSH,
-                window: self.rx_free() as u16,
-            },
-            &scratch[..n],
-        );
-        // RFC 6298 §3 (Karn's algorithm): the outstanding RTT sample
-        // is now ambiguous — a later ACK could be for either the
-        // original transmission or this one — so discard it.
-        self.rtt_anchor_active = false;
+        self.emit_rtx_entry(0);
     }
 
     /// Retransmit the oldest unacked segment on RTO expiry (RFC 6298

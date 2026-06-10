@@ -14,38 +14,9 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Read the monotonic hardware cycle counter — TSC on x86_64,
-/// CNTVCT_EL0 on aarch64. Both are unprivileged reads on the
-/// targets we ship (kernel ring-0 or macOS/Linux user mode).
-#[inline(always)]
-fn now_cycles() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let lo: u32;
-        let hi: u32;
-        core::arch::asm!(
-            "rdtsc",
-            out("eax") lo,
-            out("edx") hi,
-            options(nomem, nostack, preserves_flags),
-        );
-        ((hi as u64) << 32) | (lo as u64)
-    }
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let v: u64;
-        core::arch::asm!(
-            "mrs {0}, cntvct_el0",
-            out(reg) v,
-            options(nomem, nostack, preserves_flags),
-        );
-        v
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        0
-    }
-}
+/// Read the monotonic hardware cycle counter — the shared
+/// [`obs::now_cycles`] (TSC on x86_64, CNTVCT_EL0 on aarch64).
+use obs::now_cycles;
 
 /// Cycle-counter frequency in ticks per microsecond.
 ///

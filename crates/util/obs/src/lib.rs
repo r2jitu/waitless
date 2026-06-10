@@ -38,6 +38,39 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use sync::Spinlock;
 
+/// Read the CPU cycle counter — `rdtsc` on x86_64, the virtual count
+/// `CNTVCT_EL0` on aarch64 (real cycles on GCE; ~24 MHz ticks on native
+/// arm64, so use it for *ratios*, not absolute timings). `0` on any other
+/// target. The single source of truth for the per-region cycle deltas the
+/// `obs`-using crates profile with: it lives here, in the leaf crate they
+/// already depend on, so it pulls in no `kernel_core` dependency (proto
+/// crates sit above the kernel only via the reactor).
+#[inline(always)]
+pub fn now_cycles() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let lo: u32;
+        let hi: u32;
+        core::arch::asm!(
+            "rdtsc",
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+        ((hi as u64) << 32) | (lo as u64)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let v: u64;
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack));
+        v
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        0
+    }
+}
+
 /// A process-wide monotonic event counter.
 ///
 /// One `AtomicU64`, relaxed ordering throughout: increments from

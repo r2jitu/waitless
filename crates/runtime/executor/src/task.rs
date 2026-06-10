@@ -357,39 +357,10 @@ pub(crate) fn wake_by_packed(packed: usize) {
 /// wake their tasks via the `Sleep` → waker chain), then poll every
 /// ready slot in its arena. Backends call this once per event-loop
 /// iteration.
-/// Cycle counter for the `RUNTIME_CYCLES` serve-bucket bracket. The
-/// executor sits below `kernel_core`, so we read the counter directly
-/// (rdtsc / cntvct) rather than depend on it. Same instruction the
-/// `tls`/`http` profilers use; zero on unsupported targets.
-#[inline(always)]
-fn now_cycles() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let lo: u32;
-        let hi: u32;
-        core::arch::asm!(
-            "rdtsc",
-            out("eax") lo,
-            out("edx") hi,
-            options(nomem, nostack, preserves_flags),
-        );
-        ((hi as u64) << 32) | (lo as u64)
-    }
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let v: u64;
-        core::arch::asm!(
-            "mrs {0}, cntvct_el0",
-            out(reg) v,
-            options(nomem, nostack, preserves_flags),
-        );
-        v
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        0
-    }
-}
+/// Cycle counter for the `RUNTIME_CYCLES` serve-bucket bracket — the shared
+/// [`obs::now_cycles`] (`obs` is a leaf crate below the executor, so this
+/// reads the counter without threading a `kernel_core` dependency).
+use obs::now_cycles;
 
 pub fn tick(worker_id: u32) -> bool {
     if worker_id >= worker::num_workers() {

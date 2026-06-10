@@ -115,30 +115,8 @@ const RST_FLOOD_CAP: u32 = 200;
 const CONTROL_FLOOD_CAP: u32 = 1024;
 
 /// Steady-state cycle counter for the per-phase profiling brackets
-/// (HPACK decode / encode / framing). Same rdtsc / cntvct instruction
-/// the `http` + `tls` profilers use; zero on unsupported targets.
-#[inline(always)]
-fn now_cycles() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let lo: u32;
-        let hi: u32;
-        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
-            options(nomem, nostack, preserves_flags));
-        ((hi as u64) << 32) | (lo as u64)
-    }
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let v: u64;
-        core::arch::asm!("mrs {0}, cntvct_el0", out(reg) v,
-            options(nomem, nostack, preserves_flags));
-        v
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        0
-    }
-}
+/// (HPACK decode / encode / framing) — the shared [`obs::now_cycles`].
+use obs::now_cycles;
 
 // ── Public entry point ─────────────────────────────────────────────
 

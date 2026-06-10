@@ -142,35 +142,8 @@ impl Drop for CycleBracket {
     }
 }
 
-#[inline(always)]
-fn now_cycles_inline() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let lo: u32;
-        let hi: u32;
-        core::arch::asm!(
-            "rdtsc",
-            out("eax") lo,
-            out("edx") hi,
-            options(nomem, nostack, preserves_flags),
-        );
-        ((hi as u64) << 32) | (lo as u64)
-    }
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let v: u64;
-        core::arch::asm!(
-            "mrs {0}, cntvct_el0",
-            out(reg) v,
-            options(nomem, nostack, preserves_flags),
-        );
-        v
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        0
-    }
-}
+// The record-layer profiling bracket reads the shared [`obs::now_cycles`].
+use obs::now_cycles as now_cycles_inline;
 
 #[inline]
 fn bump_encrypt(plaintext_len: usize) {
