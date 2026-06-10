@@ -28,7 +28,7 @@ cumulative `/obs` `heap_total_allocation_count`.
 | h1-TLS `GET /health` | **1.00** | the rtx retain — `rtx_push`'s `into_owned()` of the Borrowed sealed record (`state.rs`); freed on ACK. The 2026-05-29 "1 → 0 DONE (`1d46f90`)" claim below is **stale: `RtxPayload::Inline` was deliberately reverted** (throughput-neutral, kept simple) |
 | h1-TLS `/static-16k` | **2.02** | + 1 TSO-record retain |
 | h1-TLS `/static-1m` | **81** | ≈ 1 retain per 16 KiB TSO record (64) + record chunking; each retain also paid a dead 16 KiB zeroing pass — **fixed this pass** (`try_reserve` + `extend_from_slice`) |
-| h2 `GET /health` | **3.7** | h1's rtx retain + `header_block: Vec::with_capacity(64)` per response + the per-flush `from_slice_with_headroom(frame_buf)` send IOBuf |
+| h2 `GET /health` | ~~3.7~~ → **1.25** (2026-06-10 `de60f15`) | was: h1's rtx retain + `header_block` Vec per response + the per-flush `from_slice_with_headroom(frame_buf)` send IOBuf. Now: header_block pools through StreamOut retirement; the flush ships a Borrowed IOBuf over `frame_buf` (the `record_scratch` pattern); ~the rtx retain remains |
 | h3 `GET /health` | **8.4** | stream-retx retention `pop_chunk().to_vec()` (×2), per-packet `Vec<StreamRetx>`, recv/send BTreeMap node churn (×2), DATA-header IOBuf |
 
 RX remains structurally zero-copy/zero-alloc on all paths (chunk move →
@@ -46,10 +46,15 @@ in-place AEAD → in-place parse); pooled IOBuf churn never touches talc.
   reuse (rx_ring + warm capacity, by design). Decomposition: rx_ring 16.4 KB
   + `TlsConnImpl` 7.9 KB (4 × 856 B `TrafficKey` now embeds expanded AES-GCM
   state — deliberate perf trade, +2.6 KB vs May) + unified serve-task future
-  ~20.4 KB + **eager `H2Conn` heap 20.7 KB** (`inbuf` 4 KB +
-  `value_scratch` 16 KB, allocated per conn at `H2Conn::new`) + slot 0.4 KB.
-  The May figure of ~31 KB described an h1-only listener that is no longer
-  the deployed shape.
+  ~20.4 KB + slot 0.4 KB + ~22 KB unattributed (likely `rx_partial` 16.4 KB
+  materialized by a handshake-flight record straddle + future-size
+  underestimate). ⚠ **Correction (2026-06-10):** the original decomposition
+  attributed an "eager `H2Conn` heap 20.7 KB" to every TLS conn — wrong:
+  `H2Conn::new` runs only on the h2-ALPN branch (`http2::serve_conn`), so
+  its heap (`inbuf` 4 KB + the now-lazy `value_scratch`) is per-*h2*-conn.
+  Verified by measurement: making `value_scratch` lazy moved idle no-ALPN
+  mem/conn by 0 bytes. The May figure of ~31 KB described an h1-only
+  listener that is no longer the deployed shape.
 - **h3/QUIC conn**: ≈ 20–22 KB — `Connection` is 17.9 KB inline, of which
   **14.0 KB (78%) is 9 × 1,552 B `Option<DirKeys>` slots** (mostly `None` on
   an established conn).
@@ -92,10 +97,12 @@ path is <10% of saturated cycles; NIC poll ~39% + async ~22% still dominate)
    per 1 MiB body.
 2. **Box the QUIC `DirKeys` slots** — 9 × 1,552 B inline, ~3 live on an
    established conn: **−9–11 KB per h3 conn** (>50% of `Connection`). **S/M**
-3. **h2 `value_scratch` 16 KiB eager → lazy** at `H2Conn::new`: −16 KB per
-   idle h2-capable conn (paid by *every* deployed TLS conn today). **S**
-4. **h2 `header_block` pool + ship `frame_buf` as a Borrowed IOBuf** (the
-   `record_scratch` NonNull pattern): h2 3.7 → ~1.7 allocs/req. **S/M**
+3. ~~h2 `value_scratch` eager → lazy~~ — **done 2026-06-10 (`de60f15`)**,
+   but the predicted −16 KB/idle-TLS-conn was based on a wrong attribution
+   (see the corrected decomposition above — `H2Conn` is h2-ALPN-only).
+   Actual value: hardening (no 16 KiB for preface-only h2 conns).
+4. ~~h2 `header_block` pool + Borrowed `frame_buf` ship~~ — **done
+   2026-06-10 (`de60f15`)**: measured h2 /health **3.7 → 1.25 allocs/req**.
 5. ~~TSO retain `vec![0u8;len]` zeroing pass~~ — **done this pass**.
 6. **rx_ring 16 KB → tiered** — Tier-2 #3 below still valid, still the
    biggest always-present per-conn block; `OOO_MAX_BYTES` is tied to it. **M**
