@@ -256,6 +256,9 @@ fn harness() -> std::sync::MutexGuard<'static, ()> {
     // Start every scenario at t=0 so a timer-driven test never
     // inherits clock advanced by an earlier one.
     kernel_core::clock::mock::reset();
+    // Refill the RFC 5961 challenge-ACK buckets so a scenario that
+    // drained them (the rate-limit test) can't starve the next one.
+    super::receive::reset_challenge_acks_for_test();
     // Disarm the rtx_push fault-injector — defensive against a future
     // test that arms it (`crate::state::FAIL_RTX_PUSH_ONCE.store(true)`)
     // without firing the push, which would leak the trigger into the
@@ -613,6 +616,131 @@ fn retransmitted_syn_replaces_the_stale_twin() {
         CLIENT_ISN.wrapping_add(1 + body.len() as u32),
         "the post-retransmit connection delivers data correctly",
     );
+}
+
+/// RFC 5961 §4 (T4): a SYN arriving on a live, synchronized 4-tuple
+/// must NOT allocate a second TCB and orphan the established
+/// connection — a blind off-path attacker who guesses the 4-tuple
+/// could otherwise wedge it. The receiver answers with a bare
+/// challenge ACK announcing its real `rcv_nxt`, leaves the connection
+/// untouched, and a legitimate restart would only then respond with
+/// an RST. Prove the SYN draws exactly one bare ACK (not a SYN|ACK,
+/// which would mean a fresh TCB) and the original connection still
+/// delivers data afterward.
+#[test]
+fn syn_on_established_conn_elicits_a_challenge_ack() {
+    let _g = harness();
+    const SP: u16 = 9171;
+    const CP: u16 = 50171;
+    const CLIENT_ISN: u32 = 0x5000;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+
+    clear_tx();
+    let sent_before = super::diag::COUNTERS.challenge_ack_sent.get();
+    // A forged SYN on the live 4-tuple, seq far from the real window.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: 0x9999_9999,
+        ack: 0,
+        flags: TCP_SYN,
+        window: 65535,
+        payload: Vec::new(),
+    });
+
+    let frames = tx();
+    assert_eq!(frames.len(), 1, "a SYN on a live conn elicits exactly one frame");
+    let h = tcp_hdr(&frames[0]);
+    assert_eq!(
+        h.flags, TCP_ACK,
+        "the reply is a bare challenge ACK — NOT a SYN|ACK (no second TCB)",
+    );
+    assert_eq!(h.seq, server_isn.wrapping_add(1), "the challenge carries our real snd_nxt");
+    assert_eq!(
+        h.ack,
+        CLIENT_ISN.wrapping_add(1),
+        "the challenge carries our real rcv_nxt — the forged SYN was ignored",
+    );
+    assert_eq!(
+        super::diag::COUNTERS.challenge_ack_sent.get(),
+        sent_before + 1,
+        "the challenge ACK was counted",
+    );
+
+    // The original connection is untouched — it still delivers data.
+    clear_tx();
+    let body = b"still-up";
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK | TCP_PSH,
+        window: 65535,
+        payload: body.to_vec(),
+    });
+    assert_eq!(
+        tcp_hdr(tx().last().unwrap()).ack,
+        CLIENT_ISN.wrapping_add(1 + body.len() as u32),
+        "the established connection survived the forged SYN and delivers data",
+    );
+}
+
+/// RFC 5961 §7 (T5): challenge ACKs are rate-limited per core so a
+/// forged-trigger flood (a SYN on a live 4-tuple, an out-of-window
+/// ACK) cannot turn the stack into a reflector or burn a core
+/// answering every packet. The per-core token bucket holds
+/// `CHALLENGE_ACK_BURST` tokens refilled at `CHALLENGE_ACK_RATE`/sec;
+/// the harness hands each scenario a full bucket. Drive a flood and
+/// prove the challenge count caps at the burst, the excess is counted
+/// as throttled, and a token refills after the clock advances.
+#[test]
+fn challenge_acks_are_rate_limited() {
+    let _g = harness();
+    const SP: u16 = 9172;
+    const CP: u16 = 50172;
+    const CLIENT_ISN: u32 = 0x6000;
+    // The bucket capacity — mirror the constant in `receive.rs`.
+    const BURST: usize = 100;
+    super::listen_on_core(0, SP);
+    handshake(SP, CP, CLIENT_ISN);
+
+    clear_tx();
+    let throttled_before = super::diag::COUNTERS.challenge_ack_throttled.get();
+    let forged_syn = Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: 0x9999_9999,
+        ack: 0,
+        flags: TCP_SYN,
+        window: 65535,
+        payload: Vec::new(),
+    };
+
+    // A flood at a fixed clock: the first `BURST` drain the bucket and
+    // each draws a challenge ACK; the rest are throttled (no frame).
+    const EXTRA: usize = 5;
+    for _ in 0..BURST + EXTRA {
+        deliver(&forged_syn);
+    }
+    assert_eq!(
+        tx().len(),
+        BURST,
+        "the challenge ACK count caps at the per-core burst, not 1-per-SYN",
+    );
+    assert_eq!(
+        super::diag::COUNTERS.challenge_ack_throttled.get(),
+        throttled_before + EXTRA as u64,
+        "the excess forged SYNs were counted as throttled",
+    );
+
+    // One second later the bucket has refilled — a forged SYN draws a
+    // fresh challenge ACK again.
+    clear_tx();
+    kernel_core::clock::mock::advance(1000);
+    deliver(&forged_syn);
+    assert_eq!(tx().len(), 1, "a token refilled after the clock advanced — challenge resumes");
 }
 
 /// A duplicate segment wholly below `rcv_nxt` (the peer never saw

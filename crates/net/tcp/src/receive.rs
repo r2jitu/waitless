@@ -11,9 +11,106 @@ use crate::send::{SegmentMeta, send_rst, send_segment, send_segment_opts};
 use crate::state::{
     RX_RING_BYTES, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN, TcpHeader, TcpState, mss_for, seq_lt,
 };
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use from_bytes::FromBytes;
 use iobuf::{Chain, IOBuf, OwnedIOBuf};
 use types::{IpAddr, ntohl, ntohs};
+
+// ── RFC 5961 challenge-ACK rate limit (T5) ───────────────────────────
+//
+// A challenge ACK resyncs a confused peer and forces an off-path
+// blind-injection attacker to guess our exact window. But each forged
+// trigger (a SYN on a live 4-tuple §4, an out-of-window ACK §3.10.7.4)
+// would otherwise elicit one, so a flood turns us into a reflector and
+// burns CPU. RFC 5961 §7 caps the rate: a per-core token bucket
+// (the RX path is per-core), `CHALLENGE_ACK_BURST` tokens refilled at
+// `CHALLENGE_ACK_RATE`/sec. Relaxed atomics — single-writer per core.
+
+const CHALLENGE_ACK_RATE: u32 = 100; // tokens per second
+const CHALLENGE_ACK_BURST: u32 = 100; // bucket capacity
+
+static CHALLENGE_TOKENS: [AtomicU32; obs::MAX_CORES] =
+    [const { AtomicU32::new(CHALLENGE_ACK_BURST) }; obs::MAX_CORES];
+static CHALLENGE_LAST_MS: [AtomicU64; obs::MAX_CORES] =
+    [const { AtomicU64::new(0) }; obs::MAX_CORES];
+
+/// Reset every per-core challenge-ACK bucket to full — test-only, so a
+/// scenario that drained the bucket can't starve the next one (the
+/// buckets are process-global statics the harness can't otherwise
+/// clear). Mirrors `reset_pool` / `clock::mock::reset` in the harness.
+#[cfg(test)]
+pub(crate) fn reset_challenge_acks_for_test() {
+    for i in 0..obs::MAX_CORES {
+        CHALLENGE_TOKENS[i].store(CHALLENGE_ACK_BURST, Ordering::Relaxed);
+        CHALLENGE_LAST_MS[i].store(0, Ordering::Relaxed);
+    }
+}
+
+/// Consume one challenge-ACK token for `core`; `true` if one was
+/// available (the challenge ACK may be sent). Refills lazily from the
+/// monotonic ms clock on each call.
+fn challenge_ack_allowed(core: u32) -> bool {
+    let i = core as usize;
+    if i >= obs::MAX_CORES {
+        return true; // outside the bucket array — don't rate-limit
+    }
+    let now = kernel_core::clock::now_ms();
+    let last = CHALLENGE_LAST_MS[i].load(Ordering::Relaxed);
+    if now > last {
+        // Refill proportional to elapsed time; only advance `last` once
+        // at least one token's worth of time has passed so sub-10 ms
+        // gaps still accumulate toward a token.
+        let refill = (now - last).saturating_mul(CHALLENGE_ACK_RATE as u64) / 1000;
+        if refill > 0 {
+            let cur = CHALLENGE_TOKENS[i].load(Ordering::Relaxed);
+            let next = (cur as u64 + refill).min(CHALLENGE_ACK_BURST as u64) as u32;
+            CHALLENGE_TOKENS[i].store(next, Ordering::Relaxed);
+            CHALLENGE_LAST_MS[i].store(now, Ordering::Relaxed);
+        }
+    }
+    let cur = CHALLENGE_TOKENS[i].load(Ordering::Relaxed);
+    if cur > 0 {
+        CHALLENGE_TOKENS[i].store(cur - 1, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+/// Send an RFC 5961 challenge ACK — a bare ACK announcing our real
+/// `snd_nxt` / `rcv_nxt` — subject to the per-core rate limit. Used for
+/// a SYN on a live Established 4-tuple (§4) and an out-of-window ACK
+/// (§3.10.7.4). No-op (counted) when the rate limit is exhausted.
+#[allow(clippy::too_many_arguments)]
+fn send_challenge_ack(
+    core: u32,
+    local_ip: IpAddr,
+    dst_ip: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    snd_nxt: u32,
+    rcv_nxt: u32,
+    window: u16,
+) {
+    if !challenge_ack_allowed(core) {
+        crate::diag::COUNTERS.challenge_ack_throttled.bump();
+        return;
+    }
+    crate::diag::COUNTERS.challenge_ack_sent.bump();
+    send_segment(
+        &SegmentMeta {
+            local_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            seq: snd_nxt,
+            ack: rcv_nxt,
+            flags: TCP_ACK,
+            window,
+        },
+        &[],
+    );
+}
 
 /// Drop-guard that wraps `tcp_receive` in a cycle-counter bracket.
 /// Fires on every exit path (early returns included) so per-packet
@@ -238,15 +335,35 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
         // (line further below), so look there first — O(1) hash
         // probe vs an O(pool_size) scan.
         let key = tcp_hash_key(src_ip, src_port, dst_port);
-        let stale_idx = tcp_hash_find(core, key).and_then(|s| {
+        let hit = tcp_hash_find(core, key).filter(|&s| {
             let c = unsafe { &*conn_ptr(core, s) };
-            (c.state != TcpState::Closed
+            c.remote_ip == src_ip && c.local_port == dst_port && c.remote_port == src_port
+        });
+
+        // RFC 5961 §4 (T4): a SYN on a live, synchronized 4-tuple must
+        // NOT silently allocate a second TCB — that orphans the live
+        // connection (nothing reclaims a synchronized orphan; there is
+        // no RTO timer and `alloc_connection`'s reclaim scans only
+        // closing states). A blind off-path attacker who guesses the
+        // 4-tuple could otherwise wedge an established connection. Reply
+        // with a (rate-limited) challenge ACK announcing our real
+        // `rcv_nxt`; a legitimate peer that truly restarted answers the
+        // ACK with an RST, the only thing that tears us down. Leave the
+        // connection untouched and drop the SYN.
+        if let Some(s) = hit {
+            let c = unsafe { &*conn_ptr(core, s) };
+            if c.state == TcpState::Established {
+                let (snd_nxt, rcv_nxt, win) = (c.snd_nxt, c.rcv_nxt, c.rx_free() as u16);
+                send_challenge_ack(core, dst_ip, src_ip, dst_port, src_port, snd_nxt, rcv_nxt, win);
+                return;
+            }
+        }
+
+        let stale_idx = hit.filter(|&s| {
+            let c = unsafe { &*conn_ptr(core, s) };
+            c.state != TcpState::Closed
                 && c.state != TcpState::Listen
                 && c.state != TcpState::Established
-                && c.remote_ip == src_ip
-                && c.local_port == dst_port
-                && c.remote_port == src_port)
-                .then_some(s)
         });
 
         // Fall back to a pool scan when the listener wasn't registered
@@ -458,18 +575,19 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             // RFC 9293 §3.10.7.4 acceptability inputs (`SEG.ACK` vs
             // `SND.NXT`) that tell a confused peer from an injection.
             crate::diag::record_ack_unsent(src_port, dst_port, ack, c.snd_una, c.snd_nxt, c.state);
-            send_segment(
-                &SegmentMeta {
-                    local_ip: dst_ip,
-                    dst_ip: src_ip,
-                    src_port: dst_port,
-                    dst_port: src_port,
-                    seq: c.snd_nxt,
-                    ack: c.rcv_nxt,
-                    flags: TCP_ACK,
-                    window: c.rx_free() as u16,
-                },
-                &[],
+            // RFC 5961 §7: an out-of-window ACK is a blind-injection
+            // trigger as much as the SYN above — rate-limit the
+            // challenge so a forged-ACK flood can't turn us into a
+            // reflector or burn a core answering every packet.
+            send_challenge_ack(
+                core,
+                dst_ip,
+                src_ip,
+                dst_port,
+                src_port,
+                c.snd_nxt,
+                c.rcv_nxt,
+                c.rx_free() as u16,
             );
             return;
         }

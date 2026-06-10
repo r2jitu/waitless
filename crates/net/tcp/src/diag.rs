@@ -45,6 +45,15 @@ pub struct Counters {
     /// off-path injection. `LAST_ACK_UNSENT` has the rejected
     /// `SEG.ACK` and the `SND.NXT` it failed against.
     pub ack_unsent: Counter,
+    /// RFC 5961 challenge ACKs sent (a SYN on a live Established 4-tuple
+    /// §4, or an out-of-window ACK §3.10.7.4) — resyncs a confused peer
+    /// and forces an off-path attacker to guess our window. Nonzero on
+    /// a public server is routine (duplicate SYNs, scanners).
+    pub challenge_ack_sent: Counter,
+    /// Challenge ACKs suppressed by the RFC 5961 §7 per-core rate limit.
+    /// Nonzero means a flood of triggers (forged SYNs / ACKs) was capped
+    /// so we don't become a reflector or burn CPU.
+    pub challenge_ack_throttled: Counter,
 
     // ── Teardown ─────────────────────────────────────────────────
     /// Connections freed, all reasons. Equals the sum of the
@@ -137,6 +146,8 @@ impl Counters {
             synack_tx: Counter::new(),
             conns_established: Counter::new(),
             ack_unsent: Counter::new(),
+            challenge_ack_sent: Counter::new(),
+            challenge_ack_throttled: Counter::new(),
             conns_freed: Counter::new(),
             rst_received: Counter::new(),
             rst_sent: Counter::new(),
@@ -540,13 +551,15 @@ pub fn record_teardown(reason: TeardownReason, state: TcpState) {
 
 /// Counter `(name, value)` pairs in declaration order — the flat
 /// half of the `/obs` `"tcp"` block.
-pub fn snapshot() -> [(&'static str, u64); 25] {
+pub fn snapshot() -> [(&'static str, u64); 27] {
     let c = &COUNTERS;
     [
         ("syn_rx", c.syn_rx.get()),
         ("synack_tx", c.synack_tx.get()),
         ("conns_established", c.conns_established.get()),
         ("ack_unsent", c.ack_unsent.get()),
+        ("challenge_ack_sent", c.challenge_ack_sent.get()),
+        ("challenge_ack_throttled", c.challenge_ack_throttled.get()),
         ("conns_freed", c.conns_freed.get()),
         ("rst_received", c.rst_received.get()),
         ("rst_sent", c.rst_sent.get()),
