@@ -591,13 +591,21 @@ fn mock_clock_drives_time_threshold_loss() {
     assert_eq!(conn.bytes_in_flight, 0, "both packets released from flight");
 }
 
-/// Helper for the virtual-time loss suite: ACK exactly `largest` (a
-/// single-PN range) through the real wire round-trip, so the test
-/// exercises the same parse → `process_ack` path production does.
-#[cfg(test)]
-fn ack_single(conn: &mut Connection, largest: u64) {
-    let mut ackbuf = [0u8; 16];
-    let n = crate::frame::write_ack(largest, 0, 0, &[], &mut ackbuf).unwrap();
+/// Wire round-trip ACK core for the virtual-time loss suites: encode
+/// the ranges with `write_ack`, parse the frame back, and feed
+/// `process_ack` — the exact path an inbound ACK takes in production.
+/// `ack_single` and the loss-schedule property suite's multi-range
+/// cumulative ACKs both funnel through here.
+fn ack_wire(
+    conn: &mut Connection,
+    largest: u64,
+    ack_delay: u64,
+    first_ack_range: u64,
+    additional_ranges: &[(u64, u64)],
+) {
+    let mut ackbuf = alloc::vec![0u8; 64 + 16 * additional_ranges.len()];
+    let n = crate::frame::write_ack(largest, ack_delay, first_ack_range, additional_ranges, &mut ackbuf)
+        .unwrap();
     let (frame, _) = crate::frame::parse_frame(&ackbuf[..n]).unwrap();
     let crate::frame::Frame::Ack {
         largest_acknowledged,
@@ -616,6 +624,13 @@ fn ack_single(conn: &mut Connection, largest: u64) {
         first_ack_range,
         ack_ranges,
     );
+}
+
+/// Helper for the virtual-time loss suite: ACK exactly `largest` (a
+/// single-PN range) through the real wire round-trip, so the test
+/// exercises the same parse → `process_ack` path production does.
+fn ack_single(conn: &mut Connection, largest: u64) {
+    ack_wire(conn, largest, 0, 0, &[]);
 }
 
 /// The NEGATIVE half of the virtual-time loss suite: ordinary
@@ -964,4 +979,386 @@ fn pacer_arms_deadline_only_when_limited() {
     conn.cc.on_ack(12_000, 0, net_cc::Rtt::new(50_000, 50_000), 0);
     conn.pace_budget = -700;
     assert!(conn.pace_deadline_us().is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Seeded loss-schedule property suite (architecture-audit direction #2's
+// scale-up: scripted-peer simulation over multi-packet flows). This moves
+// the correctness-under-loss class of validation that previously needed
+// GCE + tc netem into deterministic in-repo tests: the REAL recovery
+// machine (`record_sent_packet` → wire-round-trip `process_ack` →
+// `detect_loss` → `send_pto_probe` → `retx_queue`) is driven through
+// multi-packet flows whose per-transmission drop/deliver decisions come
+// from a seeded PRNG. Every run is reproducible from its seed — a failure
+// message carries `seed=…/loss=…‰`; re-run `run_loss_schedule(seed, loss)`
+// to replay the identical event sequence.
+// ---------------------------------------------------------------------------
+
+/// Tiny seeded PRNG for the scripted peer — SplitMix64, the same mix
+/// constants as `kernel/core/src/rng.rs`'s host branch. No std::time /
+/// rand crates: determinism from the seed is the point.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform-ish value in `[0, 1000)` — per-mille drop decisions.
+    fn permille(&mut self) -> u64 {
+        self.next_u64() % 1000
+    }
+}
+
+/// Encode the scripted peer's full cumulative receive set as one
+/// multi-range ACK — maximal contiguous `[lo, hi]` PN ranges folded into
+/// the RFC 9000 §19.3.1 `(gap, length)` encoding — and process it through
+/// the same wire round-trip as `ack_single`.
+fn ack_received_set(
+    conn: &mut Connection,
+    delivered: &alloc::collections::BTreeSet<u64>,
+    ack_delay: u64,
+) {
+    let mut iter = delivered.iter().rev().copied();
+    let largest = iter.next().expect("peer receive set is non-empty");
+    // Coalesce descending PNs into maximal contiguous (hi, lo) ranges.
+    let mut ranges: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    let (mut hi, mut lo) = (largest, largest);
+    for pn in iter {
+        if pn + 1 == lo {
+            lo = pn;
+        } else {
+            ranges.push((hi, lo));
+            (hi, lo) = (pn, pn);
+        }
+    }
+    ranges.push((hi, lo));
+    // First range covers [largest - first_ack_range, largest]; each
+    // additional (gap, length) pair continues downward with
+    // next_hi = prev_lo - gap - 2 and next_lo = next_hi - length —
+    // the exact inverse of `process_ack`'s range walk.
+    let first_ack_range = ranges[0].0 - ranges[0].1;
+    let mut additional: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    let mut prev_lo = ranges[0].1;
+    for &(hi, lo) in &ranges[1..] {
+        additional.push((prev_lo - hi - 2, hi - lo));
+        prev_lo = lo;
+    }
+    ack_wire(conn, largest, ack_delay, first_ack_range, &additional);
+}
+
+/// Event counts of one seeded run — compared verbatim by the determinism
+/// guard, and the substrate of the per-run property assertions.
+#[derive(Debug, PartialEq, Eq)]
+struct LossRunStats {
+    n_chunks: u64,
+    /// Data-packet transmissions: originals + retransmissions.
+    data_tx: u64,
+    /// PTO PING probes emitted by the real `send_pto_probe`.
+    probes: u64,
+    /// Transmissions the scripted peer dropped.
+    drops: u64,
+    /// ACK frames processed (wire round-trip).
+    acks: u64,
+    rounds: u64,
+    /// Virtual µs from epoch to completion.
+    virtual_us: u64,
+}
+
+/// One seeded run of the loss-schedule simulation. The scripted parts are
+/// ONLY the peer's per-transmission drop/deliver decision and the re-send
+/// pump (which mirrors `encode_one_rtt_packet`'s retx drain: pop front,
+/// `retx_bytes`↓, stage as `pending_sent_stream_frames`, record). Loss
+/// detection, RTT estimation, PTO arming/backoff/persistent-congestion,
+/// cwnd updates, and retx bookkeeping are all the real code, driven via
+/// `record_sent_packet`, `ack_wire`→`process_ack` (which runs
+/// `detect_loss`), `pto_deadline_us`, and `send_pto_probe`.
+///
+/// Per-transmission loss schedule with a termination cap: a chunk's 4th
+/// transmission is always delivered (≤ 3 drops per chunk), and a 4th
+/// consecutive PTO probe is always delivered — so every run completes and
+/// the transmission bound below is sound.
+fn run_loss_schedule(seed: u64, loss_permille: u64) -> LossRunStats {
+    use net_cc::CongestionControl;
+    let ctx = move || alloc::format!("seed={seed}/loss={loss_permille}‰");
+
+    const EPOCH_US: u64 = 10_000_000;
+    /// One simulation round = one RTT: transmit at T, peer receives at
+    /// ~T+RTT/2, the cumulative ACK lands at T+RTT.
+    const ROUND_US: u64 = 50_000;
+    /// Bytes per data packet — large enough relative to the ~13.5 KB
+    /// initial window that the cwnd gate actually binds mid-flow.
+    const CHUNK: u32 = 1_000;
+    /// Max fresh data packets entered per round (a cwnd-ish burst).
+    const BURST: usize = 10;
+    /// Peer's reported ack_delay, raw wire units (default exponent 3
+    /// → 8 µs units): 125 = 1 ms, comfortably under max_ack_delay.
+    const ACK_DELAY_RAW: u64 = 125;
+
+    let mut rng = SplitMix64(seed ^ (loss_permille << 32));
+    crate::time::mock::set(EPOCH_US);
+    let mut conn = Connection::new_server(ConnectionId::new(&[0x7a; 8]), [0x5au8; 32]);
+    // 1-RTT send keys so the real PTO probe path can emit its PING.
+    let secrets = derive_initial_secrets(&[0xee; 8]);
+    conn.application_send = Some(Box::new(super::keys::DirKeys::from_aes128(
+        &derive_initial_keys(&secrets.server),
+    )));
+
+    let n_chunks = 30 + (rng.next_u64() % 31); // 30..=60, varies by seed
+    let mut stats = LossRunStats {
+        n_chunks,
+        data_tx: 0,
+        probes: 0,
+        drops: 0,
+        acks: 0,
+        rounds: 0,
+        virtual_us: 0,
+    };
+
+    // pn → the chunk offset it carries (None for the priming packet and
+    // PTO PINGs). Offsets identify chunks across retransmissions.
+    let mut pn_chunk: alloc::collections::BTreeMap<u64, Option<u64>> =
+        alloc::collections::BTreeMap::new();
+    // Per-chunk transmission count — drives the 4th-transmission cap.
+    let mut tx_count: alloc::collections::BTreeMap<u64, u64> =
+        alloc::collections::BTreeMap::new();
+    // The scripted peer's cumulative receive set + which chunks landed.
+    let mut delivered_pns: alloc::collections::BTreeSet<u64> =
+        alloc::collections::BTreeSet::new();
+    let mut delivered_chunks: alloc::collections::BTreeSet<u64> =
+        alloc::collections::BTreeSet::new();
+    // Receipts the peer hasn't acked yet (an ACK fires the round after).
+    let mut peer_has_unacked = false;
+    let mut consecutive_probe_drops: u64 = 0;
+
+    // RTT priming, the way the time-threshold tests do it: an
+    // ack-eliciting packet at T, acked at T+50 ms → SRTT = 50 ms, so the
+    // RFC 9002 §6.1.2 time threshold (9/8·max_rtt + 25 ms
+    // peer_max_ack_delay = 81.25 ms) is defined for the whole run.
+    let prime_pn = conn.application_space.next_send_pn;
+    conn.application_space.next_send_pn += 1;
+    conn.record_sent_packet(crate::CryptoLevel::OneRtt, prime_pn, true, 100);
+    pn_chunk.insert(prime_pn, None);
+    crate::time::mock::advance(ROUND_US);
+    ack_single(&mut conn, prime_pn);
+    delivered_pns.insert(prime_pn);
+    assert_eq!(conn.smoothed_rtt_us, Some(ROUND_US), "{}: RTT primed", ctx());
+
+    let mut next_fresh: u64 = 0; // next chunk index to enter the flow
+    loop {
+        stats.rounds += 1;
+        assert!(
+            stats.rounds < 10_000,
+            "{}: livelock — {} rounds without completing",
+            ctx(),
+            stats.rounds
+        );
+
+        // --- Transmit phase (at time T) ---------------------------------
+        let mut sent_this_round: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        // (a) Scripted re-send pump — mirrors the encoder's retx drain
+        // (one lost range per packet): the DETECTION that put these
+        // ranges here was the real `detect_loss`.
+        while let Some(rtx) = conn.retx_queue.pop_front() {
+            conn.retx_bytes = conn.retx_bytes.saturating_sub(rtx.data.len() as u32);
+            let off = rtx.offset;
+            conn.pending_sent_stream_frames = alloc::vec![rtx];
+            let pn = conn.application_space.next_send_pn;
+            conn.application_space.next_send_pn += 1;
+            conn.record_sent_packet(crate::CryptoLevel::OneRtt, pn, true, CHUNK);
+            pn_chunk.insert(pn, Some(off));
+            sent_this_round.push(pn);
+            stats.data_tx += 1;
+        }
+        // (b) Fresh data, gated by the REAL cwnd predicate the encoder
+        // uses (in-flight + retx backlog vs window).
+        let mut fresh_this_round = 0usize;
+        while next_fresh < n_chunks
+            && fresh_this_round < BURST
+            && conn
+                .cc
+                .can_send(conn.bytes_in_flight + conn.retx_bytes, CHUNK)
+        {
+            let off = next_fresh * CHUNK as u64;
+            conn.pending_sent_stream_frames = alloc::vec![super::StreamRetx {
+                sid: 0,
+                offset: off,
+                fin: false,
+                data: iobuf::IOBuf::from(alloc::vec![0xC5u8; CHUNK as usize]),
+            }];
+            let pn = conn.application_space.next_send_pn;
+            conn.application_space.next_send_pn += 1;
+            conn.record_sent_packet(crate::CryptoLevel::OneRtt, pn, true, CHUNK);
+            pn_chunk.insert(pn, Some(off));
+            sent_this_round.push(pn);
+            next_fresh += 1;
+            fresh_this_round += 1;
+            stats.data_tx += 1;
+        }
+
+        // --- Scripted peer: per-TRANSMISSION drop/deliver decision ------
+        // (so retransmissions can be re-dropped), with the 4th
+        // transmission of any chunk forced through.
+        for &pn in &sent_this_round {
+            let off = pn_chunk[&pn].expect("data packets carry a chunk");
+            let txc = tx_count.entry(off).or_insert(0);
+            *txc += 1;
+            let forced = *txc >= 4;
+            if !forced && rng.permille() < loss_permille {
+                stats.drops += 1;
+            } else {
+                delivered_pns.insert(pn);
+                delivered_chunks.insert(off);
+                peer_has_unacked = true;
+            }
+        }
+
+        // --- One RTT elapses; the cumulative ACK (if owed) lands --------
+        crate::time::mock::advance(ROUND_US);
+        if peer_has_unacked {
+            ack_received_set(&mut conn, &delivered_pns, ACK_DELAY_RAW);
+            peer_has_unacked = false;
+            stats.acks += 1;
+        }
+
+        // --- PTO: the real deadline arithmetic + probe entry point ------
+        // Checked every round-end against the virtual clock, exactly as
+        // the endpoint races its sleep against `pto_deadline_us`.
+        if let Some(deadline) = conn.pto_deadline_us()
+            && crate::time::now_us() >= deadline
+        {
+            assert!(conn.send_pto_probe(), "{}: probe must emit", ctx());
+            stats.probes += 1;
+            let probe_pn = conn.application_space.next_send_pn - 1;
+            pn_chunk.insert(probe_pn, None);
+            // Drain the probe datagram the real path queued.
+            conn.pop_packet_owned()
+                .expect("PTO probe queued a datagram");
+            // Probes ride the same loss schedule; a 4th consecutive
+            // probe is forced through so stalls always break.
+            let forced = consecutive_probe_drops >= 3;
+            if !forced && rng.permille() < loss_permille {
+                stats.drops += 1;
+                consecutive_probe_drops += 1;
+            } else {
+                delivered_pns.insert(probe_pn);
+                peer_has_unacked = true;
+                consecutive_probe_drops = 0;
+            }
+        }
+
+        // Property (d), checked CONTINUOUSLY: whatever the loss schedule
+        // does (incl. persistent-congestion collapse via `cc.on_rto`),
+        // the window never drops below the RFC 9002 §7.2 floor.
+        assert!(
+            conn.cc.window() >= net_cc::minimum_window(super::MAX_QUIC_DATAGRAM as u32),
+            "{}: cwnd {} collapsed below the minimum window",
+            ctx(),
+            conn.cc.window()
+        );
+
+        // --- Completion --------------------------------------------------
+        if next_fresh == n_chunks
+            && conn.application_space.sent_packets.is_empty()
+            && conn.retx_queue.is_empty()
+            && !peer_has_unacked
+        {
+            break;
+        }
+    }
+    stats.virtual_us = crate::time::now_us() - EPOCH_US;
+
+    // Property (a): eventual completion — every chunk delivered, nothing
+    // still tracked as in flight or awaiting retransmission.
+    assert_eq!(
+        delivered_chunks.len() as u64,
+        n_chunks,
+        "{}: all chunks must eventually be delivered",
+        ctx()
+    );
+    assert_eq!(conn.bytes_in_flight, 0, "{}: flight fully released", ctx());
+    assert_eq!(conn.retx_bytes, 0, "{}: no retx backlog left", ctx());
+
+    // Property (b): no retransmit storm. Sound bound from the loss cap:
+    // each chunk is dropped ≤ 3 times then forced through, and a chunk is
+    // only ever re-queued by `detect_loss` after a genuinely dropped
+    // transmission (the lockstep ACK model leaves no room for spurious
+    // loss) — so transmissions per chunk ≤ 4, total ≤ 4·N. Probes are
+    // bounded separately: stalls need peer silence across a full PTO, so
+    // their count stays far below the flow size.
+    assert!(
+        stats.data_tx <= 4 * n_chunks,
+        "{}: retransmit storm — {} data transmissions for {} chunks",
+        ctx(),
+        stats.data_tx,
+        n_chunks
+    );
+    assert!(
+        stats.probes <= n_chunks,
+        "{}: probe storm — {} PTO probes for {} chunks",
+        ctx(),
+        stats.probes,
+        n_chunks
+    );
+
+    // Property (c): bounded virtual time — no livelock; recovery converges
+    // well inside a generous budget (PTO backoff is capped by the
+    // forced-delivery rule, so tails are short).
+    assert!(
+        stats.virtual_us <= 60_000_000,
+        "{}: run took {} virtual µs (> 60 s budget)",
+        ctx(),
+        stats.virtual_us
+    );
+
+    stats
+}
+
+/// The seeded loss-schedule property suite: 100 seeds × two loss rates
+/// (10 % ≈ heavy WAN loss, 35 % ≈ pathological) over 30-60-packet flows.
+/// Each run drives the full real recovery loop — send-record, multi-range
+/// wire ACKs, packet- and time-threshold loss, PTO backoff + persistent
+/// congestion, retx re-queue — and asserts completion, the ≤4·N
+/// transmission bound, the virtual-time budget, and the cwnd floor. A
+/// failure names its `seed`/`loss` — replay with
+/// `run_loss_schedule(seed, loss)` for the identical event sequence.
+#[test]
+fn seeded_loss_schedule_property_suite() {
+    for &loss_permille in &[100u64, 350] {
+        let (mut chunks, mut tx, mut drops, mut probes) = (0u64, 0u64, 0u64, 0u64);
+        for seed in 1..=100u64 {
+            let s = run_loss_schedule(seed, loss_permille);
+            chunks += s.n_chunks;
+            tx += s.data_tx;
+            drops += s.drops;
+            probes += s.probes;
+        }
+        // Non-vacuousness (deterministic — the PRNG fixes these): the
+        // batch must actually exercise drops, retransmissions, and the
+        // PTO path, or the per-run properties prove nothing. Measured at
+        // landing: 10 % → 5084 tx / 560 drops, 35 % → 6618 tx / 2341
+        // drops, max tx/N ratio 1.77 (vs the 4.0 bound), worst run
+        // 4.15 virtual s (vs the 60 s budget).
+        assert!(drops > 0, "loss {loss_permille}‰: schedule dropped nothing");
+        assert!(tx > chunks, "loss {loss_permille}‰: no retransmissions exercised");
+        assert!(probes > 0, "loss {loss_permille}‰: PTO path never exercised");
+    }
+}
+
+/// Determinism guard: the same seed replays the IDENTICAL event sequence
+/// — transmission, drop, probe, ACK, round, and virtual-time counts all
+/// equal across two runs. This is what makes a property-suite failure
+/// reproducible from the seed in its message.
+#[test]
+fn seeded_loss_schedule_is_deterministic() {
+    let first = run_loss_schedule(7, 350);
+    let second = run_loss_schedule(7, 350);
+    assert_eq!(
+        first, second,
+        "same seed must produce identical transmission/loss/ack counts"
+    );
 }
