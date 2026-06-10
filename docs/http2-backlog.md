@@ -141,15 +141,19 @@ landed this session; the rate-limit-flood guard is still open.
   rejected (only CONTINUATION on the same stream may follow a HEADERS
   without END_HEADERS), and the "CONTINUATION flood" (CVE-2024-27316) is
   bounded by `HEADER_BLOCK_CAP` (64 KiB) on the accumulated block.
-- **H2-6 — Full SETTINGS surface.** *Partial.* We honor peer
-  `INITIAL_WINDOW_SIZE` (for new streams), `MAX_FRAME_SIZE` (caps DATA we
-  emit), and validate `ENABLE_PUSH`/`MAX_FRAME_SIZE` ranges. **Still open:**
-  applying a mid-connection `INITIAL_WINDOW_SIZE` change **retroactively**
-  to already-open streams' send windows (RFC 7540 §6.9.2 — the tricky
-  one; peers send it before opening streams in practice, so it's low-risk
-  but non-conformant). `HEADER_TABLE_SIZE`/`MAX_HEADER_LIST_SIZE` from the
-  peer bound *our* encoder, which uses no dynamic table and emits tiny
-  header blocks, so nothing to honor there.
+- [x] **H2-6 — Full SETTINGS surface.** We honor peer
+  `INITIAL_WINDOW_SIZE`, `MAX_FRAME_SIZE` (caps DATA we emit), and validate
+  `ENABLE_PUSH`/`MAX_FRAME_SIZE` ranges. A mid-connection
+  `INITIAL_WINDOW_SIZE` change is now applied **retroactively** to every
+  open stream's send window (RFC 7540 §6.9.2) across both emission paths
+  (`out_queue` buffered + `streams` streaming) — the delta may drive a
+  spent window negative, and an overflow past 2^31−1 is a connection
+  `FLOW_CONTROL_ERROR`. Unit-tested
+  (`initial_window_size_change_shifts_open_streams`,
+  `initial_window_size_overflow_is_flow_control_error`).
+  `HEADER_TABLE_SIZE`/`MAX_HEADER_LIST_SIZE` from the peer bound *our*
+  encoder, which uses no dynamic table and emits tiny header blocks, so
+  nothing to honor there.
 - [x] **H2-7 — HPACK dynamic-table eviction.** Entry overhead = 32 B/entry
   (RFC 7541 §4.1), eviction on insert and on size-update, table-clear when
   a single entry exceeds the max — implemented + unit-tested.

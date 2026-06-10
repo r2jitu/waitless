@@ -1144,10 +1144,31 @@ fn apply_setting(conn: &mut H2Conn, id: u16, val: u32) -> Result<(), u32> {
             if val > 0x7fff_ffff {
                 return Err(error::FLOW_CONTROL_ERROR);
             }
-            // Retroactive adjustment of open streams' windows (RFC 7540
-            // §6.9.2) is a tracked tail item (H2-6); peers send this
-            // before opening streams in practice.
-            conn.peer_initial_window = val as i64;
+            // RFC 7540 §6.9.2: a mid-connection INITIAL_WINDOW_SIZE change
+            // retroactively shifts every open stream's send window by the
+            // delta (new − old). The window may legitimately go negative —
+            // the stream just can't send until WINDOW_UPDATEs lift it back
+            // positive — but a shift that pushes any window past 2^31−1 is
+            // a connection-level FLOW_CONTROL_ERROR. Apply to both
+            // emission paths: buffered responses (`out_queue`) and
+            // streaming responses (`streams`).
+            let new_iw = val as i64;
+            let delta = new_iw - conn.peer_initial_window;
+            if delta != 0 {
+                for out in &mut conn.out_queue {
+                    out.send_window += delta;
+                    if out.send_window > 0x7fff_ffff {
+                        return Err(error::FLOW_CONTROL_ERROR);
+                    }
+                }
+                for slot in &mut conn.streams {
+                    slot.send_window += delta;
+                    if slot.send_window > 0x7fff_ffff {
+                        return Err(error::FLOW_CONTROL_ERROR);
+                    }
+                }
+            }
+            conn.peer_initial_window = new_iw;
         }
         settings_id::MAX_FRAME_SIZE => {
             // Valid range 2^14..=2^24-1 (RFC 7540 §6.5.2).
@@ -2098,6 +2119,73 @@ mod tests {
         assert_eq!(fr.len(), 1);
         assert_eq!(fr[0].0, ftype::RST_STREAM);
         assert!(conn.streams.is_empty(), "reset stream retired");
+    }
+
+    // ── H2-6 retroactive INITIAL_WINDOW_SIZE (RFC 7540 §6.9.2) ────────
+
+    /// A mid-connection INITIAL_WINDOW_SIZE change shifts every open
+    /// stream's send window by the delta — across both the buffered
+    /// (`out_queue`) and streaming (`streams`) emission paths — and a
+    /// shrink may drive a partially-spent window negative.
+    #[test]
+    fn initial_window_size_change_shifts_open_streams() {
+        let mut conn = H2Conn::new();
+        conn.out_queue.push_back(StreamOut {
+            id: 1,
+            header_block: alloc::vec![0xAB],
+            headers_sent: false,
+            cur: None,
+            cur_off: 0,
+            body: IOBufChain::new(),
+            body_remaining: 0,
+            // As if 5 000 bytes were already sent on this stream.
+            send_window: INITIAL_WINDOW - 5_000,
+            zero_copy: false,
+        });
+        conn.streams
+            .push(streaming_slot(head_block(), &[], false, INITIAL_WINDOW));
+
+        // Grow the initial window by 1 000 → both windows shift up.
+        apply_setting(
+            &mut conn,
+            settings_id::INITIAL_WINDOW_SIZE,
+            INITIAL_WINDOW as u32 + 1_000,
+        )
+        .unwrap();
+        assert_eq!(conn.out_queue[0].send_window, INITIAL_WINDOW - 5_000 + 1_000);
+        assert_eq!(conn.streams[0].send_window, INITIAL_WINDOW + 1_000);
+        assert_eq!(conn.peer_initial_window, INITIAL_WINDOW + 1_000);
+
+        // Shrink the initial window to 0 → delta −(INITIAL_WINDOW+1000);
+        // the partially-spent buffered window goes negative (allowed).
+        apply_setting(&mut conn, settings_id::INITIAL_WINDOW_SIZE, 0).unwrap();
+        assert_eq!(
+            conn.out_queue[0].send_window, -5_000,
+            "a shrink may drive a spent window negative (RFC 7540 §6.9.2)",
+        );
+        assert_eq!(conn.streams[0].send_window, 0);
+    }
+
+    /// A change that pushes an open stream's send window past 2^31−1 is
+    /// a connection-level FLOW_CONTROL_ERROR (RFC 7540 §6.9.2).
+    #[test]
+    fn initial_window_size_overflow_is_flow_control_error() {
+        let mut conn = H2Conn::new();
+        conn.out_queue.push_back(StreamOut {
+            id: 1,
+            header_block: alloc::vec![0xAB],
+            headers_sent: false,
+            cur: None,
+            cur_off: 0,
+            body: IOBufChain::new(),
+            body_remaining: 0,
+            // Already at the maximum; any positive delta overflows.
+            send_window: 0x7fff_ffff,
+            zero_copy: false,
+        });
+        let err = apply_setting(&mut conn, settings_id::INITIAL_WINDOW_SIZE, 0x7fff_ffff)
+            .expect_err("overflow past 2^31-1 must error");
+        assert_eq!(err, error::FLOW_CONTROL_ERROR);
     }
 
     // ── H2-3 control-flood guard ──────────────────────────────────
