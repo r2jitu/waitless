@@ -397,7 +397,7 @@ and `W_max` at `t = K`, β = 0.7, reduce-once, time-based growth).
 
 **GCE/`tc netem` A/B ran (2026-06-09) — Reno stays default.** Both arms
 built from the same tree (const-flipped), deployed to a c3 GCE VM, measured
-with `scripts/netem-cc-*.sh` (IFB-ingress netem on the loadgen so loss hits
+with `scripts/netem-cc.sh` (IFB-ingress netem on the loadgen so loss hits
 the *server→client data* path → the server's controller is under test),
 15 single-`/static-1m` trials per profile so the median rejects the
 tail-loss outliers (see L4):

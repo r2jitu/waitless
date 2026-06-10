@@ -1030,12 +1030,7 @@ impl TcpConnection {
     pub(crate) fn arm_rtx(&mut self) {
         let now = kernel_core::clock::now_ms();
         self.rtx_deadline_ms = now + self.rto_ms as u64;
-        let pto = self.pto_ms();
-        self.tlp_deadline_ms = if pto != 0 && self.tlp_count < TLP_MAX_PROBES {
-            now + pto as u64
-        } else {
-            0
-        };
+        self.arm_tlp(now);
         self.arm_for_tick();
     }
 
@@ -1049,6 +1044,20 @@ impl TcpConnection {
         }
         let pto = self.srtt_ms.saturating_mul(2).max(TLP_MIN_MS);
         if pto >= self.rto_ms { 0 } else { pto }
+    }
+
+    /// Arm (or, when ineligible, disarm) the Tail Loss Probe deadline at the
+    /// PTO ahead of `now`. Ineligible = no RTT sample yet, PTO ≥ RTO, or the
+    /// per-tail probe budget (`TLP_MAX_PROBES`) is spent — in each of which
+    /// the RTO is the backstop. Does not touch the tick list; callers pair it
+    /// with `arm_for_tick`.
+    fn arm_tlp(&mut self, now: u64) {
+        let pto = self.pto_ms();
+        self.tlp_deadline_ms = if pto != 0 && self.tlp_count < TLP_MAX_PROBES {
+            now + pto as u64
+        } else {
+            0
+        };
     }
 
     /// Fire a Tail Loss Probe (RFC 8985 §7.3). Retransmits the oldest
@@ -1068,14 +1077,10 @@ impl TcpConnection {
         self.tlp_count = self.tlp_count.saturating_add(1);
         crate::diag::COUNTERS.tlp_probes.bump();
         self.emit_rtx_entry(0);
-        // Re-arm for a second probe if budget remains; otherwise disarm and
-        // let the (still-armed) RTO be the next, congestion-aware, event.
-        let pto = self.pto_ms();
-        self.tlp_deadline_ms = if pto != 0 && self.tlp_count < TLP_MAX_PROBES {
-            now + pto as u64
-        } else {
-            0
-        };
+        // Re-arm for a second probe if budget remains; otherwise `arm_tlp`
+        // disarms and the (still-armed) RTO becomes the next, congestion-
+        // aware, event.
+        self.arm_tlp(now);
         self.arm_for_tick();
     }
 
