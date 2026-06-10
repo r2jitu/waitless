@@ -8,6 +8,10 @@ and the performance features Linux's kernel TCP has that ours doesn't
 coverage) and the conformance-testing strategy + QUIC roadmap live in
 [`conformance-roadmap.md`](conformance-roadmap.md); this is the work queue.
 
+Finished items are collapsed to one-line ledger entries with their commit
+ref — the implementation narrative lives in git log. Only the *open* work
+and any deliberate-deferral rationale is carried in full below.
+
 ## Current state
 
 The TCP stack (`crates/net/tcp/`) is a **server-role** implementation:
@@ -68,214 +72,70 @@ Effort: **S** ≈ hours, **M** ≈ a few days, **L** ≈ a week+.
 
 ## P0 — correctness bugs reachable in normal operation
 
-### T1 — The ACK field is not validated against the send window — ✅ done
+### T1 — ACK field validated against the send window — ✅ done (main)
 
-**Status.** Done and merged to main — `tcp_receive` now applies the
-RFC 9293 §3.10.7.4 acceptability rule. Kept here for the record; the
-rest of the entry describes the gap that was closed.
+RFC 9293 §3.10.7.4 acceptability rule enforced in `tcp_receive`'s ACK
+branch. Security rationale: an old/reordered or forged ACK previously
+drove `snd_una` backwards and flushed the retransmit ring (RFC 5961 §5
+blind-injection territory) — do not regress the `SND.UNA < SEG.ACK <=
+SND.NXT` guard.
 
-**What.** `tcp_receive`'s generic ACK branch did `c.snd_una = ack`
-unconditionally. There was no `SND.UNA < SEG.ACK <= SND.NXT` check.
+### T2 — MSS option honored from SYN + SYN-ACK advertise + PMTUD — ✅ done (`74e53e1`, `be7ad67`)
 
-**RFC.** RFC 9293 §3.10.7.4: an ACK above `SND.NXT` MUST be answered
-with an ACK and the segment dropped; an ACK at or below `SND.UNA` is
-ignored.
+Parse the peer SYN's MSS → `snd_mss = min(local, peer).max(536)` at every
+segmentation site; advertise our own MSS in the SYN-ACK; decode ICMP
+PTB/Frag-Needed (RFC 1191 / 8201) and lower `snd_mss` with RFC 5927
+anti-spoof. Fixed a live 5G/NAT64 cert-flight blackhole.
 
-**Triggers when.** A plain **reordered or duplicated old ACK** —
-common on real paths — has `ack < snd_una`, so it drives `snd_una`
-*backwards*; `rtx_on_ack` then computes a wrapped, huge `acked`,
-flushes the whole retransmit ring, and desyncs the connection. A
-forged ACK from an off-path attacker who guessed the 4-tuple does the
-same on purpose (RFC 5961 §5 territory).
-
-**Fix.** In the ACK branch, before touching `snd_una`: ignore
-`SEG.ACK <= SND.UNA`; for `SEG.ACK > SND.NXT` send a bare ACK and drop;
-otherwise accept. **Effort: S.**
-
-**Test.** Harness scenario: deliver an old ACK (`ack < snd_una`) and a
-future ACK (`ack > snd_nxt`); assert `snd_una` is unchanged and the
-retransmit ring is intact, and that the future ACK elicits a bare ACK.
-
-### T2 — MSS option + PMTUD ✅ done (only minor PMTUD slivers remain)
-
-> **Status (2026-06-09):** the receive half is ✅ done (`74e53e1`): the
-> SYN's MSS option is parsed (`parse_syn_options`) and the negotiated
-> `snd_mss = min(local, peer).max(536)` drives every segmentation site
-> including retransmit re-segmentation. It fixed a live production
-> failure — a 5G/NAT64 path MSS-clamped the SYN to ~1220, our 1460-byte
-> TLS cert flight was silently dropped, and cold (incognito) h2 loads
-> stalled deterministically.
->
-> **SYN-ACK MSS advertise ✅ done** — we emit our own MSS option in the
-> SYN-ACK (test `synack_advertises_our_mss`), so peers no longer assume 536
-> toward us.
->
-> **PMTUD ✅ done (`be7ad67`)** — the mid-path half. We decode ICMPv4
-> Destination-Unreachable/Fragmentation-Needed (RFC 1191) and ICMPv6
-> Packet-Too-Big (RFC 8201) in the RX dispatch, and `tcp::note_path_mtu`
-> lowers the flow's `snd_mss` to fit the next-hop MTU. RFC 5927 anti-spoof:
-> the quoted seq must be in the live send window, the result is floored at
-> the IP minimum and only ever lowers. /obs `pmtu_applied`/`pmtu_dropped`.
->
-> **PMTUD remaining slivers** (both minor): (1) the update applies on the
-> *receiving* core only — an ICMP error RSS-hashes by its own header, so on
-> a multi-queue NIC it's often delivered to a core that doesn't own the flow
-> and dropped (`pmtu_dropped`); routing it to the owning core is a follow-up.
-> (2) `note_path_mtu` lowers `snd_mss` but does **not** immediately re-send
-> the already-in-flight oversized segment that triggered the ICMP — it waits
-> for the RTO/TLP to re-segment at the new MSS (one recovery cycle of delay
-> per MTU drop).
-
-
-**What.** The SYN handler never parses the peer's `MSS` option and
-`send_segment` never emits one (`data_offset` is hardcoded to a
-20-byte header). The send MSS is the constant `MSS_V4`/`MSS_V6`
-(1460/1440). There is no Path MTU Discovery.
-
-**RFC.** RFC 9293 §3.7.1: a TCP SHOULD send the MSS option, and MUST
-assume the 536 (IPv4) / 1220 (IPv6) default when it receives none.
-
-**Triggers when.** Any path with an MTU below 1500 — tunnels, PPPoE,
-some VPNs, IPv6's 1280-byte minimum. Our 1460-byte segments are then
-dropped or fragmented, and with no PMTUD the connection **blackholes**
-for any multi-segment response. A one-segment `/health` reply
-survives; a real page does not.
-
-**Fix (cheap 80%).** Parse the inbound SYN's MSS option and clamp the
-per-conn send MSS to it; emit our own MSS option in the SYN-ACK. Needs
-a small TCP-options parse/emit path (none exists today). Full PMTUD
-(RFC 8201 / RFC 1191, or PLPMTUD RFC 8899) is a larger follow-up; the
-MSS clamp removes the common-case blackhole. **Effort: M.**
-
-**Test.** Scenario: SYN carrying `MSS=1300`; assert the SYN-ACK echoes
-an MSS option and that subsequent data segments are ≤ 1300 bytes.
+**Open (PMTUD slivers, both minor):**
+1. The MTU update applies on the *receiving* core only — an ICMP error
+   RSS-hashes by its own header, so on a multi-queue NIC it's often
+   delivered to a core that doesn't own the flow and dropped
+   (`pmtu_dropped`); routing it to the owning core is a follow-up.
+2. `note_path_mtu` lowers `snd_mss` but does **not** immediately re-send
+   the already-in-flight oversized segment that triggered the ICMP — it
+   waits for the RTO/TLP to re-segment at the new MSS (one recovery cycle
+   of delay per MTU drop).
 
 ---
 
 ## P1 — real impact under loss or hostile traffic
 
-### T3 — No out-of-order reassembly queue ✅ done
+### T3 — Out-of-order reassembly queue — ✅ done
 
-**Status.** Fixed. A bounded per-conn `OooQueue` (`state.rs`,
-`OOO_MAX_SEGS = 32`, `OOO_MAX_BYTES = 16 KiB = one window) buffers a
-segment with a gap before it (`seq > rcv_nxt`) instead of dropping it,
-and `drain_ooo` releases the contiguous prefix into `rx_ring` the
-moment the gap fills — advancing `rcv_nxt` so the cumulative ACK covers
-the reassembled run. An out-of-order arrival now elicits an immediate
-duplicate ACK (RFC 5681 §4.2). Overlapping / out-of-window / over-cap
-segments are dropped (the peer retransmits), keeping the queue sorted
-and non-overlapping by construction. `/obs` exposes `ooo_queued`.
-Covered by `out_of_order_segment_is_reassembled`,
-`multiple_out_of_order_segments_reassemble_in_order`,
-`gap_fill_overlapping_buffered_segment_delivers_tail`, and
-`ooo_queue_rejects_overlap_and_enforces_bounds`. This unblocks SACK
-(T7) and the ACK-out-of-window classification (T8). **GCE/netem
-loss-path throughput validation still pending** (the win is invisible
-on a clean LAN; correctness is unit-pinned).
+Bounded per-conn `OooQueue` (`state.rs`, 32 segs / 16 KiB) buffers gapped
+segments and `drain_ooo` releases the contiguous prefix as the gap fills;
+an OOO arrival elicits an immediate dup-ACK (RFC 5681 §4.2). Unblocked
+SACK (T7) and the in-window classification (T8).
 
-**What (original).** A data segment with a gap before it
-(`seq > rcv_nxt`) is dropped, not buffered.
+**Open:** GCE/netem loss-path *throughput* validation still pending (the
+win is invisible on a clean LAN; correctness is unit-pinned).
 
-**RFC.** RFC 9293 permits dropping out-of-order segments but
-recommends queuing them; every modern stack does.
+### T4 — SYN on a synchronized connection — ✅ done
 
-**Triggers when.** Any packet loss or reordering. One lost segment
-makes the receiver discard *every* later segment in the same window;
-the sender must RTO-retransmit and re-send the whole tail. Throughput
-collapses toward one segment per RTT on a lossy WAN. Invisible on a
-clean LAN / datacenter path.
+SYN matching an `Established` 4-tuple now sends a (rate-limited) RFC 5961
+§4 challenge ACK and drops the SYN, leaving the live TCB intact — no
+second TCB, no orphaned slot leak.
 
-**Fix.** A per-conn out-of-order segment queue, drained into `rx_ring`
-as the gap fills. This is the prerequisite for SACK (T7). **Effort: L.**
+### T5 — RFC 5961 challenge ACKs + rate limiting — ✅ done (§7 rate limit + §4/§3.10.7.4 routed)
 
-**Test.** Deliver segments out of order; assert all bytes are
-ultimately delivered in sequence and the gap-filling segment releases
-the queued tail.
+Per-core token-bucket challenge-ACK rate limit (RFC 5961 §7) gating the
+SYN-on-`Established` (§4) and out-of-window-ACK (§3.10.7.4) paths via
+`send_challenge_ack`.
 
-### T4 — A SYN on a synchronized connection corrupts the pool ✅ done
-
-**Status.** Fixed. The SYN handler now probes the 4-tuple hash once; a
-SYN matching an `Established` TCB sends a (rate-limited) RFC 5961 §4
-challenge ACK and drops the SYN, leaving the live connection intact —
-no second TCB, no orphan. A legitimate restart answers the challenge
-with an RST (in-window → tears down → client re-SYNs). See
-`syn_on_established_conn_elicits_a_challenge_ack` in `tests.rs`.
-
-**What.** The SYN handler treats only non-`Established` slots as a
-"stale twin." A SYN arriving on a live `Established` 4-tuple leaves the
-old TCB intact *and* allocates a second TCB for the same 4-tuple; the
-hash insert then points at the new one and **orphans the live
-connection** (its slot leaks — the pool-exhaustion reclaim only scans
-closing states).
-
-**RFC.** RFC 9293 §3.10.7.4 (SYN in a synchronized state); RFC 5961
-§4 — a SYN in the window should elicit a challenge ACK, not a
-state change.
-
-**Triggers when.** A duplicate/retransmitted SYN, a NAT rebinding onto
-a live 4-tuple, or a blind-injection attempt.
-
-**Fix.** Detect a SYN whose 4-tuple matches an `Established` TCB;
-respond per RFC 5961 §4 (challenge ACK) rather than allocating a new
-TCB. Pairs naturally with T5. **Effort: S–M.**
-
-**Test.** Handshake to `Established`, deliver a fresh SYN on the same
-4-tuple; assert a single challenge ACK, no new TCB, the original
-connection still delivers data.
-
-### T5 — RFC 5961 §4/§5 challenge ACKs and rate limiting ✅ done (§7 rate limit + §4/§3.10.7.4 routed; §5-in-window deferred)
-
-**Status.** A per-core token-bucket challenge-ACK rate limit
-(`CHALLENGE_ACK_RATE`/`CHALLENGE_ACK_BURST`, RFC 5961 §7) now gates the
-two challenge-ACK triggers we emit: the SYN-on-`Established` path (§4,
-T4) and the RFC 9293 §3.10.7.4 out-of-window-ACK path. Both route
-through `send_challenge_ack`, counted via `challenge_ack_sent` /
-`challenge_ack_throttled` on `/obs`. See
-`challenge_acks_are_rate_limited` in `tests.rs`. **Deferred:** the §5
-in-window-but-off-`rcv_nxt` *data*-injection challenge (we still drop
-such data silently, which is safe, just not the proactive challenge) —
-folds into T3 out-of-order reassembly, which needs the in-window
-classification anyway.
-
-**What (original).** Only the §3.2 RST check is implemented. There is no
-challenge-ACK path for an in-window-but-not-exact SYN (§4) or for
-blind data injection (§5), and no challenge-ACK rate limit.
-
-**RFC.** RFC 5961 §4, §5.
-
-**Triggers when.** Off-path blind-injection attempts against a
-public-facing server. Lower urgency than T1–T4 (it is hardening, not
-an everyday-breakage bug), but it is the standard mitigation for a
-server on the open internet.
-
-**Fix.** Add the challenge-ACK responses and a per-core token-bucket
-rate limit. **Effort: M.**
-
-**Test.** Script in-window-but-off-`rcv_nxt` SYN / data; assert a
-challenge ACK and no state change; assert the rate limit caps the
-challenge-ACK rate.
+**Open (deferred):** the §5 in-window-but-off-`rcv_nxt` *data*-injection
+challenge — we still drop such data silently (safe, just not the proactive
+challenge). Folds into T3's in-window classification, so close it there.
 
 ---
 
 ## P2 — performance ceilings / feature breadth
 
-### T6 — Window scaling ✅ done; Timestamps + PAWS still pending (RFC 7323)
+### T6 — Window scaling — ✅ done (`bd89169`); Timestamps + PAWS still pending (RFC 7323)
 
-**Status — Window Scale: done and merged (`bd89169`).** `snd_wnd` is now
-`u32`; the peer's scale shift is parsed from its SYN (`parse_window_scale`,
-clamped at 14 per §2.3) and applied to every post-handshake window update;
-the SYN-ACK echoes a Window-Scale option only when the peer offered one,
-advertising `rcv_wscale = 0` (our 16 KiB RX ring needs no scaling, so our
-*own* receive window stays ≤ 64 KiB by design — a server mostly sends).
-Four `tcp_test` scenarios cover negotiation, the scaled update, the
-no-offer path, and the §2.3 clamp. **GCE-validated:** `ss` confirms
-`wscale:0,7` on the wire; a sustained 20 MB keep-alive transfer over
-`tc netem` ran **18.9 → 81.9 Mbps at 25 ms (4.3×)** and **9.5 → 46.2 Mbps
-at 50 ms (4.9×)**, with window-scaling-off sitting exactly on the
-64 KiB/RTT cap. (A *cold* single 1 MB transfer improved only ~12–28 % —
-slow-start/`cwnd` is the binding limit there, not `rwnd`; see *ABC* and
-*initial window* under Linux-parity. So window scaling is the lever for
-sustained / warm-connection transfers, not cold small ones.)
+Window Scale done & GCE-validated (`snd_wnd` is `u32`, peer scale parsed
+and applied, SYN-ACK echoes our `rcv_wscale = 0`); ~4.3–4.9× on sustained
+high-RTT keep-alive transfers.
 
 **Pending — Timestamps + PAWS.** No `Timestamps` option, so no RTTM
 sample per ACK and no Protect-Against-Wrapped-Sequences. Lower priority
@@ -293,44 +153,23 @@ TSecr into the RTT estimator, and add the PAWS drop check.
 **Test.** Assert Timestamps are echoed; a wrapped-sequence old segment is
 dropped by PAWS; the RTT estimator consumes TSecr.
 
-### T7 — SACK (RFC 2018) + RFC 6675 loss recovery ✅ done (correctness; netem throughput A/B pending)
+### T7 — SACK (RFC 2018) + RFC 6675 loss recovery — ✅ done (correctness)
 
-**Status — receiver-side (RFC 2018) done.** `SACK-Permitted` is now
-negotiated (parsed from the peer's SYN, echoed in the SYN-ACK only when
-offered; `TcpConnection::sack_ok`), and every ACK sent while the T3
-reassembly queue holds out-of-order data carries SACK blocks built from
-that queue (`OooQueue::sack_blocks`, up to 4 blocks, abutting segments
-coalesced) via a single `emit_ack` helper — so a peer **uploading** to
-us retransmits only the holes. Hot-path-neutral: no SACK option unless
-`sack_ok && !ooo.is_empty()`. Covered by
-`sack_permitted_negotiated_and_blocks_emitted` and
-`no_sack_when_peer_does_not_permit`.
+Receiver side: `SACK-Permitted` negotiated, ACKs carry SACK blocks built
+from the T3 OOO queue (hot-path-neutral — no option unless `sack_ok &&
+!ooo.is_empty()`). Sender side: parse peer SACK blocks, mark the
+retransmit queue, and on 3rd-dup-ACK fast retransmit fill every un-SACKed
+hole below the highest SACK in one pass; RTO clears the scoreboard
+(reneging safety).
 
-**Status — sender-side (RFC 6675) done (correctness).** We now parse
-the peer's SACK blocks off incoming ACKs (`parse_sack_blocks`), mark the
-covered retransmit-queue entries (`RtxEntry::sacked` / `apply_sack`),
-and on the 3rd-dup-ACK fast retransmit fill every un-SACKed hole below
-the highest SACK in one pass (`sack_retransmit_holes`) — skipping SACKed
-ranges and data above the highest SACK. RTO clears the scoreboard
-(reneging safety). Bounded by the window + gated on `sack_ok` &
-SACK-present, so the clean path is byte-identical. Deterministically
-unit-tested (`sack_fast_retransmit_fills_only_the_holes`). **GCE/netem
-multi-hole-loss THROUGHPUT A/B still pending** (correctness is unit-
-pinned, like T3).
+**Open:** GCE/netem multi-hole-loss *throughput* A/B still pending
+(correctness is unit-pinned, like T3).
 
-### T8 — An out-of-window segment should be ACKed, not dropped silently ✅ done
+### T8 — Out-of-window segment ACKed, not dropped silently — ✅ done
 
-**Status.** Done — fell out of the T3 change. The reassembly branch
-(`seq > rcv_nxt`) sends a bare ACK for *every* future data segment,
-whether it lands in the OOO queue or is too far ahead to buffer; a
-segment behind the window (`seq < rcv_nxt`) already drew a dup-ACK. So
-every data segment now produces an ACK and none is dropped silently.
-Pinned by `segment_beyond_window_is_acked_not_buffered` (100 KiB past
-`rcv_nxt` → one bare ACK at the real `rcv_nxt`, not buffered).
-
-**What (original).** A data segment ahead of the receive window is
-dropped with no response. RFC 9293 §3.10.7.4 step 1 calls for an ACK so
-the peer re-synchronizes promptly.
+Fell out of T3: the reassembly branch sends a bare ACK for every future
+data segment (queued or too-far-ahead); a behind-window segment already
+drew a dup-ACK. So every data segment now produces an ACK.
 
 ---
 
@@ -384,52 +223,15 @@ is wired into TCP yet. The plan lives in
 [`stack-architecture.md`](stack-architecture.md) → *Transport reliability
 — one congestion-control / loss-recovery / pacing core*.
 
-### L1 — CUBIC ✅ implemented + GCE-validated (Reno stays default — no win on this workload); BBR still open
+### L1 — CUBIC — ✅ done + GCE-validated (Reno stays default — no win on this workload); BBR still open
 
-**What (original).** Our controller was classic RFC 5681 Reno: slow start +
-AIMD (halve on loss, +1 MSS/RTT in avoidance). Linux defaults to **CUBIC**
-(cubic window growth — far more aggressive recovery on high-BDP paths) and
-ships **BBR** (model-based, rate/RTT estimation, loss-agnostic).
-
-**Status — CUBIC written once for both transports.** `net_cc::Cubic`
-implements RFC 8312 — the cubic window law `W_cubic(t) = C·(t−K)³ + W_max`
-(C = 0.4), the §4.2 TCP-friendly floor (never slower than Reno on a short
-RTT), and §4.6 fast convergence, all fixed-point integer math (ms time,
-byte windows; the cube root for K is the overflow-safe `icbrt_u128`). The
-`CongestionControl` trait gained a monotonic `now_ms` that only a
-time-based controller reads (NewReno ignores it → a Reno flow is
-byte-identical). A `Controller` enum selects NewReno or CUBIC; both TCP and
-QUIC hold it. **`DEFAULT_ALGORITHM = Reno`**. The numerics are
-deterministically unit-tested (the cubic curve hits `W_max·β` at the epoch
-and `W_max` at `t = K`, β = 0.7, reduce-once, time-based growth).
-
-**GCE/`tc netem` A/B ran (2026-06-09) — Reno stays default.** Both arms
-built from the same tree (const-flipped), deployed to a c3 GCE VM, measured
-with `scripts/netem-cc.sh` (IFB-ingress netem on the loadgen so loss hits
-the *server→client data* path → the server's controller is under test),
-15 single-`/static-1m` trials per profile so the median rejects the
-tail-loss outliers (see L4):
-
-| profile | arm | good-cluster (CC-bound) | median | stalls |
-|---|---|---|---|---|
-| 25 ms 1 % | Reno  | **2.573 MB/s** | 0.218 | 7/15 |
-| 25 ms 1 % | CUBIC | **2.567 MB/s** | 0.159 | 9/15 |
-| 50 ms 1 % | Reno  | **1.295 MB/s** | 0.142 | 10/15 |
-| 50 ms 1 % | CUBIC | **1.294 MB/s** | 0.114 | 11/15 |
-
-The CC-curve-bound "good cluster" is **byte-identical** between the two,
-and the median/stall spread is pure L4 tail-loss-RTO noise. Two reasons
-CUBIC can't pull ahead here: (1) a **1 MB object is too short to exercise
-the congestion-avoidance curve** — the transfer finishes within a few RTTs
-of the first loss, before CUBIC's cubic reopen diverges from Reno's linear
-reopen (CUBIC's edge needs sustained multi-MB / many-RTT flows); (2) on a
-lossy path the **binding limit is L4 tail-loss RTO recovery**, which is
-CC-algorithm-independent. So for *this* server's workload (HTTP
-request/response, objects ≤ 1 MB) CUBIC ≡ Reno, and the implementation is
-validated (no regression, behaves identically where expected) but **the
-default flip is not data-justified**. CUBIC stays available behind the
-selector; revisit if a bulk-transfer workload appears or after L4 lands
-(which would let the curves be measured without the RTO confound).
+`net_cc::Cubic` (RFC 8312, fixed-point) selectable behind the `Controller`
+enum, shared by TCP and QUIC. **`DEFAULT_ALGORITHM = Reno`** — the GCE/netem
+A/B showed CUBIC ≡ Reno on this workload (≤1 MB objects finish within a few
+RTTs of first loss, before CUBIC's curve diverges; the binding limit is L4
+tail-loss RTO, which is CC-independent), so the default flip is **not
+data-justified**. CUBIC stays available; revisit if a bulk-transfer workload
+appears or after L4 lets the curves be measured without the RTO confound.
 
 **Open — BBR.** Model-based (delivery-rate + min-RTT estimation,
 loss-agnostic). A larger, separate effort on the same trait seam.
@@ -437,39 +239,11 @@ loss-agnostic). A larger, separate effort on the same trait seam.
 
 ### L2 — Appropriate Byte Counting (ABC, RFC 3465) — ✅ done
 
-**Status — done and merged.** `cwnd_on_ack`'s slow-start branch now
-grows `cwnd` by the *bytes* the ACK acknowledged, capped at `L = 2·SMSS`
-per ACK (RFC 3465 §2.3), instead of the old flat `min(acked, SMSS)`.
-
-**What it fixed.** The old "count ACKs" rule grew `cwnd` by one SMSS per
-ACK; under the delayed-ACK receivers that dominate the internet (1 ACK
-per 2 segments) that is one SMSS per *two* segments → slow start grew
-~1.5×/RTT instead of the 2× it intends — the measured "~3× below
-textbook" on cold single-conn high-RTT downloads (the slow-start ramp,
-not `rwnd`, bounds those). Byte counting restores the full 2× regardless
-of how the receiver batches ACKs; the `2·SMSS` cap bounds the burst a
-stretch-/post-idle ACK can release (we don't pace — L3 — so this cap is
-the burst guard).
-
-**Test.** `slow_start_grows_cwnd_by_bytes_acked_abc` asserts a 2-segment
-ACK opens `cwnd` by 2·SMSS and a stretch-ACK is capped at 2·SMSS.
-Congestion avoidance is unchanged (still the RFC 5681 `SMSS²/cwnd`
-approximation — the byte-counting CA accumulator is a separate, lower-
-value follow-up; the cold-transfer gap is entirely slow start).
-
-**GCE-validated.** A controlled single-build-line A/B on e2-small (deploy
-ABC, measure; revert *only* the `min(2·SMSS)` → `min(SMSS)` line, redeploy,
-measure — same `tc netem` path, 12 cold fresh-connection trials, median):
-
-| RTT | object | ABC | baseline | gain |
-|---|---|--:|--:|:-:|
-| 25 ms | `/static-256k` | 8.16 | 6.77 Mbps | +20 % |
-| 25 ms | `/static-1m` | 20.29 | 15.50 Mbps | +31 % |
-| 50 ms | `/static-256k` | 4.14 | 3.45 Mbps | +20 % |
-| 50 ms | `/static-1m` | 10.67 | 7.91 Mbps | +35 % |
-
-Matches the ~28 % theory (≈7 vs ≈9 slow-start RTTs for 1 MB); the larger
-`/static-1m` gain confirms the ramp compounds over more RTTs.
+Slow start now grows `cwnd` by *bytes* acked, capped at `L = 2·SMSS` per
+ACK (RFC 3465 §2.3), restoring the full 2×/RTT ramp under delayed-ACK
+receivers; GCE-validated +20–35 % on cold high-RTT downloads. Congestion
+avoidance unchanged (byte-counting CA accumulator is a separate, lower-value
+follow-up — the cold-transfer gap is entirely slow start).
 
 ### L3 — No packet pacing
 
@@ -488,63 +262,15 @@ QUIC's token-bucket pacer (`crates/proto/quic/src/conn/tx.rs`, driving
 `net_cc`'s `pacing_rate()`) is the prior art to port. Pairs with BBR (L1).
 **Effort: M.**
 
-### L4 — TLP ✅ done + GCE-validated (the tail-loss-RTO fix); RACK time-detection ✅ done
+### L4 — TLP + RACK time-detection — ✅ done + GCE-validated (the tail-loss-RTO fix)
 
-**What (original).** We detected loss via 3 duplicate ACKs (fast
-retransmit) or the RTO only. SACK (T7) lands — block generation + RFC 6675
-sender-side hole-filling — but there was no **Tail Loss Probe** nor RACK
-time-based detection (RFC 8985, Linux's default since 4.18).
-
-**Why it mattered — GCE/netem profile (2026-06-09).** Single-`/static-1m`
-transfers under `tc netem` at 1 % loss were **bimodal**: a tight "good
-cluster" recovered via fast retransmit (~2.5 MB/s at 25 ms, ~1.3 MB/s at
-50 ms), but **7–11 of every 15 transfers hit a 9–18 s stall** (one RTO
-doubling out, `1+2+4+8 ≈ 15 s`) — tail losses / lost retransmissions where
-no later data ⇒ no dup-ACKs ⇒ no fast retransmit ⇒ a full backed-off RTO.
-The median collapsed to ~0.15 MB/s. **CC-algorithm-independent** (Reno and
-CUBIC measured identical — L1), so TLP, not CUBIC/BBR, was the lever.
-
-**Status — TLP ✅ done (`tcp` Tail Loss Probe).** A probe timer at
-`PTO = 2·SRTT` (floored `TLP_MIN_MS`, armed only when `PTO < RTO`) rides
-alongside the RTO whenever data is outstanding; on expiry — well before the
-RTO — it retransmits `snd_una` (the cumulative-ACK blocker) to elicit an
-ACK, recovering a single near-tail loss in ~one PTO and, against a SACKing
-peer, driving the T7 recovery. **Not** a congestion signal (cwnd untouched,
-no backoff, scoreboard kept); capped at `TLP_MAX_PROBES = 2` before the RTO
-takes over; RTO supersedes a coincident TLP. Hot-path-neutral (the final
-ACK disarms the probe before its PTO on a clean transfer). /obs `tlp_probes`;
-unit-test `tail_loss_probe_fires_before_rto_then_caps`.
-
-**GCE/netem A/B (same harness, before vs after):**
-
-| profile | metric | no TLP | with TLP |
-|---|---|---|---|
-| 25 ms 1 % | stalls (<0.2 MB/s) | 7/15 | **0/15** |
-| 25 ms 1 % | median | 0.218 | **0.841 MB/s (3.9×)** |
-| 25 ms 1 % | worst | 0.038 | **0.389 MB/s (10×)** |
-| 50 ms 1 % | stalls | 10/15 | **1/15** |
-| 50 ms 1 % | median | 0.142 | **0.451 MB/s (3.2×)** |
-
-The multi-second stalls are gone; the good-cluster max is unchanged
-(clean-path neutral).
-
-**Status — RACK time-based detection ✅ done (shared-core consumer).**
-TCP now consumes `net_cc::loss::LossParams` — the same RFC 9002/RACK
-decision core QUIC's detector runs on (architecture-audit #4). After every
-ACK's SACK/cum-ACK scoreboard update (`TcpConnection::rack_detect`), an
-un-SACKed segment whose **latest** transmission (`RtxEntry::last_tx_ms`,
-refreshed on every retransmit) is older than the `9/8·SRTT` reordering
-window while a later-sent segment is SACKed is marked lost and routed
-through the same retransmit-emission + `cc.on_loss` path RFC 6675
-hole-filling uses (one deduped cwnd reduction per window). The core's
-returned deadline arms a per-conn RACK reordering timer
-(`rack_deadline_ms`, serviced by `on_tcp_tick`) so segments age into loss
-without needing another ACK. The packet threshold is disabled for TCP
-(ids are byte offsets; count-based detection stays RFC 6675's job). /obs
-`rack_marked`; scenarios `rack_marks_aged_unsacked_segments_below_dupack_threshold`,
-`rack_holds_fire_inside_the_reordering_window`,
-`rack_late_fill_cancels_the_pending_mark`,
-`rack_timer_marks_aged_segments_without_further_acks`.
+TLP (probe timer at `PTO = 2·SRTT`, capped at 2 probes, not a congestion
+signal) eliminated the multi-second tail-loss-RTO stalls — GCE/netem 1 %
+loss: stalls 7→0 (25 ms) / 10→1 (50 ms), median ×3.2–3.9, clean-path
+neutral. RACK time-based detection consumes the shared `net_cc::loss`
+core QUIC runs on (`9/8·SRTT` reordering window, per-conn RACK timer); the
+packet threshold is disabled for TCP (ids are byte offsets — count-based
+stays RFC 6675's job).
 
 **Open (follow-up).** RFC 8985's *adaptive* reo_wnd (start `min_rtt/4`,
 grow on DSACK-detected spurious marks) — deliberately not landed; the
@@ -604,18 +330,19 @@ Dependency-ordered, test-first per item:
 1. ✅ **T1** (ACK validation) — done.
 2. ✅ **T6 window scaling** (RFC 7323 Window Scale) — done & GCE-validated.
    Timestamps + PAWS remain (the rest of T6).
-3. ✅ **T2** (peer-MSS honor + clamp) — done (`74e53e1`); fixed the live
-   5G/NAT64 cert-flight blackhole. SYN-ACK MSS advertise + PMTUD remain
-   (follow-up hardening).
-4. **T4 + T5** (SYN-on-sync + RFC 5961 challenge ACKs) — one coherent
-   hardening change.
-5. **T3** (out-of-order reassembly) — the big one; unblocks T7/T8.
-6. **T8** (ACK out-of-window segments) — falls out of T3.
-7. **T7** (SACK / RFC 6675).
+3. ✅ **T2** (peer-MSS honor + clamp + SYN-ACK advertise + PMTUD) — done
+   (`74e53e1`, `be7ad67`). PMTUD core-routing/in-flight-resegment slivers remain.
+4. ✅ **T4 + T5** (SYN-on-sync + RFC 5961 challenge ACKs + §7 rate limit) —
+   done. §5 in-window data challenge deferred into T3.
+5. ✅ **T3** (out-of-order reassembly) — done; unblocked T7/T8. Netem
+   throughput A/B pending.
+6. ✅ **T8** (ACK out-of-window segments) — done; fell out of T3.
+7. ✅ **T7** (SACK / RFC 6675) — done (correctness). Netem A/B pending.
 8. ✅ **L2** (ABC) — done; closed the measured ~3× cold-transfer
    slow-start gap (slow start now byte-counts, capped at 2·SMSS).
-9. **L1 / L3 / L4** (CUBIC, pacing, RACK-TLP) — the deeper CC/loss-recovery
-   parity work; gated on the L4 vtable seam and SACK (T7).
+9. **L1 / L3 / L4** (CUBIC, pacing, RACK-TLP) — L1 CUBIC + L4 TLP/RACK
+   done; **L3 pacing** + **L1 BBR** + **L4 adaptive reo_wnd** remain (the
+   deeper CC/loss-recovery parity work).
 10. **T9–T13**, **L5**, Timestamps/PAWS — checklist, as priorities allow.
 
 Test-infrastructure items (fuzzing, traceability matrix, deeper

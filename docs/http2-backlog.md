@@ -1,6 +1,6 @@
 # HTTP/2 — build plan + hardening backlog
 
-Last updated 2026-06-01. **Status: happy path landed.** Server-role
+Last updated 2026-06-10. **Status: happy path landed.** Server-role
 HTTP/2 is implemented in `crates/proto/http2` and selected by ALPN over
 the existing TLS/TCP path; real `curl --http2` and browsers negotiate
 `h2` and multiplex the test page's assets (validated by the HVF
@@ -78,157 +78,116 @@ coexist, selected per-connection by ALPN.
 | ALPN negotiation | `proto/tls/src/handlers.rs` (~line 249) — already negotiates ALPN, selects `http/1.1` today; add `"h2"` and surface the choice to the serve dispatch |
 | Per-conn async task + multiplexing pattern | the h3 server's stream-dispatch shape (`proto/http3/src/server.rs`) |
 
-## Build scope — first session (happy path) — DONE
+## Build scope — first session (happy path) — ✅ done
 
-A working server-role H2 that real `curl --http2` and a browser use:
+A working server-role H2 that real `curl --http2` and a browser use. The
+shipped capabilities (don't re-propose):
 
-- [x] **HPACK** encode/decode (`hpack.rs`): shared Huffman, 61-entry
-  static table, full dynamic-table **decoder** (insert / evict /
-  size-update — the correctness-critical half, exercised by the RFC 7541
-  §C.3 first/second-request vectors); stateless **encoder** (static-indexed
-  + literal-without-indexing, H=0, names lowercased — never uses a dynamic
-  table, the same simplification QPACK makes).
-- [x] **Frame codec** (`frame.rs`): the 9-byte header + SETTINGS, HEADERS,
-  DATA, WINDOW_UPDATE, RST_STREAM, GOAWAY, PING, PRIORITY (parse-and-ignore),
+- **HPACK** encode/decode (`hpack.rs`): shared Huffman, 61-entry static
+  table, full dynamic-table decoder (insert/evict/size-update); stateless
+  encoder (static-indexed + literal-without-indexing, H=0, names
+  lowercased — never uses a dynamic table, like QPACK).
+- **Frame codec** (`frame.rs`): 9-byte header + SETTINGS, HEADERS, DATA,
+  WINDOW_UPDATE, RST_STREAM, GOAWAY, PING, PRIORITY (parse-and-ignore),
   CONTINUATION assembly.
-- [x] **Connection preface** + SETTINGS exchange (server SETTINGS first,
-  client 24-byte magic validated, SETTINGS ACK).
-- [x] **Multiplexing serve loop** (`server.rs`): per-stream assembly,
-  **connection- and stream-level flow control** (the `min(stream_window,
-  conn_window)` discipline, stacked on TCP's own window), responses
-  interleaved by a single cooperative writer (`next_output_frame` draining
-  the out-queue + WINDOW_UPDATE-driven re-flush — the design favoured over
-  a task per stream).
-- [x] Wire each stream's request + body to the `proto/http` handler API.
-  Request bodies are **buffered** before dispatch and served via a prebuf
-  `BodyReader` (matching the h3 server); streaming request bodies through
-  `BodyReader` over live DATA frames is a tail item (see H2-10).
-- [x] **ALPN dispatch** in `proto/tls`.
+- **Connection preface** + SETTINGS exchange (server SETTINGS first,
+  24-byte client magic validated, SETTINGS ACK).
+- **Multiplexing serve loop** (`server.rs`): per-stream assembly,
+  connection- and stream-level flow control (`min(stream_window,
+  conn_window)`, stacked on TCP's window), responses interleaved by a
+  single cooperative writer — chosen over a task per stream.
+- Each stream's request + body wired to the `proto/http` handler API
+  (request bodies now stream — see H2-10).
+- **ALPN dispatch** in `proto/tls`.
 
 ## Hardening backlog (the tail — track here as found)
 
 ### Security / DoS — required before any public deploy (P0)
 
 HTTP/2's framing opens DoS vectors that H1.1 doesn't have; a public
-server **must** bound them. The cheap caps that fell out of the build
-landed this session; the rate-limit-flood guard is still open.
+server **must** bound them. The cheap caps landed; a rate/ratio-over-time
+flood guard is still open (see H2-1).
 
-- [x] **H2-1 — Rapid Reset (CVE-2023-44487).** Cumulative RST_STREAM
-  count per connection; past `RST_FLOOD_CAP` (200) the connection is torn
-  down with `GOAWAY(ENHANCE_YOUR_CALM)`. *Partial* — a cumulative cap, not
-  yet a rate/ratio over time; revisit alongside H2-3.
-- [x] **H2-2 — HPACK bomb / decompression ratio.** The decoder enforces
-  `SETTINGS_MAX_HEADER_LIST_SIZE` (64 KiB) on the decompressed list and
-  bounds the dynamic table at the advertised `SETTINGS_HEADER_TABLE_SIZE`
-  (4 KiB).
-- [x] **H2-3 — Frame floods.** SETTINGS / PING / empty-DATA /
-  WINDOW_UPDATE / 0-length-HEADERS floods are bounded by a
-  consecutive-control-frame counter (`ctrl_since_progress`): a productive
-  frame (request HEADERS or body DATA) resets it; past `CONTROL_FLOOD_CAP`
-  (1024) consecutive control frames with no request, the connection is
-  shed with `GOAWAY(ENHANCE_YOUR_CALM)`. Checked BEFORE dispatch, so it
-  also bounds `ctrl_out` growth. (`ctrl_out` is in any case flushed every
-  demux iteration, so it never accumulates across frames.) The
-  CONTINUATION-flood half is covered by `HEADER_BLOCK_CAP` (see H2-5).
-- [x] **H2-4 — `MAX_CONCURRENT_STREAMS` enforcement.** Advertised (100)
-  and enforced — a new stream past `active_count()` (pending bodies +
-  in-flight responses) is refused with `RST_STREAM(REFUSED_STREAM)`.
+### H2-1 — Rapid Reset (CVE-2023-44487) — ✅ done (cumulative cap)
+
+Cumulative RST_STREAM count per connection; past `RST_FLOOD_CAP` (200) the
+connection is torn down with `GOAWAY(ENHANCE_YOUR_CALM)`.
+
+Open: this is a cumulative cap, not yet a rate/ratio over time — revisit
+alongside any H2-3 rate-limit-flood work.
+
+### H2-2 — HPACK bomb / decompression ratio — ✅ done
+
+### H2-3 — Frame floods — ✅ done
+
+`ctrl_since_progress` consecutive-control-frame counter; past
+`CONTROL_FLOOD_CAP` (1024) with no request, shed with
+`GOAWAY(ENHANCE_YOUR_CALM)`. Checked before dispatch (also bounds
+`ctrl_out`). CONTINUATION-flood half covered by `HEADER_BLOCK_CAP` (H2-5).
+
+### H2-4 — `MAX_CONCURRENT_STREAMS` enforcement — ✅ done
+
+Advertised (100) and enforced; a stream past `active_count()` is refused
+with `RST_STREAM(REFUSED_STREAM)`.
 
 ### Conformance / interop (P1–P2)
 
-- [x] **H2-5 — CONTINUATION handling.** Header blocks split across
-  CONTINUATION frames are assembled (`header_asm`), interleaving is
-  rejected (only CONTINUATION on the same stream may follow a HEADERS
-  without END_HEADERS), and the "CONTINUATION flood" (CVE-2024-27316) is
-  bounded by `HEADER_BLOCK_CAP` (64 KiB) on the accumulated block.
-- [x] **H2-6 — Full SETTINGS surface.** We honor peer
-  `INITIAL_WINDOW_SIZE`, `MAX_FRAME_SIZE` (caps DATA we emit), and validate
-  `ENABLE_PUSH`/`MAX_FRAME_SIZE` ranges. A mid-connection
-  `INITIAL_WINDOW_SIZE` change is now applied **retroactively** to every
-  open stream's send window (RFC 7540 §6.9.2) across both emission paths
-  (`out_queue` buffered + `streams` streaming) — the delta may drive a
-  spent window negative, and an overflow past 2^31−1 is a connection
-  `FLOW_CONTROL_ERROR`. Unit-tested
-  (`initial_window_size_change_shifts_open_streams`,
-  `initial_window_size_overflow_is_flow_control_error`).
-  `HEADER_TABLE_SIZE`/`MAX_HEADER_LIST_SIZE` from the peer bound *our*
-  encoder, which uses no dynamic table and emits tiny header blocks, so
-  nothing to honor there.
-- [x] **H2-7 — HPACK dynamic-table eviction.** Entry overhead = 32 B/entry
-  (RFC 7541 §4.1), eviction on insert and on size-update, table-clear when
-  a single entry exceeds the max — implemented + unit-tested.
-- **H2-8 — Error handling completeness.** *Mostly done.* Connection errors
-  emit `GOAWAY(code, last-stream-id)`; stream errors emit `RST_STREAM` with
-  a code (PROTOCOL_ERROR / REFUSED_STREAM / FLOW_CONTROL_ERROR /
-  ENHANCE_YOUR_CALM). **§8.1.2 malformed-request validation now enforced**
-  (`RequestSink`, stream error `PROTOCOL_ERROR`): non-lowercase field
-  names (§8.1.2), pseudo-after-regular ordering + duplicate-pseudo +
-  response/unknown pseudo (§8.1.2.1), required `:method`/`:scheme`/`:path`
-  and non-empty `:path` (§8.1.2.3), forbidden connection-specific headers
-  (`connection`/`keep-alive`/`proxy-connection`/`transfer-encoding`/
-  `upgrade`) and `te`≠`trailers` (§8.1.2.2). Unit-tested
-  (`well_formed_request_is_accepted`, `malformed_requests_are_rejected`,
-  `te_trailers_is_allowed`). **§8.1.2.6 Content-Length vs DATA** is now
-  enforced too: per-stream `body_received` vs declared `content_length`,
-  reset (PROTOCOL_ERROR) on over-delivery, under-delivery at END_STREAM,
-  or a non-zero content-length on a bodyless request. Tested
-  (`content_length_mismatch_resets_the_stream`,
-  `content_length_exact_match_is_accepted`). **Still open:** a §7
-  code-choice audit and a graceful two-GOAWAY drain.
-- **H2-9 — h2spec.** Run the h2spec conformance suite; track failures here.
-  Not yet run.
+### H2-5 — CONTINUATION handling — ✅ done
+
+CONTINUATION-flood (CVE-2024-27316) bounded by `HEADER_BLOCK_CAP` (64 KiB)
+on the accumulated block; cross-stream interleaving rejected.
+
+### H2-6 — Full SETTINGS surface — ✅ done
+
+Mid-connection `INITIAL_WINDOW_SIZE` change applied **retroactively** to
+every open stream's send window across both emission paths (RFC 7540
+§6.9.2); the delta may drive a window negative, overflow past 2^31−1 is a
+connection `FLOW_CONTROL_ERROR`. Peer `HEADER_TABLE_SIZE`/
+`MAX_HEADER_LIST_SIZE` bound *our* encoder, which uses no dynamic table —
+nothing to honor.
+
+### H2-7 — HPACK dynamic-table eviction — ✅ done
+
+32 B/entry overhead (RFC 7541 §4.1); table-clear when a single entry
+exceeds the max.
+
+### H2-8 — Error handling completeness — ✅ mostly done
+
+Connection errors emit `GOAWAY(code, last-stream-id)`; stream errors emit
+`RST_STREAM`. §8.1.2 malformed-request validation enforced (field-name
+case, pseudo ordering/duplication, required pseudos, forbidden
+connection-specific headers, `te`≠`trailers`) and §8.1.2.6 Content-Length
+vs DATA (over/under-delivery, content-length on a bodyless request).
+
+Open: a §7 error-code-choice audit and a graceful two-GOAWAY drain.
+
+### H2-9 — h2spec
+
+Run the h2spec conformance suite; track failures here. Not yet run.
 
 ### Tail items discovered during the build
 
-- **H2-10 — Streaming request bodies. DONE.** Request bodies now stream;
-  the 256 KiB whole-body buffer / `RST_STREAM`-on-overflow is gone. All
-  transports stream uniformly (h1.1 always did; h3 via `H3BodySource` +
-  the QUIC receive-flow-control extension; h2 here).
+- **H2-10 — Streaming request bodies — ✅ done.** All transports now
+  stream uniformly. Approach: per-stream handler tasks (no read/write
+  split — the demux task `select`s read-first/cancel-safe, so a single
+  TLS-stream owner does both read and write); bodyless GETs dispatch
+  inline. (The reentrant-body-source and single-`select`-handler
+  alternatives were rejected as tangled / non-multiplexing.)
+- **H2-11 — DATA framing / send batching — ✅ batching done; zero-copy
+  open.** `flush` frames all sendable frames into one `IOBufChain` and
+  emits a single `stream.send` (HEADERS + DATA ride one TLS record / TCP
+  send → H1.1 small-response parity).
 
-  Approach taken: **per-stream handler tasks** (option 2 below) — but
-  *without* a stream split. The demux task stays the single TLS-stream
-  owner doing both read and write; it `select`s on `(read_frame,
-  handler-wakeup)` each iteration (the `select` polls the read first and
-  only drops it while pending, so no inbound bytes are lost on the wakeup
-  branch — that's what makes a split unnecessary). A body-bearing request
-  spawns a handler task fed by a shared `StreamBody` channel; bodyless
-  GETs still dispatch inline (no task-arena hit). Responses funnel back
-  through `resp_sink` → `queue_response` so HPACK encode + send-window
-  framing stay in the one owner. Receive flow control credits the stream
-  window on consume (backpressure) and the conn window on arrival.
-
-  The three shapes that were weighed, for the record:
-
-  1. **Reentrant body source** — the body source itself calls `read_frame`
-     and buffers other streams' frames for after the handler. Smallest
-     diff but tangled: HPACK ordering across deferred HEADERS, CONTINUATION
-     spanning frames, flow-control crediting mid-reentrancy.
-  2. **Per-stream handler tasks** *(chosen)* — demux routes DATA to
-     per-stream channels; handlers run concurrently. True multiplexing.
-     The feared read/write **split** turned out unnecessary given
-     `select`'s cancel-safe read.
-  3. **Cooperative `select` on one handler future** — no spawn, but one
-     in-flight handler (gives up multiplexing).
-- **H2-11 — DATA framing / send batching. *Batching done; zero-copy
-  deferred.*** The **one-send-per-frame** half is fixed: `flush` now
-  frames all sendable frames into one `IOBufChain` and emits a single
-  `stream.send`, so a small response's HEADERS + DATA ride one TLS
-  record / one TCP send instead of two (measured on HVF: TCP sends and
-  TLS encrypt-records per `/health` request 2.0 → 1.0, i.e. H1.1 parity;
-  closed the bulk of the h2-vs-h1.1 small-response gap — h2 went from
-  ~0.65× h1.1 throughput to ~parity). Per-response allocations were also
-  trimmed (header list stack-allocated; the DATA chunk `Vec` folded into
-  the frame `Vec` — `/health` allocs/req 7.3 → 5.4). **Still copies** the
-  DATA payload into a per-frame `Vec` (forfeiting H1.1's zero-copy TX).
-  A true zero-copy rewrite (frame DATA directly from the body's own
-  IOBufs via narrowed/shared views, or coalesce into one reused buffer)
-  was prototyped and **reverted**: it intermittently corrupted large
-  single-stream transfers (~40% h2load failure on `/static-256k`, the
-  multi-flush window-blocked path) with the server-side frame/flow
-  counters clean — a latent hazard in the TLS-seal / TX path triggered
-  by emitting non-frame-shaped (oversized or refcount-shared) buffers.
-  Needs that path investigated first; the remaining alloc delta isn't
-  worth the corruption risk until then.
+  Open (zero-copy TX): the DATA payload is still copied into a per-frame
+  `Vec`, forfeiting H1.1's zero-copy TX. **Do not just re-do the obvious
+  rewrite:** framing DATA directly from the body's own IOBufs (narrowed/
+  shared views or a reused coalesce buffer) was prototyped and **reverted**
+  — it intermittently corrupted large single-stream transfers (~40% h2load
+  failure on `/static-256k`, the multi-flush window-blocked path) with the
+  server-side frame/flow counters clean, i.e. a latent hazard in the
+  TLS-seal / TX path triggered by emitting non-frame-shaped (oversized or
+  refcount-shared) buffers. That path must be investigated first; the
+  alloc delta isn't worth the corruption risk until then.
 - **H2-12 — Pre-dispatch WINDOW_UPDATE.** A WINDOW_UPDATE that arrives for
   a stream before its response is queued (no `StreamOut` yet) is dropped.
   Harmless for the request/response shape (clients grow the window in
