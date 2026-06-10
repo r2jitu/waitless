@@ -28,12 +28,11 @@ The perf docs route work by *cost locus* — see **[`high-concurrency-perf.md`](
 | Doc | What it owns |
 |-----|--------------|
 | [`high-concurrency-perf.md`](high-concurrency-perf.md) | The 10 K+ concurrent-conn cliff: saturation behaviour, heap/OOM analysis, load shedding, per-conn data structures. Hosts the perf-doc routing taxonomy. |
-| [`efficiency-audit.md`](efficiency-audit.md) | Cross-cutting audit of the four efficiency axes — mem/conn, allocs/req, copies/req, cross-core sync — with a prioritized plan. Synthesis across the rx/tx trackers + the per-core slab + the sub-MSS TX nexus; the "what to optimize next and why" doc. |
 | [`rx-path-optimizations.md`](rx-path-optimizations.md) | Per-byte / per-frame **RX** cost: memcpy reduction, IOBuf zero-copy, HW GRO/RSC. (Items A–O + progress log.) |
 | [`tx-path-optimizations.md`](tx-path-optimizations.md) | Per-byte / per-frame **TX** cost: encrypt-in-place, TSO, header fusion, UDP-GSO. (Items A–R + progress log.) |
 | [`observability.md`](observability.md) | The `/obs` instrumentation doctrine and primitives (`Counter`, `PerCoreCounter`, `LastEvent`, `LatencyHist`). |
 | [`gvnic.md`](gvnic.md) | gVNIC device behaviour and the DQO_RDA vs GQI_QPL queue formats. |
-| [`quic-golden.md`](quic-golden.md) | The QUIC golden-path throughput campaign: the pacing-cap bulk fix (~8–10× h3 downloads), HW UDP-GSO on DQO, the upload-reassembly cliff fix, HW UDP-RX-GRO ruled out, and the cross-env (c3/DQO, n2/GQI, kvm/virtio, HVF) before/after matrix. The QUIC results/narrative doc; per-mechanism plan state lives in the rx/tx trackers + gvnic. |
+| [`quic-golden.md`](quic-golden.md) | The QUIC golden-path throughput campaign: the pacing-cap bulk fix (~8–10× h3 downloads), HW UDP-GSO on DQO, the upload-reassembly cliff fix, HW UDP-RX-GRO ruled out, and the cross-env (c3/DQO, n2/GQI, kvm/virtio, HVF) before/after matrix. Part 2 (merged from the retired h3-health-cycle-profile): the h3 /health small-response cost root-caused — ~2.1× CPU/req, diffuse orchestration, levers A/B-refuted. The QUIC performance record; per-mechanism plan state lives in the rx/tx trackers + gvnic. |
 
 ## Conformance
 
@@ -54,7 +53,7 @@ that ties them together.
 | Doc | What it owns |
 |-----|--------------|
 | [`benchmarking.md`](benchmarking.md) | How to run benches: `bench.py`, the GCE wrappers, the env matrix and workloads. Read first for "how do I bench?" |
-| [`benchmark-results.md`](benchmark-results.md) | Published results: Waitless vs **tokio-hyper** on GCE c3/gVNIC (≈ 2–3× throughput, ~2× lower latency) and *why* (tokio-hyper's ~61 % kernel/syscall time). The "show me the numbers" doc. |
+| [`benchmark-results.md`](benchmark-results.md) | Published results: Waitless vs **tokio-hyper** on GCE c3/gVNIC (≈ 2–3× throughput, ~2× lower latency) and *why* (tokio-hyper's ~61 % kernel/syscall time). Also holds the standing **efficiency baselines** (allocs/req, mem/conn, the falsified heap-lock thesis, open levers — folded from the retired efficiency-audit). The "show me the numbers" doc. |
 | [`crates.md`](crates.md) | The crate map: tiers, dependency layering, and the `crates/` layout. |
 | [`consuming-as-a-library.md`](consuming-as-a-library.md) | Using Waitless as a Bazel dependency — the `MODULE.bazel` / `BUILD.bazel` boilerplate an app needs. |
 

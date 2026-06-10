@@ -144,3 +144,107 @@ why it's ~2× and not ~1.06×.
 - **tokio-hyper is an idiomatic baseline** (release, rustls, multi-thread
   runtime), not a hand-tuned record-chaser — a reasonable stand-in for "a
   competent Rust async server on Linux."
+
+
+## Efficiency baselines (folded from the 2026-06 efficiency audit)
+
+> `efficiency-audit.md` retired 2026-06-10; its full narrative (the
+> 2026-05-28 static audit, the 2026-05-30 falsification pass, the
+> 2026-06-09 re-measurement) is in git history. This section keeps the
+> standing measured baselines + the do-not-redo findings. Dated numbers
+> are snapshots — re-measure before trusting an absolute.
+
+### Measurement traps (don't repeat them)
+
+A multi-URL `curl -o /dev/null url url …` does **not** issue one request
+per URL against this server, and the bench harness's `allocs/iter` is a
+*net live-count* delta (allocs − frees ≈ 0 in steady state), not
+cumulative — both produced bogus "0 allocs/req" readings. Count
+client-verified keep-alive responses against the cumulative `/obs`
+`heap_total_allocation_count`.
+
+### Allocs/request (measured, client-verified; HVF/virtio)
+
+| Path | allocs/req | What they are (code-traced) |
+|---|---|---|
+| h1-TLS `GET /health` | **1.00** | the rtx retain — `rtx_push`'s `into_owned()` of the sealed record, freed on ACK. (`RtxPayload::Inline` reached 0/req, measured throughput-neutral, deliberately reverted) |
+| h1-TLS `/static-16k` | **2.02** | + 1 TSO-record retain |
+| h1-TLS `/static-1m` | **81** | ≈ 1 retain per 16 KiB TSO record + record chunking |
+| h2 `GET /health` | **1.25** | (`de60f15`) header_block pools through StreamOut retirement; Borrowed-IOBuf flush |
+| h3 `GET /health` | **6.0** | (`68080c5`, was 8.4) stream-retx now `clone_shared` views; remaining: BTreeMap node churn + DATA-header IOBuf |
+
+RX is structurally zero-copy / zero-alloc on all paths (chunk move →
+in-place AEAD → in-place parse).
+
+### Memory per connection (measured + compiler-exact decomposition)
+
+- **Idle system heap**: 1.86 MB / 374 live allocations after boot (HVF,
+  1 core). Dominant per-core statics: `TCP_HASH` 328 KB, accept rings
+  66 KB; NIC queue DMA ~1.5–2.5 MiB/QP.
+- **h1-TLS conn (deployed `https` facade)**: **≈ 67 KB idle established**
+  / ≈ 84 KB after the first request (+16.4 KB lazy `record_scratch`).
+  Decomposition: rx_ring 16.4 KB + `TlsConnImpl` 7.9 KB + serve-task
+  future ~20.4 KB + ~22 KB unattributed (likely `rx_partial`
+  materialized by a handshake-flight straddle). ⚠ `H2Conn` heap is
+  h2-ALPN-only — attributing it to every TLS conn was a measured,
+  corrected mistake.
+- **h3/QUIC conn**: `Connection` 17,944 → **4,008 B** after the DirKeys
+  boxing (`b513437`); the four per-conn Rcs co-allocate into one
+  4,080-B `ConnArena` (`b055a26`, 4 → 1 allocs/conn).
+- **TCP slot**: `TcpConnection` = 384 B; pool segment 24.6 KB / 64
+  slots, lazy.
+- **No unbounded growth paths**: every queue is capped (OOO 16 KB/conn,
+  retx ≤ cwnd ≤ 2 MiB, CRYPTO reassembly 64 KB, h2 1 MiB recv / 256 KiB
+  send per stream, QUIC 2 MiB/stream / 8 MiB/conn / 256 MiB global,
+  conn inbox 256 datagrams, per-IP half-open 256, refuse-at-90%-heap).
+
+### Single-loadgen workload snapshot (GCE 2026-06-09, c3-highcpu-4 DQO)
+
+| Workload | 1c | 2c | 4c | Notes |
+|---|---|---|---|---|
+| `get_tcp` (plain /health) | 182.5K | 327.2K | 536.9K | |
+| `get_tls` (TLS /health, 32c) | 114.9K | 207.1K | 357.1K | cy/B 9.8–10.0 |
+| `get_h1` | 347.4K | 428.5K | 482.6K | 4c **client-bound** |
+| `get_h2` | 324.3K | 419.1K | 482.0K | h1-parity; client-bound |
+| `get_h3` | 185.5K | 237.6K | 301.9K | ≈ 0.63× h1 |
+| `get_tcp_fresh` (conn/s) | 36.4K | 64.1K | 99.2K | |
+| `get_tls_fresh` (full hs/s) | 3.8K | 5.2K | 6.2K | |
+| `download_64k_tls` | 23.6K | 35.6K | 36.5K | **NIC-bound ≥2c** (2.3–2.4 GB/s) |
+| `download_64k_quic` | 10.0K | 12.1K | 13.2K | 659–864 MB/s |
+| `upload_32k_tls` | 41.3K | 52.8K | 54.2K | 1.4–1.8 GB/s RX |
+| `get_tcp_single` (1-conn RTT) | p50 49 µs | 48 µs | 49 µs | |
+
+The 4c h1/h2 numbers are a floor (single loadgen saturates first); the
+two-loadgen saturated reference is the TL;DR table above.
+
+### The falsified thesis (do-not-redo)
+
+The audit's original "global heap lock = #1 lever" thesis was **measured
+false**: a per-core magazine allocator made the hot allocs 99.95%
+lock-free on the contended gve-8c path and bought **~0 throughput**
+(576K OFF vs 570K ON; branch `perf/tls-beat-tokio` preserves it).
+Under true saturation all 8 cores are 99.7–99.8% busy, perfectly
+balanced — already shared-nothing. Saturated cycle split: NIC driver
+~39%, async-dispatch ~22%, TLS ~17%, HTTP ~10%, tcp_send (incl. the
+1 alloc) 6%. Alloc/copy micro-work targets <10% of cycles — efficiency
+wins, not throughput levers.
+
+### What's already optimal (do not re-touch)
+
+RX zero-copy; the rtx_queue `VecDeque` migration (155→88 KB/conn); the
+TCP hot/cold struct split was tried and **rejected** (3–19% worse);
+accept + steady-state wakes are same-core; c3/gVNIC runs Tier 1
+(per-core RX queues).
+
+### Open efficiency levers (allocs/bytes, not throughput)
+
+- **rx_ring 16 KB → tiered** (default 4–8 KB, grow lazily): −8–12
+  KB/conn; `OOO_MAX_BYTES` is tied to it. Biggest always-present block.
+- **`[Header;16]` 5.4 KB → 8 inline + overflow**: −3–4 KB/conn, also a
+  per-stream cost in every spawned h2/h3 handler task.
+- **Pool/shrink the TLS scratches** (`record_scratch`/`rx_partial`
+  16 KB): held `&mut` across `.await` → needs a drop-returned guard.
+- **Per-request shared `Counter`s → `PerCoreCounter`**; pad the gve
+  per-QP counter array (false sharing at packet rate). Low risk.
+- **ConnArena long arc**: typed arena regions for the dynamic conn
+  state — architecture-audit #6.

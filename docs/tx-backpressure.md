@@ -169,7 +169,7 @@ are the abstractions `stack-architecture.md` marked "not started."
 congestion control (2). For the egress owner (3), the QUIC arm went through two
 iterations: a *ship-ordering* DRR (reorder already-built packets) measured
 throughput-neutral-to-slightly-negative with no upside — because, as
-[`h3-health-cycle-profile.md`](h3-health-cycle-profile.md) found, TX isn't the
+[`quic-golden.md`](quic-golden.md) found, TX isn't the
 throughput lever and the fairness it buys isn't exercised by a single flow. The
 *build-at-drain* iteration that replaced it **is** a win: the owner builds each
 steady-state 1-RTT packet at drain time — acquire a slot, encode into it, submit

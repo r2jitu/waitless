@@ -176,7 +176,7 @@ Bumped `MAX_ETH_FRAME` 1514 → 16512 so one TX-pool slot fits a 16 KiB super-se
 ## Allocations (separate dimension from memcpy)
 
 > ⚠️ **The cold-conn alloc table below is stale (2026-05-29 efficiency audit — see
-> [`efficiency-audit.md`](efficiency-audit.md) for the verified current state).**
+> [`benchmark-results.md`](benchmark-results.md) for the verified current state).**
 > `rx_buf` (#4) and `pt_buf` (#6) were **removed** from `TlsServer` (only `tx_buf`
 > remains); the conn-future path is now `reactor/tcp.rs`, not `net/tcp.rs`. The
 > **steady-state keep-alive** figure that matters is now **1 alloc/req** (the
