@@ -1141,4 +1141,67 @@ mod tests {
         assert_eq!(count, 6);
         assert_eq!(p, buf.len());
     }
+
+    /// Fuzz-smoke (architecture-audit direction #2, first increment): the
+    /// frame parser is the most attacker-facing pure function in QUIC —
+    /// every byte of it is reachable pre-handshake-completion. Pin its
+    /// panic-freedom over (a) raw pseudo-random buffers and (b) valid
+    /// frame streams with byte-level mutations, deterministically (a
+    /// fixed-seed xorshift, so a failure reproduces). Not a substitute
+    /// for coverage-guided fuzzing — a regression tripwire that runs on
+    /// every `bazel test`.
+    #[test]
+    fn parse_frame_fuzz_smoke_never_panics() {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // (a) Raw random buffers, varied lengths incl. empty.
+        for _ in 0..20_000 {
+            let len = (rnd() % 64) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| rnd() as u8).collect();
+            let mut p = 0;
+            // Walk like dispatch does: parse until error or end, with a
+            // progress guard so a zero-consumed bug can't hang the test.
+            while p < buf.len() {
+                match parse_frame(&buf[p..]) {
+                    Ok((_, consumed)) => {
+                        assert!(consumed > 0, "parser must consume bytes");
+                        p += consumed;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        // (b) A valid multi-frame stream with single-byte mutations at
+        // every position — exercises the deep arms (ACK ranges, CRYPTO
+        // offsets, STREAM flag combinations) near-validity.
+        let mut valid = alloc::vec![0x00, 0x01]; // PADDING, PING
+        let mut tmp = [0u8; 64];
+        let n = write_ack(1000, 25, 3, &[(2, 5), (1, 1)], &mut tmp).unwrap();
+        valid.extend_from_slice(&tmp[..n]);
+        let n = write_crypto(0x3fff, b"hello-crypto", &mut tmp).unwrap();
+        valid.extend_from_slice(&tmp[..n]);
+        let n = write_stream(4, 0x42, true, b"body", &mut tmp).unwrap();
+        valid.extend_from_slice(&tmp[..n]);
+        for pos in 0..valid.len() {
+            for _ in 0..32 {
+                let mut m = valid.clone();
+                m[pos] = rnd() as u8;
+                let mut p = 0;
+                while p < m.len() {
+                    match parse_frame(&m[p..]) {
+                        Ok((_, consumed)) => {
+                            assert!(consumed > 0);
+                            p += consumed;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+    }
 }
