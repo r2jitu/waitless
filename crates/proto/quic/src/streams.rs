@@ -530,12 +530,18 @@ impl SendStream {
         }
     }
 
-    /// Pop up to `max_bytes` from the front of the chunk chain as an
-    /// owned Vec, returning `(offset, bytes, fin)`. The owned copy is
-    /// what the encode path retains as a `StreamRetx` for
-    /// retransmission (RFC 9002 §6), so this is the live drain path. A
-    /// `Closing` stream with empty `outbound` yields a zero-length FIN.
-    pub fn pop_chunk(&mut self, max_bytes: usize) -> Option<(u64, Vec<u8>, bool)> {
+    /// Pop up to `max_bytes` from the front of the chunk chain as a
+    /// refcount-shared [`IOBuf`] view, returning `(offset, view, fin)`.
+    /// The view is what the encode path retains as a `StreamRetx` for
+    /// retransmission (RFC 9002 §6) — a `clone_shared` + `narrow` of
+    /// the queued chunk's storage, NOT a heap copy, so the TX path's
+    /// only per-byte pass is the encode write into the packet buffer.
+    /// The head chunk is promoted to `Shared` in place on first touch
+    /// (Heap/External Arc-wrap with no byte copy; an External — pooled
+    /// framing buffer — simply defers its pool-recycle drop until the
+    /// last retained view is ACKed, ≤ 1 RTT). A `Closing` stream with
+    /// empty `outbound` yields a zero-length FIN.
+    pub fn pop_chunk(&mut self, max_bytes: usize) -> Option<(u64, iobuf::IOBuf, bool)> {
         match self.state {
             SendState::FinSent => return None,
             SendState::Open if self.outbound.is_empty() => return None,
@@ -543,15 +549,31 @@ impl SendStream {
         }
         let offset = self.send_offset;
         if self.outbound.is_empty() {
-            // Closing with empty outbound → zero-byte FIN.
+            // Closing with empty outbound → zero-byte FIN. An empty
+            // Vec-backed IOBuf allocates nothing.
             self.enter_fin_sent();
-            return Some((offset, Vec::new(), true));
+            return Some((offset, iobuf::IOBuf::from(Vec::new()), true));
         }
         let head_remaining = self.head_remaining_len();
         let n = head_remaining.min(max_bytes);
-        let chunk: Vec<u8> = {
-            let head = self.outbound.front().unwrap();
-            head.data()[self.head_consumed..self.head_consumed + n].to_vec()
+        let view = {
+            let head = self.outbound.front_mut().unwrap();
+            let mut v = match head.clone_shared() {
+                Ok(v) => v,
+                Err(_) => {
+                    // First slice off a Heap/External chunk: promote to
+                    // Shared in place (Arc wrap, no byte copy). Static
+                    // and already-Shared chunks took the Ok arm.
+                    let taken = core::mem::replace(head, iobuf::IOBuf::from(Vec::new()));
+                    *head = taken.share();
+                    head.clone_shared().ok()? // infallible post-promote
+                }
+            };
+            // Narrow to this slice of the chunk's visible window. In
+            // bounds by construction (`n ≤ head_remaining`); the
+            // defensive `ok()?` mirrors the crate's panic-free style.
+            v.narrow(self.head_consumed, n).ok()?;
+            v
         };
         self.advance_head(n);
         self.send_offset += n as u64;
@@ -559,7 +581,7 @@ impl SendStream {
         if fin {
             self.enter_fin_sent();
         }
-        Some((offset, chunk, fin))
+        Some((offset, view, fin))
     }
 }
 
@@ -846,7 +868,7 @@ mod tests {
         s.close();
         let (off, c, fin) = s.pop_chunk(1024).unwrap();
         assert_eq!(off, 0);
-        assert_eq!(c, b"hello");
+        assert_eq!(c.data(), b"hello");
         assert!(fin);
         // After fin, no further chunks.
         assert!(s.pop_chunk(1024).is_none());
@@ -858,11 +880,11 @@ mod tests {
         s.write_owned(b"abcdefghij".to_vec());
         let (off1, c1, fin1) = s.pop_chunk(4).unwrap();
         assert_eq!(off1, 0);
-        assert_eq!(c1, b"abcd");
+        assert_eq!(c1.data(), b"abcd");
         assert!(!fin1);
         let (off2, c2, _) = s.pop_chunk(4).unwrap();
         assert_eq!(off2, 4);
-        assert_eq!(c2, b"efgh");
+        assert_eq!(c2.data(), b"efgh");
     }
 
     /// `buffered_len` reports the un-emitted byte count

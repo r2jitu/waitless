@@ -342,7 +342,9 @@ impl SpaceState {
 /// calls this `SentPacketInfo`. We track only the metadata that
 /// matters to current loss detection / RTT estimation; frame
 /// retransmission state lives on the streams + handshake queues.
-#[derive(Clone, Debug)]
+/// (No `Clone`/`Debug`: the retained `StreamRetx` views are
+/// move-only refcounted IOBufs, and nothing clones or formats a
+/// `SentPacket` — it moves through the ring and drops on ACK.)
 pub(super) struct SentPacket {
     /// Microseconds-since-boot when we sealed and queued this packet.
     /// `now() - time_sent_us` on ACK = RTT sample (RFC 9002 §5.1).
@@ -394,16 +396,19 @@ pub(super) struct CryptoRetx {
 }
 
 /// One STREAM frame's retransmittable contents — the offset, FIN bit,
-/// and a copy of the data bytes. Held in a [`SentPacket`] until the
-/// packet is acked (then dropped) or declared lost (then moved to
-/// [`Connection::retx_queue`] and re-emitted). Each copy is ≤ one
-/// packet's STREAM payload (~1100 B), so re-emitting fits one packet.
-#[derive(Clone, Debug)]
+/// and a refcount-shared [`iobuf::IOBuf`] view of the queued chunk's
+/// bytes (`SendStream::pop_chunk` clones + narrows; NOT a heap copy —
+/// dropping the view on ACK is what releases the chunk storage, incl.
+/// deferring a pooled framing buffer's recycle until then). Held in a
+/// [`SentPacket`] until the packet is acked (then dropped) or declared
+/// lost (then moved to [`Connection::retx_queue`] and re-emitted). Each
+/// view is ≤ one packet's STREAM payload (~1100 B), so re-emitting fits
+/// one packet.
 pub(super) struct StreamRetx {
     pub(super) sid: u64,
     pub(super) offset: u64,
     pub(super) fin: bool,
-    pub(super) data: alloc::vec::Vec<u8>,
+    pub(super) data: iobuf::IOBuf,
 }
 
 /// Per-space record of sent-but-unresolved packets (RFC 9002 §A.1
@@ -416,7 +421,7 @@ pub(super) struct StreamRetx {
 /// once it reaches the front. Length is bounded by the in-flight PN span
 /// (≈ cwnd), exactly like the map it replaces. The ACK path removes a
 /// whole range in `O(range)` instead of `O(range·log n)`.
-#[derive(Default, Debug)]
+#[derive(Default)]
 pub(super) struct SentPackets {
     base_pn: u64,
     slots: alloc::collections::VecDeque<Option<SentPacket>>,
@@ -509,6 +514,7 @@ pub(super) fn ack_remove_range(
     target_pn: u64,
     largest_out: &mut Option<SentPacket>,
     acked_in_flight_bytes: &mut u32,
+    frame_vec_pool: &mut alloc::vec::Vec<alloc::vec::Vec<StreamRetx>>,
 ) {
     if low > high {
         return;
@@ -518,11 +524,20 @@ pub(super) fn ack_remove_range(
     // explicit loop is still O((high-low) * log n) which is fine.
     let mut pn = high;
     loop {
-        if let Some(pkt) = space.sent_packets.remove(pn) {
+        if let Some(mut pkt) = space.sent_packets.remove(pn) {
             // Release its congestion-control bytes-in-flight (RFC 9002
             // §7.8 OnPacketAcked); accumulated for the caller's `on_ack`.
             if pkt.in_flight {
                 *acked_in_flight_bytes = acked_in_flight_bytes.saturating_add(pkt.byte_count);
+            }
+            // The packet is acked: dropping its `stream_frames` here is
+            // what releases the retained IOBuf views (and lets a pooled
+            // framing buffer recycle). Keep the emptied Vec backing for
+            // the next data packet instead of re-allocating it.
+            if pkt.stream_frames.capacity() > 0 && frame_vec_pool.len() < RETX_VEC_POOL_CAP {
+                let mut v = core::mem::take(&mut pkt.stream_frames);
+                v.clear();
+                frame_vec_pool.push(v);
             }
             if pn == target_pn {
                 *largest_out = Some(pkt);
@@ -1214,6 +1229,12 @@ pub struct Connection {
     /// A field (not a return value) so the 6 `record_sent_packet` call
     /// sites that carry no stream data need no signature change.
     pub(super) pending_sent_stream_frames: alloc::vec::Vec<StreamRetx>,
+    /// Recycle pool for the per-packet `Vec<StreamRetx>` (the
+    /// `SentPacket::stream_frames` backing): packet retirement on ACK
+    /// returns the emptied Vec here; `encode_one_rtt_packet` pops one
+    /// instead of allocating. Caps at [`RETX_VEC_POOL_CAP`] — a steady
+    /// data flow holds ~one Vec per in-flight data packet.
+    pub(super) retx_frame_vec_pool: alloc::vec::Vec<alloc::vec::Vec<StreamRetx>>,
 
     /// CRYPTO fragments declared lost and awaiting retransmission (RFC
     /// 9002 §6.2). `detect_loss` moves a lost Initial/Handshake packet's
@@ -1276,6 +1297,11 @@ pub(super) const REAPED_STREAM_EMPTY: u64 = u64::MAX;
 /// burst (the user's "20-conn refresh" scenario) without
 /// stockpiling memory on a long-idle conn.
 pub(super) const STREAM_POOL_CAP: usize = 8;
+
+/// Cap on [`Connection::retx_frame_vec_pool`] — recycled per-packet
+/// `Vec<StreamRetx>` backings. Sized like the in-flight data-packet
+/// count a keep-alive flow holds at once; beyond it the Vec just drops.
+pub(super) const RETX_VEC_POOL_CAP: usize = 16;
 
 impl Connection {
     /// Create a fresh connection from the client's first Initial
@@ -1381,6 +1407,7 @@ impl Connection {
             pending_sent_crypto_frames: alloc::vec::Vec::new(),
             retx_bytes: 0,
             pending_sent_stream_frames: alloc::vec::Vec::new(),
+            retx_frame_vec_pool: alloc::vec::Vec::new(),
             pace_budget: 0,
             pace_last_us: 0,
         }

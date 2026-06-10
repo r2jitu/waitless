@@ -1339,7 +1339,10 @@ impl Connection {
         let window = self.cc.window() as usize;
         let in_flight = self.bytes_in_flight as usize;
         let mut wire_budget = window.saturating_sub(in_flight);
-        let mut pkt_frames: alloc::vec::Vec<StreamRetx> = alloc::vec::Vec::new();
+        // Reuse a retired packet's Vec backing (recycled on ACK) instead
+        // of allocating one per data-carrying packet.
+        let mut pkt_frames: alloc::vec::Vec<StreamRetx> =
+            self.retx_frame_vec_pool.pop().unwrap_or_default();
 
         // (a) Retransmissions (RFC 9000 §13.3): re-send lost ranges before
         // any fresh data so the receiver's gap fills promptly. Gated on
@@ -1366,7 +1369,7 @@ impl Connection {
             wire_budget = wire_budget.saturating_sub(rtx.data.len());
             crate::frame::append_stream_header(rtx.sid, rtx.offset, rtx.fin, rtx.data.len(), out)
                 .map_err(|_| ConnError::Wire)?;
-            out.extend_from_slice(&rtx.data);
+            out.extend_from_slice(rtx.data.data());
             ack_eliciting = true;
             pkt_frames.push(rtx);
         }
@@ -1423,15 +1426,17 @@ impl Connection {
                     }
                     mc
                 };
-                // `pop_chunk` returns the owned bytes (the copy retained for
-                // retransmission); we frame them into `out` ourselves. For a
-                // pure FIN it returns `(offset, [], true)`; a drained stream
-                // returns `None` and ends this stream's inner loop.
+                // `pop_chunk` returns a refcount-shared view of the queued
+                // bytes (retained for retransmission — no heap copy); we
+                // frame them into `out` ourselves, the TX path's single
+                // per-byte pass. For a pure FIN it returns an empty view
+                // with `fin = true`; a drained stream returns `None` and
+                // ends this stream's inner loop.
                 match s.pop_chunk(max_chunk) {
                     Some((offset, data, fin)) => {
                         crate::frame::append_stream_header(*sid, offset, fin, data.len(), out)
                             .map_err(|_| ConnError::Wire)?;
-                        out.extend_from_slice(&data);
+                        out.extend_from_slice(data.data());
                         ack_eliciting = true;
                         let data_popped = data.len();
                         cc_budget = cc_budget.saturating_sub(data_popped);

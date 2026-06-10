@@ -495,7 +495,7 @@ fn detect_loss_recovers_more_than_64_at_once() {
             sid: 0,
             offset: pn * 100,
             fin: false,
-            data: alloc::vec![0u8; 100],
+            data: iobuf::IOBuf::from(alloc::vec![0u8; 100]),
         }];
         conn.record_sent_packet(crate::CryptoLevel::OneRtt, pn, true, 100);
     }
@@ -753,7 +753,7 @@ fn pacer_arms_deadline_only_when_limited() {
         sid: 0,
         offset: 0,
         fin: false,
-        data: alloc::vec![0u8; 100],
+        data: iobuf::IOBuf::from(alloc::vec![0u8; 100]),
     });
     let d = conn
         .pace_deadline_us()

@@ -169,6 +169,7 @@ impl Connection {
                 largest_acknowledged,
                 &mut largest_pkt,
                 &mut acked_bytes,
+                &mut self.retx_frame_vec_pool,
             );
             let mut largest_smallest = first_smallest;
             for (gap, length) in ack_ranges {
@@ -188,6 +189,7 @@ impl Connection {
                     largest_acknowledged,
                     &mut largest_pkt,
                     &mut acked_bytes,
+                    &mut self.retx_frame_vec_pool,
                 );
                 largest_smallest = low;
             }
