@@ -1104,12 +1104,35 @@ impl Connection {
         out: &mut Vec<u8>,
         pad_to_wire: Option<usize>,
     ) -> Result<(), ConnError> {
-        // `PACKET_BODY_BUDGET` is the module-level const (shared with the
-        // UDP-GSO segment-size math).
-        let send_keys = match self.application_send.as_ref() {
-            Some(k) => k.clone(),
+        // Take-and-restore instead of cloning the ~1.5 KB `DirKeys`
+        // (expanded AES round keys + GHASH state) per packet: the keys
+        // move out of `self` for the encode call — releasing the borrow
+        // the old clone existed to dodge — and are restored on every
+        // exit path. Nothing reached from the encode body consults
+        // `self.application_send` (key rotation runs from the RX path).
+        // Architecture-audit direction #6 precondition: with the clone
+        // gone, boxing the key slots can't regress into a per-packet
+        // heap alloc.
+        let send_keys = match self.application_send.take() {
+            Some(k) => k,
             None => return Ok(()),
         };
+        let r = self.encode_one_rtt_packet_with_keys(&send_keys, out, pad_to_wire);
+        self.application_send = Some(send_keys);
+        r
+    }
+
+    /// The body of [`Self::encode_one_rtt_packet_padded`], with the 1-RTT
+    /// send keys threaded by reference (taken out of `self` by the
+    /// wrapper, so `&mut self` here cannot alias them).
+    fn encode_one_rtt_packet_with_keys(
+        &mut self,
+        send_keys: &super::keys::DirKeys,
+        out: &mut Vec<u8>,
+        pad_to_wire: Option<usize>,
+    ) -> Result<(), ConnError> {
+        // `PACKET_BODY_BUDGET` is the module-level const (shared with the
+        // UDP-GSO segment-size math).
 
         // ── Header ───────────────────────────────────────────────
         // Lay down the short-header bytes first so frames write
@@ -1503,7 +1526,7 @@ impl Connection {
             payload_len,
             total_end,
             pn,
-            &send_keys,
+            send_keys,
             false,
         )?;
         // Egress-composition obs: classify each emitted 1-RTT packet as
