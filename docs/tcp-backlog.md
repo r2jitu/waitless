@@ -96,7 +96,7 @@ otherwise accept. **Effort: S.**
 future ACK (`ack > snd_nxt`); assert `snd_una` is unchanged and the
 retransmit ring is intact, and that the future ACK elicits a bare ACK.
 
-### T2 — Received MSS option ignored; send MSS hardcoded; no PMTUD
+### T2 — MSS option + PMTUD ✅ done (SYN-ACK advertise is the remaining sliver)
 
 > **Status (2026-06-09):** the receive half is ✅ done (`74e53e1`): the
 > SYN's MSS option is parsed (`parse_syn_options`) and the negotiated
@@ -104,10 +104,19 @@ retransmit ring is intact, and that the future ACK elicits a bare ACK.
 > including retransmit re-segmentation. It fixed a live production
 > failure — a 5G/NAT64 path MSS-clamped the SYN to ~1220, our 1460-byte
 > TLS cert flight was silently dropped, and cold (incognito) h2 loads
-> stalled deterministically. Still open, tracked as the follow-up
-> hardening task: *sending* our MSS option in the SYN-ACK (peers
-> currently assume 536 toward us, shrinking upload segments) and PMTUD
-> (ICMP Packet-Too-Big) for the advertise-large-but-path-small case.
+> stalled deterministically.
+>
+> **PMTUD ✅ done (`be7ad67`)** — the mid-path half. We decode ICMPv4
+> Destination-Unreachable/Fragmentation-Needed (RFC 1191) and ICMPv6
+> Packet-Too-Big (RFC 8201) in the RX dispatch, and `tcp::note_path_mtu`
+> lowers the flow's `snd_mss` to fit the next-hop MTU. RFC 5927 anti-spoof:
+> the quoted seq must be in the live send window, the result is floored at
+> the IP minimum and only ever lowers. Same-core only (race-free: a hit in
+> this core's pool ⇒ we own the flow) — cross-core routing on a multi-queue
+> NIC is the follow-up. /obs `pmtu_applied`/`pmtu_dropped`.
+>
+> Remaining sliver: *advertising* our own MSS option in the SYN-ACK (peers
+> currently assume 536 toward us, shrinking their upload segments).
 
 
 **What.** The SYN handler never parses the peer's `MSS` option and
