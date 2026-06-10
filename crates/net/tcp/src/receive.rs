@@ -309,7 +309,88 @@ fn parse_sack_blocks(opts: &[u8], out: &mut [(u32, u32)]) -> usize {
 /// or — when a `recv_chunk` consumer is parked and the ring is
 /// empty — the single-part device buffer is moved into
 /// `pending_chunk` zero-copy.
-pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf>) {
+pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: Chain<OwnedIOBuf>) {
+    tcp_receive_inner(src_ip, dst_ip, segment)
+}
+
+/// Path-MTU floor: never shrink `snd_mss` below the IP minimum-MTU MSS —
+/// 536 (IPv4, RFC 879) / 1220 (IPv6 min MTU 1280 − 60 B headers). Bounds a
+/// forged ICMP's reach (RFC 5927).
+fn pmtu_floor(local_ip: IpAddr) -> u16 {
+    match local_ip {
+        IpAddr::V4(_) => 536,
+        IpAddr::V6(_) => 1220,
+    }
+}
+
+/// React to a Path-MTU report decoded from an ICMPv4 Fragmentation-Needed
+/// (RFC 1191) or ICMPv6 Packet-Too-Big (RFC 8201): lower the connection's
+/// `snd_mss` so future (re)transmissions fit the smaller path MTU — the
+/// other half of the small-MTU (5G / NAT64 / tunnel) story whose
+/// connection-setup half is the peer-MSS honor in the SYN path.
+///
+/// `candidate_mss` is the advertised next-hop MTU minus the IP+TCP headers
+/// (the v4/v6 caller knows the header sizes); `seq` is the quoted first
+/// sequence number of the segment the router dropped.
+///
+/// Security (RFC 5927) — ICMP is unauthenticated and the 4-tuple is on the
+/// wire, so an off-path attacker can forge these to shrink our MSS (a
+/// throughput-degradation DoS). Three gates blunt that:
+///   * the report is matched to a live connection **on this core** — a
+///     successful `tcp_hash_find` here means we are its owning core, so the
+///     `snd_mss` write is single-writer-safe with no cross-core hazard;
+///   * the quoted `seq` must lie inside the current send window
+///     `[snd_una, snd_nxt)` — blind off-path guessing must hit the window;
+///   * the result is floored at the IP minimum and only ever *lowers*
+///     `snd_mss` (PMTUD never raises), so a valid-looking forgery's worst
+///     case is the already-safe minimum segment size.
+///
+/// Returns whether `snd_mss` was lowered. **Multi-core note:** an ICMP
+/// error RSS-hashes to a core by its own header, usually not the flow's
+/// owning core, so on a multi-queue NIC the report is often delivered to
+/// the wrong core and dropped here (`pmtu_dropped`). Routing it to the
+/// owning core (a second `RxInbox` control channel) is a follow-up; PMTUD
+/// fires rarely and the peer-MSS honor already covers the common case.
+pub fn note_path_mtu(
+    remote_ip: IpAddr,
+    remote_port: u16,
+    local_port: u16,
+    seq: u32,
+    candidate_mss: u16,
+) -> bool {
+    let core = kernel_core::cpu_id();
+    let key = tcp_hash_key(remote_ip, remote_port, local_port);
+    let hit = tcp_hash_find(core, key).filter(|&s| {
+        // SAFETY: single worker per core; `s` indexes this core's pool.
+        let c = unsafe { &*conn_ptr(core, s) };
+        c.remote_ip == remote_ip && c.remote_port == remote_port && c.local_port == local_port
+    });
+    let Some(slot) = hit else {
+        crate::diag::COUNTERS.pmtu_dropped.bump();
+        return false;
+    };
+    // SAFETY: found in *this* core's pool ⇒ this is the owning core ⇒ the
+    // mutable borrow is the sole writer.
+    let c = unsafe { &mut *conn_ptr(core, slot) };
+    // RFC 5927 §4.1: act only on a synchronized connection whose quoted seq
+    // is within the live send window.
+    let in_window = seq.wrapping_sub(c.snd_una) < c.flight();
+    if c.state != TcpState::Established || !in_window {
+        crate::diag::COUNTERS.pmtu_dropped.bump();
+        return false;
+    }
+    let new_mss = candidate_mss.max(pmtu_floor(c.local_ip));
+    if new_mss < c.snd_mss {
+        c.snd_mss = new_mss;
+        crate::diag::COUNTERS.pmtu_applied.bump();
+        true
+    } else {
+        crate::diag::COUNTERS.pmtu_dropped.bump();
+        false
+    }
+}
+
+fn tcp_receive_inner(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf>) {
     // Cost instrumentation: bracket every exit (early-return paths
     // included) with a cycle-counter delta. Placed first so we
     // attribute the full per-packet wall clock — including the

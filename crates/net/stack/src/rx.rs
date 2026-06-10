@@ -170,9 +170,57 @@ pub(crate) fn deliver(parsed: types::ParsedL3, chain: Chain<OwnedIOBuf>) {
                 }
             }
         }
+        types::proto::ICMPV4 => {
+            // ICMPv4 — we act only on Destination-Unreachable /
+            // Fragmentation-Needed (RFC 1191 PMTUD); everything else
+            // (echo, other unreachables) is parsed-and-ignored.
+            let Some(first) = chain.iter().next() else {
+                return;
+            };
+            if let Some(seg) = parsed.l4(first.data())
+                && let Some((rip, rport, lport, seq, mss)) = icmpv4_pmtu_report(seg)
+            {
+                tcp::note_path_mtu(rip, rport, lport, seq, mss);
+            }
+        }
         // Any other L4 protocol — no handler; `chain` drops, reposting.
         _ => crate::diag::COUNTERS.unknown_l4.bump(),
     }
+}
+
+/// Decode an ICMPv4 Destination-Unreachable / Fragmentation-Needed
+/// (type 3, code 4, RFC 1191) into a Path-MTU report — `(remote_ip,
+/// remote_port, local_port, quoted_seq, candidate_mss)`, where
+/// `candidate_mss = next-hop-MTU − IPv4(20) − TCP(20)`. `None` for any
+/// other ICMP type/code, a non-TCP or truncated quoted datagram, or a
+/// next-hop MTU below the IPv4 minimum. The quoted datagram was
+/// local→peer, so its IPv4 src is ours and dst is the peer.
+fn icmpv4_pmtu_report(icmp: &[u8]) -> Option<(types::IpAddr, u16, u16, u32, u16)> {
+    // ICMP header (8 B) + quoted IPv4 header (≥ 20) + ≥ 8 B of TCP.
+    if icmp.len() < 8 + 20 + 8 || icmp[0] != 3 || icmp[1] != 4 {
+        return None;
+    }
+    // RFC 1191: the low 16 bits of the 32-bit field after the checksum
+    // carry the next-hop MTU (the high 16 bits are zero).
+    let next_hop_mtu = u16::from_be_bytes([icmp[6], icmp[7]]);
+    if next_hop_mtu < 68 {
+        return None; // below the IPv4 minimum MTU — bogus / legacy zero
+    }
+    let ip = &icmp[8..];
+    if ip[0] >> 4 != 4 {
+        return None;
+    }
+    let ihl = (ip[0] & 0x0f) as usize * 4;
+    if ihl < 20 || ip.len() < ihl + 8 || ip[9] != types::proto::TCP {
+        return None;
+    }
+    let peer = types::Ipv4Addr::from(ip[16], ip[17], ip[18], ip[19]); // quoted dst
+    let tcp = &ip[ihl..];
+    let local_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+    let remote_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+    let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+    let candidate_mss = next_hop_mtu.saturating_sub(40);
+    Some((types::IpAddr::V4(peer), remote_port, local_port, seq, candidate_mss))
 }
 
 /// Narrow a received frame's chain down to its TCP segment and hand

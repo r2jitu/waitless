@@ -31,6 +31,7 @@ pub fn ntohl(n: u32) -> u32 {
 /// family-neutral: the RX L4 dispatch, the TX header builders, and
 /// both IP modules all refer to these.
 pub mod proto {
+    pub const ICMPV4: u8 = 1;
     pub const TCP: u8 = 6;
     pub const UDP: u8 = 17;
     pub const ICMPV6: u8 = 58;

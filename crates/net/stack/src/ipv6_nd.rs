@@ -231,6 +231,13 @@ pub(crate) fn handle_icmpv6(
                 &icmp_out[..n],
             );
         }
+        icmpv6::msg::PACKET_TOO_BIG => {
+            // RFC 8201 Path MTU Discovery: a router on the path can't
+            // forward our segment — lower the flow's send MSS to fit.
+            if let Some((rip, rport, lport, seq, mss)) = icmpv6_ptb_report(payload) {
+                crate::tcp::note_path_mtu(rip, rport, lport, seq, mss);
+            }
+        }
         icmpv6::msg::ROUTER_ADVERTISEMENT => {
             handle_router_advertisement(payload);
         }
@@ -275,4 +282,42 @@ pub(crate) fn handle_icmpv6(
         }
         _ => {}
     }
+}
+
+/// Decode an ICMPv6 Packet-Too-Big (type 2, RFC 4443 §3.2) into a
+/// Path-MTU report — `(remote_ip, remote_port, local_port, quoted_seq,
+/// candidate_mss)` — where `candidate_mss = MTU − IPv6(40) − TCP(20)`.
+/// `None` unless the message quotes one of our TCP segments and the MTU
+/// is a valid (≥ 1280, RFC 8201) value. The quoted datagram was
+/// local→peer, so its IPv6 src is ours and dst is the peer.
+fn icmpv6_ptb_report(icmp: &[u8]) -> Option<(types::IpAddr, u16, u16, u32, u16)> {
+    // ICMPv6 header (8 B: type/code/cksum + 32-bit MTU) + quoted IPv6
+    // header (40) + ≥ 8 B of TCP.
+    if icmp.len() < 8 + 40 + 8 || icmp[0] != icmpv6::msg::PACKET_TOO_BIG {
+        return None;
+    }
+    let mtu = u32::from_be_bytes([icmp[4], icmp[5], icmp[6], icmp[7]]);
+    if mtu < 1280 {
+        return None; // below the IPv6 minimum link MTU — bogus
+    }
+    let ip = &icmp[8..];
+    // version == 6 and next-header == TCP directly (we emit no extension
+    // headers, so our own quoted datagrams never carry them).
+    if ip[0] >> 4 != 6 || ip[6] != types::proto::TCP {
+        return None;
+    }
+    let mut peer = [0u8; 16];
+    peer.copy_from_slice(&ip[24..40]); // quoted IPv6 dst = the peer
+    let tcp = &ip[40..];
+    let local_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+    let remote_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+    let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+    let candidate_mss = mtu.saturating_sub(60).min(u16::MAX as u32) as u16;
+    Some((
+        types::IpAddr::V6(types::Ipv6Addr::from(peer)),
+        remote_port,
+        local_port,
+        seq,
+        candidate_mss,
+    ))
 }

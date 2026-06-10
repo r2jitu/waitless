@@ -31,6 +31,9 @@ use types::{Ipv6Addr, MacAddr, ntohs};
 
 /// ICMPv6 message types we recognize.
 pub mod msg {
+    /// RFC 4443 §3.2 Packet Too Big — carries the next-hop MTU; drives
+    /// IPv6 Path MTU Discovery (RFC 8201).
+    pub const PACKET_TOO_BIG: u8 = 2;
     pub const ECHO_REQUEST: u8 = 128;
     pub const ECHO_REPLY: u8 = 129;
     pub const ROUTER_SOLICITATION: u8 = 133;

@@ -3691,6 +3691,50 @@ fn tail_loss_probe_fires_before_rto_then_caps() {
     );
 }
 
+/// RFC 1191/8201 Path MTU Discovery: an ICMP Path-MTU report (decoded by
+/// the stack into `note_path_mtu`) lowers `snd_mss` — but only for a report
+/// that quotes an in-window sequence of a live flow (RFC 5927 anti-spoof),
+/// only downward, and never below the IP-minimum floor.
+#[test]
+fn path_mtu_report_lowers_snd_mss_with_rfc5927_gates() {
+    let _g = harness();
+    const SP: u16 = 9184;
+    const CP: u16 = 50184;
+    const CLIENT_ISN: u32 = 0xE100;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+    let base = server_isn.wrapping_add(1);
+    assert_eq!(conn_snd_mss(CP, SP), 1460, "no SYN MSS option → local default");
+
+    // Put 1000 bytes in flight so the send window is [base, base+1000).
+    {
+        let mut chain = iobuf::IOBufChain::from(alloc::vec![b'z'; 1000]);
+        super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    }
+    let remote = v4(CLIENT_IP);
+
+    // A wrong-flow report (unknown peer IP) finds nothing → no change.
+    assert!(!super::note_path_mtu(v4([10, 0, 0, 99]), CP, SP, base, 1200));
+    assert_eq!(conn_snd_mss(CP, SP), 1460, "no matching flow → untouched");
+
+    // An out-of-window quoted seq is rejected (blind off-path forgery).
+    assert!(!super::note_path_mtu(remote, CP, SP, base.wrapping_add(50_000), 1200));
+    assert_eq!(conn_snd_mss(CP, SP), 1460, "out-of-window quote rejected");
+
+    // A valid in-window report lowers snd_mss to MTU(1240)−40 = 1200.
+    assert!(super::note_path_mtu(remote, CP, SP, base.wrapping_add(100), 1200));
+    assert_eq!(conn_snd_mss(CP, SP), 1200, "in-window report lowers snd_mss");
+
+    // A larger MTU never raises it (PMTUD is monotone-down).
+    assert!(!super::note_path_mtu(remote, CP, SP, base.wrapping_add(100), 1400));
+    assert_eq!(conn_snd_mss(CP, SP), 1200, "PMTUD never raises snd_mss");
+
+    // A tiny MTU is floored at the IPv4 minimum (536), never below.
+    assert!(super::note_path_mtu(remote, CP, SP, base.wrapping_add(100), 100));
+    assert_eq!(conn_snd_mss(CP, SP), 536, "floored at the IPv4 minimum");
+}
+
 /// Locate the live (non-listener) connection for a client/server
 /// port pair and return its `(handle, generation)` so a scenario
 /// can drive the real send path (`async_try_send_chain`).

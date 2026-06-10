@@ -58,7 +58,7 @@ pub use listener::{
     do_recv_chunk, init, is_readable_or_closed, listen_on_core, register_recv_waker,
     register_send_waker, set_chunk_buf_slot, shutdown_all,
 };
-pub use receive::tcp_receive;
+pub use receive::{note_path_mtu, tcp_receive};
 pub use retransmit::{has_armed_timers, on_tcp_tick};
 pub use send::{async_try_send_chain, try_send_tso};
 pub use state::{TcpConnection, TcpState};
