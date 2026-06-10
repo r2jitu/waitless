@@ -326,12 +326,19 @@ on top (RFC 9114 framing + RFC 9204 QPACK) is tracked in
   `server_app_secret`, toggles `send_key_phase`, stamps the 1-RTT
   KEY_PHASE bit). Unit-tested
   (`key_update_rotates_send_keys_and_toggles_phase`).
-- ✅ **Path validation** (RFC 9000 §8.2.2) — **done**. A received
-  PATH_CHALLENGE is now echoed in a PATH_RESPONSE (was parsed-and-
-  dropped). This is the primitive connection migration / NAT-rebinding
-  rely on. **Remaining for full migration**: switching the active
-  peer address + CID after a validated path change (L; the echo is the
-  foundation).
+- ✅ **Path validation + connection migration** (RFC 9000 §8.2.2 / §9.3)
+  — **done (auth-gated)**. A received PATH_CHALLENGE is echoed in a
+  PATH_RESPONSE, and the TX peer address now follows the peer's source
+  across a NAT rebind / network change — but **only after a packet from
+  the new source authenticates** (`Connection::authenticated_pkts`,
+  bumped past the AEAD `?`; `is_path_migration` gate in the conn task).
+  This *fixed a real traffic-redirection*: the old code followed the
+  source of every unauthenticated datagram, so a spoof of the cleartext
+  DCID could redirect our traffic. Unit-tested
+  (`path_migration_gate_classifies_new_sources`); /obs `path_migrations`.
+  **Remaining hardening**: we don't yet *initiate* our own PATH_CHALLENGE
+  to probe the new path before fully committing (RFC 9000 §9.3.1
+  anti-amplification on the unvalidated path) + CID rotation.
 - **Optional / not a correctness gap**: Retry-token handling — we don't
   send Retry packets; we use the RFC 9000 §8.1 3× anti-amplification
   limit (the baseline mechanism) instead, which is conformant. Retry is
