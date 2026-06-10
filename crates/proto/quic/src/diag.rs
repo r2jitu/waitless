@@ -529,7 +529,7 @@ pub struct DropRecord {
     /// The `quic_drop!` reason — a counter field name, always
     /// identifier-safe so it needs no JSON escaping.
     pub reason: &'static str,
-    /// `tls::ticket::now_us()` at the drop.
+    /// `crate::time::now_us()` at the drop.
     pub at_us: u64,
 }
 
@@ -555,7 +555,7 @@ pub struct ConnCloseRecord {
     pub reason: [u8; 32],
     /// Valid prefix length of `reason` (≤ 32).
     pub reason_len: u8,
-    /// `tls::ticket::now_us()` at receipt.
+    /// `crate::time::now_us()` at receipt.
     pub at_us: u64,
 }
 
@@ -618,7 +618,7 @@ pub struct ConnExitRecord {
     pub last_recv_age_us: u64,
     /// The negotiated idle window the age above was compared to.
     pub idle_us: u64,
-    /// `tls::ticket::now_us()` at exit.
+    /// `crate::time::now_us()` at exit.
     pub at_us: u64,
 }
 
@@ -652,7 +652,7 @@ pub struct LossRecord {
     pub min_lost_age_us: u64,
     /// In-flight (unacked) sent-packet count at entry to detect_loss.
     pub inflight_pkts: u64,
-    /// `tls::ticket::now_us()` at the declaration.
+    /// `crate::time::now_us()` at the declaration.
     pub at_us: u64,
 }
 
@@ -694,7 +694,7 @@ fn write_json_ascii(w: &mut dyn fmt::Write, bytes: &[u8]) -> fmt::Result {
 pub fn record_drop(reason: &'static str) {
     LAST_DROP.record(DropRecord {
         reason,
-        at_us: tls::ticket::now_us(),
+        at_us: crate::time::now_us(),
     });
 }
 
@@ -703,7 +703,7 @@ pub fn record_drop(reason: &'static str) {
 pub fn record_bug(reason: &'static str) {
     LAST_BUG.record(DropRecord {
         reason,
-        at_us: tls::ticket::now_us(),
+        at_us: crate::time::now_us(),
     });
 }
 
@@ -721,7 +721,7 @@ pub fn record_conn_close(is_app: bool, error_code: u64, frame_type: u64, reason:
         frame_type,
         reason: buf,
         reason_len: n as u8,
-        at_us: tls::ticket::now_us(),
+        at_us: crate::time::now_us(),
     });
 }
 
@@ -752,7 +752,7 @@ pub fn record_conn_exit(
         iterations,
         last_recv_age_us,
         idle_us,
-        at_us: tls::ticket::now_us(),
+        at_us: crate::time::now_us(),
     });
 }
 

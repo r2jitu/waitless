@@ -55,7 +55,7 @@ impl Connection {
         // counts — even one we'll fail to decrypt below — because
         // the peer is clearly still trying. RFC 9000 §10.1 only
         // requires receipt, not successful processing.
-        self.last_recv_us = tls::ticket::now_us();
+        self.last_recv_us = crate::time::now_us();
         // Anti-amplification accounting (RFC 9000 §8.1.2): all
         // bytes received from the peer's address count toward our
         // 3× send credit, including ones that fail to decrypt.

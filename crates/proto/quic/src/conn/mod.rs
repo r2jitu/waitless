@@ -1529,7 +1529,7 @@ impl Connection {
     /// allocates a slot and then disappears entirely (no further
     /// datagrams) still gets reaped after the idle window.
     pub fn set_last_recv_now(&mut self) {
-        self.last_recv_us = tls::ticket::now_us();
+        self.last_recv_us = crate::time::now_us();
     }
 
     /// Microseconds-since-boot timestamp of the most recent inbound

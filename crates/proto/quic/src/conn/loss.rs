@@ -201,7 +201,7 @@ impl Connection {
         if let Some(pkt) = largest_pkt
             && pkt.ack_eliciting
         {
-            let now = tls::ticket::now_us();
+            let now = crate::time::now_us();
             let latest = now.saturating_sub(pkt.time_sent_us);
             // Scale the raw wire value into µs by the peer's advertised
             // ack_delay_exponent (default 3 → 8 µs units; the old code
@@ -227,7 +227,7 @@ impl Connection {
                 self.min_rtt_us.unwrap_or(0) as u32,
             );
             // ms timestamp for a time-based controller (CUBIC); NewReno ignores it.
-            let now_ms = tls::ticket::now_us() / 1000;
+            let now_ms = crate::time::now_us() / 1000;
             self.cc
                 .on_ack(acked_bytes, self.bytes_in_flight, rtt, now_ms);
         }
@@ -289,7 +289,7 @@ impl Connection {
         // floor — the h3 real-RTT throughput bug. At low RTT the term is
         // irrelevant (packet-threshold dominates; ACKs return in µs).
         let time_threshold_us = ((max_rtt * 9) / 8).max(K_GRANULARITY_US) + ack_delay_us;
-        let now = tls::ticket::now_us();
+        let now = crate::time::now_us();
 
         let space = match level {
             CryptoLevel::Initial => &mut self.initial_space,
@@ -456,7 +456,7 @@ impl Connection {
         ack_eliciting: bool,
         byte_count: u32,
     ) {
-        let now = tls::ticket::now_us();
+        let now = crate::time::now_us();
         // Take the STREAM frames the encoder staged for this packet (empty
         // for ACK-only / PING / CRYPTO packets) so they ride along for
         // retransmission on loss.

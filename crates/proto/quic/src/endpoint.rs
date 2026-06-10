@@ -289,7 +289,7 @@ impl QuicConn {
     /// diagnose it.
     pub async fn recv(&self, sid: u64, out: &mut [u8]) -> (usize, bool) {
         const STUCK_THRESHOLD_US: u64 = 5_000_000; // 5 s
-        let entered_us = tls::ticket::now_us();
+        let entered_us = crate::time::now_us();
         let mut warned = false;
         loop {
             {
@@ -310,7 +310,7 @@ impl QuicConn {
                 }
             }
             if !warned {
-                let elapsed = tls::ticket::now_us().saturating_sub(entered_us);
+                let elapsed = crate::time::now_us().saturating_sub(entered_us);
                 if elapsed > STUCK_THRESHOLD_US {
                     let state = self.conn.borrow().recv_stream_state(sid);
                     // A handler that hasn't made progress in 5 s is
@@ -622,7 +622,7 @@ async fn listener_loop<H, F>(
         // Stamp arrival time once per datagram — carried on the
         // `Datagram` to the conn task, where it feeds the
         // `inbox_wait` / `request_latency` performance histograms.
-        let rx_us = tls::ticket::now_us();
+        let rx_us = crate::time::now_us();
         buf.truncate(n);
         let dcid = match extract_dcid(&buf) {
             Some(d) => d,
@@ -885,7 +885,7 @@ where
                 c.app_ack_deadline_us(),
             )
         };
-        let now = tls::ticket::now_us();
+        let now = crate::time::now_us();
         let elapsed = now.saturating_sub(last_recv_us);
         if elapsed >= idle_us {
             crate::quic_event!(
@@ -931,7 +931,7 @@ where
                 // NOT self-identifying, and timer granularity can
                 // wake us a hair early. Re-derive from the clock
                 // rather than trusting which deadline it "was".
-                let after = tls::ticket::now_us();
+                let after = crate::time::now_us();
                 // Genuine idle timeout: no inbound datagram for the
                 // full idle window. This MUST mirror the
                 // top-of-loop `elapsed >= idle_us` check exactly.
@@ -1027,7 +1027,7 @@ where
             // arrival time the conn carries forward so a request's
             // RX→TX latency can be sampled when its response FINs.
             let rx_us = d.rx_us;
-            crate::diag::INBOX_WAIT.record(tls::ticket::now_us().saturating_sub(rx_us));
+            crate::diag::INBOX_WAIT.record(crate::time::now_us().saturating_sub(rx_us));
             // Pass the datagram as `&mut [u8]` so the per-packet
             // processors can do HP-unprotect + AEAD-decrypt in
             // place rather than allocating a fresh buffer per
@@ -1153,7 +1153,7 @@ where
     // vs `idle_us` — that decide whether an idle exit was spurious.
     {
         let c = conn.borrow();
-        let last_recv_age = tls::ticket::now_us().saturating_sub(c.last_recv_us());
+        let last_recv_age = crate::time::now_us().saturating_sub(c.last_recv_us());
         crate::diag::record_conn_exit(
             exit_reason,
             &local_cid_bytes,

@@ -460,7 +460,7 @@ impl SendStream {
     fn enter_fin_sent(&mut self) {
         self.state = SendState::FinSent;
         if self.rx_us != 0 {
-            let lat_us = tls::ticket::now_us().saturating_sub(self.rx_us);
+            let lat_us = crate::time::now_us().saturating_sub(self.rx_us);
             crate::diag::REQUEST_LATENCY.record(lat_us);
             self.rx_us = 0;
         }

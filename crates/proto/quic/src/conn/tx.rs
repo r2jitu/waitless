@@ -234,7 +234,7 @@ impl Connection {
     /// keep the budget positive and ship without a pacing wait (see
     /// `MAX_PACE_BURST`).
     fn pace_gate(&mut self) -> bool {
-        let now = tls::ticket::now_us();
+        let now = crate::time::now_us();
         let rate = self.pace_rate(); // always > 0
         let elapsed = now.saturating_sub(self.pace_last_us);
         let add = rate.saturating_mul(elapsed) / 1_000_000;
@@ -707,7 +707,7 @@ impl Connection {
         const STREAM_DATA_WINDOW: u64 = crate::streams::INITIAL_MAX_STREAM_DATA;
         // 1-RTT ACK: piggyback (data present) or standalone-due.
         if self.application_space.ack_pending
-            && (self.has_pending_one_rtt_data() || self.app_ack_due(tls::ticket::now_us()))
+            && (self.has_pending_one_rtt_data() || self.app_ack_due(crate::time::now_us()))
         {
             return true;
         }
@@ -1143,7 +1143,7 @@ impl Connection {
         // packet per inbound datagram. `||` short-circuits so `now_us()`
         // is read only when not piggybacking.
         if self.application_space.ack_pending
-            && (self.has_pending_one_rtt_data() || self.app_ack_due(tls::ticket::now_us()))
+            && (self.has_pending_one_rtt_data() || self.app_ack_due(crate::time::now_us()))
         {
             self.append_ack_frame(out, &self.application_space);
             self.application_space.ack_pending = false;

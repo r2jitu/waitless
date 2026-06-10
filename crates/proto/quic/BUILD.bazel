@@ -56,6 +56,7 @@ rust_library(
         "src/endpoint.rs",
         "src/inbox.rs",
         "src/streams.rs",
+        "src/time.rs",
         "src/tls.rs",
     ],
     compile_data = [
