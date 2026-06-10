@@ -234,8 +234,13 @@ pub(crate) fn handle_icmpv6(
         icmpv6::msg::PACKET_TOO_BIG => {
             // RFC 8201 Path MTU Discovery: a router on the path can't
             // forward our segment — lower the flow's send MSS to fit.
-            if let Some((rip, rport, lport, seq, mss)) = icmpv6_ptb_report(payload) {
-                crate::tcp::note_path_mtu(rip, rport, lport, seq, mss);
+            if let Some((rip, rport, lport, seq, mss)) = icmpv6_ptb_report(payload)
+                && crate::tcp::note_path_mtu(rip, rport, lport, seq, mss)
+                    == crate::tcp::PathMtuOutcome::NoConn
+            {
+                // Not our flow — RSS hashed the ICMP error by its own
+                // header. Route it to the owning core.
+                crate::ctrl::broadcast_path_mtu(rip, rport, lport, seq, mss);
             }
         }
         icmpv6::msg::ROUTER_ADVERTISEMENT => {

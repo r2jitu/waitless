@@ -3714,25 +3714,37 @@ fn path_mtu_report_lowers_snd_mss_with_rfc5927_gates() {
     }
     let remote = v4(CLIENT_IP);
 
-    // A wrong-flow report (unknown peer IP) finds nothing → no change.
-    assert!(!super::note_path_mtu(v4([10, 0, 0, 99]), CP, SP, base, 1200));
+    use super::PathMtuOutcome::{Applied, NoConn, Rejected};
+
+    // A wrong-flow report (unknown peer IP) finds nothing → `NoConn`,
+    // the signal the stack uses to route the report to the owning core
+    // over the cross-core control lane.
+    assert_eq!(super::note_path_mtu(v4([10, 0, 0, 99]), CP, SP, base, 1200), NoConn);
     assert_eq!(conn_snd_mss(CP, SP), 1460, "no matching flow → untouched");
 
     // An out-of-window quoted seq is rejected (blind off-path forgery).
-    assert!(!super::note_path_mtu(remote, CP, SP, base.wrapping_add(50_000), 1200));
+    assert_eq!(
+        super::note_path_mtu(remote, CP, SP, base.wrapping_add(50_000), 1200),
+        Rejected
+    );
     assert_eq!(conn_snd_mss(CP, SP), 1460, "out-of-window quote rejected");
 
     // A valid in-window report lowers snd_mss to MTU(1240)−40 = 1200.
-    assert!(super::note_path_mtu(remote, CP, SP, base.wrapping_add(100), 1200));
+    assert_eq!(super::note_path_mtu(remote, CP, SP, base.wrapping_add(100), 1200), Applied);
     assert_eq!(conn_snd_mss(CP, SP), 1200, "in-window report lowers snd_mss");
 
     // A larger MTU never raises it (PMTUD is monotone-down).
-    assert!(!super::note_path_mtu(remote, CP, SP, base.wrapping_add(100), 1400));
+    assert_eq!(super::note_path_mtu(remote, CP, SP, base.wrapping_add(100), 1400), Rejected);
     assert_eq!(conn_snd_mss(CP, SP), 1200, "PMTUD never raises snd_mss");
 
     // A tiny MTU is floored at the IPv4 minimum (536), never below.
-    assert!(super::note_path_mtu(remote, CP, SP, base.wrapping_add(100), 100));
+    assert_eq!(super::note_path_mtu(remote, CP, SP, base.wrapping_add(100), 100), Applied);
     assert_eq!(conn_snd_mss(CP, SP), 536, "floored at the IPv4 minimum");
+
+    // A routed re-apply is idempotent: the same report arriving again
+    // (e.g. via the broadcast lane) finds nothing left to lower.
+    assert_eq!(super::note_path_mtu(remote, CP, SP, base.wrapping_add(100), 100), Rejected);
+    assert_eq!(conn_snd_mss(CP, SP), 536, "re-applied report changes nothing");
 }
 
 /// Locate the live (non-listener) connection for a client/server

@@ -23,6 +23,16 @@ pub struct Counters {
     /// no handler for — not TCP / UDP / ICMPv6. Dropped after the
     /// L3 parse; also silent before now.
     pub unknown_l4: Counter,
+    /// PMTUD reports that missed this core's connection table and were
+    /// broadcast over the cross-core control lane (one bump per
+    /// report, not per recipient). Whether the owner then applied or
+    /// rejected it shows up in tcp's `pmtu_applied` / `pmtu_dropped`.
+    pub pmtu_routed: Counter,
+    /// Control-lane sends dropped because the shared node pool was
+    /// momentarily exhausted — should stay 0 (messages are rare and
+    /// drained every loop); a climbing value means a producer is
+    /// flooding the lane.
+    pub ctrl_dropped: Counter,
 }
 
 impl Counters {
@@ -30,6 +40,8 @@ impl Counters {
         Counters {
             classified_drops: Counter::new(),
             unknown_l4: Counter::new(),
+            pmtu_routed: Counter::new(),
+            ctrl_dropped: Counter::new(),
         }
     }
 }
@@ -73,11 +85,13 @@ pub fn record_classified_drop(frame: &[u8]) {
 }
 
 /// Counter `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 2] {
+pub fn snapshot() -> [(&'static str, u64); 4] {
     let c = &COUNTERS;
     [
         ("classified_drops", c.classified_drops.get()),
         ("unknown_l4", c.unknown_l4.get()),
+        ("pmtu_routed", c.pmtu_routed.get()),
+        ("ctrl_dropped", c.ctrl_dropped.get()),
     ]
 }
 

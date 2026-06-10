@@ -27,6 +27,7 @@ pub use udp;
 
 use kernel_bare::percpu;
 
+mod ctrl;
 pub mod diag;
 mod ipv6_nd;
 mod rx;

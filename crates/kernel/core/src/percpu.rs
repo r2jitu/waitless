@@ -64,6 +64,53 @@ pub fn rx_node_pool() -> &'static RxNodePool<RxChain, RX_NODE_POOL_CAP> {
     &RX_NODE_POOL
 }
 
+/// A cross-core control message — a small copyable fact one core
+/// learned that a *different* core owns. Carried by each core's
+/// `PerCore::ctrl_inbox` over [`ctrl_node_pool`]: the control twin of
+/// the Tier-2 RX data lane (`rx_inbox` + [`rx_node_pool`]), reusing the
+/// same MPSC mechanism. The lane is message-generic on purpose — every
+/// future cross-core fact (flow rebalancing, migration hints, …) should
+/// add a variant here and ride this one audited channel rather than
+/// grow a bespoke one. The net stack owns the send/handle policy.
+pub enum CtrlMsg {
+    /// A TCP Path-MTU report (ICMPv4 Fragmentation-Needed / ICMPv6
+    /// Packet-Too-Big) that arrived on a core that does not own the
+    /// quoted flow: a multi-queue NIC RSS-hashes the ICMP error by its
+    /// *own* header, not the quoted TCP 4-tuple, so it usually lands on
+    /// the wrong core. Broadcast so the owning core — whichever it is —
+    /// applies it; every other recipient's lookup misses and ignores it.
+    PathMtu {
+        remote_ip: net_types::IpAddr,
+        remote_port: u16,
+        local_port: u16,
+        /// Quoted first sequence number of the segment the router dropped.
+        seq: u32,
+        /// Advertised next-hop MTU minus the IP+TCP headers.
+        candidate_mss: u16,
+    },
+}
+
+/// Node count of the shared control-lane pool. Control messages are
+/// rare (a PMTUD report fires once per flow per path-MTU change) and a
+/// broadcast parks at most `num_cores − 1` nodes until the next drain
+/// pass, so 64 is generous. On momentary exhaustion `distribute`
+/// returns the message to the sender, which drops it — every current
+/// message is an advisory hint whose trigger re-fires (a too-big
+/// retransmit elicits a fresh ICMP error).
+pub const CTRL_NODE_POOL_CAP: usize = 64;
+
+/// The one shared control-lane node pool. Valid only after [`init`]
+/// has run its `CTRL_NODE_POOL.init()`.
+static CTRL_NODE_POOL: RxNodePool<CtrlMsg, CTRL_NODE_POOL_CAP> = RxNodePool::new();
+
+/// The global control-lane node pool — senders (`distribute` to a
+/// target core's `ctrl_inbox`) and the per-core drain both route
+/// through it.
+#[inline]
+pub fn ctrl_node_pool() -> &'static RxNodePool<CtrlMsg, CTRL_NODE_POOL_CAP> {
+    &CTRL_NODE_POOL
+}
+
 // `CurrentWorker` + `PerWorker<T>` (runtime-sized) live in `//crates/runtime/worker`
 // so native can share them. Kept under the `kernel_bare::percpu` path via
 // re-export so existing callers don't shift.
@@ -112,6 +159,12 @@ pub struct PerCore {
     /// shared `rx_inbox` node pool, no frame copy); this core drains
     /// it via `net_drain_cb`. See [`crate::rx_inbox`].
     pub rx_inbox: RxInbox,
+
+    /// Control inbox — the cross-core lane for [`CtrlMsg`] facts
+    /// (first consumer: wrong-core PMTUD reports). Same MPSC mechanism
+    /// as `rx_inbox`, over [`ctrl_node_pool`]; drained by this core in
+    /// the same event-loop stage.
+    pub ctrl_inbox: RxInbox,
 
     /// Inbox for Tier 2 RX delivery (SPSC: core 0 writes, this core reads).
     pub inbox: spsc::Ring<Task>,
@@ -208,6 +261,7 @@ impl PerCore {
             id,
             _pad: 0,
             rx_inbox: RxInbox::new(),
+            ctrl_inbox: RxInbox::new(),
             inbox: spsc::Ring::new(),
             pinned: spsc::Ring::new(),
             stealable: Deque::new(),
@@ -245,6 +299,7 @@ pub unsafe fn init(count: u32) {
     // BSP-only, single-threaded — no AP has started, so this races
     // nothing.
     RX_NODE_POOL.init();
+    CTRL_NODE_POOL.init();
     executor::init(count);
 }
 

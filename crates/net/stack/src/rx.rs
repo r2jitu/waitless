@@ -179,8 +179,11 @@ pub(crate) fn deliver(parsed: types::ParsedL3, chain: Chain<OwnedIOBuf>) {
             };
             if let Some(seg) = parsed.l4(first.data())
                 && let Some((rip, rport, lport, seq, mss)) = icmpv4_pmtu_report(seg)
+                && tcp::note_path_mtu(rip, rport, lport, seq, mss) == tcp::PathMtuOutcome::NoConn
             {
-                tcp::note_path_mtu(rip, rport, lport, seq, mss);
+                // Not our flow — RSS hashed the ICMP error by its own
+                // header. Route it to the owning core.
+                crate::ctrl::broadcast_path_mtu(rip, rport, lport, seq, mss);
             }
         }
         // Any other L4 protocol — no handler; `chain` drops, reposting.

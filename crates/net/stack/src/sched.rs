@@ -277,9 +277,14 @@ fn net_drain_cb(core_id: u32) -> bool {
     // skips straight to the L4 stack (no re-parse) and drops the
     // chain there, reposting its device buffers. No frame-byte copy
     // (item C).
-    core.rx_inbox.drain_each(percpu::rx_node_pool(), |frame| {
+    let drained_rx = core.rx_inbox.drain_each(percpu::rx_node_pool(), |frame| {
         rx::deliver(frame.parsed, frame.chain)
-    }) > 0
+    }) > 0;
+    // Control lane: cross-core facts another core routed to us (first
+    // consumer: wrong-core PMTUD reports). Rare — usually one empty-head
+    // load.
+    let drained_ctrl = crate::ctrl::drain(core);
+    drained_rx | drained_ctrl
 }
 
 fn net_flush_cb() {

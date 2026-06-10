@@ -345,19 +345,20 @@ fn pmtu_floor(local_ip: IpAddr) -> u16 {
 ///     `snd_mss` (PMTUD never raises), so a valid-looking forgery's worst
 ///     case is the already-safe minimum segment size.
 ///
-/// Returns whether `snd_mss` was lowered. **Multi-core note:** an ICMP
-/// error RSS-hashes to a core by its own header, usually not the flow's
-/// owning core, so on a multi-queue NIC the report is often delivered to
-/// the wrong core and dropped here (`pmtu_dropped`). Routing it to the
-/// owning core (a second `RxInbox` control channel) is a follow-up; PMTUD
-/// fires rarely and the peer-MSS honor already covers the common case.
+/// **Multi-core note:** an ICMP error RSS-hashes to a core by its own
+/// header, usually not the flow's owning core, so on a multi-queue NIC
+/// the report is often delivered to the wrong core and misses here
+/// (`NoConn`). The stack then broadcasts it over the cross-core control
+/// lane (`kernel_core::percpu::CtrlMsg::PathMtu`) and the owning core
+/// re-runs this function — which re-checks every RFC 5927 gate, so a
+/// routed report gets no trust the original didn't have.
 pub fn note_path_mtu(
     remote_ip: IpAddr,
     remote_port: u16,
     local_port: u16,
     seq: u32,
     candidate_mss: u16,
-) -> bool {
+) -> PathMtuOutcome {
     let core = kernel_core::cpu_id();
     let key = tcp_hash_key(remote_ip, remote_port, local_port);
     let hit = tcp_hash_find(core, key).filter(|&s| {
@@ -366,8 +367,10 @@ pub fn note_path_mtu(
         c.remote_ip == remote_ip && c.remote_port == remote_port && c.local_port == local_port
     });
     let Some(slot) = hit else {
-        crate::diag::COUNTERS.pmtu_dropped.bump();
-        return false;
+        // Not this core's flow — no counter: the caller either routes
+        // it on (origin core) or expected the miss (broadcast recipient
+        // that doesn't own the flow).
+        return PathMtuOutcome::NoConn;
     };
     // SAFETY: found in *this* core's pool ⇒ this is the owning core ⇒ the
     // mutable borrow is the sole writer.
@@ -377,17 +380,32 @@ pub fn note_path_mtu(
     let in_window = seq.wrapping_sub(c.snd_una) < c.flight();
     if c.state != TcpState::Established || !in_window {
         crate::diag::COUNTERS.pmtu_dropped.bump();
-        return false;
+        return PathMtuOutcome::Rejected;
     }
     let new_mss = candidate_mss.max(pmtu_floor(c.local_ip));
     if new_mss < c.snd_mss {
         c.snd_mss = new_mss;
         crate::diag::COUNTERS.pmtu_applied.bump();
-        true
+        PathMtuOutcome::Applied
     } else {
         crate::diag::COUNTERS.pmtu_dropped.bump();
-        false
+        PathMtuOutcome::Rejected
     }
+}
+
+/// What [`note_path_mtu`] did with a Path-MTU report on this core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathMtuOutcome {
+    /// This core owns the flow and lowered its `snd_mss`.
+    Applied,
+    /// This core owns the flow but the report failed an RFC 5927 gate
+    /// (state / quoted-seq window) or would not lower `snd_mss`.
+    /// Counted as `pmtu_dropped`.
+    Rejected,
+    /// No such flow on this core — on a multi-queue NIC the report
+    /// likely RSS-hashed to the wrong core. Not counted here; the
+    /// origin core routes it over the control lane.
+    NoConn,
 }
 
 fn tcp_receive_inner(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf>) {
