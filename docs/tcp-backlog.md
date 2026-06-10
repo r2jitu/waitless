@@ -158,7 +158,14 @@ as the gap fills. This is the prerequisite for SACK (T7). **Effort: L.**
 ultimately delivered in sequence and the gap-filling segment releases
 the queued tail.
 
-### T4 — A SYN on a synchronized connection corrupts the pool
+### T4 — A SYN on a synchronized connection corrupts the pool ✅ done
+
+**Status.** Fixed. The SYN handler now probes the 4-tuple hash once; a
+SYN matching an `Established` TCB sends a (rate-limited) RFC 5961 §4
+challenge ACK and drops the SYN, leaving the live connection intact —
+no second TCB, no orphan. A legitimate restart answers the challenge
+with an RST (in-window → tears down → client re-SYNs). See
+`syn_on_established_conn_elicits_a_challenge_ack` in `tests.rs`.
 
 **What.** The SYN handler treats only non-`Established` slots as a
 "stale twin." A SYN arriving on a live `Established` 4-tuple leaves the
@@ -182,9 +189,21 @@ TCB. Pairs naturally with T5. **Effort: S–M.**
 4-tuple; assert a single challenge ACK, no new TCB, the original
 connection still delivers data.
 
-### T5 — RFC 5961 §4/§5 challenge ACKs and rate limiting
+### T5 — RFC 5961 §4/§5 challenge ACKs and rate limiting ✅ done (§7 rate limit + §4/§3.10.7.4 routed; §5-in-window deferred)
 
-**What.** Only the §3.2 RST check is implemented. There is no
+**Status.** A per-core token-bucket challenge-ACK rate limit
+(`CHALLENGE_ACK_RATE`/`CHALLENGE_ACK_BURST`, RFC 5961 §7) now gates the
+two challenge-ACK triggers we emit: the SYN-on-`Established` path (§4,
+T4) and the RFC 9293 §3.10.7.4 out-of-window-ACK path. Both route
+through `send_challenge_ack`, counted via `challenge_ack_sent` /
+`challenge_ack_throttled` on `/obs`. See
+`challenge_acks_are_rate_limited` in `tests.rs`. **Deferred:** the §5
+in-window-but-off-`rcv_nxt` *data*-injection challenge (we still drop
+such data silently, which is safe, just not the proactive challenge) —
+folds into T3 out-of-order reassembly, which needs the in-window
+classification anyway.
+
+**What (original).** Only the §3.2 RST check is implemented. There is no
 challenge-ACK path for an in-window-but-not-exact SYN (§4) or for
 blind data injection (§5), and no challenge-ACK rate limit.
 
