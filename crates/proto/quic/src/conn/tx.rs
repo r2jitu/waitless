@@ -917,11 +917,9 @@ impl Connection {
         crypto_bytes: &[u8],
         emit_ack: bool,
     ) -> Result<(), ConnError> {
-        let send_keys = self
-            .initial_send
-            .as_ref()
-            .ok_or(ConnError::BadState)?
-            .clone();
+        if self.initial_send.is_none() {
+            return Err(ConnError::BadState);
+        }
         let pn = self.initial_space.next_send_pn;
         self.initial_space.next_send_pn += 1;
 
@@ -978,7 +976,11 @@ impl Connection {
 
         let ack_eliciting = !crypto_bytes.is_empty();
         let byte_count = (total_end - header_start) as u32;
-        self.seal_packet(
+        // Take-and-restore across the seal (see
+        // `encode_one_rtt_packet_padded` for why this replaces the
+        // ~1.5 KB `DirKeys` clone); restored on both paths.
+        let send_keys = self.initial_send.take().ok_or(ConnError::BadState)?;
+        let sealed = self.seal_packet(
             out,
             header_start,
             pn_offset,
@@ -988,7 +990,9 @@ impl Connection {
             pn,
             &send_keys,
             true,
-        )?;
+        );
+        self.initial_send = Some(send_keys);
+        sealed?;
         self.record_sent_packet(CryptoLevel::Initial, pn, ack_eliciting, byte_count);
         Ok(())
     }
@@ -999,11 +1003,9 @@ impl Connection {
         crypto_bytes: &[u8],
         emit_ack: bool,
     ) -> Result<(), ConnError> {
-        let send_keys = self
-            .handshake_send
-            .as_ref()
-            .ok_or(ConnError::BadState)?
-            .clone();
+        if self.handshake_send.is_none() {
+            return Err(ConnError::BadState);
+        }
         let pn = self.handshake_space.next_send_pn;
         self.handshake_space.next_send_pn += 1;
 
@@ -1060,7 +1062,8 @@ impl Connection {
 
         let ack_eliciting = !crypto_bytes.is_empty();
         let byte_count = (total_end - header_start) as u32;
-        self.seal_packet(
+        let send_keys = self.handshake_send.take().ok_or(ConnError::BadState)?;
+        let sealed = self.seal_packet(
             out,
             header_start,
             pn_offset,
@@ -1070,7 +1073,9 @@ impl Connection {
             pn,
             &send_keys,
             true,
-        )?;
+        );
+        self.handshake_send = Some(send_keys);
+        sealed?;
         self.record_sent_packet(CryptoLevel::Handshake, pn, ack_eliciting, byte_count);
         Ok(())
     }
@@ -1571,7 +1576,7 @@ impl Connection {
         .map_err(|_| ConnError::Wire)?;
         let frames = &frame_buf[..frame_n];
 
-        if let Some(send_keys) = self.application_send.as_ref().cloned() {
+        if self.application_send.is_some() {
             // 1-RTT short-header packet.
             let pn = self.application_space.next_send_pn;
             self.application_space.next_send_pn += 1;
@@ -1592,7 +1597,8 @@ impl Connection {
             let payload_len = out.len() - payload_offset;
             out.extend_from_slice(&[0u8; TAG_LEN]);
             let total_end = out.len();
-            return self.seal_packet(
+            let send_keys = self.application_send.take().ok_or(ConnError::BadState)?;
+            let sealed = self.seal_packet(
                 out,
                 header_start,
                 pn_offset,
@@ -1603,9 +1609,11 @@ impl Connection {
                 &send_keys,
                 false,
             );
+            self.application_send = Some(send_keys);
+            return sealed;
         }
 
-        if let Some(send_keys) = self.handshake_send.as_ref().cloned() {
+        if self.handshake_send.is_some() {
             // Handshake long-header packet.
             let pn = self.handshake_space.next_send_pn;
             self.handshake_space.next_send_pn += 1;
@@ -1629,7 +1637,8 @@ impl Connection {
             out.extend_from_slice(frames);
             out.extend_from_slice(&[0u8; TAG_LEN]);
             let total_end = out.len();
-            return self.seal_packet(
+            let send_keys = self.handshake_send.take().ok_or(ConnError::BadState)?;
+            let sealed = self.seal_packet(
                 out,
                 header_start,
                 pn_offset,
@@ -1640,9 +1649,11 @@ impl Connection {
                 &send_keys,
                 true,
             );
+            self.handshake_send = Some(send_keys);
+            return sealed;
         }
 
-        if let Some(send_keys) = self.initial_send.as_ref().cloned() {
+        if self.initial_send.is_some() {
             // Initial long-header packet.
             let pn = self.initial_space.next_send_pn;
             self.initial_space.next_send_pn += 1;
@@ -1667,7 +1678,8 @@ impl Connection {
             out.extend_from_slice(frames);
             out.extend_from_slice(&[0u8; TAG_LEN]);
             let total_end = out.len();
-            return self.seal_packet(
+            let send_keys = self.initial_send.take().ok_or(ConnError::BadState)?;
+            let sealed = self.seal_packet(
                 out,
                 header_start,
                 pn_offset,
@@ -1678,6 +1690,8 @@ impl Connection {
                 &send_keys,
                 true,
             );
+            self.initial_send = Some(send_keys);
+            return sealed;
         }
 
         // No send keys at any level — peer has no way to decrypt
@@ -1701,10 +1715,9 @@ impl Connection {
 
         match level {
             CryptoLevel::OneRtt => {
-                let send_keys = match self.application_send.as_ref() {
-                    Some(k) => k.clone(),
-                    None => return Ok(()),
-                };
+                if self.application_send.is_none() {
+                    return Ok(());
+                }
                 let pn = self.application_space.next_send_pn;
                 self.application_space.next_send_pn += 1;
                 let pn_length: usize = 4;
@@ -1723,7 +1736,8 @@ impl Connection {
                 out.extend_from_slice(&[0u8; TAG_LEN]);
                 let total_end = out.len();
                 let byte_count = (total_end - header_start) as u32;
-                self.seal_packet(
+                let send_keys = self.application_send.take().ok_or(ConnError::BadState)?;
+                let sealed = self.seal_packet(
                     out,
                     header_start,
                     pn_offset,
@@ -1733,14 +1747,15 @@ impl Connection {
                     pn,
                     &send_keys,
                     false,
-                )?;
+                );
+                self.application_send = Some(send_keys);
+                sealed?;
                 self.record_sent_packet(CryptoLevel::OneRtt, pn, true, byte_count);
             }
             CryptoLevel::Handshake => {
-                let send_keys = match self.handshake_send.as_ref() {
-                    Some(k) => k.clone(),
-                    None => return Ok(()),
-                };
+                if self.handshake_send.is_none() {
+                    return Ok(());
+                }
                 let pn = self.handshake_space.next_send_pn;
                 self.handshake_space.next_send_pn += 1;
                 let pn_length: usize = 4;
@@ -1764,7 +1779,8 @@ impl Connection {
                 out.extend_from_slice(&[0u8; TAG_LEN]);
                 let total_end = out.len();
                 let byte_count = (total_end - header_start) as u32;
-                self.seal_packet(
+                let send_keys = self.handshake_send.take().ok_or(ConnError::BadState)?;
+                let sealed = self.seal_packet(
                     out,
                     header_start,
                     pn_offset,
@@ -1774,14 +1790,15 @@ impl Connection {
                     pn,
                     &send_keys,
                     true,
-                )?;
+                );
+                self.handshake_send = Some(send_keys);
+                sealed?;
                 self.record_sent_packet(CryptoLevel::Handshake, pn, true, byte_count);
             }
             CryptoLevel::Initial => {
-                let send_keys = match self.initial_send.as_ref() {
-                    Some(k) => k.clone(),
-                    None => return Ok(()),
-                };
+                if self.initial_send.is_none() {
+                    return Ok(());
+                }
                 let pn = self.initial_space.next_send_pn;
                 self.initial_space.next_send_pn += 1;
                 let pn_length: usize = 4;
@@ -1806,7 +1823,8 @@ impl Connection {
                 out.extend_from_slice(&[0u8; TAG_LEN]);
                 let total_end = out.len();
                 let byte_count = (total_end - header_start) as u32;
-                self.seal_packet(
+                let send_keys = self.initial_send.take().ok_or(ConnError::BadState)?;
+                let sealed = self.seal_packet(
                     out,
                     header_start,
                     pn_offset,
@@ -1816,7 +1834,9 @@ impl Connection {
                     pn,
                     &send_keys,
                     true,
-                )?;
+                );
+                self.initial_send = Some(send_keys);
+                sealed?;
                 self.record_sent_packet(CryptoLevel::Initial, pn, true, byte_count);
             }
         }
