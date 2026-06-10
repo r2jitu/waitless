@@ -43,6 +43,19 @@ impl<'a> Reader<'a> {
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    /// Read a 3-byte big-endian length (TLS `uint24`).
+    pub(super) fn read_u24(&mut self) -> Result<usize, ParseError> {
+        let b = self.read_bytes(3)?;
+        Ok(((b[0] as usize) << 16) | ((b[1] as usize) << 8) | (b[2] as usize))
+    }
+
+    /// Read a length-prefixed vector where the length is a big-endian
+    /// uint24 (Certificate's `certificate_list` / `cert_data` shape).
+    pub(super) fn read_vector_u24(&mut self) -> Result<&'a [u8], ParseError> {
+        let len = self.read_u24()?;
+        self.read_bytes(len)
+    }
+
     /// Read a length-prefixed vector where the length is a u8.
     pub(super) fn read_vector_u8(&mut self) -> Result<&'a [u8], ParseError> {
         if self.remaining() < 1 {

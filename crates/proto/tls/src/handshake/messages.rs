@@ -7,10 +7,15 @@
 //   Finished (build + parse) RFC 8446 §4.4.4
 //   NewSessionTicket         RFC 8446 §4.6.1
 //
+// …plus the mirror PARSERS the client role (`client.rs`) needs to
+// consume the same flight: `parse_encrypted_extensions`,
+// `parse_certificate_leaf`, `parse_certificate_verify`.
+//
 // All are sans-io byte-slice helpers — the caller wraps each body with
 // `encode_handshake(...)` before handing it to the record layer.
 
-use super::{HASH_LEN, ParseError, sig_scheme};
+use super::reader::Reader;
+use super::{HASH_LEN, ParseError, ext_type, sig_scheme};
 
 // ============================================================================
 // EncryptedExtensions builder (RFC 8446 §4.3.1)
@@ -45,6 +50,67 @@ pub fn build_encrypted_extensions(extras: &[(u16, &[u8])], out: &mut [u8]) -> Op
         p += 4 + data.len();
     }
     Some(2 + body_len)
+}
+
+// ============================================================================
+// EncryptedExtensions parser (client role's mirror half)
+// ============================================================================
+
+/// Parsed view of an EncryptedExtensions body — just the two
+/// extensions the client role cares about. Unknown extensions are
+/// tolerated/skipped.
+#[derive(Clone, Copy)]
+pub struct EncryptedExtensionsView<'a> {
+    /// The single ALPN protocol name the server selected (RFC 7301
+    /// §3.2), if it echoed one. The caller checks it against its
+    /// offered list.
+    pub alpn_protocol: Option<&'a [u8]>,
+    /// Raw `quic_transport_parameters` blob (RFC 9001 §8.2), for the
+    /// future QUIC client driver. `None` over TCP.
+    pub quic_transport_parameters: Option<&'a [u8]>,
+}
+
+/// Parse an EncryptedExtensions body: `u16 extensions_len || (u16
+/// ext_type || u16 ext_len || data)*`. Bounds-checked throughout; no
+/// input can panic.
+pub fn parse_encrypted_extensions(body: &[u8]) -> Result<EncryptedExtensionsView<'_>, ParseError> {
+    let mut r = Reader::new(body);
+    let ext_bytes = r.read_vector_u16()?;
+    if !r.is_empty() {
+        return Err(ParseError::BadLength);
+    }
+    let mut er = Reader::new(ext_bytes);
+    let mut alpn_protocol = None;
+    let mut quic_transport_parameters = None;
+    while !er.is_empty() {
+        let ext_type_v = er.read_u16()?;
+        let ext_data = er.read_vector_u16()?;
+        match ext_type_v {
+            ext_type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION => {
+                // RFC 7301 §3.2: the server's echo carries EXACTLY one
+                // protocol name: u16 list_len || u8 name_len || name.
+                let mut ar = Reader::new(ext_data);
+                let names = ar.read_vector_u16()?;
+                if !ar.is_empty() {
+                    return Err(ParseError::BadExtension);
+                }
+                let mut nr = Reader::new(names);
+                let name = nr.read_vector_u8()?;
+                if name.is_empty() || !nr.is_empty() {
+                    return Err(ParseError::BadExtension);
+                }
+                alpn_protocol = Some(name);
+            }
+            ext_type::QUIC_TRANSPORT_PARAMETERS => {
+                quic_transport_parameters = Some(ext_data);
+            }
+            _ => { /* tolerate/skip unknown extensions */ }
+        }
+    }
+    Ok(EncryptedExtensionsView {
+        alpn_protocol,
+        quic_transport_parameters,
+    })
 }
 
 // ============================================================================
@@ -121,6 +187,33 @@ pub fn build_certificate(chain: &[&[u8]], out: &mut [u8]) -> Option<usize> {
     Some(p)
 }
 
+/// Parse a Certificate body and return the LEAF certificate's DER
+/// bytes (the first `CertificateEntry`'s `cert_data`).
+///
+/// The client role authenticates by SPKI pin on the leaf, so the rest
+/// of the chain is irrelevant — its entries are not even walked (the
+/// list length is bounds-checked; trailing entries stay opaque).
+/// Full chain / web-PKI validation is a documented non-goal.
+pub fn parse_certificate_leaf(body: &[u8]) -> Result<&[u8], ParseError> {
+    let mut r = Reader::new(body);
+    // certificate_request_context<0..2^8-1> — empty for server auth;
+    // skipped either way.
+    let _ctx = r.read_vector_u8()?;
+    // certificate_list<0..2^24-1>
+    let list = r.read_vector_u24()?;
+    if !r.is_empty() {
+        return Err(ParseError::BadLength);
+    }
+    let mut lr = Reader::new(list);
+    // First CertificateEntry: cert_data<1..2^24-1> + extensions.
+    let leaf = lr.read_vector_u24()?;
+    if leaf.is_empty() {
+        return Err(ParseError::BadLength);
+    }
+    let _leaf_extensions = lr.read_vector_u16()?;
+    Ok(leaf)
+}
+
 // ============================================================================
 // CertificateVerify builder (RFC 8446 §4.4.3)
 // ============================================================================
@@ -170,6 +263,19 @@ pub fn build_certificate_verify(signature: &[u8], out: &mut [u8]) -> Option<usiz
     out[2..4].copy_from_slice(&(signature.len() as u16).to_be_bytes());
     out[4..4 + signature.len()].copy_from_slice(signature);
     Some(total)
+}
+
+/// Parse a CertificateVerify body: `(SignatureScheme, signature)`.
+/// The caller checks the scheme and verifies the DER-encoded ECDSA
+/// signature against the §4.4.3 signed content.
+pub fn parse_certificate_verify(body: &[u8]) -> Result<(u16, &[u8]), ParseError> {
+    let mut r = Reader::new(body);
+    let algorithm = r.read_u16()?;
+    let signature = r.read_vector_u16()?;
+    if !r.is_empty() {
+        return Err(ParseError::BadLength);
+    }
+    Ok((algorithm, signature))
 }
 
 // ============================================================================
@@ -471,5 +577,85 @@ mod tests {
     fn new_session_ticket_rejects_empty_ticket() {
         let mut out = [0u8; 64];
         assert!(build_new_session_ticket(60, 0, &[], &[], &[], &mut out).is_none());
+    }
+
+    // ── Client-role mirror parsers ──────────────────────────────────
+
+    #[test]
+    fn parse_encrypted_extensions_round_trips_builder() {
+        // Empty EE (the fresh TCP path).
+        let mut out = [0u8; 64];
+        let n = build_encrypted_extensions(&[], &mut out).unwrap();
+        let ee = parse_encrypted_extensions(&out[..n]).unwrap();
+        assert!(ee.alpn_protocol.is_none());
+        assert!(ee.quic_transport_parameters.is_none());
+
+        // ALPN echo + a QUIC transport-params blob.
+        let alpn_body = [0u8, 3, 2, b'h', b'2'];
+        let qtp = [0xab, 0xcd];
+        let extras: &[(u16, &[u8])] = &[
+            (ext_type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION, &alpn_body),
+            (ext_type::QUIC_TRANSPORT_PARAMETERS, &qtp),
+        ];
+        let n = build_encrypted_extensions(extras, &mut out).unwrap();
+        let ee = parse_encrypted_extensions(&out[..n]).unwrap();
+        assert_eq!(ee.alpn_protocol, Some(&b"h2"[..]));
+        assert_eq!(ee.quic_transport_parameters, Some(&qtp[..]));
+    }
+
+    #[test]
+    fn parse_encrypted_extensions_rejects_malformed() {
+        // Trailing junk after the extensions vector.
+        assert_eq!(
+            parse_encrypted_extensions(&[0x00, 0x00, 0xff]).err(),
+            Some(ParseError::BadLength)
+        );
+        // ALPN echo with TWO names is not a valid server selection.
+        let alpn_two = [0u8, 6, 2, b'h', b'2', 2, b'h', b'3'];
+        let extras: &[(u16, &[u8])] = &[(
+            ext_type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
+            &alpn_two,
+        )];
+        let mut out = [0u8; 64];
+        let n = build_encrypted_extensions(extras, &mut out).unwrap();
+        assert_eq!(
+            parse_encrypted_extensions(&out[..n]).err(),
+            Some(ParseError::BadExtension)
+        );
+        // Truncated never panics.
+        for end in 0..n {
+            let _ = parse_encrypted_extensions(&out[..end]);
+        }
+    }
+
+    #[test]
+    fn parse_certificate_leaf_round_trips_builder() {
+        let leaf: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+        let intermediate: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let mut out = [0u8; 64];
+        let n = build_certificate(&[&leaf, &intermediate], &mut out).unwrap();
+        let parsed = parse_certificate_leaf(&out[..n]).unwrap();
+        assert_eq!(parsed, &leaf[..]);
+        // Truncations never panic.
+        for end in 0..n {
+            let _ = parse_certificate_leaf(&out[..end]);
+        }
+    }
+
+    #[test]
+    fn parse_certificate_verify_round_trips_builder() {
+        let sig = [0x22u8; 71];
+        let mut out = [0u8; 128];
+        let n = build_certificate_verify(&sig, &mut out).unwrap();
+        let (alg, parsed_sig) = parse_certificate_verify(&out[..n]).unwrap();
+        assert_eq!(alg, sig_scheme::ECDSA_SECP256R1_SHA256);
+        assert_eq!(parsed_sig, &sig[..]);
+        // Trailing junk is rejected; truncations never panic.
+        let mut long = out[..n].to_vec();
+        long.push(0);
+        assert!(parse_certificate_verify(&long).is_err());
+        for end in 0..n {
+            let _ = parse_certificate_verify(&out[..end]);
+        }
     }
 }

@@ -27,6 +27,12 @@
 //   `Finished`, `NewSessionTicket` builders covering the server side
 //   of the TLS 1.3 handshake. See `messages.rs`.
 // - `Finished` parser for the client's response (`messages.rs`).
+// - Client-role mirror halves: `ClientHello` BUILDER
+//   (`client_hello.rs`), `ServerHello` PARSER incl. HelloRetryRequest
+//   detection (`server_hello.rs`), and parsers for
+//   EncryptedExtensions / Certificate-leaf / CertificateVerify
+//   (`messages.rs`). Driven by the `TlsClient` state machine in
+//   `crate::client`.
 //
 // Explicitly out of scope (future work):
 // - signature_algorithms extension parsing / enforcement (we
@@ -54,12 +60,22 @@ mod reader;
 mod server_hello;
 
 // Public re-exports preserve the pre-split `tls::handshake::*` API.
-pub use client_hello::{AlpnIter, ClientHello, PskOffer, iter_alpn};
-pub use messages::{
-    build_certificate, build_certificate_verify, build_encrypted_extensions, build_finished,
-    build_new_session_ticket, parse_finished, sign_content_server_cert_verify,
+// The client-role mirror halves (`build_client_hello`,
+// `parse_server_hello`, the EE / Certificate / CertificateVerify
+// parsers) export alongside their server-role counterparts.
+pub use client_hello::{
+    AlpnIter, ClientHello, ClientHelloParams, PskOffer, build_client_hello, iter_alpn,
 };
-pub use server_hello::{build_server_hello, build_server_pre_shared_key_ext};
+pub use messages::{
+    EncryptedExtensionsView, build_certificate, build_certificate_verify,
+    build_encrypted_extensions, build_finished, build_new_session_ticket,
+    parse_certificate_leaf, parse_certificate_verify, parse_encrypted_extensions, parse_finished,
+    sign_content_server_cert_verify,
+};
+pub use server_hello::{
+    HELLO_RETRY_REQUEST_RANDOM, ServerHelloView, build_server_hello,
+    build_server_pre_shared_key_ext, parse_server_hello,
+};
 
 // ============================================================================
 // Constants

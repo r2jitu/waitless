@@ -1,4 +1,5 @@
-// ClientHello parser (subset: only what TLS 1.3 + X25519 needs)
+// ClientHello parser (subset: only what TLS 1.3 + X25519 needs) and
+// the mirror ClientHello BUILDER used by the client role (`client.rs`).
 //
 // The parser is strict: TLS 1.3 (via supported_versions) must be
 // advertised or we fail with `Unsupported`. Lack of an X25519 key_share
@@ -8,10 +9,14 @@
 // Session-resumption support lives here as well: the parser captures
 // `pre_shared_key` + `psk_key_exchange_modes` and records the binders
 // offset so the caller can later rebuild the partial-transcript hash
-// per RFC 8446 §4.2.11.2.
+// per RFC 8446 §4.2.11.2. (The builder offers no PSK — client-side
+// resumption is a follow-up.)
 
 use super::reader::Reader;
-use super::{ParseError, cipher_suite, ext_type, named_group, psk_ke_mode};
+use super::{
+    LEGACY_VERSION_TLS12, ParseError, VERSION_TLS13, cipher_suite, ext_type, named_group,
+    psk_ke_mode, sig_scheme,
+};
 
 /// Parsed view of a `pre_shared_key` extension (RFC 8446 §4.2.11).
 /// Lives inside `ClientHello.psk` when the client offered resumption.
@@ -397,6 +402,187 @@ impl<'a> ClientHello<'a> {
     }
 }
 
+// ============================================================================
+// ClientHello builder (RFC 8446 §4.1.2) — the client role's mirror half
+// ============================================================================
+
+/// Inputs to [`build_client_hello`]. All entropy arrives by value /
+/// reference — the builder itself is deterministic, so the same params
+/// reproduce the same wire bytes (the deterministic-simulation arc
+/// leans on this).
+#[derive(Clone, Copy)]
+pub struct ClientHelloParams<'a> {
+    /// ClientHello.random — 32 bytes of caller-supplied entropy.
+    pub random: &'a [u8; 32],
+    /// legacy_session_id (0–32 bytes). The client role sends a random
+    /// 32-byte id for middlebox compat (RFC 8446 §D.4) and expects the
+    /// ServerHello to echo it verbatim.
+    pub legacy_session_id: &'a [u8],
+    /// Our ephemeral X25519 public key for the key_share extension.
+    pub x25519_pub: &'a [u8; 32],
+    /// Optional `server_name` (RFC 6066) host bytes. ≤ 255 bytes.
+    pub server_name: Option<&'a [u8]>,
+    /// ALPN protocol names in preference order (RFC 7301). Empty
+    /// list ⇒ no ALPN extension. Each name 1–255 bytes.
+    pub alpn: &'a [&'a [u8]],
+}
+
+/// Serialise a TLS 1.3 ClientHello *body* (the bytes AFTER the 4-byte
+/// handshake header) for the one shape this crate speaks:
+///
+///   cipher_suites        = [TLS_AES_128_GCM_SHA256]
+///   supported_versions   = [0x0304]
+///   supported_groups     = [x25519]
+///   key_share            = one X25519 entry
+///   signature_algorithms = [ecdsa_secp256r1_sha256]
+///   server_name / ALPN   = caller-supplied, optional
+///
+/// Returns bytes written, or `None` if `out` is too small or a
+/// caller-supplied field exceeds its wire bound. The output parses
+/// back through [`ClientHello::parse`] — pinned by a round-trip test.
+pub fn build_client_hello(p: &ClientHelloParams<'_>, out: &mut [u8]) -> Option<usize> {
+    if p.legacy_session_id.len() > 32 {
+        return None;
+    }
+    if p
+        .server_name
+        .is_some_and(|name| name.is_empty() || name.len() > 255)
+    {
+        return None;
+    }
+    // ALPN wire body: u16 list_len || (u8 name_len || name)+.
+    let mut alpn_list_len = 0usize;
+    for name in p.alpn {
+        if name.is_empty() || name.len() > 255 {
+            return None;
+        }
+        alpn_list_len += 1 + name.len();
+    }
+    if alpn_list_len > 0xffff {
+        return None;
+    }
+
+    // Extension envelope sizes (4-byte type+len header + body).
+    let sni_ext = p.server_name.map_or(0, |n| 4 + 2 + 1 + 2 + n.len());
+    let groups_ext = 4 + 2 + 2; // u16 list_len + x25519
+    let sigalgs_ext = 4 + 2 + 2; // u16 list_len + ecdsa_secp256r1_sha256
+    let alpn_ext = if alpn_list_len > 0 {
+        4 + 2 + alpn_list_len
+    } else {
+        0
+    };
+    let sv_ext = 4 + 1 + 2; // u8 list_len + 0x0304
+    let ks_ext = 4 + 2 + 2 + 2 + 32; // u16 shares_len + entry(group, len, key)
+    let ext_total = sni_ext + groups_ext + sigalgs_ext + alpn_ext + sv_ext + ks_ext;
+    if ext_total > 0xffff {
+        return None;
+    }
+
+    let total = 2 // legacy_version
+        + 32 // random
+        + 1 + p.legacy_session_id.len()
+        + 2 + 2 // cipher_suites vector (one suite)
+        + 1 + 1 // legacy_compression_methods (null)
+        + 2 + ext_total;
+    if out.len() < total {
+        return None;
+    }
+
+    let mut q = 0usize;
+    out[q..q + 2].copy_from_slice(&LEGACY_VERSION_TLS12.to_be_bytes());
+    q += 2;
+    out[q..q + 32].copy_from_slice(p.random);
+    q += 32;
+    out[q] = p.legacy_session_id.len() as u8;
+    q += 1;
+    out[q..q + p.legacy_session_id.len()].copy_from_slice(p.legacy_session_id);
+    q += p.legacy_session_id.len();
+    out[q..q + 2].copy_from_slice(&2u16.to_be_bytes());
+    q += 2;
+    out[q..q + 2].copy_from_slice(&cipher_suite::TLS_AES_128_GCM_SHA256.to_be_bytes());
+    q += 2;
+    out[q] = 1; // one compression method
+    q += 1;
+    out[q] = 0; // null
+    q += 1;
+    out[q..q + 2].copy_from_slice(&(ext_total as u16).to_be_bytes());
+    q += 2;
+
+    // Local helper: extension envelope header.
+    fn ext_header(out: &mut [u8], q: &mut usize, ty: u16, body_len: usize) {
+        out[*q..*q + 2].copy_from_slice(&ty.to_be_bytes());
+        out[*q + 2..*q + 4].copy_from_slice(&(body_len as u16).to_be_bytes());
+        *q += 4;
+    }
+
+    // server_name (RFC 6066 §3): ServerNameList of one host_name.
+    if let Some(name) = p.server_name {
+        ext_header(out, &mut q, ext_type::SERVER_NAME, 2 + 1 + 2 + name.len());
+        out[q..q + 2].copy_from_slice(&((1 + 2 + name.len()) as u16).to_be_bytes());
+        q += 2;
+        out[q] = 0; // NameType host_name
+        q += 1;
+        out[q..q + 2].copy_from_slice(&(name.len() as u16).to_be_bytes());
+        q += 2;
+        out[q..q + name.len()].copy_from_slice(name);
+        q += name.len();
+    }
+
+    // supported_groups: just x25519.
+    ext_header(out, &mut q, ext_type::SUPPORTED_GROUPS, 4);
+    out[q..q + 2].copy_from_slice(&2u16.to_be_bytes());
+    q += 2;
+    out[q..q + 2].copy_from_slice(&named_group::X25519.to_be_bytes());
+    q += 2;
+
+    // signature_algorithms: just ecdsa_secp256r1_sha256 — the one
+    // scheme this crate verifies (and the one our server signs with).
+    ext_header(out, &mut q, ext_type::SIGNATURE_ALGORITHMS, 4);
+    out[q..q + 2].copy_from_slice(&2u16.to_be_bytes());
+    q += 2;
+    out[q..q + 2].copy_from_slice(&sig_scheme::ECDSA_SECP256R1_SHA256.to_be_bytes());
+    q += 2;
+
+    // ALPN (RFC 7301).
+    if alpn_list_len > 0 {
+        ext_header(
+            out,
+            &mut q,
+            ext_type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
+            2 + alpn_list_len,
+        );
+        out[q..q + 2].copy_from_slice(&(alpn_list_len as u16).to_be_bytes());
+        q += 2;
+        for name in p.alpn {
+            out[q] = name.len() as u8;
+            q += 1;
+            out[q..q + name.len()].copy_from_slice(name);
+            q += name.len();
+        }
+    }
+
+    // supported_versions (ClientHello form: u8-prefixed list).
+    ext_header(out, &mut q, ext_type::SUPPORTED_VERSIONS, 3);
+    out[q] = 2;
+    q += 1;
+    out[q..q + 2].copy_from_slice(&VERSION_TLS13.to_be_bytes());
+    q += 2;
+
+    // key_share: one X25519 entry.
+    ext_header(out, &mut q, ext_type::KEY_SHARE, 2 + 2 + 2 + 32);
+    out[q..q + 2].copy_from_slice(&36u16.to_be_bytes());
+    q += 2;
+    out[q..q + 2].copy_from_slice(&named_group::X25519.to_be_bytes());
+    q += 2;
+    out[q..q + 2].copy_from_slice(&32u16.to_be_bytes());
+    q += 2;
+    out[q..q + 32].copy_from_slice(p.x25519_pub);
+    q += 32;
+
+    debug_assert_eq!(q, total);
+    Some(q)
+}
+
 /// Iterate the `name_len:u8 || name:bytes` pairs inside an ALPN
 /// extension body. Returns each protocol name as a borrowed slice.
 pub fn iter_alpn(list_bytes: &[u8]) -> AlpnIter<'_> {
@@ -568,6 +754,105 @@ mod tests {
         for end in 0..valid.len() {
             let _ = ClientHello::parse(&valid[..end]);
         }
+    }
+
+    // ── ClientHello builder (client role) ──────────────────────────────────
+
+    /// Pin the builder against our own strict parser: every field and
+    /// extension `build_client_hello` emits must be recovered by
+    /// `ClientHello::parse` (acceptance test f for the client role).
+    #[test]
+    fn build_client_hello_round_trips_through_parser() {
+        let random = [0xabu8; 32];
+        let sid = [0xcdu8; 32];
+        let x25519_pub = [0x77u8; 32];
+        let params = ClientHelloParams {
+            random: &random,
+            legacy_session_id: &sid,
+            x25519_pub: &x25519_pub,
+            server_name: Some(b"dev.r2jitu.com"),
+            alpn: &[b"h2", b"http/1.1"],
+        };
+        let mut buf = [0u8; 512];
+        let n = build_client_hello(&params, &mut buf).expect("build");
+
+        let ch = ClientHello::parse(&buf[..n]).expect("parse own builder output");
+        assert!(ch.offers_tls13);
+        assert!(ch.offers_x25519);
+        assert_eq!(ch.random, &random);
+        assert_eq!(ch.legacy_session_id, &sid[..]);
+        assert_eq!(ch.x25519_client_pub, Some(x25519_pub));
+        // ALPN list round-trips in order.
+        let names: Vec<&[u8]> = iter_alpn(ch.alpn_protocol_list.expect("alpn present")).collect();
+        assert_eq!(names, vec![&b"h2"[..], &b"http/1.1"[..]]);
+        // signature_algorithms carries our one scheme.
+        let algs = &ch.observed_sig_algs[..ch.observed_sig_alg_count as usize];
+        assert!(algs.contains(&sig_scheme::ECDSA_SECP256R1_SHA256));
+        // supported_groups observed x25519.
+        let groups = &ch.observed_supported_groups[..ch.observed_supported_group_count as usize];
+        assert!(groups.contains(&named_group::X25519));
+        // No resumption offer in v1.
+        assert!(ch.psk.is_none());
+        assert_eq!(ch.psk_ke_modes, 0);
+    }
+
+    /// Minimal shape: no SNI, no ALPN — still a valid TLS 1.3 hello.
+    #[test]
+    fn build_client_hello_minimal_parses() {
+        let random = [1u8; 32];
+        let x25519_pub = [2u8; 32];
+        let params = ClientHelloParams {
+            random: &random,
+            legacy_session_id: &[],
+            x25519_pub: &x25519_pub,
+            server_name: None,
+            alpn: &[],
+        };
+        let mut buf = [0u8; 256];
+        let n = build_client_hello(&params, &mut buf).expect("build");
+        let ch = ClientHello::parse(&buf[..n]).expect("parse");
+        assert!(ch.offers_tls13);
+        assert_eq!(ch.legacy_session_id.len(), 0);
+        assert!(ch.alpn_protocol_list.is_none());
+        assert_eq!(ch.x25519_client_pub, Some(x25519_pub));
+    }
+
+    /// Bounds: undersized output and oversized fields fail cleanly.
+    #[test]
+    fn build_client_hello_rejects_bad_inputs() {
+        let random = [1u8; 32];
+        let x25519_pub = [2u8; 32];
+        let base = ClientHelloParams {
+            random: &random,
+            legacy_session_id: &[],
+            x25519_pub: &x25519_pub,
+            server_name: None,
+            alpn: &[],
+        };
+        let mut tiny = [0u8; 32];
+        assert!(build_client_hello(&base, &mut tiny).is_none());
+
+        let mut buf = [0u8; 1024];
+        let long_sid = [0u8; 33];
+        let bad_sid = ClientHelloParams {
+            legacy_session_id: &long_sid,
+            ..base
+        };
+        assert!(build_client_hello(&bad_sid, &mut buf).is_none());
+
+        let empty_alpn_name: &[&[u8]] = &[b""];
+        let bad_alpn = ClientHelloParams {
+            alpn: empty_alpn_name,
+            ..base
+        };
+        assert!(build_client_hello(&bad_alpn, &mut buf).is_none());
+
+        let long_name = [b'a'; 256];
+        let bad_sni = ClientHelloParams {
+            server_name: Some(&long_name),
+            ..base
+        };
+        assert!(build_client_hello(&bad_sni, &mut buf).is_none());
     }
 
     // ── PSK / session-resumption parsing & builders ────────────────────────

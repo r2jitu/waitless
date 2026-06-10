@@ -1,12 +1,15 @@
-// ServerHello + ServerHello pre_shared_key extension builders.
+// ServerHello + ServerHello pre_shared_key extension builders, and the
+// mirror ServerHello PARSER used by the client role (`client.rs`).
 //
 // We only ever issue ServerHellos for one shape:
 //   cipher_suite = TLS_AES_128_GCM_SHA256
 //   key_share    = X25519
 // Other suites / groups are unsupported by this crate, so the builder
-// is concrete rather than parameterised on suite.
+// is concrete rather than parameterised on suite — and the parser is
+// equally strict (anything else fails with `Unsupported`).
 
-use super::{LEGACY_VERSION_TLS12, VERSION_TLS13, cipher_suite, ext_type, named_group};
+use super::reader::Reader;
+use super::{LEGACY_VERSION_TLS12, ParseError, VERSION_TLS13, cipher_suite, ext_type, named_group};
 
 /// Build a ServerHello body for TLS 1.3 with
 /// cipher_suite = TLS_AES_128_GCM_SHA256 and key_share = X25519.
@@ -136,6 +139,163 @@ pub fn build_server_pre_shared_key_ext(selected_identity: u16, out: &mut [u8]) -
     Some(6)
 }
 
+// ============================================================================
+// ServerHello parser (RFC 8446 §4.1.3) — the client role's mirror half
+// ============================================================================
+
+/// RFC 8446 §4.1.3: a ServerHello whose `random` equals this value is
+/// a HelloRetryRequest in disguise. (The constant is SHA-256 of
+/// "HelloRetryRequest" — pinned by a test below.)
+pub const HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8,
+    0x91, 0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8,
+    0x33, 0x9C,
+];
+
+/// Parsed view of a ServerHello body. Byte slices point into the
+/// input buffer — a view, not owned data.
+#[derive(Clone, Copy)]
+pub struct ServerHelloView<'a> {
+    /// Server random (32 bytes).
+    pub random: &'a [u8; 32],
+    /// The echoed legacy_session_id — the client checks it equals
+    /// what it sent (RFC 8446 §4.1.3). Empty for an HRR view.
+    pub legacy_session_id_echo: &'a [u8],
+    /// `true` when `random` is the HelloRetryRequest sentinel. The
+    /// rest of the view is NOT populated in that case — HRR re-uses
+    /// the ServerHello frame but changes the key_share format, and
+    /// HRR support is a documented non-goal (we always offer x25519,
+    /// so a compliant server never needs to retry us).
+    pub is_hello_retry_request: bool,
+    /// The server's X25519 public key from its key_share extension.
+    /// Always `Some` on the non-HRR path (the parser fails with
+    /// `Unsupported` otherwise).
+    pub x25519_server_pub: Option<[u8; 32]>,
+    /// `true` when the server echoed a `pre_shared_key` extension
+    /// (it accepted a resumption offer). The v1 client never offers
+    /// a PSK, so it treats this as a protocol violation.
+    pub has_pre_shared_key: bool,
+}
+
+/// Parse a ServerHello body (the bytes AFTER the handshake header).
+///
+/// Strict mirror of our builder: the cipher suite must be
+/// `TLS_AES_128_GCM_SHA256`, `supported_versions` must select 0x0304,
+/// and a 32-byte X25519 key_share must be present — anything else is
+/// `Unsupported`. Unknown extensions are skipped (tolerated). A
+/// HelloRetryRequest-shaped hello short-circuits: the view comes back
+/// with `is_hello_retry_request = true` and no further validation, so
+/// the caller can surface its own distinct error.
+///
+/// Attacker-facing parser discipline: all reads go through the
+/// bounds-checked `Reader`; no input can panic (fuzz-smoke below).
+pub fn parse_server_hello(body: &[u8]) -> Result<ServerHelloView<'_>, ParseError> {
+    let mut r = Reader::new(body);
+
+    // legacy_version — fixed 0x0303 on the wire; ignored (the real
+    // version is in supported_versions, exactly like the CH parser).
+    let _legacy_version = r.read_u16()?;
+
+    let random_slice = r.read_bytes(32)?;
+    let random: &[u8; 32] = random_slice.try_into().map_err(|_| ParseError::BadLength)?;
+    if *random == HELLO_RETRY_REQUEST_RANDOM {
+        // HRR re-purposes the ServerHello frame with a different
+        // key_share payload — don't validate further, just flag it.
+        return Ok(ServerHelloView {
+            random,
+            legacy_session_id_echo: &[],
+            is_hello_retry_request: true,
+            x25519_server_pub: None,
+            has_pre_shared_key: false,
+        });
+    }
+
+    let legacy_session_id_echo = r.read_vector_u8()?;
+    if legacy_session_id_echo.len() > 32 {
+        return Err(ParseError::BadLength);
+    }
+
+    let suite = r.read_u16()?;
+    if suite != cipher_suite::TLS_AES_128_GCM_SHA256 {
+        return Err(ParseError::Unsupported);
+    }
+
+    let compression = r.read_bytes(1)?;
+    if compression[0] != 0 {
+        // TLS 1.3 ServerHello MUST carry null compression.
+        return Err(ParseError::Unsupported);
+    }
+
+    let ext_bytes = r.read_vector_u16()?;
+    if !r.is_empty() {
+        return Err(ParseError::BadLength);
+    }
+
+    let mut er = Reader::new(ext_bytes);
+    let mut selected_tls13 = false;
+    let mut x25519_server_pub: Option<[u8; 32]> = None;
+    let mut has_pre_shared_key = false;
+    while !er.is_empty() {
+        let ext_type_v = er.read_u16()?;
+        let ext_data = er.read_vector_u16()?;
+        match ext_type_v {
+            ext_type::SUPPORTED_VERSIONS => {
+                // ServerHello form: exactly one u16 selected_version.
+                if ext_data.len() != 2 {
+                    return Err(ParseError::BadExtension);
+                }
+                let v = u16::from_be_bytes([ext_data[0], ext_data[1]]);
+                if v != VERSION_TLS13 {
+                    return Err(ParseError::Unsupported);
+                }
+                selected_tls13 = true;
+            }
+            ext_type::KEY_SHARE => {
+                // ServerHello form: a single KeyShareEntry (no list
+                // prefix): group(u16) || key_exchange<1..2^16-1>.
+                let mut kr = Reader::new(ext_data);
+                let group = kr.read_u16()?;
+                let key_exchange = kr.read_vector_u16()?;
+                if !kr.is_empty() {
+                    return Err(ParseError::BadExtension);
+                }
+                if group != named_group::X25519 || key_exchange.len() != 32 {
+                    return Err(ParseError::Unsupported);
+                }
+                let mut pk = [0u8; 32];
+                pk.copy_from_slice(key_exchange);
+                x25519_server_pub = Some(pk);
+            }
+            ext_type::PRE_SHARED_KEY => {
+                // Body is a u16 selected_identity.
+                if ext_data.len() != 2 {
+                    return Err(ParseError::BadExtension);
+                }
+                has_pre_shared_key = true;
+            }
+            _ => { /* tolerate/skip unknown extensions */ }
+        }
+    }
+
+    if !selected_tls13 {
+        // RFC 8446 §4.1.3: supported_versions is mandatory in a
+        // TLS 1.3 ServerHello. Its absence means the peer negotiated
+        // TLS 1.2-or-below — unsupported.
+        return Err(ParseError::Unsupported);
+    }
+    if x25519_server_pub.is_none() {
+        return Err(ParseError::Unsupported);
+    }
+
+    Ok(ServerHelloView {
+        random,
+        legacy_session_id_echo,
+        is_hello_retry_request: false,
+        x25519_server_pub,
+        has_pre_shared_key,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +364,112 @@ mod tests {
     fn server_pre_shared_key_ext_too_small_buffer() {
         let mut out = [0u8; 5];
         assert!(build_server_pre_shared_key_ext(0, &mut out).is_none());
+    }
+
+    // ── ServerHello parser (client role) ────────────────────────────
+
+    /// The HRR sentinel is, per RFC 8446 §4.1.3, SHA-256 of the ASCII
+    /// string "HelloRetryRequest" — pin the constant against the math.
+    #[test]
+    fn hrr_random_is_sha256_of_label() {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"HelloRetryRequest");
+        let digest: [u8; 32] = h.finalize().into();
+        assert_eq!(digest, HELLO_RETRY_REQUEST_RANDOM);
+    }
+
+    /// Builder → parser round-trip: every field the builder emits is
+    /// recovered, for both the fresh and resumption shapes.
+    #[test]
+    fn parse_server_hello_round_trips_builder() {
+        let random = [0x5au8; 32];
+        let sid = [0x66u8; 32];
+        let server_pub = [0x99u8; 32];
+        let mut out = [0u8; 256];
+
+        let n = build_server_hello(&random, &sid, &server_pub, None, &mut out).unwrap();
+        let sh = parse_server_hello(&out[..n]).expect("parse fresh");
+        assert!(!sh.is_hello_retry_request);
+        assert_eq!(sh.random, &random);
+        assert_eq!(sh.legacy_session_id_echo, &sid[..]);
+        assert_eq!(sh.x25519_server_pub, Some(server_pub));
+        assert!(!sh.has_pre_shared_key);
+
+        let n = build_server_hello(&random, &sid, &server_pub, Some(0), &mut out).unwrap();
+        let sh = parse_server_hello(&out[..n]).expect("parse resumed");
+        assert!(sh.has_pre_shared_key);
+    }
+
+    /// An HRR-shaped hello is flagged, not parsed strictly.
+    #[test]
+    fn parse_server_hello_detects_hrr() {
+        let sid: [u8; 0] = [];
+        let server_pub = [0x11u8; 32];
+        let mut out = [0u8; 256];
+        let n =
+            build_server_hello(&HELLO_RETRY_REQUEST_RANDOM, &sid, &server_pub, None, &mut out)
+                .unwrap();
+        let sh = parse_server_hello(&out[..n]).expect("HRR view");
+        assert!(sh.is_hello_retry_request);
+        assert!(sh.x25519_server_pub.is_none());
+    }
+
+    /// Strictness: wrong cipher suite / missing supported_versions
+    /// fail with `Unsupported` rather than mis-negotiating.
+    #[test]
+    fn parse_server_hello_rejects_wrong_suite() {
+        let random = [0x42u8; 32];
+        let sid: [u8; 0] = [];
+        let server_pub = [0x11u8; 32];
+        let mut out = [0u8; 256];
+        let n = build_server_hello(&random, &sid, &server_pub, None, &mut out).unwrap();
+        // With an empty session id the cipher suite sits at [35..37]
+        // (see `server_hello_layout`). Corrupt it.
+        out[36] = 0x02; // TLS_AES_256_GCM_SHA384
+        assert_eq!(
+            parse_server_hello(&out[..n]).err(),
+            Some(ParseError::Unsupported)
+        );
+    }
+
+    /// Fuzz-smoke (same discipline as `ClientHello::parse`): random
+    /// buffers, single-byte mutations of a valid hello, and every
+    /// truncation must return — never panic.
+    #[test]
+    fn parse_server_hello_fuzz_smoke_never_panics() {
+        let random = [0x21u8; 32];
+        let sid = [0x33u8; 32];
+        let server_pub = [0x44u8; 32];
+        let mut out = [0u8; 256];
+        let n = build_server_hello(&random, &sid, &server_pub, Some(1), &mut out).unwrap();
+        let valid = &out[..n];
+        assert!(parse_server_hello(valid).is_ok(), "fixture must parse");
+
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // (a) Raw random buffers, varied lengths incl. empty.
+        for _ in 0..20_000 {
+            let len = (rnd() % 256) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| rnd() as u8).collect();
+            let _ = parse_server_hello(&buf);
+        }
+        // (b) Single-byte mutations at every position.
+        for pos in 0..valid.len() {
+            for _ in 0..32 {
+                let mut m = valid.to_vec();
+                m[pos] = rnd() as u8;
+                let _ = parse_server_hello(&m);
+            }
+        }
+        // (c) Truncations at every length.
+        for end in 0..valid.len() {
+            let _ = parse_server_hello(&valid[..end]);
+        }
     }
 }
