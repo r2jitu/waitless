@@ -343,6 +343,36 @@ pub enum TcpSendError {
     Closed,
 }
 
+/// Where an active open (client connect) stands — what
+/// [`TcpBackend::connect_status`] reports and the [`TcpConnect`]
+/// future polls on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpConnectStatus {
+    /// SYN sent, no verdict yet — the future parks on the conn's
+    /// send-waker slot (unused pre-Established) and re-polls when
+    /// the backend wakes it.
+    InProgress,
+    /// Three-way handshake complete — the handle is a live stream.
+    Established,
+    /// The peer actively refused (RST in reply to our SYN).
+    Refused,
+    /// The SYN retry budget was exhausted with no answer.
+    TimedOut,
+}
+
+/// Why [`TcpConnect`] resolved `Err`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpConnectError {
+    /// The peer actively refused the connection.
+    Refused,
+    /// No answer within the backend's SYN retry budget.
+    TimedOut,
+    /// The connect never started — no backend registered, or the
+    /// backend could not allocate a conn slot / ephemeral port /
+    /// socket.
+    Failed,
+}
+
 /// Optional TSO fast-path send. The `fill` closure writes TCP-
 /// payload bytes directly into the driver's big-slot TX-pool
 /// buffer; the backend stamps L2/L3/L4 headers around them and
@@ -381,6 +411,22 @@ pub struct TcpBackend {
     /// bare-metal frees its per-core Listen TCB slots. Backends
     /// without per-listener state can leave this `None`.
     pub unlisten: Option<fn(port: u16)>,
+
+    // Active open (client connect).
+    /// Start an active open to `ip:port` on the **calling worker**.
+    /// Sends the SYN (bare-metal) / issues the nonblocking
+    /// `connect(2)` (native) and returns the embryo conn's handle +
+    /// generation — the SAME handle shape `accept` yields, so the
+    /// established stream is an ordinary [`TcpStream`].
+    /// `TcpStream::NULL` when no slot / port / socket could be had.
+    /// Completion is observed via [`Self::connect_status`]; the
+    /// waiter parks on the conn's send-waker slot (unused
+    /// pre-Established).
+    pub connect: fn(ip: crate::ip::IpAddr, port: u16) -> TcpStream,
+    /// Poll an in-flight active open. Stale `generation` reports a
+    /// terminal status so the future resolves rather than parking
+    /// forever.
+    pub connect_status: fn(handle: *mut (), generation: u16) -> TcpConnectStatus,
 
     // Per-stream recv hooks (hot path — TcpRecv::poll).
     /// Cheap non-blocking probe. Returns `true` also on close or
@@ -774,6 +820,120 @@ impl<'a> Future for TcpAccept<'a> {
         }
 
         Poll::Pending
+    }
+}
+
+// ---- Active open (client connect) -------------------------------------------
+//
+// `tcp_connect(ip, port).await` resolves with a live `TcpStream` once
+// the backend reports the handshake complete, or an error on refusal
+// / timeout. The future holds the embryo conn as a `TcpStream` from
+// its first poll, so cancellation (drop before completion) closes it
+// through the ordinary `TcpStream::Drop` → `close` path — no leaked
+// SynSent slots. The waiter parks on the conn's send-waker slot,
+// which is unused pre-Established.
+
+/// Start an active open to `ip:port` on the calling worker. The
+/// returned future resolves to the connected [`TcpStream`] — the same
+/// handle/generation shape `TcpListener::accept` yields.
+pub fn tcp_connect(ip: crate::ip::IpAddr, port: u16) -> TcpConnect {
+    TcpConnect {
+        ip,
+        port,
+        stream: None,
+        _not_send: PhantomData,
+    }
+}
+
+/// Future returned by [`tcp_connect`]. `!Send` — the conn handle
+/// points into per-worker state, like every other TCP future here.
+pub struct TcpConnect {
+    ip: crate::ip::IpAddr,
+    port: u16,
+    /// The embryo conn, present once the first poll has issued the
+    /// backend `connect`. Held as a `TcpStream` so dropping this
+    /// future before completion closes the half-open conn (releases
+    /// the backend slot) via the stream's own `Drop`.
+    stream: Option<TcpStream>,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl Future for TcpConnect {
+    type Output = Result<TcpStream, TcpConnectError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let b = match tcp_backend() {
+            Some(b) => b,
+            None => return Poll::Ready(Err(TcpConnectError::Failed)),
+        };
+        // First poll: kick off the connect (SYN / nonblocking
+        // connect(2)). Lazy so constructing the future is free and
+        // the conn is owned by the polling worker.
+        if this.stream.is_none() {
+            let s = (b.connect)(this.ip, this.port);
+            if s.is_null() {
+                return Poll::Ready(Err(TcpConnectError::Failed));
+            }
+            this.stream = Some(s);
+        }
+        let (h, g) = {
+            let s = this.stream.as_ref().expect("installed above");
+            (s.handle, s.generation)
+        };
+        // Fast path — already decided.
+        match (b.connect_status)(h, g) {
+            TcpConnectStatus::Established => {
+                (b.clear_send_waker)(h, g);
+                return Poll::Ready(Ok(this.stream.take().expect("present")));
+            }
+            // Dropping the embryo stream releases the backend slot
+            // (`TcpStream::Drop` → `close`).
+            TcpConnectStatus::Refused => {
+                this.stream = None;
+                return Poll::Ready(Err(TcpConnectError::Refused));
+            }
+            TcpConnectStatus::TimedOut => {
+                this.stream = None;
+                return Poll::Ready(Err(TcpConnectError::TimedOut));
+            }
+            TcpConnectStatus::InProgress => {}
+        }
+        // Park on the send-waker slot, then re-check once — closes
+        // the wake-before-park race with the backend's completion
+        // site (same shape as `TcpRecv::poll`).
+        (b.register_send_waker)(h, g, cx.waker());
+        match (b.connect_status)(h, g) {
+            TcpConnectStatus::InProgress => Poll::Pending,
+            TcpConnectStatus::Established => {
+                (b.clear_send_waker)(h, g);
+                Poll::Ready(Ok(this.stream.take().expect("present")))
+            }
+            TcpConnectStatus::Refused => {
+                this.stream = None;
+                Poll::Ready(Err(TcpConnectError::Refused))
+            }
+            TcpConnectStatus::TimedOut => {
+                this.stream = None;
+                Poll::Ready(Err(TcpConnectError::TimedOut))
+            }
+        }
+    }
+}
+
+impl Drop for TcpConnect {
+    fn drop(&mut self) {
+        // Cancel-safety, structural rather than by-convention (same
+        // discipline as `TcpRecv` / `TcpSendChain`): clear our parked
+        // send waker before the held embryo stream (if any) drops and
+        // closes the conn. Pre-Established the send slot can only be
+        // ours; a post-resolve drop holds no stream and clears
+        // nothing.
+        if let Some(s) = &self.stream
+            && let Some(b) = tcp_backend()
+        {
+            (b.clear_send_waker)(s.handle, s.generation);
+        }
     }
 }
 

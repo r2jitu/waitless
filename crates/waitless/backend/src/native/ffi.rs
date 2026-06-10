@@ -66,6 +66,36 @@ pub(super) const EAGAIN: i32 = 35;
 #[cfg(target_os = "linux")]
 pub(super) const EAGAIN: i32 = 11;
 
+// Nonblocking `connect(2)` progress / verdict codes. The async
+// connect path issues the connect once (expecting EINPROGRESS),
+// then re-issues it from `connect_status` to read the verdict:
+// EALREADY/EINPROGRESS = still going, EISCONN = established,
+// ECONNREFUSED/ECONNRESET = refused, ETIMEDOUT = timed out.
+#[cfg(target_os = "macos")]
+pub(super) const EINPROGRESS: i32 = 36;
+#[cfg(target_os = "linux")]
+pub(super) const EINPROGRESS: i32 = 115;
+#[cfg(target_os = "macos")]
+pub(super) const EALREADY: i32 = 37;
+#[cfg(target_os = "linux")]
+pub(super) const EALREADY: i32 = 114;
+#[cfg(target_os = "macos")]
+pub(super) const EISCONN: i32 = 56;
+#[cfg(target_os = "linux")]
+pub(super) const EISCONN: i32 = 106;
+#[cfg(target_os = "macos")]
+pub(super) const ECONNREFUSED: i32 = 61;
+#[cfg(target_os = "linux")]
+pub(super) const ECONNREFUSED: i32 = 111;
+#[cfg(target_os = "macos")]
+pub(super) const ECONNRESET: i32 = 54;
+#[cfg(target_os = "linux")]
+pub(super) const ECONNRESET: i32 = 104;
+#[cfg(target_os = "macos")]
+pub(super) const ETIMEDOUT: i32 = 60;
+#[cfg(target_os = "linux")]
+pub(super) const ETIMEDOUT: i32 = 110;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct IoVec {
@@ -78,6 +108,7 @@ pub(crate) struct IoVec {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(super) struct SockAddrIn {
     #[cfg(target_os = "macos")]
     pub sin_len: u8,
@@ -148,6 +179,7 @@ unsafe extern "C" {
     pub(super) fn bind(fd: i32, addr: *const SockAddrIn, len: u32) -> i32;
     pub(super) fn listen(fd: i32, backlog: i32) -> i32;
     pub(super) fn accept(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
+    pub(super) fn connect(fd: i32, addr: *const SockAddrIn, len: u32) -> i32;
     pub(super) fn recv(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
     pub(super) fn send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
     pub(super) fn writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> isize;

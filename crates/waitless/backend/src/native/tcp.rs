@@ -179,6 +179,99 @@ fn async_tcp_accept_hook(app_port: u16) -> executor::reactor::TcpStream {
     }
 }
 
+/// Active open via nonblocking POSIX `connect(2)`. Issues the
+/// connect (expecting EINPROGRESS), stamps the conn into the calling
+/// worker's pool, and registers the fd in its event queue — the
+/// EVFILT_WRITE / EPOLLOUT readiness that fires on completion is
+/// armed lazily by `register_send_waker`, exactly the pattern the
+/// pending-send path uses. The verdict is read by
+/// `native_tcp_connect_status`.
+fn native_tcp_connect(ip: executor::ip::IpAddr, port: u16) -> executor::reactor::TcpStream {
+    use executor::reactor::TcpStream;
+    // v4 only — matches the bare-metal backend (v6 source-address
+    // selection is deferred there too).
+    let executor::ip::IpAddr::V4(v4) = ip else {
+        return TcpStream::NULL;
+    };
+    unsafe {
+        let fd = socket(AF_INET, SOCK_STREAM, 0);
+        if fd < 0 {
+            return TcpStream::NULL;
+        }
+        set_nonblocking(fd);
+        // Same Nagle-off policy as accepted conns — the client-role
+        // TLS handshake writes the same small consecutive flights.
+        let opt: i32 = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, 4);
+        let addr = SockAddrIn {
+            #[cfg(target_os = "macos")]
+            sin_len: std::mem::size_of::<SockAddrIn>() as u8,
+            #[cfg(target_os = "macos")]
+            sin_family: AF_INET as u8,
+            #[cfg(target_os = "linux")]
+            sin_family: AF_INET as u16,
+            sin_port: port.to_be(),
+            // `Ipv4Addr.addr` holds the four octets in memory in
+            // network order — the exact bytes `sin_addr` wants.
+            sin_addr: v4.addr,
+            sin_zero: [0; 8],
+        };
+        let r = connect(fd, &addr, std::mem::size_of::<SockAddrIn>() as u32);
+        if r < 0 && errno() != EINPROGRESS {
+            close(fd);
+            return TcpStream::NULL;
+        }
+        let tid = platform::current_worker();
+        let ts = thread_state(tid);
+        let c = ts.alloc_conn();
+        if c.is_null() {
+            close(fd);
+            return TcpStream::NULL;
+        }
+        (*c).fd = fd;
+        (*c).connect_addr = Some(addr);
+        ts.register_fd(fd);
+        TcpStream::from_raw(c as *mut (), (*c).generation)
+    }
+}
+
+/// Poll an in-flight nonblocking connect. Re-issues `connect(2)` on
+/// the same fd — the portable completion probe: the kernel answers
+/// EALREADY/EINPROGRESS while the handshake runs, EISCONN once it
+/// completed, and surfaces the pending error (ECONNREFUSED, …) when
+/// it failed.
+fn native_tcp_connect_status(handle: *mut (), generation: u16) -> executor::reactor::TcpConnectStatus {
+    use executor::reactor::TcpConnectStatus;
+    unsafe {
+        let (c, live) = check_gen(handle, generation);
+        if !live {
+            return TcpConnectStatus::TimedOut;
+        }
+        let fd = (*c).fd;
+        if fd < 0 {
+            return TcpConnectStatus::TimedOut;
+        }
+        let Some(addr) = (*c).connect_addr else {
+            // Not an active-open conn (accepted) — already connected.
+            return TcpConnectStatus::Established;
+        };
+        let r = connect(fd, &addr, std::mem::size_of::<SockAddrIn>() as u32);
+        if r == 0 {
+            return TcpConnectStatus::Established;
+        }
+        match errno() {
+            EISCONN => TcpConnectStatus::Established,
+            EALREADY | EINPROGRESS => TcpConnectStatus::InProgress,
+            ECONNREFUSED | ECONNRESET => TcpConnectStatus::Refused,
+            ETIMEDOUT => TcpConnectStatus::TimedOut,
+            // Any other verdict (EHOSTUNREACH, EINVAL after a consumed
+            // error, …): the connect is dead — report timed out so the
+            // future resolves.
+            _ => TcpConnectStatus::TimedOut,
+        }
+    }
+}
+
 /// Called from `dispatch_ready_fd` (in `super`). Returns `true` iff
 /// `fd` matched an async-TCP listener (and the reactor notification
 /// was issued).
@@ -521,6 +614,8 @@ pub(super) static NATIVE_TCP_BACKEND: executor::reactor::TcpBackend =
         listen: async_tcp_listen_hook,
         accept: async_tcp_accept_hook,
         unlisten: Some(async_tcp_unlisten_hook),
+        connect: native_tcp_connect,
+        connect_status: native_tcp_connect_status,
         has_data: native_tcp_has_data,
         do_recv: native_tcp_do_recv,
         register_recv_waker: native_tcp_register_recv_waker,

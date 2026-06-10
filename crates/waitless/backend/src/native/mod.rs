@@ -121,6 +121,12 @@ struct NativeConn {
     /// poll so we leave it armed across partial-send cycles and
     /// drop it on clear_send_waker / close.
     send_registered: bool,
+    /// Active-open conns only: the destination `connect(2)` was
+    /// issued against. `connect_status` re-issues the (nonblocking)
+    /// connect to read the verdict — EISCONN / EALREADY /
+    /// ECONNREFUSED — which needs the original sockaddr. `None` for
+    /// accepted conns.
+    connect_addr: Option<SockAddrIn>,
 }
 
 impl NativeConn {
@@ -133,6 +139,7 @@ impl NativeConn {
             recv_waker: None,
             send_waker: None,
             send_registered: false,
+            connect_addr: None,
         }
     }
 }
@@ -366,6 +373,7 @@ impl ThreadState {
                 c.recv_waker = None;
                 c.send_waker = None;
                 c.send_registered = false;
+                c.connect_addr = None;
                 // Generation is preserved across reuse — `release_conn`
                 // bumps it.
                 return c as *mut NativeConn;
@@ -391,6 +399,7 @@ impl ThreadState {
             (*c).closed = true;
             (*c).has_pending_data = false;
             (*c).send_registered = false;
+            (*c).connect_addr = None;
             // Bump generation so any still-outstanding async handle
             // sees a mismatch on its next hook call.
             (*c).generation = (*c).generation.wrapping_add(1);

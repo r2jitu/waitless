@@ -235,9 +235,9 @@ pub mod runtime {
     pub use executor::ip::{IpAddr, Ipv4Addr, Ipv6Addr};
     pub use executor::launcher::{LaunchTable, Launcher};
     pub use executor::reactor::{
-        RecvChunk, RecvChunkGuard, TcpBindError, TcpHandle, TcpListener, TcpRecv, TcpSendChain,
-        TcpStream, UdpBindError, UdpClient, UdpHandle, UdpRecv, UdpRecvInplace, UdpSocket,
-        tcp_listen, udp_listen,
+        RecvChunk, RecvChunkGuard, TcpBindError, TcpConnect, TcpConnectError, TcpHandle,
+        TcpListener, TcpRecv, TcpSendChain, TcpStream, UdpBindError, UdpClient, UdpHandle,
+        UdpRecv, UdpRecvInplace, UdpSocket, tcp_connect, tcp_listen, udp_listen,
     };
     pub use executor::select::{Either, Three, join, join3, select, select3, timeout_us};
     pub use executor::{Sleep, SpawnError, TaskHandle, sleep_us, spawn};
@@ -259,6 +259,23 @@ where
     let handle = executor::reactor::tcp_listen(port, body)?;
     _retain(handle);
     Ok(())
+}
+
+/// Open a TCP connection to `ip:port` (active open / client role).
+/// Resolves with the connected stream — the same [`runtime::TcpStream`]
+/// type accepted connections use, with the same generation-checked
+/// handle underneath (a stale handle surviving close+reuse
+/// short-circuits to the closed path on every later op). Errors
+/// distinguish an active refusal (RST) from a SYN-retry timeout from
+/// a connect that never started (no slot / backend).
+///
+/// Must be called from a task (it awaits); the conn is owned by the
+/// calling worker, like every accepted stream.
+pub async fn tcp_connect(
+    ip: runtime::IpAddr,
+    port: u16,
+) -> Result<runtime::TcpStream, executor::reactor::TcpConnectError> {
+    executor::reactor::tcp_connect(ip, port).await
 }
 
 /// Listen for UDP on `port`; semantics match [`tcp_listen`].
