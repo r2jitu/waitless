@@ -176,7 +176,7 @@ fn write_bytes_param(out: &mut Vec<u8>, id: u64, value: &[u8]) {
 /// Subset of client transport parameters the server cares about.
 /// Anything we don't track is silently dropped on parse — RFC 9000
 /// §18.1 requires endpoints to ignore unknown params.
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct ClientParams {
     pub initial_source_connection_id: Option<Vec<u8>>,
     pub initial_max_data: u64,
@@ -186,6 +186,36 @@ pub struct ClientParams {
     pub initial_max_streams_bidi: u64,
     pub initial_max_streams_uni: u64,
     pub max_idle_timeout_ms: u64,
+    /// RFC 9000 §18.2 `ack_delay_exponent` (0x0a): the peer's ACK
+    /// `ack_delay` fields are in `2^exponent` µs units. Default 3
+    /// (8 µs units); values above 20 are a protocol violation.
+    pub ack_delay_exponent: u8,
+    /// RFC 9000 §18.2 `max_ack_delay` (0x0b), in milliseconds: the
+    /// longest the peer will intentionally delay an ACK — feeds our
+    /// PTO and caps the `ack_delay` honored in RTT samples. Default
+    /// 25; values ≥ 2^14 are a protocol violation.
+    pub max_ack_delay_ms: u64,
+}
+
+/// The RFC 9000 §18.2 defaults apply both when a parameter is absent
+/// from the peer's extension and before any extension is parsed, so
+/// `default()` carries them — a derived all-zeros default would
+/// silently misscale every ACK delay.
+impl Default for ClientParams {
+    fn default() -> Self {
+        ClientParams {
+            initial_source_connection_id: None,
+            initial_max_data: 0,
+            initial_max_stream_data_bidi_local: 0,
+            initial_max_stream_data_bidi_remote: 0,
+            initial_max_stream_data_uni: 0,
+            initial_max_streams_bidi: 0,
+            initial_max_streams_uni: 0,
+            max_idle_timeout_ms: 0,
+            ack_delay_exponent: 3,
+            max_ack_delay_ms: 25,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -241,6 +271,24 @@ pub fn parse_client_params(mut bytes: &[u8]) -> Result<ClientParams, ParamsError
             tp_id::MAX_IDLE_TIMEOUT => {
                 out.max_idle_timeout_ms = decode_varint_payload(value)?;
             }
+            tp_id::ACK_DELAY_EXPONENT => {
+                let v = decode_varint_payload(value)?;
+                // RFC 9000 §18.2: values above 20 are invalid — a peer
+                // sending one MUST be treated as a protocol violation
+                // (TRANSPORT_PARAMETER_ERROR; surfaced as a parse error).
+                if v > 20 {
+                    return Err(ParamsError::Wire);
+                }
+                out.ack_delay_exponent = v as u8;
+            }
+            tp_id::MAX_ACK_DELAY => {
+                let v = decode_varint_payload(value)?;
+                // RFC 9000 §18.2: 2^14 ms or more is invalid.
+                if v >= 1 << 14 {
+                    return Err(ParamsError::Wire);
+                }
+                out.max_ack_delay_ms = v;
+            }
             _ => {} // unknown / ignored
         }
     }
@@ -294,5 +342,35 @@ mod tests {
         // id = 0x04 (initial_max_data), len = 8, only 4 bytes follow.
         let blob: &[u8] = &[0x04, 0x08, 0x01, 0x02, 0x03, 0x04];
         assert!(parse_client_params(blob).is_err());
+    }
+
+    /// RFC 9000 §18.2: ack_delay_exponent (0x0a) + max_ack_delay (0x0b)
+    /// parse into the params; absent → the RFC defaults (3, 25 ms);
+    /// out-of-range values are protocol violations.
+    #[test]
+    fn parse_ack_delay_params() {
+        // Absent → defaults.
+        let parsed = parse_client_params(&[]).expect("empty parses");
+        assert_eq!(parsed.ack_delay_exponent, 3, "default exponent");
+        assert_eq!(parsed.max_ack_delay_ms, 25, "default max_ack_delay");
+
+        // exponent = 10 (1-byte varint), max_ack_delay = 100 ms (100 ≥ 64
+        // so it takes the 2-byte varint form 0x40 0x64).
+        let blob: &[u8] = &[0x0a, 0x01, 0x0a, 0x0b, 0x02, 0x40, 0x64];
+        let parsed = parse_client_params(blob).expect("parse");
+        assert_eq!(parsed.ack_delay_exponent, 10);
+        assert_eq!(parsed.max_ack_delay_ms, 100);
+
+        // exponent 21 (> 20) is invalid.
+        let blob: &[u8] = &[0x0a, 0x01, 0x15];
+        assert!(parse_client_params(blob).is_err(), "exponent > 20 rejected");
+
+        // max_ack_delay = 2^14 ms is invalid (2-byte varint 0x4000
+        // encodes 0... use 16384 = varint 0x80 0x00 0x40 0x00).
+        let blob: &[u8] = &[0x0b, 0x04, 0x80, 0x00, 0x40, 0x00];
+        assert!(
+            parse_client_params(blob).is_err(),
+            "max_ack_delay >= 2^14 rejected"
+        );
     }
 }

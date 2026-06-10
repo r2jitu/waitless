@@ -29,8 +29,9 @@ impl Connection {
     pub fn pto_period_us(&self) -> u64 {
         const K_INITIAL_RTT_US: u64 = 333_000;
         const K_GRANULARITY_US: u64 = 1_000;
-        // Default peer max_ack_delay is 25 ms (RFC 9000 §18.2).
-        let max_ack_delay_us: u64 = 25_000;
+        // The peer's advertised max_ack_delay (RFC 9000 §18.2), cached
+        // when its transport params are applied; 25 ms default before.
+        let max_ack_delay_us: u64 = self.peer_max_ack_delay_us;
         let base = match self.smoothed_rtt_us {
             None => K_INITIAL_RTT_US + K_GRANULARITY_US,
             Some(srtt) => srtt + (4 * self.rttvar_us).max(K_GRANULARITY_US) + max_ack_delay_us,
@@ -115,11 +116,11 @@ impl Connection {
     ///   3. take an RTT sample from the largest newly-acked
     ///      ack-eliciting packet (RFC 9002 §5.1).
     ///
-    /// `ack_delay` is the peer's reported delay before generating
-    /// the ACK, in microseconds (already scaled by their
-    /// ack_delay_exponent on the wire — we treat the value as μs
-    /// for the simple case where both ends use the default
-    /// exponent of 3 → 8 μs units; close enough for now).
+    /// `ack_delay` is the peer's reported delay before generating the
+    /// ACK, as the RAW wire value — in `2^ack_delay_exponent` µs units
+    /// (RFC 9000 §19.3.1). The RTT-sample site below scales it by the
+    /// peer's advertised exponent and clamps it to the peer's
+    /// `max_ack_delay` (RFC 9002 §5.3) before use.
     pub(super) fn process_ack(
         &mut self,
         level: CryptoLevel,
@@ -200,7 +201,17 @@ impl Connection {
         {
             let now = tls::ticket::now_us();
             let latest = now.saturating_sub(pkt.time_sent_us);
-            self.update_rtt(latest, ack_delay);
+            // Scale the raw wire value into µs by the peer's advertised
+            // ack_delay_exponent (default 3 → 8 µs units; the old code
+            // treated raw as µs, under-counting 8× even for default
+            // peers), and clamp to the peer's max_ack_delay so an
+            // inflated report can't deflate the RTT sample (RFC 9002
+            // §5.3). Exponent ≤ 20 is parser-enforced, so the shift
+            // can't overflow past the saturating multiply.
+            let ack_delay_us = ack_delay
+                .saturating_mul(1u64 << self.peer_ack_delay_exponent)
+                .min(self.peer_max_ack_delay_us);
+            self.update_rtt(latest, ack_delay_us);
         }
         // Release acked bytes from flight and grow the congestion
         // window (RFC 9002 §7.8 OnPacketAcked). After the RTT sample so

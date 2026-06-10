@@ -1035,6 +1035,14 @@ pub struct Connection {
     /// floods PINGs when the peer is unresponsive (3180 probes / 12 s on
     /// the gve retransmit-storm conn). Capped so the period can't overflow.
     pub(super) pto_count: u32,
+    /// Peer's `ack_delay_exponent` (RFC 9000 §18.2): its ACK frames'
+    /// `ack_delay` is in `2^exponent` µs units. RFC default 3 until the
+    /// client's transport parameters are applied.
+    pub(super) peer_ack_delay_exponent: u8,
+    /// Peer's `max_ack_delay` in µs (RFC 9000 §18.2): added to our PTO
+    /// (RFC 9002 §6.2.1) and the cap on the `ack_delay` we honor in an
+    /// RTT sample (§5.3). RFC default 25 ms until the params are applied.
+    pub(super) peer_max_ack_delay_us: u64,
 
     /// Microseconds since boot when this conn last accepted ANY
     /// inbound datagram. Bumped at the end of `process_datagram`
@@ -1340,6 +1348,8 @@ impl Connection {
             min_rtt_us: None,
             smoothed_rtt_us: None,
             rttvar_us: 0,
+            peer_ack_delay_exponent: 3,
+            peer_max_ack_delay_us: 25_000,
             time_of_last_ack_eliciting_us: [None; 3],
             pto_count: 0,
             last_recv_us: 0,
@@ -1455,6 +1465,11 @@ impl Connection {
             self.peer_max_data = p.initial_max_data;
             self.peer_initial_max_stream_data_bidi = p.initial_max_stream_data_bidi_local;
             self.peer_initial_max_stream_data_uni = p.initial_max_stream_data_uni;
+            // RTT/PTO inputs (RFC 9000 §18.2): how to scale the peer's
+            // ACK `ack_delay` fields, and the most it will intentionally
+            // delay an ACK. Defaults (3 / 25 ms) until this runs.
+            self.peer_ack_delay_exponent = p.ack_delay_exponent;
+            self.peer_max_ack_delay_us = p.max_ack_delay_ms.saturating_mul(1_000);
             self.peer_fc_applied = true;
         }
     }
