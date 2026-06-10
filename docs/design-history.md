@@ -37,6 +37,18 @@ Next-Gen Roadmap" until 2026-05-28, when the forward-looking content moved to
 - **Deps as feature selection**: app declares what it needs via Bazel deps — unused protocols never compile
 - **No preemption, no locks**: cooperative scheduling, lock-free data structures only
 - **Lean by default**: start from zero, add only what's needed
+- **Environmental dependencies are capabilities, not globals**
+  (architecture-audit #1): pure library crates (proto/*, net_cc) take
+  **Time** and **Entropy** at the call boundary — a `now` parameter or
+  seam (`quic::time`), a seed value (`TlsServer::new_box(x25519_seed)`,
+  `Connection::new_server(_, seed)`) — and never reach for an ambient
+  source. Ambient reads (`waitless::rng`, `kernel_core::rng`,
+  `kernel_core::clock`) are reserved for the composition shell (app
+  glue, listener init, the kernel proper), which is where capabilities
+  get wired. Review rule, same direction: **new leaf state goes on the
+  worker (`PerCore`/`PerWorker`), not in a fresh `static`** — statics
+  are why tests needed reset hooks and why two stacks can't share a
+  process.
 
 ---
 
