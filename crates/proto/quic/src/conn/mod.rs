@@ -66,6 +66,7 @@
 //               `process_ack`, `detect_loss`, `update_rtt`,
 //               `record_sent_packet`, PTO timer + probe.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::tls::{QuicTls, QuicTlsError};
@@ -812,12 +813,20 @@ pub struct Connection {
     /// (RFC 9001 §5.2). Discarded once Initial keys are derived.
     pub(super) initial_dcid: ConnectionId,
 
-    pub(super) initial_send: Option<DirKeys>,
-    pub(super) initial_recv: Option<DirKeys>,
-    pub(super) handshake_send: Option<DirKeys>,
-    pub(super) handshake_recv: Option<DirKeys>,
-    pub(super) application_send: Option<DirKeys>,
-    pub(super) application_recv: Option<DirKeys>,
+    // The nine key slots are BOXED: a `DirKeys` is ~1.5 KB of expanded
+    // AES round-key + GHASH state, and inline `Option<DirKeys>` slots
+    // made the key material **78% of the `Connection` struct** (~14 KB)
+    // while an established conn holds only ~3 live sets (send/recv +
+    // a pre-derived next phase). Boxing keeps the struct ~4 KB and pays
+    // one heap alloc per key *derivation* (a handshake/key-update event,
+    // not a packet — the per-packet clone was eliminated first so this
+    // cannot regress into a per-packet alloc).
+    pub(super) initial_send: Option<Box<DirKeys>>,
+    pub(super) initial_recv: Option<Box<DirKeys>>,
+    pub(super) handshake_send: Option<Box<DirKeys>>,
+    pub(super) handshake_recv: Option<Box<DirKeys>>,
+    pub(super) application_send: Option<Box<DirKeys>>,
+    pub(super) application_recv: Option<Box<DirKeys>>,
     /// Sticky flag set once we've discarded our Initial keys per
     /// RFC 9001 §4.9.1 (first received Handshake packet). Without
     /// this flag, `process_initial`'s `initial_recv.is_none()`
@@ -848,7 +857,7 @@ pub struct Connection {
     /// derived from `QuicTls::client_early_traffic_secret` once the
     /// CH has been parsed. The server never sends 0-RTT, so there's
     /// no `early_send` counterpart.
-    pub(super) early_recv: Option<DirKeys>,
+    pub(super) early_recv: Option<Box<DirKeys>>,
     /// 0-RTT packets that arrived before we'd derived `early_recv`
     /// — typically because they were coalesced with (or arrived
     /// before) the LAST fragment of a multi-packet ClientHello.
@@ -871,8 +880,8 @@ pub struct Connection {
     // traffic volume. The previous-phase keys are retained for one
     // rotation to absorb reordered packets that arrived after the
     // peer's KU but were sent before it.
-    pub(super) application_recv_prev: Option<DirKeys>,
-    pub(super) application_recv_next: Option<DirKeys>,
+    pub(super) application_recv_prev: Option<Box<DirKeys>>,
+    pub(super) application_recv_next: Option<Box<DirKeys>>,
     /// Latest CLIENT application-traffic secret. Updated on each
     /// successful key update — `next_traffic_secret(client_ap)` is
     /// then ready to feed `derive_aes128_keys` for the

@@ -13,6 +13,7 @@
 // `rotate_recv_keys` implements RFC 9001 §6 key updates on the
 // receive side.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use super::{ConnError, ConnState, Connection};
@@ -181,7 +182,7 @@ impl Connection {
             // Reuse HP from the new-current keys (HP is invariant
             // across KU per §6.1).
             if let Some(cur) = self.application_recv.as_ref() {
-                self.application_recv_next = Some(DirKeys::from_aes128_reuse_hp(&next_aes128, cur));
+                self.application_recv_next = Some(Box::new(DirKeys::from_aes128_reuse_hp(&next_aes128, cur)));
             }
         }
         // RFC 9001 §6.1: respond to the peer's key update by also
@@ -201,7 +202,7 @@ impl Connection {
             self.server_app_secret = Some(next_secret);
             let next_aes128 = derive_aes128_keys(&next_secret);
             if let Some(cur) = self.application_send.as_ref() {
-                self.application_send = Some(DirKeys::from_aes128_reuse_hp(&next_aes128, cur));
+                self.application_send = Some(Box::new(DirKeys::from_aes128_reuse_hp(&next_aes128, cur)));
                 self.send_key_phase ^= 1;
             }
         }
@@ -219,7 +220,7 @@ impl Connection {
             && self.early_recv.is_none()
         {
             let recv = derive_aes128_keys(et);
-            self.early_recv = Some(DirKeys::from_aes128(&recv));
+            self.early_recv = Some(Box::new(DirKeys::from_aes128(&recv)));
             crate::quic_event!(
                 early_keys_derived,
                 "local_cid={}",
@@ -247,16 +248,16 @@ impl Connection {
         {
             let send = derive_aes128_keys(&hs.server_hs);
             let recv = derive_aes128_keys(&hs.client_hs);
-            self.handshake_send = Some(DirKeys::from_aes128(&send));
-            self.handshake_recv = Some(DirKeys::from_aes128(&recv));
+            self.handshake_send = Some(Box::new(DirKeys::from_aes128(&send)));
+            self.handshake_recv = Some(Box::new(DirKeys::from_aes128(&recv)));
         }
         if let Some(ap) = self.tls.application_secrets()
             && self.application_send.is_none()
         {
             let send = derive_aes128_keys(&ap.server_ap);
             let recv = derive_aes128_keys(&ap.client_ap);
-            self.application_send = Some(DirKeys::from_aes128(&send));
-            self.application_recv = Some(DirKeys::from_aes128(&recv));
+            self.application_send = Some(Box::new(DirKeys::from_aes128(&send)));
+            self.application_recv = Some(Box::new(DirKeys::from_aes128(&recv)));
             // Pre-derive next-phase recv keys so a peer-initiated
             // key update (RFC 9001 §6) doesn't require HKDF on
             // the hot decrypt path — we just trial-decrypt with
@@ -269,7 +270,7 @@ impl Connection {
             let next_aes128 = derive_aes128_keys(&next_secret);
             let cur_recv = self.application_recv.as_ref().unwrap();
             self.application_recv_next =
-                Some(DirKeys::from_aes128_reuse_hp(&next_aes128, cur_recv));
+                Some(Box::new(DirKeys::from_aes128_reuse_hp(&next_aes128, cur_recv)));
             // Remember the server secret too, so `rotate_send_keys` can
             // derive the next-generation send keys when we respond to a
             // peer-initiated key update (RFC 9001 §6.1).

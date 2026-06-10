@@ -20,6 +20,7 @@ use crate::wire::{
     FIXED_BIT, HEADER_FORM_LONG, decode_packet_number, long_packet_type, parse_initial_header,
     parse_long_header_preamble, read_varint,
 };
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use tls::TlsServerConfig;
 
@@ -296,8 +297,8 @@ impl Connection {
                 let secrets = derive_initial_secrets(self.initial_dcid.as_slice());
                 let server_keys = derive_initial_keys(&secrets.server);
                 let client_keys = derive_initial_keys(&secrets.client);
-                self.initial_send = Some(DirKeys::from_initial(&server_keys));
-                self.initial_recv = Some(DirKeys::from_initial(&client_keys));
+                self.initial_send = Some(Box::new(DirKeys::from_initial(&server_keys)));
+                self.initial_recv = Some(Box::new(DirKeys::from_initial(&client_keys)));
                 self.state = ConnState::Connecting;
                 let server_params = {
                     let p = crate::transport_params::ServerParams::defaults(

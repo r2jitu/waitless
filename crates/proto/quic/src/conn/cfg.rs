@@ -453,8 +453,8 @@ fn pure_fin_emitted_at_flow_control_boundary() {
     // 1-RTT send keys so `encode_one_rtt_packet` produces an app packet
     // (it no-ops without them); the key bytes are irrelevant here.
     let secrets = derive_initial_secrets(&[0xcd; 8]);
-    conn.application_send = Some(super::keys::DirKeys::from_aes128(&derive_initial_keys(
-        &secrets.server,
+    conn.application_send = Some(Box::new(super::keys::DirKeys::from_aes128(
+        &derive_initial_keys(&secrets.server),
     )));
     // A response on client-bidi stream 0 whose body exactly fills the
     // granted windows (stream + conn both == body length).
@@ -707,8 +707,8 @@ fn key_update_rotates_send_keys_and_toggles_phase() {
     let secret0 = [0x11u8; 32];
     conn.server_app_secret = Some(secret0);
     let secrets = derive_initial_secrets(&[0xcd; 8]);
-    conn.application_send = Some(super::keys::DirKeys::from_aes128(&derive_initial_keys(
-        &secrets.server,
+    conn.application_send = Some(Box::new(super::keys::DirKeys::from_aes128(
+        &derive_initial_keys(&secrets.server),
     )));
     assert_eq!(conn.send_key_phase, 0);
 
@@ -744,8 +744,8 @@ fn repeated_pto_triggers_persistent_congestion_collapse() {
     use net_cc::CongestionControl;
     let mut conn = Connection::new_server(ConnectionId::new(&[0xab; 8]), [0x42u8; 32]);
     let secrets = derive_initial_secrets(&[0xcd; 8]);
-    conn.application_send = Some(super::keys::DirKeys::from_aes128(&derive_initial_keys(
-        &secrets.server,
+    conn.application_send = Some(Box::new(super::keys::DirKeys::from_aes128(
+        &derive_initial_keys(&secrets.server),
     )));
     // An in-flight ack-eliciting packet so `send_pto_probe` has a space
     // to probe.

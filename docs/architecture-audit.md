@@ -269,4 +269,4 @@ It is the change that compounds.
 | 3 | Completion reactor | `trait Nic` (completion-shaped); DQO TX waker | open |
 | 4 | Transport engine | TCP RACK built as the shared core | open |
 | 5 | Flow steering | PMTUD ICMP cross-core routing via generalized inbox | open |
-| 6 | Memory arenas | box QUIC `DirKeys`; h3 `ConnArena` pattern-setter | precondition ✅ 2026-06-10 — the hot-path per-packet `DirKeys` clone (~1.5 KB/packet) is gone (take-and-restore in `encode_one_rtt_packet_padded`), so boxing the 9 key slots can no longer regress into a per-packet heap alloc; the boxing sweep itself + the arena open (two cold clone sites remain: close + probe encoders) |
+| 6 | Memory arenas | box QUIC `DirKeys`; h3 `ConnArena` pattern-setter | first increment ✅ 2026-06-10 in two steps: the hot-path per-packet `DirKeys` clone eliminated (take-and-restore), then all 9 key slots boxed — **`Connection` 17,944 → 4,008 B (−13.9 KB per h3 conn)**, key derivation (a handshake/key-update event) pays the alloc, never a packet. The `ConnArena` pattern-setter remains open (two cold Box-clone sites: close + probe encoders) |
