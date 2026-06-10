@@ -1273,6 +1273,11 @@ where
         let mut sink = RequestSink {
             req: &mut req,
             malformed: false,
+            seen_regular: false,
+            has_method: false,
+            has_scheme: false,
+            has_path: false,
+            has_authority: false,
         };
         let r = conn.hpack.decode(
             block,
@@ -1284,7 +1289,11 @@ where
             .decode_cycles
             .add(now_cycles().wrapping_sub(__d0));
         match r {
-            Ok(()) => sink.malformed,
+            // RFC 7540 §8.1.2.3: a request MUST carry :method, :scheme,
+            // and :path (we don't support CONNECT, the lone exception).
+            // A trailers block (handled below, where it returns early)
+            // legitimately lacks these — this flag is ignored there.
+            Ok(()) => sink.malformed || !sink.has_method || !sink.has_scheme || !sink.has_path,
             Err(HpackError::HeaderListTooLarge) => {
                 crate::h2_drop!(header_list_too_large, "sid={}", sid);
                 return Err(error::ENHANCE_YOUR_CALM);
@@ -1657,15 +1666,44 @@ async fn dispatch_bodyless<S, H>(
 /// cousin of the h3 server's `RequestSink`.
 struct RequestSink<'r> {
     req: &'r mut RequestHead,
-    /// Set on a malformed pseudo-header (response pseudo in a request, or
-    /// an unknown `:`-prefixed name) → stream error.
+    /// Set on any RFC 7540 §8.1.2 malformed-request violation (bad
+    /// pseudo-header, non-lowercase name, pseudo after a regular field,
+    /// duplicate pseudo, connection-specific header) → stream error.
     malformed: bool,
+    /// `true` once a regular (non-`:`) field has been seen — a pseudo
+    /// after it is malformed (§8.1.2.1: pseudo-headers precede regulars).
+    seen_regular: bool,
+    has_method: bool,
+    has_scheme: bool,
+    has_path: bool,
+    has_authority: bool,
 }
 
 impl FieldSink for RequestSink<'_> {
     fn on_field(&mut self, name: &[u8], value: &[u8]) {
+        // RFC 7540 §8.1.2: header field names MUST be lowercase. An
+        // uppercase byte (in a regular or pseudo name) is malformed.
+        if name.iter().any(u8::is_ascii_uppercase) {
+            self.malformed = true;
+            return;
+        }
+        let is_pseudo = name.first() == Some(&b':');
+        // §8.1.2.1: all pseudo-header fields MUST precede regular ones.
+        if is_pseudo && self.seen_regular {
+            self.malformed = true;
+            return;
+        }
+        if !is_pseudo {
+            self.seen_regular = true;
+        }
         match name {
+            // §8.1.2.1: a pseudo-header MUST NOT be duplicated.
             b":method" => {
+                if self.has_method {
+                    self.malformed = true;
+                    return;
+                }
+                self.has_method = true;
                 self.req.method = match value {
                     b"GET" => Method::Get,
                     b"HEAD" => Method::Head,
@@ -1675,13 +1713,47 @@ impl FieldSink for RequestSink<'_> {
                     _ => Method::Unknown,
                 };
             }
-            b":path" => self.req.set_path(value),
+            b":path" => {
+                // §8.1.2.3: :path MUST NOT be empty for http/https URIs.
+                if self.has_path || value.is_empty() {
+                    self.malformed = true;
+                    return;
+                }
+                self.has_path = true;
+                self.req.set_path(value);
+            }
+            // §8.1.2.3: :scheme is required but not used for routing.
+            b":scheme" => {
+                if self.has_scheme {
+                    self.malformed = true;
+                    return;
+                }
+                self.has_scheme = true;
+            }
             // Surface :authority as a Host header so app code that reads
             // `Host` keeps working across H1/H2/H3.
-            b":authority" => self.req.push_header(b"host", value),
-            b":scheme" => {} // not used for routing — drop.
+            b":authority" => {
+                if self.has_authority {
+                    self.malformed = true;
+                    return;
+                }
+                self.has_authority = true;
+                self.req.push_header(b"host", value);
+            }
             b":status" => self.malformed = true, // response pseudo in a request.
             n if n.starts_with(b":") => self.malformed = true, // unknown pseudo.
+            // §8.1.2.2: connection-specific header fields MUST NOT appear
+            // in HTTP/2 (the protocol has its own framing for these).
+            b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding"
+            | b"upgrade" => {
+                self.malformed = true;
+            }
+            // §8.1.2.2: TE may be present but only with the value "trailers".
+            b"te" => {
+                if value != b"trailers" {
+                    self.malformed = true;
+                }
+            }
             _ => self.req.push_header(name, value),
         }
     }
@@ -2186,6 +2258,115 @@ mod tests {
         let err = apply_setting(&mut conn, settings_id::INITIAL_WINDOW_SIZE, 0x7fff_ffff)
             .expect_err("overflow past 2^31-1 must error");
         assert_eq!(err, error::FLOW_CONTROL_ERROR);
+    }
+
+    // ── H2-8 §8.1.2 malformed-request validation ─────────────────────
+
+    /// Run a header-field sequence through a `RequestSink` and return
+    /// the same malformed verdict `complete_headers` computes (sink
+    /// flag OR a missing required pseudo-header).
+    fn validate_fields(fields: &[(&[u8], &[u8])]) -> bool {
+        let mut req = RequestHead::new();
+        let mut sink = RequestSink {
+            req: &mut req,
+            malformed: false,
+            seen_regular: false,
+            has_method: false,
+            has_scheme: false,
+            has_path: false,
+            has_authority: false,
+        };
+        for (n, v) in fields {
+            sink.on_field(n, v);
+        }
+        sink.malformed || !sink.has_method || !sink.has_scheme || !sink.has_path
+    }
+
+    #[test]
+    fn well_formed_request_is_accepted() {
+        assert!(!validate_fields(&[
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":path", b"/"),
+            (b":authority", b"example.com"),
+            (b"accept", b"*/*"),
+        ]));
+    }
+
+    #[test]
+    fn malformed_requests_are_rejected() {
+        // §8.1.2: uppercase field name.
+        assert!(validate_fields(&[
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":path", b"/"),
+            (b"Accept", b"*/*"),
+        ]));
+        // §8.1.2.1: pseudo-header after a regular field.
+        assert!(validate_fields(&[
+            (b":method", b"GET"),
+            (b"accept", b"*/*"),
+            (b":scheme", b"https"),
+            (b":path", b"/"),
+        ]));
+        // §8.1.2.1: duplicate pseudo-header.
+        assert!(validate_fields(&[
+            (b":method", b"GET"),
+            (b":method", b"POST"),
+            (b":scheme", b"https"),
+            (b":path", b"/"),
+        ]));
+        // §8.1.2.1: response pseudo / unknown pseudo in a request.
+        assert!(validate_fields(&[(b":status", b"200"), (b":method", b"GET")]));
+        assert!(validate_fields(&[
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":path", b"/"),
+            (b":bogus", b"x"),
+        ]));
+        // §8.1.2.3: missing :scheme; empty :path.
+        assert!(validate_fields(&[(b":method", b"GET"), (b":path", b"/")]));
+        assert!(validate_fields(&[
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":path", b""),
+        ]));
+        // §8.1.2.2: connection-specific header fields.
+        for bad in [
+            &b"connection"[..],
+            b"keep-alive",
+            b"proxy-connection",
+            b"transfer-encoding",
+            b"upgrade",
+        ] {
+            assert!(
+                validate_fields(&[
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":path", b"/"),
+                    (bad, b"x"),
+                ]),
+                "{:?} must be rejected",
+                core::str::from_utf8(bad).unwrap(),
+            );
+        }
+        // §8.1.2.2: TE may only carry "trailers".
+        assert!(validate_fields(&[
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":path", b"/"),
+            (b"te", b"gzip"),
+        ]));
+    }
+
+    #[test]
+    fn te_trailers_is_allowed() {
+        assert!(!validate_fields(&[
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":path", b"/"),
+            (b"te", b"trailers"),
+        ]));
     }
 
     // ── H2-3 control-flood guard ──────────────────────────────────

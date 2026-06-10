@@ -157,13 +157,19 @@ landed this session; the rate-limit-flood guard is still open.
 - [x] **H2-7 — HPACK dynamic-table eviction.** Entry overhead = 32 B/entry
   (RFC 7541 §4.1), eviction on insert and on size-update, table-clear when
   a single entry exceeds the max — implemented + unit-tested.
-- **H2-8 — Error handling completeness.** *Partial.* Connection errors
+- **H2-8 — Error handling completeness.** *Mostly done.* Connection errors
   emit `GOAWAY(code, last-stream-id)`; stream errors emit `RST_STREAM` with
   a code (PROTOCOL_ERROR / REFUSED_STREAM / FLOW_CONTROL_ERROR /
-  ENHANCE_YOUR_CALM). **Open:** a full audit of RFC 7540 §7 code choices,
-  graceful two-GOAWAY drain, and malformed-request edge cases (we do a
-  minimal pseudo-header check — response pseudo / unknown pseudo →
-  RST_STREAM — but not the full §8.1.2 validation).
+  ENHANCE_YOUR_CALM). **§8.1.2 malformed-request validation now enforced**
+  (`RequestSink`, stream error `PROTOCOL_ERROR`): non-lowercase field
+  names (§8.1.2), pseudo-after-regular ordering + duplicate-pseudo +
+  response/unknown pseudo (§8.1.2.1), required `:method`/`:scheme`/`:path`
+  and non-empty `:path` (§8.1.2.3), forbidden connection-specific headers
+  (`connection`/`keep-alive`/`proxy-connection`/`transfer-encoding`/
+  `upgrade`) and `te`≠`trailers` (§8.1.2.2). Unit-tested
+  (`well_formed_request_is_accepted`, `malformed_requests_are_rejected`,
+  `te_trailers_is_allowed`). **Still open:** §8.1.2.6 Content-Length-vs-DATA
+  consistency, a §7 code-choice audit, and a graceful two-GOAWAY drain.
 - **H2-9 — h2spec.** Run the h2spec conformance suite; track failures here.
   Not yet run.
 
