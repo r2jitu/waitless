@@ -132,6 +132,24 @@ work is the embryo). (c) An async TX-completion waker on DQO (already named
 in [`tx-path-optimizations.md`](tx-path-optimizations.md) as the large-body
 latency fix).
 
+**Migration recipe for (a)** (sized 2026-06-10 so the next session executes
+instead of re-deriving): `NicOps` is a struct of ~25 fn pointers with
+exactly three instances (`gve`, `virtio-net`, the null-object backstop in
+`nic/src/api.rs`) plus a test shim in `tcp/src/tests.rs`; the facade
+(`nic/src/nic.rs`) has 33 `active_ops()` call sites whose field-call shape
+(`ops.send(…)`) survives a method-call conversion verbatim. The `Option<fn>`
+capability fields become default trait methods returning `None`/`false`.
+The link-time registry keeps working: a `&'static dyn Nic` fat pointer to a
+per-driver ZST is const-evaluable inside `EthernetDriverReg`. The ONE open
+question is performance, not mechanics: dyn dispatch adds one vtable load
+to `poll_rx`, which sits on the busy-poll instruction path (~39% of
+saturated cycles) — almost certainly invisible, but by this project's own
+measured doctrine that claim must be settled by a GCE A/B (`/health` +
+`/static-1m`, c3/DQO), not asserted. Do the conversion and the A/B in one
+GCE session; keep `(c)` gated on re-profiling there too, since T1–T3's
+ACK-clocked backpressure already removed the drop-cliff `(c)` was named
+for.
+
 ## 4. One reliable-transport engine (finish what net_cc started)
 
 **The problem as lived.** `net_cc` proved CC converges (both transports
@@ -266,7 +284,7 @@ It is the change that compounds.
 | 7 | Cancel-safety | `Drop`-clears-waker on TcpRecv/RecvChunk/TcpSendChain; `WaitEvent` Drop-deregistration | ✅ both landed 2026-06-10 (`clear_waker_if` is `will_wake`-precise, so the documented sequential-waiter pattern is untouched); remaining: a shared `WakerSlot` RAII helper for new park-points |
 | 1 | Capabilities | `Time` facade; QUIC off `tls::ticket` time | `quic::time` seam ✅ 2026-06-10 — all ~17 µs-reads route through one mockable facade (tests can pin/advance a virtual clock); the broader capability injection open |
 | 2 | Simulation | parser fuzz targets; mock-clock loss suite; two-endpoint QUIC sim | fuzz-smoke ✅ on all three attacker-facing parsers; **virtual-time loss suite ✅ 2026-06-10**: time-threshold loss, the reordering NEGATIVE case (same ACK, later virtual instant flips the verdict — the §52 spurious-collapse guard pinned), and PTO deadline arithmetic + backoff + disarm — the RACK/PTO machinery is now deterministically testable in-repo, the class of validation that previously needed GCE+netem. Bonus finds: a parallel-schedule flake in the recv-budget test (de-flaked) and `detect_loss` still using the 25 ms const instead of the cached `peer_max_ack_delay_us` (fixed). The full scripted-peer sim (loss *schedules* over multi-packet flows) remains the scale-up; a true two-endpoint sim needs a QUIC client role that doesn't exist |
-| 3 | Completion reactor | `trait Nic` (completion-shaped); DQO TX waker | open |
+| 3 | Completion reactor | `trait Nic` (completion-shaped); DQO TX waker | open — migration recipe written + sized (see §3): mechanics are safe (3 instances, 33 facade sites, fat-pointer registry works); the +1 vtable load on the busy-poll path is the one open question and needs the GCE A/B that the conversion session must include. The only direction whose first increment cannot land on local evidence |
 | 4 | Transport engine | TCP RACK built as the shared core | first increment ✅ 2026-06-10: the recovery-episode hold (one reduction per congestion event, ended by ~one window of fresh acks — the #52 real-RTT-collapse guard) extracted into a single `RecoveryEpisode` struct in `net_cc` that both NewReno and CUBIC embed — the first piece of loss-recovery logic written once for both transports. RACK scoreboard over the abstract sent-unit = the continuation |
 | 5 | Flow steering | PMTUD ICMP cross-core routing via generalized inbox | first increment ✅ 2026-06-10: per-core `ctrl_inbox` + shared `CtrlMsg` pool in kernel_core (the RX lane mechanism, control twin), policy in `net_stack::ctrl` — a wrong-core PMTUD report (`NoConn` from the now-three-way `note_path_mtu`) broadcasts to all cores; the owner re-runs every RFC 5927 gate and applies, closing the `pmtu_dropped` wrong-core hole. The lane is message-generic by design: the next cross-core fact adds a `CtrlMsg` variant, not a bespoke channel. `pmtu_routed`/`ctrl_dropped` counters in the net /obs block. An ownership *map* (vs rare-hint broadcast) = the continuation if a high-volume consumer arrives |
 | 6 | Memory arenas | box QUIC `DirKeys`; h3 `ConnArena` pattern-setter | first increment ✅ 2026-06-10 in two steps: the hot-path per-packet `DirKeys` clone eliminated (take-and-restore), then all 9 key slots boxed — **`Connection` 17,944 → 4,008 B (−13.9 KB per h3 conn)**, key derivation (a handshake/key-update event) pays the alloc, never a packet. The `ConnArena` pattern-setter remains open (two cold Box-clone sites: close + probe encoders) |
