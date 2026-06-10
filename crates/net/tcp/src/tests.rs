@@ -405,6 +405,40 @@ fn tcp_options(frame: &[u8]) -> Vec<u8> {
     tcp[TCP_HDR_LEN..data_off].to_vec()
 }
 
+/// Extract the RFC 2018 SACK blocks (option kind=5) from a captured
+/// frame's TCP options as `(left, right)` absolute-sequence pairs.
+/// Empty when no SACK option is present.
+fn sack_blocks_of(frame: &[u8]) -> Vec<(u32, u32)> {
+    let opts = tcp_options(frame);
+    let mut i = 0;
+    while i < opts.len() {
+        match opts[i] {
+            0 => break,
+            1 => i += 1,
+            5 => {
+                let len = opts[i + 1] as usize;
+                let mut out = Vec::new();
+                let mut j = i + 2;
+                while j + 8 <= i + len {
+                    let l = u32::from_be_bytes([opts[j], opts[j + 1], opts[j + 2], opts[j + 3]]);
+                    let r = u32::from_be_bytes([opts[j + 4], opts[j + 5], opts[j + 6], opts[j + 7]]);
+                    out.push((l, r));
+                    j += 8;
+                }
+                return out;
+            }
+            _ => {
+                let len = opts[i + 1] as usize;
+                if len < 2 {
+                    break;
+                }
+                i += len;
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// Host-order view of a captured frame's TCP header. Returned by
 /// value so callers never hold a reference into the `repr(packed)`
 /// `TcpHeader`.
@@ -741,6 +775,137 @@ fn challenge_acks_are_rate_limited() {
     kernel_core::clock::mock::advance(1000);
     deliver(&forged_syn);
     assert_eq!(tx().len(), 1, "a token refilled after the clock advanced — challenge resumes");
+}
+
+/// RFC 2018 (T7a): when the peer's SYN permits SACK, the SYN-ACK
+/// echoes SACK-Permitted, and a subsequent out-of-order segment draws
+/// a dup-ACK carrying a SACK block describing the buffered range — so
+/// the peer can retransmit only the hole.
+#[test]
+fn sack_permitted_negotiated_and_blocks_emitted() {
+    let _g = harness();
+    const SP: u16 = 9176;
+    const CP: u16 = 50176;
+    const CLIENT_ISN: u32 = 0xA000;
+    super::listen_on_core(0, SP);
+
+    // SYN carrying SACK-Permitted (kind=4, len=2). Capture the SYN-ACK
+    // before the 3-way ACK clears the TX log.
+    deliver_opts(
+        &Seg {
+            src_port: CP,
+            dst_port: SP,
+            seq: CLIENT_ISN,
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            payload: Vec::new(),
+        },
+        &[4, 2, 1, 1],
+    );
+    let synack = tx()[0].clone();
+    assert_eq!(tcp_hdr(&synack).flags, TCP_SYN | TCP_ACK);
+    assert!(
+        tcp_options(&synack).windows(2).any(|w| w == [4, 2]),
+        "SYN-ACK must echo SACK-Permitted, got {:?}",
+        tcp_options(&synack),
+    );
+    let server_isn = tcp_hdr(&synack).seq;
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+    let rcv_nxt = CLIENT_ISN.wrapping_add(1);
+
+    // An out-of-order segment [rcv_nxt+4, rcv_nxt+8) → dup-ACK at
+    // rcv_nxt with a SACK block covering exactly that range.
+    clear_tx();
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: rcv_nxt.wrapping_add(4),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK | TCP_PSH,
+        payload: b"BBBB".to_vec(),
+        window: 65535,
+    });
+    let frames = tx();
+    assert_eq!(frames.len(), 1, "one dup-ACK for the out-of-order segment");
+    assert_eq!(tcp_hdr(&frames[0]).ack, rcv_nxt, "cumulative ACK still at rcv_nxt");
+    assert_eq!(
+        sack_blocks_of(&frames[0]),
+        vec![(rcv_nxt.wrapping_add(4), rcv_nxt.wrapping_add(8))],
+        "the dup-ACK carries a SACK block for the buffered range",
+    );
+
+    // Two more out-of-order segments — one abutting (coalesces into the
+    // first block), one with a gap (a second block).
+    clear_tx();
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: rcv_nxt.wrapping_add(8),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK | TCP_PSH,
+        payload: b"CCCC".to_vec(),
+        window: 65535,
+    });
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: rcv_nxt.wrapping_add(20),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK | TCP_PSH,
+        payload: b"DDDD".to_vec(),
+        window: 65535,
+    });
+    assert_eq!(
+        sack_blocks_of(tx().last().unwrap()),
+        vec![
+            (rcv_nxt.wrapping_add(4), rcv_nxt.wrapping_add(12)),
+            (rcv_nxt.wrapping_add(20), rcv_nxt.wrapping_add(24)),
+        ],
+        "abutting segments coalesce into one block; the gapped one is a second block",
+    );
+}
+
+/// RFC 2018: without SACK-Permitted on the SYN, the SYN-ACK carries no
+/// SACK-Permitted and out-of-order dup-ACKs carry no SACK blocks.
+#[test]
+fn no_sack_when_peer_does_not_permit() {
+    let _g = harness();
+    const SP: u16 = 9177;
+    const CP: u16 = 50177;
+    const CLIENT_ISN: u32 = 0xB000;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN); // plain SYN, no options
+    let rcv_nxt = CLIENT_ISN.wrapping_add(1);
+
+    // SYN-ACK is the bare MSS option — no SACK-Permitted.
+    assert!(
+        !tcp_options(&tx()[0]).windows(2).any(|w| w == [4, 2]),
+        "SYN-ACK must not advertise SACK-Permitted when the peer didn't",
+    );
+
+    clear_tx();
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: rcv_nxt.wrapping_add(4),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK | TCP_PSH,
+        payload: b"BBBB".to_vec(),
+        window: 65535,
+    });
+    assert!(
+        sack_blocks_of(tx().last().unwrap()).is_empty(),
+        "no SACK blocks when SACK was not negotiated",
+    );
 }
 
 /// A duplicate segment wholly below `rcv_nxt` (the peer never saw

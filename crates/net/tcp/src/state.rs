@@ -268,6 +268,11 @@ pub struct TcpConnection {
     /// `snd_wnd` left-shift; per RFC 7323 the SYN/SYN-ACK windows
     /// themselves are always unscaled.
     pub(crate) wscale_ok: bool,
+    /// RFC 2018: true once both ends permitted SACK (the peer sent
+    /// SACK-Permitted in its SYN and we echoed it in the SYN-ACK).
+    /// Gates emitting SACK blocks (built from the `ooo` reassembly
+    /// queue) on out-of-order ACKs.
+    pub(crate) sack_ok: bool,
     /// RFC 9293 SND.WL1 — the `SEG.SEQ` of the segment that last
     /// updated `snd_wnd`. Guards against a reordered segment
     /// installing a stale window.
@@ -553,6 +558,31 @@ impl OooQueue {
         true
     }
 
+    /// Fill `out` with the RFC 2018 SACK blocks for the buffered data —
+    /// the absolute `[left, right)` sequence ranges currently held,
+    /// merging segments that abut into one block. Returns the number of
+    /// blocks written (≤ `out.len()`). The segments are already sorted
+    /// ascending and non-overlapping, so one forward pass suffices.
+    pub(crate) fn sack_blocks(&self, out: &mut [(u32, u32)]) -> usize {
+        let mut n = 0;
+        for s in &self.segs {
+            let left = s.seq_start;
+            let right = s.seq_start.wrapping_add(s.bytes.len() as u32);
+            if n > 0 && out[n - 1].1 == left {
+                // Abuts the previous block — extend it rather than
+                // spending another (scarce, 8-byte) block slot.
+                out[n - 1].1 = right;
+            } else {
+                if n == out.len() {
+                    break;
+                }
+                out[n] = (left, right);
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Remove and return the buffered segment that reaches `rcv_nxt`
     /// (i.e. `seq_start <= rcv_nxt < seq_start + len`), so the caller
     /// can deliver its `[rcv_nxt..]` tail in order. Segments wholly
@@ -594,6 +624,7 @@ impl TcpConnection {
             // safe default is our largest segment (clamped only down).
             snd_mss: MSS_MAX as u16,
             wscale_ok: false,
+            sack_ok: false,
             snd_wl1: 0,
             snd_wl2: 0,
             rcv_nxt: 0,

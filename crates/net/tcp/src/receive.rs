@@ -9,7 +9,8 @@ use crate::pool::{
 };
 use crate::send::{SegmentMeta, send_rst, send_segment, send_segment_opts};
 use crate::state::{
-    RX_RING_BYTES, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN, TcpHeader, TcpState, mss_for, seq_lt,
+    RX_RING_BYTES, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN, TcpConnection, TcpHeader, TcpState, mss_for,
+    seq_lt,
 };
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use from_bytes::FromBytes;
@@ -112,6 +113,46 @@ fn send_challenge_ack(
     );
 }
 
+/// Emit a bare ACK for `c` announcing our `snd_nxt` / `rcv_nxt` and
+/// current window. While out-of-order data is buffered and SACK was
+/// negotiated (RFC 2018), attach SACK blocks describing the queued
+/// ranges so the peer retransmits only the holes on multi-segment
+/// loss. On the clean in-order path (`ooo` empty) this is byte-
+/// identical to a plain `send_segment` ACK — the option is never
+/// attached, so the hot path is unchanged.
+fn emit_ack(c: &TcpConnection, dst_ip: IpAddr, src_ip: IpAddr, dst_port: u16, src_port: u16) {
+    let meta = SegmentMeta {
+        local_ip: dst_ip,
+        dst_ip: src_ip,
+        src_port: dst_port,
+        dst_port: src_port,
+        seq: c.snd_nxt,
+        ack: c.rcv_nxt,
+        flags: TCP_ACK,
+        window: c.rx_free() as u16,
+    };
+    if c.sack_ok && !c.ooo.is_empty() {
+        // Up to 4 blocks (RFC 2018 §3, no Timestamps option in use):
+        // [NOP, NOP, kind=5, len, (left,right)*nb]. The two leading
+        // NOPs make the blob 4-byte aligned; len = 2 + 8·nb.
+        let mut blocks = [(0u32, 0u32); 4];
+        let nb = c.ooo.sack_blocks(&mut blocks);
+        if nb > 0 {
+            let mut opt = [1u8; 4 + 8 * 4];
+            opt[2] = 5;
+            opt[3] = (2 + 8 * nb) as u8;
+            for (k, &(l, r)) in blocks[..nb].iter().enumerate() {
+                let base = 4 + 8 * k;
+                opt[base..base + 4].copy_from_slice(&l.to_be_bytes());
+                opt[base + 4..base + 8].copy_from_slice(&r.to_be_bytes());
+            }
+            send_segment_opts(&meta, &[], &opt[..4 + 8 * nb]);
+            return;
+        }
+    }
+    send_segment(&meta, &[]);
+}
+
 /// Drop-guard that wraps `tcp_receive` in a cycle-counter bracket.
 /// Fires on every exit path (early returns included) so per-packet
 /// cost is the true measurement, not the happy-path subset. Two
@@ -162,6 +203,11 @@ struct SynOptions {
     /// stalls on 5G; tiny requests fit, so it only bites a cold
     /// connection that has to send the cert.
     mss: Option<u16>,
+    /// RFC 2018 SACK-Permitted (kind 4). True if the peer's SYN
+    /// carried it — only then do we echo SACK-Permitted in the SYN-ACK
+    /// and emit SACK blocks (built from the T3 reassembly queue) so the
+    /// peer retransmits only the holes on multi-segment loss.
+    sack_permitted: bool,
 }
 
 /// Single walk over a SYN's TCP options. First occurrence of each
@@ -195,6 +241,8 @@ fn parse_syn_options(opts: &[u8]) -> SynOptions {
                             out.wscale.get_or_insert(s.min(14));
                         }
                     }
+                    // SACK-Permitted: kind=4, len=2, no value.
+                    (4, 2) => out.sack_permitted = true,
                     _ => {} // unknown option, or known kind with wrong len
                 }
                 i += len;
@@ -255,6 +303,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
     let SynOptions {
         wscale: syn_wscale,
         mss: syn_mss,
+        sack_permitted: syn_sack,
     } = if flags & TCP_SYN != 0 && data_offset > 20 {
         first
             .data()
@@ -446,6 +495,11 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             // 64 KiB and a high-RTT download run at full speed.
             c.wscale_ok = syn_wscale.is_some();
             c.snd_wscale = syn_wscale.unwrap_or(0);
+            // RFC 2018: enable SACK only if the peer permitted it. We
+            // then echo SACK-Permitted in the SYN-ACK and emit SACK
+            // blocks (from the T3 reassembly queue) on out-of-order
+            // ACKs so the peer retransmits only the holes.
+            c.sack_ok = syn_sack;
             // RFC 9293 §3.7.1: honor the peer's advertised MSS. Clamp our
             // send segment size to min(our MSS, peer's) so a peer on a
             // small-MTU path (cellular / NAT64, ~1220) isn't sent
@@ -511,14 +565,29 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             // factor), but emitting it authorises the peer to scale the
             // window *it* advertises, lifting `snd_wnd` past 64 KiB so a
             // high-RTT download isn't capped at 64 KiB/RTT.
+            // RFC 2018 §2: additionally echo SACK-Permitted (kind 4,
+            // len 2) only when the peer's SYN carried it — authorising
+            // us to send, and the peer to act on, SACK blocks. The
+            // blobs stay 4-byte aligned (NOP-padded), as
+            // `send_segment_opts` requires.
             let [mss_hi, mss_lo] = (mss_for(c.local_ip) as u16).to_be_bytes();
-            if c.wscale_ok {
-                // MSS(kind 2,len 4) + NOP(pad) + WS(kind 3,len 3) = 8 B
-                // (two 32-bit option words).
-                send_segment_opts(&meta, &[], &[2, 4, mss_hi, mss_lo, 1, 3, 3, 0]);
-            } else {
+            match (c.wscale_ok, c.sack_ok) {
+                // MSS + NOP + WS = 8 B (unchanged from the WS-only path).
+                (true, false) => {
+                    send_segment_opts(&meta, &[], &[2, 4, mss_hi, mss_lo, 1, 3, 3, 0]);
+                }
+                // MSS + NOP + WS + SACK-Perm + 2·NOP = 12 B.
+                (true, true) => {
+                    send_segment_opts(&meta, &[], &[2, 4, mss_hi, mss_lo, 1, 3, 3, 0, 4, 2, 1, 1]);
+                }
+                // MSS + SACK-Perm + 2·NOP = 8 B.
+                (false, true) => {
+                    send_segment_opts(&meta, &[], &[2, 4, mss_hi, mss_lo, 4, 2, 1, 1]);
+                }
                 // MSS only — 4 bytes (one option word).
-                send_segment_opts(&meta, &[], &[2, 4, mss_hi, mss_lo]);
+                (false, false) => {
+                    send_segment_opts(&meta, &[], &[2, 4, mss_hi, mss_lo]);
+                }
             }
             crate::diag::COUNTERS.synack_tx.bump();
         }
@@ -800,35 +869,16 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
             // regression from the old comment shows up again we'll
             // want a real timer-based ACK coalescer rather than
             // pinning this to "next data segment".
-            send_segment(
-                &SegmentMeta {
-                    local_ip: dst_ip,
-                    dst_ip: src_ip,
-                    src_port: dst_port,
-                    dst_port: src_port,
-                    seq: c.snd_nxt,
-                    ack: c.rcv_nxt,
-                    flags: TCP_ACK,
-                    window: c.rx_free() as u16,
-                },
-                &[],
-            );
+            //
+            // Carries RFC 2018 SACK blocks if a partial drain (ring
+            // full) left out-of-order data buffered; none on the clean
+            // path, so the wire format is unchanged there.
+            emit_ack(c, dst_ip, src_ip, dst_port, src_port);
         } else if seq_lt(seq, c.rcv_nxt) {
             // Duplicate/retransmitted segment — send ACK immediately so the
             // sender knows we already have this data (fast retransmit signal).
-            send_segment(
-                &SegmentMeta {
-                    local_ip: dst_ip,
-                    dst_ip: src_ip,
-                    src_port: dst_port,
-                    dst_port: src_port,
-                    seq: c.snd_nxt,
-                    ack: c.rcv_nxt,
-                    flags: TCP_ACK,
-                    window: c.rx_free() as u16,
-                },
-                &[],
-            );
+            // SACK blocks ride along if out-of-order data is still queued.
+            emit_ack(c, dst_ip, src_ip, dst_port, src_port);
         } else {
             // T3: a wholly-future segment (`seq > rcv_nxt`) — there is a
             // gap before it. Buffer it in the out-of-order reassembly
@@ -855,19 +905,10 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
                     crate::diag::COUNTERS.ooo_queued.bump();
                 }
             }
-            send_segment(
-                &SegmentMeta {
-                    local_ip: dst_ip,
-                    dst_ip: src_ip,
-                    src_port: dst_port,
-                    dst_port: src_port,
-                    seq: c.snd_nxt,
-                    ack: c.rcv_nxt,
-                    flags: TCP_ACK,
-                    window: c.rx_free() as u16,
-                },
-                &[],
-            );
+            // Immediate dup-ACK (RFC 5681 §4.2) carrying SACK blocks
+            // (RFC 2018) for the queued out-of-order ranges so the peer
+            // retransmits only the holes.
+            emit_ack(c, dst_ip, src_ip, dst_port, src_port);
         }
     }
 
