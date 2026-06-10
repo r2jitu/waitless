@@ -303,10 +303,10 @@ pub struct TcpConnection {
     /// `async_recv` drains via `rx_ring_pop`.
     ///
     /// Inline `[u8; RX_RING_BYTES]` would bloat the per-slot
-    /// footprint by 8 KiB × every slot in the per-core pool; with
+    /// footprint by 16 KiB × every slot in the per-core pool; with
     /// the segmented-pool growth ceiling at MAX_SEGMENTS × SEGMENT_SIZE
-    /// that's ~512 MiB worst-case. Boxing the ring keeps idle
-    /// segments cheap and only materialises 8 KiB per live conn.
+    /// that's ~1 GiB worst-case. Boxing the ring keeps idle
+    /// segments cheap and only materialises 16 KiB per live conn.
     pub(crate) rx_ring: Option<Box<[u8; RX_RING_BYTES]>>,
     pub(crate) rx_head: u16,
     pub(crate) rx_tail: u16,
@@ -739,8 +739,8 @@ impl TcpConnection {
         if self.rx_ring.is_some() {
             return true;
         }
-        // The ring is reused across SYN/close cycles. Box::new
-        // on a [u8; 8192] allocates 8 KiB on the global heap;
+        // The ring is reused across SYN/close cycles. The boxed
+        // `[u8; RX_RING_BYTES]` is 16 KiB on the global heap;
         // OOM at SYN time refuses the connection — same admission-
         // gate behaviour the previous `VecDeque<IOBuf>` design had.
         let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -1238,8 +1238,18 @@ impl TcpConnection {
         if bytes.is_empty() || self.rtx_alloc_failed {
             return;
         }
-        let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; bytes.len()];
-        staging.copy_from_slice(bytes);
+        // Reserve-then-extend, not `vec![0u8; len]`: the macro zeroes the
+        // whole buffer before the copy overwrites it — a dead ~16 KiB
+        // memset per TSO record on every large response — and it aborts
+        // the kernel on OOM via the alloc-error handler, where this path
+        // (like `rtx_push`) degrades gracefully to the no-coverage flow.
+        let mut staging: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        if staging.try_reserve_exact(bytes.len()).is_err() {
+            self.rtx_alloc_failed = true;
+            self.handle_rtx_push_oom();
+            return;
+        }
+        staging.extend_from_slice(bytes);
         let seq_start = self.snd_nxt.wrapping_sub(bytes.len() as u32);
         let now_ms = kernel_core::clock::now_ms();
         let iobuf = IOBuf::from(staging);
