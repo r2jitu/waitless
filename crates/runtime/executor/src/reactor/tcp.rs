@@ -848,6 +848,21 @@ impl<'a> Future for TcpRecv<'a> {
     }
 }
 
+impl Drop for TcpRecv<'_> {
+    fn drop(&mut self) {
+        // Cancel-safety, structural rather than by-convention: a future
+        // dropped while its waker is parked (`select!` losing branch,
+        // task abort) clears the slot. Safe unconditionally — recv-side
+        // futures take `&mut TcpStream`, so at most one exists per conn
+        // and a parked recv waker can only be ours; a normal wake
+        // `take()`s the slot before the re-poll, so a post-resolve drop
+        // clears nothing.
+        if let Some(b) = tcp_backend() {
+            (b.clear_recv_waker)(self.handle, self.generation);
+        }
+    }
+}
+
 // ---- Per-stream zero-copy chunk recv ---------------------------------------
 //
 // `TcpStream::recv_chunk().await` resolves with a `RecvChunkGuard`
@@ -948,11 +963,14 @@ impl<'a> Drop for RecvChunk<'a> {
         // segment would otherwise be stashed for a consumer that no
         // longer exists. An already-stashed chunk is left intact;
         // it's still owed to the conn slot and is released on slot
-        // reset.
-        if let Some(b) = tcp_backend()
-            && let Some(clear) = b.clear_chunk_buf_slot
-        {
-            clear(self.handle, self.generation);
+        // reset. The parked recv waker is cleared too (same argument
+        // as `TcpRecv::drop`: exclusive `&mut TcpStream` ⇒ it can
+        // only be ours).
+        if let Some(b) = tcp_backend() {
+            if let Some(clear) = b.clear_chunk_buf_slot {
+                clear(self.handle, self.generation);
+            }
+            (b.clear_recv_waker)(self.handle, self.generation);
         }
     }
 }
@@ -992,6 +1010,21 @@ impl<'a> TcpSendChain<'a> {
             generation,
             chain,
             _not_send: PhantomData,
+        }
+    }
+}
+
+impl Drop for TcpSendChain<'_> {
+    fn drop(&mut self) {
+        // Cancel-safety, structural rather than by-convention: clear the
+        // parked send waker when the future is dropped mid-send
+        // (`timeout`/`select!` cancel, task abort). Send futures take
+        // `&mut TcpStream`, so a parked send waker can only be ours; a
+        // normal wake `take()`s the slot before the re-poll, so a
+        // post-resolve drop clears nothing. (The send slot is separate
+        // from the recv slot — recv futures are unaffected.)
+        if let Some(b) = tcp_backend() {
+            (b.clear_send_waker)(self.handle, self.generation);
         }
     }
 }
