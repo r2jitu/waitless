@@ -137,10 +137,27 @@ an MSS option and that subsequent data segments are ≤ 1300 bytes.
 
 ## P1 — real impact under loss or hostile traffic
 
-### T3 — No out-of-order reassembly queue
+### T3 — No out-of-order reassembly queue ✅ done
 
-**What.** A data segment with a gap before it (`seq > rcv_nxt`) is
-dropped, not buffered. Pinned by `out_of_order_segment_is_not_buffered`.
+**Status.** Fixed. A bounded per-conn `OooQueue` (`state.rs`,
+`OOO_MAX_SEGS = 32`, `OOO_MAX_BYTES = 16 KiB = one window) buffers a
+segment with a gap before it (`seq > rcv_nxt`) instead of dropping it,
+and `drain_ooo` releases the contiguous prefix into `rx_ring` the
+moment the gap fills — advancing `rcv_nxt` so the cumulative ACK covers
+the reassembled run. An out-of-order arrival now elicits an immediate
+duplicate ACK (RFC 5681 §4.2). Overlapping / out-of-window / over-cap
+segments are dropped (the peer retransmits), keeping the queue sorted
+and non-overlapping by construction. `/obs` exposes `ooo_queued`.
+Covered by `out_of_order_segment_is_reassembled`,
+`multiple_out_of_order_segments_reassemble_in_order`,
+`gap_fill_overlapping_buffered_segment_delivers_tail`, and
+`ooo_queue_rejects_overlap_and_enforces_bounds`. This unblocks SACK
+(T7) and the ACK-out-of-window classification (T8). **GCE/netem
+loss-path throughput validation still pending** (the win is invisible
+on a clean LAN; correctness is unit-pinned).
+
+**What (original).** A data segment with a gap before it
+(`seq > rcv_nxt`) is dropped, not buffered.
 
 **RFC.** RFC 9293 permits dropping out-of-order segments but
 recommends queuing them; every modern stack does.
