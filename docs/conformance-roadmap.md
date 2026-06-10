@@ -313,11 +313,12 @@ on top (RFC 9114 framing + RFC 9204 QPACK) is tracked in
   response can't outrun the peer's advertised credit.
 - **Missing** (the live transport gaps; migration itself landed — see
   §8.2.2/§9.3 below):
-  - the **full transport-parameter set** — in particular the peer's
-    `ack_delay_exponent` (0x0a) and `max_ack_delay` (0x0b) are not parsed,
-    so a peer advertising non-default values gets the wrong ACK-delay
-    scaling in our RTT sample and PTO/time-threshold-loss timing (the
-    code hard-codes exponent 3 + a 25 ms `max_ack_delay`).
+  - parts of the **transport-parameter set** — `ack_delay_exponent` /
+    `max_ack_delay` ✅ now parsed, validated (§18.2 bounds), cached on the
+    connection, and honored in the RTT sample (scaled + clamped per
+    RFC 9002 §5.3) and the PTO (2026-06-10); still unparsed:
+    `max_udp_payload_size`, `disable_active_migration`,
+    `active_connection_id_limit` (moot until CID rotation lands).
   - **RESET_STREAM / STOP_SENDING** (RFC 9000 §19.4-5) — parsed past but
     never *generated* (a handler erroring mid-response can only tear the
     whole connection down, not abort the one stream) nor *honored* (a

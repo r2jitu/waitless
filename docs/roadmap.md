@@ -63,12 +63,12 @@ audit and are documented here (some also in their backlog).
 | TCP | **FinWait2 / half-closed** has no time-based idle reap (only reclaimed on pool-full) † | S2 | tcp-backlog |
 | L3 (IPv4) | inbound **IP fragments** aren't reassembled (a non-first fragment is fed to L4); no inbound IP/TCP **checksum verify** (relies on NIC RX-csum offload) † | S1 | networking |
 | L3 (NDP/ARP) | learn-only: no active solicitation on miss, no RFC 4861 reachability state, FIFO eviction only † | S3 | networking |
-| QUIC | peer **`ack_delay_exponent` / `max_ack_delay`** unparsed → wrong RTT/PTO scaling for a non-default peer † | S1 | conformance-roadmap |
+| QUIC | ~~peer `ack_delay_exponent` / `max_ack_delay` unparsed~~ ✅ closed 2026-06-10 (parsed + validated + honored in RTT/PTO); still unparsed: `max_udp_payload_size`, `disable_active_migration`, `active_connection_id_limit` | S3 | conformance-roadmap |
 | QUIC | **RESET_STREAM / STOP_SENDING** not generated/honored (per-stream abort) † | S1 | conformance-roadmap |
 | QUIC | **CID rotation** (NEW/RETIRE_CONNECTION_ID) + WE-initiated PATH_CHALLENGE on a migrated path | S2 | conformance-roadmap |
 | QUIC | CONNECTION_CLOSE emitted in only the highest-keys PN space (RFC 9000 §10.2.3) † | S3 | conformance-roadmap |
 | QUIC interop | QUIC Interop Runner (external Docker) not wired | S2 | conformance-roadmap |
-| TLS | **record sequence wraps with no nonce-reuse guard** — must terminate before the AES-GCM record limit (RFC 8446 §5.5) † | S1 | tls-backlog |
+| TLS | ~~record sequence had no nonce-reuse guard~~ ✅ closed 2026-06-10 (`SEAL_RECORD_LIMIT` 2^24/key — `seal_app_data` refuses → conn closes; KeyUpdate-instead remains TL-2) | S3 | tls-backlog |
 | TLS | HelloRetryRequest, full key-update, ticket-key rotation, cipher/curve breadth, 0-RTT (replay-sensitive) | S2 | tls-backlog |
 | TLS | AES round-keys not zeroized on drop (single-tenant bare-metal) † | S3 | tls-backlog |
 | HTTP/2 | **h2spec** run (external tool); §7 error-code audit; two-GOAWAY drain; receive-window overrun not strictly rejected; request **trailers** dropped (no §8.1.2 validation) † | S1/S2 | http2-backlog |
