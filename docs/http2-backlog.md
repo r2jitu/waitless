@@ -168,8 +168,13 @@ landed this session; the rate-limit-flood guard is still open.
   (`connection`/`keep-alive`/`proxy-connection`/`transfer-encoding`/
   `upgrade`) and `te`≠`trailers` (§8.1.2.2). Unit-tested
   (`well_formed_request_is_accepted`, `malformed_requests_are_rejected`,
-  `te_trailers_is_allowed`). **Still open:** §8.1.2.6 Content-Length-vs-DATA
-  consistency, a §7 code-choice audit, and a graceful two-GOAWAY drain.
+  `te_trailers_is_allowed`). **§8.1.2.6 Content-Length vs DATA** is now
+  enforced too: per-stream `body_received` vs declared `content_length`,
+  reset (PROTOCOL_ERROR) on over-delivery, under-delivery at END_STREAM,
+  or a non-zero content-length on a bodyless request. Tested
+  (`content_length_mismatch_resets_the_stream`,
+  `content_length_exact_match_is_accepted`). **Still open:** a §7
+  code-choice audit and a graceful two-GOAWAY drain.
 - **H2-9 — h2spec.** Run the h2spec conformance suite; track failures here.
   Not yet run.
 

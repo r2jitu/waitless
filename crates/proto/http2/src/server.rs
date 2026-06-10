@@ -696,6 +696,12 @@ struct StreamSlot {
     send_window: i64,
     /// HEADERS frame emitted for the streaming response.
     headers_sent: bool,
+    /// Declared `content-length` of the request body, if the header was
+    /// present and valid. RFC 7540 §8.1.2.6: the sum of DATA payloads
+    /// MUST equal this; checked against `body_received` at END_STREAM.
+    content_length: Option<usize>,
+    /// Request DATA payload bytes received so far (excludes padding).
+    body_received: usize,
 }
 
 /// [`BodySource`] over a streaming request stream, owned by the spawned
@@ -1350,6 +1356,16 @@ where
     }
 
     if end_stream {
+        // RFC 7540 §8.1.2.6: a bodyless request (END_STREAM on HEADERS)
+        // that declared a non-zero content-length is malformed — it
+        // claims a body it will never send.
+        if let Some(cl) = parse_content_length(req.header(b"content-length"))
+            && cl != 0
+        {
+            crate::h2_drop!(flow_control_error, "content-length={} but no body sid={}", cl, sid);
+            frame::push_rst_stream(&mut conn.ctrl_out, sid, error::PROTOCOL_ERROR);
+            return Ok(());
+        }
         // Bodyless request (typically GET): run the handler inline —
         // it has no body to await, so it returns promptly without
         // stalling the demux, and we skip a task spawn on the hot path.
@@ -1475,6 +1491,8 @@ where
                 tx,
                 send_window: conn.peer_initial_window,
                 headers_sent: false,
+                content_length,
+                body_received: 0,
             });
             true
         }
@@ -1494,6 +1512,31 @@ fn process_data(conn: &mut H2Conn, hdr: FrameHeader, payload: &[u8]) -> Result<(
 
     match conn.streams.iter().position(|s| s.id == hdr.stream_id) {
         Some(i) => {
+            // RFC 7540 §8.1.2.6: track received body bytes against the
+            // declared content-length. A DATA payload that pushes the
+            // total over content-length, or an END_STREAM where the
+            // total doesn't equal it, is a malformed request → stream
+            // error PROTOCOL_ERROR.
+            conn.streams[i].body_received += data.len();
+            if let Some(cl) = conn.streams[i].content_length {
+                let got = conn.streams[i].body_received;
+                if got > cl || (end_stream && got != cl) {
+                    crate::h2_drop!(
+                        flow_control_error,
+                        "content-length mismatch sid={} got={} declared={}",
+                        hdr.stream_id,
+                        got,
+                        cl
+                    );
+                    reset_stream(conn, hdr.stream_id, error::PROTOCOL_ERROR);
+                    // Still credit the connection window so the peer's
+                    // accounting stays consistent.
+                    if full_len > 0 {
+                        frame::push_window_update(&mut conn.ctrl_out, 0, full_len);
+                    }
+                    return Ok(());
+                }
+            }
             // Route the payload into the streaming handler's body
             // channel. The STREAM-level window is credited on consume
             // (see `credit_consumed_bodies`) for backpressure; the
@@ -2061,6 +2104,8 @@ mod tests {
             }),
             send_window,
             headers_sent: false,
+            content_length: None,
+            body_received: 0,
         }
     }
 
@@ -2367,6 +2412,71 @@ mod tests {
             (b":path", b"/"),
             (b"te", b"trailers"),
         ]));
+    }
+
+    /// RFC 7540 §8.1.2.6: DATA that under-delivers vs the declared
+    /// content-length at END_STREAM, or over-delivers at any point, is a
+    /// malformed request → RST_STREAM(PROTOCOL_ERROR).
+    #[test]
+    fn content_length_mismatch_resets_the_stream() {
+        use crate::frame::flags;
+        // Under-delivery: declared 5, END_STREAM after 3 bytes.
+        let mut conn = H2Conn::new();
+        conn.streams
+            .push(streaming_slot(head_block(), &[], false, INITIAL_WINDOW));
+        conn.streams[0].content_length = Some(5);
+        let hdr = crate::frame::FrameHeader {
+            length: 3,
+            ty: ftype::DATA,
+            flags: flags::END_STREAM,
+            stream_id: 1,
+        };
+        process_data(&mut conn, hdr, b"abc").unwrap();
+        assert!(conn.streams.is_empty(), "under-delivery reset the stream");
+        assert!(
+            frames(&conn.ctrl_out).iter().any(|f| f.0 == ftype::RST_STREAM),
+            "RST_STREAM queued for the under-delivery",
+        );
+
+        // Over-delivery: declared 2, a 5-byte DATA frame.
+        let mut conn = H2Conn::new();
+        conn.streams
+            .push(streaming_slot(head_block(), &[], false, INITIAL_WINDOW));
+        conn.streams[0].content_length = Some(2);
+        let hdr = crate::frame::FrameHeader {
+            length: 5,
+            ty: ftype::DATA,
+            flags: 0,
+            stream_id: 1,
+        };
+        process_data(&mut conn, hdr, b"abcde").unwrap();
+        assert!(conn.streams.is_empty(), "over-delivery reset the stream");
+        assert!(
+            frames(&conn.ctrl_out).iter().any(|f| f.0 == ftype::RST_STREAM),
+            "RST_STREAM queued for the over-delivery",
+        );
+    }
+
+    /// An exact content-length match is accepted (no reset).
+    #[test]
+    fn content_length_exact_match_is_accepted() {
+        use crate::frame::flags;
+        let mut conn = H2Conn::new();
+        conn.streams
+            .push(streaming_slot(head_block(), &[], false, INITIAL_WINDOW));
+        conn.streams[0].content_length = Some(3);
+        let hdr = crate::frame::FrameHeader {
+            length: 3,
+            ty: ftype::DATA,
+            flags: flags::END_STREAM,
+            stream_id: 1,
+        };
+        process_data(&mut conn, hdr, b"abc").unwrap();
+        assert!(!conn.streams.is_empty(), "an exact match is not reset");
+        assert!(
+            !frames(&conn.ctrl_out).iter().any(|f| f.0 == ftype::RST_STREAM),
+            "no RST_STREAM for a matching content-length",
+        );
     }
 
     // ── H2-3 control-flood guard ──────────────────────────────────
