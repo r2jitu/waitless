@@ -157,12 +157,12 @@ AEAD seals there.
   `send_to_with_l2_headroom` and recycles the Vec into the
   conn's pool. End state: QUIC TX hot path is **1 memcpy per
   byte** — the fundamental encrypt R/W pass.
-  > ⚠️ **Stale since the 2026-06-06 stream-retx work**: the retain-until-ACK
-  > retention copies every queued STREAM payload via
-  > `SendStream::pop_chunk().to_vec()` (`streams.rs`), so QUIC TX is
-  > currently **2 R/W passes per response byte** (+1 alloc per packet-slice).
-  > Restoring 1 memcpy/byte = retain `clone_shared` IOBuf views instead —
-  > lever #1 in `efficiency-audit.md`'s 2026-06-09 update.
+  > (History: the 2026-06-06 stream-retx work temporarily regressed this
+  > to 2 R/W passes/byte — the retain-until-ACK retention copied every
+  > queued STREAM payload via `pop_chunk().to_vec()`. Fixed 2026-06-10:
+  > `pop_chunk` returns `clone_shared` IOBuf views, so the retention is
+  > refcounted, not copied, and 1 memcpy/byte holds again. h3 /health
+  > measured 8.4 → 6.0 allocs/req.)
 - **Note (`send_on_qp` busy-spin)**: still there in the slow path
   used by ARP/DHCP/ICMP/UDP and the TCP fallback when the pool
   is full. With the new acquire path returning `None` on full,

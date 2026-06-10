@@ -84,12 +84,12 @@ documented gVNIC-DQO ring-full drop → RTO tail, not a regression.
 ### Prioritized efficiency levers (allocs/bytes, NOT throughput — the serve
 path is <10% of saturated cycles; NIC poll ~39% + async ~22% still dominate)
 
-1. **QUIC stream-retx retention: `clone_shared` views, not `to_vec`**
-   (`streams.rs` `pop_chunk`, `conn/tx.rs`). The 2026-06-06 stream-retx work
-   silently made QUIC TX **2 R/W passes per response byte**; on bulk h3 a
-   1 MiB body ≈ 880 allocs + 1 MiB of extra memcpy. −2 allocs/req on h3
-   /health. (`tx-path-optimizations.md`'s "1 memcpy/byte QUIC TX" is stale
-   until this lands.) **M**
+1. ~~QUIC stream-retx retention: `clone_shared` views, not `to_vec`~~ —
+   **done 2026-06-10 (`68080c5`)**: `pop_chunk` returns refcounted views,
+   the per-packet `Vec<StreamRetx>` recycles through packet retirement,
+   and 1 memcpy/byte QUIC TX holds again. Measured h3 /health
+   **8.4 → 6.0 allocs/req**; bulk h3 drops ~880 allocs + 1 MiB of memcpy
+   per 1 MiB body.
 2. **Box the QUIC `DirKeys` slots** — 9 × 1,552 B inline, ~3 live on an
    established conn: **−9–11 KB per h3 conn** (>50% of `Connection`). **S/M**
 3. **h2 `value_scratch` 16 KiB eager → lazy** at `H2Conn::new`: −16 KB per
@@ -99,8 +99,8 @@ path is <10% of saturated cycles; NIC poll ~39% + async ~22% still dominate)
 5. ~~TSO retain `vec![0u8;len]` zeroing pass~~ — **done this pass**.
 6. **rx_ring 16 KB → tiered** — Tier-2 #3 below still valid, still the
    biggest always-present per-conn block; `OOO_MAX_BYTES` is tied to it. **M**
-7. Per-packet `Vec<StreamRetx>` recycle through `SentPacket` retirement
-   (−1 alloc/data-packet, falls out of #1). **S**
+7. ~~Per-packet `Vec<StreamRetx>` recycle~~ — **done with #1** (`68080c5`,
+   `retx_frame_vec_pool`).
 8. `[Header;16]` 5.4 KB → 8 inline + overflow — Tier-2 #4 below, value *up*:
    now also a per-stream cost in every spawned h2/h3 handler task. **S/M**
 
