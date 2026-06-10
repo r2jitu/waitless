@@ -7,6 +7,106 @@ are code-grounded (file:line in the source); the perf trackers
 [`tx-path-optimizations.md`](tx-path-optimizations.md), and
 [`high-concurrency-perf.md`](high-concurrency-perf.md) hold the per-item history.
 
+## Update (2026-06-09) — full re-measurement (req/s, allocs/req, mem/conn, idle)
+
+A whole-codebase efficiency pass: dynamic measurement (HVF work-counters +
+a fresh GCE bench of current main) cross-checked against a compiler-exact
+static footprint walk. Numbers below supersede the tables further down.
+
+**Measurement traps fixed first (don't repeat them):** a multi-URL
+`curl -o /dev/null url url …` run does NOT issue one request per URL against
+this server, and the bench harness's `allocs/iter` is a *net live-count*
+delta (allocs − frees ≈ 0 in steady state), not cumulative — both previously
+produced bogus "0 allocs/req" readings. The numbers below use a raw
+keep-alive driver that counts client-verified responses against the
+cumulative `/obs` `heap_total_allocation_count`.
+
+### Allocs/request (measured, client-verified; HVF/virtio)
+
+| Path | allocs/req | What they are (code-traced, agrees with measurement) |
+|---|---|---|
+| h1-TLS `GET /health` | **1.00** | the rtx retain — `rtx_push`'s `into_owned()` of the Borrowed sealed record (`state.rs`); freed on ACK. The 2026-05-29 "1 → 0 DONE (`1d46f90`)" claim below is **stale: `RtxPayload::Inline` was deliberately reverted** (throughput-neutral, kept simple) |
+| h1-TLS `/static-16k` | **2.02** | + 1 TSO-record retain |
+| h1-TLS `/static-1m` | **81** | ≈ 1 retain per 16 KiB TSO record (64) + record chunking; each retain also paid a dead 16 KiB zeroing pass — **fixed this pass** (`try_reserve` + `extend_from_slice`) |
+| h2 `GET /health` | **3.7** | h1's rtx retain + `header_block: Vec::with_capacity(64)` per response + the per-flush `from_slice_with_headroom(frame_buf)` send IOBuf |
+| h3 `GET /health` | **8.4** | stream-retx retention `pop_chunk().to_vec()` (×2), per-packet `Vec<StreamRetx>`, recv/send BTreeMap node churn (×2), DATA-header IOBuf |
+
+RX remains structurally zero-copy/zero-alloc on all paths (chunk move →
+in-place AEAD → in-place parse); pooled IOBuf churn never touches talc.
+
+### Memory (measured + compiler-exact decomposition)
+
+- **Idle system heap**: 1.86 MB / 374 live allocations after boot (HVF,
+  1 core). Per-core statics that dominate: `TCP_HASH` 328 KB, accept rings
+  66 KB, warm TLS-conn pool ≤ 127 KB; NIC queue DMA ~1.5–2.5 MiB/QP.
+- **Mem/conn, deployed h1-TLS path** (the `https` facade serves *every* TLS
+  conn through the unified h2-capable task): **≈ 67 KB idle established**
+  (measured, 50 held conns; 6 allocs/conn), **≈ 84 KB after the first
+  request** (+16.4 KB lazy `record_scratch`), ~25 KB/conn retained on slot
+  reuse (rx_ring + warm capacity, by design). Decomposition: rx_ring 16.4 KB
+  + `TlsConnImpl` 7.9 KB (4 × 856 B `TrafficKey` now embeds expanded AES-GCM
+  state — deliberate perf trade, +2.6 KB vs May) + unified serve-task future
+  ~20.4 KB + **eager `H2Conn` heap 20.7 KB** (`inbuf` 4 KB +
+  `value_scratch` 16 KB, allocated per conn at `H2Conn::new`) + slot 0.4 KB.
+  The May figure of ~31 KB described an h1-only listener that is no longer
+  the deployed shape.
+- **h3/QUIC conn**: ≈ 20–22 KB — `Connection` is 17.9 KB inline, of which
+  **14.0 KB (78%) is 9 × 1,552 B `Option<DirKeys>` slots** (mostly `None` on
+  an established conn).
+- **TCP slot**: `TcpConnection` = 384 B (`Controller` 64 B — CUBIC variant;
+  `OooQueue` hdr 32 B; TLP ~9 B); pool segment 24.6 KB / 64 slots, lazy.
+- **No unbounded growth paths**: every post-May-30 queue is capped (OOO
+  16 KB/conn, retx ≤ cwnd ≤ 2 MiB, CRYPTO reassembly 64 KB, h2 1 MiB recv /
+  256 KiB send per stream, QUIC 2 MiB/stream / 8 MiB/conn / 256 MiB global,
+  conn inbox 256 datagrams, per-IP half-open 256, refuse-at-90%-heap).
+
+### Req/sec (GCE 2026-06-09, c3-highcpu-4 + gVNIC DQO, single 8-vCPU loadgen, current main)
+
+| Workload | 1c | 2c | 4c | Notes |
+|---|---|---|---|---|
+| `get_tcp` (plain /health) | 182.5K | 327.2K | 536.9K | |
+| `get_tls` (TLS /health, 32c) | 114.9K | 207.1K | 357.1K | cy/B 9.8–10.0 |
+| `get_h1` | 347.4K | 428.5K | 482.6K | 4c **client-bound** (cli 5.7 cpu) |
+| `get_h2` | 324.3K | 419.1K | 482.0K | h1-parity; client-bound |
+| `get_h3` | 185.5K | 237.6K | 301.9K | ≈ 0.63× h1 |
+| `get_tcp_fresh` (conn/s) | 36.4K | 64.1K | 99.2K | |
+| `get_tls_fresh` (full hs/s) | 3.8K | 5.2K | 6.2K | |
+| `download_64k_tls` | 23.6K | 35.6K | 36.5K | **NIC-bound ≥2c** (2.3–2.4 GB/s TX, cy/B 2.2) |
+| `download_64k_quic` | 10.0K | 12.1K | 13.2K | 659–864 MB/s |
+| `upload_32k_tls` | 41.3K | 52.8K | 54.2K | 1.4–1.8 GB/s RX |
+| `get_tcp_single` (1-conn RTT) | p50 49 µs | 48 µs | 49 µs | |
+
+The 4c h1/h2 numbers are a **floor** (the single loadgen saturates first);
+the two-loadgen saturated reference remains ~610–730K h1 @4c / ~950K @8c
+(`benchmark-results.md`). The 4c large-body p99 cliffs (115–295 ms) are the
+documented gVNIC-DQO ring-full drop → RTO tail, not a regression.
+
+### Prioritized efficiency levers (allocs/bytes, NOT throughput — the serve
+path is <10% of saturated cycles; NIC poll ~39% + async ~22% still dominate)
+
+1. **QUIC stream-retx retention: `clone_shared` views, not `to_vec`**
+   (`streams.rs` `pop_chunk`, `conn/tx.rs`). The 2026-06-06 stream-retx work
+   silently made QUIC TX **2 R/W passes per response byte**; on bulk h3 a
+   1 MiB body ≈ 880 allocs + 1 MiB of extra memcpy. −2 allocs/req on h3
+   /health. (`tx-path-optimizations.md`'s "1 memcpy/byte QUIC TX" is stale
+   until this lands.) **M**
+2. **Box the QUIC `DirKeys` slots** — 9 × 1,552 B inline, ~3 live on an
+   established conn: **−9–11 KB per h3 conn** (>50% of `Connection`). **S/M**
+3. **h2 `value_scratch` 16 KiB eager → lazy** at `H2Conn::new`: −16 KB per
+   idle h2-capable conn (paid by *every* deployed TLS conn today). **S**
+4. **h2 `header_block` pool + ship `frame_buf` as a Borrowed IOBuf** (the
+   `record_scratch` NonNull pattern): h2 3.7 → ~1.7 allocs/req. **S/M**
+5. ~~TSO retain `vec![0u8;len]` zeroing pass~~ — **done this pass**.
+6. **rx_ring 16 KB → tiered** — Tier-2 #3 below still valid, still the
+   biggest always-present per-conn block; `OOO_MAX_BYTES` is tied to it. **M**
+7. Per-packet `Vec<StreamRetx>` recycle through `SentPacket` retirement
+   (−1 alloc/data-packet, falls out of #1). **S**
+8. `[Header;16]` 5.4 KB → 8 inline + overflow — Tier-2 #4 below, value *up*:
+   now also a per-stream cost in every spawned h2/h3 handler task. **S/M**
+
+Everything below this block is the 2026-05-28/30 audit, kept for history;
+read its numbers as superseded by the above.
+
 ## Update (2026-05-30) — measured: the central thesis was wrong
 
 This audit was written from static code reading. A per-core magazine
@@ -151,7 +251,11 @@ small per-conn ring of sealed buffers, freed on ACK). **Validate:** tcp_test rtx
 coverage; HVF functional; GCE allocs/req (expect 1→0) + send-path cy/req.
 
 > **Status (2026-05-29).**
-> - **2(b) DONE — allocs/req 1 → 0** (landed `1d46f90`). A per-conn reusable
+> - **2(b) DONE — allocs/req 1 → 0** (landed `1d46f90`). ⚠️ **Later REVERTED
+>   (2026-05-30):** `RtxPayload::Inline` was measured throughput-neutral and
+>   backed out for simplicity — today's measured value is **1 alloc/req**
+>   again (see the 2026-06-09 update at top). Original text kept for history:
+>   A per-conn reusable
 >   inline retransmit-retain buffer (`RtxPayload::Inline`) replaces the borrowed
 >   header/record `into_owned` copy; GCE-validated 1.00 → 0.000 on /health plain
 >   and TLS. (Implemented as a copy-into-reusable-buffer rather than
