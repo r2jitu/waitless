@@ -212,13 +212,18 @@ impl LaunchTable {
         if prev.is_null() || is_tombstone(prev) {
             return;
         }
-        // SAFETY: every non-null non-tombstone pointer was produced
-        // by `Box::into_raw(Box::new(Launcher{..}))` in `register`.
-        // We own it exclusively now — the swap removed it from the
-        // shared table.
-        unsafe {
-            let _ = Box::from_raw(prev);
-        }
+        // Intentionally **leak** `prev` rather than `Box::from_raw`-free it.
+        // A concurrent `fire_pending` on another worker may have already
+        // loaded this slot's pointer and passed its tombstone check and be
+        // about to deref it — freeing here would be a use-after-free in that
+        // load→check→deref TOCTOU window (visibility ordering doesn't make
+        // those three steps atomic). The `Launcher` box is tiny and `release`
+        // is rare (listener teardown), so we leak it — exactly as the chunks
+        // themselves are never freed — and trade a bounded, negligible leak
+        // for memory safety. (A worker that fires a just-released launcher
+        // runs it once more against the still-valid leaked box; benign — the
+        // body finds the listener gone and exits.)
+        let _leaked: *mut Launcher = prev;
     }
 
     /// Invoke every launcher registered since `worker_id` last
@@ -264,10 +269,11 @@ impl LaunchTable {
                 new_fired = i + 1;
                 continue;
             }
-            // SAFETY: `p` came from `Box::into_raw(Box::new(
-            // Launcher{..}))` and stays valid until `release`
-            // swaps in a tombstone (detected above). The swap is
-            // AcqRel so we see a consistent snapshot.
+            // SAFETY: `p` came from `Box::into_raw(Box::new(Launcher{..}))`
+            // and is never freed — `release` only swaps a tombstone in and
+            // leaks the box (see there), precisely so this deref can't race
+            // a free. The tombstone check above is a skip-released filter,
+            // not a memory-safety guard.
             let launcher: &Launcher = unsafe { &*p };
             launcher();
             new_fired = i + 1;

@@ -87,6 +87,17 @@ impl Future for Sleep {
                 })
             }) {
                 this.timer_scheduled = true;
+            } else {
+                // The wheel slot for this deadline is full (> MAX_PER_SLOT
+                // timers collided into one of the 256 buckets — an extreme
+                // high-timer-concurrency edge). We could not register a wake,
+                // so parking would hang the task forever with no timer to
+                // fire it. Fire the sleep NOW instead: a `Sleep` used as a
+                // timeout then trips early and a `Sleep` used as a delay
+                // under-sleeps — both safe, bounded degradations, unlike a
+                // lost wakeup. (See docs/stack-architecture.md — the proper
+                // fix is a wheel overflow list so `insert` never fails.)
+                return Poll::Ready(());
             }
         }
         Poll::Pending
