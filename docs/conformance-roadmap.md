@@ -3,8 +3,8 @@
 Status: in progress (steps 1-5 complete). Last updated 2026-06-07
 (TCP window scaling + ABC shipped — see [`tcp-backlog.md`](tcp-backlog.md);
 QUIC RFC 9002 frame retx + congestion controller now landed — the shared
-`net_cc` NewReno controller is wired into QUIC; CRYPTO-frame retx via the
-PTO probe is the one residual).
+`net_cc` NewReno controller is wired into QUIC, and STREAM + CRYPTO frame
+retransmission are both done).
 
 This doc keeps the conformance-testing **strategy** (the in-process
 harness pattern), the **sequencing**, and the per-RFC **status** view
@@ -73,8 +73,8 @@ Landed:
   `//crates/net:classify_test`.
 
 QUIC loss recovery + congestion (step 5) has since landed too — STREAM
-retx, the shared `net_cc` NewReno controller wired into QUIC, and PTO
-backoff (only CRYPTO-frame retx remains). What remains is the
+retx, CRYPTO-frame retx (RFC 9002 §6.2), the shared `net_cc` NewReno
+controller wired into QUIC, and PTO backoff. What remains is the
 feature-breadth items (SACK, Timestamps/PAWS, and the Linux
 performance-parity gaps) — steps 6 onward — plus delegating TCP onto the
 shared `net_cc` core. Window scaling (RFC 7323) is done. See
@@ -342,12 +342,17 @@ on top (RFC 9114 framing + RFC 9204 QPACK) is tracked in
   not `#[allow(dead_code)]`. **PTO backoff**: `pto_period_us` shifts the
   base left by `pto_count` (`base << pto_count.min(10)`), so an
   unresponsive peer probes at a geometrically increasing interval.
-- **Missing**: **CRYPTO-frame retransmission** — `send_pto_probe` still
-  emits a bare PING rather than replaying lost CRYPTO frames, so
-  handshake-loss recovery leans on the peer's PING-elicited ACK (the
-  STREAM half above is done; CRYPTO is the residual). Plus the wider
-  loss-recovery audit items (ECN, the §7.6.1 lost-time-span persistent-
-  congestion test — we trigger collapse off `pto_count` instead).
+- ✅ **CRYPTO-frame retransmission** (RFC 9002 §6.2) — **done**. Each
+  sealed Initial/Handshake packet retains its CRYPTO fragment
+  (`CryptoRetx{level, offset, data}`); `detect_loss` re-queues a lost
+  packet's fragments into `crypto_retx_queue`, and `flush_outbound`
+  re-emits each at its original offset/space before fresh handshake
+  CRYPTO — so handshake-packet loss is recovered by resending the bytes,
+  not just by the PTO PING. Unit-tested
+  (`lost_crypto_fragment_is_requeued_for_retransmission`); `/obs`
+  `crypto_frames_retransmitted`. **Remaining**: the wider loss-recovery
+  audit items (ECN, the §7.6.1 lost-time-span persistent-congestion
+  test — we trigger collapse off `pto_count` instead).
   **Note (shared core, QUIC-wired only)**: the controller landed as the
   **shared TCP+QUIC `net_cc` core** (`crates/net/cc`, the `CongestionControl`
   trait + NewReno) — but it is wired into **QUIC only** today. TCP still
