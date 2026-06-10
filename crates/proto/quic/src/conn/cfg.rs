@@ -589,6 +589,35 @@ fn lost_crypto_fragment_is_requeued_for_retransmission() {
     );
 }
 
+/// RFC 9000 §4.6: a STREAMS_BLOCKED frame means the peer is wedged at
+/// its stream limit — most likely a MAX_STREAMS we sent was lost (the
+/// level-trigger can't recover that, since it needs the peer to open
+/// more streams, which it can't). Processing one must force a
+/// re-advertise of the current cap, mirroring the DATA_BLOCKED →
+/// MAX_DATA recovery.
+#[test]
+fn streams_blocked_forces_max_streams_readvertise() {
+    let mut conn = Connection::new_server(ConnectionId::new(&[0xab; 8]), [0x42u8; 32]);
+    assert!(!conn.force_max_streams_bidi);
+    assert!(!conn.force_max_streams_uni);
+
+    // STREAMS_BLOCKED_BIDI (type 0x16) carrying a max-streams varint (5).
+    conn.dispatch_frames(crate::CryptoLevel::OneRtt, &[0x16, 0x05])
+        .unwrap();
+    assert!(
+        conn.force_max_streams_bidi,
+        "STREAMS_BLOCKED_BIDI forces a MAX_STREAMS (bidi) re-advertise",
+    );
+
+    // STREAMS_BLOCKED_UNI (type 0x17).
+    conn.dispatch_frames(crate::CryptoLevel::OneRtt, &[0x17, 0x05])
+        .unwrap();
+    assert!(
+        conn.force_max_streams_uni,
+        "STREAMS_BLOCKED_UNI forces a MAX_STREAMS (uni) re-advertise",
+    );
+}
+
 /// Persistent congestion (RFC 9002 §7.6): once several consecutive PTO
 /// periods elapse with no ACK, the congestion window collapses to the
 /// minimum and slow start restarts. Regression for the gap where

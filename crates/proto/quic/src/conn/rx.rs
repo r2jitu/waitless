@@ -960,15 +960,22 @@ impl Connection {
                     // Most wire-recognized frames need no app-level
                     // reaction (NEW_CONNECTION_ID, …); the
                     // frame layer already consumed the right bytes. But
-                    // DATA_BLOCKED / STREAM_DATA_BLOCKED mean the peer is
-                    // stalled at a receive-window edge — force the next
-                    // packet (this datagram's post-dispatch flush) to
-                    // re-advertise the current window so a MAX_* the peer
-                    // lost is recovered (we don't retransmit them).
+                    // DATA_BLOCKED / STREAM_DATA_BLOCKED / STREAMS_BLOCKED
+                    // mean the peer is stalled at a flow-control or
+                    // stream-limit edge — force the next packet (this
+                    // datagram's post-dispatch flush) to re-advertise the
+                    // current limit so a MAX_* the peer lost is recovered
+                    // (we don't retransmit those frames per se).
                     match kind {
                         crate::frame::ftype::DATA_BLOCKED => self.force_max_data = true,
                         crate::frame::ftype::STREAM_DATA_BLOCKED => {
                             self.force_max_stream_data = true;
+                        }
+                        crate::frame::ftype::STREAMS_BLOCKED_BIDI => {
+                            self.force_max_streams_bidi = true;
+                        }
+                        crate::frame::ftype::STREAMS_BLOCKED_UNI => {
+                            self.force_max_streams_uni = true;
                         }
                         _ => {}
                     }

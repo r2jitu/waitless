@@ -944,6 +944,14 @@ pub struct Connection {
     /// already caught up. Cleared once re-advertised.
     pub(super) force_max_data: bool,
     pub(super) force_max_stream_data: bool,
+    /// As above, for MAX_STREAMS: set on an inbound STREAMS_BLOCKED so
+    /// the next packet re-advertises the *current* stream limit even
+    /// when the replenish threshold isn't crossed — recovering a
+    /// MAX_STREAMS the peer lost (otherwise a peer blocked on stream
+    /// creation stays wedged, since the level-trigger needs the peer to
+    /// open more streams, which it can't). Cleared once re-advertised.
+    pub(super) force_max_streams_bidi: bool,
+    pub(super) force_max_streams_uni: bool,
 
     // ── Anti-amplification (RFC 9000 §8.1) ────────────────────────
     //
@@ -1289,6 +1297,8 @@ impl Connection {
             data_received: 0,
             force_max_data: false,
             force_max_stream_data: false,
+            force_max_streams_bidi: false,
+            force_max_streams_uni: false,
             bytes_received_pre_validation: 0,
             bytes_sent_pre_validation: 0,
             path_validated: false,

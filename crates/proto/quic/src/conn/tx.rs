@@ -714,6 +714,9 @@ impl Connection {
         if !self.handshake_done_sent
             || self.peer_max_streams_bidi_advertised <= self.peer_bidi_streams_opened + REFILL_AT
             || self.peer_max_streams_uni_advertised <= self.peer_uni_streams_opened + REFILL_AT
+            // STREAMS_BLOCKED recovery: re-advertise the current cap.
+            || self.force_max_streams_bidi
+            || self.force_max_streams_uni
             || self.force_max_data
             // MAX_DATA slide is gated on the aggregate recv budget (#75):
             // while over budget we deliberately DON'T grant new credit,
@@ -1150,30 +1153,41 @@ impl Connection {
         // MAX_STREAMS replenishment (RFC 9000 §4.6 / §19.11).
         const STREAM_CREDIT_REFILL_AT: u64 = 256;
         const STREAM_CREDIT_WINDOW: u64 = 1024;
-        if self.peer_max_streams_bidi_advertised
-            <= self.peer_bidi_streams_opened + STREAM_CREDIT_REFILL_AT
-        {
+        // Bump the advertised cap on the replenish threshold; re-emit
+        // the *current* cap (without bumping) on a STREAMS_BLOCKED
+        // recovery (`force_max_streams_*`) — the level trigger alone
+        // can't fire there, since it needs the peer to open more streams,
+        // which a peer blocked on a lost MAX_STREAMS cannot do.
+        let bidi_replenish = self.peer_max_streams_bidi_advertised
+            <= self.peer_bidi_streams_opened + STREAM_CREDIT_REFILL_AT;
+        if bidi_replenish {
             self.peer_max_streams_bidi_advertised =
                 self.peer_bidi_streams_opened + STREAM_CREDIT_WINDOW;
+        }
+        if bidi_replenish || self.force_max_streams_bidi {
             append_max_streams_into(
                 out,
                 self.peer_max_streams_bidi_advertised,
                 /* uni= */ false,
             )
             .map_err(|_| ConnError::Wire)?;
+            self.force_max_streams_bidi = false;
             ack_eliciting = true;
         }
-        if self.peer_max_streams_uni_advertised
-            <= self.peer_uni_streams_opened + STREAM_CREDIT_REFILL_AT
-        {
+        let uni_replenish = self.peer_max_streams_uni_advertised
+            <= self.peer_uni_streams_opened + STREAM_CREDIT_REFILL_AT;
+        if uni_replenish {
             self.peer_max_streams_uni_advertised =
                 self.peer_uni_streams_opened + STREAM_CREDIT_WINDOW;
+        }
+        if uni_replenish || self.force_max_streams_uni {
             append_max_streams_into(
                 out,
                 self.peer_max_streams_uni_advertised,
                 /* uni= */ true,
             )
             .map_err(|_| ConnError::Wire)?;
+            self.force_max_streams_uni = false;
             ack_eliciting = true;
         }
 
