@@ -5,7 +5,7 @@
 // the facade crate, NOT in `nic_api`. nic_api is the driver-ABI leaf
 // crate — DHCP-protocol error variants have no business living in
 // the trait crate every NIC driver depends on. NicError stays in
-// nic_api (it appears in `NicOps` fn-pointer signatures).
+// nic_api (it appears in `Nic` method signatures).
 //
 // Design rules unchanged from the previous co-located version:
 //   1. Every error fits in ≤ 2 pointers (16 bytes on 64-bit). Keeps

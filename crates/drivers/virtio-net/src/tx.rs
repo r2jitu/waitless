@@ -573,7 +573,7 @@ pub(crate) fn submit_tx_tso(
 /// goes straight through `acquire_tx_buf`/`submit_tx` now (per-
 /// worker pool + virtq submit, with TX_LOCK on Tier 2). The
 /// per-core SPSC staging-ring path has been retired; this hook
-/// stays in the NicOps vtable so callers compile, but never
+/// stays in the `NicIdleOps` vtable so callers compile, but never
 /// reports work pending.
 pub(crate) fn has_pending_tx() -> bool {
     false

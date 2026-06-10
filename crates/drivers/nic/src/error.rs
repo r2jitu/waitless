@@ -1,6 +1,6 @@
 // drivers/nic-api/src/error.rs — Driver-side errors only.
 //
-// `NicError` is referenced by `NicOps` fn-pointer signatures, so it
+// `NicError` is referenced by `Nic` method signatures, so it
 // has to live in the trait crate. The application-level error types
 // (`NetError`, `DhcpError`) used to live here too but moved to
 // `crates/waitless/net/src/error.rs` — they're facade-level concerns, not

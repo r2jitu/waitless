@@ -1,4 +1,4 @@
-// `NicOps` POD + link-time registry. Leaf crate so NIC drivers can
+// `Nic` trait + link-time registry. Leaf crate so NIC drivers can
 // depend here without inheriting the full net stack.
 
 #![no_std]
@@ -25,7 +25,7 @@ pub const MAX_L2_HEADROOM: usize = 14 + 40 + 8;
 
 // ---- Core ops --------------------------------------------------------------
 
-/// Handle returned by [`NicOps::acquire_tx_buf`]. Wraps a writable
+/// Handle returned by [`Nic::acquire_tx_buf`]. Wraps a writable
 /// region of driver-owned TX-pool storage so the caller can fill
 /// frame bytes in place — no memcpy through an intermediate
 /// stack buffer when handing the frame to the driver.
@@ -33,7 +33,7 @@ pub const MAX_L2_HEADROOM: usize = 14 + 40 + 8;
 /// Lifecycle:
 ///   * Acquire → driver marks the slot busy, returns this handle.
 ///   * Caller fills `data_mut()[..frame_len]` with the L2 frame.
-///   * Caller passes the handle to [`NicOps::submit_tx`], which
+///   * Caller passes the handle to [`Nic::submit_tx`], which
 ///     mem-forgets it (skipping `Drop`) and enqueues a virtio
 ///     descriptor pointing at the slot. The slot stays busy
 ///     until the device signals descriptor completion (via the
@@ -71,7 +71,7 @@ pub struct TxBufHandle {
 // share it (which would defeat the "exclusive write" property).
 unsafe impl Send for TxBufHandle {}
 
-/// L4 checksum-offload hint passed to [`NicOps::submit_tx`]. When
+/// L4 checksum-offload hint passed to [`Nic::submit_tx`]. When
 /// `start != 0`, the driver tells the device to compute the
 /// per-segment L4 checksum host-side. Saves the guest CPU one
 /// full pass over the packet payload.
@@ -129,9 +129,9 @@ impl Drop for TxBufHandle {
     }
 }
 
-/// Handle returned by [`NicOps::acquire_tx_tso_buf`] for a TCP
+/// Handle returned by [`Nic::acquire_tx_tso_buf`] for a TCP
 /// TSO super-segment. Type-distinct from `TxBufHandle` so
-/// [`NicOps::submit_tx`] can't accept it (and vice versa) — the
+/// [`Nic::submit_tx`] can't accept it (and vice versa) — the
 /// big-pool / small-pool distinction is enforced at compile
 /// time, not just by a runtime pool-ID check on the token.
 ///
@@ -160,7 +160,7 @@ impl TxTsoBufHandle {
     }
 }
 
-/// Handle returned by [`NicOps::acquire_tx_udp_gso_buf`] for a
+/// Handle returned by [`Nic::acquire_tx_udp_gso_buf`] for a
 /// UDP-GSO super-packet. Same big-pool storage as
 /// [`TxTsoBufHandle`] — the type distinction is so the API surface
 /// can route to the correct `submit_tx_*` variant (TCP TSO vs UDP
@@ -184,33 +184,17 @@ impl TxUdpGsoBufHandle {
     }
 }
 
-/// Submit a previously-acquired TSO super-segment slot. Wider than
-/// `submit_tx` because the device needs the per-segment GSO
-/// parameters (header len, checksum start, MSS) up-front.
-pub type SubmitTxTsoFn =
-    fn(handle: TxTsoBufHandle, frame_len: usize, hdr_len: u16, csum_start: u16, gso_size: u16);
-
-/// Submit a previously-acquired UDP-GSO super-packet slot. Same
-/// shape as `SubmitTxTsoFn` modulo the handle type — the L4 layer
-/// just differs.
-pub type SubmitTxUdpGsoFn =
-    fn(handle: TxUdpGsoBufHandle, frame_len: usize, hdr_len: u16, csum_start: u16, gso_size: u16);
-
-/// Per-queue-pair RX delivery callback. Takes the qp index and the
-/// per-frame `IOBuf`-chain callback the dispatcher uses to forward
-/// frames into the net stack.
-pub type PollQpFn = fn(usize, fn(Chain<OwnedIOBuf>)) -> usize;
-
-/// All fn pointers a NIC driver exposes. A single `&'static NicOps`
-/// is published via `AtomicPtr` at boot; every dispatcher call does
-/// one Acquire load + one direct call.
+/// All entry points a NIC driver exposes. A single `&'static dyn Nic`
+/// is published at boot (through a thin `&'static DynSlot` in an
+/// `AtomicPtr`); every dispatcher call does one Acquire load, one
+/// `.rodata` slot load, and one vtable call.
 ///
 /// `probe` returns `true` iff the driver bound hardware. It's the
 /// only method callers may invoke before bring-up completes; every
 /// other call is a no-op / zero until the first probe succeeds.
-pub struct NicOps {
-    pub name: &'static str,
-    pub probe: fn() -> bool,
+pub trait Nic: Sync {
+    fn name(&self) -> &'static str;
+    fn probe(&self) -> bool;
 
     // ── Data path ───────────────────────────────────────────────────
     /// Slice-shaped TX: the driver memcpys the frame into a TX-pool
@@ -219,13 +203,23 @@ pub struct NicOps {
     /// via device offload, or a software pass when the device never
     /// negotiated it. Pass [`CsumOffload::NONE`] for a frame that
     /// already carries a full checksum or needs none (ARP, ...).
-    pub send: fn(&[u8], CsumOffload),
+    fn send(&self, data: &[u8], csum: CsumOffload);
+    /// Whether the driver implements the zero-copy direct-fill TX
+    /// surface ([`Self::acquire_tx_buf`]) at all. Lets the
+    /// dispatcher distinguish "no surface — use the slice `send`
+    /// path" from "surface present but the pool is full right now —
+    /// apply back-pressure and retry". Drivers that override
+    /// `acquire_tx_buf` override this to return `true`.
+    fn has_direct_fill(&self) -> bool {
+        false
+    }
     /// Optional zero-copy TX: caller acquires a slot from the
     /// driver's TX pool, fills frame bytes in place, submits.
-    /// `None` means the driver doesn't support this surface (or
-    /// the runtime context — e.g. Tier-2 shared queue under
-    /// multi-core — can't supply a slot without lock contention);
-    /// caller falls back to `send(&[u8])`.
+    /// The default (never-`Some`) implementation means the driver
+    /// doesn't support this surface (or the runtime context —
+    /// e.g. Tier-2 shared queue under multi-core — can't supply a
+    /// slot without lock contention); caller falls back to
+    /// `send(&[u8])`.
     ///
     /// On `Some(handle)` return:
     ///   * Caller fills `handle.data_mut()[..frame_len]` with the
@@ -239,7 +233,9 @@ pub struct NicOps {
     ///
     /// Returns `None` on pool exhaustion — caller may retry, fall
     /// back to `send`, or drop the packet (UDP / QUIC retransmit).
-    pub acquire_tx_buf: Option<fn() -> Option<TxBufHandle>>,
+    fn acquire_tx_buf(&self) -> Option<TxBufHandle> {
+        None
+    }
     /// Submit a previously-acquired TX buffer for transmission.
     /// `frame_len` is the bytes the caller wrote at the start of
     /// `handle.data_mut()`. `csum` carries the optional checksum-
@@ -248,32 +244,40 @@ pub struct NicOps {
     /// partial sum at `csum.start + csum.offset`). Consumes the
     /// handle (slot returns to pool when the device signals
     /// descriptor completion via `tx_drain`, NOT when this fn
-    /// returns). `None` mirrors `acquire_tx_buf`'s `None`.
-    pub submit_tx: Option<fn(TxBufHandle, usize, CsumOffload)>,
+    /// returns). The default implementation mirrors
+    /// `acquire_tx_buf`'s default `None`: only reachable via API
+    /// misuse — a caller that does proper acquire+submit can never
+    /// end up here — and just drops the handle (its `Drop` returns
+    /// the slot to the pool).
+    fn submit_tx(&self, handle: TxBufHandle, _frame_len: usize, _csum: CsumOffload) {
+        drop(handle);
+    }
     /// TSOv4 capability: `true` when the device negotiated
     /// `VIRTIO_NET_F_HOST_TSO4` + `VIRTIO_NET_F_CSUM` (or the
     /// equivalent on non-virtio drivers). When true,
-    /// [`acquire_tx_tso_buf`] returns 16-KiB-capacity slots that
+    /// [`Self::acquire_tx_tso_buf`] returns 16-KiB-capacity slots that
     /// the TCP layer fills with a single super-segment and ships
-    /// via [`submit_tx_tso`]. When false, callers must split
+    /// via [`Self::submit_tx_tso`]. When false, callers must split
     /// into MSS-sized segments themselves and use the small-pool
     /// `acquire_tx_buf` + `submit_tx` path.
-    pub tso_available: fn() -> bool,
+    fn tso_available(&self) -> bool;
     /// Acquire a big-slot TX buffer (16 KiB capacity) for a TCP
     /// TSO super-segment. Returns `None` when:
     ///   * TSO isn't negotiated (no big pool allocated), OR
     ///   * the big pool is full, OR
-    ///   * the driver doesn't expose this surface (`None`
-    ///     variant of the option).
+    ///   * the driver doesn't expose this surface (the default
+    ///     implementation).
     ///
     /// Caller falls back to per-MSS segmentation via
-    /// [`acquire_tx_buf`] when None.
+    /// [`Self::acquire_tx_buf`] when None.
     ///
     /// Returns the type-distinct [`TxTsoBufHandle`] so the
-    /// caller can't accidentally hand it to [`submit_tx`] (the
+    /// caller can't accidentally hand it to [`Self::submit_tx`] (the
     /// type system enforces big-pool slots → `submit_tx_tso`,
     /// small-pool slots → `submit_tx`).
-    pub acquire_tx_tso_buf: Option<fn() -> Option<TxTsoBufHandle>>,
+    fn acquire_tx_tso_buf(&self) -> Option<TxTsoBufHandle> {
+        None
+    }
     /// Submit a TSO super-segment. Same shape as `submit_tx` plus
     /// the gso fields the device needs to segment host-side:
     ///
@@ -289,15 +293,26 @@ pub struct NicOps {
     ///   * `gso_size`: MSS — bytes of TCP payload per emitted
     ///     segment.
     ///
-    /// `None` when the driver doesn't support TSO (mirror of
-    /// `tso_available()`); caller falls back to per-MSS
-    /// `submit_tx` calls.
+    /// The default implementation covers drivers that don't
+    /// support TSO (mirror of `tso_available()`): it drops the
+    /// handle, returning the slot to the pool with no traffic
+    /// emitted; the caller falls back to per-MSS `submit_tx`
+    /// calls.
     ///
     /// Takes a [`TxTsoBufHandle`] (the type-distinct wrapper
     /// from `acquire_tx_tso_buf`) — a small-pool `TxBufHandle`
     /// won't compile here, eliminating the previous runtime
     /// pool-ID check.
-    pub submit_tx_tso: Option<SubmitTxTsoFn>,
+    fn submit_tx_tso(
+        &self,
+        handle: TxTsoBufHandle,
+        _frame_len: usize,
+        _hdr_len: u16,
+        _csum_start: u16,
+        _gso_size: u16,
+    ) {
+        drop(handle);
+    }
     /// UDP-GSO (`UDP_SEGMENT` / `GSO_UDP_L4`) capability — the UDP
     /// analogue of `tso_available`. `true` when the device can
     /// segment a single big UDP super-packet into N same-size
@@ -305,13 +320,15 @@ pub struct NicOps {
     /// for each emitted segment and computing per-segment
     /// checksums. The natural beneficiary is QUIC, which sends
     /// streams of fixed-MTU datagrams to the same peer.
-    pub udp_gso_available: fn() -> bool,
+    fn udp_gso_available(&self) -> bool;
     /// Acquire a big-slot TX buffer for a UDP-GSO super-packet.
     /// Same shape and pool as `acquire_tx_tso_buf` — drivers may
     /// reuse the same big pool internally; the type-distinct
     /// [`TxUdpGsoBufHandle`] enforces "this slot was acquired for
     /// UDP GSO" at the API surface.
-    pub acquire_tx_udp_gso_buf: Option<fn() -> Option<TxUdpGsoBufHandle>>,
+    fn acquire_tx_udp_gso_buf(&self) -> Option<TxUdpGsoBufHandle> {
+        None
+    }
     /// Submit a UDP-GSO super-packet. The slot's bytes are laid
     /// out as
     /// `[Eth | IP | UDP | seg₀(gso_size) | seg₁(gso_size) | … | seg_N]`
@@ -331,8 +348,17 @@ pub struct NicOps {
     ///     enforce this.
     ///
     /// Takes a [`TxUdpGsoBufHandle`]; same handling rules as the
-    /// TSO wrapper.
-    pub submit_tx_udp_gso: Option<SubmitTxUdpGsoFn>,
+    /// TSO wrapper (the default implementation drops the handle).
+    fn submit_tx_udp_gso(
+        &self,
+        handle: TxUdpGsoBufHandle,
+        _frame_len: usize,
+        _hdr_len: u16,
+        _csum_start: u16,
+        _gso_size: u16,
+    ) {
+        drop(handle);
+    }
     /// RX callback: the driver delivers each received L2 frame
     /// (Eth + IP + L4 + payload) as an owned `Chain<OwnedIOBuf>`.
     /// `OwnedIOBuf` is `Send` by derivation, so the chain — and the
@@ -365,48 +391,58 @@ pub struct NicOps {
     /// the chain drops, wherever and whenever that happens. Each
     /// driver's drop callback MUST be panic-safe — it can run from
     /// `IOBuf::drop` on any core.
-    pub poll_rx: fn(fn(Chain<OwnedIOBuf>)) -> usize,
-    pub poll_qp: PollQpFn,
+    fn poll_rx(&self, deliver: fn(Chain<OwnedIOBuf>)) -> usize;
+    /// Per-queue-pair RX delivery. Takes the qp index and the
+    /// per-frame `IOBuf`-chain callback the dispatcher uses to
+    /// forward frames into the net stack.
+    fn poll_qp(&self, qp: usize, deliver: fn(Chain<OwnedIOBuf>)) -> usize;
 
     // ── Config / bring-up ───────────────────────────────────────────
-    pub get_mac: fn(*mut u8),
-    pub num_queue_pairs: fn() -> u16,
-    pub enable_irq: fn(),
-    pub enable_deferred_tx_kick: fn(),
+    fn get_mac(&self, mac_out: *mut u8);
+    fn num_queue_pairs(&self) -> u16;
+    fn enable_irq(&self);
+    fn enable_deferred_tx_kick(&self);
 
     // ── Per-batch TX flush ──────────────────────────────────────────
-    pub flush_tx_staging: fn(),
-    pub flush_tx_kick_if_dirty: fn() -> bool,
+    fn flush_tx_staging(&self);
+    fn flush_tx_kick_if_dirty(&self) -> bool;
 
     // ── Per-cycle interrupt-ack (virtio MMIO ISR) ───────────────────
-    pub poke_interrupt_status: fn(),
+    fn poke_interrupt_status(&self);
 
     // ── Optional capabilities ───────────────────────────────────────
-    /// NAPI-style idle hooks. `None` = polling-only driver; the
-    /// dispatcher treats `irq_idle_supported` as `false`.
-    pub idle: Option<&'static NicIdleOps>,
+    /// NAPI-style idle hooks. `None` (the default) = polling-only
+    /// driver; the dispatcher treats `irq_idle_supported` as `false`.
+    fn idle(&self) -> Option<&'static NicIdleOps> {
+        None
+    }
 
     /// Lightweight "arm RX interrupt ahead of a sustained-idle sleep"
-    /// hook for *polling* drivers (those that keep `idle: None` so their
-    /// busy-poll-under-load path is untouched). Called by the event
-    /// loop's sustained-idle gate just before it commits to a
+    /// hook for *polling* drivers (those that keep `idle()` `None` so
+    /// their busy-poll-under-load path is untouched). Called by the
+    /// event loop's sustained-idle gate just before it commits to a
     /// timer-bounded HLT: the driver unmasks the calling core's RX
     /// interrupt so the HLT wakes on a packet instead of only the timer
     /// backstop, and returns `true` if RX work is *already* pending (the
-    /// caller then skips the sleep and re-polls). `None` = driver has no
+    /// caller then skips the sleep and re-polls). The default
+    /// (`false`-returning) implementation = driver has no
     /// interrupt-arming surface; the gate just sleeps on the timer.
     ///
-    /// Distinct from [`idle`]: that reroutes the whole idle path through
-    /// `wait_for_events` (abandoning the sustained-idle gate); this is an
-    /// arm-only add-on so a polling driver gains wake-on-packet without
-    /// changing its load-path behaviour. The interrupt is armed only from
-    /// the deep-idle gate, so a busy core never arms it (zero hot-path
-    /// cost).
-    pub arm_rx_idle: Option<fn() -> bool>,
+    /// Distinct from [`Self::idle`]: that reroutes the whole idle path
+    /// through `wait_for_events` (abandoning the sustained-idle gate);
+    /// this is an arm-only add-on so a polling driver gains
+    /// wake-on-packet without changing its load-path behaviour. The
+    /// interrupt is armed only from the deep-idle gate, so a busy core
+    /// never arms it (zero hot-path cost).
+    fn arm_rx_idle(&self) -> bool {
+        false
+    }
 
-    /// Per-queue diagnostics. `None` = driver doesn't expose them;
-    /// dispatcher returns zero arrays.
-    pub diag: Option<&'static NicDiagOps>,
+    /// Per-queue diagnostics. `None` (the default) = driver doesn't
+    /// expose them; dispatcher returns zero arrays.
+    fn diag(&self) -> Option<&'static NicDiagOps> {
+        None
+    }
 }
 
 /// NAPI-style idle hooks. A driver that implements interrupt-driven
@@ -532,11 +568,19 @@ pub struct TxDiag {
 
 // ---- Link-time registry ---------------------------------------------------
 
+/// Thin, statically-addressable carrier for a `&'static dyn Nic` fat
+/// pointer. Rust has no atomic fat pointer, so the active-driver slot
+/// stores a thin `*mut DynSlot` and dereferences through it — one
+/// extra `.rodata` load on dispatch.
+pub struct DynSlot {
+    pub nic: &'static dyn Nic,
+}
+
 /// One entry per linked driver crate, placed in `.waitless_drivers_ethernet`
 /// by `register_ethernet_driver!`.
 #[repr(C)]
 pub struct EthernetDriverReg {
-    pub ops: &'static NicOps,
+    pub nic: &'static DynSlot,
 }
 
 /// Register a driver with `waitless_net` at link time. Expands to a
@@ -544,16 +588,18 @@ pub struct EthernetDriverReg {
 /// `init()` discovers it via section-boundary symbols.
 ///
 /// ```ignore
-/// static MY_OPS: nic_api::NicOps = nic_api::NicOps { /* … */ };
-/// nic_api::register_ethernet_driver!(MY_OPS);
+/// struct MyNic;
+/// impl nic_api::Nic for MyNic { /* … */ }
+/// nic_api::register_ethernet_driver!(MyNic);
 /// ```
 #[macro_export]
 macro_rules! register_ethernet_driver {
-    ($ops:expr) => {
+    ($nic:expr) => {
         #[used]
         #[unsafe(link_section = ".waitless_drivers_ethernet")]
-        static ETHERNET_DRIVER_REG: $crate::EthernetDriverReg =
-            $crate::EthernetDriverReg { ops: &$ops };
+        static ETHERNET_DRIVER_REG: $crate::EthernetDriverReg = $crate::EthernetDriverReg {
+            nic: &$crate::DynSlot { nic: &$nic },
+        };
     };
 }
 
@@ -588,73 +634,65 @@ pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
 
 // Null-object backstop. `ACTIVE_OPS` points here until the first
 // probe succeeds, so every dispatcher call resolves to a real
-// `&'static NicOps` without a null check. Hot-path cost per call:
-// one Acquire load + one direct fn-pointer call.
+// `&'static dyn Nic` without a null check. Hot-path cost per call:
+// one Acquire load + one slot load + one vtable call.
 
-fn null_send(_: &[u8], _: CsumOffload) {}
-fn null_poll(_: fn(Chain<OwnedIOBuf>)) -> usize {
-    0
-}
-fn null_poll_qp(_: usize, _: fn(Chain<OwnedIOBuf>)) -> usize {
-    0
-}
-fn null_probe() -> bool {
-    false
-}
-fn null_get_mac(_: *mut u8) {}
-fn null_num_queue_pairs() -> u16 {
-    1
-}
-fn null_void() {}
-fn null_false() -> bool {
-    false
-}
+struct NullNic;
 
-static NULL_OPS: NicOps = NicOps {
-    name: "none",
-    probe: null_probe,
-    send: null_send,
-    acquire_tx_buf: None,
-    submit_tx: None,
-    tso_available: null_false,
-    acquire_tx_tso_buf: None,
-    submit_tx_tso: None,
-    udp_gso_available: null_false,
-    acquire_tx_udp_gso_buf: None,
-    submit_tx_udp_gso: None,
-    poll_rx: null_poll,
-    poll_qp: null_poll_qp,
-    get_mac: null_get_mac,
-    num_queue_pairs: null_num_queue_pairs,
-    enable_irq: null_void,
-    enable_deferred_tx_kick: null_void,
-    flush_tx_staging: null_void,
-    flush_tx_kick_if_dirty: null_false,
-    poke_interrupt_status: null_void,
-    idle: None,
-    arm_rx_idle: None,
-    diag: None,
-};
-
-static ACTIVE_OPS: AtomicPtr<NicOps> = AtomicPtr::new(&NULL_OPS as *const NicOps as *mut NicOps);
-
-/// Install `ops` as the active driver. Called once by `init()` when
-/// the first `probe` succeeds.
-pub fn set_active_ops(ops: &'static NicOps) {
-    ACTIVE_OPS.store(ops as *const _ as *mut _, Ordering::Release);
+impl Nic for NullNic {
+    fn name(&self) -> &'static str {
+        "none"
+    }
+    fn probe(&self) -> bool {
+        false
+    }
+    fn send(&self, _data: &[u8], _csum: CsumOffload) {}
+    fn tso_available(&self) -> bool {
+        false
+    }
+    fn udp_gso_available(&self) -> bool {
+        false
+    }
+    fn poll_rx(&self, _deliver: fn(Chain<OwnedIOBuf>)) -> usize {
+        0
+    }
+    fn poll_qp(&self, _qp: usize, _deliver: fn(Chain<OwnedIOBuf>)) -> usize {
+        0
+    }
+    fn get_mac(&self, _mac_out: *mut u8) {}
+    fn num_queue_pairs(&self) -> u16 {
+        1
+    }
+    fn enable_irq(&self) {}
+    fn enable_deferred_tx_kick(&self) {}
+    fn flush_tx_staging(&self) {}
+    fn flush_tx_kick_if_dirty(&self) -> bool {
+        false
+    }
+    fn poke_interrupt_status(&self) {}
 }
 
-/// Currently-active ops. Returns `NULL_OPS` (all no-ops) before the
-/// first successful probe and on native — callers never need to
-/// branch on "is a driver installed?". Use `is_installed()` if a
-/// cold-path caller genuinely needs to know.
+static NULL_OPS: DynSlot = DynSlot { nic: &NullNic };
+
+static ACTIVE_OPS: AtomicPtr<DynSlot> = AtomicPtr::new(&NULL_OPS as *const DynSlot as *mut DynSlot);
+
+/// Install `slot`'s driver as the active driver. Called once by
+/// `init()` when the first `probe` succeeds.
+pub fn set_active_ops(slot: &'static DynSlot) {
+    ACTIVE_OPS.store(slot as *const _ as *mut _, Ordering::Release);
+}
+
+/// Currently-active driver. Returns the null object (all no-ops)
+/// before the first successful probe and on native — callers never
+/// need to branch on "is a driver installed?". Use `is_installed()`
+/// if a cold-path caller genuinely needs to know.
 #[inline]
-pub fn active_ops() -> &'static NicOps {
+pub fn active_ops() -> &'static dyn Nic {
     // SAFETY: `ACTIVE_OPS` is always non-null — it starts pointing
     // at `NULL_OPS` and `set_active_ops` only stores pointers
-    // derived from `&'static NicOps`. The Release/Acquire pair
+    // derived from `&'static DynSlot`. The Release/Acquire pair
     // synchronises store with readers.
-    unsafe { &*(ACTIVE_OPS.load(Ordering::Acquire) as *const NicOps) }
+    unsafe { (*(ACTIVE_OPS.load(Ordering::Acquire) as *const DynSlot)).nic }
 }
 
 /// Whether a real driver has been installed. Cold-path — used by
@@ -662,7 +700,7 @@ pub fn active_ops() -> &'static NicOps {
 /// linked but none probed".
 pub fn is_installed() -> bool {
     !core::ptr::eq(
-        ACTIVE_OPS.load(Ordering::Acquire) as *const NicOps,
-        &NULL_OPS as *const NicOps,
+        ACTIVE_OPS.load(Ordering::Acquire) as *const DynSlot,
+        &NULL_OPS as *const DynSlot,
     )
 }

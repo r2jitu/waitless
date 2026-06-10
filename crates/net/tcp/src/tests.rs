@@ -1,7 +1,7 @@
 // ── Host-native TCP conformance harness ─────────────────────────────────────
 //
 // packetdrill-style: drive scripted TCP segments into `tcp_receive`
-// against a mock `NicOps` that captures every transmitted frame into a
+// against a mock `Nic` that captures every transmitted frame into a
 // `Vec`, then assert on the captured output. `tcp_receive` is the real
 // RX entry point and the send path is the real TX code — only the NIC
 // underneath is mocked.
@@ -19,7 +19,7 @@ use alloc::boxed::Box;
 use core::ptr::NonNull;
 use from_bytes::FromBytes;
 use iobuf::{Chain, IOBufDropFn, OwnedIOBuf};
-use nic_api::{CsumOffload, NicOps, TxBufHandle, TxTsoBufHandle, set_active_ops};
+use nic_api::{CsumOffload, DynSlot, Nic, TxBufHandle, TxTsoBufHandle, set_active_ops};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 use types::{IpAddr, Ipv4Addr, ntohl, ntohs};
@@ -147,83 +147,110 @@ fn mock_get_mac(out: *mut u8) {
     // six writable bytes.
     unsafe { core::ptr::copy_nonoverlapping(SERVER_MAC.as_ptr(), out, 6) };
 }
-fn yes() -> bool {
-    true
-}
-fn no() -> bool {
-    false
-}
-fn unit() {}
-fn no_poll(_: fn(Chain<OwnedIOBuf>)) -> usize {
-    0
-}
-fn no_poll_qp(_: usize, _: fn(Chain<OwnedIOBuf>)) -> usize {
-    0
-}
-fn one_qp() -> u16 {
-    1
+
+// `acquire_tx_buf` / TSO left at the trait defaults, so every
+// transmit funnels through `send` — the one path the capture hook
+// covers. The stack stamps a pseudo-header partial sum; a real
+// driver finishes the L4 checksum, but the conformance assertions
+// check headers / seq / ack / payload, not the checksum, so the
+// mock just records the frame bytes.
+struct MockNic;
+
+impl Nic for MockNic {
+    fn name(&self) -> &'static str {
+        "mock"
+    }
+    fn probe(&self) -> bool {
+        true
+    }
+    fn send(&self, frame: &[u8], csum: CsumOffload) {
+        mock_send(frame, csum)
+    }
+    fn tso_available(&self) -> bool {
+        false
+    }
+    fn udp_gso_available(&self) -> bool {
+        false
+    }
+    fn poll_rx(&self, _deliver: fn(Chain<OwnedIOBuf>)) -> usize {
+        0
+    }
+    fn poll_qp(&self, _qp: usize, _deliver: fn(Chain<OwnedIOBuf>)) -> usize {
+        0
+    }
+    fn get_mac(&self, out: *mut u8) {
+        mock_get_mac(out)
+    }
+    fn num_queue_pairs(&self) -> u16 {
+        1
+    }
+    fn enable_irq(&self) {}
+    fn enable_deferred_tx_kick(&self) {}
+    fn flush_tx_staging(&self) {}
+    fn flush_tx_kick_if_dirty(&self) -> bool {
+        false
+    }
+    fn poke_interrupt_status(&self) {}
 }
 
-// `acquire_tx_buf` / TSO left `None`, so every transmit funnels
-// through `send` — the one path the capture hook covers. The
-// stack stamps a pseudo-header partial sum; a real driver finishes
-// the L4 checksum, but the conformance assertions check headers /
-// seq / ack / payload, not the checksum, so the mock just records
-// the frame bytes.
-static MOCK_OPS: NicOps = NicOps {
-    name: "mock",
-    probe: yes,
-    send: mock_send,
-    acquire_tx_buf: None,
-    submit_tx: None,
-    tso_available: no,
-    acquire_tx_tso_buf: None,
-    submit_tx_tso: None,
-    udp_gso_available: no,
-    acquire_tx_udp_gso_buf: None,
-    submit_tx_udp_gso: None,
-    poll_rx: no_poll,
-    poll_qp: no_poll_qp,
-    get_mac: mock_get_mac,
-    num_queue_pairs: one_qp,
-    enable_irq: unit,
-    enable_deferred_tx_kick: unit,
-    flush_tx_staging: unit,
-    flush_tx_kick_if_dirty: no,
-    poke_interrupt_status: unit,
-    idle: None,
-    arm_rx_idle: None,
-    diag: None,
-};
+static MOCK_OPS: DynSlot = DynSlot { nic: &MockNic };
 
-// TSO-capable NIC mock — identical to `MOCK_OPS` but advertises
+// TSO-capable NIC mock — identical to `MockNic` but advertises
 // TSOv4 and supplies the big-slot acquire / submit hooks, so the
 // `try_send_tso` fast path can be driven by the conformance harness.
-static MOCK_OPS_TSO: NicOps = NicOps {
-    name: "mock-tso",
-    probe: yes,
-    send: mock_send,
-    acquire_tx_buf: None,
-    submit_tx: None,
-    tso_available: yes,
-    acquire_tx_tso_buf: Some(mock_acquire_tx_tso_buf),
-    submit_tx_tso: Some(mock_submit_tx_tso),
-    udp_gso_available: no,
-    acquire_tx_udp_gso_buf: None,
-    submit_tx_udp_gso: None,
-    poll_rx: no_poll,
-    poll_qp: no_poll_qp,
-    get_mac: mock_get_mac,
-    num_queue_pairs: one_qp,
-    enable_irq: unit,
-    enable_deferred_tx_kick: unit,
-    flush_tx_staging: unit,
-    flush_tx_kick_if_dirty: no,
-    poke_interrupt_status: unit,
-    idle: None,
-    arm_rx_idle: None,
-    diag: None,
-};
+struct MockTsoNic;
+
+impl Nic for MockTsoNic {
+    fn name(&self) -> &'static str {
+        "mock-tso"
+    }
+    fn probe(&self) -> bool {
+        true
+    }
+    fn send(&self, frame: &[u8], csum: CsumOffload) {
+        mock_send(frame, csum)
+    }
+    fn tso_available(&self) -> bool {
+        true
+    }
+    fn acquire_tx_tso_buf(&self) -> Option<TxTsoBufHandle> {
+        mock_acquire_tx_tso_buf()
+    }
+    fn submit_tx_tso(
+        &self,
+        handle: TxTsoBufHandle,
+        frame_len: usize,
+        hdr_len: u16,
+        csum_start: u16,
+        gso_size: u16,
+    ) {
+        mock_submit_tx_tso(handle, frame_len, hdr_len, csum_start, gso_size)
+    }
+    fn udp_gso_available(&self) -> bool {
+        false
+    }
+    fn poll_rx(&self, _deliver: fn(Chain<OwnedIOBuf>)) -> usize {
+        0
+    }
+    fn poll_qp(&self, _qp: usize, _deliver: fn(Chain<OwnedIOBuf>)) -> usize {
+        0
+    }
+    fn get_mac(&self, out: *mut u8) {
+        mock_get_mac(out)
+    }
+    fn num_queue_pairs(&self) -> u16 {
+        1
+    }
+    fn enable_irq(&self) {}
+    fn enable_deferred_tx_kick(&self) {}
+    fn flush_tx_staging(&self) {}
+    fn flush_tx_kick_if_dirty(&self) -> bool {
+        false
+    }
+    fn poke_interrupt_status(&self) {}
+}
+
+static MOCK_OPS_TSO: DynSlot = DynSlot { nic: &MockTsoNic };
 
 // ---- one-time bring-up + per-test serialisation -----------------------
 

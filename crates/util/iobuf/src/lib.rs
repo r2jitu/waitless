@@ -240,7 +240,7 @@ mod tests {
         assert_eq!(&out[..n], b"hello world");
     }
 
-    /// Mock-NIC RX-delivery tests for the contract the `NicOps` poll
+    /// Mock-NIC RX-delivery tests for the contract the `Nic` poll
     /// callback depends on: a driver hands up a received frame as an
     /// **owned** `IOBufChain` whose `ExternalOwned` `IOBuf`, on drop,
     /// reposts the backing buffer via its drop callback — and that

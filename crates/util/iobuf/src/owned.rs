@@ -28,7 +28,7 @@ use crate::{Chain, ExternalOwned, HeapStorage, IOBufDropFn, IOBufError, IOBufRea
 ///
 /// This is the type the cross-core RX path is *born* in —
 /// [`OwnedIOBuf::wrap_owned`] and [`crate::IOBufPool::alloc`] produce
-/// it, and it stays `OwnedIOBuf` through the `NicOps` callback, net
+/// it, and it stays `OwnedIOBuf` through the `Nic` poll callback, net
 /// dispatch, and the per-core RX inbox. A `BorrowedView` *cannot*
 /// reach that path: the path's type is `OwnedIOBuf` and no
 /// constructor of `OwnedIOBuf` takes a borrow — compile-time

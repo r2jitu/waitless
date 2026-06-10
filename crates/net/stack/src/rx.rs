@@ -55,7 +55,7 @@ pub(crate) fn net_receive(chain: Chain<OwnedIOBuf>) {
     }
 }
 
-/// Tier-2 distributor RX callback — the `NicOps::poll_rx` callback in
+/// Tier-2 distributor RX callback — the `Nic::poll_rx` callback in
 /// single-queue mode. Classifies one frame, then for a TCP/UDP packet
 /// owned by another core *moves the whole chain* into that core's
 /// `rx_inbox` (item C — no frame-byte copy), bundled with the

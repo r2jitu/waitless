@@ -32,7 +32,7 @@ pub(crate) fn current_qp() -> Option<usize> {
     Some(if core < num_qp { core as usize } else { 0 })
 }
 
-/// Master gate for hardware UDP-GSO on gve. Drives BOTH the NicOps
+/// Master gate for hardware UDP-GSO on gve. Drives BOTH the `Nic`
 /// `udp_gso_available` flag AND `acquire_tx_udp_gso_buf` so they agree
 /// (QUIC's `take_gso_datagram_buf` gates on acquire returning `Some`;
 /// keeping the two in sync is what lets `udp_gso_available` stay the
@@ -190,7 +190,7 @@ pub(crate) fn flush_tx_kick_if_dirty_qp(qp: usize) -> bool {
 }
 
 /// Flush the current core's TX queue if dirty. Matches the
-/// `NicOps::flush_tx_kick_if_dirty` signature so the `nic` dispatch
+/// `Nic::flush_tx_kick_if_dirty` signature so the `nic` dispatch
 /// crate can call it through the active-ops slot.
 pub(crate) fn flush_tx_kick_if_dirty() -> bool {
     match current_qp() {

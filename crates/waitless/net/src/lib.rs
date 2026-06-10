@@ -1,4 +1,4 @@
-// `Net::enable` API + re-exports. The `NicOps` POD + link-time
+// `Net::enable` API + re-exports. The `Nic` trait + link-time
 // registry live in the sibling `nic_api` leaf crate so NIC
 // drivers can depend there without forming a `drivers → waitless` cycle.
 
@@ -8,7 +8,7 @@ extern crate alloc;
 
 // Only `NicError` crosses the facade — it's the user-visible error
 // type surfaced via `NetError::Nic`. The other `nic_api` items
-// (`NicOps`, `EthernetDriverReg`, `register_ethernet_driver`, …) are
+// (`Nic`, `EthernetDriverReg`, `register_ethernet_driver`, …) are
 // the driver-author API; NIC crates depend on `nic_api` directly and
 // have no reason to reach for them through the `waitless::net` facade.
 pub use nic_api::NicError;

@@ -38,7 +38,7 @@
 // the rest of the code works in natural host-endian `u32`s.
 //
 // File layout:
-//   * `lib.rs`  — types, statics, BE/MMIO helpers, NicOps registration,
+//   * `lib.rs`  — types, statics, BE/MMIO helpers, Nic registration,
 //                 and the small bits of public surface the kernel needs.
 //   * `init.rs` — probe + DESCRIBE_DEVICE + CONFIGURE_DEVICE_RESOURCES
 //                 + REGISTER_PAGE_LIST + CREATE_*_QUEUE + finalize.
@@ -656,15 +656,19 @@ pub(crate) fn log_mac(mac: &[u8; 6]) {
 }
 
 // ============================================================================
-// NicOps registration
+// Nic registration
 // ============================================================================
 //
-// Registered into the `.waitless_drivers_ethernet` section as a static
-// `NicOps`. Every dispatcher call does one Acquire load + one direct
-// call through the pointer. gve is polling-only — no NAPI, no MSI-X,
-// so `idle` is `None` and the dispatcher's idle path skips it.
+// Registered into the `.waitless_drivers_ethernet` section as a
+// zero-sized `Nic` impl. Every dispatcher call does one Acquire load
+// + one slot load + one vtable call. gve is polling-only — no NAPI,
+// no MSI-X, so `idle()` stays `None` and the dispatcher's idle path
+// skips it.
 
-use nic_api::{NicDiagOps, NicOps};
+use nic_api::{
+    Chain, CsumOffload, Nic, NicDiagOps, OwnedIOBuf, TxBufHandle, TxTsoBufHandle,
+    TxUdpGsoBufHandle,
+};
 
 /// `init()` internally short-circuits on `GVNIC_OK`, but we also
 /// check `probe_ok` here so multi-probe driver walks don't re-enter
@@ -681,17 +685,32 @@ static GVE_DIAG_OPS: NicDiagOps = NicDiagOps {
     obs_json: diag::write_obs_json,
 };
 
-static GVE_OPS: NicOps = NicOps {
-    name: "gve",
-    probe,
-    send: tx::send,
+struct GveNic;
+
+impl Nic for GveNic {
+    fn name(&self) -> &'static str {
+        "gve"
+    }
+    fn probe(&self) -> bool {
+        probe()
+    }
+    fn send(&self, data: &[u8], csum: CsumOffload) {
+        tx::send(data, csum)
+    }
     // Direct-fill TX: both formats fill the device send buffer in
     // place (no scratch→buffer memcpy). GQI_QPL uses its two-pool
     // QPL allocator; DQO_RDA hands back the next ring slot's bounce
     // buffer and emits the same proven (ctx, pkt) descriptor pair as
     // its slice path. Callers fall back to slice `send` when full.
-    acquire_tx_buf: Some(tx::acquire_tx_buf),
-    submit_tx: Some(tx::submit_tx),
+    fn has_direct_fill(&self) -> bool {
+        true
+    }
+    fn acquire_tx_buf(&self) -> Option<TxBufHandle> {
+        tx::acquire_tx_buf()
+    }
+    fn submit_tx(&self, handle: TxBufHandle, frame_len: usize, csum: CsumOffload) {
+        tx::submit_tx(handle, frame_len, csum)
+    }
     // TSO v4 / v6 on both formats — the device segments a
     // super-segment host-side and fixes up L3/L4 headers + checksums
     // per segment. GQI: `GVE_TXD_TSO` + `GVE_TXD_SEG` desc pair (mss
@@ -699,9 +718,22 @@ static GVE_OPS: NicOps = NicOps {
     // scatter-gather packet descs, per `gve_tx_dqo.c` (see
     // `dqo::submit_tx_tso`). Both use ≈16–20 KiB big-pool slots so a
     // ~10× MSS super-segment lands in one slot.
-    tso_available: || true,
-    acquire_tx_tso_buf: Some(tx::acquire_tx_tso_buf),
-    submit_tx_tso: Some(tx::submit_tx_tso),
+    fn tso_available(&self) -> bool {
+        true
+    }
+    fn acquire_tx_tso_buf(&self) -> Option<TxTsoBufHandle> {
+        tx::acquire_tx_tso_buf()
+    }
+    fn submit_tx_tso(
+        &self,
+        handle: TxTsoBufHandle,
+        frame_len: usize,
+        hdr_len: u16,
+        csum_start: u16,
+        gso_size: u16,
+    ) {
+        tx::submit_tx_tso(handle, frame_len, hdr_len, csum_start, gso_size)
+    }
     // UDP-GSO via the same TSO descriptor shape with
     // l4_csum_offset = 3 (UDP cksum at byte 6 of UDP header). The
     // device picks TCP vs UDP segmentation from the IP-header
@@ -710,27 +742,57 @@ static GVE_OPS: NicOps = NicOps {
     // DQO mode — c3/DQO-validated (tcpdump: device emitted segmented
     // packets, client HW-GRO'd them; 0 failed). GQI doesn't support
     // it → per-datagram fallback there.
-    udp_gso_available: tx::udp_gso_enabled,
-    acquire_tx_udp_gso_buf: Some(tx::acquire_tx_udp_gso_buf),
-    submit_tx_udp_gso: Some(tx::submit_tx_udp_gso),
-    poll_rx: rx::poll,
-    poll_qp: rx::poll_qp,
-    get_mac,
-    num_queue_pairs,
-    enable_irq: irq::enable_irq,
-    enable_deferred_tx_kick: tx::enable_deferred_tx_kick,
-    flush_tx_staging: tx::flush_all_tx_kicks,
-    flush_tx_kick_if_dirty: tx::flush_tx_kick_if_dirty,
-    poke_interrupt_status: noop,
-    // gve stays `idle: None` (polling): the proven sustained-idle gate in
-    // `idle_cb` keeps its busy-poll-under-load path and the measured
+    fn udp_gso_available(&self) -> bool {
+        tx::udp_gso_enabled()
+    }
+    fn acquire_tx_udp_gso_buf(&self) -> Option<TxUdpGsoBufHandle> {
+        tx::acquire_tx_udp_gso_buf()
+    }
+    fn submit_tx_udp_gso(
+        &self,
+        handle: TxUdpGsoBufHandle,
+        frame_len: usize,
+        hdr_len: u16,
+        csum_start: u16,
+        gso_size: u16,
+    ) {
+        tx::submit_tx_udp_gso(handle, frame_len, hdr_len, csum_start, gso_size)
+    }
+    fn poll_rx(&self, deliver: fn(Chain<OwnedIOBuf>)) -> usize {
+        rx::poll(deliver)
+    }
+    fn poll_qp(&self, qp: usize, deliver: fn(Chain<OwnedIOBuf>)) -> usize {
+        rx::poll_qp(qp, deliver)
+    }
+    fn get_mac(&self, mac_out: *mut u8) {
+        get_mac(mac_out)
+    }
+    fn num_queue_pairs(&self) -> u16 {
+        num_queue_pairs()
+    }
+    fn enable_irq(&self) {
+        irq::enable_irq()
+    }
+    fn enable_deferred_tx_kick(&self) {
+        tx::enable_deferred_tx_kick()
+    }
+    fn flush_tx_staging(&self) {
+        tx::flush_all_tx_kicks()
+    }
+    fn flush_tx_kick_if_dirty(&self) -> bool {
+        tx::flush_tx_kick_if_dirty()
+    }
+    fn poke_interrupt_status(&self) {}
+    // gve keeps `idle()` `None` (polling): the proven sustained-idle gate
+    // in `idle_cb` keeps its busy-poll-under-load path and the measured
     // 99.3% e2 idle. `arm_rx_idle` layers MSI-X wake-on-packet onto that
     // gate without rerouting the idle path. See gve/src/irq.rs (T7).
-    idle: None,
-    arm_rx_idle: Some(irq::arm_rx_idle),
-    diag: Some(&GVE_DIAG_OPS),
-};
+    fn arm_rx_idle(&self) -> bool {
+        irq::arm_rx_idle()
+    }
+    fn diag(&self) -> Option<&'static NicDiagOps> {
+        Some(&GVE_DIAG_OPS)
+    }
+}
 
-fn noop() {}
-
-nic_api::register_ethernet_driver!(GVE_OPS);
+nic_api::register_ethernet_driver!(GveNic);

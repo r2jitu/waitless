@@ -2,8 +2,8 @@
 //
 // Crate root: declares the submodules that hold the cohesive
 // per-path code (init / tx / rx / irq / diag), defines the shared
-// driver-state types they all touch, and registers the public
-// `NicOps` vtable into the `nic_api::ACTIVE_OPS` slot via
+// driver-state types they all touch, and registers the `Nic`
+// implementation into the `nic_api::ACTIVE_OPS` slot via
 // `register_ethernet_driver!`.
 
 #![no_std]
@@ -434,7 +434,7 @@ fn init() -> bool {
 }
 
 /// Whether `init()` successfully bound a VirtIO-net NIC. Used by
-/// the `NicOps::probe` adapter to short-circuit repeat probes
+/// the `Nic::probe` adapter to short-circuit repeat probes
 /// during multi-driver discovery.
 fn probe_ok() -> bool {
     PROBE_OK.load(core::sync::atomic::Ordering::Acquire)
@@ -447,17 +447,19 @@ fn get_mac(mac_out: *mut u8) {
 }
 
 // ============================================================================
-// NicOps registration
+// Nic registration
 // ============================================================================
 //
 // ── Registration ────────────────────────────────────────────────────────────
 //
-// A static `NicOps` struct of fn pointers, registered into the
+// A zero-sized `Nic` impl, registered into the
 // `.waitless_drivers_ethernet` section via `register_ethernet_driver!`.
-// The active-driver slot stores `&'static NicOps`; every dispatcher
-// call does one Acquire load + one direct call.
+// The active-driver slot stores `&'static dyn Nic`; every dispatcher
+// call does one Acquire load + one slot load + one vtable call.
 
-use nic_api::{NicDiagOps, NicIdleOps, NicOps};
+use nic_api::{
+    Chain, CsumOffload, Nic, NicDiagOps, NicIdleOps, OwnedIOBuf, TxBufHandle, TxTsoBufHandle,
+};
 
 /// `init()` is NOT idempotent — it re-runs PCI/MMIO probe + queue
 /// realloc + MSI-X rebind, corrupting in-flight state if called after
@@ -487,36 +489,86 @@ static VIRTIO_NET_DIAG_OPS: NicDiagOps = NicDiagOps {
     obs_json: diag::write_obs_json,
 };
 
-static VIRTIO_NET_OPS: NicOps = NicOps {
-    name: "virtio-net",
-    probe,
-    send: tx::send,
-    acquire_tx_buf: Some(tx::acquire_tx_buf),
-    submit_tx: Some(tx::submit_tx),
-    tso_available: tx::tso_available,
-    acquire_tx_tso_buf: Some(tx::acquire_tx_tso_buf),
-    submit_tx_tso: Some(tx::submit_tx_tso),
+struct VirtioNic;
+
+impl Nic for VirtioNic {
+    fn name(&self) -> &'static str {
+        "virtio-net"
+    }
+    fn probe(&self) -> bool {
+        probe()
+    }
+    fn send(&self, data: &[u8], csum: CsumOffload) {
+        tx::send(data, csum)
+    }
+    fn has_direct_fill(&self) -> bool {
+        true
+    }
+    fn acquire_tx_buf(&self) -> Option<TxBufHandle> {
+        tx::acquire_tx_buf()
+    }
+    fn submit_tx(&self, handle: TxBufHandle, frame_len: usize, csum: CsumOffload) {
+        tx::submit_tx(handle, frame_len, csum)
+    }
+    fn tso_available(&self) -> bool {
+        tx::tso_available()
+    }
+    fn acquire_tx_tso_buf(&self) -> Option<TxTsoBufHandle> {
+        tx::acquire_tx_tso_buf()
+    }
+    fn submit_tx_tso(
+        &self,
+        handle: TxTsoBufHandle,
+        frame_len: usize,
+        hdr_len: u16,
+        csum_start: u16,
+        gso_size: u16,
+    ) {
+        tx::submit_tx_tso(handle, frame_len, hdr_len, csum_start, gso_size)
+    }
     // UDP-GSO would require negotiating `VIRTIO_NET_F_HOST_USO` and
     // wiring `VIRTIO_NET_HDR_GSO_UDP_L4`. The HVF runner's
     // userspace UDP proxy would also need to parse super-packets
     // and emit N datagrams per super-packet — currently it reads
     // the descriptor as a single frame and forwards verbatim.
-    // Until both pieces are in place, advertise unavailable.
-    udp_gso_available: || false,
-    acquire_tx_udp_gso_buf: None,
-    submit_tx_udp_gso: None,
-    poll_rx: rx::poll,
-    poll_qp: rx::poll_qp,
-    get_mac,
-    num_queue_pairs,
-    enable_irq: irq::enable_irq,
-    enable_deferred_tx_kick: tx::enable_deferred_tx_kick,
-    flush_tx_staging: tx::flush_tx_staging,
-    flush_tx_kick_if_dirty: tx::flush_tx_kick_if_dirty,
-    poke_interrupt_status: irq::poke_interrupt_status,
-    idle: Some(&VIRTIO_NET_IDLE_OPS),
-    arm_rx_idle: None,
-    diag: Some(&VIRTIO_NET_DIAG_OPS),
-};
+    // Until both pieces are in place, advertise unavailable (and
+    // keep the acquire/submit defaults).
+    fn udp_gso_available(&self) -> bool {
+        false
+    }
+    fn poll_rx(&self, deliver: fn(Chain<OwnedIOBuf>)) -> usize {
+        rx::poll(deliver)
+    }
+    fn poll_qp(&self, qp: usize, deliver: fn(Chain<OwnedIOBuf>)) -> usize {
+        rx::poll_qp(qp, deliver)
+    }
+    fn get_mac(&self, mac_out: *mut u8) {
+        get_mac(mac_out)
+    }
+    fn num_queue_pairs(&self) -> u16 {
+        num_queue_pairs()
+    }
+    fn enable_irq(&self) {
+        irq::enable_irq()
+    }
+    fn enable_deferred_tx_kick(&self) {
+        tx::enable_deferred_tx_kick()
+    }
+    fn flush_tx_staging(&self) {
+        tx::flush_tx_staging()
+    }
+    fn flush_tx_kick_if_dirty(&self) -> bool {
+        tx::flush_tx_kick_if_dirty()
+    }
+    fn poke_interrupt_status(&self) {
+        irq::poke_interrupt_status()
+    }
+    fn idle(&self) -> Option<&'static NicIdleOps> {
+        Some(&VIRTIO_NET_IDLE_OPS)
+    }
+    fn diag(&self) -> Option<&'static NicDiagOps> {
+        Some(&VIRTIO_NET_DIAG_OPS)
+    }
+}
 
-nic_api::register_ethernet_driver!(VIRTIO_NET_OPS);
+nic_api::register_ethernet_driver!(VirtioNic);
