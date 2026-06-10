@@ -290,21 +290,23 @@ impl PooledTlsConn {
 
 /// Headroom reserved at the front of every record IOBuf for the
 /// 5 B TLS 1.3 record header that the seal layer prepends.
-const TLS_HEADROOM: usize = record::HEADER_LEN;
+/// `pub(crate)`: the client-side `connect::TlsClientStream` shares
+/// the same record geometry.
+pub(crate) const TLS_HEADROOM: usize = record::HEADER_LEN;
 
 /// Tailroom reserved at the back of every record IOBuf for the
 /// 1 B inner-content-type byte + 16 B AEAD tag.
-const TLS_TAILROOM: usize = 1 + record::TAG_LEN;
+pub(crate) const TLS_TAILROOM: usize = 1 + record::TAG_LEN;
 
 /// Plaintext capacity of one TLS 1.3 record (RFC 8446 §5.1: 2^14 B).
 /// One less than `MAX_INNER_PLAINTEXT` since the latter includes
 /// the one-byte inner-content-type trailer.
-const PLAINTEXT_CHUNK: usize = record::MAX_INNER_PLAINTEXT - 1;
+pub(crate) const PLAINTEXT_CHUNK: usize = record::MAX_INNER_PLAINTEXT - 1;
 
 /// Total bytes in one TLS record envelope + max plaintext.
 /// Sized for the worker scratch and the wire-bytes capacity
 /// `seal_app_data` writes into.
-const TLS_RECORD_LEN: usize = TLS_HEADROOM + PLAINTEXT_CHUNK + TLS_TAILROOM;
+pub(crate) const TLS_RECORD_LEN: usize = TLS_HEADROOM + PLAINTEXT_CHUNK + TLS_TAILROOM;
 
 /// HTTPS-side `HttpStream`: owns the `TcpStream` + `PooledTlsConn`
 /// and drives the TLS state machine. `recv_chunk` blocks until
