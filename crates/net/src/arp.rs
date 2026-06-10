@@ -1,6 +1,8 @@
-// net/arp.rs — ARP cache, request/reply, resolve, announce.
+// net/arp.rs — ARP cache, request/reply, resolve, announce, and the
+// async next-hop resolver (`resolve_route` / `resolve_mac`) the TCP
+// active-open path uses to solicit a MAC before the first SYN.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
@@ -226,6 +228,7 @@ fn arp_fast_store(ip: Ipv4Addr, mac: MacAddr) {
 }
 
 fn arp_request(target_ip: Ipv4Addr) {
+    diag::COUNTERS.requests_sent.bump();
     let our_mac = ethernet_our_mac();
     let our_ip = CONFIG.ip();
 
@@ -300,6 +303,9 @@ pub fn arp_receive(data: &[u8]) {
         // into the slow-path spin inside arp_resolve — which in turn
         // discards every non-ARP frame the poll loop sees.
         arp_fast_store(sender_ip, sender_mac);
+        // Wake any async resolvers parked on this IP (the slow cache
+        // they re-read on wake was updated above).
+        pending_wake(sender_ip);
     }
 
     let op = ntohs(operation);
@@ -333,23 +339,23 @@ pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
         return Some(mac);
     }
 
-    let target = {
-        let mask = CONFIG.subnet_mask().addr;
-        let our_ip = CONFIG.ip().addr;
-        let gateway = CONFIG.gateway();
-        if (ip.addr & mask) != (our_ip & mask) && gateway != Ipv4Addr::ANY {
-            let cache = ARP_CACHE.lock();
-            if cache.gateway_mac_valid {
-                let mac = cache.gateway_mac;
-                drop(cache);
-                arp_fast_store(ip, mac);
-                return Some(mac);
-            }
-            gateway
-        } else {
-            ip
+    // Shared routing decision (`types::next_hop_v4`). NoRoute
+    // (off-link, no gateway) falls back to ARPing the destination
+    // directly — hopeless on a real network, but byte-identical to
+    // the historical behavior of this path.
+    let target = types::next_hop_v4(ip, &CONFIG.load()).unwrap_or(ip);
+    if target != ip {
+        // Routed via the gateway: the cached gateway MAC short-
+        // circuits the cache walk (and warms this core's fast slot
+        // for the *destination* IP).
+        let cache = ARP_CACHE.lock();
+        if cache.gateway_mac_valid {
+            let mac = cache.gateway_mac;
+            drop(cache);
+            arp_fast_store(ip, mac);
+            return Some(mac);
         }
-    };
+    }
 
     if let Some(mac) = ARP_CACHE.lock().lookup(target) {
         arp_fast_store(ip, mac);
@@ -401,4 +407,397 @@ fn arp_poll_callback(chain: Chain<OwnedIOBuf>) {
     }
     // `chain` drops at scope exit → each part's drop callback
     // reposts the backing buffer to the device.
+}
+
+// ─── Async next-hop resolution (active solicitation) ────────────────────────
+//
+// The synchronous `arp_resolve` above is fine for the server role —
+// peers are always learned from their own inbound frames before we
+// ever transmit — but its miss path is a busy-spin that monopolizes
+// the core and *discards* every non-ARP frame it drains. A client
+// connect to a fresh destination starts from a guaranteed miss, so
+// it gets a proper async path instead: emit the request, park on the
+// runtime's waker discipline, and let `arp_receive` wake us when the
+// reply lands.
+//
+// Per-core vs global: the learn-side caches stay exactly as they are
+// (global slow cache + per-core fast slots). The PENDING table below
+// is global-but-tiny, and deliberately so — inbound ARP is delivered
+// inline on whichever core the frame happens to land on (Tier 1: the
+// NIC's non-IP queue placement; Tier 2: the distributor core; see
+// `net_stack::rx`), which is in general NOT the core the resolver is
+// parked on. A per-core pending set would strand waiters whenever the
+// reply lands elsewhere. Cross-core waking is the runtime's bread and
+// butter (same discipline as DHCP's `AsyncEvent`), the table is 8
+// entries of two words each, and the touch rate is per-connect-miss,
+// not per-packet — so global costs nothing where it matters.
+
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+
+use executor::waker_slot::{Parked, WakerSlot};
+
+/// Why an async next-hop resolution failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveError {
+    /// Destination is off-link and no gateway is configured
+    /// (`types::next_hop_v4` said [`types::NoRoute`]).
+    NoRoute,
+    /// All [`RESOLVE_ATTEMPTS`] solicitations went unanswered.
+    Timeout,
+    /// The pending-resolve table was full — more concurrent
+    /// first-contact resolutions than [`PENDING_RESOLVERS`]. Counted
+    /// in `diag::COUNTERS.pending_overflow`.
+    PendingOverflow,
+}
+
+/// Concurrent first-contact resolutions, process-wide. Connects to
+/// already-known next hops never claim a slot (fast path), and every
+/// distinct destination behind one gateway shares the gateway's
+/// resolution — so a handful of slots covers any sane workload.
+const PENDING_RESOLVERS: usize = 8;
+/// Solicitations per resolution, ~[`RESOLVE_RETRY_US`] apart.
+const RESOLVE_ATTEMPTS: u32 = 3;
+const RESOLVE_RETRY_US: u64 = 1_000_000;
+
+struct PendingSlot {
+    /// IP being resolved (`Ipv4Addr::addr` form), `0` = slot free.
+    /// The CAS on this field is the slot allocator; `pending_wake`
+    /// matches against it lock-free.
+    ip: AtomicU32,
+    waker: WakerSlot,
+}
+
+impl PendingSlot {
+    const fn new() -> Self {
+        PendingSlot {
+            ip: AtomicU32::new(0),
+            waker: WakerSlot::new(),
+        }
+    }
+}
+
+static PENDING: [PendingSlot; PENDING_RESOLVERS] =
+    [const { PendingSlot::new() }; PENDING_RESOLVERS];
+
+/// Wake every resolver parked on `ip`. Called from `arp_receive` —
+/// on whichever core the ARP frame landed — right after the slow
+/// cache learned the mapping the waiters will re-read.
+fn pending_wake(ip: Ipv4Addr) {
+    for slot in &PENDING {
+        if slot.ip.load(Ordering::Acquire) == ip.addr {
+            slot.waker.wake();
+        }
+    }
+}
+
+/// A claimed [`PendingSlot`] — RAII, released on drop. `owner` marks
+/// the first waiter for this IP at claim time: only the owner emits
+/// solicitations, so N conns racing to the same fresh next hop put
+/// one request per retry on the wire (the coalescing contract).
+struct PendingClaim {
+    slot: &'static PendingSlot,
+    owner: bool,
+}
+
+impl PendingClaim {
+    fn claim(ip: Ipv4Addr) -> Option<PendingClaim> {
+        // Owner scan before the claim CAS, so our own slot can't
+        // shadow the check. Two cores racing the same fresh IP can
+        // both conclude "owner" and each send a request — harmless
+        // (one duplicate per retry, bounded by the table size).
+        let owner = !PENDING
+            .iter()
+            .any(|s| s.ip.load(Ordering::Acquire) == ip.addr);
+        for slot in &PENDING {
+            if slot
+                .ip
+                .compare_exchange(0, ip.addr, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(PendingClaim { slot, owner });
+            }
+        }
+        None
+    }
+}
+
+impl Drop for PendingClaim {
+    fn drop(&mut self) {
+        // No waker cleanup needed: the `Parked` guard inside the
+        // wait future deregistered itself when that future dropped
+        // (RAII), strictly before this claim drops. A `pending_wake`
+        // racing the release can at worst spuriously wake a waiter
+        // that re-claimed this slot — it re-checks its cache entry
+        // and re-parks.
+        self.slot.ip.store(0, Ordering::Release);
+    }
+}
+
+/// Future: the slow-cache MAC for `ip`, parking on the claim's waker
+/// slot until `arp_receive` learns it. Re-armed fresh for every
+/// retry window (`timeout_us` drops the loser, and the `Parked`
+/// field deregisters the waker structurally — audit #7).
+struct WaitMac {
+    ip: Ipv4Addr,
+    slot: &'static PendingSlot,
+    parked: Option<Parked<'static>>,
+}
+
+impl Future for WaitMac {
+    type Output = MacAddr;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<MacAddr> {
+        let this = self.get_mut();
+        if let Some(mac) = ARP_CACHE.lock().lookup(this.ip) {
+            return Poll::Ready(mac);
+        }
+        match &mut this.parked {
+            Some(p) => p.repark(cx.waker()),
+            None => this.parked = Some(this.slot.waker.park_guard(cx.waker())),
+        }
+        // Park-then-re-check: a reply that landed between the first
+        // read and the park already consumed (or missed) our waker;
+        // the second read closes the race — `WakerSlot`'s lock
+        // orders the two critical sections.
+        if let Some(mac) = ARP_CACHE.lock().lookup(this.ip) {
+            return Poll::Ready(mac);
+        }
+        Poll::Pending
+    }
+}
+
+/// Resolve the MAC of an on-link `next_hop` IP, actively soliciting
+/// on a miss. Cache hit (per-core fast slot or shared slow cache)
+/// returns without awaiting; a miss claims a pending slot, emits up
+/// to [`RESOLVE_ATTEMPTS`] ARP requests ~1s apart, and parks between
+/// them. Concurrent resolutions of the same IP coalesce to one
+/// request stream; all waiters wake on the reply.
+pub async fn resolve_mac(next_hop: Ipv4Addr) -> Result<MacAddr, ResolveError> {
+    if next_hop == Ipv4Addr::BROADCAST {
+        return Ok(MacAddr::BROADCAST);
+    }
+    if next_hop == Ipv4Addr::ANY {
+        return Err(ResolveError::NoRoute);
+    }
+    if let Some(mac) = arp_fast_lookup(next_hop) {
+        return Ok(mac);
+    }
+    if let Some(mac) = ARP_CACHE.lock().lookup(next_hop) {
+        arp_fast_store(next_hop, mac);
+        return Ok(mac);
+    }
+    let Some(claim) = PendingClaim::claim(next_hop) else {
+        diag::COUNTERS.pending_overflow.bump();
+        return Err(ResolveError::PendingOverflow);
+    };
+    for _ in 0..RESOLVE_ATTEMPTS {
+        if claim.owner {
+            arp_request(next_hop);
+        }
+        let wait = WaitMac {
+            ip: next_hop,
+            slot: claim.slot,
+            parked: None,
+        };
+        if let Some(mac) = executor::select::timeout_us(RESOLVE_RETRY_US, wait).await {
+            arp_fast_store(next_hop, mac);
+            diag::COUNTERS.resolves_ok.bump();
+            return Ok(mac);
+        }
+        // Timed out this window. A non-owner keeps waiting on its
+        // own schedule — if the owner already gave up and released,
+        // nobody re-solicits, but this waiter's residual windows are
+        // bounded by the same ~3s budget.
+    }
+    diag::COUNTERS.resolve_timeouts.bump();
+    Err(ResolveError::Timeout)
+}
+
+/// Route + resolve in one step: pick the next hop for `dest`
+/// ([`types::next_hop_v4`] against the live config) and resolve its
+/// MAC. The TCP active-open path calls this *before* sending the
+/// SYN, so the SYN's `mac_resolve::resolve` → `arp_resolve` lookup
+/// hits the (now-warm) caches and the sync spin path stays cold.
+pub async fn resolve_route(dest: Ipv4Addr) -> Result<MacAddr, ResolveError> {
+    let cfg = CONFIG.load();
+    if cfg.ip == Ipv4Addr::ANY {
+        // Boot-before-DHCP edge: mirror `mac_resolve` / `ipv4_send`,
+        // which fall back to Ethernet broadcast.
+        return Ok(MacAddr::BROADCAST);
+    }
+    let hop = types::next_hop_v4(dest, &cfg).map_err(|types::NoRoute| ResolveError::NoRoute)?;
+    resolve_mac(hop).await
+}
+
+// ─── Diag — active-resolve observability ────────────────────────────────────
+
+/// Counters for the ARP resolver, surfaced through the `/obs` `"net"`
+/// block (`net_stack::diag` appends [`snapshot`](diag::snapshot)).
+pub mod diag {
+    use obs::Counter;
+
+    pub struct Counters {
+        /// ARP requests put on the wire — both the async resolver's
+        /// solicitations and the legacy sync-spin path's (counted at
+        /// the single `arp_request` choke point).
+        pub requests_sent: Counter,
+        /// Async resolutions that completed via solicitation (cache
+        /// fast-path hits are not counted — they answer without ever
+        /// touching the pending table).
+        pub resolves_ok: Counter,
+        /// Async resolutions that exhausted every solicitation window.
+        pub resolve_timeouts: Counter,
+        /// Resolutions refused because the pending table was full.
+        pub pending_overflow: Counter,
+    }
+
+    impl Counters {
+        const fn new() -> Self {
+            Counters {
+                requests_sent: Counter::new(),
+                resolves_ok: Counter::new(),
+                resolve_timeouts: Counter::new(),
+                pending_overflow: Counter::new(),
+            }
+        }
+    }
+
+    pub static COUNTERS: Counters = Counters::new();
+
+    /// Counter `(name, value)` pairs in declaration order, prefixed
+    /// for splicing into the `"net"` `/obs` block.
+    pub fn snapshot() -> [(&'static str, u64); 4] {
+        let c = &COUNTERS;
+        [
+            ("arp_requests_sent", c.requests_sent.get()),
+            ("arp_resolves_ok", c.resolves_ok.get()),
+            ("arp_resolve_timeouts", c.resolve_timeouts.get()),
+            ("arp_pending_overflow", c.pending_overflow.get()),
+        ]
+    }
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    extern crate std;
+    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::AtomicUsize;
+    use std::task::{Wake, Waker};
+
+    /// `PENDING` and `ARP_CACHE` are process globals and libtest runs
+    /// tests on multiple threads — serialize the tests that touch them.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct CountingWake(AtomicUsize);
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn waker() -> (Waker, Arc<CountingWake>) {
+        let cw = Arc::new(CountingWake(AtomicUsize::new(0)));
+        (Waker::from(Arc::clone(&cw)), cw)
+    }
+
+    fn poll_wait(wait: &mut WaitMac, w: &Waker) -> Poll<MacAddr> {
+        let mut cx = Context::from_waker(w);
+        Pin::new(wait).poll(&mut cx)
+    }
+
+    /// 28-byte wire-format ARP reply from `ip` claiming `mac`.
+    fn reply_bytes(ip: Ipv4Addr, mac: MacAddr) -> std::vec::Vec<u8> {
+        let pkt = ArpPacket {
+            hw_type: htons(1),
+            proto_type: htons(0x0800),
+            hw_len: 6,
+            proto_len: 4,
+            operation: htons(ARP_OP_REPLY),
+            sender_mac: mac,
+            sender_ip: ip,
+            target_mac: MacAddr::ZERO,
+            target_ip: Ipv4Addr::ANY,
+        };
+        pkt.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn resolve_coalesces_two_waiters_one_owner_both_woken() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let ip = Ipv4Addr::from(192, 168, 77, 1);
+        let mac = MacAddr {
+            bytes: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+        };
+
+        // Two concurrent claims for one IP: exactly one owner — the
+        // owner flag is what gates request emission in `resolve_mac`,
+        // so this IS the "one request emitted" contract.
+        let a = PendingClaim::claim(ip).expect("slot");
+        let b = PendingClaim::claim(ip).expect("slot");
+        assert!(a.owner, "first claim solicits");
+        assert!(!b.owner, "second claim coalesces");
+
+        // Park both waiters (cache is cold → Pending).
+        let (wa, ca) = waker();
+        let (wb, cb) = waker();
+        let mut fa = WaitMac { ip, slot: a.slot, parked: None };
+        let mut fb = WaitMac { ip, slot: b.slot, parked: None };
+        assert!(poll_wait(&mut fa, &wa).is_pending());
+        assert!(poll_wait(&mut fb, &wb).is_pending());
+
+        // The reply lands (on any core): both waiters wake, and both
+        // resolve to the learned MAC on their next poll.
+        arp_receive(&reply_bytes(ip, mac));
+        assert_eq!(ca.0.load(Ordering::Relaxed), 1, "waiter A woken");
+        assert_eq!(cb.0.load(Ordering::Relaxed), 1, "waiter B woken");
+        assert_eq!(poll_wait(&mut fa, &wa), Poll::Ready(mac));
+        assert_eq!(poll_wait(&mut fb, &wb), Poll::Ready(mac));
+
+        // Claims release their slots on drop.
+        drop((fa, fb, a, b));
+        assert!(
+            PENDING.iter().all(|s| s.ip.load(Ordering::Relaxed) != ip.addr),
+            "slots released"
+        );
+    }
+
+    #[test]
+    fn pending_table_overflow_refuses_and_recovers() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let mut held = std::vec::Vec::new();
+        for i in 0..PENDING_RESOLVERS as u8 {
+            held.push(PendingClaim::claim(Ipv4Addr::from(10, 99, 0, i + 1)).expect("slot"));
+        }
+        assert!(
+            PendingClaim::claim(Ipv4Addr::from(10, 99, 1, 1)).is_none(),
+            "table full refuses"
+        );
+        held.pop();
+        assert!(
+            PendingClaim::claim(Ipv4Addr::from(10, 99, 1, 1)).is_some(),
+            "released slot is claimable again"
+        );
+    }
+
+    #[test]
+    fn wait_mac_park_then_recheck_closes_pre_park_race() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let ip = Ipv4Addr::from(192, 168, 77, 2);
+        let mac = MacAddr {
+            bytes: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x02],
+        };
+        let claim = PendingClaim::claim(ip).expect("slot");
+        // Reply already in the cache before the first poll: the
+        // future must resolve immediately, never parking.
+        arp_receive(&reply_bytes(ip, mac));
+        let (w, cw) = waker();
+        let mut f = WaitMac { ip, slot: claim.slot, parked: None };
+        assert_eq!(poll_wait(&mut f, &w), Poll::Ready(mac));
+        assert_eq!(cw.0.load(Ordering::Relaxed), 0, "no spurious wake");
+    }
 }

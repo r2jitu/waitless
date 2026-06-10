@@ -266,8 +266,9 @@ where
 /// type accepted connections use, with the same generation-checked
 /// handle underneath (a stale handle surviving close+reuse
 /// short-circuits to the closed path on every later op). Errors
-/// distinguish an active refusal (RST) from a SYN-retry timeout from
-/// a connect that never started (no slot / backend).
+/// distinguish the resolve stage (`NoRoute` / `HostUnreachable`)
+/// from an active refusal (RST), a SYN-retry timeout, and a connect
+/// that never started (no slot / backend).
 ///
 /// Must be called from a task (it awaits); the conn is owned by the
 /// calling worker, like every accepted stream.
@@ -275,6 +276,11 @@ pub async fn tcp_connect(
     ip: runtime::IpAddr,
     port: u16,
 ) -> Result<runtime::TcpStream, executor::reactor::TcpConnectError> {
+    // Resolve next-hop + MAC BEFORE the engine connect, so the SYN
+    // leaves with a real destination MAC through the ordinary egress
+    // lookup. Bare-metal does active ARP here; native is a no-op
+    // (the host stack resolves during `connect(2)`).
+    waitless_backend::tcp_pre_connect_resolve(ip).await?;
     executor::reactor::tcp_connect(ip, port).await
 }
 

@@ -64,6 +64,34 @@ pub fn net_obs_json(w: &mut dyn core::fmt::Write) {
     let _ = net_stack::diag::write_obs_json(w);
 }
 
+/// Pre-connect next-hop/MAC resolution for an active open — called
+/// by `waitless::tcp_connect` BEFORE the engine `connect` so the SYN
+/// that `connect_on_core` emits finds a warm neighbor cache and the
+/// normal egress lookup (`mac_resolve::resolve`) hits without ever
+/// entering `arp_resolve`'s sync miss-spin. On a miss this awaits
+/// the async ARP solicitation (3 requests ~1s apart); resolver
+/// failures map onto `TcpConnectError`'s resolve-stage variants. v6
+/// passes through — the backend `connect` hook rejects v6 active
+/// opens itself (reported as `Failed`), and NDP solicitation will
+/// ride this same seam when v6 connect lands. The native backend
+/// stubs this `Ok(())` (the host stack routes/ARPs on its own).
+pub async fn tcp_pre_connect_resolve(
+    ip: executor::ip::IpAddr,
+) -> Result<(), executor::reactor::TcpConnectError> {
+    use executor::reactor::TcpConnectError;
+    match ip {
+        executor::ip::IpAddr::V4(dest) => match net_stack::arp::resolve_route(dest).await {
+            Ok(_) => Ok(()),
+            Err(net_stack::arp::ResolveError::NoRoute) => Err(TcpConnectError::NoRoute),
+            Err(
+                net_stack::arp::ResolveError::Timeout
+                | net_stack::arp::ResolveError::PendingOverflow,
+            ) => Err(TcpConnectError::HostUnreachable),
+        },
+        executor::ip::IpAddr::V6(_) => Ok(()),
+    }
+}
+
 // ---- Event loop re-exports ------------------------------------------------
 
 pub use kernel_bare::eventloop::{request_shutdown, set_ready};

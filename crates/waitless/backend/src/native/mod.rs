@@ -1085,6 +1085,15 @@ pub fn net_obs_json(w: &mut dyn core::fmt::Write) {
     let _ = w.write_str("{}");
 }
 
+/// Native stub for the pre-connect next-hop/MAC resolution — the
+/// host's own stack routes and ARPs when `connect(2)` runs, so there
+/// is nothing to do here. Mirrors `bare::tcp_pre_connect_resolve`.
+pub async fn tcp_pre_connect_resolve(
+    _ip: executor::ip::IpAddr,
+) -> Result<(), executor::reactor::TcpConnectError> {
+    Ok(())
+}
+
 // ---- Diag-capture stubs (native has no kernel panic to capture) ----
 
 pub fn diag_append(_bytes: &[u8]) {}

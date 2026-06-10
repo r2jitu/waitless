@@ -358,6 +358,48 @@ impl ConfigStore {
 
 pub static CONFIG: ConfigStore = ConfigStore::new();
 
+// ── IPv4 next-hop selection ──────────────────────────────────────────────────
+
+/// `next_hop_v4` found no usable next hop: the destination is
+/// off-link and no gateway is configured. Distinguishable from a
+/// neighbor-resolution failure (the next hop is known but its MAC
+/// never resolved) — that's `arp::ResolveError::Timeout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoRoute;
+
+/// The IPv4 routing decision — which IP do we put on the local link
+/// to reach `dest`? On-link (`dest & mask == our_net & mask`) →
+/// `dest` itself; off-link → the configured gateway. Lives here,
+/// next to the DHCP-recorded facts (`NetConfig`) it consults, so the
+/// sync ARP path (`arp_resolve`) and the async resolver
+/// (`arp::resolve_route`) share one copy of the policy.
+///
+/// Edge cases, deliberately:
+///   * limited broadcast (255.255.255.255) never crosses a router —
+///     always on-link;
+///   * an all-zero mask (unconfigured, or a deliberate /0) makes
+///     everything on-link, matching the stack's pre-DHCP behavior.
+pub fn next_hop_v4(dest: Ipv4Addr, cfg: &NetConfig) -> Result<Ipv4Addr, NoRoute> {
+    if dest == Ipv4Addr::BROADCAST {
+        return Ok(dest);
+    }
+    let mask = cfg.subnet_mask.addr;
+    if (dest.addr & mask) == (cfg.ip.addr & mask) {
+        return Ok(dest);
+    }
+    if cfg.gateway != Ipv4Addr::ANY {
+        return Ok(cfg.gateway);
+    }
+    Err(NoRoute)
+}
+
+impl ConfigStore {
+    /// [`next_hop_v4`] against the live configuration.
+    pub fn next_hop(&self, dest: Ipv4Addr) -> Result<Ipv4Addr, NoRoute> {
+        next_hop_v4(dest, &self.load())
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -398,6 +440,85 @@ mod tests {
         let c = Ipv4Addr::from(192, 168, 1, 2);
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    fn cfg(ip: [u8; 4], mask: [u8; 4], gw: [u8; 4]) -> NetConfig {
+        NetConfig {
+            ip: Ipv4Addr::from(ip[0], ip[1], ip[2], ip[3]),
+            subnet_mask: Ipv4Addr::from(mask[0], mask[1], mask[2], mask[3]),
+            gateway: Ipv4Addr::from(gw[0], gw[1], gw[2], gw[3]),
+            dns: Ipv4Addr::ANY,
+        }
+    }
+
+    #[test]
+    fn next_hop_on_link_is_dest() {
+        let c = cfg([10, 0, 2, 15], [255, 255, 255, 0], [10, 0, 2, 2]);
+        let dest = Ipv4Addr::from(10, 0, 2, 99);
+        assert_eq!(next_hop_v4(dest, &c), Ok(dest));
+    }
+
+    #[test]
+    fn next_hop_off_link_is_gateway() {
+        let c = cfg([10, 0, 2, 15], [255, 255, 255, 0], [10, 0, 2, 2]);
+        let dest = Ipv4Addr::from(93, 184, 216, 34);
+        assert_eq!(next_hop_v4(dest, &c), Ok(Ipv4Addr::from(10, 0, 2, 2)));
+    }
+
+    #[test]
+    fn next_hop_off_link_no_gateway_is_no_route() {
+        let c = cfg([10, 0, 2, 15], [255, 255, 255, 0], [0, 0, 0, 0]);
+        assert_eq!(
+            next_hop_v4(Ipv4Addr::from(93, 184, 216, 34), &c),
+            Err(NoRoute)
+        );
+    }
+
+    #[test]
+    fn next_hop_zero_mask_is_always_on_link() {
+        // Pre-DHCP (all-zero config) and deliberate /0 alike: no
+        // destination is ever routed through a gateway.
+        let c = cfg([10, 0, 2, 15], [0, 0, 0, 0], [0, 0, 0, 0]);
+        let dest = Ipv4Addr::from(93, 184, 216, 34);
+        assert_eq!(next_hop_v4(dest, &c), Ok(dest));
+    }
+
+    #[test]
+    fn next_hop_slash32_mask_routes_everyone_but_self() {
+        let c = cfg([10, 0, 2, 15], [255, 255, 255, 255], [10, 0, 2, 2]);
+        let me = Ipv4Addr::from(10, 0, 2, 15);
+        assert_eq!(next_hop_v4(me, &c), Ok(me));
+        let neighbor = Ipv4Addr::from(10, 0, 2, 16);
+        assert_eq!(next_hop_v4(neighbor, &c), Ok(Ipv4Addr::from(10, 0, 2, 2)));
+    }
+
+    #[test]
+    fn next_hop_subnet_boundary_edges() {
+        // /30: network 10.0.2.12, hosts .13/.14, broadcast .15 —
+        // .16 is the next block over and must route via the gateway.
+        let c = cfg([10, 0, 2, 13], [255, 255, 255, 252], [10, 0, 2, 14]);
+        let in_net = Ipv4Addr::from(10, 0, 2, 14);
+        assert_eq!(next_hop_v4(in_net, &c), Ok(in_net));
+        assert_eq!(
+            next_hop_v4(Ipv4Addr::from(10, 0, 2, 16), &c),
+            Ok(Ipv4Addr::from(10, 0, 2, 14))
+        );
+    }
+
+    #[test]
+    fn next_hop_limited_broadcast_is_on_link() {
+        // Even off-subnet by mask math, 255.255.255.255 never routes.
+        let c = cfg([10, 0, 2, 15], [255, 255, 255, 0], [10, 0, 2, 2]);
+        assert_eq!(
+            next_hop_v4(Ipv4Addr::BROADCAST, &c),
+            Ok(Ipv4Addr::BROADCAST)
+        );
+        // And without a gateway it still must not be NoRoute.
+        let c = cfg([10, 0, 2, 15], [255, 255, 255, 0], [0, 0, 0, 0]);
+        assert_eq!(
+            next_hop_v4(Ipv4Addr::BROADCAST, &c),
+            Ok(Ipv4Addr::BROADCAST)
+        );
     }
 
     #[test]

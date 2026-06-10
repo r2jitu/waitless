@@ -371,6 +371,16 @@ pub enum TcpConnectError {
     /// backend could not allocate a conn slot / ephemeral port /
     /// socket.
     Failed,
+    /// Pre-connect routing failed: the destination is off-link and
+    /// no gateway is configured (`ENETUNREACH` analogue). Bare-metal
+    /// resolve stage only — the native backend's host stack does its
+    /// own routing and reports failures through `connect(2)` errnos.
+    NoRoute,
+    /// Pre-connect neighbor resolution failed: the next hop is known
+    /// but its MAC never resolved — ARP solicitation timed out, or
+    /// the small pending-resolve table was full (`EHOSTUNREACH`
+    /// analogue). Bare-metal resolve stage only.
+    HostUnreachable,
 }
 
 /// Optional TSO fast-path send. The `fill` closure writes TCP-

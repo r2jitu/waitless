@@ -108,9 +108,24 @@ rust_library(
         ":types",
         "//crates/drivers/nic",
         "//crates/kernel/core",
+        # Async next-hop resolver: `WakerSlot` park points +
+        # `timeout_us` retry windows. No cycle — the executor sits
+        # below `kernel_core`, which `arp` already depends on.
+        "//crates/runtime/executor",
         "//crates/util/iobuf",
+        "//crates/util/obs",
         "//crates/util/sync",
     ],
+)
+
+# Host-native tests for the async-resolve machinery: pending-table
+# claim/coalesce/overflow + the WaitMac park-then-re-check discipline.
+# The NIC dep resolves to the null-object driver on the host, so
+# `arp_receive` is safely callable from the tests.
+rust_test(
+    name = "arp_test",
+    size = "small",
+    crate = ":arp",
 )
 
 # IPv4 wire format — parse + header build. Pure leaf: `ipv4_parse`

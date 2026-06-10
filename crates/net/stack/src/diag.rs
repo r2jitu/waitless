@@ -96,10 +96,17 @@ pub fn snapshot() -> [(&'static str, u64); 4] {
 }
 
 /// Render the L2/L3-dispatch observability block as a JSON object.
-/// This is the network stack's `/obs` block.
+/// This is the network stack's `/obs` block. The ARP resolver's
+/// counters (`arp::diag` — active solicitation for the TCP client
+/// path) are spliced in here rather than given their own block:
+/// they are L2/L3 facts, and `arp` is a leaf crate this umbrella
+/// already owns the rendering for.
 pub fn write_obs_json(w: &mut dyn fmt::Write) -> fmt::Result {
     w.write_str("{")?;
     for (name, value) in snapshot() {
+        write!(w, "\"{name}\":{value},")?;
+    }
+    for (name, value) in arp::diag::snapshot() {
         write!(w, "\"{name}\":{value},")?;
     }
     LAST_CLASSIFIED_DROP.write_json(w, "last_classified_drop")?;
