@@ -57,6 +57,20 @@ rust_test(
     crate_root = "src/decoder.rs",
 )
 
+# Host-native unit tests for the outbound-TCP flow state machine
+# (guest-initiated connects through the userspace proxy). Pure-logic
+# like decoder_test — the FSM file has no HVF / libc / virtio deps,
+# so it compiles standalone under the rust_test harness; the I/O
+# glue that executes its verdicts lives in
+# src/userspace_net/outbound_tcp.rs and is covered by the
+# apps/webserver HVF integration test.
+rust_test(
+    name = "outbound_fsm_test",
+    size = "small",
+    srcs = ["src/userspace_net/outbound_fsm.rs"],
+    crate_root = "src/userspace_net/outbound_fsm.rs",
+)
+
 genrule(
     name = "run_hvf",
     srcs = ["run-hvf.entitlements"],

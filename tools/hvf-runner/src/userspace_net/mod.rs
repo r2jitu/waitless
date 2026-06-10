@@ -74,10 +74,13 @@ use crate::virtio;
 mod frame; // pure packet construction (builders + checksums)
 mod guest_tx; // guest -> host: ARP / IPv4 / IPv6 / TCP / UDP / DHCP
 mod inbound; // host -> guest: listener threads, flow hash, RX inject
+mod outbound_fsm; // guest-initiated TCP: pure state machine (unit-tested)
+mod outbound_tcp; // guest-initiated TCP: host sockets + poll-loop glue
 
 use frame::*;
 use guest_tx::*;
 use inbound::*;
+use outbound_tcp::*;
 
 const VIRTIO_NET_HDR_SIZE: usize = 12;
 const GW_MAC: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
@@ -367,6 +370,10 @@ const GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 #[derive(Clone, Copy)]
 struct TcpListen {
     fd: i32,
+    /// Host-side port this listener is bound to. Read by the
+    /// outbound-TCP path to refuse guest connects that would loop
+    /// back into the proxy's own forwarder.
+    host_port: u16,
     guest_port: u16,
     family: IpFamily,
 }
@@ -479,6 +486,11 @@ struct IoState {
     /// guest's RX queue. Single-owner per vCPU — no cross-thread
     /// mutation, no SO_REUSEPORT.
     outbound_udp: HashMap<u16, OutboundUdp>,
+    /// Outbound TCP NAT — guest-initiated flows bridged to real host
+    /// sockets (the guest TCP stack's active open). Keyed by the
+    /// guest 4-tuple's variable parts; same single-owner-per-vCPU
+    /// model as `outbound_udp`. See `outbound_tcp.rs`.
+    outbound_tcp: HashMap<OutTcpKey, OutboundTcp>,
     /// Read end of the per-vCPU wake pipe. Polled in `pollfds` so a
     /// write from the accept thread breaks the blocking poll. The
     /// payload is a doorbell — drained and discarded.
@@ -779,6 +791,7 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
                 let fd = bind_listen_v4(m.host)?;
                 listens.push(TcpListen {
                     fd,
+                    host_port: m.host,
                     guest_port: m.guest,
                     family: IpFamily::V4,
                 });
@@ -789,6 +802,7 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
                 match bind_listen_v6(m.host) {
                     Ok(fd6) => listens.push(TcpListen {
                         fd: fd6,
+                        host_port: m.host,
                         guest_port: m.guest,
                         family: IpFamily::V6,
                     }),
@@ -869,6 +883,7 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
         vcpu_ios.push(Mutex::new(IoState {
             id,
             outbound_udp: HashMap::new(),
+            outbound_tcp: HashMap::new(),
             wake_pipe_read: wake_read,
             guest_mac: mac,
             read_buf: [0u8; 2048],
@@ -1134,14 +1149,21 @@ fn flush_established_pending(
 /// Slot offsets into `io.pollfds` produced by `build_pollfds`.
 /// `pollfds[0]` is the wake pipe; `[listen_slot_start..]` the shared
 /// TCP listen fds; `[outbound_slot_start..]` the outbound-UDP NAT
-/// fds; `[fixed_slots..]` this vCPU's assigned TCP conn fds.
+/// fds; `[outbound_tcp_slot_start..]` the outbound-TCP flow fds;
+/// `[fixed_slots..]` this vCPU's assigned TCP conn fds.
 struct PollLayout {
     listen_slot_start: usize,
     outbound_slot_start: usize,
+    outbound_tcp_slot_start: usize,
     fixed_slots: usize,
     /// `(guest_src_port, flow)` snapshot of this vCPU's outbound-UDP
     /// table, parallel to the `outbound_slot_start` pollfd range.
     outbound_drain: Vec<(u16, OutboundUdp)>,
+    /// `(key, fd, connecting)` snapshot of this vCPU's outbound-TCP
+    /// table (pollable flows only), parallel to the
+    /// `outbound_tcp_slot_start` pollfd range. `connecting` flows
+    /// poll POLLOUT (connect completion), the rest POLLIN.
+    outbound_tcp_drain: Vec<(OutTcpKey, i32, bool)>,
 }
 
 /// Rebuild `io.pollfds` / `io.conn_ports` for this iteration: the
@@ -1189,6 +1211,29 @@ fn build_pollfds(io: &mut IoState, shared: &WorkerShared, listens: &[TcpListen])
         });
         io.conn_ports.push(*gport);
     }
+    // Outbound TCP flow fds — guest-initiated connections bridged to
+    // real host sockets. Connecting flows watch POLLOUT (connect
+    // completion → SYN-ACK/RST); bridging flows watch POLLIN
+    // (host→guest data / EOF). `poll_wants` skips SynAckSent flows —
+    // see its doc for the SYN-ACK-ordering rationale.
+    let outbound_tcp_slot_start = io.pollfds.len();
+    let outbound_tcp_drain: Vec<(OutTcpKey, i32, bool)> = io
+        .outbound_tcp
+        .iter()
+        .filter_map(|(&k, f)| f.poll_wants().map(|connecting| (k, f.fd, connecting)))
+        .collect();
+    for (_, fd, connecting) in &outbound_tcp_drain {
+        io.pollfds.push(libc::pollfd {
+            fd: *fd,
+            events: if *connecting {
+                libc::POLLOUT
+            } else {
+                libc::POLLIN
+            },
+            revents: 0,
+        });
+        io.conn_ports.push(0);
+    }
     let fixed_slots = io.pollfds.len();
     {
         let conns = shared.conns.lock().unwrap();
@@ -1208,8 +1253,10 @@ fn build_pollfds(io: &mut IoState, shared: &WorkerShared, listens: &[TcpListen])
     PollLayout {
         listen_slot_start,
         outbound_slot_start,
+        outbound_tcp_slot_start,
         fixed_slots,
         outbound_drain,
+        outbound_tcp_drain,
     }
 }
 
@@ -1771,6 +1818,7 @@ fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) ->
         layout.outbound_slot_start,
         &mut any_injected,
     );
+    drain_outbound_tcp(io, shared, &qsnap, single_queue, &layout, &mut any_injected);
     drain_conn_rx(
         io,
         shared,

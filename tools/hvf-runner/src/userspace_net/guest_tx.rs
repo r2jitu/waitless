@@ -65,7 +65,9 @@ pub(super) fn handle_ipv6(ip: &[u8], guest_mac: [u8; 6]) {
             }
         }
         17 => handle_udp_v6(payload, src_ip, dst_ip),
-        6 => handle_tcp(IpFamily::V6, payload),
+        // v6 has no outbound-TCP support (the guest's active open is
+        // v4-first) — the zero dst_ip is never read for V6.
+        6 => handle_tcp(IpFamily::V6, payload, [0; 4]),
         _ => {}
     }
 }
@@ -353,7 +355,17 @@ pub(super) fn handle_arp(arp: &[u8]) {
     if u16::from_be_bytes([arp[6], arp[7]]) != 1 {
         return;
     }
-    if arp[24..28] != GW_IP {
+    // Answer ONLY for the gateway IP. This is sufficient for every
+    // reachable outbound destination: the gateway itself (10.0.2.2 →
+    // host loopback) is ARPed directly, and any off-subnet target
+    // (LAN, loopback-routed) resolves through the gateway MAC
+    // (guest `arp_resolve` next-hop logic). Deliberately NOT
+    // proxy-ARP: an absent on-link 10.0.2.x must stay unanswered so
+    // the guest's resolver fails the connect cleanly at the resolve
+    // stage (test.py::test_connect_probe_unreachable_fails_clean
+    // depends on exactly this topology).
+    let target_ip: [u8; 4] = arp[24..28].try_into().unwrap_or([0; 4]);
+    if target_ip != GW_IP {
         return;
     }
     let guest_mac: [u8; 6] = arp[8..14].try_into().unwrap_or([0; 6]);
@@ -381,7 +393,9 @@ pub(super) fn handle_arp(arp: &[u8]) {
         o += 2;
         b[o..o + 6].copy_from_slice(&GW_MAC);
         o += 6;
-        b[o..o + 4].copy_from_slice(&GW_IP);
+        // Sender protocol address = the requested target (== GW_IP,
+        // the only target we answer for).
+        b[o..o + 4].copy_from_slice(&target_ip);
         o += 4;
         b[o..o + 6].copy_from_slice(&arp[8..14]);
         o += 6;
@@ -400,13 +414,13 @@ pub(super) fn handle_ipv4(ip: &[u8]) {
     let src_ip: [u8; 4] = ip[12..16].try_into().unwrap_or([0; 4]);
     let dst_ip: [u8; 4] = ip[16..20].try_into().unwrap_or([0; 4]);
     match ip[9] {
-        6 => handle_tcp(IpFamily::V4, &ip[ihl..]),
+        6 => handle_tcp(IpFamily::V4, &ip[ihl..], dst_ip),
         17 => handle_udp_v4(&ip[ihl..], src_ip, dst_ip),
         _ => {}
     }
 }
 
-pub(super) fn handle_tcp(family: IpFamily, tcp: &[u8]) {
+pub(super) fn handle_tcp(family: IpFamily, tcp: &[u8], dst_ip: [u8; 4]) {
     if tcp.len() < 20 {
         return;
     }
@@ -421,6 +435,20 @@ pub(super) fn handle_tcp(family: IpFamily, tcp: &[u8]) {
         &[]
     };
 
+    // Guest-initiated active open: a bare SYN is ALWAYS outbound —
+    // inbound flows are guest-server conns (the toy peer initiated
+    // them; the guest never SYNs back on one). Routed before the
+    // inbound lookup so an outbound SYN whose dst_port happens to
+    // collide with an inbound pseudo-ephemeral key can't be misread
+    // as inbound traffic. v4 only for now — the guest's active open
+    // targets the v4 path.
+    if flags & 0x12 == 0x02 {
+        if family == IpFamily::V4 {
+            outbound_tcp::handle_guest_segment(dst_ip, tcp);
+        }
+        return;
+    }
+
     // The vCPU only processes conns that its paired worker accepted, so
     // the lookup is scoped to this worker's local `conns` map.
     let shared = my_worker_shared();
@@ -433,40 +461,68 @@ pub(super) fn handle_tcp(family: IpFamily, tcp: &[u8]) {
         seq: u32,
         state: ConnState,
     }
+    // An inbound conn matches only when BOTH ends line up: the conn
+    // keyed by our pseudo-ephemeral port (`dst_port` of the guest's
+    // reply) must also have been targeted at the guest port the
+    // segment is sourced from. Genuine inbound replies always
+    // satisfy this; a guest-initiated outbound segment whose
+    // dst_port lands in the [40000, 60000) key range falls through
+    // to the outbound map instead of hijacking the inbound conn.
     let snap = {
         let mut conns = shared.conns.lock().unwrap();
         if flags & 0x04 != 0 {
-            if let Some(c) = conns.get_mut(&dst_port) {
-                if c.host_fd >= 0 {
-                    // RST the host-side socket too — set SO_LINGER
-                    // {1,0} so close() emits RST instead of the
-                    // default FIN-ACK dance, mirroring what the guest
-                    // just sent. Without this the host TCP socket
-                    // sits in ESTABLISHED until keepalive (minutes).
-                    let linger = libc::linger {
-                        l_onoff: 1,
-                        l_linger: 0,
-                    };
-                    unsafe {
-                        libc::setsockopt(
-                            c.host_fd,
-                            libc::SOL_SOCKET,
-                            libc::SO_LINGER,
-                            &linger as *const _ as *const _,
-                            std::mem::size_of::<libc::linger>() as u32,
-                        );
-                        libc::close(c.host_fd);
+            match conns.get_mut(&dst_port) {
+                Some(c) if c.guest_port == src_port => {
+                    if c.host_fd >= 0 {
+                        // RST the host-side socket too — set SO_LINGER
+                        // {1,0} so close() emits RST instead of the
+                        // default FIN-ACK dance, mirroring what the guest
+                        // just sent. Without this the host TCP socket
+                        // sits in ESTABLISHED until keepalive (minutes).
+                        let linger = libc::linger {
+                            l_onoff: 1,
+                            l_linger: 0,
+                        };
+                        unsafe {
+                            libc::setsockopt(
+                                c.host_fd,
+                                libc::SOL_SOCKET,
+                                libc::SO_LINGER,
+                                &linger as *const _ as *const _,
+                                std::mem::size_of::<libc::linger>() as u32,
+                            );
+                            libc::close(c.host_fd);
+                        }
+                        c.host_fd = -1;
                     }
-                    c.host_fd = -1;
+                    c.state = ConnState::Closed;
+                    return;
                 }
-                c.state = ConnState::Closed;
+                // Not an inbound conn — possibly a guest RST for an
+                // outbound flow; fall through below.
+                _ => None,
             }
-            return;
+        } else {
+            match conns.get_mut(&dst_port) {
+                Some(c) if c.guest_port == src_port => Some(snap_and_update(c, seq, flags, payload)),
+                _ => None,
+            }
         }
-        let c = match conns.get_mut(&dst_port) {
-            Some(c) => c,
-            None => return,
-        };
+    };
+    let Some(snap) = snap else {
+        // No inbound flow matches: guest-initiated outbound traffic
+        // (or a stray segment for an already-reaped conn, which the
+        // outbound handler drops when no flow matches either).
+        if family == IpFamily::V4 {
+            outbound_tcp::handle_guest_segment(dst_ip, tcp);
+        }
+        return;
+    };
+
+    /// Snapshot the conn's pre-segment state, then update it eagerly
+    /// (still under the conns lock). The snapshot drives the
+    /// write/reply phases below without holding the lock.
+    fn snap_and_update(c: &mut ProxyConn, seq: u32, flags: u8, payload: &[u8]) -> TxSnap {
         let s = TxSnap {
             fd: c.host_fd,
             port: c.src_port,
@@ -474,7 +530,6 @@ pub(super) fn handle_tcp(family: IpFamily, tcp: &[u8]) {
             seq: c.my_seq,
             state: c.state,
         };
-        // Update state eagerly (before dropping lock).
         match c.state {
             ConnState::SynSent => {
                 if flags & 0x12 == 0x12 {
@@ -512,7 +567,7 @@ pub(super) fn handle_tcp(family: IpFamily, tcp: &[u8]) {
             _ => {}
         }
         s
-    }; // conns lock released
+    }
 
     // write() outside both conns and tx_replies locks — no contention.
     //
