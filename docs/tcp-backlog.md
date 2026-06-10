@@ -367,24 +367,31 @@ is wired into TCP yet. The plan lives in
 [`stack-architecture.md`](stack-architecture.md) → *Transport reliability
 — one congestion-control / loss-recovery / pacing core*.
 
-### L1 — Congestion control is Reno only (no CUBIC / BBR)
+### L1 — CUBIC ✅ implemented (Reno default; netem A/B is the activation gate); BBR still open
 
-**What.** Our controller is classic RFC 5681 Reno: slow start + AIMD
-(halve on loss, +1 MSS/RTT in avoidance). Linux defaults to **CUBIC**
-(cubic window growth — far more aggressive recovery on high-BDP paths)
-and ships **BBR** (model-based, rate/RTT estimation, loss-agnostic).
+**What (original).** Our controller was classic RFC 5681 Reno: slow start +
+AIMD (halve on loss, +1 MSS/RTT in avoidance). Linux defaults to **CUBIC**
+(cubic window growth — far more aggressive recovery on high-BDP paths) and
+ships **BBR** (model-based, rate/RTT estimation, loss-agnostic).
 
-**Triggers when.** High-BDP paths and any path with non-congestive loss.
-Reno's `cwnd ÷ 2` per loss + linear reopen badly underfills a fat pipe;
-CUBIC reopens cubically, BBR ignores loss as a signal entirely. The gap
-widens with bandwidth × RTT.
+**Status — CUBIC written once for both transports.** `net_cc::Cubic`
+implements RFC 8312 — the cubic window law `W_cubic(t) = C·(t−K)³ + W_max`
+(C = 0.4), the §4.2 TCP-friendly floor (never slower than Reno on a short
+RTT), and §4.6 fast convergence, all fixed-point integer math (ms time,
+byte windows; the cube root for K is the overflow-safe `icbrt_u128`). The
+`CongestionControl` trait gained a monotonic `now_ms` that only a
+time-based controller reads (NewReno ignores it → a Reno flow is
+byte-identical). A `Controller` enum selects NewReno or CUBIC; both TCP and
+QUIC hold it. **`DEFAULT_ALGORITHM = Reno`** so the golden path is unchanged
+until measured — CUBIC's correctness *is* its throughput behaviour on real
+high-BDP paths, so activating it without a GCE/`tc netem` A/B would be
+reckless. The numerics are deterministically unit-tested (the cubic curve
+hits `W_max·β` at the epoch and `W_max` at `t = K`, β = 0.7, reduce-once,
+time-based growth); the **netem throughput A/B is the remaining step to
+flip the default**.
 
-**Fix.** The shared `CongestionControl` trait already exists
-(`crates/net/cc`, QUIC-wired — see
-[`stack-architecture.md`](stack-architecture.md) → Transport reliability);
-delegate TCP onto it behind the roadmap's "Lift `tcp` above `executor`"
-seam, then write CUBIC once for both TCP and QUIC. CUBIC is the pragmatic
-first algorithm — it genuinely doesn't exist yet (only NewReno/Reno does).
+**Open — BBR.** Model-based (delivery-rate + min-RTT estimation,
+loss-agnostic). A larger, separate effort on the same trait seam.
 **Effort: L.**
 
 ### L2 — Appropriate Byte Counting (ABC, RFC 3465) — ✅ done

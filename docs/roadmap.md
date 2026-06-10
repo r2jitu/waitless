@@ -26,10 +26,12 @@ depth and performance**, not new subsystems:
   step 5. The controller landed as the **shared TCP+QUIC congestion core**
   (`crates/net/cc` — the `CongestionControl` trait + NewReno), and **both
   transports now delegate to it** (TCP's hand-rolled RFC 5681 cwnd replaced
-  2026-06-08, netem + GCE validated). The remaining transport work is the
-  CUBIC/BBR algorithms + a TCP-side pacer →
-  [`stack-architecture.md`](stack-architecture.md) *Transport reliability*. One
-  QUIC residual: CRYPTO-frame retx still rides a bare PTO PING.
+  2026-06-08, netem + GCE validated). **CUBIC (RFC 8312) now also lives on the
+  shared trait** (`net_cc::Cubic` — cubic window law + TCP-friendly floor +
+  fast convergence, fixed-point), selectable per flow via a `Controller` enum
+  but **default-Reno** until a GCE/netem throughput A/B justifies flipping it.
+  The remaining transport work is BBR + a TCP-side pacer →
+  [`stack-architecture.md`](stack-architecture.md) *Transport reliability*.
 - **TCP conformance + Linux performance parity** — window scaling (RFC 7323), ABC, and peer-MSS honor (the 5G/NAT64 cert-flight fix) ✅ shipped & validated; SACK, out-of-order reassembly, and the Linux-parity gaps (Reno→CUBIC/BBR, pacing, RACK-TLP) remain → [`tcp-backlog.md`](tcp-backlog.md).
 - **RX/TX datapath** — RX offload (HW GRO/RSC), conn-state / conn-future pools, owned-UDP zero-copy → [`rx-path-optimizations.md`](rx-path-optimizations.md) / [`tx-path-optimizations.md`](tx-path-optimizations.md).
 - **Inter-layer contracts** — converging the TCP/TLS/HTTP-1.1 and UDP/QUIC/HTTP-3 stacks onto one golden path (the `ByteStream` trait, the owned buffer currency, the NIC/reactor vtable→trait migrations) → [`stack-architecture.md`](stack-architecture.md).
