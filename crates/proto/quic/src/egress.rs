@@ -35,15 +35,13 @@ use alloc::boxed::Box;
 use alloc::rc::{Rc, Weak};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::drr::DeficitRoundRobin;
-use waitless::runtime::{IpAddr, UdpSocket};
+use waitless::runtime::UdpSocket;
 use worker::{CurrentWorker, WorkerLocal};
 
-use crate::conn::Connection;
-use crate::endpoint::ship_datagram;
+use crate::endpoint::{ConnArena, ship_datagram};
 
 /// Max concurrent egress-managed QUIC flows per core. A flow id is a dense
 /// index assigned from a free list at [`register`] and returned at
@@ -67,14 +65,13 @@ const QUANTUM_BYTES: u32 = 8 * 1500;
 const MAX_DRAIN_ITERS: u32 = 4096;
 
 /// Everything the drain needs to ship one connection's packets without the
-/// owning task: a weak handle to the shared `Connection` (so a finished
-/// conn can't be kept alive by the registry), the socket, and the live
-/// peer 4-tuple cells (updated by the conn task on migration).
+/// owning task: a weak handle to the shared [`ConnArena`] (so a finished
+/// conn can't be kept alive by the registry — the arena co-allocates the
+/// `Connection` plus the live peer 4-tuple cells, updated by the conn task
+/// on migration) and the socket.
 struct Shipper {
-    conn: Weak<RefCell<Connection>>,
+    conn: Weak<ConnArena>,
     sock: Arc<UdpSocket>,
-    peer_ip: Rc<Cell<IpAddr>>,
-    peer_port: Rc<Cell<u16>>,
 }
 
 /// Per-core scheduler state. Holds `Rc`/`Weak`/`Cell` (auto-`!Send`); lives
@@ -173,24 +170,14 @@ pub fn enabled() -> bool {
 /// returned guard between the conn task and the handler. The id is
 /// reclaimed when the last guard clone drops — never explicitly — so reuse
 /// can't race a live sender.
-pub fn register(
-    conn: Weak<RefCell<Connection>>,
-    sock: Arc<UdpSocket>,
-    peer_ip: Rc<Cell<IpAddr>>,
-    peer_port: Rc<Cell<u16>>,
-) -> Option<Rc<FlowGuard>> {
+pub(crate) fn register(conn: Weak<ConnArena>, sock: Arc<UdpSocket>) -> Option<Rc<FlowGuard>> {
     if !enabled() {
         return None;
     }
     let cc = CurrentWorker::enter();
     EGRESS.with_mut(&cc, |e| {
         let id = e.free.pop()?;
-        e.ship[id as usize] = Some(Shipper {
-            conn,
-            sock,
-            peer_ip,
-            peer_port,
-        });
+        e.ship[id as usize] = Some(Shipper { conn, sock });
         Some(Rc::new(FlowGuard { flow: id }))
     })
 }
@@ -227,9 +214,9 @@ pub fn drain_current_core() {
             // before its task's unregister ran (rare; the task holds an
             // `Rc` until exit) — just stop selecting it; unregister will
             // reclaim the id.
-            let (conn, sock, peer_ip, peer_port) = match &e.ship[flow] {
+            let (arena, sock) = match &e.ship[flow] {
                 Some(s) => match s.conn.upgrade() {
-                    Some(c) => (c, s.sock.clone(), s.peer_ip.get(), s.peer_port.get()),
+                    Some(a) => (a, s.sock.clone()),
                     None => {
                         e.drr.deactivate(flow);
                         continue;
@@ -240,13 +227,14 @@ pub fn drain_current_core() {
                     continue;
                 }
             };
+            let (peer_ip, peer_port) = (arena.peer_ip.get(), arena.peer_port.get());
 
             // Phase 1 — ship eagerly-built datagrams (handshake / UDP-GSO
             // super-buffers) the conn task queued in `outbound`.
             let mut sent = 0u32;
             loop {
                 let pkt = {
-                    let mut c = conn.borrow_mut();
+                    let mut c = arena.conn.borrow_mut();
                     c.pop_packet_owned()
                 };
                 let pkt = match pkt {
@@ -254,7 +242,7 @@ pub fn drain_current_core() {
                     None => break,
                 };
                 let len = pkt.len() as u32;
-                ship_datagram(&sock, &conn, peer_ip, peer_port, pkt);
+                ship_datagram(&sock, &arena.conn, peer_ip, peer_port, pkt);
                 sent = sent.saturating_add(len);
                 if sent >= grant {
                     break;
@@ -269,13 +257,13 @@ pub fn drain_current_core() {
             // anti-amp gate, or when nothing more is pending.
             while sent < grant {
                 let pkt = {
-                    let mut c = conn.borrow_mut();
+                    let mut c = arena.conn.borrow_mut();
                     c.build_next_one_rtt_datagram()
                 };
                 match pkt {
                     Ok(Some(p)) => {
                         let len = p.len() as u32;
-                        ship_datagram(&sock, &conn, peer_ip, peer_port, p);
+                        ship_datagram(&sock, &arena.conn, peer_ip, peer_port, p);
                         sent = sent.saturating_add(len);
                     }
                     Ok(None) | Err(_) => break,
@@ -288,7 +276,7 @@ pub fn drain_current_core() {
             // flow in a tight spin. Either way the conn task re-activates it on
             // its next wake (inbound datagram or pacing/ACK timer) as long as
             // `has_pending_tx`.
-            if sent == 0 || !conn.borrow().has_pending_tx() {
+            if sent == 0 || !arena.conn.borrow().has_pending_tx() {
                 e.drr.deactivate(flow);
             }
         }

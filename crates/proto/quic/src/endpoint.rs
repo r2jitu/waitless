@@ -139,6 +139,45 @@ fn is_path_migration(
     cur_ip != waitless::runtime::IpAddr::V4_ANY && (cur_ip != src_ip || cur_port != src_port)
 }
 
+/// The fixed per-connection shared state, co-allocated as ONE heap
+/// allocation (architecture-audit direction #6, first increment).
+///
+/// Before this existed, every accepted connection made four separate
+/// `Rc` allocations — `Rc<RefCell<Connection>>`, `Rc<AsyncEvent>`
+/// (the `progress` signal), `Rc<Cell<IpAddr>>` and `Rc<Cell<u16>>`
+/// (the live peer 4-tuple) — each cloned into the conn task, the
+/// handler's [`QuicConn`], and the egress shipper. Co-allocating them
+/// buys the audit's "one allocation, exact size visible at one
+/// location" property for the FIXED per-conn state: 4 allocations →
+/// 1, one refcount pair instead of four, and
+/// `size_of::<ConnArena>()` (regression-gated in the tests below) IS
+/// the fixed per-conn footprint.
+///
+/// Honest scope note: the DYNAMIC per-conn regions — the stream map,
+/// retransmission queue, CRYPTO/stream reassembly buffers, and the
+/// outbound packet queue — remain ordinary heap allocations behind
+/// the `Connection`. Folding those into typed arena regions is the
+/// direction's long arc and needs allocator plumbing; deliberately
+/// not attempted here. There's also no `reset()`: connections are
+/// not reused today — the conn task ends and the arena drops.
+///
+/// Borrow discipline is unchanged from the four-Rc era: both halves
+/// run on the same worker, short `conn.borrow_mut()` scopes never
+/// held across an `.await`, `Cell` get/set for the peer tuple.
+pub(crate) struct ConnArena {
+    /// The `Connection` state machine the conn task drives and the
+    /// handler reads/writes via short RefCell borrows.
+    pub(crate) conn: RefCell<Connection>,
+    /// Wakes the handler when the conn task ingested an inbound
+    /// datagram / made TX progress. Manual-reset; the handler drives
+    /// the reset cycle via its await loops.
+    pub(crate) progress: AsyncEvent,
+    /// Peer 4-tuple, updated by the conn task on every (authenticated,
+    /// for migrations) inbound datagram so replies follow the peer.
+    pub(crate) peer_ip: Cell<waitless::runtime::IpAddr>,
+    pub(crate) peer_port: Cell<u16>,
+}
+
 /// Flush a connection's queued outbound packets to the wire. With egress
 /// scheduling on (`egress_guard` is `Some`), just mark the flow ready — the
 /// per-core drain ships it in DRR order at the FLUSH step. Off, drain the
@@ -148,25 +187,29 @@ fn is_path_migration(
 fn flush_to_wire(
     egress_guard: &Option<Rc<crate::egress::FlowGuard>>,
     sock: &UdpSocket,
-    conn: &Rc<RefCell<Connection>>,
-    peer_ip: &Rc<Cell<waitless::runtime::IpAddr>>,
-    peer_port: &Rc<Cell<u16>>,
+    arena: &ConnArena,
 ) {
     if let Some(g) = egress_guard {
         // Owner-driven: mark ready if anything is pending — an eagerly-built
         // `outbound` datagram (handshake / GSO) OR steady-state 1-RTT data the
         // owner will build at drain. The drain ships both.
-        if conn.borrow().has_pending_tx() {
+        if arena.conn.borrow().has_pending_tx() {
             crate::egress::activate(g.flow());
         }
         return;
     }
     loop {
-        let pkt = match conn.borrow_mut().pop_packet_owned() {
+        let pkt = match arena.conn.borrow_mut().pop_packet_owned() {
             Some(p) => p,
             None => break,
         };
-        ship_datagram(sock, conn, peer_ip.get(), peer_port.get(), pkt);
+        ship_datagram(
+            sock,
+            &arena.conn,
+            arena.peer_ip.get(),
+            arena.peer_port.get(),
+            pkt,
+        );
     }
 }
 
@@ -200,17 +243,18 @@ pub struct QuicListener {
 }
 
 /// Public per-connection handle the user's handler closure
-/// receives. Wraps an `Rc<RefCell<Connection>>` shared with the
-/// conn task plus the metadata needed to send replies and wait
-/// for new stream activity. Both halves run on the same worker —
-/// no cross-worker locking, just RefCell + an `AsyncEvent` for
-/// waking the handler when new data arrives.
+/// receives. Wraps the shared [`ConnArena`] (the `Connection` the
+/// conn task drives, the `progress` wake event, and the live peer
+/// 4-tuple — one co-allocated block) plus the metadata needed to
+/// send replies. Both halves run on the same worker — no
+/// cross-worker locking, just RefCell + an `AsyncEvent` for waking
+/// the handler when new data arrives. The handler reads stream
+/// state via shared borrows + writes outbound via short mutable
+/// borrows, never holding a borrow across an `.await`.
 pub struct QuicConn {
-    /// Same `Connection` the conn task drives. The handler reads
-    /// stream state via shared borrows + writes outbound via
-    /// short mutable borrows, never holding a borrow across an
-    /// `.await`.
-    conn: Rc<RefCell<Connection>>,
+    /// The co-allocated fixed per-conn state, shared with the conn
+    /// task (see [`ConnArena`]).
+    arena: Rc<ConnArena>,
     /// Cert / key bundle. Needed by `flush()` to drive the TLS
     /// state machine even when we're emitting only application
     /// data on an already-Established connection.
@@ -218,17 +262,6 @@ pub struct QuicConn {
     /// UDP socket used for outbound packets (the same one the
     /// listener bound).
     sock: Arc<UdpSocket>,
-    /// Peer 4-tuple. Updated by the conn task on every inbound
-    /// datagram so connection migration "just works" — handler
-    /// reads the latest values when it sends a reply.
-    peer_ip: Rc<Cell<waitless::runtime::IpAddr>>,
-    peer_port: Rc<Cell<u16>>,
-    /// Wakes the handler when the conn task ingested an inbound
-    /// datagram (new stream data may be available, conn state
-    /// may have changed). Manual-reset; consumer drives the
-    /// reset cycle via the await loop in `accept_stream` /
-    /// `recv`.
-    progress: Rc<AsyncEvent>,
     /// The local CID we issued for this connection. App code can
     /// log it as a connection identifier. Stored as bytes since
     /// `ConnectionId` itself is internal.
@@ -253,7 +286,7 @@ impl QuicConn {
     pub async fn accept_stream(&self) -> Option<u64> {
         loop {
             {
-                let mut c = self.conn.borrow_mut();
+                let mut c = self.arena.conn.borrow_mut();
                 if let Some(id) = c.pop_accepted_stream() {
                     return Some(id);
                 }
@@ -261,10 +294,10 @@ impl QuicConn {
                     return None;
                 }
             }
-            self.progress.reset();
+            self.arena.progress.reset();
             // Re-check after reset to close the wake / observe race.
             {
-                let mut c = self.conn.borrow_mut();
+                let mut c = self.arena.conn.borrow_mut();
                 if let Some(id) = c.pop_accepted_stream() {
                     return Some(id);
                 }
@@ -272,7 +305,7 @@ impl QuicConn {
                     return None;
                 }
             }
-            self.progress.wait().await;
+            self.arena.progress.wait().await;
         }
     }
 
@@ -293,7 +326,7 @@ impl QuicConn {
         let mut warned = false;
         loop {
             {
-                let mut c = self.conn.borrow_mut();
+                let mut c = self.arena.conn.borrow_mut();
                 let (n, eof) = c.stream_recv(sid, out);
                 if n > 0 || eof {
                     drop(c);
@@ -312,7 +345,7 @@ impl QuicConn {
             if !warned {
                 let elapsed = crate::time::now_us().saturating_sub(entered_us);
                 if elapsed > STUCK_THRESHOLD_US {
-                    let state = self.conn.borrow().recv_stream_state(sid);
+                    let state = self.arena.conn.borrow().recv_stream_state(sid);
                     // A handler that hasn't made progress in 5 s is
                     // a wedge, not a routine drop — log it loudly
                     // and unconditionally (doctrine principle 6).
@@ -327,9 +360,9 @@ impl QuicConn {
                     warned = true;
                 }
             }
-            self.progress.reset();
+            self.arena.progress.reset();
             {
-                let mut c = self.conn.borrow_mut();
+                let mut c = self.arena.conn.borrow_mut();
                 let (n, eof) = c.stream_recv(sid, out);
                 if n > 0 || eof {
                     drop(c);
@@ -342,7 +375,7 @@ impl QuicConn {
                     return (0, true);
                 }
             }
-            self.progress.wait().await;
+            self.arena.progress.wait().await;
         }
     }
 
@@ -353,7 +386,7 @@ impl QuicConn {
     /// framing + body path uses the zero-copy `send_iobuf` instead.
     pub fn send_owned(&self, sid: u64, data: Vec<u8>) {
         {
-            let mut c = self.conn.borrow_mut();
+            let mut c = self.arena.conn.borrow_mut();
             c.stream_send_owned(sid, data);
             let _ = c.flush(&self.cfg);
         }
@@ -372,7 +405,7 @@ impl QuicConn {
     /// chunk-completion pathway (future work).
     pub fn send_iobuf(&self, sid: u64, data: iobuf::IOBuf) {
         {
-            let mut c = self.conn.borrow_mut();
+            let mut c = self.arena.conn.borrow_mut();
             c.stream_send_iobuf(sid, data);
             let _ = c.flush(&self.cfg);
         }
@@ -389,7 +422,7 @@ impl QuicConn {
     /// Cuts the per-request packet / AEAD-seal count on small responses
     /// (a /health response was 3 packets — HEADERS, DATA, FIN — now 1).
     pub fn queue_iobuf(&self, sid: u64, data: iobuf::IOBuf) {
-        self.conn.borrow_mut().stream_send_iobuf(sid, data);
+        self.arena.conn.borrow_mut().stream_send_iobuf(sid, data);
     }
 
     /// Discard any bytes buffered for `sid`'s recv side without
@@ -399,7 +432,7 @@ impl QuicConn {
     /// connection accumulates QPACK encoder bytes per request
     /// in `recv_streams[sid].buffer` forever.
     pub fn discard_recv(&self, sid: u64) {
-        self.conn.borrow_mut().discard_recv(sid);
+        self.arena.conn.borrow_mut().discard_recv(sid);
         // Discarding advances the consumed offset, which can reopen the
         // flow-control window — flush the replenished credit so a chatty
         // long-lived peer uni stream (QPACK encoder/decoder) doesn't
@@ -412,7 +445,7 @@ impl QuicConn {
     /// flush produced.
     pub fn close_stream(&self, sid: u64) {
         {
-            let mut c = self.conn.borrow_mut();
+            let mut c = self.arena.conn.borrow_mut();
             c.stream_close(sid);
             let _ = c.flush(&self.cfg);
         }
@@ -421,7 +454,7 @@ impl QuicConn {
 
     /// Bytes queued on `sid`'s send side but not yet on the wire.
     pub fn stream_buffered(&self, sid: u64) -> usize {
-        self.conn.borrow().stream_send_buffered(sid)
+        self.arena.conn.borrow().stream_send_buffered(sid)
     }
 
     /// Whether the connection has failed / been closed by the peer. A
@@ -430,7 +463,7 @@ impl QuicConn {
     /// immediately on a failed conn, an app streaming a large body would
     /// race ahead buffering the remainder into a dead stream (heap OOM).
     pub fn is_failed(&self) -> bool {
-        matches!(self.conn.borrow().state(), ConnState::Failed)
+        matches!(self.arena.conn.borrow().state(), ConnState::Failed)
     }
 
     /// Park until `sid`'s unsent send buffer drains to `cap` or below —
@@ -444,19 +477,19 @@ impl QuicConn {
     pub async fn stream_drain_below(&self, sid: u64, cap: usize) {
         loop {
             {
-                let c = self.conn.borrow();
+                let c = self.arena.conn.borrow();
                 if c.stream_send_buffered(sid) <= cap || matches!(c.state(), ConnState::Failed) {
                     return;
                 }
             }
-            self.progress.reset();
+            self.arena.progress.reset();
             {
-                let c = self.conn.borrow();
+                let c = self.arena.conn.borrow();
                 if c.stream_send_buffered(sid) <= cap || matches!(c.state(), ConnState::Failed) {
                     return;
                 }
             }
-            self.progress.wait().await;
+            self.arena.progress.wait().await;
         }
     }
 
@@ -470,7 +503,7 @@ impl QuicConn {
     /// `recv_credit_due`, so it's cheap to call unconditionally.
     fn flush_recv_credit(&self) {
         let due = {
-            let mut c = self.conn.borrow_mut();
+            let mut c = self.arena.conn.borrow_mut();
             let due = c.recv_credit_due();
             if due {
                 let _ = c.flush(&self.cfg);
@@ -483,13 +516,7 @@ impl QuicConn {
     }
 
     fn drain_outbound(&self) {
-        flush_to_wire(
-            &self.egress_guard,
-            &self.sock,
-            &self.conn,
-            &self.peer_ip,
-            &self.peer_port,
-        );
+        flush_to_wire(&self.egress_guard, &self.sock, &self.arena);
     }
 }
 
@@ -826,28 +853,33 @@ where
         slot_idx,
         generation,
     } = args;
-    let conn = Rc::new(RefCell::new(Connection::new_server(local_cid, seed)));
+    // THE fixed per-conn allocation (see `ConnArena`): conn state +
+    // progress event + peer tuple, co-allocated behind one Rc.
+    let arena = Rc::new(ConnArena {
+        conn: RefCell::new(Connection::new_server(local_cid, seed)),
+        progress: AsyncEvent::new(),
+        peer_ip: Cell::new(waitless::runtime::IpAddr::V4_ANY),
+        peer_port: Cell::new(0),
+    });
+    // Local borrows so the task body below reads exactly as it did
+    // when these were four separate Rcs.
+    let conn = &arena.conn;
+    let progress = &arena.progress;
+    let peer_ip = &arena.peer_ip;
+    let peer_port = &arena.peer_port;
     // Seed last_recv at conn creation so a peer that allocates a
     // slot via Initial and then disappears gets reaped after the
     // idle window (the listener has already pushed the first
     // datagram into the inbox; we'll process it on the first loop
     // iteration and refresh last_recv there).
     conn.borrow_mut().set_last_recv_now();
-    let progress = Rc::new(AsyncEvent::new());
-    let peer_ip: Rc<Cell<waitless::runtime::IpAddr>> = Rc::new(Cell::new(waitless::runtime::IpAddr::V4_ANY));
-    let peer_port: Rc<Cell<u16>> = Rc::new(Cell::new(0));
     // Per-core egress scheduling (docs/tx-backpressure.md stage 3). When
     // enabled, register this connection as a flow; the per-core drain ships
     // its packets in DRR order instead of the inline `ship_datagram` loops
     // below. `None` (the default / table-full) ⇒ keep shipping inline. The
     // guard is shared with the handler's `QuicConn` so the flow id is
     // reclaimed only when both halves are gone (see `egress::FlowGuard`).
-    let egress_guard = crate::egress::register(
-        Rc::downgrade(&conn),
-        Arc::clone(&sock),
-        Rc::clone(&peer_ip),
-        Rc::clone(&peer_port),
-    );
+    let egress_guard = crate::egress::register(Rc::downgrade(&arena), Arc::clone(&sock));
     if egress_guard.is_some() {
         // The owner drives steady-state 1-RTT build-at-drain → `flush` must
         // not also build per-packet 1-RTT into `outbound` (double-send).
@@ -983,7 +1015,7 @@ where
                 if shipped_work {
                     // Hand off to the wire: inline drain, or (egress on)
                     // mark the flow ready for the per-core DRR drain.
-                    flush_to_wire(&egress_guard, &sock, &conn, &peer_ip, &peer_port);
+                    flush_to_wire(&egress_guard, &sock, &arena);
                     // Wake any handler parked in `stream_drain_below`: the
                     // paced flush may have drained its send buffer below the
                     // cap, and — unlike the inbound path — no datagram
@@ -1107,7 +1139,7 @@ where
         // `send_to_with_l2_headroom` and recycles the Vec into
         // the conn's pool. With egress scheduling on, `flush_to_wire`
         // instead marks the flow ready for the per-core DRR drain.
-        flush_to_wire(&egress_guard, &sock, &conn, &peer_ip, &peer_port);
+        flush_to_wire(&egress_guard, &sock, &arena);
         if tearing_down {
             break;
         }
@@ -1125,12 +1157,9 @@ where
         if !handler_spawned && est {
             handler_spawned = true;
             let qconn = QuicConn {
-                conn: Rc::clone(&conn),
+                arena: Rc::clone(&arena),
                 cfg: cfg.clone(),
                 sock: Arc::clone(&sock),
-                peer_ip: Rc::clone(&peer_ip),
-                peer_port: Rc::clone(&peer_port),
-                progress: Rc::clone(&progress),
                 local_cid: local_cid_bytes,
                 egress_guard: egress_guard.clone(),
             };
@@ -1165,7 +1194,7 @@ where
     // Mark the conn terminated BEFORE the final wake. The user
     // handler observes `state() == Failed` to break out of its
     // `accept_stream` / `recv` loops and let its captured
-    // `Rc<RefCell<Connection>>` drop. Without this, an idle-timeout
+    // `Rc<ConnArena>` drop. Without this, an idle-timeout
     // or batch-limit teardown leaves the handler stranded on
     // `progress.wait()` forever — the Rc count never reaches 0, the
     // Connection (with its recv/send pools, outbound recycle Vec,
@@ -1243,6 +1272,42 @@ fn is_long_header_initial(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Architecture-audit direction #6 regression gate: `ConnArena` IS
+    /// the fixed per-connection allocation, so its size is the fixed
+    /// per-conn heap footprint (the dynamic regions — stream maps,
+    /// retx queue, reassembly buffers, outbound queue — hang off it
+    /// separately). Growth here lands on EVERY accepted connection at
+    /// SLOTS_PER_WORKER × cores scale, so it must be a deliberate,
+    /// justified change — not an accidental field added to
+    /// `Connection`. Measured size when the gate was written:
+    /// 4,080 bytes on 64-bit hosts, composed of `Connection` (the
+    /// state machine: CIDs, per-space key slots (boxed), loss/CC
+    /// state, stream-map headers, queue headers, transport params)
+    /// plus `AsyncEvent` (AtomicBool, WakerSlot), `Cell<IpAddr>`,
+    /// `Cell<u16>`, and padding. The window below is measured
+    /// plus/minus 256 (slack for host-platform layout differences and
+    /// small deliberate field additions); the hard ceiling is measured
+    /// plus 512 — past that, per-conn memory has materially regressed.
+    #[test]
+    fn conn_arena_size_within_window() {
+        const MEASURED: usize = 4_080;
+        let sz = core::mem::size_of::<ConnArena>();
+        println!(
+            "size_of::<ConnArena>() = {sz} (Connection = {})",
+            core::mem::size_of::<Connection>()
+        );
+        assert!(
+            (MEASURED - 256..=MEASURED + 256).contains(&sz),
+            "ConnArena is {sz} B (window {}..={} B). This is the fixed \
+             per-conn footprint — justify the change, then update \
+             MEASURED and this window.",
+            MEASURED - 256,
+            MEASURED + 256,
+        );
+        // Hard ceiling: never let the fixed per-conn block creep past this.
+        assert!(sz < MEASURED + 512, "ConnArena {sz} B breached the hard ceiling");
+    }
 
     #[test]
     fn extract_dcid_long_header() {
