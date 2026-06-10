@@ -316,8 +316,16 @@ on top (RFC 9114 framing + RFC 9204 QPACK) is tracked in
 - **Have**: the TLS 1.3 handshake over CRYPTO frames, Initial-secret
   derivation, header protection, AEAD. `end_to_end_self_handshake`
   exercises the whole pipeline.
-- **Missing**: audit retry-token handling and key-update (RFC 9001
-  §6).
+- ✅ **Key update (RFC 9001 §6)** — **done**. Receive side promotes the
+  pre-derived next-phase keys on a KEY_PHASE flip (`rotate_recv_keys`,
+  one-rotation prev-key window for reordering); send side now rotates in
+  lock-step (`rotate_send_keys` derives next-gen send keys from
+  `server_app_secret`, toggles `send_key_phase`, stamps the 1-RTT
+  KEY_PHASE bit). Unit-tested
+  (`key_update_rotates_send_keys_and_toggles_phase`).
+- **Missing**: Retry-token handling (we don't send Retry / validate its
+  token — an anti-amplification / DoS hardening, not a correctness gap
+  for the common path), and connection migration.
 - **Conformance test**: scripted Initial / Retry / key-update cases in
   `quic_test`.
 
