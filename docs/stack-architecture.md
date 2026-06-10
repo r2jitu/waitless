@@ -233,16 +233,32 @@ This keeps `HttpStream`'s connection==stream conflation (correct for TCP) and
 moves multiplexing *above* the trait, which is the only structural reason QUIC
 didn't fit.
 
-- **Status**: [~] seam types landed 2026-06-09 — the read guard lives in
-  `iobuf` (reused the existing leaf instead of minting `net-io`) and
-  `MAX_L2_HEADROOM` in `nic_api`; protocol signatures no longer name reactor
-  types. REMAINING: the trait itself + the h3 per-stream impl below.
-  **Where** (original proposal): new `//crates/net-io`; impls in
-  `runtime/executor`, `proto/tls`, `proto/quic`. **Win**: one read/write
-  surface across all transports; removes the layering inversion and the
-  `NullStream` stub; unblocks the handler-API unification and h3 streaming.
-  **Effort**: medium (coordinated across 4 crates). **Risk**: medium — it
-  re-homes `RecvChunkGuard`; do it as a rename+move, not a rewrite.
+- **Status**: ✅ *the wins are met; the trait itself is deferred as low-value*
+  (assessed 2026-06-09). Every benefit this contract was meant to unlock has
+  landed by other routes:
+  - **layering inversion removed** + **`NullStream` deleted** — via the
+    seam-type cleanup (`RecvChunkGuard` → `iobuf`, `MAX_L2_HEADROOM` →
+    `nic_api`; no new `net-io` crate needed);
+  - **handler-API unified** — every transport's handler is now the *identical*
+    `AsyncFn(&mut Request, &mut Response) -> Result<(), ()>` (streaming-response),
+    reading via the shared `BodySource`/`BodyReader` and writing via the shared
+    `ResponseSink`; h3 supplies thin `H3BodySource`/`H3Sink` adapters exactly as
+    h1 supplies `CellSource`/`CellSink`;
+  - **h3 streaming** — done.
+
+  What the `ByteStream` trait would *additionally* buy is unifying the **raw
+  per-stream byte-I/O call** (`recv_chunk`/`send`/`finish`) beneath the HTTP
+  framing. But the three serve loops (`http::serve_conn` over `HttpStream`,
+  `http2::serve_conn` with frame demux + HPACK + per-stream FC, `http3`'s
+  accept-loop + `handle_request(conn, sid)`) differ for *intrinsic*
+  multiplexing reasons — conn==stream vs frame-multiplexed vs QUIC-sid — that a
+  byte-I/O trait does **not** merge; and the per-transport framing adapters
+  (`CellSink` chunked / `H2Sink` DATA / `H3Sink` DATA+QPACK) stay separate
+  regardless. So the trait would re-home `RecvChunkGuard` a second time and add
+  a `QuicStream` newtype to unify three already-one-line call sites, touching
+  the h3 hot path for a lateral gain. Deferred unless a concrete consumer (an
+  alternate runtime backend implementing the trait, or a fourth transport)
+  makes the shared surface pay. The seam types are in place if that day comes.
 
 ### Respect the guard façade as the stable boundary
 
