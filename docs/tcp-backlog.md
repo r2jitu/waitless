@@ -471,36 +471,51 @@ QUIC's token-bucket pacer (`crates/proto/quic/src/conn/tx.rs`, driving
 `net_cc`'s `pacing_rate()`) is the prior art to port. Pairs with BBR (L1).
 **Effort: M.**
 
-### L4 — Loss recovery is RTO + 3-dup-ACK only (no RACK-TLP) — ⚠ GCE-confirmed the top under-loss lever
+### L4 — TLP ✅ done + GCE-validated (the tail-loss-RTO fix); RACK time-detection still open
 
-**What.** We detect loss via 3 duplicate ACKs (fast retransmit) or the
-RTO. SACK (T7) now lands — both block generation and RFC 6675 sender-side
-hole-filling — but there is still no **RACK-TLP** (RFC 8985 — time-based
-loss detection + Tail Loss Probe), which is Linux's default loss detector
-since 4.18.
+**What (original).** We detected loss via 3 duplicate ACKs (fast
+retransmit) or the RTO only. SACK (T7) lands — block generation + RFC 6675
+sender-side hole-filling — but there was no **Tail Loss Probe** nor RACK
+time-based detection (RFC 8985, Linux's default since 4.18).
 
-**⚠ GCE/netem profile (2026-06-09) — this, not the CC algorithm, is the
-binding under-loss limit.** Single-`/static-1m` transfers under `tc netem`
-at 1 % loss are **bimodal**: a tight "good cluster" recovers via fast
-retransmit (~2.5 MB/s at 25 ms, ~1.3 MB/s at 50 ms), but **7–11 of every 15
-transfers hit a multi-second stall** (measured 9–18 s on 256 KB–1 MB
-objects — i.e. one RTO doubling out to `1+2+4+8 ≈ 15 s`). Those are exactly
-tail losses / lost retransmissions: no later data ⇒ no dup-ACKs ⇒ no fast
-retransmit ⇒ wait a full backed-off RTO. The median throughput collapses to
-~0.15 MB/s purely from this tail. It is **CC-algorithm-independent** (Reno
-and CUBIC measured identical — see L1), so RACK-TLP, not CUBIC/BBR, is the
-highest-impact under-loss lever for this server's small-response workload.
+**Why it mattered — GCE/netem profile (2026-06-09).** Single-`/static-1m`
+transfers under `tc netem` at 1 % loss were **bimodal**: a tight "good
+cluster" recovered via fast retransmit (~2.5 MB/s at 25 ms, ~1.3 MB/s at
+50 ms), but **7–11 of every 15 transfers hit a 9–18 s stall** (one RTO
+doubling out, `1+2+4+8 ≈ 15 s`) — tail losses / lost retransmissions where
+no later data ⇒ no dup-ACKs ⇒ no fast retransmit ⇒ a full backed-off RTO.
+The median collapsed to ~0.15 MB/s. **CC-algorithm-independent** (Reno and
+CUBIC measured identical — L1), so TLP, not CUBIC/BBR, was the lever.
 
-**Triggers when.** Tail loss (the last segments of a response) and
-multi-hole loss. Without TLP a lost tail waits a full RTO (~200 ms+, and
-backs off into multi-second stalls under repeated tail loss) instead of a
-probe-timeout (~2·RTT). **Now confirmed: this is the dominant cost on a
-lossy path, ahead of every congestion-control item.**
+**Status — TLP ✅ done (`tcp` Tail Loss Probe).** A probe timer at
+`PTO = 2·SRTT` (floored `TLP_MIN_MS`, armed only when `PTO < RTO`) rides
+alongside the RTO whenever data is outstanding; on expiry — well before the
+RTO — it retransmits `snd_una` (the cumulative-ACK blocker) to elicit an
+ACK, recovering a single near-tail loss in ~one PTO and, against a SACKing
+peer, driving the T7 recovery. **Not** a congestion signal (cwnd untouched,
+no backoff, scoreboard kept); capped at `TLP_MAX_PROBES = 2` before the RTO
+takes over; RTO supersedes a coincident TLP. Hot-path-neutral (the final
+ACK disarms the probe before its PTO on a clean transfer). /obs `tlp_probes`;
+unit-test `tail_loss_probe_fires_before_rto_then_caps`.
 
-**Fix.** RACK-TLP needs per-segment send timestamps (the retransmit ring
-can carry them); QUIC's RFC 9002 packet-/time-threshold loss detector
-(`crates/proto/quic/src/conn/loss.rs`) is already the RACK model to mirror.
-SACK is T7 (needs the T3 reassembly queue). **Effort: L.**
+**GCE/netem A/B (same harness, before vs after):**
+
+| profile | metric | no TLP | with TLP |
+|---|---|---|---|
+| 25 ms 1 % | stalls (<0.2 MB/s) | 7/15 | **0/15** |
+| 25 ms 1 % | median | 0.218 | **0.841 MB/s (3.9×)** |
+| 25 ms 1 % | worst | 0.038 | **0.389 MB/s (10×)** |
+| 50 ms 1 % | stalls | 10/15 | **1/15** |
+| 50 ms 1 % | median | 0.142 | **0.451 MB/s (3.2×)** |
+
+The multi-second stalls are gone; the good-cluster max is unchanged
+(clean-path neutral).
+
+**Open — RACK time-based detection.** TLP fixes the *tail*; full RACK
+(per-segment send timestamps + a reordering window replacing the 3-dup-ACK
+heuristic for *mid-stream* multi-hole loss) is the remaining half. QUIC's
+RFC 9002 detector (`crates/proto/quic/src/conn/loss.rs`) is the model to
+mirror. **Effort: M.**
 
 ### L5 — No receive/send buffer autotuning
 
