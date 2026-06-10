@@ -111,6 +111,58 @@ const fn max_u32(a: u32, b: u32) -> u32 {
     if a > b { a } else { b }
 }
 
+/// One-reduction-per-congestion-event tracking (RFC 9002 §7.3.2), shared
+/// by every controller — the first piece of the transport-reliability
+/// plane written once (architecture-audit direction #4). The episode
+/// ends only after ~one pre-reduction window of NEW data is acknowledged
+/// (≈ one RTT — packets sent after recovery started are now being
+/// acked), NOT on the next ack: resetting per-ack let a loss cluster
+/// within one RTT reduce cwnd once per loss and collapse it to the floor
+/// on real-RTT paths (the h3 throughput bug, task #52). Duplicating this
+/// subtle logic per algorithm was a measured divergence risk — both
+/// NewReno and CUBIC embed this one struct instead.
+#[derive(Clone, Copy, Debug)]
+struct RecoveryEpisode {
+    active: bool,
+    /// Bytes of fresh acks still required to exit the episode. Set to
+    /// the pre-reduction window on entry; meaningless when `!active`.
+    rem_bytes: u32,
+}
+
+impl RecoveryEpisode {
+    /// Not in a recovery episode (`const` for the controllers' `const fn`
+    /// constructors).
+    const fn idle() -> Self {
+        RecoveryEpisode { active: false, rem_bytes: 0 }
+    }
+
+    /// Enter a recovery episode spanning ~`window_bytes` of fresh acks
+    /// (callers pass the pre-reduction cwnd, floored at the minimum
+    /// window).
+    fn begin(&mut self, window_bytes: u32) {
+        self.active = true;
+        self.rem_bytes = window_bytes;
+    }
+
+    /// Fold an ack into the episode. Returns `true` while the episode
+    /// holds (the caller must neither grow nor re-reduce the window);
+    /// the episode ends once a full span of fresh acks has drained.
+    fn absorb_ack(&mut self, bytes_acked: u32) -> bool {
+        if !self.active {
+            return false;
+        }
+        self.rem_bytes = self.rem_bytes.saturating_sub(bytes_acked);
+        if self.rem_bytes == 0 {
+            self.active = false;
+        }
+        true
+    }
+
+    fn active(&self) -> bool {
+        self.active
+    }
+}
+
 /// NewReno (RFC 5681 / RFC 9002 §7): slow start until `cwnd >= ssthresh`,
 /// then additive-increase (~1 MSS/RTT); multiplicative-decrease (halve) on
 /// loss, once per recovery episode; collapse to the minimum window on
@@ -120,19 +172,8 @@ pub struct NewReno {
     mss: u32,
     cwnd: u32,
     ssthresh: u32,
-    /// In a recovery episode → ignore further loss reductions (RFC 9002
-    /// §7.3.2: at most one cwnd reduction per congestion event). The episode
-    /// ends only after `recovery_rem_bytes` of NEW data is acknowledged
-    /// (≈ one window ≈ one RTT — i.e. packets sent after recovery started are
-    /// now being acked), NOT on the next ack. Resetting on every ack (the old
-    /// behaviour) let a cluster of losses within one RTT halve cwnd once per
-    /// loss → collapse to the minimum window on a real-RTT path where acks
-    /// arrive several times per RTT (the h3 real-RTT throughput bug).
-    in_recovery: bool,
-    /// Bytes of fresh acks still required to exit the current recovery
-    /// episode. Set to the pre-reduction cwnd on entry; decremented by
-    /// `on_ack`. Meaningless when `in_recovery` is false.
-    recovery_rem_bytes: u32,
+    /// One-reduction-per-congestion-event hold; see [`RecoveryEpisode`].
+    recovery: RecoveryEpisode,
     /// Last smoothed RTT (µs) seen on an ack, for `pacing_rate`.
     srtt_us: u32,
     /// Upper bound on `cwnd` (and thus bytes-in-flight). See
@@ -155,8 +196,7 @@ impl NewReno {
             // Start ssthresh "infinite" so the connection begins in slow
             // start (RFC 5681 §3.1).
             ssthresh: u32::MAX,
-            in_recovery: false,
-            recovery_rem_bytes: 0,
+            recovery: RecoveryEpisode::idle(),
             srtt_us: 0,
             max_window: max_u32(DEFAULT_MAX_WINDOW, initial_window(mss)),
             slow_start_cap: 0,
@@ -192,13 +232,11 @@ impl NewReno {
     /// Halve the window into recovery (RFC 5681 §3.1 / RFC 9002 §7.3.2):
     /// `ssthresh = cwnd/2` (≥ min), `cwnd = ssthresh`.
     fn enter_recovery(&mut self) {
-        // The recovery period ends once ~one window of new data is acked
-        // (≈ one RTT). Anchor it to the pre-reduction cwnd.
-        self.recovery_rem_bytes = max_u32(self.cwnd, minimum_window(self.mss));
+        // Anchor the episode to the pre-reduction cwnd.
+        self.recovery.begin(max_u32(self.cwnd, minimum_window(self.mss)));
         let half = self.cwnd / 2;
         self.ssthresh = max_u32(half, minimum_window(self.mss));
         self.cwnd = self.ssthresh;
-        self.in_recovery = true;
     }
 }
 
@@ -210,16 +248,10 @@ impl CongestionControl for NewReno {
         if bytes_acked == 0 {
             return;
         }
-        // Recovery period (RFC 9002 §7.3.2): hold cwnd — neither grow nor
-        // reduce again — until ~one window of new data is acked, which marks
-        // the recovery-triggering congestion event as past. Only THEN may a
-        // later loss reduce cwnd again. (Counting acked bytes ≈ "a packet
-        // sent after recovery started has been acked" without packet numbers.)
-        if self.in_recovery {
-            self.recovery_rem_bytes = self.recovery_rem_bytes.saturating_sub(bytes_acked);
-            if self.recovery_rem_bytes == 0 {
-                self.in_recovery = false;
-            }
+        // Recovery hold (see `RecoveryEpisode`): neither grow nor re-reduce
+        // until the episode drains. (Counting acked bytes ≈ "a packet sent
+        // after recovery started has been acked" without packet numbers.)
+        if self.recovery.absorb_ack(bytes_acked) {
             return;
         }
         if self.in_slow_start() {
@@ -256,11 +288,10 @@ impl CongestionControl for NewReno {
             self.ssthresh = self.cwnd / 2;
             self.ssthresh = max_u32(self.ssthresh, minimum_window(self.mss));
             self.cwnd = minimum_window(self.mss);
-            self.recovery_rem_bytes = self.cwnd;
-            self.in_recovery = true;
+            self.recovery.begin(self.cwnd);
             return;
         }
-        if self.in_recovery {
+        if self.recovery.active() {
             // Already reduced for this window — one halving per episode.
             return;
         }
@@ -372,8 +403,8 @@ pub struct Cubic {
     epoch_start_ms: u64,
     srtt_us: u32,
     min_rtt_us: u32,
-    in_recovery: bool,
-    recovery_rem_bytes: u32,
+    /// One-reduction-per-congestion-event hold; see [`RecoveryEpisode`].
+    recovery: RecoveryEpisode,
     max_window: u32,
     slow_start_cap: u32,
 }
@@ -392,8 +423,7 @@ impl Cubic {
             epoch_start_ms: 0,
             srtt_us: 0,
             min_rtt_us: 0,
-            in_recovery: false,
-            recovery_rem_bytes: 0,
+            recovery: RecoveryEpisode::idle(),
             max_window: max_u32(DEFAULT_MAX_WINDOW, initial_window(mss)),
             slow_start_cap: 0,
         }
@@ -503,15 +533,10 @@ impl CongestionControl for Cubic {
         if bytes_acked == 0 {
             return;
         }
-        // Recovery hold — identical to NewReno: one reduction per congestion
-        // event, ended by ~one window of fresh acks (the real-RTT collapse
-        // guard, task #52). Epoch stays unset through the hold so `t` is
-        // measured from when growth actually resumes.
-        if self.in_recovery {
-            self.recovery_rem_bytes = self.recovery_rem_bytes.saturating_sub(bytes_acked);
-            if self.recovery_rem_bytes == 0 {
-                self.in_recovery = false;
-            }
+        // Recovery hold (see `RecoveryEpisode`, shared with NewReno). Epoch
+        // stays unset through the hold so `t` is measured from when growth
+        // actually resumes.
+        if self.recovery.absorb_ack(bytes_acked) {
             return;
         }
         if self.cwnd < self.ssthresh {
@@ -537,11 +562,10 @@ impl CongestionControl for Cubic {
             self.w_last_max = 0;
             self.cwnd = minimum_window(self.mss);
             self.epoch_start_ms = 0;
-            self.recovery_rem_bytes = self.cwnd;
-            self.in_recovery = true;
+            self.recovery.begin(self.cwnd);
             return;
         }
-        if self.in_recovery {
+        if self.recovery.active() {
             return; // one reduction per episode
         }
         let pre = self.cwnd;
@@ -558,8 +582,7 @@ impl CongestionControl for Cubic {
         self.ssthresh = max_u32((pre as u64 * BETA_NUM / BETA_DEN) as u32, minimum_window(self.mss));
         self.cwnd = self.ssthresh;
         self.epoch_start_ms = 0; // recompute K/origin on the next CA ack
-        self.recovery_rem_bytes = max_u32(pre, minimum_window(self.mss));
-        self.in_recovery = true;
+        self.recovery.begin(max_u32(pre, minimum_window(self.mss)));
     }
 
     fn on_rto(&mut self) {
