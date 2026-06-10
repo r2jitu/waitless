@@ -618,6 +618,29 @@ fn streams_blocked_forces_max_streams_readvertise() {
     );
 }
 
+/// RFC 9000 §8.2.2: a PATH_CHALLENGE MUST be echoed in a PATH_RESPONSE.
+/// Processing one queues the 8 bytes, and `has_one_rtt_to_send` reports
+/// the connection has work so the flush emits the response.
+#[test]
+fn path_challenge_queues_a_path_response() {
+    let mut conn = Connection::new_server(ConnectionId::new(&[0xab; 8]), [0x42u8; 32]);
+    assert!(conn.pending_path_response.is_none());
+
+    // PATH_CHALLENGE (type 0x1a) + 8 opaque bytes.
+    conn.dispatch_frames(crate::CryptoLevel::OneRtt, &[0x1a, 9, 8, 7, 6, 5, 4, 3, 2])
+        .unwrap();
+    assert_eq!(
+        conn.pending_path_response,
+        Some([9, 8, 7, 6, 5, 4, 3, 2]),
+        "the challenge data is queued for echo",
+    );
+
+    // The append helper writes a well-formed PATH_RESPONSE frame.
+    let mut out = alloc::vec::Vec::new();
+    super::append_path_response_into(&mut out, &[9, 8, 7, 6, 5, 4, 3, 2]);
+    assert_eq!(out, alloc::vec![0x1b, 9, 8, 7, 6, 5, 4, 3, 2]);
+}
+
 /// RFC 9001 §6.1: responding to a peer key update must also rotate our
 /// SEND keys to the next generation and toggle the KEY_PHASE bit we
 /// stamp on 1-RTT packets — otherwise our packets stay at the old phase

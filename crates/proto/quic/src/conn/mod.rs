@@ -962,6 +962,11 @@ pub struct Connection {
     /// open more streams, which it can't). Cleared once re-advertised.
     pub(super) force_max_streams_bidi: bool,
     pub(super) force_max_streams_uni: bool,
+    /// 8 bytes from a received PATH_CHALLENGE awaiting echo in a
+    /// PATH_RESPONSE (RFC 9000 §8.2.2 — a MUST). Set by the RX frame
+    /// dispatch, drained by the next 1-RTT flush. Only the most recent
+    /// is kept; a fresh challenge supersedes an unsent one.
+    pub(super) pending_path_response: Option<[u8; 8]>,
 
     // ── Anti-amplification (RFC 9000 §8.1) ────────────────────────
     //
@@ -1311,6 +1316,7 @@ impl Connection {
             force_max_stream_data: false,
             force_max_streams_bidi: false,
             force_max_streams_uni: false,
+            pending_path_response: None,
             bytes_received_pre_validation: 0,
             bytes_sent_pre_validation: 0,
             path_validated: false,
@@ -1905,6 +1911,13 @@ pub(super) fn append_max_data_into(
     let n = crate::frame::write_max_data(max, &mut tmp)?;
     out.extend_from_slice(&tmp[..n]);
     Ok(())
+}
+
+/// Append a PATH_RESPONSE frame (RFC 9000 §19.18) echoing the 8 bytes
+/// from a received PATH_CHALLENGE: type byte 0x1b + the data.
+pub(super) fn append_path_response_into(out: &mut Vec<u8>, data: &[u8; 8]) {
+    out.push(crate::frame::ftype::PATH_RESPONSE);
+    out.extend_from_slice(data);
 }
 
 /// Append a MAX_STREAM_DATA frame (per-stream credit). `sid` + `max`

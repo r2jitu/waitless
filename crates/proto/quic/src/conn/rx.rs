@@ -956,6 +956,12 @@ impl Connection {
                         s.peer_max_stream_data = s.peer_max_stream_data.max(maximum);
                     }
                 }
+                Frame::PathChallenge { data } => {
+                    // RFC 9000 §8.2.2: MUST echo the data in a
+                    // PATH_RESPONSE. Queue it for the next 1-RTT flush;
+                    // a fresh challenge supersedes an unsent one.
+                    self.pending_path_response = Some(data);
+                }
                 Frame::Skipped { kind } => {
                     // Most wire-recognized frames need no app-level
                     // reaction (NEW_CONNECTION_ID, …); the

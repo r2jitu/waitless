@@ -159,6 +159,13 @@ pub enum Frame<'a> {
         reason: &'a [u8],
     },
     HandshakeDone,
+    /// 0x1a PATH_CHALLENGE — the peer is validating a network path
+    /// (RFC 9000 §8.2). We MUST echo the 8 opaque bytes back in a
+    /// PATH_RESPONSE. Carried by value (copied out of the payload) so
+    /// the receiver can queue the response after the borrow ends.
+    PathChallenge {
+        data: [u8; 8],
+    },
     /// 0x10 MAX_DATA — peer raised the connection-level limit on how
     /// many total stream bytes we may send (send-side flow control).
     MaxData {
@@ -262,7 +269,11 @@ pub fn parse_frame(data: &[u8]) -> Result<(Frame<'_>, usize), FrameError> {
         | ftype::RETIRE_CONNECTION_ID => skip_one_varint(rest, t, frame_total_offset),
         ftype::STREAM_DATA_BLOCKED => skip_two_varints(rest, t, frame_total_offset),
         ftype::NEW_CONNECTION_ID => skip_new_connection_id(rest, t, frame_total_offset),
-        ftype::PATH_CHALLENGE | ftype::PATH_RESPONSE => skip_fixed(rest, t, 8, frame_total_offset),
+        // PATH_CHALLENGE: parse the 8 opaque bytes — we MUST echo them
+        // in a PATH_RESPONSE (RFC 9000 §8.2.2). PATH_RESPONSE: skipped
+        // (we don't yet send our own PATH_CHALLENGE to validate).
+        ftype::PATH_CHALLENGE => parse_path_challenge(rest, frame_total_offset),
+        ftype::PATH_RESPONSE => skip_fixed(rest, t, 8, frame_total_offset),
         other => Err(FrameError::UnknownFrameType(other)),
     }
 }
@@ -353,6 +364,18 @@ fn skip_fixed(
         return Err(FrameError::Truncated);
     }
     Ok((Frame::Skipped { kind }, header + n))
+}
+
+/// PATH_CHALLENGE (RFC 9000 §19.17): 8 opaque bytes the peer wants
+/// echoed in a PATH_RESPONSE. Copied out by value so the receiver can
+/// queue the response after the payload borrow ends.
+fn parse_path_challenge(body: &[u8], header: usize) -> Result<(Frame<'_>, usize), FrameError> {
+    if body.len() < 8 {
+        return Err(FrameError::Truncated);
+    }
+    let mut data = [0u8; 8];
+    data.copy_from_slice(&body[..8]);
+    Ok((Frame::PathChallenge { data }, header + 8))
 }
 
 fn parse_ack<'a>(
@@ -821,10 +844,27 @@ mod tests {
     }
 
     #[test]
-    fn skip_path_challenge_consumes_8_bytes() {
+    fn path_challenge_parses_its_8_bytes() {
         let buf = [0x1au8, 1, 2, 3, 4, 5, 6, 7, 8];
         let (f, n) = parse_frame(&buf).unwrap();
-        assert!(matches!(f, Frame::Skipped { kind: 0x1a }));
+        assert!(matches!(f, Frame::PathChallenge { data } if data == [1, 2, 3, 4, 5, 6, 7, 8]));
+        assert_eq!(n, 9);
+    }
+
+    #[test]
+    fn path_challenge_truncated_errors() {
+        // Fewer than 8 data bytes → Truncated, not a panic.
+        let buf = [0x1au8, 1, 2, 3];
+        assert!(matches!(parse_frame(&buf), Err(FrameError::Truncated)));
+    }
+
+    #[test]
+    fn skip_path_response_consumes_8_bytes() {
+        // We don't send PATH_CHALLENGE, so an inbound PATH_RESPONSE is
+        // still skipped (consumed) rather than acted on.
+        let buf = [0x1bu8, 1, 2, 3, 4, 5, 6, 7, 8];
+        let (f, n) = parse_frame(&buf).unwrap();
+        assert!(matches!(f, Frame::Skipped { kind: 0x1b }));
         assert_eq!(n, 9);
     }
 

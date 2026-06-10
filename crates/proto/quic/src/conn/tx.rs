@@ -15,6 +15,7 @@
 use super::{
     ConnError, ConnState, Connection, CryptoRetx, HS_CRYPTO_BUDGET, MAX_QUIC_DATAGRAM, SpaceState,
     StreamRetx, append_max_data_into, append_max_stream_data_into, append_max_streams_into,
+    append_path_response_into,
 };
 use net_cc::CongestionControl;
 
@@ -710,13 +711,15 @@ impl Connection {
         {
             return true;
         }
-        // HANDSHAKE_DONE, MAX_STREAMS (bidi/uni), MAX_DATA.
+        // HANDSHAKE_DONE, MAX_STREAMS (bidi/uni), MAX_DATA, PATH_RESPONSE.
         if !self.handshake_done_sent
             || self.peer_max_streams_bidi_advertised <= self.peer_bidi_streams_opened + REFILL_AT
             || self.peer_max_streams_uni_advertised <= self.peer_uni_streams_opened + REFILL_AT
             // STREAMS_BLOCKED recovery: re-advertise the current cap.
             || self.force_max_streams_bidi
             || self.force_max_streams_uni
+            // PATH_CHALLENGE awaiting echo (RFC 9000 §8.2.2).
+            || self.pending_path_response.is_some()
             || self.force_max_data
             // MAX_DATA slide is gated on the aggregate recv budget (#75):
             // while over budget we deliberately DON'T grant new credit,
@@ -1150,6 +1153,14 @@ impl Connection {
         if !self.handshake_done_sent {
             out.push(crate::frame::ftype::HANDSHAKE_DONE);
             self.handshake_done_sent = true;
+            ack_eliciting = true;
+        }
+
+        // PATH_RESPONSE (RFC 9000 §8.2.2): echo a received PATH_CHALLENGE
+        // promptly so the peer can validate the path (used in connection
+        // migration / NAT rebinding). Ack-eliciting.
+        if let Some(data) = self.pending_path_response.take() {
+            append_path_response_into(out, &data);
             ack_eliciting = true;
         }
 
