@@ -541,9 +541,10 @@ fn detect_loss_recovers_more_than_64_at_once() {
 /// virtual time, the class of behavior that previously needed
 /// GCE + netem to observe. Timeline: pn0 at T+0 ms (carrying a STREAM
 /// frame), pn1 at T+50 ms, ACK of pn1-only at T+100 ms → the RTT sample
-/// is 50 ms, the time threshold 56.25 ms, and pn0 (age 100 ms, below
-/// the packet threshold at only 1 PN behind) is declared lost by TIME,
-/// its frame re-queued for retransmission.
+/// is 50 ms, the time threshold 9/8·50 ms + 25 ms max_ack_delay =
+/// 81.25 ms, and pn0 (age 100 ms, below the packet threshold at only
+/// 1 PN behind) is declared lost by TIME, its frame re-queued for
+/// retransmission.
 #[test]
 fn mock_clock_drives_time_threshold_loss() {
     let mut conn = Connection::new_server(ConnectionId::new(&[0x77; 8]), [0x55u8; 32]);
@@ -588,6 +589,142 @@ fn mock_clock_drives_time_threshold_loss() {
     assert_eq!(conn.retx_queue.len(), 1, "pn0's STREAM frame requeued");
     assert_eq!(conn.retx_queue[0].data.len(), 100);
     assert_eq!(conn.bytes_in_flight, 0, "both packets released from flight");
+}
+
+/// Helper for the virtual-time loss suite: ACK exactly `largest` (a
+/// single-PN range) through the real wire round-trip, so the test
+/// exercises the same parse → `process_ack` path production does.
+#[cfg(test)]
+fn ack_single(conn: &mut Connection, largest: u64) {
+    let mut ackbuf = [0u8; 16];
+    let n = crate::frame::write_ack(largest, 0, 0, &[], &mut ackbuf).unwrap();
+    let (frame, _) = crate::frame::parse_frame(&ackbuf[..n]).unwrap();
+    let crate::frame::Frame::Ack {
+        largest_acknowledged,
+        ack_delay,
+        first_ack_range,
+        ack_ranges,
+        ..
+    } = frame
+    else {
+        panic!("expected ACK frame");
+    };
+    conn.process_ack(
+        crate::CryptoLevel::OneRtt,
+        largest_acknowledged,
+        ack_delay,
+        first_ack_range,
+        ack_ranges,
+    );
+}
+
+/// The NEGATIVE half of the virtual-time loss suite: ordinary
+/// reordering must NOT be declared loss (the §52/h3-real-RTT
+/// spurious-collapse class). pn0 is only 1 PN behind (below the
+/// 3-packet threshold) and YOUNGER than the 9/8·RTT time threshold at
+/// the first ACK — it must stay in flight. Then the SAME ACK content
+/// re-processed 9 ms of virtual time later flips the verdict: pure
+/// time passage, fully deterministic — the demonstration that the
+/// RACK detector's clock input is now drivable.
+#[test]
+fn mock_clock_reordering_is_not_loss_until_threshold_ages() {
+    let mut conn = Connection::new_server(ConnectionId::new(&[0x78; 8]), [0x56u8; 32]);
+    crate::time::mock::set(3_000_000);
+    conn.pending_sent_stream_frames = alloc::vec![super::StreamRetx {
+        sid: 0,
+        offset: 0,
+        fin: false,
+        data: iobuf::IOBuf::from(alloc::vec![0xBBu8; 100]),
+    }];
+    conn.record_sent_packet(crate::CryptoLevel::OneRtt, 0, true, 100);
+    crate::time::mock::set(3_001_000);
+    conn.record_sent_packet(crate::CryptoLevel::OneRtt, 1, true, 100);
+    // ACK pn1-only at T+51ms: RTT sample = 50ms → time threshold =
+    // 9/8·50ms + 25ms max_ack_delay (the §52 spurious-loss guard) =
+    // 81.25ms; pn0's age is 51ms — reordered but NOT lost (and only
+    // 1 PN behind, below the packet threshold).
+    crate::time::mock::set(3_051_000);
+    ack_single(&mut conn, 1);
+    assert_eq!(conn.smoothed_rtt_us, Some(50_000));
+    assert_eq!(
+        conn.application_space.sent_packets.len(),
+        1,
+        "pn0 reordered, not lost: age 51ms < 81.25ms threshold"
+    );
+    assert!(conn.retx_queue.is_empty(), "nothing requeued on reordering");
+    assert_eq!(conn.bytes_in_flight, 100, "pn0 still counted in flight");
+    // Re-process the SAME ACK 39ms later: pn0's age (90ms) now exceeds
+    // the unchanged threshold — declared lost by time alone.
+    crate::time::mock::set(3_090_000);
+    ack_single(&mut conn, 1);
+    assert_eq!(
+        conn.application_space.sent_packets.len(),
+        0,
+        "same ACK, later virtual instant: pn0 aged past the threshold"
+    );
+    assert_eq!(conn.retx_queue.len(), 1, "pn0's frame requeued on the aging");
+    assert_eq!(conn.bytes_in_flight, 0);
+}
+
+/// PTO timeline under virtual time (RFC 9002 §6.2.1): the probe
+/// deadline is an exact arithmetic consequence of the pinned clock —
+/// `last_ack_eliciting + (kInitialRtt + kGranularity) << pto_count` —
+/// doubling per unanswered probe and disarming entirely once the ACK
+/// empties the space. Previously only the period *formula* was
+/// unit-tested; the deadline timestamps themselves needed a live peer.
+#[test]
+fn mock_clock_pto_deadline_arithmetic_and_disarm() {
+    let mut conn = Connection::new_server(ConnectionId::new(&[0x79; 8]), [0x57u8; 32]);
+    let secrets = derive_initial_secrets(&[0xee; 8]);
+    conn.application_send = Some(Box::new(super::keys::DirKeys::from_aes128(
+        &derive_initial_keys(&secrets.server),
+    )));
+    crate::time::mock::set(2_000_000);
+    conn.record_sent_packet(crate::CryptoLevel::OneRtt, 0, true, 100);
+    // No SRTT yet → base period = kInitialRtt + kGranularity = 334ms.
+    assert_eq!(
+        conn.pto_deadline_us(),
+        Some(2_000_000 + 334_000),
+        "deadline = send instant + initial PTO period"
+    );
+    // An unanswered probe doubles the period (backoff). The probe's own
+    // PING re-stamps last-ack-eliciting at the (unchanged) pinned now.
+    assert!(conn.send_pto_probe(), "probe emitted");
+    assert_eq!(
+        conn.pto_deadline_us(),
+        Some(2_000_000 + 668_000),
+        "after one unanswered probe the period doubles"
+    );
+    // ACK everything in the space (pn0 + the probe PING's pn1): the
+    // backoff resets and, with nothing ack-eliciting in flight, the
+    // PTO disarms.
+    crate::time::mock::set(2_050_000);
+    let mut ackbuf = [0u8; 16];
+    let n = crate::frame::write_ack(1, 0, 1, &[], &mut ackbuf).unwrap();
+    let (frame, _) = crate::frame::parse_frame(&ackbuf[..n]).unwrap();
+    let crate::frame::Frame::Ack {
+        largest_acknowledged,
+        ack_delay,
+        first_ack_range,
+        ack_ranges,
+        ..
+    } = frame
+    else {
+        panic!("expected ACK frame");
+    };
+    conn.process_ack(
+        crate::CryptoLevel::OneRtt,
+        largest_acknowledged,
+        ack_delay,
+        first_ack_range,
+        ack_ranges,
+    );
+    assert_eq!(conn.pto_count, 0, "ack of new data resets the backoff");
+    assert_eq!(
+        conn.pto_deadline_us(),
+        None,
+        "space empty → no probe deadline armed"
+    );
 }
 
 /// RFC 9002 §6.2: a lost Handshake packet's CRYPTO fragment is

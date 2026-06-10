@@ -261,16 +261,15 @@ impl Connection {
     fn detect_loss(&mut self, level: CryptoLevel) {
         const K_PACKET_THRESHOLD: u64 = 3;
         const K_GRANULARITY_US: u64 = 1_000;
-        // Peer's default max_ack_delay (RFC 9000 §18.2). Added to the time
-        // threshold below — but ONLY for the Application Data space (RFC
-        // 9002 §6.1.2): a peer must not delay ACKs of Initial / Handshake
-        // packets, so including it there would over-extend the threshold
-        // and delay real handshake-loss recovery. We use the RFC default
-        // 25 ms; the peer's advertised value isn't parsed (it would only
-        // lower this, and a compliant peer never delays beyond it).
-        const MAX_ACK_DELAY_US: u64 = 25_000;
+        // Peer's max_ack_delay (RFC 9000 §18.2) — the value advertised in
+        // its transport params, cached as `peer_max_ack_delay_us` (25 ms
+        // RFC default until applied). Added to the time threshold below —
+        // but ONLY for the Application Data space (RFC 9002 §6.1.2): a
+        // peer must not delay ACKs of Initial / Handshake packets, so
+        // including it there would over-extend the threshold and delay
+        // real handshake-loss recovery.
         let ack_delay_us = match level {
-            CryptoLevel::OneRtt => MAX_ACK_DELAY_US,
+            CryptoLevel::OneRtt => self.peer_max_ack_delay_us,
             CryptoLevel::Initial | CryptoLevel::Handshake => 0,
         };
         // Cache `max_rtt` and `now` before borrowing through SpaceState.
