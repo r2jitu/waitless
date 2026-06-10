@@ -314,14 +314,49 @@ const SEED_ROUNDS: u32 = 256;
 /// accumulated entropy is folded in), not bootstraps from nothing.
 const RESEED_ROUNDS: u32 = 64;
 
+/// Health report from the cold-bootstrap seed's jitter assessment
+/// (NIST SP 800-90B). Stored once at seed time; read by `/obs` via
+/// [`seed_health`] so a degraded jitter source (e.g. a pathological
+/// hypervisor TSC) is visible rather than silent. Not load-bearing: the
+/// seed still folds hardware entropy and an ongoing reseed, so a weak
+/// jitter estimate doesn't compromise the construction.
+static SEED_HEALTH: Spinlock<Option<kernel_core::entropy_health::HealthReport>> =
+    Spinlock::new(None);
+
+/// The cold-bootstrap seed's entropy-health report, or `None` if the
+/// RNG hasn't been seeded yet (no `fill_bytes` call has happened).
+pub fn seed_health() -> Option<kernel_core::entropy_health::HealthReport> {
+    *SEED_HEALTH.lock()
+}
+
 /// Mix `SEED_ROUNDS` jitter reads + hardware entropy through SHA-256 to
-/// produce a 32-byte cold-bootstrap seed.
+/// produce a 32-byte cold-bootstrap seed. Also captures one noise
+/// symbol per round (the low byte of the inter-read cycle-counter
+/// delta) and runs the SP 800-90B health assessment over them, stashing
+/// the result for `/obs`.
 fn collect_seed() -> [u8; 32] {
     let mut h = Sha256::new();
     // Constant tag — domain separates this seed from any other use of
     // SHA-256 in the kernel.
     h.update(b"unikernel kernel rng seed v1\0");
-    collect_jitter(&mut h, SEED_ROUNDS);
+    // Inline the jitter loop (rather than `collect_jitter`) so we can
+    // tap each round's cycle-delta low byte as a noise symbol for the
+    // health assessment. The hasher inputs match `collect_jitter`.
+    let mut samples = [0u8; SEED_ROUNDS as usize];
+    let mut prev = read_cycle_counter();
+    for i in 0..SEED_ROUNDS {
+        let t = read_cycle_counter();
+        h.update(t.to_le_bytes());
+        h.update(i.to_le_bytes());
+        mix_hw_entropy(&mut h);
+        samples[i as usize] = t.wrapping_sub(prev) as u8;
+        prev = t;
+        // Small varying spin to perturb the next cycle counter read.
+        for _ in 0..((i & 7) + 1) {
+            core::hint::spin_loop();
+        }
+    }
+    *SEED_HEALTH.lock() = Some(kernel_core::entropy_health::assess(&samples));
     let digest = h.finalize();
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&digest);

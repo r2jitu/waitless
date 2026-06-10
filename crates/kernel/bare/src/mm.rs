@@ -552,6 +552,23 @@ pub fn write_obs_json(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
         s.total_allocation_count,
         HEAP_OOM.get(),
     )?;
+    // RNG entropy-source health (NIST SP 800-90B) from the cold-boot
+    // seed. `rng_seeded` is false until the first `fill_bytes`; once
+    // seeded, `rng_min_entropy_mbits` is the most-common-value estimate
+    // in milli-bits/symbol and the two `*_pass` flags are the RCT/APT
+    // startup tests. A low estimate or a failed test on a real deploy
+    // flags a degraded jitter source (e.g. a pathological hypervisor TSC).
+    let h = crate::rng::seed_health();
+    write!(
+        w,
+        "\"rng_seeded\":{},\"rng_rct_pass\":{},\"rng_apt_pass\":{},\
+         \"rng_min_entropy_mbits\":{},\"rng_jitter_samples\":{},",
+        h.is_some(),
+        h.map(|r| r.rct_pass).unwrap_or(false),
+        h.map(|r| r.apt_pass).unwrap_or(false),
+        h.map(|r| r.min_entropy_mbits).unwrap_or(0),
+        h.map(|r| r.samples).unwrap_or(0),
+    )?;
     LAST_OOM.write_json(w, "last_oom")?;
     w.write_str("}")
 }
