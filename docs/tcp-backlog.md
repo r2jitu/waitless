@@ -367,7 +367,7 @@ is wired into TCP yet. The plan lives in
 [`stack-architecture.md`](stack-architecture.md) → *Transport reliability
 — one congestion-control / loss-recovery / pacing core*.
 
-### L1 — CUBIC ✅ implemented (Reno default; netem A/B is the activation gate); BBR still open
+### L1 — CUBIC ✅ implemented + GCE-validated (Reno stays default — no win on this workload); BBR still open
 
 **What (original).** Our controller was classic RFC 5681 Reno: slow start +
 AIMD (halve on loss, +1 MSS/RTT in avoidance). Linux defaults to **CUBIC**
@@ -382,13 +382,37 @@ byte windows; the cube root for K is the overflow-safe `icbrt_u128`). The
 `CongestionControl` trait gained a monotonic `now_ms` that only a
 time-based controller reads (NewReno ignores it → a Reno flow is
 byte-identical). A `Controller` enum selects NewReno or CUBIC; both TCP and
-QUIC hold it. **`DEFAULT_ALGORITHM = Reno`** so the golden path is unchanged
-until measured — CUBIC's correctness *is* its throughput behaviour on real
-high-BDP paths, so activating it without a GCE/`tc netem` A/B would be
-reckless. The numerics are deterministically unit-tested (the cubic curve
-hits `W_max·β` at the epoch and `W_max` at `t = K`, β = 0.7, reduce-once,
-time-based growth); the **netem throughput A/B is the remaining step to
-flip the default**.
+QUIC hold it. **`DEFAULT_ALGORITHM = Reno`**. The numerics are
+deterministically unit-tested (the cubic curve hits `W_max·β` at the epoch
+and `W_max` at `t = K`, β = 0.7, reduce-once, time-based growth).
+
+**GCE/`tc netem` A/B ran (2026-06-09) — Reno stays default.** Both arms
+built from the same tree (const-flipped), deployed to a c3 GCE VM, measured
+with `scripts/netem-cc-*.sh` (IFB-ingress netem on the loadgen so loss hits
+the *server→client data* path → the server's controller is under test),
+15 single-`/static-1m` trials per profile so the median rejects the
+tail-loss outliers (see L4):
+
+| profile | arm | good-cluster (CC-bound) | median | stalls |
+|---|---|---|---|---|
+| 25 ms 1 % | Reno  | **2.573 MB/s** | 0.218 | 7/15 |
+| 25 ms 1 % | CUBIC | **2.567 MB/s** | 0.159 | 9/15 |
+| 50 ms 1 % | Reno  | **1.295 MB/s** | 0.142 | 10/15 |
+| 50 ms 1 % | CUBIC | **1.294 MB/s** | 0.114 | 11/15 |
+
+The CC-curve-bound "good cluster" is **byte-identical** between the two,
+and the median/stall spread is pure L4 tail-loss-RTO noise. Two reasons
+CUBIC can't pull ahead here: (1) a **1 MB object is too short to exercise
+the congestion-avoidance curve** — the transfer finishes within a few RTTs
+of the first loss, before CUBIC's cubic reopen diverges from Reno's linear
+reopen (CUBIC's edge needs sustained multi-MB / many-RTT flows); (2) on a
+lossy path the **binding limit is L4 tail-loss RTO recovery**, which is
+CC-algorithm-independent. So for *this* server's workload (HTTP
+request/response, objects ≤ 1 MB) CUBIC ≡ Reno, and the implementation is
+validated (no regression, behaves identically where expected) but **the
+default flip is not data-justified**. CUBIC stays available behind the
+selector; revisit if a bulk-transfer workload appears or after L4 lands
+(which would let the curves be measured without the RTO confound).
 
 **Open — BBR.** Model-based (delivery-rate + min-RTT estimation,
 loss-agnostic). A larger, separate effort on the same trait seam.
@@ -447,17 +471,31 @@ QUIC's token-bucket pacer (`crates/proto/quic/src/conn/tx.rs`, driving
 `net_cc`'s `pacing_rate()`) is the prior art to port. Pairs with BBR (L1).
 **Effort: M.**
 
-### L4 — Loss recovery is RTO + 3-dup-ACK only (no RACK-TLP, no SACK)
+### L4 — Loss recovery is RTO + 3-dup-ACK only (no RACK-TLP) — ⚠ GCE-confirmed the top under-loss lever
 
 **What.** We detect loss via 3 duplicate ACKs (fast retransmit) or the
-RTO. No SACK (T7), no **RACK-TLP** (RFC 8985 — time-based loss detection
-+ Tail Loss Probe), which is Linux's default loss detector since 4.18.
+RTO. SACK (T7) now lands — both block generation and RFC 6675 sender-side
+hole-filling — but there is still no **RACK-TLP** (RFC 8985 — time-based
+loss detection + Tail Loss Probe), which is Linux's default loss detector
+since 4.18.
+
+**⚠ GCE/netem profile (2026-06-09) — this, not the CC algorithm, is the
+binding under-loss limit.** Single-`/static-1m` transfers under `tc netem`
+at 1 % loss are **bimodal**: a tight "good cluster" recovers via fast
+retransmit (~2.5 MB/s at 25 ms, ~1.3 MB/s at 50 ms), but **7–11 of every 15
+transfers hit a multi-second stall** (measured 9–18 s on 256 KB–1 MB
+objects — i.e. one RTO doubling out to `1+2+4+8 ≈ 15 s`). Those are exactly
+tail losses / lost retransmissions: no later data ⇒ no dup-ACKs ⇒ no fast
+retransmit ⇒ wait a full backed-off RTO. The median throughput collapses to
+~0.15 MB/s purely from this tail. It is **CC-algorithm-independent** (Reno
+and CUBIC measured identical — see L1), so RACK-TLP, not CUBIC/BBR, is the
+highest-impact under-loss lever for this server's small-response workload.
 
 **Triggers when.** Tail loss (the last segments of a response) and
-multi-hole loss. Without TLP a lost tail waits a full RTO (~200 ms+)
-instead of a probe-timeout (~2·RTT); without SACK, multi-hole recovery
-re-sends more than the holes. Both punish exactly the small-response
-HTTP pattern this server is built for, on a lossy path.
+multi-hole loss. Without TLP a lost tail waits a full RTO (~200 ms+, and
+backs off into multi-second stalls under repeated tail loss) instead of a
+probe-timeout (~2·RTT). **Now confirmed: this is the dominant cost on a
+lossy path, ahead of every congestion-control item.**
 
 **Fix.** RACK-TLP needs per-segment send timestamps (the retransmit ring
 can carry them); QUIC's RFC 9002 packet-/time-threshold loss detector
