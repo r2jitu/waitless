@@ -950,6 +950,45 @@ fn multiple_out_of_order_segments_reassemble_in_order() {
     );
 }
 
+/// T8 (RFC 9293 §3.10.7.4 step 1): a data segment past the receive
+/// window — too far ahead to buffer — must still draw a bare ACK so the
+/// peer re-synchronizes promptly, rather than being dropped silently.
+#[test]
+fn segment_beyond_window_is_acked_not_buffered() {
+    let _g = harness();
+    const SP: u16 = 9175;
+    const CP: u16 = 50175;
+    const CLIENT_ISN: u32 = 0x9000;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let rcv_nxt = CLIENT_ISN.wrapping_add(1);
+
+    clear_tx();
+    let ooo_before = super::diag::COUNTERS.ooo_queued.get();
+    // 100 KiB past rcv_nxt — far beyond the 16 KiB window / OOO cap.
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: rcv_nxt.wrapping_add(100 * 1024),
+        ack: server_isn.wrapping_add(1),
+        flags: TCP_ACK | TCP_PSH,
+        payload: b"too-far".to_vec(),
+        window: 65535,
+    });
+    let frames = tx();
+    assert_eq!(frames.len(), 1, "an out-of-window segment still draws one ACK");
+    assert_eq!(
+        tcp_hdr(&frames[0]).ack,
+        rcv_nxt,
+        "the ACK carries our real rcv_nxt — the peer re-synchronizes",
+    );
+    assert_eq!(
+        super::diag::COUNTERS.ooo_queued.get(),
+        ooo_before,
+        "the out-of-window segment was not buffered (over the OOO cap)",
+    );
+}
+
 /// A gap-filling segment that overlaps a buffered out-of-order segment
 /// from below delivers only the non-overlapping tail of the buffered
 /// segment — `drain_ooo` skips the already-covered prefix.

@@ -292,14 +292,19 @@ sender-side RFC 6675. **Effort: L.**
 **Test.** Out-of-order arrival → assert correct SACK blocks; scripted
 multi-hole loss → assert only the holes are retransmitted.
 
-### T8 — An out-of-window segment should be ACKed, not dropped silently
+### T8 — An out-of-window segment should be ACKed, not dropped silently ✅ done
 
-**What.** A data segment ahead of the receive window is dropped with
-no response. RFC 9293 §3.10.7.4 step 1 calls for an ACK so the peer
-re-synchronizes promptly.
+**Status.** Done — fell out of the T3 change. The reassembly branch
+(`seq > rcv_nxt`) sends a bare ACK for *every* future data segment,
+whether it lands in the OOO queue or is too far ahead to buffer; a
+segment behind the window (`seq < rcv_nxt`) already drew a dup-ACK. So
+every data segment now produces an ACK and none is dropped silently.
+Pinned by `segment_beyond_window_is_acked_not_buffered` (100 KiB past
+`rcv_nxt` → one bare ACK at the real `rcv_nxt`, not buffered).
 
-**Fix.** Send a bare ACK for an unacceptable segment. Small; related
-to T3. **Effort: S.**
+**What (original).** A data segment ahead of the receive window is
+dropped with no response. RFC 9293 §3.10.7.4 step 1 calls for an ACK so
+the peer re-synchronizes promptly.
 
 ---
 
