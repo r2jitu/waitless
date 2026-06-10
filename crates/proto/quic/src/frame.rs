@@ -7,17 +7,17 @@
 //   0x01       PING
 //   0x02..03   ACK (without and with ECN counts)
 //   0x06       CRYPTO
-//   0x07       NEW_TOKEN  (skip)
+//   0x07       NEW_TOKEN  (skip — client-only frame)
 //   0x08..0f   STREAM (with OFF/LEN/FIN flag combinations)
-//   0x10       MAX_DATA           (skip)
-//   0x11       MAX_STREAM_DATA    (skip)
-//   0x12..13   MAX_STREAMS        (skip)
-//   0x14       DATA_BLOCKED       (skip)
-//   0x15       STREAM_DATA_BLOCKED (skip)
-//   0x16..17   STREAMS_BLOCKED    (skip)
-//   0x18       NEW_CONNECTION_ID  (skip)
-//   0x19       RETIRE_CONNECTION_ID (skip)
-//   0x1a..1b   PATH_CHALLENGE / PATH_RESPONSE (skip)
+//   0x10       MAX_DATA            (conn send-flow-control credit)
+//   0x11       MAX_STREAM_DATA     (stream send-flow-control credit)
+//   0x12..13   MAX_STREAMS         (stream-creation credit)
+//   0x14       DATA_BLOCKED        (→ re-advertise MAX_DATA)
+//   0x15       STREAM_DATA_BLOCKED (→ re-advertise MAX_STREAM_DATA)
+//   0x16..17   STREAMS_BLOCKED     (→ re-advertise MAX_STREAMS)
+//   0x18       NEW_CONNECTION_ID    (skip — no CID rotation yet)
+//   0x19       RETIRE_CONNECTION_ID (skip — no CID rotation yet)
+//   0x1a..1b   PATH_CHALLENGE / PATH_RESPONSE (path validation / migration)
 //   0x1c..1d   CONNECTION_CLOSE (transport- and application-layer)
 //   0x1e       HANDSHAKE_DONE
 //
@@ -25,14 +25,13 @@
 // over decrypted packet payloads from `crate::crypto::open_*` and
 // builds outbound payloads that go back into `crate::crypto::seal_*`.
 //
-// "Skip" frames are parsed enough to advance past their wire
-// length (so coalesced frames after them keep parsing) but the
-// connection layer doesn't act on them — flow control reactivity
-// and CID rotation are out of scope for the MVP server. Adding
-// real handling later only changes the `dispatch_frames` arm.
-//
-// Out of scope (no parser yet — would close the connection on receipt):
-//   RESET_STREAM, STOP_SENDING, DATAGRAM (RFC 9221).
+// A "skip" frame is parsed enough to advance past its wire length (so
+// coalesced frames after it keep parsing — `Frame::Skipped`) but the
+// connection layer takes no action on it. Still skip-only: NEW_TOKEN,
+// NEW/RETIRE_CONNECTION_ID (CID rotation is out of scope for the MVP
+// server), RESET_STREAM and STOP_SENDING (per-stream abort — parsed past,
+// not yet generated/honored), and DATAGRAM (RFC 9221). Adding real
+// handling later only changes the `dispatch_frames` arm.
 
 // (no-std declaration is in lib.rs. `wire` is now this crate's
 // sibling module rather than a separate crate.)

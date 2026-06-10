@@ -1,14 +1,13 @@
 // crates/runtime/worker/src/timer.rs — Per-worker timer wheel.
 //
 // Simple single-level timer wheel with fixed tick granularity.
-// Each worker has its own wheel — no synchronization needed for
-// insert/fire on the owning worker.
+// Each worker has its own wheel (a fixed `[Slot; WHEEL_SIZE]` array) —
+// no synchronization needed for insert/fire on the owning worker.
 //
-// Cross-worker timer creation goes through the `PendingTimers` MPSC
-// queue. Pool storage is a lock-free intrusive free-list.
-
-// No cross-worker submission queue yet — kept simple until a
-// concrete consumer shows up.
+// There is no cross-worker submission queue: a timer is only ever
+// inserted by its owning worker. (An earlier draft of this header
+// described a `PendingTimers` MPSC queue + intrusive free-list — neither
+// exists; kept simple until a concrete cross-worker consumer shows up.)
 
 /// Number of slots in the wheel. Must be a power of 2.
 const WHEEL_SIZE: usize = 256;

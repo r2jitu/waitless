@@ -44,36 +44,12 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use obs::{Counter, LastEvent, LatencyHist, ObsRecord};
 
 /// Monotonic cycle counter for the per-phase CPU brackets
-/// (`process_rx_cycles` / `flush_tx_cycles`). TSC on x86_64, CNTVCT_EL0
-/// on arm64 — real cycles on GCE, 24 MHz ticks on native arm64 (ratios
-/// only). Mirrors `http::server::now_cycles`; QUIC sits above
-/// `kernel_core` only via the reactor, so we read the counter inline
-/// rather than thread a dependency.
-#[inline(always)]
-pub fn now_cycles() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let lo: u32;
-        let hi: u32;
-        core::arch::asm!(
-            "rdtsc",
-            out("eax") lo,
-            out("edx") hi,
-            options(nomem, nostack, preserves_flags),
-        );
-        ((hi as u64) << 32) | (lo as u64)
-    }
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let v: u64;
-        core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack));
-        v
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        0
-    }
-}
+/// (`process_rx_cycles` / `flush_tx_cycles`) — the shared
+/// [`obs::now_cycles`] (TSC on x86_64, CNTVCT_EL0 on arm64). Re-exported
+/// here so the existing `crate::diag::now_cycles()` call sites are
+/// unchanged; QUIC sits above `kernel_core` only via the reactor, so the
+/// reader lives in the leaf `obs` crate (no kernel dependency threaded in).
+pub use obs::now_cycles;
 
 /// One counter per drop / event reason. Cheap to read in bulk for a
 /// stats dump, cheap to increment on the hot path.
@@ -225,16 +201,16 @@ pub struct Counters {
     pub conn_closes_received: Counter,
     /// One packet declared lost by the packet-threshold rule
     /// (RFC 9002 §6.1.1: `pn < largest_acked - kPacketThreshold`).
-    /// Counter only — we don't yet retransmit the frames that
-    /// were in those packets, so on a lossy network handshakes
-    /// can stall. Sustained growth on a healthy localhost link
-    /// would point at a misordered ACK or an off-by-one in the
-    /// detection logic, not real loss.
+    /// Its STREAM and CRYPTO frames are re-queued for retransmission
+    /// (`detect_loss` → `stream_retx_queue` / `crypto_retx_queue`).
+    /// Sustained growth on a healthy localhost link would point at a
+    /// misordered ACK or an off-by-one in the detection logic, not
+    /// real loss.
     pub packets_lost_threshold: Counter,
     /// One packet declared lost by the time-threshold rule
     /// (RFC 9002 §6.1.2): older than the largest acked AND aged
-    /// past `max(9/8 * max(SRTT, latest_rtt), kGranularity)`.
-    /// Same caveat as `packets_lost_threshold` w.r.t. retx.
+    /// past `max(9/8 * max(SRTT, latest_rtt), kGranularity)`. Its
+    /// frames are re-queued like the packet-threshold case above.
     pub packets_lost_time: Counter,
     /// CRYPTO fragments re-queued for retransmission after their packet
     /// was declared lost (RFC 9002 §6.2). Nonzero means handshake-packet

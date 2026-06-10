@@ -32,15 +32,19 @@
 //   * Coalesced packets (Initial+Handshake in one datagram —
 //     standard rustls / quinn client behavior)
 //
-// Out of scope (future commits):
-//   * Loss detection / retransmission timers (relies on client
-//     retransmits today; OK for first interop check)
-//   * Stream layer (STREAM frames, app data)
+// Out of scope (see docs/conformance-roadmap.md for the live list):
 //   * 0-RTT / early data
-//   * Connection migration / path validation
 //   * Stateless reset
-//   * Connection close protocol (we drop on error rather than
-//     emit CONNECTION_CLOSE for now)
+//   * CID rotation (NEW/RETIRE_CONNECTION_ID) + WE-initiated
+//     PATH_CHALLENGE on a migrated path (we answer the peer's, and
+//     auth-gate the TX-address follow, but don't probe a new path
+//     ourselves)
+//   * Per-stream abort: generating RESET_STREAM / honoring STOP_SENDING
+//     (both are parsed past today, not acted on)
+//
+// (Loss detection + RFC 9002 retransmission, the stream layer, NewReno/
+// CUBIC congestion control, pacing, key update, and connection close all
+// landed since this header was first written.)
 //
 // Module layout (under `conn/`):
 //
