@@ -146,6 +146,15 @@ pub(crate) const RTO_K: u32 = 4;
 /// RTO ceiling — the §5.5 exponential backoff clamps here. RFC 6298
 /// §2.5 requires the bound to be at least 60 s.
 pub(crate) const RTO_MAX_MS: u32 = 60_000;
+/// Tail Loss Probe floor (RFC 8985 §7.2). The PTO is `2·SRTT` but never
+/// shorter than this, so a very-low-RTT LAN doesn't fire spurious probes
+/// in the gap before the final ACK arrives.
+pub(crate) const TLP_MIN_MS: u32 = 10;
+/// Max consecutive Tail Loss Probes before falling back to the RTO. Two
+/// probes (RFC 8985 caps TLP at one per "tail"; we allow a second for a
+/// 2-segment tail) — beyond that a real RTO is the right, congestion-aware
+/// response.
+pub(crate) const TLP_MAX_PROBES: u8 = 2;
 /// Retransmissions of one segment before the connection is declared
 /// dead and torn down. With 1+2+4+…+60 s (capped) backoff this is
 /// ~100 s of total wait — in line with the RFC 9293 §3.8.3 "R2"
@@ -411,6 +420,17 @@ pub struct TcpConnection {
     /// exponential-backoff exponent and the `PERSIST_MAX_PROBES`
     /// give-up counter.
     pub(crate) persist_backoff: u8,
+    /// Absolute deadline (`kernel_core::clock::now_ms`) for the next
+    /// RFC 8985 Tail Loss Probe. Armed alongside the RTO (at the shorter
+    /// `pto_ms()` = 2·SRTT) whenever data is outstanding; fires *before*
+    /// the RTO to probe a tail loss that has too few following segments
+    /// to trip 3-dup-ACK fast retransmit. 0 = disarmed (no RTT sample yet,
+    /// PTO ≥ RTO, probe budget spent, or nothing outstanding).
+    pub(crate) tlp_deadline_ms: u64,
+    /// Consecutive Tail Loss Probes sent without intervening ACK progress;
+    /// capped at `TLP_MAX_PROBES`, after which the RTO is the backstop.
+    /// Reset to 0 whenever new data is acknowledged.
+    pub(crate) tlp_count: u8,
     /// Cache of `cc.window()` — the congestion window in bytes, refreshed
     /// after every `cc` event. The send path (`usable_window`) and diag
     /// read this so they don't borrow `cc`. 0 until `congestion_init`.
@@ -662,6 +682,8 @@ impl TcpConnection {
             fin_retx_count: 0,
             persist_deadline_ms: 0,
             persist_backoff: 0,
+            tlp_deadline_ms: 0,
+            tlp_count: 0,
             cwnd: 0,
             dup_acks: 0,
             cc: net_cc::Controller::with_default_mss(),
@@ -1002,9 +1024,58 @@ impl TcpConnection {
         acked
     }
 
-    /// Arm the retransmission timer `rto_ms` ahead of now.
+    /// Arm the retransmission timer `rto_ms` ahead of now — and, when
+    /// eligible, the shorter Tail Loss Probe timer so a tail loss is probed
+    /// well before the RTO would fire.
     pub(crate) fn arm_rtx(&mut self) {
-        self.rtx_deadline_ms = kernel_core::clock::now_ms() + self.rto_ms as u64;
+        let now = kernel_core::clock::now_ms();
+        self.rtx_deadline_ms = now + self.rto_ms as u64;
+        let pto = self.pto_ms();
+        self.tlp_deadline_ms = if pto != 0 && self.tlp_count < TLP_MAX_PROBES {
+            now + pto as u64
+        } else {
+            0
+        };
+        self.arm_for_tick();
+    }
+
+    /// RFC 8985 §7.2 Probe Timeout: `2·SRTT`, floored at [`TLP_MIN_MS`].
+    /// Returns 0 (⇒ no TLP, rely on the RTO) when there is no RTT sample
+    /// yet or when the PTO would not beat the RTO — there is no point
+    /// probing if the RTO fires no later.
+    pub(crate) fn pto_ms(&self) -> u32 {
+        if self.srtt_ms == 0 {
+            return 0;
+        }
+        let pto = self.srtt_ms.saturating_mul(2).max(TLP_MIN_MS);
+        if pto >= self.rto_ms { 0 } else { pto }
+    }
+
+    /// Fire a Tail Loss Probe (RFC 8985 §7.3). Retransmits the oldest
+    /// unacked segment (`snd_una`) — the cumulative-ACK blocker — to elicit
+    /// an ACK at a tail where too few segments follow the loss to trip the
+    /// 3-dup-ACK fast retransmit. The probe directly fills the lowest hole
+    /// (recovering a single near-tail loss in one PTO instead of a full,
+    /// backed-off RTO) and, against a SACKing peer, the reply drives our
+    /// existing SACK recovery. Crucially it is **not** a congestion signal:
+    /// `cwnd` is untouched, no `rtx_backoff`, the SACK scoreboard is kept.
+    /// The RTO stays armed as the backstop.
+    pub(crate) fn send_tlp_probe(&mut self, now: u64) {
+        if self.rtx_bytes_in_flight == 0 {
+            self.tlp_deadline_ms = 0;
+            return;
+        }
+        self.tlp_count = self.tlp_count.saturating_add(1);
+        crate::diag::COUNTERS.tlp_probes.bump();
+        self.emit_rtx_entry(0);
+        // Re-arm for a second probe if budget remains; otherwise disarm and
+        // let the (still-armed) RTO be the next, congestion-aware, event.
+        let pto = self.pto_ms();
+        self.tlp_deadline_ms = if pto != 0 && self.tlp_count < TLP_MAX_PROBES {
+            now + pto as u64
+        } else {
+            0
+        };
         self.arm_for_tick();
     }
 
@@ -1218,12 +1289,16 @@ impl TcpConnection {
         // (RFC 6298 §5.7 — a backed-off RTO holds only until a
         // successful round trip restores the estimator's value).
         self.rtx_backoff = 0;
+        // Progress means the tail advanced — restore a fresh Tail Loss Probe
+        // budget for the new tail (RFC 8985: TLP state is per-tail).
+        self.tlp_count = 0;
         self.rto_ms = self.estimated_rto();
         if self.rtx_bytes_in_flight == 0 {
-            // §5.2: everything outstanding is ACK'd — stop the timer.
+            // §5.2: everything outstanding is ACK'd — stop both timers.
             self.rtx_deadline_ms = 0;
+            self.tlp_deadline_ms = 0;
         } else {
-            // §5.3: some (not all) ACK'd — restart the timer.
+            // §5.3: some (not all) ACK'd — restart the RTO and TLP timers.
             self.arm_rtx();
         }
     }
@@ -1299,6 +1374,10 @@ impl TcpConnection {
             e.sacked = false;
         }
         self.retransmit_oldest_segment();
+        // The RTO has taken over recovery — disarm TLP so a stale probe
+        // deadline doesn't fire a redundant retransmit during backoff. A
+        // later progress ACK re-arms it (with a fresh budget) via `arm_rtx`.
+        self.tlp_deadline_ms = 0;
         // §5.5: back the RTO off exponentially, capped at the ceiling.
         self.rtx_backoff = self.rtx_backoff.saturating_add(1);
         self.rto_ms = self.rto_ms.saturating_mul(2).min(RTO_MAX_MS);

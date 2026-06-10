@@ -3602,6 +3602,95 @@ fn fast_retransmit_keeps_a_windowed_transfer_flowing() {
     );
 }
 
+/// RFC 8985 Tail Loss Probe: a tail loss — too few segments follow it to
+/// trip the 3-dup-ACK fast retransmit — is probed at the PTO (~2·SRTT),
+/// far before the RTO, by retransmitting `snd_una`. The probe is NOT a
+/// congestion signal (no RTO retransmit counted) and is budget-capped at
+/// `TLP_MAX_PROBES`, after which the RTO is the backstop. This is the fix
+/// for the GCE-measured 9-18 s tail-loss stalls (docs/tcp-backlog L4).
+#[test]
+fn tail_loss_probe_fires_before_rto_then_caps() {
+    let _g = harness();
+    const SP: u16 = 9182;
+    const CP: u16 = 50182;
+    const CLIENT_ISN: u32 = 0xD700;
+    super::listen_on_core(0, SP);
+    let server_isn = handshake(SP, CP, CLIENT_ISN);
+    let (handle, generation) = conn_handle(CP, SP);
+    let base = server_isn.wrapping_add(1);
+
+    // Establish an SRTT: send one segment, ACK it 25 ms later → SRTT = 25 ms,
+    // PTO = 2·SRTT = 50 ms (≪ the 1 s initial RTO).
+    clear_tx();
+    {
+        let mut chain = iobuf::IOBufChain::from(alloc::vec![b'x'; 100]);
+        super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    }
+    kernel_core::clock::mock::advance(25);
+    deliver(&Seg {
+        src_port: CP,
+        dst_port: SP,
+        seq: CLIENT_ISN.wrapping_add(1),
+        ack: base.wrapping_add(100),
+        flags: TCP_ACK,
+        window: 65535,
+        payload: Vec::new(),
+    });
+
+    // Send a 2-segment tail and withhold the ACKs (the loss).
+    clear_tx();
+    for _ in 0..2 {
+        let mut chain = iobuf::IOBufChain::from(alloc::vec![b'y'; 100]);
+        super::async_try_send_chain(handle, generation, &mut chain).unwrap();
+    }
+    assert_eq!(tx().len(), 2, "two tail segments on the wire");
+    let tlp_before = super::diag::COUNTERS.tlp_probes.get();
+    let rto_before = super::diag::COUNTERS.data_retransmits.get();
+
+    // Advance past the PTO (50 ms) but far below the RTO (1 s) and tick:
+    // only a TLP can retransmit this early, and it re-sends snd_una.
+    clear_tx();
+    kernel_core::clock::mock::advance(100);
+    super::on_tcp_tick();
+    let p1 = tx();
+    assert_eq!(p1.len(), 1, "exactly one TLP probe fired");
+    assert_eq!(
+        tcp_hdr(&p1[0]).seq,
+        base.wrapping_add(100),
+        "the probe retransmits snd_una (the cumulative-ACK blocker)",
+    );
+    assert_eq!(
+        super::diag::COUNTERS.tlp_probes.get() - tlp_before,
+        1,
+        "one TLP counted",
+    );
+    assert_eq!(
+        super::diag::COUNTERS.data_retransmits.get(),
+        rto_before,
+        "a TLP is not an RTO retransmit — cwnd is untouched",
+    );
+
+    // A second probe fires (the 2-segment-tail budget), still before the RTO.
+    clear_tx();
+    kernel_core::clock::mock::advance(100);
+    super::on_tcp_tick();
+    assert_eq!(tx().len(), 1, "second TLP probe");
+    assert_eq!(super::diag::COUNTERS.tlp_probes.get() - tlp_before, 2, "two TLPs");
+
+    // Budget spent (TLP_MAX_PROBES = 2) — no third probe; the RTO is the
+    // backstop and has NOT yet fired (the clock is still well under 1 s).
+    clear_tx();
+    kernel_core::clock::mock::advance(100);
+    super::on_tcp_tick();
+    assert!(tx().is_empty(), "no third probe — TLP budget spent, RTO not yet due");
+    assert_eq!(super::diag::COUNTERS.tlp_probes.get() - tlp_before, 2, "TLP capped at 2");
+    assert_eq!(
+        super::diag::COUNTERS.data_retransmits.get(),
+        rto_before,
+        "the RTO still hasn't fired",
+    );
+}
+
 /// Locate the live (non-listener) connection for a client/server
 /// port pair and return its `(handle, generation)` so a scenario
 /// can drive the real send path (`async_try_send_chain`).

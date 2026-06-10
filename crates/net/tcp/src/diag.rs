@@ -110,6 +110,9 @@ pub struct Counters {
     /// RFC 6298 data retransmissions — the oldest unacked segment
     /// resent after its RTO expired.
     pub data_retransmits: Counter,
+    /// RFC 8985 Tail Loss Probes — `snd_una` resent at the PTO (before
+    /// the RTO) to recover a tail loss without a backed-off RTO stall.
+    pub tlp_probes: Counter,
     /// FIN retransmissions — a `FinWait1` / `LastAck` FIN resent
     /// because the peer hadn't acknowledged it.
     pub fin_retransmits: Counter,
@@ -165,6 +168,7 @@ impl Counters {
             rx_ring_oom: Counter::new(),
             rtx_alloc_fail: Counter::new(),
             data_retransmits: Counter::new(),
+            tlp_probes: Counter::new(),
             fin_retransmits: Counter::new(),
             persist_probes: Counter::new(),
             rx_chunk_stash_hits: Counter::new(),
@@ -557,7 +561,7 @@ pub fn record_teardown(reason: TeardownReason, state: TcpState) {
 
 /// Counter `(name, value)` pairs in declaration order — the flat
 /// half of the `/obs` `"tcp"` block.
-pub fn snapshot() -> [(&'static str, u64); 28] {
+pub fn snapshot() -> [(&'static str, u64); 29] {
     let c = &COUNTERS;
     [
         ("syn_rx", c.syn_rx.get()),
@@ -578,6 +582,7 @@ pub fn snapshot() -> [(&'static str, u64); 28] {
         ("rx_ring_oom", c.rx_ring_oom.get()),
         ("rtx_alloc_fail", c.rtx_alloc_fail.get()),
         ("data_retransmits", c.data_retransmits.get()),
+        ("tlp_probes", c.tlp_probes.get()),
         ("fin_retransmits", c.fin_retransmits.get()),
         ("persist_probes", c.persist_probes.get()),
         ("rx_chunk_stash_hits", c.rx_chunk_stash_hits.get()),

@@ -62,7 +62,11 @@ pub fn on_tcp_tick() {
         let next = c.tick_next;
         armed += 1;
 
-        // RFC 6298 data retransmission.
+        // RFC 6298 data retransmission — or, when the RTO is not yet due,
+        // an RFC 8985 Tail Loss Probe (PTO < RTO) to recover a tail loss in
+        // ~one PTO instead of a backed-off RTO. The two are mutually
+        // exclusive per tick: if a coarse tick jumps past *both* deadlines,
+        // the congestion-aware RTO supersedes the probe.
         if c.rtx_deadline_ms != 0 && now >= c.rtx_deadline_ms {
             if c.rtx_backoff >= RTX_MAX_RETRIES {
                 crate::diag::record_teardown(crate::diag::TeardownReason::RtxGiveup, c.state);
@@ -71,6 +75,13 @@ pub fn on_tcp_tick() {
             }
             crate::diag::COUNTERS.data_retransmits.bump();
             c.retransmit_oldest(now);
+        } else if c.tlp_deadline_ms != 0 && now >= c.tlp_deadline_ms {
+            if c.state == TcpState::Established {
+                c.send_tlp_probe(now);
+            } else {
+                // Timer outlived Established (sending task gone) — disarm.
+                c.tlp_deadline_ms = 0;
+            }
         }
 
         // RFC 9293 §3.8.6.1 zero-window persist. Probe a peer that
@@ -133,6 +144,7 @@ pub fn on_tcp_tick() {
         // (`tick_in_list` is still true), so the in_list flag stays
         // accurate for the steady-state re-arm case.
         let still_armed = c.rtx_deadline_ms != 0
+            || c.tlp_deadline_ms != 0
             || c.persist_deadline_ms != 0
             || c.lifecycle_deadline_ms != 0;
         if still_armed {
