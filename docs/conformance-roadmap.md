@@ -323,9 +323,16 @@ on top (RFC 9114 framing + RFC 9204 QPACK) is tracked in
   `server_app_secret`, toggles `send_key_phase`, stamps the 1-RTT
   KEY_PHASE bit). Unit-tested
   (`key_update_rotates_send_keys_and_toggles_phase`).
-- **Missing**: Retry-token handling (we don't send Retry / validate its
-  token — an anti-amplification / DoS hardening, not a correctness gap
-  for the common path), and connection migration.
+- ✅ **Path validation** (RFC 9000 §8.2.2) — **done**. A received
+  PATH_CHALLENGE is now echoed in a PATH_RESPONSE (was parsed-and-
+  dropped). This is the primitive connection migration / NAT-rebinding
+  rely on. **Remaining for full migration**: switching the active
+  peer address + CID after a validated path change (L; the echo is the
+  foundation).
+- **Optional / not a correctness gap**: Retry-token handling — we don't
+  send Retry packets; we use the RFC 9000 §8.1 3× anti-amplification
+  limit (the baseline mechanism) instead, which is conformant. Retry is
+  an additional optional DoS hardening, not required.
 - **Conformance test**: scripted Initial / Retry / key-update cases in
   `quic_test`.
 
