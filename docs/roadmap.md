@@ -11,6 +11,7 @@ Granular live work lives in the backlog trackers, not here:
 - TCP RFC gaps — [`tcp-backlog.md`](tcp-backlog.md)
 - Per-byte RX/TX cost — [`rx-path-optimizations.md`](rx-path-optimizations.md) / [`tx-path-optimizations.md`](tx-path-optimizations.md)
 - Inter-layer API contracts / the two-stacks → one-golden-path direction — [`stack-architecture.md`](stack-architecture.md)
+- System-level long-term directions (capabilities, deterministic simulation, completion-driven reactor, transport engine, flow steering, memory arenas, structural cancel-safety) — [`architecture-audit.md`](architecture-audit.md)
 
 This doc is the higher-level "what major work remains" view that ties those together.
 

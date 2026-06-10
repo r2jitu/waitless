@@ -14,6 +14,7 @@ dispatches packets today) and [`stack-architecture.md`](stack-architecture.md)
 
 | Doc | What it owns |
 |-----|--------------|
+| [`architecture-audit.md`](architecture-audit.md) | **System-level long-term directions** (2026-06 whole-codebase audit): ambient authority → capabilities, deterministic simulation testing, completion-driven reactor, one reliable-transport engine, flow-ownership plane, per-conn memory arenas, structural cancel-safety — each grounded in a measured incident, with first increments and a do-not-change list. One level above `stack-architecture.md`'s contracts. |
 | [`stack-architecture.md`](stack-architecture.md) | Inter-layer contracts and stack shape — the buffer currency, the stream trait, the handler API, the NIC/reactor backend abstraction, the **shared TCP+QUIC congestion-control / loss-recovery / pacing core**, and the two-stacks → one-golden-path convergence. The design/proposal lens; owns *structure*, not per-byte cost. |
 | [`networking.md`](networking.md) | The RX/TX dispatch model as it works *today*: Tier 1 (per-core queue) vs Tier 2 (rotating distributor). The current-reality counterpart to `stack-architecture.md`. |
 | [`iobuf-type-model.md`](iobuf-type-model.md) | The `iobuf` ownership / `Send` type model (`OwnedIOBuf`, `Chain<B>`, `IOBufRead`, the uniform drop/free + refcount-share contracts). |
