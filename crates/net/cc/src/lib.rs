@@ -46,8 +46,13 @@ impl Rtt {
 pub trait CongestionControl {
     /// `bytes_acked` newly-acknowledged bytes; `in_flight` is the bytes
     /// still unacknowledged *after* this ack is applied by the caller; `rtt`
-    /// the current estimate. Grows the window (slow start or AIMD).
-    fn on_ack(&mut self, bytes_acked: u32, in_flight: u32, rtt: Rtt);
+    /// the current estimate; `now_ms` a monotonic millisecond timestamp.
+    /// Grows the window (slow start or AIMD).
+    ///
+    /// `now_ms` is the wall-position on a per-flow monotonic clock — only
+    /// time-based controllers (CUBIC's `W_cubic(t)`) consult it; NewReno
+    /// ignores it, so a Reno flow is byte-identical with or without it.
+    fn on_ack(&mut self, bytes_acked: u32, in_flight: u32, rtt: Rtt, now_ms: u64);
 
     /// A loss was declared (`bytes_lost` bytes). `persistent` = persistent
     /// congestion (RFC 9002 §7.6 / repeated RTO): collapse to the minimum
@@ -198,7 +203,7 @@ impl NewReno {
 }
 
 impl CongestionControl for NewReno {
-    fn on_ack(&mut self, bytes_acked: u32, _in_flight: u32, rtt: Rtt) {
+    fn on_ack(&mut self, bytes_acked: u32, _in_flight: u32, rtt: Rtt, _now_ms: u64) {
         if rtt.smoothed_us != 0 {
             self.srtt_us = rtt.smoothed_us;
         }
@@ -287,6 +292,407 @@ impl CongestionControl for NewReno {
     }
 }
 
+// ── CUBIC (RFC 8312) ────────────────────────────────────────────────────────
+//
+// CUBIC replaces Reno's RTT-clocked linear increase with a cubic function of
+// the *wall-clock* time `t` since the last congestion event:
+//
+//     W_cubic(t) = C·(t − K)³ + W_max          K = ∛( W_max·(1−β) / C )
+//
+// W_max is the window at the last loss; the curve starts at W_max·β (the
+// reduced window), climbs *concavely* back toward W_max (probing cautiously
+// near the last-known-good point), then *convexly* past it (probing for new
+// capacity). Because growth is keyed to elapsed time, not ACK arrivals, CUBIC
+// is RTT-fair and fills high-bandwidth·delay paths far faster than Reno —
+// which is exactly the WAN gap this closes. Constants per RFC 8312:
+// C = 0.4, β_cubic = 717/1024 ≈ 0.7.
+//
+// All fixed-point integer math (no FPU in the kernel, host-unit-testable):
+// time in ms, windows in bytes. The only transcendental is the cube root,
+// done by [`icbrt_u128`]. The TCP-friendly region (§4.2) keeps CUBIC at least
+// as aggressive as Reno on short-RTT paths so it never regresses the LAN.
+
+/// β_cubic numerator/denominator (RFC 8312 §4.5: 0.7, the Linux 717/1024).
+const BETA_NUM: u64 = 717;
+const BETA_DEN: u64 = 1024;
+
+/// Largest `c` with `c³ ≤ x` — integer cube root, overflow-safe over the full
+/// `u128` range (Newton's method from an overshoot, then an exact adjust using
+/// checked multiplication so we never form `c³` when it would overflow).
+pub fn icbrt_u128(x: u128) -> u128 {
+    if x < 8 {
+        return u128::from(x > 0);
+    }
+    // Overshoot start: 2^ceil(bits/3) ≥ ∛x. bits = 128 − leading_zeros.
+    let bits = 128 - x.leading_zeros();
+    let mut y: u128 = 1 << bits.div_ceil(3);
+    // Newton: y ← (2y + x/y²)/3, monotonically decreasing to the floor.
+    loop {
+        let next = (2 * y + x / (y * y)) / 3;
+        if next >= y {
+            break;
+        }
+        y = next;
+    }
+    // Exact floor adjust. `cube_le(c)` = `c³ ≤ x` without overflow.
+    let cube_le = |c: u128| -> bool {
+        match c.checked_mul(c).and_then(|c2| c2.checked_mul(c)) {
+            Some(c3) => c3 <= x,
+            None => false, // c³ overflowed u128 ⇒ certainly > x
+        }
+    };
+    while y > 0 && !cube_le(y) {
+        y -= 1;
+    }
+    while cube_le(y + 1) {
+        y += 1;
+    }
+    y
+}
+
+/// CUBIC (RFC 8312). Slow start and the one-reduction-per-episode recovery
+/// hold are shared with [`NewReno`]; the difference is the congestion-avoidance
+/// growth law (the cubic curve + TCP-friendly floor) and the larger β = 0.7
+/// multiplicative-decrease factor (vs Reno's 0.5).
+#[derive(Clone, Copy, Debug)]
+pub struct Cubic {
+    mss: u32,
+    cwnd: u32,
+    ssthresh: u32,
+    /// Window at the last congestion event (the cubic origin's height).
+    w_max: u32,
+    /// Previous `w_max`, for fast convergence (§4.6).
+    w_last_max: u32,
+    /// Cubic origin height in bytes (= `w_max`, or `cwnd` if already above it).
+    origin_point: u32,
+    /// `K` in ms — time from the epoch to when the curve regains `w_max`.
+    k_ms: u64,
+    /// Monotonic ms timestamp of the current epoch start; `0` = not yet set
+    /// (recompute `K`/origin on the next congestion-avoidance ack).
+    epoch_start_ms: u64,
+    srtt_us: u32,
+    min_rtt_us: u32,
+    in_recovery: bool,
+    recovery_rem_bytes: u32,
+    max_window: u32,
+    slow_start_cap: u32,
+}
+
+impl Cubic {
+    pub const fn new(mss: u32) -> Self {
+        let mss = if mss == 0 { DEFAULT_MSS } else { mss };
+        Cubic {
+            mss,
+            cwnd: initial_window(mss),
+            ssthresh: u32::MAX,
+            w_max: 0,
+            w_last_max: 0,
+            origin_point: 0,
+            k_ms: 0,
+            epoch_start_ms: 0,
+            srtt_us: 0,
+            min_rtt_us: 0,
+            in_recovery: false,
+            recovery_rem_bytes: 0,
+            max_window: max_u32(DEFAULT_MAX_WINDOW, initial_window(mss)),
+            slow_start_cap: 0,
+        }
+    }
+
+    pub const fn with_default_mss() -> Self {
+        Self::new(DEFAULT_MSS)
+    }
+
+    pub fn set_max_window(&mut self, max: u32) {
+        self.max_window = max_u32(max, initial_window(self.mss));
+    }
+
+    pub fn set_slow_start_cap(&mut self, cap: u32) {
+        self.slow_start_cap = cap;
+    }
+
+    pub fn ssthresh(&self) -> u32 {
+        self.ssthresh
+    }
+
+    pub fn in_slow_start(&self) -> bool {
+        self.cwnd < self.ssthresh
+    }
+
+    /// RTT for the time-based law: prefer min-RTT (less noisy, RFC 8312 uses
+    /// the smoothed/again-min for the TCP-friendly term); fall back to SRTT,
+    /// then to a 1 ms floor so the division is always defined.
+    fn rtt_ms(&self) -> u64 {
+        let us = if self.min_rtt_us != 0 {
+            self.min_rtt_us
+        } else {
+            self.srtt_us
+        };
+        max_u32(us / 1000, 1) as u64
+    }
+
+    /// `W_cubic(t)` in bytes (§4.1). `delta = mss · C · (t−K)³`, with
+    /// `t,K` in ms and `C = 0.4`: scaling `(t−K)³` ms³ → s³ is `/1e9`, times
+    /// `C` is `·4/1e10`. Signed — below the origin while `t < K`.
+    fn w_cubic(&self, t_ms: u64) -> u32 {
+        let dt = t_ms as i128 - self.k_ms as i128;
+        let cube = dt * dt * dt;
+        let delta = (self.mss as i128 * cube * 4) / 10_000_000_000;
+        let w = self.origin_point as i128 + delta;
+        let lo = minimum_window(self.mss) as i128;
+        let hi = self.max_window as i128;
+        w.clamp(lo, hi) as u32
+    }
+
+    /// `W_est(t)` — the TCP-friendly (Reno-equivalent) window (§4.2):
+    /// `W_max·β + 3·(1−β)/(1+β)·(t/RTT)`. With β = 717/1024 the slope
+    /// `3(1−β)/(1+β) = 921/1741`. A *floor* under `W_cubic` so CUBIC never
+    /// grows slower than Reno on short-RTT paths.
+    fn w_est(&self, t_ms: u64, rtt_ms: u64) -> u32 {
+        let base = (self.w_max as u64 * BETA_NUM) / BETA_DEN;
+        let grow = (921u64 * t_ms * self.mss as u64) / (1741 * rtt_ms);
+        base.saturating_add(grow).min(self.max_window as u64) as u32
+    }
+
+    /// Congestion-avoidance growth (one ACK of `bytes_acked`). Establishes the
+    /// epoch lazily on the first CA ack after a loss, then nudges `cwnd` toward
+    /// `max(W_cubic(t+RTT), W_est(t))`.
+    fn cubic_avoid(&mut self, bytes_acked: u32, now_ms: u64) {
+        if self.epoch_start_ms == 0 {
+            self.epoch_start_ms = now_ms.max(1); // 0 is the "unset" sentinel
+            if self.cwnd >= self.w_max {
+                self.k_ms = 0;
+                self.origin_point = self.cwnd;
+            } else {
+                // K = ∛((w_max−cwnd)/mss / C) seconds, ·1000 → ms, with
+                // 1/C = 5/2: ∛(N·1e9·5/2) = ∛(N·2.5e9). N = (w_max−cwnd)/mss.
+                let num = (self.w_max - self.cwnd) as u128 * 2_500_000_000u128
+                    / self.mss as u128;
+                self.k_ms = icbrt_u128(num) as u64;
+                self.origin_point = self.w_max;
+            }
+        }
+        let t = now_ms.saturating_sub(self.epoch_start_ms);
+        let rtt_ms = self.rtt_ms();
+        let target = max_u32(self.w_cubic(t + rtt_ms), self.w_est(t, rtt_ms));
+        if target > self.cwnd {
+            // Approach `target` over ~one RTT: +(target−cwnd)·acked/cwnd,
+            // bounded by the bytes acked (never faster than slow start) and at
+            // least 1 byte of progress; clamp so we don't overshoot.
+            let inc = ((target - self.cwnd) as u64 * bytes_acked as u64
+                / self.cwnd as u64) as u32;
+            let inc = max_u32(min_u32(inc, bytes_acked), 1);
+            self.cwnd = min_u32(self.cwnd.saturating_add(inc), target);
+        } else {
+            // At/above the target: crawl (Linux's cnt = 100·cwnd region).
+            let inc = (self.mss as u64 * bytes_acked as u64
+                / (100 * self.cwnd as u64)) as u32;
+            self.cwnd = self.cwnd.saturating_add(inc);
+        }
+    }
+}
+
+impl CongestionControl for Cubic {
+    fn on_ack(&mut self, bytes_acked: u32, _in_flight: u32, rtt: Rtt, now_ms: u64) {
+        if rtt.smoothed_us != 0 {
+            self.srtt_us = rtt.smoothed_us;
+        }
+        if rtt.min_us != 0 {
+            self.min_rtt_us = rtt.min_us;
+        }
+        if bytes_acked == 0 {
+            return;
+        }
+        // Recovery hold — identical to NewReno: one reduction per congestion
+        // event, ended by ~one window of fresh acks (the real-RTT collapse
+        // guard, task #52). Epoch stays unset through the hold so `t` is
+        // measured from when growth actually resumes.
+        if self.in_recovery {
+            self.recovery_rem_bytes = self.recovery_rem_bytes.saturating_sub(bytes_acked);
+            if self.recovery_rem_bytes == 0 {
+                self.in_recovery = false;
+            }
+            return;
+        }
+        if self.cwnd < self.ssthresh {
+            // Slow start: same exponential byte-counting as Reno, same L cap.
+            let room = self.ssthresh.saturating_sub(self.cwnd);
+            let mut inc = min_u32(bytes_acked, room);
+            if self.slow_start_cap != 0 {
+                inc = min_u32(inc, self.slow_start_cap);
+            }
+            self.cwnd = self.cwnd.saturating_add(inc);
+        } else {
+            self.cubic_avoid(bytes_acked, now_ms);
+        }
+        self.cwnd = min_u32(self.cwnd, self.max_window);
+    }
+
+    fn on_loss(&mut self, _bytes_lost: u32, persistent: bool) {
+        if persistent {
+            // Collapse to the minimum window and restart slow start; remember
+            // the level for the post-recovery CA re-entry.
+            self.ssthresh = max_u32((self.cwnd as u64 * BETA_NUM / BETA_DEN) as u32, minimum_window(self.mss));
+            self.w_max = self.cwnd;
+            self.w_last_max = 0;
+            self.cwnd = minimum_window(self.mss);
+            self.epoch_start_ms = 0;
+            self.recovery_rem_bytes = self.cwnd;
+            self.in_recovery = true;
+            return;
+        }
+        if self.in_recovery {
+            return; // one reduction per episode
+        }
+        let pre = self.cwnd;
+        // Fast convergence (§4.6): if we lost before regaining the previous
+        // W_max, more flows are likely sharing the path — pull the origin
+        // down further so the curve converges to the fair share faster.
+        if pre < self.w_last_max {
+            self.w_last_max = pre;
+            self.w_max = (pre as u64 * (BETA_DEN + BETA_NUM) / (2 * BETA_DEN)) as u32;
+        } else {
+            self.w_last_max = pre;
+            self.w_max = pre;
+        }
+        self.ssthresh = max_u32((pre as u64 * BETA_NUM / BETA_DEN) as u32, minimum_window(self.mss));
+        self.cwnd = self.ssthresh;
+        self.epoch_start_ms = 0; // recompute K/origin on the next CA ack
+        self.recovery_rem_bytes = max_u32(pre, minimum_window(self.mss));
+        self.in_recovery = true;
+    }
+
+    fn on_rto(&mut self) {
+        self.on_loss(0, true);
+    }
+
+    fn window(&self) -> u32 {
+        min_u32(max_u32(self.cwnd, minimum_window(self.mss)), self.max_window)
+    }
+
+    fn pacing_rate(&self) -> u64 {
+        if self.srtt_us == 0 {
+            return 0;
+        }
+        let n_num: u64 = if self.in_slow_start() { 2 } else { 5 };
+        let n_den: u64 = if self.in_slow_start() { 1 } else { 4 };
+        let cwnd = self.window() as u64;
+        cwnd.saturating_mul(1_000_000).saturating_mul(n_num) / (self.srtt_us as u64 * n_den)
+    }
+}
+
+/// Which congestion-control algorithm a [`Controller`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Algorithm {
+    /// RFC 5681 / RFC 9002 §7 NewReno — the conservative default.
+    Reno,
+    /// RFC 8312 CUBIC — faster fill on high-BDP / high-RTT (WAN) paths.
+    Cubic,
+}
+
+/// The default algorithm new flows use. **Reno** so the golden path is
+/// byte-identical to before CUBIC landed; CUBIC is opt-in until the GCE/netem
+/// throughput A/B justifies flipping it (its correctness *is* its throughput
+/// behaviour on real paths — see `docs/tcp-backlog.md`).
+pub const DEFAULT_ALGORITHM: Algorithm = Algorithm::Reno;
+
+/// Runtime-selectable congestion controller — a thin enum over [`NewReno`] and
+/// [`Cubic`] so a transport can A/B the two without monomorphising its whole
+/// connection type. Both variants are `Copy`, no-alloc, `no_std`.
+#[derive(Clone, Copy, Debug)]
+pub enum Controller {
+    Reno(NewReno),
+    Cubic(Cubic),
+}
+
+impl Controller {
+    /// New controller running [`DEFAULT_ALGORITHM`].
+    pub const fn new(mss: u32) -> Self {
+        Self::with(mss, DEFAULT_ALGORITHM)
+    }
+
+    /// New controller running `algo`.
+    pub const fn with(mss: u32, algo: Algorithm) -> Self {
+        match algo {
+            Algorithm::Reno => Controller::Reno(NewReno::new(mss)),
+            Algorithm::Cubic => Controller::Cubic(Cubic::new(mss)),
+        }
+    }
+
+    /// Default-MSS controller running [`DEFAULT_ALGORITHM`].
+    pub const fn with_default_mss() -> Self {
+        Self::new(DEFAULT_MSS)
+    }
+
+    pub fn algorithm(&self) -> Algorithm {
+        match self {
+            Controller::Reno(_) => Algorithm::Reno,
+            Controller::Cubic(_) => Algorithm::Cubic,
+        }
+    }
+
+    pub fn set_max_window(&mut self, max: u32) {
+        match self {
+            Controller::Reno(c) => c.set_max_window(max),
+            Controller::Cubic(c) => c.set_max_window(max),
+        }
+    }
+
+    pub fn set_slow_start_cap(&mut self, cap: u32) {
+        match self {
+            Controller::Reno(c) => c.set_slow_start_cap(cap),
+            Controller::Cubic(c) => c.set_slow_start_cap(cap),
+        }
+    }
+
+    pub fn ssthresh(&self) -> u32 {
+        match self {
+            Controller::Reno(c) => c.ssthresh(),
+            Controller::Cubic(c) => c.ssthresh(),
+        }
+    }
+
+    pub fn in_slow_start(&self) -> bool {
+        match self {
+            Controller::Reno(c) => c.in_slow_start(),
+            Controller::Cubic(c) => c.in_slow_start(),
+        }
+    }
+}
+
+impl CongestionControl for Controller {
+    fn on_ack(&mut self, bytes_acked: u32, in_flight: u32, rtt: Rtt, now_ms: u64) {
+        match self {
+            Controller::Reno(c) => c.on_ack(bytes_acked, in_flight, rtt, now_ms),
+            Controller::Cubic(c) => c.on_ack(bytes_acked, in_flight, rtt, now_ms),
+        }
+    }
+    fn on_loss(&mut self, bytes_lost: u32, persistent: bool) {
+        match self {
+            Controller::Reno(c) => c.on_loss(bytes_lost, persistent),
+            Controller::Cubic(c) => c.on_loss(bytes_lost, persistent),
+        }
+    }
+    fn on_rto(&mut self) {
+        match self {
+            Controller::Reno(c) => c.on_rto(),
+            Controller::Cubic(c) => c.on_rto(),
+        }
+    }
+    fn window(&self) -> u32 {
+        match self {
+            Controller::Reno(c) => c.window(),
+            Controller::Cubic(c) => c.window(),
+        }
+    }
+    fn pacing_rate(&self) -> u64 {
+        match self {
+            Controller::Reno(c) => c.pacing_rate(),
+            Controller::Cubic(c) => c.pacing_rate(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,7 +726,7 @@ mod tests {
         let start = cc.window();
         // Ack a full window worth of bytes → cwnd should ~double (one
         // window per RTT in slow start).
-        cc.on_ack(start, 0, rtt());
+        cc.on_ack(start, 0, rtt(), 0);
         assert_eq!(cc.window(), start * 2);
     }
 
@@ -328,7 +734,7 @@ mod tests {
     fn loss_halves_once_per_episode() {
         let mut cc = NewReno::new(MSS);
         // Grow a bit first.
-        cc.on_ack(cc.window(), 0, rtt());
+        cc.on_ack(cc.window(), 0, rtt(), 0);
         let before = cc.window();
         cc.on_loss(MSS, false);
         let after = cc.window();
@@ -339,14 +745,14 @@ mod tests {
         assert_eq!(cc.window(), after);
         // A SINGLE ack must NOT end the recovery period (the real-RTT bug: at
         // several acks per RTT, that let a loss cluster halve once per loss).
-        cc.on_ack(MSS, 0, rtt());
+        cc.on_ack(MSS, 0, rtt(), 0);
         cc.on_loss(MSS, false);
         assert_eq!(cc.window(), after, "one ack must not reopen reductions");
         // Only after ~a full window of acks does the episode end; a fresh loss
         // then reduces again (a new congestion event).
         let mut acked = 0;
         while acked < before {
-            cc.on_ack(MSS, 0, rtt());
+            cc.on_ack(MSS, 0, rtt(), 0);
             acked += MSS;
         }
         let grown = cc.window();
@@ -358,14 +764,14 @@ mod tests {
     fn congestion_avoidance_is_additive() {
         let mut cc = NewReno::new(MSS);
         // Force into congestion avoidance via a loss (sets ssthresh<=cwnd).
-        cc.on_ack(cc.window(), 0, rtt());
+        cc.on_ack(cc.window(), 0, rtt(), 0);
         let pre = cc.window();
         cc.on_loss(MSS, false);
         // Drain the recovery period (~one pre-loss window of acks) so cwnd is
         // free to grow again; now cwnd>=ssthresh → CA.
         let mut drain = 0;
         while drain < pre {
-            cc.on_ack(MSS, 0, rtt());
+            cc.on_ack(MSS, 0, rtt(), 0);
             drain += MSS;
         }
         assert!(!cc.in_slow_start());
@@ -373,7 +779,7 @@ mod tests {
         // Acking ~one full window should add ~one MSS (additive increase).
         let mut acked = 0;
         while acked < w0 {
-            cc.on_ack(MSS, 0, rtt());
+            cc.on_ack(MSS, 0, rtt(), 0);
             acked += MSS;
         }
         let grew = cc.window() - w0;
@@ -384,12 +790,12 @@ mod tests {
     #[test]
     fn persistent_congestion_collapses_to_min() {
         let mut cc = NewReno::new(MSS);
-        cc.on_ack(cc.window() * 4, 0, rtt()); // grow
+        cc.on_ack(cc.window() * 4, 0, rtt(), 0); // grow
         cc.on_loss(MSS, true);
         assert_eq!(cc.window(), minimum_window(MSS));
         // RTO is the same.
         let mut cc2 = NewReno::new(MSS);
-        cc2.on_ack(cc2.window() * 4, 0, rtt());
+        cc2.on_ack(cc2.window() * 4, 0, rtt(), 0);
         cc2.on_rto();
         assert_eq!(cc2.window(), minimum_window(MSS));
     }
@@ -410,7 +816,7 @@ mod tests {
         // lossless path; the cap must hold.
         for _ in 0..40 {
             let w = cc.window();
-            cc.on_ack(w, 0, rtt());
+            cc.on_ack(w, 0, rtt(), 0);
         }
         assert_eq!(cc.window(), DEFAULT_MAX_WINDOW);
         // A lower override is honored (clamped to ≥ initial window).
@@ -432,11 +838,11 @@ mod tests {
     fn pacing_rate_scales_with_cwnd_over_rtt() {
         let mut cc = NewReno::new(MSS);
         assert_eq!(cc.pacing_rate(), 0); // no RTT sample yet
-        cc.on_ack(MSS, 0, rtt());
+        cc.on_ack(MSS, 0, rtt(), 0);
         let r1 = cc.pacing_rate();
         assert!(r1 > 0);
         // Bigger cwnd (more acks) → higher rate at the same RTT.
-        cc.on_ack(cc.window(), 0, rtt());
+        cc.on_ack(cc.window(), 0, rtt(), 0);
         assert!(cc.pacing_rate() > r1);
     }
 
@@ -450,7 +856,7 @@ mod tests {
         // Grow into a healthy window.
         for _ in 0..6 {
             let w = cc.window();
-            cc.on_ack(w, 0, rtt());
+            cc.on_ack(w, 0, rtt(), 0);
         }
         let pre = cc.window();
         assert!(pre > 8 * minimum_window(MSS), "need headroom to see a collapse");
@@ -458,7 +864,7 @@ mod tests {
         // small acks (as a real-RTT flow sees). cwnd must halve at most once.
         for _ in 0..20 {
             cc.on_loss(MSS, false);
-            cc.on_ack(MSS, 0, rtt()); // a few packets ack within the same RTT
+            cc.on_ack(MSS, 0, rtt(), 0); // a few packets ack within the same RTT
         }
         let after = cc.window();
         // Exactly one halving (to ssthresh), NOT a collapse to the floor.
@@ -476,14 +882,147 @@ mod tests {
         let mut cc = NewReno::new(MSS);
         cc.set_slow_start_cap(2 * MSS);
         let before = cc.window();
-        cc.on_ack(10 * MSS, 0, rtt());
+        cc.on_ack(10 * MSS, 0, rtt(), 0);
         assert_eq!(cc.window(), before + 2 * MSS, "stretch-ACK capped at 2·MSS");
         // Uncapped (paced default): the same stretch-ACK opens by the full
         // bytes acked (still bounded by room-to-ssthresh, here effectively
         // infinite at start).
         let mut paced = NewReno::new(MSS);
         let before = paced.window();
-        paced.on_ack(10 * MSS, 0, rtt());
+        paced.on_ack(10 * MSS, 0, rtt(), 0);
         assert_eq!(paced.window(), before + 10 * MSS, "uncapped grows by bytes acked");
+    }
+
+    // ── CUBIC ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn icbrt_is_exact_floor() {
+        assert_eq!(icbrt_u128(0), 0);
+        assert_eq!(icbrt_u128(1), 1);
+        assert_eq!(icbrt_u128(7), 1);
+        assert_eq!(icbrt_u128(8), 2);
+        assert_eq!(icbrt_u128(26), 2);
+        assert_eq!(icbrt_u128(27), 3);
+        assert_eq!(icbrt_u128(63), 3);
+        assert_eq!(icbrt_u128(64), 4);
+        assert_eq!(icbrt_u128(1_000_000), 100);
+        assert_eq!(icbrt_u128(999_999), 99);
+        // Exact around an arbitrary large perfect cube.
+        let n: u128 = 1_234_567;
+        let cube = n * n * n;
+        assert_eq!(icbrt_u128(cube), n);
+        assert_eq!(icbrt_u128(cube - 1), n - 1);
+        assert_eq!(icbrt_u128(cube + 1), n);
+        // Near the top of the range (no overflow in the adjust).
+        let big = (u128::MAX >> 1) - 12345;
+        let r = icbrt_u128(big);
+        assert!(r * r * r <= big);
+        assert!((r + 1).checked_mul(r + 1).and_then(|v| v.checked_mul(r + 1)).is_none_or(|v| v > big));
+    }
+
+    /// The scaling check that validates the whole fixed-point cubic: at the
+    /// epoch (`t=0`) the curve sits at the reduced window `W_max·β`, regains
+    /// `W_max` exactly at `t=K`, and grows convex above it afterwards.
+    #[test]
+    fn w_cubic_curve_hits_known_points() {
+        let mut cc = Cubic::new(MSS);
+        let w_max = 144_000u32; // 100 MSS
+        let entry = (w_max as u64 * BETA_NUM / BETA_DEN) as u32; // ≈ 0.7·W_max
+        cc.w_max = w_max;
+        cc.cwnd = entry;
+        cc.origin_point = w_max;
+        let num = (w_max - entry) as u128 * 2_500_000_000u128 / MSS as u128;
+        cc.k_ms = icbrt_u128(num) as u64;
+        assert!(cc.k_ms > 3000 && cc.k_ms < 5000, "K≈4.2s, got {}", cc.k_ms);
+        // t=0 → reduced window (within a segment of rounding).
+        let w0 = cc.w_cubic(0);
+        assert!(w0.abs_diff(entry) <= MSS, "w_cubic(0)={w0} entry={entry}");
+        // t=K → W_max (within a segment).
+        let wk = cc.w_cubic(cc.k_ms);
+        assert!(wk.abs_diff(w_max) <= MSS, "w_cubic(K)={wk} w_max={w_max}");
+        // Past K → strictly above W_max (convex probing).
+        assert!(cc.w_cubic(cc.k_ms + 2000) > w_max);
+        // Monotonically increasing across the epoch.
+        assert!(cc.w_cubic(cc.k_ms / 2) > w0);
+    }
+
+    #[test]
+    fn cubic_loss_uses_beta_0_7_not_half() {
+        let mut cc = Cubic::new(MSS);
+        // Slow start to a healthy window (3 doublings from IW).
+        for _ in 0..3 {
+            let w = cc.window();
+            cc.on_ack(w, 0, rtt(), 0);
+        }
+        let pre = cc.window();
+        cc.on_loss(MSS, false);
+        let expect = max_u32((pre as u64 * BETA_NUM / BETA_DEN) as u32, minimum_window(MSS));
+        assert_eq!(cc.window(), expect, "CUBIC reduces by β=0.7, not 0.5");
+        // Reno would have halved — confirm CUBIC keeps strictly more.
+        assert!(cc.window() > pre / 2, "CUBIC retains more window than Reno");
+    }
+
+    #[test]
+    fn cubic_clustered_losses_reduce_once() {
+        // Same one-reduction-per-episode guard as Reno (task #52 regression).
+        let mut cc = Cubic::new(MSS);
+        for _ in 0..4 {
+            let w = cc.window();
+            cc.on_ack(w, 0, rtt(), 0);
+        }
+        let pre = cc.window();
+        for i in 0..20 {
+            cc.on_loss(MSS, false);
+            cc.on_ack(MSS, 0, rtt(), 100 + i); // a few acks within the RTT
+        }
+        let expect = max_u32((pre as u64 * BETA_NUM / BETA_DEN) as u32, minimum_window(MSS));
+        assert_eq!(cc.window(), expect, "clustered losses must reduce once");
+    }
+
+    #[test]
+    fn cubic_grows_over_time_in_avoidance() {
+        let mut cc = Cubic::new(MSS);
+        for _ in 0..3 {
+            let w = cc.window();
+            cc.on_ack(w, 0, rtt(), 0);
+        }
+        let pre = cc.window();
+        cc.on_loss(MSS, false);
+        // Drain the recovery hold (~one pre-loss window of acks) so growth resumes.
+        let mut t = 100u64;
+        let mut acked = 0;
+        while acked < pre {
+            t += 5;
+            cc.on_ack(MSS, 0, rtt(), t);
+            acked += MSS;
+        }
+        assert!(!cc.in_slow_start(), "post-loss CUBIC is in congestion avoidance");
+        let w_lo = cc.window();
+        // Advance wall-clock time: the cubic curve must climb back toward W_max.
+        for _ in 0..400 {
+            t += 5;
+            cc.on_ack(MSS, 0, rtt(), t);
+        }
+        let w_hi = cc.window();
+        assert!(w_hi > w_lo, "time-based growth: {w_hi} !> {w_lo}");
+        assert!(w_hi <= pre + MSS, "must not blow past W_max early: {w_hi} vs pre {pre}");
+    }
+
+    #[test]
+    fn controller_defaults_to_reno_and_dispatches() {
+        let c = Controller::new(MSS);
+        assert_eq!(c.algorithm(), Algorithm::Reno);
+        assert_eq!(c.window(), initial_window(MSS));
+        // Reno arm grows exponentially in slow start (byte-identical to NewReno).
+        let mut reno = Controller::new(MSS);
+        let s = reno.window();
+        reno.on_ack(s, 0, rtt(), 0);
+        assert_eq!(reno.window(), s * 2);
+        // Cubic arm selectable and live.
+        let mut cubic = Controller::with(MSS, Algorithm::Cubic);
+        assert_eq!(cubic.algorithm(), Algorithm::Cubic);
+        let s = cubic.window();
+        cubic.on_ack(s, 0, rtt(), 0);
+        assert_eq!(cubic.window(), s * 2, "cubic slow start matches Reno");
     }
 }

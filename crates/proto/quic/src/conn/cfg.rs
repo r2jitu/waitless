@@ -768,7 +768,7 @@ fn pacer_arms_deadline_only_when_limited() {
     // Real-RTT path (50 ms) uncaps: pacing follows cc.pacing_rate, not the
     // fixed cap — the gate still arms a deadline when the budget is spent.
     conn.smoothed_rtt_us = Some(50_000);
-    conn.cc.on_ack(12_000, 0, net_cc::Rtt::new(50_000, 50_000));
+    conn.cc.on_ack(12_000, 0, net_cc::Rtt::new(50_000, 50_000), 0);
     conn.pace_budget = -700;
     assert!(conn.pace_deadline_us().is_some());
 }

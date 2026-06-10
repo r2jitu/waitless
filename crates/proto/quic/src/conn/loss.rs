@@ -213,7 +213,10 @@ impl Connection {
                 self.smoothed_rtt_us.unwrap_or(0) as u32,
                 self.min_rtt_us.unwrap_or(0) as u32,
             );
-            self.cc.on_ack(acked_bytes, self.bytes_in_flight, rtt);
+            // ms timestamp for a time-based controller (CUBIC); NewReno ignores it.
+            let now_ms = tls::ticket::now_us() / 1000;
+            self.cc
+                .on_ack(acked_bytes, self.bytes_in_flight, rtt, now_ms);
         }
         // Loss detection — runs after each ACK in the same space.
         // RFC 9002 §6.1: declare lost any sent packet that's both

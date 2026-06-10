@@ -1157,7 +1157,9 @@ pub struct Connection {
     /// response at line rate. Fed by `process_ack` (on_ack) and
     /// `detect_loss` (on_loss); read at packetization time to gate
     /// the 1-RTT STREAM-data sweep (see `encode_one_rtt_packet`).
-    pub(super) cc: net_cc::NewReno,
+    /// `net_cc::Controller` — NewReno (default) or CUBIC, per
+    /// `net_cc::DEFAULT_ALGORITHM`.
+    pub(super) cc: net_cc::Controller,
     /// Bytes of ack-eliciting data currently in flight (sealed +
     /// sent, not yet acked or declared lost). Incremented in
     /// `record_sent_packet`, decremented in `process_ack` /
@@ -1350,10 +1352,10 @@ impl Connection {
             opened_streams: Vec::new(),
             reaped_streams: [REAPED_STREAM_EMPTY; REAPED_STREAMS_CAP],
             reaped_idx: 0,
-            // NewReno over the QUIC datagram payload size (~1200 B);
-            // initial window = IW10 (RFC 9002 §7.2), matching the old
-            // implicit burst the loss/PTO machinery already assumed.
-            cc: net_cc::NewReno::new(MAX_QUIC_DATAGRAM as u32),
+            // Controller (default NewReno) over the QUIC datagram payload size
+            // (~1200 B); initial window = IW10 (RFC 9002 §7.2), matching the
+            // old implicit burst the loss/PTO machinery already assumed.
+            cc: net_cc::Controller::new(MAX_QUIC_DATAGRAM as u32),
             bytes_in_flight: 0,
             peer_max_data: 0,
             data_sent: 0,

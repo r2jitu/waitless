@@ -419,12 +419,14 @@ pub struct TcpConnection {
     /// triggers fast retransmit; reset by any ACK of new data. Stays here
     /// (not in `cc`) — a TCP wire-event detail net_cc doesn't model.
     pub(crate) dup_acks: u8,
-    /// Shared congestion controller (`net_cc::NewReno`) — the single
-    /// source of truth for cwnd / ssthresh / recovery, the SAME controller
-    /// QUIC drives. TCP feeds it ack/loss/rto events and caches
-    /// `window()` into `cwnd` above. Configured with the RFC 3465
-    /// `L = 2·SMSS` slow-start burst cap (TCP is unpaced).
-    pub(crate) cc: net_cc::NewReno,
+    /// Shared congestion controller (`net_cc::Controller` — NewReno or CUBIC,
+    /// selected at `congestion_init`) — the single source of truth for cwnd /
+    /// ssthresh / recovery, the SAME controller QUIC drives. TCP feeds it
+    /// ack/loss/rto events and caches `window()` into `cwnd` above. Configured
+    /// with the RFC 3465 `L = 2·SMSS` slow-start burst cap (TCP is unpaced).
+    /// Defaults to NewReno (`net_cc::DEFAULT_ALGORITHM`) so the golden path is
+    /// unchanged until the CUBIC netem A/B justifies flipping it.
+    pub(crate) cc: net_cc::Controller,
     /// Free-list link. When this slot is on the free list (state ==
     /// Closed AND the slot has been returned to the pool), this
     /// holds the index of the next free slot, or `NULL_SLOT` for
@@ -662,7 +664,7 @@ impl TcpConnection {
             persist_backoff: 0,
             cwnd: 0,
             dup_acks: 0,
-            cc: net_cc::NewReno::with_default_mss(),
+            cc: net_cc::Controller::with_default_mss(),
             next_free: NULL_SLOT,
             slot_index: 0,
             tick_next: NULL_SLOT,
@@ -1408,7 +1410,7 @@ impl TcpConnection {
     /// start.
     pub(crate) fn congestion_init(&mut self) {
         let smss = mss_for(self.local_ip) as u32;
-        self.cc = net_cc::NewReno::new(smss);
+        self.cc = net_cc::Controller::new(smss);
         // Unpaced sender: keep TCP's RFC 3465 L = 2·SMSS slow-start burst cap.
         self.cc.set_slow_start_cap(2 * smss);
         self.cwnd = self.cc.window();
@@ -1449,7 +1451,11 @@ impl TcpConnection {
         // `flight()` is the post-ack in-flight; the RTT (ms → µs) only feeds
         // `pacing_rate`, which TCP doesn't consume yet.
         let rtt = net_cc::Rtt::new(self.srtt_ms.saturating_mul(1000), 0);
-        self.cc.on_ack(acked, self.flight(), rtt);
+        // `now_ms` is only consulted by a time-based controller (CUBIC); a
+        // NewReno flow ignores it, so the clock read is the only added cost on
+        // the Reno golden path.
+        self.cc
+            .on_ack(acked, self.flight(), rtt, kernel_core::clock::now_ms());
         self.cwnd = self.cc.window();
     }
 
