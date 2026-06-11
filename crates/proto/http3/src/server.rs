@@ -35,7 +35,59 @@ use crate::frame::{self, ftype as h3_ftype};
 use crate::qpack::{self, FieldSink};
 
 /// Stream-type byte for HTTP/3 control streams (RFC 9114 §6.2.1).
-const STREAM_TYPE_CONTROL: u64 = 0x00;
+pub(crate) const STREAM_TYPE_CONTROL: u64 = 0x00;
+
+/// The server request path's view of a QUIC connection — exactly the
+/// slice of [`QuicConn`] that `handle_request` / `write_response` /
+/// `H3Sink` / `H3BodySource` consume. Production monomorphises to
+/// `QuicConn` (zero-cost: every method is a direct delegate); the
+/// in-process loopback tests (client.rs) implement it over a raw
+/// server-role `Connection` pumped against the real QUIC client, so
+/// the REAL h3 server-role processing runs under `bazel test` with no
+/// sockets or runtime. Wire behavior is unchanged by this seam.
+pub(crate) trait ServerConn {
+    async fn recv(&self, sid: u64, out: &mut [u8]) -> (usize, bool);
+    fn queue_iobuf(&self, sid: u64, data: IOBuf);
+    fn send_iobuf(&self, sid: u64, data: IOBuf);
+    fn close_stream(&self, sid: u64);
+    fn discard_recv(&self, sid: u64);
+    fn stream_buffered(&self, sid: u64) -> usize;
+    async fn stream_drain_below(&self, sid: u64, cap: usize);
+    fn is_failed(&self) -> bool;
+    /// S1: abort the response stream (RFC 9000 §19.4) — the
+    /// mid-stream handler-error path.
+    fn reset_stream(&self, sid: u64, app_error_code: u64);
+}
+
+impl ServerConn for QuicConn {
+    async fn recv(&self, sid: u64, out: &mut [u8]) -> (usize, bool) {
+        QuicConn::recv(self, sid, out).await
+    }
+    fn queue_iobuf(&self, sid: u64, data: IOBuf) {
+        QuicConn::queue_iobuf(self, sid, data);
+    }
+    fn send_iobuf(&self, sid: u64, data: IOBuf) {
+        QuicConn::send_iobuf(self, sid, data);
+    }
+    fn close_stream(&self, sid: u64) {
+        QuicConn::close_stream(self, sid);
+    }
+    fn discard_recv(&self, sid: u64) {
+        QuicConn::discard_recv(self, sid);
+    }
+    fn stream_buffered(&self, sid: u64) -> usize {
+        QuicConn::stream_buffered(self, sid)
+    }
+    async fn stream_drain_below(&self, sid: u64, cap: usize) {
+        QuicConn::stream_drain_below(self, sid, cap).await;
+    }
+    fn is_failed(&self) -> bool {
+        QuicConn::is_failed(self)
+    }
+    fn reset_stream(&self, sid: u64, app_error_code: u64) {
+        QuicConn::reset_stream(self, sid, app_error_code);
+    }
+}
 
 #[derive(Debug)]
 pub enum ListenError {
@@ -381,8 +433,9 @@ unsafe fn framing_pool_drop(base: core::ptr::NonNull<u8>, capacity: u32, ctx: *m
     // pool's Arc drops at scope-end too, decrementing the strong count.
 }
 
-async fn handle_request<H>(conn: &QuicConn, sid: u64, handler: &H, scratch: &mut Scratch)
+pub(crate) async fn handle_request<C, H>(conn: &C, sid: u64, handler: &H, scratch: &mut Scratch)
 where
+    C: ServerConn,
     H: for<'a, 'b, 'c> AsyncFn(&'a mut Request<'b>, &'a mut Response<'c>) -> Result<(), ()>,
 {
     // Read just far enough to parse the HEADERS frame, then dispatch
@@ -563,13 +616,19 @@ where
         // straight onto the QUIC stream via `H3Sink`, bounded `O(cap)` by
         // `stream_drain_below`; one that buffers (`res.set`) leaves the
         // sink unused and is framed in one shot by `write_response` below.
-        let _ = handler(&mut request, &mut response).await;
+        let handler_result = handler(&mut request, &mut response).await;
         streamed = response.is_streamed();
         if streamed {
-            // Head + body already on the stream — FIN it. (A mid-stream
-            // handler error has no clean h3 recovery — RESET_STREAM isn't
-            // surfaced — so we still FIN; rare path.)
-            let _ = response.finish().await;
+            if handler_result.is_err() {
+                // S1: a mid-stream handler error aborts the stream with
+                // RESET_STREAM(H3_INTERNAL_ERROR) — RFC 9114 §4.1.1 —
+                // instead of the old silent FIN, which presented a
+                // truncated body as a complete response.
+                conn.reset_stream(sid, crate::errcode::H3_INTERNAL_ERROR);
+            } else {
+                // Head + body on the stream — FIN it.
+                let _ = response.finish().await;
+            }
         }
     }
     // The handler returned; abandon any unread request body WITHOUT
@@ -628,8 +687,8 @@ fn parse_content_length(v: &[u8]) -> Option<usize> {
 /// The DATA payload is copied out of the parse buffer (same per-frame
 /// copy the old buffered path paid); true zero-copy would need the QUIC
 /// recv path to surface `IOBuf`s (rx-path item L), out of scope here.
-struct H3BodySource<'c> {
-    conn: &'c QuicConn,
+struct H3BodySource<'c, C: ServerConn> {
+    conn: &'c C,
     sid: u64,
     /// Raw stream bytes not yet parsed into DATA payloads.
     buf: Vec<u8>,
@@ -640,8 +699,8 @@ struct H3BodySource<'c> {
     done: bool,
 }
 
-impl<'c> H3BodySource<'c> {
-    fn new(conn: &'c QuicConn, sid: u64, buf: Vec<u8>, eof: bool) -> Self {
+impl<'c, C: ServerConn> H3BodySource<'c, C> {
+    fn new(conn: &'c C, sid: u64, buf: Vec<u8>, eof: bool) -> Self {
         H3BodySource {
             conn,
             sid,
@@ -652,7 +711,7 @@ impl<'c> H3BodySource<'c> {
     }
 }
 
-impl BodySource for H3BodySource<'_> {
+impl<C: ServerConn> BodySource for H3BodySource<'_, C> {
     fn next_chunk(&mut self) -> Pin<Box<dyn Future<Output = Option<IOBuf>> + '_>> {
         Box::pin(async move {
             if self.done {
@@ -735,8 +794,8 @@ const H3_FRAME_HEADER_MAX: usize = 16;
 /// payload + tailroom layout `write_response` expects.
 const QPACK_BODY_RESERVE: usize = FRAMING_BUF_SIZE - 2 * H3_FRAME_HEADER_MAX;
 
-fn write_response(
-    conn: &QuicConn,
+fn write_response<C: ServerConn>(
+    conn: &C,
     sid: u64,
     resp: Response,
     framing_pool: &alloc::sync::Arc<FramingPool>,
@@ -866,7 +925,7 @@ fn write_response(
 /// IOBufs natively, so we move the chunk through without
 /// converting to a Vec — preserves any reserved
 /// headroom/tailroom for layers below to prepend / append.
-fn queue_chunk(conn: &QuicConn, sid: u64, b: http::IOBuf) {
+fn queue_chunk<C: ServerConn>(conn: &C, sid: u64, b: http::IOBuf) {
     // Non-flushing: the response's frames coalesce into as few packets
     // as fit; `write_response`'s trailing `close_stream` is the flush.
     conn.queue_iobuf(sid, b);
@@ -884,12 +943,12 @@ const H3_SEND_BUF_CAP: usize = 256 * 1024;
 /// on the stream send buffer. The QUIC conn task drains the stream
 /// (peer ACK / `MAX_STREAM_DATA`) independently of this inline handler,
 /// so `stream_drain_below` makes progress without a per-request spawn.
-struct H3Sink<'c> {
-    conn: &'c QuicConn,
+struct H3Sink<'c, C: ServerConn> {
+    conn: &'c C,
     sid: u64,
 }
 
-impl ResponseSink for H3Sink<'_> {
+impl<C: ServerConn> ResponseSink for H3Sink<'_, C> {
     fn send_head(
         &mut self,
         status: i32,

@@ -12,6 +12,7 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "http3",
     srcs = [
+        "src/client.rs",
         "src/diag.rs",
         "src/frame.rs",
         "src/huffman.rs",
@@ -19,6 +20,12 @@ rust_library(
         "src/qpack.rs",
         "src/server.rs",
         "src/static_table.rs",
+    ],
+    compile_data = [
+        # client.rs's loopback tests pin against the dev cert (same
+        # include_bytes! pattern as http2's connect.rs tests).
+        "//apps/webserver/dev_certs:dev_cert.der",
+        "//apps/webserver/dev_certs:dev_key.der",
     ],
     crate_name = "http3",
     deps = [
@@ -28,6 +35,8 @@ rust_library(
         "//crates/proto/field-huffman",
         "//crates/proto/http",
         "//crates/proto/quic",
+        # TlsClientConfig / ServerAuth for the h3 client's QUIC-TLS setup.
+        "//crates/proto/tls",
         "//crates/waitless",
     ],
 )
@@ -36,4 +45,10 @@ rust_test(
     name = "http3_test",
     size = "small",
     crate = ":http3",
+    # The in-process h3 loopback drives spawned tasks via the executor.
+    compile_data = [
+        "//apps/webserver/dev_certs:dev_cert.der",
+        "//apps/webserver/dev_certs:dev_key.der",
+    ],
+    deps = ["//crates/runtime/executor"],
 )

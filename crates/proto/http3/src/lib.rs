@@ -36,6 +36,7 @@
 
 extern crate alloc;
 
+pub mod client;
 pub mod diag;
 pub mod frame;
 pub mod huffman;
@@ -43,4 +44,18 @@ pub mod qpack;
 pub mod server;
 pub mod static_table;
 
+pub use client::{H3ClientConn, H3ClientError, H3FetchError, H3Response, h3_connect, h3_fetch, h3_get};
 pub use server::{ListenError, listen};
+
+/// HTTP/3 application error codes (RFC 9114 §8.1) — carried in
+/// RESET_STREAM / STOP_SENDING / CONNECTION_CLOSE(0x1d) frames.
+pub mod errcode {
+    /// No error: graceful shutdown / request cancel without blame.
+    pub const H3_NO_ERROR: u64 = 0x0100;
+    /// Internal error in the peer's HTTP stack — what the server
+    /// resets a response stream with when a streaming handler errors
+    /// mid-body.
+    pub const H3_INTERNAL_ERROR: u64 = 0x0102;
+    /// The client no longer wants this request/response.
+    pub const H3_REQUEST_CANCELLED: u64 = 0x010c;
+}
