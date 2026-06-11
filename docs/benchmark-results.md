@@ -138,6 +138,61 @@ connections, not shutting down. The honest ceiling statement: **stable
 at 240 K, fatal by 280 K; the next lever is per-conn memory** (rx_ring
 tiering / the arena arc, architecture-audit #6).
 
+### Latency under offered load (open-loop, wrk2-style)
+
+The sweep above is closed-loop (wrk): a slow server slows its clients, so
+saturation latency partly hides queueing. This section is the stricter
+open-loop measurement: a first-party fixed-rate loadgen
+([`scripts/bench/loadgen`](../scripts/bench/loadgen), `http-rate`
+workload) fires requests on a fixed schedule across 4,000 keep-alive TLS
+conns (2,000 per loadgen) and measures every latency **from the request's
+scheduled time** — coordinated-omission-corrected, like wrk2. Each point
+is 30 s + 5 s warmup, both servers back-to-back on the same loadgens.
+
+![Tail latency vs offered load](assets/latency-under-load.svg)
+
+| offered req/s | **Waitless 8c** p99 | **Waitless 4c** p99 | tokio-hyper 8c p99 |
+|--:|--:|--:|--:|
+| 100 K | 2.3 ms | 2.2 ms | 2.3 ms |
+| 300 K | 2.6 ms | 2.5 ms | 2.7 ms |
+| 500 K | 3.2 ms | 3.3 ms | 3.8 ms |
+| 600 K | 3.7 ms | **3.6 ms** | *1.7 s — saturated* |
+| 700 K | 7.8 ms | 3.4 s — saturated | 6.7 s |
+| 800 K | **11 ms** | — | — |
+| 900 K | saturated | — | — |
+
+Readings:
+
+- **Below everyone's knee, latency is near-identical** (~2–4 ms p99 for
+  all three) — the syscall tax shows up as *capacity*, not as per-request
+  latency at low load.
+- **The knees: tokio-hyper ≈ 550 K, Waitless-4c ≈ 650 K, Waitless-8c
+  ≈ 850 K.** Once an open-loop arrival rate exceeds capacity, backlog
+  grows without bound — the multi-second "latencies" past each knee are
+  queue depth, not service time (hollow markers in the chart).
+- **The 4-vCPU row is the cost claim: half the hardware out-serves
+  tokio-hyper's eight cores.** 600 K req/s at p99 3.6 ms on 4 vCPUs vs
+  tokio-hyper failing to meet 600 K on 8.
+- Zero request errors at every met rate, all three servers.
+
+### Boot time and footprint
+
+Measured on Apple HVF (the dev runner), three runs: **guest boot to
+serving — kernel, NIC driver, TCP/IP, TLS init, listeners bound — takes
+~3 ms** (serial-stamped `ready` at 0.0028–0.0032 s); launch-to-first-
+HTTP-200 including hypervisor + image load is ~120 ms warm. The bootable
+image is 1.5 MB; the booted system idles at ~2 MB of heap. (GCE boots
+currently add a ~10 s DHCP wait — the first DISCOVER's reply is missed
+and the retry loop is slow; tracked in the roadmap.)
+
+**Memory per connection — honest numbers** (measured at 50 K live TLS
+conns): Waitless ≈ 55 KB/conn (heap; the fixed 16 KB per-conn RX ring
+dominates), Linux+tokio-hyper ≈ 38 KB/conn (1.51 GB process RSS + 192 MB
+kernel TCP buffers). Per-conn memory is **not** currently a Waitless
+advantage — rx_ring tiering (architecture-audit #6 territory) is the
+lever. The footprint advantage is the *system*: megabytes idle vs a
+full Linux userland + kernel.
+
 ### What the sweep flushed out (fixed the same day)
 
 The first pass of this sweep collapsed at 4–8 K connections — and the causes

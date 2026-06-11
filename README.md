@@ -104,6 +104,29 @@ places — queueing fairness under overload is Linux-mature and tracked in
 the [gaps](#current-gaps--limits). Plain-HTTP peaks at **0.86 M vs 0.63 M
 req/s** (≈1.4×).
 
+### Latency under load — and half the hardware
+
+Closed-loop benchmarks (wrk) let a slow server slow the clients down, hiding
+queueing. The chart below is the stricter, open-loop measurement (wrk2-style:
+requests fire on a fixed schedule; latency counts from the *scheduled* time):
+
+![Tail latency vs offered load — Waitless 8c and 4c vs tokio-hyper 8c](docs/assets/latency-under-load.svg)
+
+Two facts fall out. **Headroom:** 8-vCPU Waitless meets every offered rate
+through **800 K req/s with p99 ≤ 11 ms**; tokio-hyper saturates between
+500–600 K. **Efficiency:** a **4-vCPU** Waitless meets 600 K req/s at p99
+3.6 ms — *a rate the 8-vCPU tokio-hyper cannot serve at all*. Half the
+hardware, more capacity: that is the cloud bill, halved.
+
+Two more numbers complete the picture. **Cold start:** the OS boots to
+serving — kernel, drivers, TCP/IP, TLS, listeners — in **~3 ms of guest
+time** (~120 ms wall including the hypervisor, Apple HVF; a Linux VM is
+seconds to tens of seconds). And **footprint:** the entire booted system
+idles at ~2 MB of heap on a 1.5 MB image. Honest counterpoint: *per-connection*
+memory is currently comparable to Linux+tokio (~55 KB vs ~38 KB measured at
+50 K conns — our fixed 16 KB RX ring dominates and tiering it is tracked
+work); the footprint win is the system, not the socket.
+
 ### Where the 2× comes from
 
 Deleting the kernel/app boundary removes the syscall *tax* — profiled at
