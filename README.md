@@ -41,8 +41,8 @@ loop, in the same address space, as plain function calls. The advantage that is
 ~2× for a static response is *larger* for a handler that does I/O, because there
 is simply more syscall tax to delete.
 
-[`apps/gateway`](apps/gateway) is that handler, in ~50 lines — see
-[The async-handler showcase](#the-async-handler-showcase) below.
+[`apps/socks`](apps/socks) and [`apps/gateway`](apps/gateway) are those
+handlers — see [The async-handler showcase](#the-async-handler-showcase) below.
 
 ## Highlights
 
@@ -116,6 +116,7 @@ architecture wins most.
 | Image (entire bootable system) | x86_64 | aarch64 |
 |--------------------------------|-------:|--------:|
 | `apps/hello` (HTTP hello-world)            | 428 KB | 364 KB |
+| `apps/socks` (SOCKS5 proxy — raw TCP)      | 452 KB | — |
 | `apps/webserver` (HTTP/1.1+2+3, TLS, QUIC, diagnostics) | 1.5 MB | 1.2 MB |
 
 There is no kernel, init, libc, or container base image underneath these
@@ -142,34 +143,37 @@ curl http://localhost:8080/health
 
 ## The async-handler showcase
 
-[`apps/gateway`](apps/gateway/src/main.rs) is a reverse proxy / API gateway: on
-every request the handler makes an outbound HTTP request to a backend and
-relays the result — the "my handler calls a database / another service"
-pattern, and the showcase for Waitless's **client** roles. The handler
-suspends on the round-trip like any other `await`, and the per-core event loop
-keeps serving other connections while it is parked.
+[`apps/socks`](apps/socks/src/main.rs) is the flagship: a **SOCKS5 proxy**
+(`curl --socks5`, `ssh -D`, a browser's proxy setting). It has *no* destination
+of its own — the client's SOCKS request names the target, the handler dials it
+with `tcp_connect`, and then relays bytes both ways until either side closes.
+That relay is the high-concurrency story in miniature: it parks on **two reads
+at once**, and while it waits the per-core event loop keeps serving every other
+proxied flow — one core, thousands of parked relays, no threads.
 
 ```rust
-async fn gateway(req: &mut Request<'_>, res: &mut Response<'_>) -> Result<(), ()> {
-    if req.path() == b"/health" {
-        res.set(Response::ok(b"application/json", b"{\"status\":\"ok\"}"));
-        return Ok(());
-    }
-    // One outbound HTTP/1.1 GET to the backend, bounded body + deadline.
-    // `http::client::get` connects, sends, parses the response, reads the
-    // body — all syscall-free, in this same event loop.
-    match http::client::get(backend_ip, 80, b"backend", req.path(), 256 * 1024).await {
-        Ok((head, body)) => { res.set(Response::ok(b"application/octet-stream", body));
-                              res.status(head.status as i32); Ok(()) }
-        Err(_) => { res.set(Response::ok(b"text/plain", b"502 Bad Gateway\n"));
-                    res.status(502); Ok(()) }
+// After the SOCKS5 handshake has dialed `target`, relay both directions.
+// Each iteration parks on BOTH reads; whichever has data is copied to the
+// other side. No threads, no per-direction tasks — one task, two buffers.
+async fn relay(client: &mut TcpStream, target: &mut TcpStream) {
+    let (mut c2t, mut t2c) = ([0u8; 16 << 10], [0u8; 16 << 10]);
+    loop {
+        match select(client.recv(&mut c2t), target.recv(&mut t2c)).await {
+            Either::Left(0) | Either::Right(0) => return,        // either side closed
+            Either::Left(n)  => if target.send_bytes(&c2t[..n]).await.is_err() { return },
+            Either::Right(n) => if client.send_bytes(&t2c[..n]).await.is_err() { return },
+        }
     }
 }
 ```
 
-The client API is uniform across protocols — `http::client`, `https::client`
-(ALPN-negotiated h2/h1.1, or pinned `get_h1`), and `http3::client` — each
-exposing the same `connect` / `get` / `fetch` verbs.
+[`apps/gateway`](apps/gateway) is the complementary example — a
+backend-for-frontend whose handler makes an outbound **HTTP** request
+(`http::client::get`) to a fixed upstream and relays the result, the
+"my handler calls a database / another service" pattern. The client API is
+uniform across protocols — `http::client`, `https::client` (ALPN-negotiated
+h2/h1.1, or pinned `get_h1`), and `http3::client` — each exposing the same
+`connect` / `get` / `fetch` verbs.
 
 ## Feature set
 
@@ -398,9 +402,10 @@ waitless_binary(
 )
 ```
 
-For the outbound-request pattern see [`apps/gateway`](apps/gateway); for a
-fuller server — HTTPS, multiple routes, HTTP/3, live diagnostics — see
-[`apps/webserver`](apps/webserver).
+For the outbound-request pattern see [`apps/socks`](apps/socks) (a SOCKS5
+proxy — `tcp_connect` + a bidirectional relay) or [`apps/gateway`](apps/gateway)
+(an HTTP backend-for-frontend); for a fuller server — HTTPS, multiple routes,
+HTTP/3, live diagnostics — see [`apps/webserver`](apps/webserver).
 
 ## Using Waitless in another project
 
@@ -431,7 +436,8 @@ complete, copy-pasteable checklist.
 waitless/
 ├── apps/
 │   ├── hello/         Minimal HTTP hello-world (~25 LOC)
-│   ├── gateway/       Reverse proxy — handler makes an outbound request (~50 LOC)
+│   ├── socks/         SOCKS5 proxy — tcp_connect + bidirectional async relay
+│   ├── gateway/       BFF — handler makes an outbound HTTP request (~50 LOC)
 │   └── webserver/     Full demo — HTTP, HTTPS, HTTP/3, live diagnostics
 ├── crates/
 │   ├── waitless/      Facade — the API apps program against (+ macros, net, backend)
