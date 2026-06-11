@@ -656,6 +656,8 @@ struct FetchProbeQuery {
     /// (`http2::https_fetch`, offer ["h2","http/1.1"]). Implies TLS —
     /// "h2" is HTTP/2-over-TLS (no h2c).
     h2: bool,
+    /// `proto=h3`: QUIC + HTTP/3 via the h3 client (UDP). Implies TLS.
+    h3: bool,
     pin: Option<[u8; 32]>,
 }
 
@@ -686,7 +688,7 @@ fn parse_hex32(s: &[u8]) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Parse `?ip=A.B.C.D&port=N[&path=/x][&tls=0|1][&pin=hex64][&proto=h1|h2]`.
+/// Parse `?ip=A.B.C.D&port=N[&path=/x][&tls=0|1][&pin=hex64][&proto=h1|h2|h3]`.
 /// `path` defaults to `/` and must be origin-form (leading `/`); no
 /// percent-decoding (dev probe). `None` on any malformed field.
 fn parse_fetch_query(query: &[u8]) -> Option<FetchProbeQuery> {
@@ -698,6 +700,7 @@ fn parse_fetch_query(query: &[u8]) -> Option<FetchProbeQuery> {
     let mut path_len = 1usize;
     let mut tls = false;
     let mut h2 = false;
+    let mut h3 = false;
     let mut pin: Option<[u8; 32]> = None;
     for kv in query.split(|&b| b == b'&') {
         if let Some(v) = kv.strip_prefix(b"ip=") {
@@ -717,9 +720,10 @@ fn parse_fetch_query(query: &[u8]) -> Option<FetchProbeQuery> {
                 _ => return None,
             };
         } else if let Some(v) = kv.strip_prefix(b"proto=") {
-            h2 = match v {
-                b"h1" => false,
-                b"h2" => true,
+            (h2, h3) = match v {
+                b"h1" => (false, false),
+                b"h2" => (true, false),
+                b"h3" => (false, true),
                 _ => return None,
             };
         } else if let Some(v) = kv.strip_prefix(b"pin=") {
@@ -735,6 +739,7 @@ fn parse_fetch_query(query: &[u8]) -> Option<FetchProbeQuery> {
         path_len,
         tls,
         h2,
+        h3,
         pin,
     })
 }
@@ -782,7 +787,16 @@ async fn run_fetch(
         };
         (seed, auth)
     };
-    let (status, bytes) = if q.h2 {
+    let (status, bytes) = if q.h3 {
+        // proto=h3: QUIC + HTTP/3 via the h3 client (UDP path).
+        let (seed, auth) = tls_auth();
+        http3::client::h3_get(q.ip, q.port, b"probe", q.path(), auth, seed, FETCH_BODY_CAP)
+            .await
+            .map_err(|e| match e {
+                http3::client::H3FetchError::Connect(c) => ("h3-connect", alloc::format!("{c:?}")),
+                http3::client::H3FetchError::H3(h) => ("h3", alloc::format!("{h:?}")),
+            })?
+    } else if q.h2 {
         // proto=h2: the ALPN-dispatching client (offer ["h2","http/1.1"],
         // h2 → H2ClientConn, h1.1 → the h1 path). Implies TLS.
         let (seed, auth) = tls_auth();
