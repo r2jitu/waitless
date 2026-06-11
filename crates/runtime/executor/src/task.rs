@@ -12,6 +12,7 @@
 // counters protect against handle-reuse races.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
@@ -25,10 +26,16 @@ use worker::{CurrentWorker, PerWorker};
 /// Per-worker task slot count. With `WORKERS × TASKS_PER_WORKER`
 /// total in-flight tasks across the machine, this is the ceiling on
 /// concurrent connections / spawned futures the runtime can handle.
-/// Sized to fit the largest planned bench point (32K conns / 8
-/// workers = 4096 per worker) with headroom for non-conn tasks
-/// (listeners, timers, internal jobs).
-pub const TASKS_PER_WORKER: usize = 4096;
+/// 16 K/worker puts the 8-core machine ceiling at 131 K tasks —
+/// sized for the 80 K-concurrent-conns bench point (10 K conns/core)
+/// with headroom for non-conn tasks (listeners, timers, internal
+/// jobs). The previous 4096 was the hard wall at the 2026-06-11
+/// 40 K-conn GCE point: accepted TCP conns couldn't get a handler
+/// task, so TLS handshakes never ran and clients timed out in
+/// connect (1.07 M accepted-but-never-served conns in one sweep).
+/// Cost is one empty `TaskSlot` (~56 B) per slot — ~1 MB/worker,
+/// heap-resident.
+pub const TASKS_PER_WORKER: usize = 16384;
 /// Words in the slot bitmap; one bit per slot. Spawn linear-scans
 /// `used_bits` for a zero bit before CAS-claiming; `ready_bits`
 /// mirrors per-slot wake state for the tick poll loop.
@@ -87,7 +94,11 @@ unsafe impl Sync for TaskSlot {}
 unsafe impl Send for TaskSlot {}
 
 pub struct TaskArena {
-    slots: [TaskSlot; TASKS_PER_WORKER],
+    /// Heap-resident: an inline `[TaskSlot; 16384]` would be a ~1 MB
+    /// by-value temporary at `ARENAS.init` time — boot-stack-hazard
+    /// territory (see the TimerWheel slot array for the same move).
+    /// `Vec` is built in place via `resize_with`; never resized after.
+    slots: Vec<TaskSlot>,
     /// Per-arena used bitmap — bit `i` set iff slot `i` currently
     /// holds a live (or aborting) future. Spawn does a find-first-
     /// zero scan + CAS-claim. Replaces the per-slot `AtomicBool used`
@@ -101,9 +112,11 @@ pub struct TaskArena {
 }
 
 impl TaskArena {
-    const fn new() -> Self {
+    fn new() -> Self {
+        let mut slots = Vec::with_capacity(TASKS_PER_WORKER);
+        slots.resize_with(TASKS_PER_WORKER, TaskSlot::new);
         TaskArena {
-            slots: [const { TaskSlot::new() }; TASKS_PER_WORKER],
+            slots,
             used_bits: [const { AtomicU64::new(0) }; TASKS_BITMAP_WORDS],
             ready_bits: [const { AtomicU64::new(0) }; TASKS_BITMAP_WORDS],
         }
