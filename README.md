@@ -23,13 +23,13 @@ twice over:
 The result — the web-server app on identical cloud hardware against
 tokio-hyper, the mainstream Rust async stack on Linux:
 
-![Waitless vs tokio-hyper — HTTPS throughput and latency on one 8-vCPU c3 VM](docs/assets/benchmark.png)
+![Waitless vs tokio-hyper — HTTPS throughput and median latency across 1K–80K concurrent connections](docs/assets/benchmark.svg)
 
-> Same NIC, same load generators, measured back-to-back. And Linux runs its
-> mature in-tree `gve` driver; Waitless runs a
-> [from-scratch one](crates/drivers/gve/). Linux should win on driver maturity
-> alone — it doesn't, because the architecture deletes the syscall boundary,
-> the user↔kernel copies, and the context switches outright.
+> Same NIC, same load generators, measured back-to-back; every connection
+> count verified server-side. And Linux runs its mature in-tree `gve` driver;
+> Waitless runs a [from-scratch one](crates/drivers/gve/). Linux should win on
+> driver maturity alone — it doesn't, because the architecture deletes the
+> syscall boundary, the user↔kernel copies, and the context switches outright.
 
 ## Try it in 30 seconds
 
@@ -70,26 +70,29 @@ handler — see [Examples](#examples).
 
 ## Performance
 
-Measured on a GCE `c3-highcpu-8` VM with **gVNIC**, driven from two separate VMs
-over the VPC (`wrk`), serving a byte-identical `/health`. SPOT hardware carries
-**~15–20 % run-to-run variance**, so lean on the **ratios** (measured
-back-to-back, same load generators) rather than any single absolute. Full
-methodology and the per-connection-count curve are in
-[docs/benchmark-results.md](docs/benchmark-results.md).
+Measured 2026-06-11 on a GCE `c3-highcpu-8` VM with **gVNIC**, driven from two
+separate 8-vCPU VMs over the VPC (`wrk`), serving a byte-identical `/health`
+over TLS 1.3. Every connection count below is **verified server-side** (live
+ESTABLISHED conns), not a load-generator parameter. SPOT hardware carries
+**~15–20 % run-to-run variance**, so lean on the **ratios**. Full sweep,
+percentiles, and methodology: [docs/benchmark-results.md](docs/benchmark-results.md).
 
-| Workload (8-vCPU c3, saturating load) | **Waitless** | tokio-hyper | Ratio |
-|---|--:|--:|:-:|
-| **HTTPS / TLS 1.3** req/s        | **1.13 M** | 0.59 M | **≈ 1.9×** |
-| HTTPS p50 latency (same load)    | **283 µs** | 644 µs | **≈ 2.3× lower** |
-| **Plain HTTP** req/s             | **0.86 M** | 0.63 M | **≈ 1.4×** |
+| Concurrent TLS conns | **Waitless** req/s | tokio-hyper req/s | **Waitless** p50 | tokio p50 |
+|--:|--:|--:|--:|--:|
+|  1,000 | **1.09 M** | 0.60 M | **0.85 ms** | 1.6 ms |
+|  8,000 | **0.95 M** | 0.49 M | **4.6 ms** | 17 ms |
+| 16,000 | **0.90 M** | 0.47 M | **5.1 ms** | 40 ms |
+| 40,000 | **0.69 M** | 0.46 M | **27 ms** | 115 ms |
+| 80,000 | **0.50 M** | *failed* | **56 ms** | — |
 
-**It scales with concurrency.** Waitless holds **>1 M HTTPS req/s through
-~2,000 concurrent connections** while sitting at less than half tokio-hyper's
-latency — far more headroom in reserve. Earlier server-bound runs measured a
-*dead-flat* tail all the way to **50,000 connections** with no collapse (at
-that point the load generators, not the server, are the limit); a clean
-re-measure of the current, faster TLS path across that range is
-[pending](#current-gaps--limits).
+**The 80,000-connection row is the story.** Under an identical patient-client
+protocol, tokio-hyper could not get past ~59,600 established connections
+(27 K connect failures); Waitless held **80,001 live TLS connections at
+~500 K req/s**. Below saturation the typical request is **4–8× faster**
+end-to-end. One honest caveat: at saturation (≥16 K conns) Waitless's p99
+*tail* trails tokio-hyper's in places — queueing fairness under overload is
+Linux-mature and tracked in the [gaps](#current-gaps--limits). Plain-HTTP
+peaks at **0.86 M vs 0.63 M req/s** (≈1.4×).
 
 **Weightless — the whole bootable system, measured:**
 
@@ -209,14 +212,12 @@ Waitless is a single-author research project, not production software — the AP
 is unstable and the checked-in dev certificate and several defaults are
 development-only. Known gaps, honestly:
 
-- **High-connection-count TLS needs a clean re-measure.** A server-bound run
-  (single load generator) once measured TLS dead-flat to 50 K connections; a
-  recent two-load-generator run hit overload around 16 K (asymmetric splits,
-  multi-ms tails — likely the load generators' edge, not the server). The
-  current, faster TLS path hasn't been cleanly swept to 50 K yet, so the
-  high-conn ceiling is unverified rather than known. Per-connection memory
-  (the [arena work](docs/architecture-audit.md)) is the lever if a real
-  ceiling shows.
+- **Tail latency at saturation trails Linux.** The high-connection sweep is
+  now clean (80 K live TLS conns served — see [Performance](#performance)),
+  but in the 16–65 K band Waitless's p99 (1.5–4 s) is worse than
+  tokio-hyper's in places even while median latency and throughput are far
+  better: under overload, Linux's scheduler+TCP queueing degrades more
+  fairly. Per-conn scheduling fairness is the open lever.
 - **HTTP client: no connection pooling or redirects** — each outbound request is
   a fresh connection. (This is why the proxy-*throughput* head-to-head vs. a
   pooled nginx/tokio gateway is future work; pooling lands first.)
