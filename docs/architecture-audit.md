@@ -300,7 +300,7 @@ picked up the same one-direction-at-a-time way.
 | # | Direction | Shipped (first increment) | Long arc remaining |
 |---|---|---|---|
 | 1 | Capabilities | `quic::time` mockable seam; Time + Entropy named capabilities + worker-owned-state review rule (design-history) | per-instance worker-owned stacks; kernel shrinks to boot+mm+executor+drivers |
-| 2 | Simulation | 3-parser fuzz-smoke; virtual-time loss/PTO suite (caught 2 bugs); 200-seed loss-schedule property suite (netem class, now ~30 ms in-repo) | true two-endpoint sim (needs a QUIC client role) |
+| 2 | Simulation | 3-parser fuzz-smoke; virtual-time loss/PTO suite (caught 2 bugs); 200-seed loss-schedule property suite (netem class, now ~30 ms in-repo) | ✅ two-endpoint sim LANDED 2026-06-11 (the client role now exists): real client vs real server through a seeded lossy pipe under the virtual clock — its first run caught the §4.9.2 client discard deadlock. Remaining arc: scale schedules/scenarios |
 | 3 | Completion reactor | `NicOps` → `trait Nic` / `&dyn Nic`; GCE A/B neutral. (c) TX-waker **withdrawn** — re-profile showed 0 ring-full drops, backpressure subsumed it | completion-source abstraction proper; (b) idle-gated MSI-X wake (latency/power) |
 | 4 | Transport engine | shared `RecoveryEpisode`; `net_cc::loss::LossParams` detector; QUIC re-homed; **TCP RACK** as 2nd consumer (netem: Δ225 marks, 0 stalls) | adaptive reo_wnd (RFC 8985 S2); BBR (lands once on this core) |
 | 5 | Flow steering | cross-core `CtrlMsg` lane; wrong-core PMTUD routing (RSS-active precondition GCE-confirmed) | ownership map if a high-volume consumer arrives; more `CtrlMsg` variants |
