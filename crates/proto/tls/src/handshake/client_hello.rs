@@ -425,6 +425,11 @@ pub struct ClientHelloParams<'a> {
     /// ALPN protocol names in preference order (RFC 7301). Empty
     /// list ⇒ no ALPN extension. Each name 1–255 bytes.
     pub alpn: &'a [&'a [u8]],
+    /// Extra raw extensions appended verbatim after the standard set:
+    /// `(extension_type, extension_data)` pairs. The QUIC client role
+    /// injects `quic_transport_parameters` (RFC 9001 §8.2) here; the
+    /// TCP client passes `&[]`. Each body ≤ 65535 bytes.
+    pub extras: &'a [(u16, &'a [u8])],
 }
 
 /// Serialise a TLS 1.3 ClientHello *body* (the bytes AFTER the 4-byte
@@ -473,7 +478,14 @@ pub fn build_client_hello(p: &ClientHelloParams<'_>, out: &mut [u8]) -> Option<u
     };
     let sv_ext = 4 + 1 + 2; // u8 list_len + 0x0304
     let ks_ext = 4 + 2 + 2 + 2 + 32; // u16 shares_len + entry(group, len, key)
-    let ext_total = sni_ext + groups_ext + sigalgs_ext + alpn_ext + sv_ext + ks_ext;
+    let mut extras_ext = 0usize;
+    for (_, body) in p.extras {
+        if body.len() > 0xffff {
+            return None;
+        }
+        extras_ext += 4 + body.len();
+    }
+    let ext_total = sni_ext + groups_ext + sigalgs_ext + alpn_ext + sv_ext + ks_ext + extras_ext;
     if ext_total > 0xffff {
         return None;
     }
@@ -578,6 +590,13 @@ pub fn build_client_hello(p: &ClientHelloParams<'_>, out: &mut [u8]) -> Option<u
     q += 2;
     out[q..q + 32].copy_from_slice(p.x25519_pub);
     q += 32;
+
+    // Caller-supplied raw extensions (e.g. quic_transport_parameters).
+    for (ty, body) in p.extras {
+        ext_header(out, &mut q, *ty, body.len());
+        out[q..q + body.len()].copy_from_slice(body);
+        q += body.len();
+    }
 
     debug_assert_eq!(q, total);
     Some(q)
@@ -772,6 +791,7 @@ mod tests {
             x25519_pub: &x25519_pub,
             server_name: Some(b"dev.r2jitu.com"),
             alpn: &[b"h2", b"http/1.1"],
+            extras: &[(0x4242, b"opaque-extra")],
         };
         let mut buf = [0u8; 512];
         let n = build_client_hello(&params, &mut buf).expect("build");
@@ -807,6 +827,7 @@ mod tests {
             x25519_pub: &x25519_pub,
             server_name: None,
             alpn: &[],
+            extras: &[],
         };
         let mut buf = [0u8; 256];
         let n = build_client_hello(&params, &mut buf).expect("build");
@@ -828,6 +849,7 @@ mod tests {
             x25519_pub: &x25519_pub,
             server_name: None,
             alpn: &[],
+            extras: &[],
         };
         let mut tiny = [0u8; 32];
         assert!(build_client_hello(&base, &mut tiny).is_none());

@@ -448,6 +448,7 @@ impl TlsClient {
             x25519_pub: &public,
             server_name: config.server_name,
             alpn: config.alpn,
+            extras: &[],
         };
         // 1 KiB covers the base ~170 B + max SNI (264) + bounded ALPN.
         let mut ch_body = [0u8; 1024];
@@ -1400,7 +1401,9 @@ pub fn extract_spki_from_cert_der(cert: &[u8]) -> Option<&[u8]> {
 /// `SEQUENCE { AlgorithmIdentifier, BIT STRING }` — the BIT STRING's
 /// content (after the unused-bits byte, which must be 0) is the SEC1
 /// point `p256::ecdsa::VerifyingKey::from_sec1_bytes` consumes.
-fn spki_p256_point(spki: &[u8]) -> Option<&[u8]> {
+/// `pub` because the QUIC client role (`//crates/proto/quic`'s
+/// `tls.rs`) runs the same pin → verify-key lift over CRYPTO frames.
+pub fn spki_p256_point(spki: &[u8]) -> Option<&[u8]> {
     let (tag, s, l) = der_tlv(spki, 0)?;
     if tag != DER_SEQUENCE {
         return None;
