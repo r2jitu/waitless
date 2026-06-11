@@ -225,6 +225,80 @@ pub fn aes128_gcm_open(
 // (no client we test cares).
 
 // ============================================================================
+// RFC 9001 §5.8 — Retry Packet Integrity
+// ============================================================================
+
+/// Fixed AEAD key for the Retry integrity tag (RFC 9001 §5.8 — a
+/// published constant; the tag authenticates, it does not encrypt).
+const RETRY_INTEGRITY_KEY: [u8; AES_KEY_LEN] = [
+    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8,
+    0x4e,
+];
+
+/// Fixed AEAD nonce for the Retry integrity tag (RFC 9001 §5.8).
+const RETRY_INTEGRITY_NONCE: [u8; NONCE_LEN] = [
+    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
+];
+
+/// Upper bound on the Retry-pseudo-packet scratch: 1 length byte +
+/// a 20-byte ODCID + one full-MTU Retry packet. Anything larger is
+/// not a Retry we accept (a real Retry is well under one datagram).
+const RETRY_PSEUDO_MAX: usize = 1 + 20 + 1500;
+
+/// Compute the RFC 9001 §5.8 Retry Integrity Tag over the "Retry
+/// Pseudo-Packet": `odcid_len(u8) || odcid || retry packet bytes
+/// without the final 16-byte tag`. The AEAD seals an EMPTY plaintext
+/// with the pseudo-packet as AAD under the fixed key/nonce above —
+/// the returned tag IS the integrity tag. `None` if the inputs exceed
+/// the bounded scratch (never for a real packet).
+pub fn retry_integrity_tag(odcid: &[u8], retry_without_tag: &[u8]) -> Option<[u8; TAG_LEN]> {
+    if odcid.len() > 20 || 1 + odcid.len() + retry_without_tag.len() > RETRY_PSEUDO_MAX {
+        return None;
+    }
+    let mut pseudo = [0u8; RETRY_PSEUDO_MAX];
+    let mut n = 0usize;
+    pseudo[n] = odcid.len() as u8;
+    n += 1;
+    pseudo[n..n + odcid.len()].copy_from_slice(odcid);
+    n += odcid.len();
+    pseudo[n..n + retry_without_tag.len()].copy_from_slice(retry_without_tag);
+    n += retry_without_tag.len();
+    let mut empty: [u8; 0] = [];
+    Some(aes128_gcm_seal(
+        &RETRY_INTEGRITY_KEY,
+        &RETRY_INTEGRITY_NONCE,
+        &pseudo[..n],
+        &mut empty,
+    ))
+}
+
+/// Verify a Retry packet's integrity tag (RFC 9001 §5.8). `odcid` is
+/// the DCID of the client's FIRST Initial; `retry_without_tag` is the
+/// received Retry packet minus its trailing 16 bytes; `tag` is those
+/// 16 bytes. Constant-time via the AEAD's own tag comparison. Returns
+/// `false` on any failure — the caller MUST then discard the packet.
+pub fn retry_integrity_verify(
+    odcid: &[u8],
+    retry_without_tag: &[u8],
+    tag: &[u8; TAG_LEN],
+) -> bool {
+    match retry_integrity_tag(odcid, retry_without_tag) {
+        // Re-sealing and AEAD-comparing via `open` would also work;
+        // the underlying GCM tag check inside `open` is constant-time,
+        // but we already have the expected tag — compare it with the
+        // TLS crate's constant-time helper (tags are 16 B; pad to 32).
+        Some(expected) => {
+            let mut a = [0u8; 32];
+            let mut b = [0u8; 32];
+            a[..TAG_LEN].copy_from_slice(&expected);
+            b[..TAG_LEN].copy_from_slice(tag);
+            tls::keys::ct_eq_32(&a, &b)
+        }
+        None => false,
+    }
+}
+
+// ============================================================================
 // §5.4 — Header Protection
 // ============================================================================
 
@@ -439,6 +513,36 @@ mod tests {
     // ChaCha20-Poly1305 → AES-128-GCM migration. RFC 9001 §A.5's
     // ChaCha20 vector lives in git history if a future reverse
     // migration ever needs it.
+
+    /// RFC 9001 Appendix A.4 — the sample Retry packet for ODCID
+    /// 0x8394c8f03e515708. The final 16 bytes are the integrity tag;
+    /// our §5.8 computation must reproduce them exactly, and the
+    /// verify helper must accept the packet (and reject a tampered
+    /// one / a wrong ODCID).
+    #[test]
+    fn rfc_9001_appendix_a4_retry_integrity_tag() {
+        // ff 00000001 00 08 f067a5502a4262b5 "token" || tag
+        let retry: std::vec::Vec<u8> = hex_var(
+            b"ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba",
+        );
+        let odcid = APPENDIX_A_DCID;
+        let split = retry.len() - TAG_LEN;
+        let (body, tag_bytes) = retry.split_at(split);
+        let tag: [u8; TAG_LEN] = tag_bytes.try_into().unwrap();
+
+        let computed = retry_integrity_tag(&odcid, body).expect("in-bounds");
+        assert_eq!(computed, tag, "§A.4 integrity tag reproduced");
+        assert!(retry_integrity_verify(&odcid, body, &tag));
+
+        // Tampered token byte → reject. The 20-byte body ends with
+        // the 5-byte token; flip its first byte ('t' at offset 15).
+        let mut bad = body.to_vec();
+        bad[15] ^= 1;
+        assert!(!retry_integrity_verify(&odcid, &bad, &tag));
+        // Wrong ODCID → reject (this is what authenticates the Retry
+        // to the client that owns the original DCID).
+        assert!(!retry_integrity_verify(&[0xff; 8], body, &tag));
+    }
 
     #[test]
     fn hp_mask_aes128_known_answer() {
