@@ -199,11 +199,17 @@ Run the h2spec conformance suite; track failures here. Not yet run.
   cooperative writer is in place; running handlers concurrently on the
   executor (and feeding their outputs into the same writer) is the next
   step toward the backlog's "N streams mapped onto the executor".
-- **H2-14 — Connection receive-window enforcement.** We replenish the
-  connection/stream receive windows (WINDOW_UPDATE crediting consumed
-  bytes) but don't strictly track-and-reject a peer that overruns our
-  advertised window. A conformant peer never does; strict enforcement is a
-  hardening item.
+- **H2-14 — Receive-window enforcement.** ✅ closed 2026-06-10 (client-arc
+  D / S1): each `StreamSlot` tracks the advertised stream receive window
+  (debited on DATA arrival, credited with the consume-driven
+  WINDOW_UPDATE); an overrun is RST_STREAM(FLOW_CONTROL_ERROR) at the
+  `process_data` site instead of riding up to the 1 MiB defensive buffer
+  cap. Connection-level overrun stays untrackable by construction — the
+  conn window is re-credited on arrival, so its in-flight exposure is one
+  ≤ MAX_FRAME_SIZE frame, always inside the 64 KiB initial window; making
+  it enforceable would mean crediting the conn window on consume, a
+  backpressure-behaviour change, not a bounds check. The h2 CLIENT
+  (`client.rs`) enforces both levels symmetrically.
 
 ### Deferred by design / non-goals
 

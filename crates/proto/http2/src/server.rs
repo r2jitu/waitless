@@ -391,7 +391,7 @@ impl H2Conn {
     /// consumed since the last sweep (receive-side flow control). Called
     /// each demux iteration; cheap when nothing was consumed.
     fn credit_consumed_bodies(&mut self) {
-        for slot in &self.streams {
+        for slot in &mut self.streams {
             let n = {
                 let mut d = slot.body.data.borrow_mut();
                 core::mem::take(&mut d.consumed_uncredited)
@@ -404,6 +404,9 @@ impl H2Conn {
                 // if the cap is ever raised.
                 debug_assert!(n <= 0x7fff_ffff, "WINDOW_UPDATE increment {n} exceeds i31");
                 frame::push_window_update(&mut self.ctrl_out, slot.id, n.min(0x7fff_ffff) as u32);
+                // The strict receive accounting moves with the credit:
+                // the peer may spend it once this WINDOW_UPDATE ships.
+                slot.recv_window += n as i64;
             }
         }
     }
@@ -726,6 +729,14 @@ struct StreamSlot {
     /// Per-stream send window for the streaming response (peer-granted;
     /// grows via WINDOW_UPDATE). Mirrors `StreamOut::send_window`.
     send_window: i64,
+    /// What remains of the per-stream *receive* window WE advertised
+    /// (`INITIAL_WINDOW`; stream credit flows only as the handler
+    /// consumes — see `credit_consumed_bodies`). Debited on DATA
+    /// arrival; a frame that drives it negative overran the advertised
+    /// window → RST_STREAM(FLOW_CONTROL_ERROR) (the S1 strict-receive
+    /// hardening; previously only the 1 MiB defensive buffer cap shed
+    /// such a peer).
+    recv_window: i64,
     /// HEADERS frame emitted for the streaming response.
     headers_sent: bool,
     /// Declared `content-length` of the request body, if the header was
@@ -1544,6 +1555,7 @@ where
                 body,
                 tx,
                 send_window: conn.peer_initial_window,
+                recv_window: INITIAL_WINDOW,
                 headers_sent: false,
                 content_length,
                 body_received: 0,
@@ -1566,6 +1578,32 @@ fn process_data(conn: &mut H2Conn, hdr: FrameHeader, payload: &[u8]) -> Result<(
 
     match conn.streams.iter().position(|s| s.id == hdr.stream_id) {
         Some(i) => {
+            // S1: strict receive-window enforcement. The stream's
+            // window is credited only as the handler consumes
+            // (`credit_consumed_bodies`), so a peer that keeps sending
+            // past the credit we advertised drives it negative —
+            // FLOW_CONTROL_ERROR (RFC 9113 §6.9.1), stream-scoped per
+            // §5.4.2. The connection window can't be overrun this way:
+            // it is re-credited on arrival below, so its in-flight
+            // exposure is bounded by one ≤ MAX_FRAME_SIZE frame, always
+            // inside the 64 KiB initial window. (The 1 MiB
+            // STREAM_RECV_BUF_CAP below stays as the defensive
+            // invariant ceiling.)
+            conn.streams[i].recv_window -= full_len as i64;
+            if conn.streams[i].recv_window < 0 {
+                crate::h2_drop!(
+                    flow_control_error,
+                    "recv window overrun sid={} by={}",
+                    hdr.stream_id,
+                    -conn.streams[i].recv_window
+                );
+                reset_stream(conn, hdr.stream_id, error::FLOW_CONTROL_ERROR);
+                // Keep the connection-level accounting consistent.
+                if full_len > 0 {
+                    frame::push_window_update(&mut conn.ctrl_out, 0, full_len);
+                }
+                return Ok(());
+            }
             // RFC 7540 §8.1.2.6: track received body bytes against the
             // declared content-length. A DATA payload that pushes the
             // total over content-length, or an END_STREAM where the
@@ -1858,7 +1896,9 @@ impl FieldSink for RequestSink<'_> {
 
 /// Strip optional padding / priority fields from a HEADERS payload,
 /// yielding the header-block fragment. `None` on a malformed frame.
-fn headers_fragment(payload: &[u8], fl: u8) -> Option<&[u8]> {
+/// `pub(crate)`: the wire shape is role-symmetric, so the client
+/// (`client.rs`) parses inbound HEADERS through the same helper.
+pub(crate) fn headers_fragment(payload: &[u8], fl: u8) -> Option<&[u8]> {
     let mut p = payload;
     let mut pad = 0usize;
     if fl & flags::PADDED != 0 {
@@ -1878,8 +1918,9 @@ fn headers_fragment(payload: &[u8], fl: u8) -> Option<&[u8]> {
     Some(&p[..p.len() - pad])
 }
 
-/// Strip optional padding from a DATA payload.
-fn data_payload(payload: &[u8], fl: u8) -> Option<&[u8]> {
+/// Strip optional padding from a DATA payload. `pub(crate)` for the
+/// client's symmetric use, like [`headers_fragment`].
+pub(crate) fn data_payload(payload: &[u8], fl: u8) -> Option<&[u8]> {
     let mut p = payload;
     let mut pad = 0usize;
     if fl & flags::PADDED != 0 {
@@ -2157,6 +2198,7 @@ mod tests {
                 event: AsyncEvent::new(),
             }),
             send_window,
+            recv_window: INITIAL_WINDOW,
             headers_sent: false,
             content_length: None,
             body_received: 0,
@@ -2582,5 +2624,70 @@ mod tests {
         assert_eq!(conn.ctrl_since_progress, 0, "body DATA resets");
         conn.note_frame_for_flood_guard(ftype::DATA, 0).unwrap();
         assert_eq!(conn.ctrl_since_progress, 1, "empty DATA is control churn");
+    }
+
+    // ── S1 strict receive-window enforcement (RFC 9113 §6.9.1) ───────
+
+    /// DATA past the advertised per-stream receive window (credited
+    /// only as the handler consumes) is rejected with
+    /// RST_STREAM(FLOW_CONTROL_ERROR) — not merely absorbed until the
+    /// 1 MiB defensive buffer cap.
+    #[test]
+    fn recv_window_overrun_resets_the_stream() {
+        let mut conn = H2Conn::new();
+        conn.streams
+            .push(streaming_slot(head_block(), &[], false, INITIAL_WINDOW));
+        // As if the peer had spent all but 3 bytes of the advertised
+        // window with no handler consumption (= no credit) since.
+        conn.streams[0].recv_window = 3;
+        let hdr = crate::frame::FrameHeader {
+            length: 5,
+            ty: ftype::DATA,
+            flags: 0,
+            stream_id: 1,
+        };
+        process_data(&mut conn, hdr, b"abcde").unwrap();
+        assert!(conn.streams.is_empty(), "overrunning stream is reset");
+        let fr = frames(&conn.ctrl_out);
+        let rst = fr.iter().find(|f| f.0 == ftype::RST_STREAM).expect("RST queued");
+        assert_eq!(
+            u32::from_be_bytes([rst.3[0], rst.3[1], rst.3[2], rst.3[3]]),
+            error::FLOW_CONTROL_ERROR,
+        );
+        // The connection-level credit still ships (peer accounting).
+        assert!(
+            fr.iter().any(|f| f.0 == ftype::WINDOW_UPDATE && f.2 == 0),
+            "conn window still credited",
+        );
+    }
+
+    /// In-window DATA is accepted and debits the strict accounting;
+    /// handler consumption restores it through the same WINDOW_UPDATE
+    /// that credits the peer.
+    #[test]
+    fn recv_window_debits_on_data_and_credits_on_consume() {
+        let mut conn = H2Conn::new();
+        conn.streams
+            .push(streaming_slot(head_block(), &[], false, INITIAL_WINDOW));
+        let hdr = crate::frame::FrameHeader {
+            length: 5,
+            ty: ftype::DATA,
+            flags: 0,
+            stream_id: 1,
+        };
+        process_data(&mut conn, hdr, b"abcde").unwrap();
+        assert!(!conn.streams.is_empty(), "in-window DATA accepted");
+        assert_eq!(conn.streams[0].recv_window, INITIAL_WINDOW - 5);
+        // Handler consumes the 5 bytes → the sweep emits the stream
+        // WINDOW_UPDATE and restores the strict window with it.
+        conn.streams[0].body.data.borrow_mut().consumed_uncredited = 5;
+        conn.credit_consumed_bodies();
+        assert_eq!(conn.streams[0].recv_window, INITIAL_WINDOW);
+        assert!(
+            frames(&conn.ctrl_out)
+                .iter()
+                .any(|f| f.0 == ftype::WINDOW_UPDATE && f.2 == 1),
+            "stream credit emitted",
+        );
     }
 }

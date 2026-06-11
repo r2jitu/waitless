@@ -73,7 +73,7 @@ audit and are documented here (some also in their backlog).
 | TLS | ~~record sequence had no nonce-reuse guard~~ ✅ closed 2026-06-10 (`SEAL_RECORD_LIMIT` 2^24/key — `seal_app_data` refuses → conn closes; KeyUpdate-instead remains TL-2) | S3 | tls-backlog |
 | TLS | HelloRetryRequest, full key-update, ticket-key rotation, cipher/curve breadth, 0-RTT (replay-sensitive) | S2 | tls-backlog |
 | TLS | AES round-keys not zeroized on drop (single-tenant bare-metal) † | S3 | tls-backlog |
-| HTTP/2 | **h2spec** run (external tool); §7 error-code audit; two-GOAWAY drain; receive-window overrun not strictly rejected; request **trailers** dropped (no §8.1.2 validation) † | S1/S2 | http2-backlog |
+| HTTP/2 | **h2spec** run (external tool); §7 error-code audit; two-GOAWAY drain; ~~receive-window overrun not strictly rejected~~ ✅ closed 2026-06-10 (stream-level debit-on-DATA → RST FLOW_CONTROL_ERROR; conn-level unreachable under credit-on-arrival — H2-14); request **trailers** dropped (no §8.1.2 validation) † | S1/S2 | http2-backlog |
 | HTTP/3 | QPACK dynamic table; `SETTINGS_MAX_FIELD_SECTION_SIZE` parsed but unenforced †; header truncation past the slot cap † | S2 | http3-backlog |
 | HPACK/QPACK | field-huffman 16 KiB scratch → a >16 KiB literal returns a mis-named `BadPadding` (a resource limit reported as a wire error) † | S3 | http2/http3-backlog |
 | Drivers | virtio-net **MMIO** path negotiates `MRG_RXBUF` but its RX can't handle multi-buffer frames (the modern-PCI path strips it) — unsafe-but-benign on current hosts † | S1 | rx-path-optimizations |
