@@ -1,7 +1,10 @@
 # Waitless docs
 
-Design notes, performance trackers, and reference for the Waitless unikernel
-network stack.
+Design notes, performance trackers, and reference for Waitless — the
+bare-metal unikernel OS. Most of the depth here is in the network stack
+(that's where the engineering went), but the system underneath is general:
+boot, kernel, SMP, memory, async runtime, drivers, and whatever app boots on
+top.
 
 **New here?** Start with [`networking.md`](networking.md) (how the stack
 dispatches packets today) and [`stack-architecture.md`](stack-architecture.md)

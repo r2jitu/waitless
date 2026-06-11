@@ -2,10 +2,13 @@
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-**A web server that boots as the entire operating system.** Waitless is a Rust
-unikernel: there is no Linux underneath, no kernel/user split, and no syscalls.
-The NIC driver, TCP/IP, TLS 1.3, HTTP/1.1–3, and your request handlers all run
-in one address space, at one privilege level, driven by one `async` runtime.
+**Waitless is an operating system that boots straight into your app.** It is a
+Rust unikernel: there is no Linux underneath, no kernel/user split, and no
+syscalls. The NIC driver, TCP/IP, TLS 1.3, HTTP/1.1–3, and your application
+code all run in one address space, at one privilege level, driven by one
+cooperative `async` runtime. Any network service can be the machine: the
+[examples](#examples) include a web server, a SOCKS5 proxy, and an API
+gateway — each is just an `async fn` on the same OS.
 
 Delete the kernel boundary and two things fall out — and they're the name,
 twice over:
@@ -17,8 +20,8 @@ twice over:
   hello-world is **428 KB**). Smaller than a typical container's *base layer*,
   with nothing else inside it.
 
-The result, on identical cloud hardware against the mainstream Rust async
-server:
+The result — the web-server app on identical cloud hardware against
+tokio-hyper, the mainstream Rust async stack on Linux:
 
 ![Waitless vs tokio-hyper — HTTPS throughput and latency on one 8-vCPU c3 VM](docs/assets/benchmark.png)
 
