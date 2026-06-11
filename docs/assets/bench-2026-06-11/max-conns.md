@@ -21,3 +21,29 @@ which waitless defers — T6), and abandoned-then-retried handshakes
 collide with their own orphaned conns (RFC 5961 challenge-ACK, mostly
 rate-limit-throttled: syn_rx 565 K vs synack_tx 328 K across the three
 90 s probes). A 4th loadgen was quota-blocked (24 c3 + 8 n2 vCPUs).
+
+## Round 2 — six small loadgens (same day, hash 64 K `0e435b8`)
+
+Redesigned rig: 6× e2-standard-4 (4 vCPU each; global-CPU quota caps
+server 8 + loadgens 24), each driving only N/6 conns — far from any
+per-IP port ceiling, so the round-1 client-side pathologies vanish.
+wrk -t4, 240 s window, 60 s timeout, fresh `instances reset` per shot.
+
+| target | live @90/150/210 s          | sum rps | errors (all LGs) |
+|-------:|------------------------------|--------:|------------------|
+| 200 K  | 199,995 / 199,995 / 199,995 | 421,601 | 30 read |
+| 240 K  | 240,316 / 240,002 / 240,001 | 332,219 | 1,639 read, 8 timeout |
+| 280 K  | dead — guest self-terminated | (5,358) | ~40 K connect |
+
+**240,000 live TLS connections, rock-stable for 4 minutes.** The rps
+drop vs the c3-loadgen runs is the clients (e2 vCPUs are weak; each
+conn cycles ~1.4–2.1 req/s) — the server's /health p50 stayed ~240 ms
+at 240 K conns under closed-loop load.
+
+**280 K kills the server**: the GCE instance went TERMINATED
+(guest-initiated shutdown — the panic→arch_shutdown path), reproduced
+twice. Consistent with the documented 2026-05-24 heap-OOM signature
+(~280 K × ~55 KB/conn ≈ 15.4 GB ≈ the whole 16 GB heap); serial
+capture wasn't enabled so the exact panic site is unconfirmed. The
+"refuse new work at 90 % heap" admission guard demonstrably does not
+cover every allocation path at this scale — filed as a roadmap gap.

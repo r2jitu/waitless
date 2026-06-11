@@ -92,15 +92,17 @@ percentiles, and methodology: [docs/benchmark-results.md](docs/benchmark-results
 **The 80,000-connection row is the story.** Under an identical patient-client
 protocol, tokio-hyper could not get past ~59,600 established connections
 (27 K connect failures); Waitless held **80,001 live TLS connections at
-~500 K req/s**. Pushed further with a third load generator, Waitless served
-**143,164 live TLS connections at ~700 K req/s** — at which point the load
-generators ran out (client-side ports), not the server: no pool, task, or
-memory counter moved, and the capacity math (16 GB heap, ~55 KB/conn)
-supports ~290 K. Below saturation the typical request is **4–8× faster**
-end-to-end. One honest caveat: at saturation (≥16 K conns) Waitless's p99
-*tail* trails tokio-hyper's in places — queueing fairness under overload is
-Linux-mature and tracked in the [gaps](#current-gaps--limits). Plain-HTTP
-peaks at **0.86 M vs 0.63 M req/s** (≈1.4×).
+~500 K req/s**. Pushed to the actual ceiling with six load generators,
+Waitless held **240,000 live TLS connections — rock-stable for four
+minutes** (30 K conns/core on the 8-core/16 GB VM; counts read from the
+server's own gauge) and served **143 K live at ~700 K req/s** in the
+three-loadgen configuration. The measured edge is real too: 280 K exhausts
+the 16 GB heap and is fatal — tracked in the gaps. Below saturation the
+typical request is **4–8× faster** end-to-end. One honest caveat: at
+saturation (≥16 K conns) Waitless's p99 *tail* trails tokio-hyper's in
+places — queueing fairness under overload is Linux-mature and tracked in
+the [gaps](#current-gaps--limits). Plain-HTTP peaks at **0.86 M vs 0.63 M
+req/s** (≈1.4×).
 
 ### Where the 2× comes from
 

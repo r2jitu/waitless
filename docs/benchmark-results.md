@@ -84,16 +84,17 @@ strictly lower.
 
 ### The connection ceiling
 
-How far does concurrency go before the server actually breaks? With a
-third load generator (the c3 quota caps two; the third rode the n2 quota)
-and the task arena raised to 32 K slots/worker (`0292a82`):
-**143,164 live TLS connections, serving ~700 K req/s** — and the limit at
-that point was demonstrably the *clients*, not the server: across every
-probe `pool_exhausted=0`, `spawn_failures=0`, heap at 2–3 GB of 16 GB, and
-throughput steady. Per-shot numbers in
+How far does concurrency actually go? Answered in two rounds; per-shot
+data in
 [`assets/bench-2026-06-11/max-conns.md`](assets/bench-2026-06-11/max-conns.md).
 
-Two client-side mechanisms bound the demonstration, both instructive:
+**Round 1 — three 8-vCPU load generators** (the c3 quota caps two; the
+third rode the n2 quota), task arena at 32 K slots/worker (`0292a82`):
+**143,164 live TLS connections at ~700 K req/s** — limit demonstrably
+the *clients*, not the server: across every probe `pool_exhausted=0`,
+`spawn_failures=0`, heap at 2–3 GB of 16 GB, throughput steady.
+
+Two client-side mechanisms bound that round, both instructive:
 
 - **Loadgen ephemeral ports don't recycle against us.** Linux
   `tcp_tw_reuse` needs TCP timestamps, which Waitless deliberately defers
@@ -110,9 +111,32 @@ Two client-side mechanisms bound the demonstration, both instructive:
   Linux does the same; under this synthetic 3-IP herd it reads as
   establishment slowness.
 
-The capacity math says the real ceiling is much higher: 16 GB of heap at
-~55 KB/conn supports ~290 K, and the arena now holds 262 K tasks. Finding
-it needs more client IPs than this rig has.
+**Round 2 — six 4-vCPU load generators** (each driving only N/6 conns,
+far below any per-IP port ceiling — which made every round-1 client
+pathology vanish), against the per-core TCP 4-tuple hash doubled to 64 K
+entries (`0e435b8`, sized for 25 K+ conns/core):
+
+| target | live conns @ 90 s / 150 s / 210 s | sum req/s |
+|--:|---|--:|
+| 200 K | 199,995 / 199,995 / 199,995 | 421 K |
+| **240 K** | **240,316 / 240,002 / 240,001** | 332 K |
+| 280 K | *server died* | — |
+
+**240,000 live TLS connections, rock-stable for four minutes** — 30 K
+conns per core on an 8-core/16 GB VM, every count read from the server's
+own gauge, ~1.7 K total socket errors across 80 M requests. (The lower
+req/s vs the c3-loadgen runs is the weak e2 clients, not the server —
+closed-loop p50 ≈ 240 ms at 240 K conns.)
+
+**And the edge is real: 280 K kills the server.** The guest
+self-terminates (panic → shutdown), reproduced twice — consistent with
+heap exhaustion (~280 K × ~55 KB/conn ≈ the full 16 GB) reaching an
+allocation site the 90 %-heap admission guard doesn't cover (serial
+capture wasn't enabled, so the exact site is unconfirmed). Tracked as a
+roadmap gap: extreme-connection-count OOM must degrade to refusing new
+connections, not shutting down. The honest ceiling statement: **stable
+at 240 K, fatal by 280 K; the next lever is per-conn memory** (rx_ring
+tiering / the arena arc, architecture-audit #6).
 
 ### What the sweep flushed out (fixed the same day)
 
