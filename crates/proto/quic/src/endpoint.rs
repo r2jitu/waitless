@@ -457,6 +457,39 @@ impl QuicConn {
         self.arena.conn.borrow().stream_send_buffered(sid)
     }
 
+    /// Abort the send side of `sid` with a RESET_STREAM carrying
+    /// `app_error_code` (RFC 9000 §19.4) — the h3 layer's mid-stream
+    /// error path (a handler that failed after the head shipped) uses
+    /// this instead of silently FIN'ing a truncated response. Queued
+    /// data + retained retransmissions are dropped; the frame ships
+    /// on the flush below.
+    pub fn reset_stream(&self, sid: u64, app_error_code: u64) {
+        {
+            let mut c = self.arena.conn.borrow_mut();
+            c.reset_stream(sid, app_error_code);
+            let _ = c.flush(&self.cfg);
+        }
+        self.drain_outbound();
+    }
+
+    /// Ask the peer to stop sending on `sid` (RFC 9000 §19.5);
+    /// locally-buffered bytes for the stream are discarded.
+    pub fn stop_sending(&self, sid: u64, app_error_code: u64) {
+        {
+            let mut c = self.arena.conn.borrow_mut();
+            c.stop_sending(sid, app_error_code);
+            let _ = c.flush(&self.cfg);
+        }
+        self.drain_outbound();
+    }
+
+    /// The application error code of a peer RESET_STREAM on `sid`,
+    /// if one was received (RFC 9000 §19.4). Readers check this when
+    /// `recv` reports EOF to distinguish an abort from a clean FIN.
+    pub fn stream_reset_code(&self, sid: u64) -> Option<u64> {
+        self.arena.conn.borrow().stream_reset_code(sid)
+    }
+
     /// Whether the connection has failed / been closed by the peer. A
     /// streaming handler checks this so it stops producing once the peer
     /// goes away — otherwise, since `stream_drain_below` returns

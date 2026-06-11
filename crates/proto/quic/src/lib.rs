@@ -53,6 +53,7 @@
 
 extern crate alloc;
 
+pub mod client_endpoint;
 pub mod conn;
 pub mod crypto;
 pub mod diag;
@@ -67,10 +68,40 @@ pub mod tls;
 pub mod transport_params;
 pub mod wire;
 
+pub use client_endpoint::{QuicClientConn, QuicConnectError, quic_connect};
 pub use conn::{ConnError, ConnState, Connection, ConnectionId, SERVER_CID_LEN};
+#[doc(hidden)]
+pub use nic_api::MAX_L2_HEADROOM;
 pub use endpoint::{QuicConn, QuicListenError, QuicListener, quic_listen};
 pub use inbox::ConnInbox;
 pub use tls::{CryptoLevel, QuicTls, QuicTlsError, QuicTlsState};
+
+/// Host-test clock override for DEPENDENT crates' tests (e.g. the h3
+/// in-process loopback), where this crate is compiled without
+/// `cfg(test)` and the internal thread-local mock isn't available.
+/// On the host the real clock reads a constant 0, freezing the egress
+/// pacer's token refill — pin + advance this virtual clock to drive
+/// it. Monotonic-only; a no-op influence on production native builds
+/// that never call it. Not compiled on bare-metal.
+#[cfg(not(target_os = "none"))]
+#[doc(hidden)]
+pub mod sim_clock {
+    /// Raise the virtual instant to at least `us`.
+    pub fn pin_at_least(us: u64) {
+        #[cfg(test)]
+        crate::time::mock::set(us);
+        #[cfg(not(test))]
+        crate::time::host_clock::pin_at_least(us);
+    }
+
+    /// Advance the virtual instant by `us`.
+    pub fn advance(us: u64) {
+        #[cfg(test)]
+        crate::time::mock::advance(us);
+        #[cfg(not(test))]
+        crate::time::host_clock::advance(us);
+    }
+}
 
 /// Force-exercise every QUIC + TLS primitive that lazily allocates
 /// inside its RustCrypto crate so the heap allocations land in

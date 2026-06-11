@@ -10,14 +10,54 @@
 
 /// Microseconds since boot — the same monotonic reader QUIC has always
 /// used (`tls::ticket::now_us`), behind the crate's one clock seam.
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "none"))]
 #[inline(always)]
 pub(crate) fn now_us() -> u64 {
     tls::ticket::now_us()
 }
 
+/// Host (non-bare-metal) builds: the real reader returns a constant 0
+/// (`tls::ticket::now_us`'s documented native fallback), which would
+/// freeze every time-driven mechanism — notably the egress pacer's
+/// token refill — for DEPENDENT crates' tests, where this crate is
+/// compiled without `cfg(test)` and the thread-local mock below
+/// doesn't exist. Route through the process-global virtual clock
+/// instead: identical behavior (0) until a test pins it via
+/// [`crate::sim_clock`]. Bare-metal never compiles this arm.
+#[cfg(all(not(test), not(target_os = "none")))]
+#[inline(always)]
+pub(crate) fn now_us() -> u64 {
+    host_clock::now_us()
+}
+
 #[cfg(test)]
 pub(crate) use mock::now_us;
+
+/// Process-global virtual clock for host builds (see [`now_us`]).
+/// Monotonic-only mutation (`fetch_max` / `fetch_add`) so parallel
+/// host tests sharing the process can each push time forward without
+/// ever observing a backward jump.
+#[cfg(all(not(test), not(target_os = "none")))]
+pub(crate) mod host_clock {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static VIRT_US: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn now_us() -> u64 {
+        let v = VIRT_US.load(Ordering::Relaxed);
+        if v != 0 { v } else { tls::ticket::now_us() }
+    }
+
+    /// Raise the virtual instant to at least `us`.
+    pub(crate) fn pin_at_least(us: u64) {
+        VIRT_US.fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// Advance the virtual instant by `d` µs.
+    pub(crate) fn advance(d: u64) {
+        VIRT_US.fetch_add(d, Ordering::Relaxed);
+    }
+}
 
 /// Test clock. Defaults to forwarding to the real reader, so tests that
 /// don't care about time are unaffected; a test that does calls
