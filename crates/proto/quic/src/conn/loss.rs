@@ -333,6 +333,10 @@ impl Connection {
         // Lost CRYPTO fragments, re-queued (at their original offsets) for
         // retransmission after the `space` borrow ends (RFC 9002 §6.2).
         let mut lost_crypto: alloc::vec::Vec<super::CryptoRetx> = alloc::vec::Vec::new();
+        // Lost RESET_STREAM / STOP_SENDING frames, pushed back onto the
+        // pending queues after the borrow ends (RFC 9000 §13.3: both are
+        // retransmitted until acknowledged).
+        let mut lost_ctrl: alloc::vec::Vec<super::CtrlRetx> = alloc::vec::Vec::new();
         // Age of the lowest-PN lost packet (lost_buf is filled in PN
         // order, so [0] is the smallest). Captured for `last_loss`:
         // an age well below one RTT means its ACK is still in flight =
@@ -348,6 +352,7 @@ impl Connection {
                 }
                 lost_frames.append(&mut pkt.stream_frames);
                 lost_crypto.append(&mut pkt.crypto_frames);
+                lost_ctrl.append(&mut pkt.ctrl_frames);
             }
         }
         let lost_threshold_n = lost_threshold_n as u64;
@@ -383,10 +388,30 @@ impl Connection {
         // §13.3). `encode_one_rtt_packet` drains this before fresh data.
         // Count their bytes so the congestion gate treats in-flight +
         // awaiting-retransmit as one bound (else the queue grows unbounded).
+        // Frames for a send-aborted stream are dropped instead: after a
+        // RESET_STREAM no further stream data flows (RFC 9000 §3.5) — the
+        // reset frame itself is what gets retransmitted (`lost_ctrl`).
+        lost_frames.retain(|f| !self.send_aborted(f.sid));
         for f in &lost_frames {
             self.retx_bytes = self.retx_bytes.saturating_add(f.data.len() as u32);
         }
         self.retx_queue.extend(lost_frames);
+        // Re-queue lost per-stream-abort control frames (RFC 9000 §13.3).
+        for c in lost_ctrl {
+            match c {
+                super::CtrlRetx::ResetStream {
+                    sid,
+                    app_error_code,
+                    final_size,
+                } => self
+                    .pending_reset_streams
+                    .push((sid, app_error_code, final_size)),
+                super::CtrlRetx::StopSending {
+                    sid,
+                    app_error_code,
+                } => self.pending_stop_sending.push((sid, app_error_code)),
+            }
+        }
         // Re-queue lost CRYPTO fragments. Unlike STREAM bytes these are
         // not congestion-controlled separately (the handshake flight is
         // tiny and bounded), so no `retx_bytes`-style accounting; the
@@ -453,6 +478,7 @@ impl Connection {
         // retransmission on loss.
         let stream_frames = core::mem::take(&mut self.pending_sent_stream_frames);
         let crypto_frames = core::mem::take(&mut self.pending_sent_crypto_frames);
+        let ctrl_frames = core::mem::take(&mut self.pending_sent_ctrl_frames);
         let pkt = SentPacket {
             time_sent_us: now,
             ack_eliciting,
@@ -460,6 +486,7 @@ impl Connection {
             byte_count,
             stream_frames,
             crypto_frames,
+            ctrl_frames,
         };
         let (space, idx) = match level {
             CryptoLevel::Initial => (&mut self.initial_space, 0usize),

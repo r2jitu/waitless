@@ -38,9 +38,12 @@
 // upload runs past the initial window. See `consumed` / `recv_max`
 // here and the pull-emission in `Connection::encode_app_packet`.
 //
-// Out of scope (not needed for MVP):
-//   * RESET_STREAM / STOP_SENDING (we'd close the conn on stream
-//     errors instead — fine for HTTP/3 GET/POST).
+// Per-stream abort (RFC 9000 §3.5) IS implemented: the recv side
+// honors RESET_STREAM via [`RecvStream::apply_reset`] (discard +
+// terminal `Closed` at the final size), and the send side aborts via
+// [`SendStream::abort`] (drop queued chunks, `ResetSent` terminal
+// state) when the app calls `Connection::reset_stream` or the peer
+// sends STOP_SENDING.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -331,6 +334,24 @@ impl RecvStream {
         produced
     }
 
+    /// Honor a peer RESET_STREAM (RFC 9000 §3.5 receive side): discard
+    /// all buffered + out-of-order data and park the stream terminally
+    /// `Closed` at `final_size`, so `drain` reports `(0, eof)` instead
+    /// of leaving the reader hung on bytes that will never arrive. The
+    /// connection layer has already validated `final_size` (§4.5) and
+    /// settled the flow-control accounting before calling this; the
+    /// application error code is surfaced separately (the conn's
+    /// `stream_reset_code`).
+    pub fn apply_reset(&mut self, final_size: u64) {
+        self.buffer.clear();
+        self.gap_buffer.clear();
+        self.offset = final_size;
+        self.recv_high = final_size;
+        self.state = RecvState::Closed {
+            fin_offset: final_size,
+        };
+    }
+
     /// Drain up to `out.len()` bytes from the head of the in-order
     /// buffer. Returns `(bytes_copied, fin_seen_after_drain)` —
     /// `fin_seen_after_drain` is true if FIN has been observed AND
@@ -366,6 +387,12 @@ pub enum SendState {
     /// panicking — the caller may have a pending write that
     /// raced the close).
     FinSent,
+    /// The send side was aborted (RFC 9000 §3.5): the app called
+    /// `Connection::reset_stream` or the peer sent STOP_SENDING. A
+    /// RESET_STREAM frame is (being) emitted by the connection layer;
+    /// queued chunks were dropped, no further STREAM frames flow, and
+    /// writes become no-ops. Terminal, like `FinSent`.
+    ResetSent,
 }
 
 /// Per-stream send state. The connection layer drives
@@ -444,11 +471,26 @@ impl SendStream {
         self.peer_max_stream_data = 0;
     }
 
-    /// Convenience predicate (FIN was emitted) — kept for the
-    /// reaper, which uses it as half of the "both sides done"
-    /// gate.
+    /// Convenience predicate (the send side reached a terminal state
+    /// — FIN emitted, or the stream was aborted with RESET_STREAM) —
+    /// kept for the reaper, which uses it as half of the "both sides
+    /// done" gate.
     pub fn fin_sent(&self) -> bool {
-        matches!(self.state, SendState::FinSent)
+        matches!(self.state, SendState::FinSent | SendState::ResetSent)
+    }
+
+    /// Abort the send side (RFC 9000 §3.5): drop every queued chunk,
+    /// enter the terminal `ResetSent` state, and return the stream's
+    /// final size (= bytes already emitted onto the wire — exactly
+    /// what flow control was charged, so the RESET_STREAM frame's
+    /// Final Size field keeps the peer's accounting consistent,
+    /// §4.5). Idempotent: a second abort returns the same final size.
+    pub fn abort(&mut self) -> u64 {
+        self.outbound.clear();
+        self.head_consumed = 0;
+        self.state = SendState::ResetSent;
+        self.rx_us = 0;
+        self.send_offset
     }
 
     /// Transition to `FinSent` — the response is fully encoded — and,
@@ -470,7 +512,7 @@ impl SendStream {
     /// borrow, heap-owned, with or without reserved
     /// headroom/tailroom) and queues it.
     pub fn write_iobuf(&mut self, data: iobuf::IOBuf) {
-        if matches!(self.state, SendState::FinSent) || data.is_empty() {
+        if matches!(self.state, SendState::FinSent | SendState::ResetSent) || data.is_empty() {
             return;
         }
         self.outbound.push_back(data);
@@ -498,8 +540,8 @@ impl SendStream {
     pub fn close(&mut self) {
         match self.state {
             SendState::Open => self.state = SendState::Closing,
-            // Already closing or FIN'd — close is idempotent.
-            SendState::Closing | SendState::FinSent => {}
+            // Already closing, FIN'd, or aborted — close is idempotent.
+            SendState::Closing | SendState::FinSent | SendState::ResetSent => {}
         }
     }
 
@@ -543,7 +585,7 @@ impl SendStream {
     /// empty `outbound` yields a zero-length FIN.
     pub fn pop_chunk(&mut self, max_bytes: usize) -> Option<(u64, iobuf::IOBuf, bool)> {
         match self.state {
-            SendState::FinSent => return None,
+            SendState::FinSent | SendState::ResetSent => return None,
             SendState::Open if self.outbound.is_empty() => return None,
             _ => {}
         }
@@ -914,5 +956,45 @@ mod tests {
         assert_eq!(s.buffered_len(), 3);
         s.reset_for_reuse();
         assert_eq!(s.buffered_len(), 0);
+    }
+
+    // ── Per-stream abort (RFC 9000 §3.5) ─────────────────────────
+
+    /// `SendStream::abort` drops queued chunks, reports the emitted
+    /// byte count as the final size, refuses further writes/pops, and
+    /// satisfies the reaper's `fin_sent` gate.
+    #[test]
+    fn send_abort_drops_queue_and_reports_final_size() {
+        let mut s = SendStream::default();
+        s.write_owned(b"abcdefghij".to_vec());
+        s.pop_chunk(4).unwrap(); // 4 bytes on the wire
+        assert_eq!(s.abort(), 4, "final size = bytes already emitted");
+        assert_eq!(s.buffered_len(), 0, "queued chunks dropped");
+        assert!(s.pop_chunk(1024).is_none(), "no frames after abort");
+        s.write_owned(b"late".to_vec()); // no-op, like post-FIN writes
+        assert_eq!(s.buffered_len(), 0);
+        assert!(s.fin_sent(), "terminal for the reaper");
+        assert_eq!(s.abort(), 4, "idempotent");
+    }
+
+    /// `RecvStream::apply_reset` discards buffered + gapped data and
+    /// turns the stream terminally closed at the final size, so a
+    /// reader sees a clean `(0, eof)` instead of a hang.
+    #[test]
+    fn recv_apply_reset_discards_and_closes() {
+        let mut s = RecvStream::default();
+        s.ingest(0, b"hello", false);
+        s.ingest(20, b"gap", false); // out-of-order, staged
+        s.apply_reset(40);
+        assert!(s.is_closed());
+        assert_eq!(s.fin_offset(), Some(40));
+        let (n, eof) = s.drain(&mut [0u8; 16]);
+        assert_eq!(n, 0, "buffered bytes discarded");
+        assert!(eof, "reader unblocks with eof");
+        // Late retransmits for the reset stream are absorbed silently.
+        assert!(!s.ingest(5, b"straggler", false));
+        let (n2, eof2) = s.drain(&mut [0u8; 16]);
+        assert_eq!(n2, 0);
+        assert!(eof2);
     }
 }

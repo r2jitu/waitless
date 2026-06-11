@@ -26,6 +26,9 @@ rust_library(
     name = "quic",
     srcs = [
         "src/lib.rs",
+        # QUIC client endpoint: ephemeral-UDP connector + conn task
+        # for the client role (quic_connect / QuicClientConn).
+        "src/client_endpoint.rs",
         # Observability: per-reason atomic counters + the
         # `quic_drop!` / `quic_event!` macros that wrap every
         # silent-drop site so failures are visible to the operator.
@@ -45,6 +48,8 @@ rust_library(
         # `rx.rs` the inbound packet path, `tx.rs` outbound assembly
         # + AEAD seal, `loss.rs` the RFC 9002 loss / RTT machinery.
         "src/conn/mod.rs",
+        # Per-stream abort (S1, RFC 9000 §3.5) transport tests.
+        "src/conn/abort_tests.rs",
         "src/conn/cfg.rs",
         # Client role: `Connection::new_client` + the client-received
         # packets (Version Negotiation, Retry) + the RFC 9000 §7.3

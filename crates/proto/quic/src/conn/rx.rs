@@ -1062,6 +1062,27 @@ impl Connection {
                     // a fresh challenge supersedes an unsent one.
                     self.pending_path_response = Some(data);
                 }
+                Frame::ResetStream {
+                    stream_id,
+                    app_error_code,
+                    final_size,
+                } => {
+                    if matches!(level, CryptoLevel::OneRtt)
+                        && !self.process_reset_stream(stream_id, app_error_code, final_size)
+                    {
+                        return Ok(());
+                    }
+                }
+                Frame::StopSending {
+                    stream_id,
+                    app_error_code,
+                } => {
+                    if matches!(level, CryptoLevel::OneRtt)
+                        && !self.process_stop_sending(stream_id, app_error_code)
+                    {
+                        return Ok(());
+                    }
+                }
                 Frame::Skipped { kind } => {
                     // Most wire-recognized frames need no app-level
                     // reaction (NEW_CONNECTION_ID, …); the
@@ -1090,6 +1111,165 @@ impl Connection {
             payload = &payload[consumed..];
         }
         Ok(())
+    }
+
+    // ── Per-stream abort, receive side (RFC 9000 §3.5 — S1) ──────
+
+    /// Honor a peer RESET_STREAM (RFC 9000 §19.4): validate the final
+    /// size (§4.5), settle the flow-control accounting, discard the
+    /// stream's recv state, and surface the application error to the
+    /// reader via [`Connection::stream_reset_code`]. Returns `false`
+    /// when the frame closed the connection (caller stops
+    /// dispatching), `true` otherwise.
+    fn process_reset_stream(&mut self, sid: u64, app_error_code: u64, final_size: u64) -> bool {
+        // Late retransmit for a stream we already finished + reaped:
+        // ACK it (so the peer stops resending) and move on.
+        if self.is_reaped(sid) {
+            self.note_app_ack_eliciting();
+            return true;
+        }
+        // §19.4: RESET_STREAM on a send-only stream (one WE initiated
+        // unidirectionally) is a STREAM_STATE_ERROR. Role-aware: our
+        // uni ids are 0x3 (server role) / 0x2 (client role).
+        let our_uni = if self.client.is_some() { 0x2 } else { 0x3 };
+        if sid & 0x3 == our_uni {
+            self.close_with_error(0x05 /* STREAM_STATE_ERROR */, b"reset on send-only");
+            return false;
+        }
+        // A RESET_STREAM can be the first frame that opens a peer-
+        // initiated stream — apply the same stream-limit gate the
+        // STREAM arm uses before creating recv state.
+        let was_new = !self.recv_streams.contains_key(&sid);
+        if was_new {
+            let over_limit = if self.client.is_some() {
+                client_exceeds_stream_limit(
+                    sid,
+                    self.peer_max_streams_bidi_advertised,
+                    self.peer_max_streams_uni_advertised,
+                    self.recv_streams.len(),
+                )
+            } else {
+                exceeds_stream_limit(
+                    sid,
+                    self.peer_max_streams_bidi_advertised,
+                    self.peer_max_streams_uni_advertised,
+                    self.recv_streams.len(),
+                )
+            };
+            if over_limit {
+                crate::diag::COUNTERS.stream_limit_exceeded.bump();
+                self.close_with_error(0x04 /* STREAM_LIMIT_ERROR */, b"stream limit");
+                return false;
+            }
+            let new_stream = self.recv_pool.pop().unwrap_or_default();
+            self.recv_streams.insert(sid, new_stream);
+        }
+        let s = self.recv_streams.get_mut(&sid).expect("inserted above");
+        // §4.5 final-size rules: the final size can neither shrink
+        // below data already received nor disagree with a FIN we saw.
+        if final_size < s.recv_high || s.fin_offset().is_some_and(|f| f != final_size) {
+            crate::quic_drop!(
+                other_wire,
+                "reset final size: sid={} final={} recv_high={}",
+                sid,
+                final_size,
+                s.recv_high
+            );
+            self.close_with_error(0x12 /* FINAL_SIZE_ERROR */, b"final size");
+            return false;
+        }
+        // §4.5: the final size charges flow control exactly like
+        // received bytes — enforce the stream + connection windows.
+        let conn_delta = final_size.saturating_sub(s.recv_high);
+        if final_size > s.recv_max
+            || self.data_received.saturating_add(conn_delta) > self.max_data_advertised
+        {
+            crate::quic_drop!(
+                other_wire,
+                "reset flow control: sid={} final={} recv_max={}",
+                sid,
+                final_size,
+                s.recv_max
+            );
+            self.close_with_error(0x03 /* FLOW_CONTROL_ERROR */, b"flow control");
+            return false;
+        }
+        self.data_received = self.data_received.saturating_add(conn_delta);
+        super::recv_buffered_add(conn_delta);
+        // Discard the stream's buffered data and credit EVERYTHING up
+        // to the final size as consumed — the app will never drain
+        // these bytes, and §4.5 requires the connection window to
+        // account for the full final size so MAX_DATA keeps sliding.
+        let s = self.recv_streams.get_mut(&sid).expect("present");
+        let already_consumed = s.consumed();
+        s.apply_reset(final_size);
+        let newly_consumed = final_size.saturating_sub(already_consumed);
+        self.data_consumed = self.data_consumed.saturating_add(newly_consumed);
+        super::recv_buffered_sub(newly_consumed);
+        self.record_peer_reset(sid, app_error_code);
+        crate::quic_event!(
+            reset_streams_received,
+            "sid={} code={:#x} final_size={} local_cid={}",
+            sid,
+            app_error_code,
+            final_size,
+            crate::endpoint::hex8(self.local_cid.as_slice())
+        );
+        // Surface a brand-new peer-initiated stream to the accept
+        // loop (same push rules as the STREAM arm's `was_new` case)
+        // so the app observes + finishes it and the reaper can run.
+        if was_new {
+            let accept = if self.client.is_some() {
+                matches!(sid & 0x3, 0x1 | 0x3)
+            } else {
+                matches!(sid & 0x3, 0x0 | 0x2)
+            };
+            if accept {
+                self.opened_streams.push(sid);
+            }
+        }
+        self.note_app_ack_eliciting();
+        true
+    }
+
+    /// Honor a peer STOP_SENDING (RFC 9000 §19.5): abort our send
+    /// side with a RESET_STREAM echoing the peer's code (§3.5 MUST
+    /// for Ready/Send streams). A stream that already FIN'd (quinn
+    /// routinely STOP_SENDINGs a fully-delivered response) or was
+    /// reaped is left alone. Returns `false` when the frame closed
+    /// the connection.
+    fn process_stop_sending(&mut self, sid: u64, app_error_code: u64) -> bool {
+        crate::diag::COUNTERS.stop_sending_received.bump();
+        if self.is_reaped(sid) {
+            self.note_app_ack_eliciting();
+            return true;
+        }
+        // §19.5: STOP_SENDING on a receive-only stream (the PEER's
+        // uni stream) is a STREAM_STATE_ERROR…
+        let peer_uni = if self.client.is_some() { 0x3 } else { 0x2 };
+        if sid & 0x3 == peer_uni {
+            self.close_with_error(0x05 /* STREAM_STATE_ERROR */, b"stop_sending recv-only");
+            return false;
+        }
+        // …as is one for a locally-initiated stream we never opened.
+        let local_init_bit = if self.client.is_some() { 0x0 } else { 0x1 };
+        if sid & 0x1 == local_init_bit && !self.send_streams.contains_key(&sid) {
+            self.close_with_error(0x05 /* STREAM_STATE_ERROR */, b"stop_sending unopened");
+            return false;
+        }
+        // Abort + answer with RESET_STREAM (copying the peer's code,
+        // §3.5 SHOULD) unless the send side already terminated. A
+        // peer-initiated bidi stream we haven't written to yet is in
+        // Ready — the abort still applies (final size 0).
+        let terminal = self
+            .send_streams
+            .get(&sid)
+            .is_some_and(|s| s.fin_sent());
+        if !terminal {
+            self.reset_stream(sid, app_error_code);
+        }
+        self.note_app_ack_eliciting();
+        true
     }
 }
 

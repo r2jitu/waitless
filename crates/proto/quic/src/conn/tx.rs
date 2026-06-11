@@ -725,6 +725,10 @@ impl Connection {
             || self.force_max_streams_uni
             // PATH_CHALLENGE awaiting echo (RFC 9000 §8.2.2).
             || self.pending_path_response.is_some()
+            // Per-stream abort frames awaiting emission (RFC 9000
+            // §19.4-19.5 — the S1 queues).
+            || !self.pending_reset_streams.is_empty()
+            || !self.pending_stop_sending.is_empty()
             || self.force_max_data
             // MAX_DATA slide is gated on the aggregate recv budget (#75):
             // while over budget we deliberately DON'T grant new credit,
@@ -775,7 +779,12 @@ impl Connection {
         // Any send stream with bytes queued OR a close pending.
         for s in self.send_streams.values() {
             match s.state {
-                crate::streams::SendState::FinSent => continue,
+                // Terminal: FIN emitted, or aborted via RESET_STREAM
+                // (the reset frame itself rides the control queue,
+                // not stream data).
+                crate::streams::SendState::FinSent | crate::streams::SendState::ResetSent => {
+                    continue
+                }
                 crate::streams::SendState::Closing => return true,
                 crate::streams::SendState::Open => {
                     if !s.outbound.is_empty() {
@@ -1238,6 +1247,42 @@ impl Connection {
         // migration / NAT rebinding). Ack-eliciting.
         if let Some(data) = self.pending_path_response.take() {
             append_path_response_into(out, &data);
+            ack_eliciting = true;
+        }
+
+        // Per-stream abort frames (S1, RFC 9000 §19.4-19.5): drain the
+        // pending RESET_STREAM / STOP_SENDING queues. Each frame is ≤
+        // 25 B; staged on the packet (`pending_sent_ctrl_frames`) so a
+        // loss re-queues it (§13.3 — both MUST be retransmitted until
+        // acknowledged). Bounded by the packet budget; the rest ride
+        // the next packet of the flush.
+        while !self.pending_stop_sending.is_empty()
+            && out.len() - header_start < PACKET_BODY_BUDGET
+        {
+            let (sid, code) = self.pending_stop_sending.remove(0);
+            let mut tmp = [0u8; 24];
+            let n = crate::frame::write_stop_sending(sid, code, &mut tmp)
+                .map_err(|_| ConnError::Wire)?;
+            out.extend_from_slice(&tmp[..n]);
+            self.pending_sent_ctrl_frames.push(super::CtrlRetx::StopSending {
+                sid,
+                app_error_code: code,
+            });
+            ack_eliciting = true;
+        }
+        while !self.pending_reset_streams.is_empty()
+            && out.len() - header_start < PACKET_BODY_BUDGET
+        {
+            let (sid, code, final_size) = self.pending_reset_streams.remove(0);
+            let mut tmp = [0u8; 32];
+            let n = crate::frame::write_reset_stream(sid, code, final_size, &mut tmp)
+                .map_err(|_| ConnError::Wire)?;
+            out.extend_from_slice(&tmp[..n]);
+            self.pending_sent_ctrl_frames.push(super::CtrlRetx::ResetStream {
+                sid,
+                app_error_code: code,
+                final_size,
+            });
             ack_eliciting = true;
         }
 

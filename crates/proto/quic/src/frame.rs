@@ -29,9 +29,10 @@
 // coalesced frames after it keep parsing — `Frame::Skipped`) but the
 // connection layer takes no action on it. Still skip-only: NEW_TOKEN,
 // NEW/RETIRE_CONNECTION_ID (CID rotation is out of scope for the MVP
-// server), RESET_STREAM and STOP_SENDING (per-stream abort — parsed past,
-// not yet generated/honored), and DATAGRAM (RFC 9221). Adding real
-// handling later only changes the `dispatch_frames` arm.
+// server) and DATAGRAM (RFC 9221). RESET_STREAM and STOP_SENDING
+// (per-stream abort, RFC 9000 §3.5) are fully typed: parsed into
+// dedicated variants, honored in `dispatch_frames`, and generated via
+// `write_reset_stream` / `write_stop_sending`.
 
 // (no-std declaration is in lib.rs. `wire` is now this crate's
 // sibling module rather than a separate crate.)
@@ -175,6 +176,21 @@ pub enum Frame<'a> {
         stream_id: u64,
         maximum: u64,
     },
+    /// 0x04 RESET_STREAM (RFC 9000 §19.4) — the peer abruptly ends the
+    /// sending part of a stream: discard its recv state, validate the
+    /// final size (§4.5), surface the application error to the reader.
+    ResetStream {
+        stream_id: u64,
+        app_error_code: u64,
+        final_size: u64,
+    },
+    /// 0x05 STOP_SENDING (RFC 9000 §19.5) — the peer no longer wants
+    /// our data on this stream: abort the send side with a
+    /// RESET_STREAM carrying the same code (§3.5).
+    StopSending {
+        stream_id: u64,
+        app_error_code: u64,
+    },
     /// Wire-recognized frame whose semantics the connection layer
     /// doesn't act on yet. Carries the type byte for diagnostics —
     /// upgrading to a typed variant is a one-arm change in dispatch.
@@ -242,19 +258,17 @@ pub fn parse_frame(data: &[u8]) -> Result<(Frame<'_>, usize), FrameError> {
         ftype::HANDSHAKE_DONE => Ok((Frame::HandshakeDone, 1)),
         ftype::NEW_TOKEN => skip_var_len_field(rest, t, frame_total_offset),
         // RESET_STREAM (RFC 9000 §19.4): three varints — stream id,
-        // application error code, final size. Skip-only today: the
-        // server treats the stream as closed via its own FIN
-        // accounting; the client's intent to abort is implicit in
-        // the response stream being dropped.
-        ftype::RESET_STREAM => skip_three_varints(rest, t, frame_total_offset),
+        // application error code, final size. Honored by the
+        // connection layer (recv-state discard + §4.5 final-size
+        // validation) and surfaced to the stream's reader.
+        ftype::RESET_STREAM => parse_reset_stream(rest, frame_total_offset),
         // STOP_SENDING (RFC 9000 §19.5): two varints — stream id,
-        // application error code. Skip-only today: quinn's H3 client
-        // sends this routinely after consuming the response, telling
-        // us "don't send any more on this stream." We're already
-        // FIN-closed on the response side by the time it arrives, so
-        // ignoring it is safe; treating it as an unknown frame
-        // tripped CONNECTION_CLOSE(PROTOCOL_VIOLATION) instead.
-        ftype::STOP_SENDING => skip_two_varints(rest, t, frame_total_offset),
+        // application error code. Honored: the connection layer
+        // aborts the send side with a RESET_STREAM echoing the code
+        // (§3.5). quinn's H3 client sends this routinely after
+        // consuming a response; with the send side already FIN'd
+        // (or the stream reaped) the connection layer ignores it.
+        ftype::STOP_SENDING => parse_stop_sending(rest, frame_total_offset),
         // MAX_DATA / MAX_STREAM_DATA carry the peer's send-side
         // flow-control credit — parsed (not skipped) so the connection
         // can raise its send windows.
@@ -290,6 +304,34 @@ fn parse_max_stream_data(body: &[u8], header: usize) -> Result<(Frame<'_>, usize
     Ok((Frame::MaxStreamData { stream_id, maximum }, header + n + m))
 }
 
+// ── Per-stream abort parsers (RFC 9000 §19.4 / §19.5) ────────────
+
+fn parse_reset_stream(body: &[u8], header: usize) -> Result<(Frame<'_>, usize), FrameError> {
+    let (stream_id, n) = read_varint(body)?;
+    let (app_error_code, m) = read_varint(&body[n..])?;
+    let (final_size, p) = read_varint(&body[n + m..])?;
+    Ok((
+        Frame::ResetStream {
+            stream_id,
+            app_error_code,
+            final_size,
+        },
+        header + n + m + p,
+    ))
+}
+
+fn parse_stop_sending(body: &[u8], header: usize) -> Result<(Frame<'_>, usize), FrameError> {
+    let (stream_id, n) = read_varint(body)?;
+    let (app_error_code, m) = read_varint(&body[n..])?;
+    Ok((
+        Frame::StopSending {
+            stream_id,
+            app_error_code,
+        },
+        header + n + m,
+    ))
+}
+
 // ── Skip helpers ─────────────────────────────────────────────────
 
 fn skip_one_varint(body: &[u8], kind: u8, header: usize) -> Result<(Frame<'_>, usize), FrameError> {
@@ -305,17 +347,6 @@ fn skip_two_varints(
     let (_a, n) = read_varint(body)?;
     let (_b, m) = read_varint(&body[n..])?;
     Ok((Frame::Skipped { kind }, header + n + m))
-}
-
-fn skip_three_varints(
-    body: &[u8],
-    kind: u8,
-    header: usize,
-) -> Result<(Frame<'_>, usize), FrameError> {
-    let (_a, n) = read_varint(body)?;
-    let (_b, m) = read_varint(&body[n..])?;
-    let (_c, p) = read_varint(&body[n + m..])?;
-    Ok((Frame::Skipped { kind }, header + n + m + p))
 }
 
 fn skip_var_len_field(
@@ -737,6 +768,45 @@ pub fn write_max_data(max: u64, out: &mut [u8]) -> Result<usize, FrameError> {
     Ok(1 + n)
 }
 
+/// RESET_STREAM (RFC 9000 §19.4). Abruptly terminates the sending
+/// part of `stream_id` with `app_error_code`; `final_size` is the
+/// cumulative number of stream bytes sent (the flow-control charge,
+/// §4.5). Stream id + code + final size, all varints.
+pub fn write_reset_stream(
+    stream_id: u64,
+    app_error_code: u64,
+    final_size: u64,
+    out: &mut [u8],
+) -> Result<usize, FrameError> {
+    if out.is_empty() {
+        return Err(FrameError::OutputTooSmall);
+    }
+    out[0] = ftype::RESET_STREAM;
+    let mut p = 1usize;
+    p += write_varint(stream_id, &mut out[p..])?;
+    p += write_varint(app_error_code, &mut out[p..])?;
+    p += write_varint(final_size, &mut out[p..])?;
+    Ok(p)
+}
+
+/// STOP_SENDING (RFC 9000 §19.5). Asks the peer to stop sending on
+/// `stream_id`; the peer answers with RESET_STREAM (§3.5). Stream id
+/// + application error code, both varints.
+pub fn write_stop_sending(
+    stream_id: u64,
+    app_error_code: u64,
+    out: &mut [u8],
+) -> Result<usize, FrameError> {
+    if out.is_empty() {
+        return Err(FrameError::OutputTooSmall);
+    }
+    out[0] = ftype::STOP_SENDING;
+    let mut p = 1usize;
+    p += write_varint(stream_id, &mut out[p..])?;
+    p += write_varint(app_error_code, &mut out[p..])?;
+    Ok(p)
+}
+
 /// MAX_STREAM_DATA (RFC 9000 §19.10). Per-stream flow control: raises
 /// the max byte *offset* the peer may send on `stream_id`. Carries the
 /// stream id then the new limit, both varints. Monotonic like MAX_DATA.
@@ -830,6 +900,49 @@ mod tests {
                 if stream_id == 1 << 30 && maximum == 1 << 22
         ));
         assert_eq!(parsed2, n2);
+    }
+
+    #[test]
+    fn reset_stream_round_trips() {
+        let mut buf = [0u8; 32];
+        let n = write_reset_stream(4, 0x0102, 1 << 20, &mut buf).unwrap();
+        assert_eq!(buf[0], ftype::RESET_STREAM);
+        let (f, parsed) = parse_frame(&buf[..n]).unwrap();
+        assert_eq!(parsed, n);
+        assert!(matches!(
+            f,
+            Frame::ResetStream {
+                stream_id: 4,
+                app_error_code: 0x0102,
+                final_size,
+            } if final_size == 1 << 20
+        ));
+    }
+
+    #[test]
+    fn stop_sending_round_trips() {
+        let mut buf = [0u8; 24];
+        let n = write_stop_sending(8, 0x010c, &mut buf).unwrap();
+        assert_eq!(buf[0], ftype::STOP_SENDING);
+        let (f, parsed) = parse_frame(&buf[..n]).unwrap();
+        assert_eq!(parsed, n);
+        assert!(matches!(
+            f,
+            Frame::StopSending {
+                stream_id: 8,
+                app_error_code: 0x010c,
+            }
+        ));
+    }
+
+    #[test]
+    fn reset_stream_truncated_errors() {
+        // Type byte + stream id only — the code/final-size varints
+        // are missing. Truncated, not a panic.
+        let buf = [ftype::RESET_STREAM, 0x04];
+        assert!(matches!(parse_frame(&buf), Err(FrameError::Truncated)));
+        let buf = [ftype::STOP_SENDING];
+        assert!(matches!(parse_frame(&buf), Err(FrameError::Truncated)));
     }
 
     #[test]

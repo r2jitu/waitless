@@ -79,6 +79,8 @@ pub(super) mod rx;
 pub(super) mod tx;
 
 #[cfg(test)]
+mod abort_tests;
+#[cfg(test)]
 mod cfg;
 
 // Sibling submodules (`rx`, `tx`, `loss`) reach `DirKeys` via
@@ -393,6 +395,30 @@ pub(super) struct SentPacket {
     /// packets. A handshake flight is bounded, so this can't grow
     /// without bound.
     pub(super) crypto_frames: alloc::vec::Vec<CryptoRetx>,
+    /// RESET_STREAM / STOP_SENDING frames this packet carried,
+    /// retained for retransmission (RFC 9000 §13.3: both MUST be
+    /// re-sent until acknowledged or the stream state is discarded).
+    /// On loss these move back onto the matching
+    /// `Connection::pending_*` queue; on ACK the packet (and these
+    /// copies) are dropped. Empty for the vast majority of packets.
+    pub(super) ctrl_frames: alloc::vec::Vec<CtrlRetx>,
+}
+
+/// One per-stream-abort control frame's retransmittable contents
+/// (RFC 9000 §19.4 / §19.5). Held in a [`SentPacket`] until acked
+/// (dropped) or lost (pushed back onto the matching pending queue,
+/// re-emitted by the next 1-RTT flush).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CtrlRetx {
+    ResetStream {
+        sid: u64,
+        app_error_code: u64,
+        final_size: u64,
+    },
+    StopSending {
+        sid: u64,
+        app_error_code: u64,
+    },
 }
 
 /// One CRYPTO frame's retransmittable contents — the packet-number
@@ -1269,6 +1295,38 @@ pub struct Connection {
     /// carries — `record_sent_packet` moves it into the `SentPacket`.
     pub(super) pending_sent_crypto_frames: alloc::vec::Vec<CryptoRetx>,
 
+    // ── Per-stream abort (RFC 9000 §3.5 / §19.4-19.5) ─────────────
+    //
+    // Generation queues: RESET_STREAM / STOP_SENDING frames awaiting
+    // emission in the next 1-RTT packet. Filled by the public
+    // `reset_stream` / `stop_sending` APIs (and the STOP_SENDING →
+    // RESET_STREAM answer in `dispatch_frames`); drained by
+    // `encode_one_rtt_packet`; refilled on loss from the lost
+    // packet's retained `ctrl_frames` (RFC 9000 §13.3).
+    /// Pending RESET_STREAM emissions: `(sid, app_error_code,
+    /// final_size)`.
+    pub(super) pending_reset_streams: alloc::vec::Vec<(u64, u64, u64)>,
+    /// Pending STOP_SENDING emissions: `(sid, app_error_code)`.
+    pub(super) pending_stop_sending: alloc::vec::Vec<(u64, u64)>,
+    /// Staging for the abort-control frames the packet currently
+    /// being encoded carries — `record_sent_packet` moves them into
+    /// the `SentPacket` for §13.3 retransmission.
+    pub(super) pending_sent_ctrl_frames: alloc::vec::Vec<CtrlRetx>,
+    /// Streams whose RECV side the peer reset (RFC 9000 §19.4):
+    /// `(sid, app_error_code)`, capped FIFO at
+    /// [`STREAM_RESETS_CAP`]. Lives on the conn (not the
+    /// `RecvStream`) so the reader can still observe the reset after
+    /// the reaper recycles the stream — the read path's
+    /// `stream_reset_code` is what turns "peer aborted" into a clean
+    /// error instead of a silent EOF.
+    pub(super) stream_resets: alloc::vec::Vec<(u64, u64)>,
+    /// Streams whose SEND side we aborted (`reset_stream` /
+    /// STOP_SENDING answer), capped FIFO like `stream_resets`. Read
+    /// by `detect_loss` so a lost packet's retained STREAM frames for
+    /// an aborted stream are dropped instead of re-queued (RFC 9000
+    /// §3.5: after RESET_STREAM, no further stream data is sent).
+    pub(super) aborted_send_sids: alloc::vec::Vec<u64>,
+
     /// Egress pacing token bucket (RFC 9002 §7.7). `pace_budget` is send
     /// credit in bytes — it goes negative after a burst and refills at the
     /// paced rate (`pace_rate()`: the srtt-gated `cc.pacing_rate()`, or the
@@ -1452,6 +1510,11 @@ impl Connection {
             retx_queue: alloc::collections::VecDeque::new(),
             crypto_retx_queue: alloc::collections::VecDeque::new(),
             pending_sent_crypto_frames: alloc::vec::Vec::new(),
+            pending_reset_streams: alloc::vec::Vec::new(),
+            pending_stop_sending: alloc::vec::Vec::new(),
+            pending_sent_ctrl_frames: alloc::vec::Vec::new(),
+            stream_resets: alloc::vec::Vec::new(),
+            aborted_send_sids: alloc::vec::Vec::new(),
             retx_bytes: 0,
             pending_sent_stream_frames: alloc::vec::Vec::new(),
             retx_frame_vec_pool: alloc::vec::Vec::new(),
@@ -2000,7 +2063,95 @@ impl Connection {
     pub fn stream_send_buffered(&self, sid: u64) -> usize {
         self.send_streams.get(&sid).map_or(0, |s| s.buffered_len())
     }
+
+    // ── Per-stream abort (RFC 9000 §3.5) ───────────────────────
+
+    /// Abort the SEND side of stream `sid` with `app_error_code`:
+    /// drop its queued chunks + retained retransmission state and
+    /// queue a RESET_STREAM (RFC 9000 §19.4) whose Final Size is the
+    /// byte count already emitted — keeping the peer's flow-control
+    /// accounting consistent (§4.5). Ships on the next flush.
+    /// Idempotent per stream. Both roles; the h3 layer maps its
+    /// error model (e.g. H3_INTERNAL_ERROR on a mid-stream handler
+    /// failure) onto this.
+    pub fn reset_stream(&mut self, sid: u64, app_error_code: u64) {
+        let s = self.ensure_send_stream(sid);
+        if matches!(s.state, crate::streams::SendState::ResetSent) {
+            return; // already aborted — keep the first frame's code
+        }
+        let final_size = s.abort();
+        // Drop queued retransmissions for the stream: after
+        // RESET_STREAM no further STREAM frames flow (§3.5).
+        let mut purged: u32 = 0;
+        self.retx_queue.retain(|f| {
+            if f.sid == sid {
+                purged = purged.saturating_add(f.data.len() as u32);
+                false
+            } else {
+                true
+            }
+        });
+        self.retx_bytes = self.retx_bytes.saturating_sub(purged);
+        // Remember the abort so `detect_loss` drops (rather than
+        // re-queues) this stream's frames retained in sent packets.
+        push_capped(&mut self.aborted_send_sids, sid, STREAM_RESETS_CAP);
+        self.pending_reset_streams
+            .push((sid, app_error_code, final_size));
+        crate::diag::COUNTERS.reset_streams_sent.bump();
+    }
+
+    /// Ask the peer to stop sending on stream `sid` (RFC 9000 §19.5):
+    /// queue a STOP_SENDING with `app_error_code` (ships on the next
+    /// flush; the peer answers with RESET_STREAM) and discard
+    /// whatever the stream has already buffered locally — the caller
+    /// has declared it doesn't want the data.
+    pub fn stop_sending(&mut self, sid: u64, app_error_code: u64) {
+        self.pending_stop_sending.push((sid, app_error_code));
+        self.discard_recv(sid);
+    }
+
+    /// The application error code of a peer RESET_STREAM received on
+    /// `sid`, if any (RFC 9000 §19.4). Tracked on the conn — not the
+    /// `RecvStream` — so the reader still observes the abort after
+    /// the reaper recycles the stream; readers check this when a
+    /// recv reports EOF to distinguish a clean FIN from an abort.
+    pub fn stream_reset_code(&self, sid: u64) -> Option<u64> {
+        self.stream_resets
+            .iter()
+            .find(|(s, _)| *s == sid)
+            .map(|&(_, code)| code)
+    }
+
+    /// Record a peer RESET_STREAM for [`stream_reset_code`]. FIFO-
+    /// capped; a duplicate (retransmitted) reset keeps the first code.
+    pub(super) fn record_peer_reset(&mut self, sid: u64, code: u64) {
+        if self.stream_resets.iter().any(|(s, _)| *s == sid) {
+            return;
+        }
+        push_capped(&mut self.stream_resets, (sid, code), STREAM_RESETS_CAP);
+    }
+
+    /// Whether `sid`'s send side was aborted (read by `detect_loss`).
+    pub(super) fn send_aborted(&self, sid: u64) -> bool {
+        self.aborted_send_sids.contains(&sid)
+    }
 }
+
+/// FIFO-capped push for the small per-conn abort ledgers: at the cap
+/// the oldest entry is dropped. The ledgers are advisory (a late
+/// reader of an evicted entry sees a plain EOF / re-queues a frame
+/// the encoder then drops via stream state), so eviction is safe.
+pub(super) fn push_capped<T: PartialEq>(v: &mut alloc::vec::Vec<T>, item: T, cap: usize) {
+    if v.len() >= cap {
+        v.remove(0);
+    }
+    v.push(item);
+}
+
+/// Cap on the per-conn abort ledgers (`stream_resets` /
+/// `aborted_send_sids`). Aborts are rare (a handler error, a peer
+/// cancel); 16 covers any realistic concurrent burst at 16 B/entry.
+pub(super) const STREAM_RESETS_CAP: usize = 16;
 
 /// Append a MAX_STREAMS frame to `out` directly. Wraps the
 /// stack-buffer-then-extend pattern so the caller doesn't have
@@ -2190,6 +2341,7 @@ mod recv_ranges_tests {
             byte_count,
             stream_frames: Vec::new(),
             crypto_frames: Vec::new(),
+            ctrl_frames: Vec::new(),
         }
     }
 

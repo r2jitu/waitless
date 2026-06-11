@@ -260,6 +260,18 @@ pub struct Counters {
     /// requests; lag means streams aren't reaching the reapable
     /// state.
     pub streams_reaped: Counter,
+    /// RESET_STREAM frames WE queued (app abort via `reset_stream`,
+    /// or the §3.5 answer to a peer STOP_SENDING). Rare in steady
+    /// state; a climbing rate means handlers are erroring mid-stream
+    /// or peers are cancelling responses.
+    pub reset_streams_sent: Counter,
+    /// Peer RESET_STREAM frames honored (recv side discarded, reset
+    /// surfaced to the reader).
+    pub reset_streams_received: Counter,
+    /// Peer STOP_SENDING frames honored (send side aborted with a
+    /// RESET_STREAM answer, or ignored because the stream already
+    /// finished).
+    pub stop_sending_received: Counter,
     /// Listener tried to push a datagram into a full
     /// `ConnInbox` (DEFAULT_CAPACITY=256) — usually because the
     /// peer is bursting faster than the conn task can drain.
@@ -439,6 +451,9 @@ impl Counters {
             conn_admit_pressure: Counter::new(),
             send_streams_created: Counter::new(),
             streams_reaped: Counter::new(),
+            reset_streams_sent: Counter::new(),
+            reset_streams_received: Counter::new(),
+            stop_sending_received: Counter::new(),
             inbox_full_drops: Counter::new(),
             conn_task_iterations: Counter::new(),
             conn_tasks_exited: Counter::new(),
@@ -867,7 +882,7 @@ pub fn should_log_event() -> bool {
 /// Snapshot of every drop / event counter, for `/quic_stats`-style
 /// dumps. Returns `(name, value)` pairs in declaration order,
 /// including the four AEAD throughput counters.
-pub fn snapshot() -> [(&'static str, u64); 66] {
+pub fn snapshot() -> [(&'static str, u64); 69] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.get()),
@@ -913,6 +928,9 @@ pub fn snapshot() -> [(&'static str, u64); 66] {
         ("recv_buffered_bytes", crate::conn::recv_buffered_now()),
         ("send_streams_created", c.send_streams_created.get()),
         ("streams_reaped", c.streams_reaped.get()),
+        ("reset_streams_sent", c.reset_streams_sent.get()),
+        ("reset_streams_received", c.reset_streams_received.get()),
+        ("stop_sending_received", c.stop_sending_received.get()),
         ("inbox_full_drops", c.inbox_full_drops.get()),
         ("conn_task_iterations", c.conn_task_iterations.get()),
         ("conn_tasks_exited", c.conn_tasks_exited.get()),
