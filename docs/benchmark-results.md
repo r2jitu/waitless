@@ -15,16 +15,36 @@ benches, see [`benchmarking.md`](benchmarking.md).)
 
 ## TL;DR
 
-On a 4-vCPU GCE `c3` VM with gVNIC, serving a byte-identical `/health`
-response, each server measured **at its own CPU-bound ceiling**:
+Latest run (2026-06, **8-vCPU `c3-highcpu-8`** + gVNIC, both servers on matched
+hardware, two `c3-highcpu-8` load generators, byte-identical `/health`,
+measured back-to-back):
 
-| Workload | Waitless | tokio-hyper | Speedup |
+| Workload | **Waitless** | tokio-hyper | Ratio |
 |---|--:|--:|:-:|
-| HTTP/1.1 plain | **≈ 1.0–1.2 M rps** \* | ≈ 398 K rps | **≈ 2.5–3×** |
-| HTTPS / TLS 1.3 | **≈ 610–730 K rps** | ≈ 338 K rps | **≈ 1.8–2.2×** |
+| HTTPS / TLS 1.3 req/s          | **1.13 M** | 0.59 M | **≈ 1.9×** |
+| HTTPS p50 latency (same load)  | **283 µs** | 644 µs | **≈ 2.3× lower** |
+| HTTP/1.1 plain req/s           | **0.86 M** | 0.63 M | **≈ 1.4×** |
 
-\* lower bound — Waitless's plain path was still loadgen-limited even with two
-8-vCPU load generators; tokio-hyper saturated its 4 cores at ~398 K.
+The HTTPS throughput + latency are measured at a saturating-but-symmetric load
+(~400 connections, both load generators balanced); the plain figure is under
+high concurrency (16 K connections). The earlier **4-vCPU `c3`** run is
+consistent after core scaling: HTTPS ≈ 610–730 K (Waitless) vs ≈ 338 K
+(tokio-hyper), plain ≈ 1.0–1.2 M vs ≈ 398 K.
+
+### HTTPS throughput vs concurrency (Waitless, 8-vCPU c3)
+
+| Concurrent connections | ~400 | ~2,000 | ~8,000 | ~16,000 |
+|---|--:|--:|--:|--:|
+| HTTPS req/s | 1.13 M | 1.07 M | 0.83 M | 0.24 M |
+| p50 latency | 283 µs | 1.7 ms | 1.2–4.9 ms | overload |
+
+Waitless sustains >1 M req/s through ~2 K connections and ~830 K through ~8 K,
+then **degrades past ~10 K simultaneous TLS connections** — at 16 K the run is
+overload for both servers (asymmetric load-generator splits, multi-ms tails;
+tokio-hyper's TLS holds ~0.49 M there while Waitless drops to ~0.24 M). That
+high-TLS-connection-count ceiling is a known limit (per-connection handshake +
+buffer memory pressure); see the roadmap's per-connection memory-arena work.
+Plain HTTP and moderate-concurrency TLS are unaffected.
 
 The ranges are **real run-to-run variance** (~15–20 %) from SPOT-instance
 placement on shared hardware — see [Caveats](#caveats). Within a single session
