@@ -25,11 +25,45 @@
 //   * An established-state RST must have `seq == rcv_nxt`
 //     (RFC 5961 §3.2) — i.e. our `my_seq`.
 
+use std::time::Duration;
+
 /// TCP flag bits (subset the FSM cares about).
 pub const FIN: u8 = 0x01;
 pub const SYN: u8 = 0x02;
 pub const RST: u8 = 0x04;
 pub const ACK: u8 = 0x10;
+
+/// How long an outbound flow may sit with no guest segment and no
+/// host I/O before the periodic sweep reaps it. The inbound `conns`
+/// sweep has no time threshold — it relies on the toy peer driving
+/// each conn to a terminal `Closed` state — but outbound flows have
+/// states that legitimately never advance on their own when the
+/// counterparty goes silent (`SynAckSent`: guest never ACKs the
+/// handshake and we deliberately don't poll it; `GuestClosed`: host
+/// peer holds its read side open forever; `FinWait`: guest abandons
+/// without a FIN). Without a reaper those leak toward the per-vCPU
+/// `MAX_OUTBOUND_TCP` cap and then RST every new connect. 60 s is
+/// far longer than any real request/response exchange through the
+/// toy proxy, so a busy long-lived flow (refreshed on every segment
+/// and every host I/O event) is never reaped, while a stranded one
+/// is freed within a sweep interval of the deadline.
+pub const OUTBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Pure expiry predicate for the periodic outbound-TCP sweep, kept
+/// here (with the FSM it reasons about) so it's unit-testable
+/// standalone like the rest of this module. `idle` is how long the
+/// flow has gone with no guest segment and no host I/O — see
+/// `OUTBOUND_IDLE_TIMEOUT` for the rationale and the refresh points.
+///
+/// Every live state is reaped once idle past the deadline; the
+/// distinction is only documentary (the leak-prone states never
+/// refresh on their own once the peer is silent, whereas a healthy
+/// `Established`/`Connecting` flow keeps its timer fresh through
+/// normal activity). A flow with recent activity (`idle <` deadline)
+/// always survives.
+pub fn flow_expired(_state: FsmState, idle: Duration) -> bool {
+    idle >= OUTBOUND_IDLE_TIMEOUT
+}
 
 /// Flow state. `Closed` has no variant — a closed flow is removed
 /// from the map (`SegOut::remove`).
@@ -576,5 +610,53 @@ mod tests {
                 ack: 0,
             }
         );
+    }
+
+    #[test]
+    fn idle_flow_past_deadline_expires() {
+        // A flow whose counterparty went silent — idle past the
+        // deadline — is reaped in every leak-prone (and every other)
+        // state. These are exactly the states that never advance on
+        // their own once the peer stops talking.
+        let just_over = OUTBOUND_IDLE_TIMEOUT + Duration::from_secs(1);
+        for state in [
+            FsmState::SynAckSent,
+            FsmState::GuestClosed,
+            FsmState::FinWait,
+            FsmState::Established,
+            FsmState::Connecting,
+        ] {
+            assert!(
+                flow_expired(state, just_over),
+                "{state:?} idle past the deadline should expire"
+            );
+        }
+    }
+
+    #[test]
+    fn active_flow_within_deadline_survives() {
+        // A flow with recent activity (idle well under the deadline)
+        // is never reaped, no matter the state — the busy long-lived
+        // flow must survive the sweep.
+        let recent = Duration::from_secs(1);
+        for state in [
+            FsmState::SynAckSent,
+            FsmState::GuestClosed,
+            FsmState::FinWait,
+            FsmState::Established,
+            FsmState::Connecting,
+        ] {
+            assert!(
+                !flow_expired(state, recent),
+                "{state:?} with recent activity should survive"
+            );
+        }
+        // Exactly at the deadline is treated as expired (>=), one tick
+        // under is not.
+        assert!(flow_expired(FsmState::Established, OUTBOUND_IDLE_TIMEOUT));
+        assert!(!flow_expired(
+            FsmState::Established,
+            OUTBOUND_IDLE_TIMEOUT - Duration::from_nanos(1)
+        ));
     }
 }

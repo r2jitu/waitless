@@ -1833,6 +1833,14 @@ fn poll_worker_iteration(io: &mut IoState, cpu_count: usize, timeout_ms: i32) ->
     if io.cleanup_ctr.is_multiple_of(1000) {
         let mut conns = shared.conns.lock().unwrap();
         conns.retain(|_, c| c.state < ConnState::Closed || c.host_fd >= 0);
+        drop(conns);
+        // Same pass reaps guest-initiated outbound flows whose
+        // counterparty went silent in a never-advancing state — they
+        // have no terminal `Closed` marker to retain on, so they need
+        // an idle-timeout sweep (`OUTBOUND_IDLE_TIMEOUT`) or they leak
+        // toward the per-vCPU `MAX_OUTBOUND_TCP` cap and RST every new
+        // connect. See `outbound_tcp::sweep_idle`.
+        outbound_tcp::sweep_idle(io, std::time::Instant::now());
     }
 
     any_injected

@@ -24,12 +24,13 @@
 // every `unsafe { libc::* }` site in this file relies on.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use crate::virtio;
 
 use super::frame::*;
 use super::inbound::*;
-use super::outbound_fsm::{Ctl, FsmState, HostOp, OutboundFsm, SegOut, refuse_syn};
+use super::outbound_fsm::{Ctl, FsmState, HostOp, OutboundFsm, SegOut, flow_expired, refuse_syn};
 use super::*;
 
 /// Per-vCPU cap on concurrent guest-initiated flows. Beyond this a
@@ -73,6 +74,29 @@ pub(super) struct OutboundTcp {
     /// FIN is deferred until the last data byte is injected so it
     /// sequences correctly.
     host_eof: bool,
+    /// Last time this flow saw legitimate activity — a guest segment
+    /// or a host I/O event. The periodic sweep (`mod.rs`) reaps a
+    /// flow idle longer than `OUTBOUND_IDLE_TIMEOUT`, so flows whose
+    /// counterparty goes silent in a never-advancing state
+    /// (`SynAckSent`/`GuestClosed`/`FinWait`) can't leak toward the
+    /// `MAX_OUTBOUND_TCP` cap. Refreshed via `touch()`.
+    last_active: Instant,
+}
+
+impl OutboundTcp {
+    /// Mark legitimate activity (a guest segment or a host I/O
+    /// event), keeping the flow off the idle-sweep's reap list.
+    fn touch(&mut self) {
+        self.last_active = Instant::now();
+    }
+
+    /// Whether the periodic sweep should evict this flow: idle past
+    /// the deadline, per the pure predicate in `outbound_fsm`. `now`
+    /// is threaded in (rather than read here) so the predicate stays
+    /// unit-testable with a faked clock.
+    pub(super) fn expired_at(&self, now: Instant) -> bool {
+        flow_expired(self.fsm.state, now.saturating_duration_since(self.last_active))
+    }
 }
 
 impl OutboundTcp {
@@ -189,6 +213,36 @@ fn apply_host_op(flow: &mut OutboundTcp, op: &HostOp) {
     }
 }
 
+/// Periodic idle-flow reaper, called from the same `mod.rs` cleanup
+/// pass that sweeps the inbound `conns` map. Evicts every outbound
+/// flow idle past `OUTBOUND_IDLE_TIMEOUT` (the leak-prone
+/// `SynAckSent`/`GuestClosed`/`FinWait` states never advance on their
+/// own once the counterparty goes silent, so without this they pin a
+/// slot toward `MAX_OUTBOUND_TCP` forever and then RST every new
+/// SYN). Closes each evicted flow's host fd on the way out (same
+/// `close_fd` teardown the normal `remove` path uses) so no fd leaks.
+/// `now` is threaded in so the expiry decision stays a pure,
+/// unit-tested predicate (`OutboundTcp::expired_at` →
+/// `outbound_fsm::flow_expired`).
+pub(super) fn sweep_idle(io: &mut IoState, now: Instant) {
+    if io.outbound_tcp.is_empty() {
+        return;
+    }
+    let mut reaped = 0usize;
+    io.outbound_tcp.retain(|_, flow| {
+        if flow.expired_at(now) {
+            close_fd(&mut flow.fd, false);
+            reaped += 1;
+            false
+        } else {
+            true
+        }
+    });
+    if reaped > 0 {
+        eprintln!("[hvf-net] reaped {reaped} idle outbound TCP flow(s)");
+    }
+}
+
 /// vCPU-side entry point: a guest TCP segment that matched no inbound
 /// port-forward flow (or is a bare SYN, which is always an active
 /// open). Called from `guest_tx::handle_tcp` with `CURRENT_VCPU` set;
@@ -219,6 +273,7 @@ pub(super) fn handle_guest_segment(dst_ip: [u8; 4], tcp: &[u8]) {
 
     let key: OutTcpKey = (src_port, dst_ip, dst_port);
     let reply: Option<TxFrame> = if let Some(flow) = io.outbound_tcp.get_mut(&key) {
+        flow.touch();
         let out = flow.fsm.on_guest_segment(seq, flags, payload.len());
         // Payload before any shutdown/close — write-then-shutdown.
         if out.write_payload && flow.fd >= 0 && !payload.is_empty() {
@@ -356,6 +411,7 @@ fn open_flow(io: &mut IoState, key: OutTcpKey, guest_isn: u32) -> Option<TxFrame
         guest_port,
         pending: Vec::new(),
         host_eof: false,
+        last_active: Instant::now(),
     };
     let reply = if r == 0 {
         // Synchronous connect (can happen on loopback) — SYN-ACK now.
@@ -525,11 +581,15 @@ pub(super) fn drain_outbound_tcp(
             let Some(flow) = io.outbound_tcp.get_mut(key) else {
                 continue;
             };
+            flow.touch();
             let out = flow.fsm.on_connect_result(ok);
             queued_ctl |= queue_ctl_and_finish(io, shared, key, out);
         } else {
             if revents & (libc::POLLIN | libc::POLLHUP) == 0 {
                 continue;
+            }
+            if let Some(flow) = io.outbound_tcp.get_mut(key) {
+                flow.touch();
             }
             queued_ctl |= drain_flow_rx(io, shared, qsnap, key, &mut injected_data);
         }
