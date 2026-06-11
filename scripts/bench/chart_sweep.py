@@ -99,6 +99,13 @@ def main():
         default="Byte-identical /health over TLS 1.3, same gVNIC, same two load generators, measured back-to-back.",
     )
     ap.add_argument("--footnote", action="append", default=[])
+    # Optional max-connections panel. The ceiling shots run on a
+    # different loadgen rig whose req/s is client-limited, so they
+    # don't belong on the throughput curve — they get their own bars.
+    ap.add_argument("--ceiling-waitless", type=int, default=0)
+    ap.add_argument("--ceiling-waitless-note", default="")
+    ap.add_argument("--ceiling-peer", type=int, default=0)
+    ap.add_argument("--ceiling-peer-note", default="")
     args = ap.parse_args()
 
     wl = load(args.waitless)
@@ -133,7 +140,12 @@ def main():
     TX0, TX1, TY0, TY1 = 90, 850, 100, 320
     # latency panel
     LX0, LX1, LY0, LY1 = 90, 850, 380, 490
-    H = LY1 + 70 + len(foot_lines) * 18 + 14
+    # ceiling panel (optional)
+    has_ceiling = args.ceiling_waitless > 0
+    CY0 = LY1 + 64  # title baseline; bars below
+    ceiling_h = 96 if has_ceiling else 0
+    foot_y0 = LY1 + 70 + ceiling_h
+    H = foot_y0 + len(foot_lines) * 18 + 14
 
     def ty(v):  # rps -> y
         return TY1 - (v / ymax) * (TY1 - TY0)
@@ -222,8 +234,44 @@ def main():
         f'<text x="{(TX0 + TX1) / 2}" y="{LY1 + 42}" text-anchor="middle" font-size="13" fill="{AXIS}">concurrent connections (log scale)</text>'
     )
 
+    # ── ceiling panel ──
+    if has_ceiling:
+        cmax = args.ceiling_waitless * 1.08
+        bx0, bx1 = TX0, TX1 - 60
+
+        def bw(v):
+            return (v / cmax) * (bx1 - bx0)
+
+        s.append(
+            f'<text x="40" y="{CY0}" font-size="13" font-weight="700" fill="{AXIS}">'
+            f"Maximum live TLS connections (server-verified gauge)</text>"
+        )
+        def bar(by, value, note, fill, label_fill, name):
+            w = bw(value)
+            s.append(f'<rect x="{bx0}" y="{by}" width="{w:.1f}" height="22" rx="4" fill="{fill}"/>')
+            text = f"{value:,} — {note}"
+            # A near-full bar's label rides inside it (right-aligned,
+            # white); a short bar's label sits to its right.
+            if w > (bx1 - bx0) * 0.6:
+                s.append(
+                    f'<text x="{bx0 + w - 10:.1f}" y="{by + 16}" text-anchor="end" font-size="13" '
+                    f'font-weight="700" fill="#ffffff">{text}</text>'
+                )
+            else:
+                s.append(
+                    f'<text x="{bx0 + w + 8:.1f}" y="{by + 16}" font-size="13" font-weight="700" '
+                    f'fill="{label_fill}">{text}</text>'
+                )
+            s.append(
+                f'<text x="{bx0 - 8}" y="{by + 16}" text-anchor="end" font-size="13" font-weight="700" '
+                f'fill="{label_fill}">{name}</text>'
+            )
+
+        bar(CY0 + 14, args.ceiling_waitless, args.ceiling_waitless_note, GREEN, GREEN, "Waitless")
+        bar(CY0 + 48, args.ceiling_peer, args.ceiling_peer_note, "#b8bcc8", GRAY_TEXT, args.peer_name)
+
     for i, fn in enumerate(foot_lines):
-        s.append(f'<text x="40" y="{LY1 + 70 + i * 18}" font-size="12" fill="{GRAY_TEXT}">{fn}</text>')
+        s.append(f'<text x="40" y="{foot_y0 + i * 18}" font-size="12" fill="{GRAY_TEXT}">{fn}</text>')
 
     s.append("</svg>")
     with open(args.out, "w") as f:

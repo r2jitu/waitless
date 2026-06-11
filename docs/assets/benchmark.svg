@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="682" viewBox="0 0 900 682" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
-<rect width="900" height="682" fill="#ffffff"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="760" viewBox="0 0 900 760" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+<rect width="900" height="760" fill="#ffffff"/>
 <text x="40" y="40" font-size="20" font-weight="700" fill="#1a1a2e">HTTPS throughput vs. concurrent connections — 8-vCPU GCE c3</text>
 <text x="40" y="63" font-size="13" fill="#5a5a72">Byte-identical /health over TLS 1.3, same gVNIC, same load generators, back-to-back. Connection counts verified server-side.</text>
 <line x1="90" y1="320.0" x2="850" y2="320.0" stroke="#e5e5ec" stroke-width="1"/>
@@ -107,10 +107,16 @@
 <circle cx="814.0" cy="410.6" r="3" fill="#1f7a4d"/>
 <circle cx="850.0" cy="406.3" r="3" fill="#1f7a4d"/>
 <text x="470.0" y="532" text-anchor="middle" font-size="13" fill="#3a3a4a">concurrent connections (log scale)</text>
-<text x="40" y="560" font-size="12" fill="#5a5a72">At 80,000 connections tokio-hyper could not establish them all (59,607 live, 27 K connect errors); Waitless held 80,001 live at</text>
-<text x="40" y="578" font-size="12" fill="#5a5a72">497 K req/s. Pushed to the ceiling with six load generators, Waitless held 240,000 live TLS connections, stable for 4 minutes</text>
-<text x="40" y="596" font-size="12" fill="#5a5a72">(30 K conns/core).</text>
-<text x="40" y="614" font-size="12" fill="#5a5a72">SPOT hardware: ~15–20% run-to-run variance — the ratios are the robust result. Points ≥40 K use a 75 s window + 30 s client</text>
-<text x="40" y="632" font-size="12" fill="#5a5a72">timeout (TLS establishment storm). At saturation (≥16 K) Waitless p99 tails trail tokio-hyper in places — full percentiles and</text>
-<text x="40" y="650" font-size="12" fill="#5a5a72">method in docs/benchmark-results.md; raw data in docs/assets/bench-2026-06-11/.</text>
+<text x="40" y="554" font-size="13" font-weight="700" fill="#3a3a4a">Maximum live TLS connections (server-verified gauge)</text>
+<rect x="90" y="568" width="648.1" height="22" rx="4" fill="#1f7a4d"/>
+<text x="728.1" y="584" text-anchor="end" font-size="13" font-weight="700" fill="#ffffff">240,000 — stable for 4 min (six loadgens; 280 K = heap edge)</text>
+<text x="82" y="584" text-anchor="end" font-size="13" font-weight="700" fill="#1f7a4d">Waitless</text>
+<rect x="90" y="602" width="161.0" height="22" rx="4" fill="#b8bcc8"/>
+<text x="259.0" y="618" font-size="13" font-weight="700" fill="#5a5a72">59,607 — failed at an 80 K target (27 K connect errors)</text>
+<text x="82" y="618" text-anchor="end" font-size="13" font-weight="700" fill="#5a5a72">tokio-hyper</text>
+<text x="40" y="656" font-size="12" fill="#5a5a72">Curves end at 80 K where tokio-hyper stopped establishing; the ceiling bars use a six-loadgen rig whose req/s is client-limited,</text>
+<text x="40" y="674" font-size="12" fill="#5a5a72">so they are reported as connections only.</text>
+<text x="40" y="692" font-size="12" fill="#5a5a72">SPOT hardware: ~15–20% run-to-run variance — the ratios are the robust result. Points ≥40 K use a 75 s window + 30 s client</text>
+<text x="40" y="710" font-size="12" fill="#5a5a72">timeout (TLS establishment storm). At saturation (≥16 K) Waitless p99 tails trail tokio-hyper in places — full percentiles and</text>
+<text x="40" y="728" font-size="12" fill="#5a5a72">method in docs/benchmark-results.md; raw data in docs/assets/bench-2026-06-11/.</text>
 </svg>

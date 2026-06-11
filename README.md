@@ -29,7 +29,7 @@ twice over:
 The result — the web-server app on identical cloud hardware against
 tokio-hyper, the mainstream Rust async stack on Linux:
 
-![Waitless vs tokio-hyper — HTTPS throughput and median latency across 1K–80K concurrent connections](docs/assets/benchmark.svg)
+![Waitless vs tokio-hyper — HTTPS throughput and median latency across 1K–80K concurrent connections, and the max-connection ceiling: 240,000 live vs 59,607](docs/assets/benchmark.svg)
 
 > Same NIC, same load generators, measured back-to-back; every connection
 > count verified server-side. And Linux runs its mature in-tree `gve` driver;
