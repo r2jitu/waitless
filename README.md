@@ -81,11 +81,12 @@ methodology and the per-connection-count curve are in
 | **Plain HTTP** req/s             | **0.86 M** | 0.63 M | **≈ 1.4×** |
 
 **It scales with concurrency.** Waitless holds **>1 M HTTPS req/s through
-~2,000 concurrent connections** and **~833 K through ~8,000** — at hundreds of
-connections it serves nearly 2× tokio-hyper's *peak* while sitting at less than
-half the latency, i.e. with far more headroom in reserve. (Past ~10 K
-*simultaneous TLS* connections it currently degrades — see
-[gaps](#current-gaps--limits).)
+~2,000 concurrent connections** while sitting at less than half tokio-hyper's
+latency — far more headroom in reserve. Earlier server-bound runs measured a
+*dead-flat* tail all the way to **50,000 connections** with no collapse (at
+that point the load generators, not the server, are the limit); a clean
+re-measure of the current, faster TLS path across that range is
+[pending](#current-gaps--limits).
 
 **Weightless — the whole bootable system, measured:**
 
@@ -205,10 +206,14 @@ Waitless is a single-author research project, not production software — the AP
 is unstable and the checked-in dev certificate and several defaults are
 development-only. Known gaps, honestly:
 
-- **Very high concurrency over TLS.** Throughput holds past 8 K connections but
-  degrades beyond ~10 K *simultaneous TLS* connections (per-connection handshake
-  + buffer memory pressure). Plain HTTP and moderate-concurrency TLS are
-  unaffected; the fix is the per-connection memory-arena work on the roadmap.
+- **High-connection-count TLS needs a clean re-measure.** A server-bound run
+  (single load generator) once measured TLS dead-flat to 50 K connections; a
+  recent two-load-generator run hit overload around 16 K (asymmetric splits,
+  multi-ms tails — likely the load generators' edge, not the server). The
+  current, faster TLS path hasn't been cleanly swept to 50 K yet, so the
+  high-conn ceiling is unverified rather than known. Per-connection memory
+  (the [arena work](docs/architecture-audit.md)) is the lever if a real
+  ceiling shows.
 - **HTTP client: no connection pooling or redirects** — each outbound request is
   a fresh connection. (This is why the proxy-*throughput* head-to-head vs. a
   pooled nginx/tokio gateway is future work; pooling lands first.)

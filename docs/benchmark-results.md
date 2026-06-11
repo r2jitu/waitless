@@ -38,13 +38,16 @@ consistent after core scaling: HTTPS ≈ 610–730 K (Waitless) vs ≈ 338 K
 | HTTPS req/s | 1.13 M | 1.07 M | 0.83 M | 0.24 M |
 | p50 latency | 283 µs | 1.7 ms | 1.2–4.9 ms | overload |
 
-Waitless sustains >1 M req/s through ~2 K connections and ~830 K through ~8 K,
-then **degrades past ~10 K simultaneous TLS connections** — at 16 K the run is
-overload for both servers (asymmetric load-generator splits, multi-ms tails;
-tokio-hyper's TLS holds ~0.49 M there while Waitless drops to ~0.24 M). That
-high-TLS-connection-count ceiling is a known limit (per-connection handshake +
-buffer memory pressure); see the roadmap's per-connection memory-arena work.
-Plain HTTP and moderate-concurrency TLS are unaffected.
+Waitless sustains >1 M req/s through ~2 K connections. The ~8 K and ~16 K points
+above were driven by **two** load generators each near its own edge (asymmetric
+splits, multi-ms tails) — that is overload of the *measurement*, not a
+demonstrated server ceiling. An earlier **server-bound** sweep (single
+`wrk -t8`, the older + slower TLS path) was *dead-flat to 50 K connections* with
+no collapse; the current faster-crypto path hasn't been cleanly swept that far
+yet, so the high-conn ceiling is **unverified, not known**. A clean server-bound
+re-measure (single loadgen + `/obs` `heap_oom`/`live_conns`/admission counters
+to isolate server vs loadgen) is the next step; per-connection memory (the
+arena work, architecture-audit #6) is the lever only if a real ceiling shows.
 
 The ranges are **real run-to-run variance** (~15–20 %) from SPOT-instance
 placement on shared hardware — see [Caveats](#caveats). Within a single session
