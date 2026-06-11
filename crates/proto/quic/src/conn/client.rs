@@ -720,4 +720,196 @@ mod tests {
         // Our uni stream: the peer must never send on it.
         assert!(f(0x2, u64::MAX, u64::MAX, 0));
     }
+
+    // ── THE TWO-ENDPOINT DETERMINISTIC SIMULATION ───────────────────
+    //
+    // Architecture-audit direction #2's endgame, runnable at last
+    // because both roles exist: the REAL client and REAL server
+    // Connections (real TLS 1.3 handshake, dev cert + SPKI pin)
+    // exchange datagrams through a SEEDED LOSSY PIPE under the
+    // virtual clock. Drops are per-transmission (retransmissions can
+    // be re-dropped); when the pipe goes quiet, virtual time advances
+    // and the real PTO machinery (send_pto_probe -> peer ACK ->
+    // detect_loss -> CRYPTO/STREAM retx) drives recovery — the same
+    // closed loop a lossy network exercises, reproducible by seed.
+
+    struct SimRng(u64);
+    impl SimRng {
+        fn next(&mut self) -> u64 {
+            // SplitMix64 — same constants as kernel_core's host rng.
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn drop_it(&mut self, permille: u64) -> bool {
+            self.next() % 1000 < permille
+        }
+    }
+
+    /// One seeded run. Returns (datagrams dropped, probes fired,
+    /// rounds, virtual µs consumed) for the batch-level
+    /// non-vacuousness asserts.
+    fn run_two_endpoint_sim(seed: u64, loss_permille: u64) -> (u32, u32, u32, u64) {
+        let t0 = 1_000_000u64;
+        crate::time::mock::set(t0);
+        let cfg = server_config();
+        let ccfg = pinned_client_config();
+        let mut cseed = [0u8; 32];
+        cseed[..8].copy_from_slice(&seed.to_le_bytes());
+        cseed[8] = 0x11;
+        let mut client = Connection::new_client(cseed, &ccfg).expect("new_client");
+        let mut server = new_server();
+        let mut rng = SimRng(seed ^ (loss_permille << 32));
+
+        let payload = b"two-endpoint sim payload: the request the echo must survive".to_vec();
+        let mut drops = 0u32;
+        let mut probes = 0u32;
+        // 0 = handshaking, 1 = request sent, 2 = server echoed.
+        let mut phase = 0u8;
+        let mut echoed: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let mut srv_got: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+
+        let ctx = |what: &str| {
+            panic!("seed={seed} loss={loss_permille}‰: {what}");
+        };
+        for round in 0..4000u32 {
+            let mut progressed = false;
+            while let Some(pkt) = client.pop_packet_owned() {
+                if rng.drop_it(loss_permille) {
+                    drops += 1;
+                    continue;
+                }
+                let mut w = wire_of(&pkt);
+                // The server may legitimately error on a datagram whose
+                // keys it discarded after a drop-induced retransmit —
+                // a real network ignores undecryptable packets too.
+                let _ = server.process_datagram(&mut w, &cfg);
+                progressed = true;
+            }
+            while let Some(pkt) = server.pop_packet_owned() {
+                if rng.drop_it(loss_permille) {
+                    drops += 1;
+                    continue;
+                }
+                let mut w = wire_of(&pkt);
+                // Like the server arm: a drop-skewed flight can deliver
+                // a retransmit the receiver can no longer decrypt
+                // (discarded keys) — a real endpoint ignores those
+                // (RFC 9000 §5.2). Only a conn that actually FAILED is
+                // a sim bug.
+                if let Err(e) = client.client_process_datagram(&mut w)
+                    && client.state() == ConnState::Failed
+                {
+                    panic!("seed={seed} loss={loss_permille}‰ round={round}: client failed {e:?}");
+                }
+                progressed = true;
+            }
+
+            // Application phases ride on top of the transport.
+            if phase == 0
+                && client.state() == ConnState::Established
+                && server.state() == ConnState::Established
+            {
+                crate::time::mock::advance(1_000);
+                client.stream_send_owned(0, payload.clone());
+                client.stream_close(0);
+                client.client_flush().expect("client flush");
+                phase = 1;
+                progressed = true;
+            }
+            if phase == 1 {
+                if let Some(sid) = server.pop_accepted_stream() {
+                    assert_eq!(sid, 0, "client-initiated bidi sid");
+                }
+                let mut buf = [0u8; 256];
+                let (n, eof) = server.stream_recv(0, &mut buf);
+                if n > 0 {
+                    srv_got.extend_from_slice(&buf[..n]);
+                    progressed = true;
+                }
+                if eof && srv_got == payload {
+                    crate::time::mock::advance(1_000);
+                    server.stream_send_owned(0, payload.clone());
+                    server.stream_close(0);
+                    server.flush(&cfg).expect("server flush");
+                    phase = 2;
+                    progressed = true;
+                }
+            }
+            if phase == 2 {
+                let mut buf = [0u8; 256];
+                let (n, eof) = client.stream_recv(0, &mut buf);
+                if n > 0 {
+                    echoed.extend_from_slice(&buf[..n]);
+                    progressed = true;
+                }
+                if eof {
+                    assert_eq!(
+                        echoed, payload,
+                        "seed={seed} loss={loss_permille}‰: echo byte-exact"
+                    );
+                    let spent = crate::time::now_us() - t0;
+                    return (drops, probes, round + 1, spent);
+                }
+            }
+
+            if !progressed {
+                // The pipe is quiet: a dropped flight is stranded.
+                // Advance virtual time past the PTO horizon and let
+                // the REAL recovery machinery re-arm the pipe — the
+                // sim's whole point.
+                crate::time::mock::advance(400_000);
+                if client.send_pto_probe() {
+                    probes += 1;
+                }
+                if server.send_pto_probe() {
+                    probes += 1;
+                }
+                let _ = client.client_flush();
+                let _ = server.flush(&cfg);
+                if crate::time::now_us() - t0 > 120_000_000 {
+                    panic!(
+                        "seed={seed} loss={loss_permille}‰: budget exhausted \
+                         phase={phase} cstate={:?} sstate={:?} cflight={} sflight={} \
+                         srv_got={} echoed={}",
+                        client.state(), server.state(),
+                        client.bytes_in_flight, server.bytes_in_flight,
+                        srv_got.len(), echoed.len()
+                    );
+                }
+            }
+        }
+        ctx("no convergence in 4000 rounds");
+        unreachable!()
+    }
+
+    /// 40 seeds × two loss rates, every run completing a REAL pinned
+    /// TLS-over-QUIC handshake + a FIN'd request/echo byte-exact
+    /// through per-transmission seeded loss. Batch-level
+    /// non-vacuousness: drops and probes both fired.
+    #[test]
+    fn two_endpoint_sim_handshake_and_echo_under_seeded_loss() {
+        let mut total_drops = 0u32;
+        let mut total_probes = 0u32;
+        for seed in 1..=40u64 {
+            for &loss in &[100u64, 250] {
+                let (d, p, _rounds, _vt) = run_two_endpoint_sim(seed, loss);
+                total_drops += d;
+                total_probes += p;
+            }
+        }
+        assert!(total_drops > 100, "the pipe actually dropped ({total_drops})");
+        assert!(total_probes > 0, "PTO recovery actually drove progress ({total_probes})");
+    }
+
+    /// Determinism: the same seed yields the identical event counts —
+    /// the property that makes a sim failure replayable.
+    #[test]
+    fn two_endpoint_sim_is_deterministic() {
+        let a = run_two_endpoint_sim(7, 250);
+        let b = run_two_endpoint_sim(7, 250);
+        assert_eq!(a, b, "same seed, same loss => identical run");
+    }
 }
