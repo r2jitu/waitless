@@ -1,0 +1,91 @@
+load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+load("//bazel/rules:variants.bzl", "waitless_app_test")
+load("//bazel/rules:waitless.bzl", "port_fwd", "waitless_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# SOCKS5 proxy example (RFC 1928) — the flagship. A *generic* TCP proxy:
+# it takes the destination ip:port from the SOCKS protocol the client
+# speaks (no hardcoded backend, unlike //apps/gateway), dials it with
+# the TCP client (`tcp_connect`), and relays bytes both ways. The
+# showcase for the client role + async-I/O concurrency: each relay
+# parks on two reads at once while the per-core loop serves every other
+# flow. Raw TCP on :1080 — no HTTP, no TLS — so the deps are just the
+# runtime crate plus the pure-parser crate below.
+
+# Pure SOCKS5 wire parsing (greeting + request byte layout + reply
+# codes), carved out as its own leaf crate so it carries host unit
+# tests (`:socks5_test`) while staying free of the waitless runtime.
+# `#![cfg_attr(not(test), no_std)]` in the file: no_std for the
+# unikernel link, libstd under `--test` for the harness.
+rust_library(
+    name = "socks5",
+    srcs = ["src/socks5.rs"],
+    crate_name = "socks5",
+    crate_root = "src/socks5.rs",
+)
+
+# Host unit test of the two parsers + the reply shape. Runs on every
+# `bazel test //...` (native host platform) — pins the protocol bytes
+# so a refactor of main.rs's read loop can't silently change the wire.
+rust_test(
+    name = "socks5_test",
+    size = "small",
+    crate = ":socks5",
+)
+
+# The app crate: boot + handler + relay. `//crates/waitless` carries
+# `Net::up`, `tcp_listen`, `tcp_connect`, `TcpStream`, and the
+# `select` / `timeout_us` combinators — the same runtime dep the other
+# examples use; no http crate is needed for a raw-TCP proxy.
+rust_library(
+    name = "app",
+    srcs = ["src/main.rs"],
+    crate_root = "src/main.rs",
+    deps = [
+        ":socks5",
+        "//crates/waitless",
+    ],
+)
+
+# Both NIC drivers, matching //apps/gateway and //apps/webserver:
+# virtio-net covers QEMU / HVF / the default GCE image; gve covers GCE
+# instances launched with GVNIC. SOCKS5 is a single raw-TCP front door,
+# so one :1080 forward suffices.
+waitless_binary(
+    name = "socks",
+    app = ":app",
+    drivers = [
+        "//crates/drivers/virtio-net",
+        "//crates/drivers/gve",
+    ],
+    port_forwards = [
+        port_fwd(
+            "tcp",
+            guest = 1080,
+            host = 1080,
+        ),
+    ],
+)
+
+# End-to-end relay test. NATIVE-ONLY: the showcase needs backend +
+# proxy + client on one host, which only the native variant (proxy as a
+# host process on loopback) provides cleanly. test.py spawns a host echo
+# backend, drives a hand-rolled SOCKS5 client through the proxy, and
+# asserts the relayed bytes survive both directions + the error replies.
+# Protocol PARSING is covered everywhere by :socks5_test above.
+waitless_app_test(
+    name = "test",
+    timeout = "short",
+    srcs = ["test.py"],
+    app_base = "socks",
+    tags = [
+        "exclusive",
+        "local",
+    ],
+    test_rule = py_test,
+    variants = ["native"],
+    deps = ["//scripts:test_helpers"],
+)
