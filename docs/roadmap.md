@@ -66,7 +66,7 @@ audit and are documented here (some also in their backlog).
 | L3 (IPv4) | inbound **IP fragments** aren't reassembled (a non-first fragment is fed to L4); no inbound IP/TCP **checksum verify** (relies on NIC RX-csum offload) † | S1 | networking |
 | L3 (NDP/ARP) | learn-only: no active solicitation on miss, no RFC 4861 reachability state, FIFO eviction only † | S3 | networking |
 | QUIC | ~~peer `ack_delay_exponent` / `max_ack_delay` unparsed~~ ✅ closed 2026-06-10 (parsed + validated + honored in RTT/PTO); still unparsed: `max_udp_payload_size`, `disable_active_migration`, `active_connection_id_limit` | S3 | conformance-roadmap |
-| QUIC | **RESET_STREAM / STOP_SENDING** not generated/honored (per-stream abort) † | S1 | conformance-roadmap |
+| QUIC | ~~RESET_STREAM / STOP_SENDING not generated/honored~~ ✅ closed 2026-06-11 (both roles: final-size + FC validation, retx purge, h3 mid-stream error RESETs). Remaining strictness gap: a RESET_STREAM/STOP_SENDING at a non-1-RTT level is silently ignored, not closed as PROTOCOL_VIOLATION (RFC 9000 §12.4) — parsed-and-dropped, no state change/panic; low-pri | S3 | conformance-roadmap |
 | QUIC | **CID rotation** (NEW/RETIRE_CONNECTION_ID) + WE-initiated PATH_CHALLENGE on a migrated path | S2 | conformance-roadmap |
 | QUIC | CONNECTION_CLOSE emitted in only the highest-keys PN space (RFC 9000 §10.2.3) † | S3 | conformance-roadmap |
 | QUIC interop | QUIC Interop Runner (external Docker) not wired | S2 | conformance-roadmap |

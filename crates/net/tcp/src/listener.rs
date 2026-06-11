@@ -198,6 +198,17 @@ pub fn close(handle: *mut (), generation: u16) {
             c.state = TcpState::LastAck;
             c.arm_fin_timer(kernel_core::clock::now_ms());
         }
+        // SynSent (a `TcpConnect` future dropped before the handshake
+        // completed) and every other non-data-bearing state: just free
+        // the slot, no wire RST. RFC 9293 §3.10.5 — an ABORT from
+        // SYN-SENT deletes the TCB and returns; no RST is sent because
+        // we received nothing acceptable from the peer (our model jumps
+        // straight to Established on a valid SYN-ACK, so a conn still in
+        // SynSent has had no peer segment). A peer that half-opened on
+        // our SYN reaps its own TCB via SYN-ACK-retransmit timeout, and
+        // `send_rst` would only emit an RST|ACK with an invalid (zero)
+        // ack the peer may discard — strictly worse than the RFC's
+        // delete-and-return.
         _ => {
             free_connection(core, slot);
         }
