@@ -203,6 +203,23 @@ async fn init() {
         }
         Err(_) => waitless::println!("[WARN] https disabled (cert/key invalid)"),
     }
+
+    // Boot-time tripwire for the SSRF-shaped client probes. They are
+    // compiled out of the hardened `--define tls_cert=prod` build (see
+    // the `probe_endpoints` cfg in BUILD.bazel), so a production image
+    // prints nothing here. Any OTHER build — dev cert, bench, a direct
+    // `deploy-gcloud.sh deploy` without the prod define — carries
+    // `/connect-probe` + `/fetch-probe`, which dial arbitrary
+    // caller-supplied destinations. The compile-time gate can't tell a
+    // throwaway validation VM from a public deploy, so this is the
+    // operator-visible signal that an image is NOT the hardened one and
+    // must not face the public internet. Expected + harmless on the
+    // short-lived GCE-validation boxes; an alarm anywhere else.
+    #[cfg(probe_endpoints)]
+    waitless::println!(
+        "[WARN] probe endpoints ENABLED (/connect-probe, /fetch-probe) — \
+         dev/bench build, NOT for public deployment (build --define tls_cert=prod to strip)"
+    );
 }
 
 // ---- Listener bodies --------------------------------------------------------

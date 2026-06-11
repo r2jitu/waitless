@@ -229,6 +229,16 @@ build_disk() {
     # `--define tls_cert=prod`); unquoted so multi-word values split.
     # shellcheck disable=SC2086
     bazel build "$BUILD_TARGET" ${WAITLESS_BAZEL_DEFINES:-}
+    # Deploy-time tripwire: without `tls_cert=prod` this is the DEV image —
+    # self-signed cert AND the SSRF-shaped /connect-probe + /fetch-probe
+    # endpoints (which dial arbitrary destinations). Fine for a throwaway
+    # GCE-validation VM; never for a public deploy. The production pipeline
+    # (renew-and-deploy.sh) always sets the prod define. The guest also
+    # prints a matching boot-time [WARN] on serial.
+    case "${WAITLESS_BAZEL_DEFINES:-}" in
+        *tls_cert=prod*) : ;;
+        *) echo "==> [WARN] DEV image (no tls_cert=prod): probe endpoints are ENABLED — not for public deployment" >&2 ;;
+    esac
     local iso="$DEPLOY_REPO/$(_iso_path_for "$BUILD_TARGET")"
     [ -f "$iso" ] || {
         echo "ERROR: ISO not produced: $iso" >&2
