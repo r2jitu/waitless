@@ -241,6 +241,12 @@ pub mod runtime {
     };
     pub use executor::select::{Either, Three, join, join3, select, select3, timeout_us};
     pub use executor::{Sleep, SpawnError, TaskHandle, sleep_us, spawn};
+    /// The zero-copy buffer currency. `TcpStream::send` takes an
+    /// `&mut IOBufChain` and `RecvChunkGuard::into_owned` yields an
+    /// `IOBuf` — re-exported so an app can relay a received chunk
+    /// into a send without copying (and without naming the `iobuf`
+    /// crate as a dep).
+    pub use iobuf::{IOBuf, IOBufChain};
 }
 
 /// Listen for TCP on `port`; the listener runs for the rest of

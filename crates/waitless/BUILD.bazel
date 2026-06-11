@@ -20,6 +20,7 @@ rust_library(
     deps = [
         "//crates/runtime/executor",
         "//crates/runtime/worker",
+        "//crates/util/iobuf",
         "//crates/waitless/backend:waitless_backend",
         "//crates/waitless/net",
     ] + select({

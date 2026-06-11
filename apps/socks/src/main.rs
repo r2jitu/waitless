@@ -34,20 +34,15 @@ extern crate alloc;
 // no waitless runtime, no I/O. This file owns the async reads/writes.
 use socks5::{GreetingError, RequestError, Target};
 use waitless::net::Net;
-use waitless::runtime::{Either, IpAddr, Ipv4Addr, TcpStream, select, tcp_connect, timeout_us};
+use waitless::runtime::{
+    Either, IOBufChain, IpAddr, Ipv4Addr, TcpStream, select, tcp_connect, timeout_us,
+};
 
 // ---- Tunables ---------------------------------------------------------------
 
 /// Front-door port. SOCKS5 runs over plain TCP; 1080 is the IANA
 /// registered SOCKS port and the default every client assumes.
 const LISTEN_PORT: u16 = 1080;
-
-/// Relay copy buffer, one per direction. 16 KiB is a comfortable
-/// multiple of the TCP MSS — big enough to amortise per-`recv` cost,
-/// small enough that ten thousand parked relays cost ~320 MiB of
-/// buffers only in the worst case where every one is mid-copy. Bounded
-/// by construction: we never grow it.
-const RELAY_BUF: usize = 16 * 1024;
 
 /// Deadline for the SOCKS5 handshake (greeting + request + connect).
 /// A client that opens the TCP connection and then says nothing must
@@ -220,39 +215,43 @@ async fn handshake(client: &mut TcpStream) -> Result<Option<TcpStream>, ()> {
 
 // ---- Bidirectional relay ----------------------------------------------------
 
-/// Copy bytes both ways between `client` and `target` until one side
-/// closes (then drain the other direction and stop).
+/// Relay bytes both ways between `client` and `target` until one side
+/// closes — **zero-copy**: each inbound chunk is the transport's own
+/// buffer (on bare metal, the NIC RX buffer the bytes DMA'd into),
+/// lifted to an owned `IOBuf` (`into_owned` — no memcpy when the
+/// buffer is already owned, which is the bare-metal case) and handed
+/// to the other stream's `send`, which packs it straight into TCP
+/// segments. The relay itself never copies a payload byte and owns no
+/// buffers — a hundred thousand parked relays hold no per-flow copy
+/// buffers at all (the old `recv`-into-`[u8; 16K]` version held two
+/// per flow).
 ///
 /// APPROACH: a single `select`-loop over the two directions' reads,
 /// NOT a task per direction. Why: `TcpStream` is a `!Send`,
-/// non-cloneable handle whose `recv`/`send` both take `&mut self`. Two
-/// tasks (client→target, target→client) would each need `&mut` to both
-/// streams, forcing `Rc<RefCell<TcpStream>>` shared between them — and
-/// because a `recv` holds its `&mut self` borrow across the await, the
-/// two tasks would hold overlapping `RefMut`s on the same stream and
-/// hit a `BorrowMutError` panic. A SOCKS client is untrusted; a relay
-/// that can be panicked by ordinary traffic is not acceptable. The
-/// select-loop owns both streams as plain locals and only ever has one
-/// borrow live per stream, so it is panic-free by construction.
+/// non-cloneable handle whose `recv_chunk`/`send` both take
+/// `&mut self`. Two tasks (client→target, target→client) would each
+/// need `&mut` to both streams, forcing `Rc<RefCell<TcpStream>>`
+/// shared between them — and because a read holds its `&mut self`
+/// borrow across the await, the two tasks would hold overlapping
+/// `RefMut`s on the same stream and hit a `BorrowMutError` panic. A
+/// SOCKS client is untrusted; a relay that can be panicked by
+/// ordinary traffic is not acceptable. The select-loop owns both
+/// streams as plain locals and only ever has one borrow live per
+/// stream, so it is panic-free by construction.
 ///
 /// Cancellation safety: each loop iteration `select`s a fresh
-/// `client.recv(..)` against a fresh `target.recv(..)`. When one
-/// resolves, `select` DROPS the other's future. `TcpRecv::drop` clears
-/// the waker it parked on the connection (the repo's Drop-clears-waker
-/// work), so the dropped read leaves no dangling registration and the
-/// NEXT iteration re-arms cleanly. No bytes are lost: a `recv` that has
-/// not resolved has, by definition, copied nothing into its buffer yet.
+/// `client.recv_chunk()` against a fresh `target.recv_chunk()`. When
+/// one resolves, `select` DROPS the other's future. `RecvChunk::drop`
+/// clears the waker it parked on the connection (the repo's
+/// Drop-clears-waker work), so the dropped read leaves no dangling
+/// registration and the NEXT iteration re-arms cleanly. No bytes are
+/// lost: an unresolved `recv_chunk` has, by definition, consumed no
+/// chunk yet.
 ///
-/// Concurrency story: both `recv`s park on I/O; this task yields, and
+/// Concurrency story: both reads park on I/O; this task yields, and
 /// the per-core loop services other connections meanwhile. It wakes
 /// only when one direction has data (or the idle timer fires).
 async fn relay(client: &mut TcpStream, target: &mut TcpStream) {
-    // One buffer per direction — both can be the destination of an
-    // in-flight `recv` within a single `select`, so they must not
-    // alias. Bounded for the whole connection lifetime.
-    let mut c2t = [0u8; RELAY_BUF];
-    let mut t2c = [0u8; RELAY_BUF];
-
     loop {
         // Park on BOTH reads at once. The idle timer bounds a flow where
         // neither side ever speaks again (half-broken peers). Any byte
@@ -260,33 +259,32 @@ async fn relay(client: &mut TcpStream, target: &mut TcpStream) {
         // long but live transfer never trips it.
         let ready = timeout_us(
             RELAY_IDLE_US,
-            select(client.recv(&mut c2t), target.recv(&mut t2c)),
+            select(client.recv_chunk(), target.recv_chunk()),
         )
         .await;
 
         match ready {
             // client → target
-            Some(Either::Left(n)) => {
-                if n == 0 {
-                    // Client closed its send side (EOF). A fuller proxy
-                    // could half-close and keep draining target→client;
-                    // we close both — simplest correct behaviour, and
-                    // what CONNECT clients expect for an IP tunnel.
-                    return;
-                }
-                if target.send_bytes(&c2t[..n]).await.is_err() {
+            Some(Either::Left(Some(chunk))) => {
+                // Zero-copy lift: the guard's buffer becomes an owned
+                // IOBuf; `send` walks the chain into MSS-sized segments.
+                let mut chain = IOBufChain::from(chunk.into_owned());
+                if target.send(&mut chain).await.is_err() {
                     return; // target gone — tear down
                 }
             }
             // target → client
-            Some(Either::Right(n)) => {
-                if n == 0 {
-                    return; // target closed (EOF) — done
-                }
-                if client.send_bytes(&t2c[..n]).await.is_err() {
+            Some(Either::Right(Some(chunk))) => {
+                let mut chain = IOBufChain::from(chunk.into_owned());
+                if client.send(&mut chain).await.is_err() {
                     return; // client gone — tear down
                 }
             }
+            // EOF on either side. A fuller proxy could half-close and
+            // keep draining the other direction; we close both —
+            // simplest correct behaviour, and what CONNECT clients
+            // expect for an IP tunnel.
+            Some(Either::Left(None)) | Some(Either::Right(None)) => return,
             // Idle deadline: neither side moved for RELAY_IDLE_US. Reap.
             None => return,
         }
