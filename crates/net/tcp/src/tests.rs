@@ -5449,6 +5449,80 @@ fn ephemeral_ports_are_distinct_and_core_affine() {
     super::close(h2, g2);
 }
 
+/// Cancel-safety regression guard: a `TcpConnect` future dropped while
+/// the embryo is still in `SynSent` (handshake never completed) reaps
+/// the slot via `close`. RFC 9293 §3.10.5 (ABORT from SYN-SENT):
+/// delete the TCB and return. The slot MUST be returned to the free
+/// list — reusable, and removed from the 4-tuple hash — or every
+/// cancelled connect leaks a slot until the pool exhausts.
+///
+/// Pins the `_ =>` arm of `listener::close` that funnels every
+/// non-data-bearing state (`SynSent` included) into `free_connection`.
+/// If that arm ever stopped freeing the slot, the embryo would linger
+/// `SynSent`: `conn_state` would still find it, and the re-connect
+/// below would pop a *different* (fresh) slot — both asserts fail.
+#[test]
+fn connect_cancelled_in_syn_sent_frees_slot() {
+    let _g = harness();
+    const RP: u16 = 9308;
+
+    // Open an active connect — SYN on the wire, conn in `SynSent` —
+    // WITHOUT injecting the peer's SYN-ACK, so it never establishes.
+    let (handle, generation) =
+        super::connect_on_core(v4(SERVER_IP), v4(CLIENT_IP), RP).expect("connect starts");
+    let local_port = tcp_hdr(&tx()[0]).src_port;
+    let (_, embryo_slot) = super::decode_handle(handle).expect("handle decodes");
+    assert_eq!(
+        conn_state(RP, local_port),
+        Some(TcpState::SynSent),
+        "the un-answered connect parks the embryo in SynSent",
+    );
+
+    // Drop the future: `TcpConnect::Drop` → `TcpStream::Drop` →
+    // `close(handle, generation)` on the still-`SynSent` embryo.
+    super::close(handle, generation);
+
+    // The slot left the live set — `free_connection` reset it to
+    // `Closed` and removed its 4-tuple from the hash.
+    assert_eq!(
+        conn_state(RP, local_port),
+        None,
+        "the cancelled embryo's slot is no longer live (freed)",
+    );
+    // SAFETY: per-core ownership, test-serialised by TEST_LOCK.
+    let freed = unsafe { &*conn_ptr(0, embryo_slot) };
+    assert_eq!(freed.state, TcpState::Closed, "the freed slot is inert (Closed)");
+
+    // The freed slot is REUSABLE: the next connect pops it back off the
+    // free list (LIFO — `free_connection` pushed it to the head, so the
+    // immediately-following `alloc_connection` pops exactly it). A leaked
+    // SynSent slot would force `alloc` to materialise/return a different
+    // one.
+    clear_tx();
+    let (handle2, generation2) =
+        super::connect_on_core(v4(SERVER_IP), v4(CLIENT_IP), RP).expect("re-connect starts");
+    let (_, reused_slot) = super::decode_handle(handle2).expect("handle decodes");
+    assert_eq!(
+        reused_slot, embryo_slot,
+        "the re-connect reuses the freed slot — the cancel returned it to the pool",
+    );
+    assert_eq!(
+        generation2,
+        generation.wrapping_add(1),
+        "slot reuse bumped the generation, so stale handles are detectable",
+    );
+    // The reused slot hosts a fresh, live SynSent embryo on its own
+    // ephemeral 4-tuple — the cancelled tuple's hash entry is gone, so
+    // this is a clean new connection, not a resurrection.
+    let local_port2 = tcp_hdr(&tx()[0]).src_port;
+    assert_eq!(
+        conn_state(RP, local_port2),
+        Some(TcpState::SynSent),
+        "the reused slot carries a fresh active open",
+    );
+    super::close(handle2, generation2);
+}
+
 /// Data after establish: the client conn sends with correct sequence
 /// numbers and receives the peer's bytes — the full bidirectional
 /// exchange on an actively-opened connection.

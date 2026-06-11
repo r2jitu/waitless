@@ -1755,6 +1755,162 @@ mod tests {
         assert!(client.is_terminated());
     }
 
+    // ── (f) Malicious server flights — auth-guard regression ────────
+    //
+    // Both negative cases need the server to emit a flight the real
+    // `TlsServer` never would (an off-list ALPN; a Certificate-less
+    // flight). The real server is driven only far enough to derive the
+    // shared handshake secret, then the offending encrypted record is
+    // hand-sealed under a FRESH `server_hs_tk` (`from_secret` starts at
+    // seq 0, matching the client's just-derived receive key) — the same
+    // "seal under the server's own key directly" technique
+    // `server_key_update_rejected_cleanly` uses.
+
+    /// Drive the CH exchange, then feed the client ONLY the server's
+    /// ServerHello so it derives `server_hs_tk` (at seq 0) and parks at
+    /// `WaitEncryptedExtensions`. Returns the live client, the real
+    /// encrypted EncryptedExtensions record (sealed at server seq 0, so
+    /// the client opens it at its own seq 0), and a fresh server
+    /// handshake key at seq 0 for sealing forged messages.
+    fn client_at_wait_encrypted_extensions(
+        client: &mut TlsClient,
+        ccfg: &TlsClientConfig,
+    ) -> (Vec<u8>, TrafficKey) {
+        let scfg = dev_server_config();
+        let mut server = TlsServer::new_box([0x5e; 32]);
+        let ch = drain_client_tx(client);
+        server.process_chunk(chunk_of(&ch), &scfg).expect("server takes CH");
+        let flight = drain_server_tx(&mut server);
+
+        // Flight = [SH(plaintext 0x16), CCS(0x14), EE, Cert, CV, Fin].
+        // The first record is the ServerHello; the first ENCRYPTED
+        // record (0x17) is the EncryptedExtensions.
+        let lens = record_lengths(&flight);
+        let mut off = 0usize;
+        let mut sh: Option<&[u8]> = None;
+        let mut ee: Option<&[u8]> = None;
+        for len in lens {
+            let rec = &flight[off..off + len];
+            if rec[0] == content_type::HANDSHAKE && sh.is_none() {
+                sh = Some(rec); // plaintext ServerHello
+            } else if rec[0] == content_type::APPLICATION_DATA && ee.is_none() {
+                ee = Some(rec); // first encrypted record = EE
+            }
+            off += len;
+        }
+        let sh = sh.expect("flight carries a plaintext ServerHello");
+        let ee = ee.expect("flight carries an encrypted EncryptedExtensions").to_vec();
+
+        // Feed the SH alone: the client derives the handshake keys and
+        // advances to WaitEncryptedExtensions.
+        client.process_chunk(chunk_of(sh), ccfg).expect("client takes ServerHello");
+        assert_eq!(client.state, State::WaitEncryptedExtensions);
+
+        // A fresh receive-side server handshake key at seq 0 — identical
+        // to the one the client just derived, so records sealed with it
+        // open cleanly.
+        let secret = server.server_hs_secret.expect("server derived its hs secret");
+        (ee, TrafficKey::from_secret(&secret))
+    }
+
+    /// Seal one handshake message into an encrypted record under `tk`,
+    /// returning the wire bytes. Advances `tk.seq`.
+    fn seal_hs_record(tk: &mut TrafficKey, msg: &[u8]) -> Vec<u8> {
+        let mut rec = vec![0u8; record::HEADER_LEN + msg.len() + 1 + record::TAG_LEN];
+        let n = record::seal(tk, content_type::HANDSHAKE, msg, &mut rec).expect("seal");
+        rec.truncate(n);
+        rec
+    }
+
+    /// (a) A server that selects an ALPN protocol the client never
+    /// offered MUST abort (RFC 7301 §3.2 — the selection must come from
+    /// the client's list). The client offers only "h2"; the forged
+    /// EncryptedExtensions names "h3". Pins the `config.alpn.contains`
+    /// check in `on_encrypted_extensions` (~client.rs:1085); without it
+    /// the off-list "h3" would be silently accepted as the negotiated
+    /// protocol and the handshake would proceed.
+    #[test]
+    fn server_selecting_unoffered_alpn_aborts() {
+        use crate::handshake::{build_encrypted_extensions, ext_type};
+        const OFFER: &[&[u8]] = &[b"h2"]; // the client offers ONLY h2
+        let ccfg = TlsClientConfig {
+            auth: ServerAuth::PinnedSpki(spki_pin_from_cert_der(CERT).expect("pin")),
+            server_name: Some(b"localhost"),
+            alpn: OFFER,
+        };
+        let mut client = TlsClient::new_box([0x5a; 32], &ccfg).expect("client");
+        let (_ee, mut hs_tk) = client_at_wait_encrypted_extensions(&mut client, &ccfg);
+
+        // Forge an EncryptedExtensions naming "h3" (never offered).
+        // ALPN extension data: u16 list_len || u8 name_len || name.
+        let alpn_body: &[u8] = &[0, 3, 2, b'h', b'3'];
+        let mut ee_body = [0u8; 64];
+        let ee_len = build_encrypted_extensions(
+            &[(ext_type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION, alpn_body)],
+            &mut ee_body,
+        )
+        .expect("EE body");
+        let mut ee_msg = [0u8; 80];
+        let ee_msg_len = encode_handshake(
+            msg_type::ENCRYPTED_EXTENSIONS,
+            &ee_body[..ee_len],
+            &mut ee_msg,
+        )
+        .expect("EE msg");
+        let rec = seal_hs_record(&mut hs_tk, &ee_msg[..ee_msg_len]);
+
+        let err = client
+            .process_chunk(chunk_of(&rec), &ccfg)
+            .expect_err("an off-list ALPN selection must abort");
+        assert_eq!(err, ClientHandshakeError::UnsupportedServer);
+        assert!(client.is_terminated(), "the client is in a terminal state");
+        assert!(!client.is_established(), "it never reaches Established");
+        assert_eq!(client.error(), Some(ClientHandshakeError::UnsupportedServer));
+    }
+
+    /// (b) A server flight that OMITS Certificate + CertificateVerify
+    /// (jumps EncryptedExtensions → Finished) under `PinnedSpki` MUST
+    /// abort: the Finished arrives while the client is at
+    /// `WaitCertificate`, so it falls through to the `UnexpectedMessage`
+    /// arm (~client.rs:1020). Pins the strict state-ordered dispatch in
+    /// `handle_hs_message`; without it a pinned client could be talked
+    /// past authentication — established with NO certificate ever
+    /// verified.
+    #[test]
+    fn server_omitting_certificate_aborts() {
+        use crate::handshake::build_finished;
+        let ccfg = pinned_client_config();
+        let mut client = TlsClient::new_box([0x5b; 32], &ccfg).expect("client");
+        let (ee, mut hs_tk) = client_at_wait_encrypted_extensions(&mut client, &ccfg);
+
+        // Deliver the genuine EncryptedExtensions (opens at the client's
+        // seq 0) → WaitCertificate. Advance our forging key past the seq
+        // the EE consumed so the next record we seal lines up at the
+        // client's seq 1.
+        client.process_chunk(chunk_of(&ee), &ccfg).expect("client takes EE");
+        assert_eq!(client.state, State::WaitCertificate);
+        let _ = seal_hs_record(&mut hs_tk, &[]); // burn seq 0 (EE's slot)
+
+        // Now jump straight to Finished — no Certificate, no
+        // CertificateVerify. The body is arbitrary: the client rejects
+        // on the (state, type) mismatch before ever checking verify_data.
+        let mut fin_body = [0u8; HASH_LEN];
+        let fin_body_len = build_finished(&[0u8; HASH_LEN], &mut fin_body).expect("finished body");
+        let mut fin_msg = [0u8; 48];
+        let fin_msg_len =
+            encode_handshake(msg_type::FINISHED, &fin_body[..fin_body_len], &mut fin_msg)
+                .expect("finished msg");
+        let rec = seal_hs_record(&mut hs_tk, &fin_msg[..fin_msg_len]);
+
+        let err = client
+            .process_chunk(chunk_of(&rec), &ccfg)
+            .expect_err("a Certificate-less flight must abort");
+        assert_eq!(err, ClientHandshakeError::UnexpectedMessage);
+        assert!(client.is_terminated(), "the client is in a terminal state");
+        assert!(!client.is_established(), "it never reaches Established");
+        assert_eq!(client.error(), Some(ClientHandshakeError::UnexpectedMessage));
+    }
+
     // ── (e) HelloRetryRequest ───────────────────────────────────────
 
     #[test]

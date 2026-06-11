@@ -78,7 +78,7 @@ pub use state::{TcpConnection, TcpState};
 // tests file (which lives a level below this) without widening the
 // real surface.
 #[cfg(test)]
-pub(crate) use pool::{conn_ptr, encode_handle, free_connection, pool_capacity};
+pub(crate) use pool::{conn_ptr, decode_handle, encode_handle, free_connection, pool_capacity};
 #[cfg(test)]
 pub(crate) use send::TCP_HDR_LEN;
 #[cfg(test)]
