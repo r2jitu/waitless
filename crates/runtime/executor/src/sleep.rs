@@ -88,15 +88,17 @@ impl Future for Sleep {
             }) {
                 this.timer_scheduled = true;
             } else {
-                // The wheel slot for this deadline is full (> MAX_PER_SLOT
-                // timers collided into one of the 256 buckets — an extreme
-                // high-timer-concurrency edge). We could not register a wake,
-                // so parking would hang the task forever with no timer to
-                // fire it. Fire the sleep NOW instead: a `Sleep` used as a
-                // timeout then trips early and a `Sleep` used as a delay
-                // under-sleeps — both safe, bounded degradations, unlike a
-                // lost wakeup. (See docs/stack-architecture.md — the proper
-                // fix is a wheel overflow list so `insert` never fails.)
+                // `insert` failed — only possible when the wheel slot's
+                // spill allocation failed (heap exhausted; slots grow on
+                // demand since the 8-per-slot cap was removed). We could
+                // not register a wake, so parking would hang the task
+                // forever with no timer to fire it. Fire the sleep NOW
+                // instead: a `Sleep` used as a timeout then trips early
+                // and a `Sleep` used as a delay under-sleeps — both safe,
+                // bounded degradations, unlike a lost wakeup. (The old
+                // fixed-cap wheel hit this branch under same-µs deadline
+                // bursts and mass-closed live keep-alive conns — the
+                // 2026-06-11 high-concurrency collapse.)
                 return Poll::Ready(());
             }
         }
