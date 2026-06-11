@@ -260,7 +260,14 @@ pub(crate) static POOLS: kernel_core::percpu::PerWorker<TcpPool> =
 // experiment for now — if it moves the 10K-conn cliff we observed
 // on the Pareto bench rig, follow up with a segmented hash that
 // grows in lockstep with the pool.
-const TCP_HASH_SIZE: usize = 32768;
+// 64 K entries/core: the pool peaks at ~65 K slots/core (u16 slot
+// index), and the 2026-06-11 connection-ceiling work targets 200 K+
+// machine-wide live conns (25 K+/core, plus TIME_WAIT debris) — at
+// the previous 32 K table that's >75 % load on an open-addressed
+// probe, and overflow degrades to the per-packet linear pool scan.
+// 64 K keeps the load factor under ~50 % at every reachable conn
+// count. 640 KB/core (keys + slots), heap-resident.
+const TCP_HASH_SIZE: usize = 65536;
 const TCP_HASH_MASK: usize = TCP_HASH_SIZE - 1;
 // log2(TCP_HASH_SIZE) — bit count for the Fibonacci-hash top-bit
 // extract. Must match TCP_HASH_SIZE: extracting only 8 bits with a
@@ -270,16 +277,23 @@ const TCP_HASH_MASK: usize = TCP_HASH_SIZE - 1;
 const TCP_HASH_SHIFT: u32 = TCP_HASH_SIZE.trailing_zeros();
 
 pub(crate) struct TcpHashCore {
-    keys: core::cell::UnsafeCell<[u64; TCP_HASH_SIZE]>,
-    slots: core::cell::UnsafeCell<[u16; TCP_HASH_SIZE]>,
+    // Boxed, not inline: an inline pair of [_; 65536] arrays is a
+    // ~640 KB by-value temporary at `PerWorker::init` time — the
+    // boot-stack-hazard pattern (see TimerWheel / TaskArena for the
+    // same move). Indexing through the Box is one extra pointer hop
+    // on a line that stays L1-hot.
+    keys: core::cell::UnsafeCell<alloc::boxed::Box<[u64]>>,
+    slots: core::cell::UnsafeCell<alloc::boxed::Box<[u16]>>,
 }
 unsafe impl Sync for TcpHashCore {}
 unsafe impl Send for TcpHashCore {}
 impl TcpHashCore {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         TcpHashCore {
-            keys: core::cell::UnsafeCell::new([0; TCP_HASH_SIZE]),
-            slots: core::cell::UnsafeCell::new([0; TCP_HASH_SIZE]),
+            keys: core::cell::UnsafeCell::new(alloc::vec![0u64; TCP_HASH_SIZE].into_boxed_slice()),
+            slots: core::cell::UnsafeCell::new(
+                alloc::vec![0u16; TCP_HASH_SIZE].into_boxed_slice(),
+            ),
         }
     }
 }
