@@ -26,16 +26,17 @@ use worker::{CurrentWorker, PerWorker};
 /// Per-worker task slot count. With `WORKERS × TASKS_PER_WORKER`
 /// total in-flight tasks across the machine, this is the ceiling on
 /// concurrent connections / spawned futures the runtime can handle.
-/// 16 K/worker puts the 8-core machine ceiling at 131 K tasks —
-/// sized for the 80 K-concurrent-conns bench point (10 K conns/core)
-/// with headroom for non-conn tasks (listeners, timers, internal
-/// jobs). The previous 4096 was the hard wall at the 2026-06-11
-/// 40 K-conn GCE point: accepted TCP conns couldn't get a handler
-/// task, so TLS handshakes never ran and clients timed out in
-/// connect (1.07 M accepted-but-never-served conns in one sweep).
-/// Cost is one empty `TaskSlot` (~56 B) per slot — ~1 MB/worker,
-/// heap-resident.
-pub const TASKS_PER_WORKER: usize = 16384;
+/// 32 K/worker puts the 8-core machine ceiling at 262 K tasks —
+/// sized so the 128 K-concurrent-conns bench point clears it even
+/// with RSS hash imbalance across cores (conns land per-core by
+/// 4-tuple hash, not round-robin, so per-core load runs a few
+/// percent hot). The previous 4096 was the hard wall at the
+/// 2026-06-11 40 K-conn GCE point: accepted TCP conns couldn't get
+/// a handler task, so TLS handshakes never ran and clients timed
+/// out in connect (1.07 M accepted-but-never-served conns in one
+/// sweep). Cost is one empty `TaskSlot` (~56 B) per slot —
+/// ~1.8 MB/worker, heap-resident.
+pub const TASKS_PER_WORKER: usize = 32768;
 /// Words in the slot bitmap; one bit per slot. Spawn linear-scans
 /// `used_bits` for a zero bit before CAS-claiming; `ready_bits`
 /// mirrors per-slot wake state for the tick poll loop.
