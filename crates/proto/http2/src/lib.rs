@@ -30,10 +30,10 @@
 //   connect.rs       The CLIENT transport half: `TlsClientStream`
 //                      (client-role `HttpStream` over
 //                      `tls::client::TlsClient`), `tls_client_handshake`,
-//                      and the one-shot `https_get` (h1-over-TLS).
+//                      and the one-shot `https_get_h1` (h1-over-TLS).
 //   client.rs        The CLIENT protocol half: `H2ClientConn` (client-
 //                      role h2 over any `HttpStream`), `h2_fetch`, and
-//                      the ALPN-dispatching `https_fetch` (h2 with
+//                      the ALPN-dispatching `https_get` (h2 with
 //                      h1.1 fallback — the mirror of `listen`'s serve
 //                      dispatch).
 //   diag.rs          `http2::diag` observability block (`/obs`).
@@ -55,10 +55,10 @@ pub mod server;
 pub mod static_table;
 
 pub use client::{
-    H2ClientConn, H2ClientError, H2Response, HttpsFetchError, h2_fetch, https_fetch,
+    H2ClientConn, H2ClientError, H2Response, HttpsGetError, h2_fetch, https_get,
 };
 pub use connect::{
-    ALPN_H2, ALPN_HTTP11, HttpsGetError, TlsClientError, TlsClientStream, https_get,
+    ALPN_H2, ALPN_HTTP11, HttpsGetH1Error, TlsClientError, TlsClientStream, https_get_h1,
     tls_client_handshake,
 };
 pub use listen::{ListenError, TlsStream, listen};

@@ -81,7 +81,7 @@ pub struct ResponseHead {
     http10: bool,
     /// Heap-boxed: the 32-slot table is ~11 KiB, and a `ResponseHead`
     /// is held across awaits by every fetch future (`http1_fetch` →
-    /// `http_get` / `https_get` → their callers). Inline it would
+    /// `http_get` / `https_get_h1` → their callers). Inline it would
     /// inflate each of those async state machines by ~11 KiB *per
     /// layer* — and futures materialise on the STACK before being
     /// moved into their parent state / `Box::pin`, so a deep client

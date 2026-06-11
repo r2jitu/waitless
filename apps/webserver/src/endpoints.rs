@@ -630,8 +630,8 @@ pub(crate) async fn connect_probe_response(query: &[u8]) -> Response<'static> {
 //
 // Where `/connect-probe` proves the raw TCP client path (connect +
 // hand-rolled bytes), `/fetch-probe` proves the REAL HTTP client:
-// `http::client::http_get` over plain TCP, `http2::https_get` over the
-// client TLS stream, or — `proto=h2` — `http2::https_fetch`, the
+// `http::client::http_get` over plain TCP, `http2::https_get_h1` over the
+// client TLS stream, or — `proto=h2` — `http2::https_get`, the
 // ALPN-dispatching HTTP/2 client (SPKI pin via `&pin=hex64`, else the
 // loudly-named `InsecureSkipVerify` — acceptable for a dev probe,
 // never for production fetches). Reports `status= bytes= sha256=` of
@@ -653,7 +653,7 @@ struct FetchProbeQuery {
     path_len: usize,
     tls: bool,
     /// `proto=h2`: use the ALPN-dispatching h2 client
-    /// (`http2::https_fetch`, offer ["h2","http/1.1"]). Implies TLS —
+    /// (`http2::https_get`, offer ["h2","http/1.1"]). Implies TLS —
     /// "h2" is HTTP/2-over-TLS (no h2c).
     h2: bool,
     /// `proto=h3`: QUIC + HTTP/3 via the h3 client (UDP). Implies TLS.
@@ -800,27 +800,27 @@ async fn run_fetch(
         // proto=h2: the ALPN-dispatching client (offer ["h2","http/1.1"],
         // h2 → H2ClientConn, h1.1 → the h1 path). Implies TLS.
         let (seed, auth) = tls_auth();
-        http2::https_fetch(q.ip, q.port, b"probe", q.path(), auth, seed, FETCH_BODY_CAP)
+        http2::https_get(q.ip, q.port, b"probe", q.path(), auth, seed, FETCH_BODY_CAP)
             .await
             .map_err(|e| match e {
-                http2::HttpsFetchError::Connect(c) => (connect_stage(&c), alloc::format!("{c:?}")),
-                http2::HttpsFetchError::Tls(t) => ("tls", alloc::format!("{t:?}")),
-                http2::HttpsFetchError::H2(h) => ("h2", alloc::format!("{h:?}")),
-                http2::HttpsFetchError::Fetch(f) => (fetch_stage(&f), alloc::format!("{f:?}")),
-                http2::HttpsFetchError::Body(b) => (body_stage(&b), alloc::format!("{b:?}")),
+                http2::HttpsGetError::Connect(c) => (connect_stage(&c), alloc::format!("{c:?}")),
+                http2::HttpsGetError::Tls(t) => ("tls", alloc::format!("{t:?}")),
+                http2::HttpsGetError::H2(h) => ("h2", alloc::format!("{h:?}")),
+                http2::HttpsGetError::Fetch(f) => (fetch_stage(&f), alloc::format!("{f:?}")),
+                http2::HttpsGetError::Body(b) => (body_stage(&b), alloc::format!("{b:?}")),
             })?
     } else if q.tls {
         let (seed, auth) = tls_auth();
         let (head, bytes) =
-            http2::https_get(q.ip, q.port, b"probe", q.path(), auth, seed, FETCH_BODY_CAP)
+            http2::https_get_h1(q.ip, q.port, b"probe", q.path(), auth, seed, FETCH_BODY_CAP)
                 .await
                 .map_err(|e| match e {
-                    http2::HttpsGetError::Connect(c) => {
+                    http2::HttpsGetH1Error::Connect(c) => {
                         (connect_stage(&c), alloc::format!("{c:?}"))
                     }
-                    http2::HttpsGetError::Tls(t) => ("tls", alloc::format!("{t:?}")),
-                    http2::HttpsGetError::Fetch(f) => (fetch_stage(&f), alloc::format!("{f:?}")),
-                    http2::HttpsGetError::Body(b) => (body_stage(&b), alloc::format!("{b:?}")),
+                    http2::HttpsGetH1Error::Tls(t) => ("tls", alloc::format!("{t:?}")),
+                    http2::HttpsGetH1Error::Fetch(f) => (fetch_stage(&f), alloc::format!("{f:?}")),
+                    http2::HttpsGetH1Error::Body(b) => (body_stage(&b), alloc::format!("{b:?}")),
                 })?;
         (head.status, bytes)
     } else {

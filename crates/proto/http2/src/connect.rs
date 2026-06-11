@@ -37,7 +37,7 @@ pub const ALPN_HTTP11: &[&[u8]] = &[b"http/1.1"];
 
 /// ALPN offer for an h2-capable client connection: prefer "h2", fall
 /// back to HTTP/1.1 — the client mirror of the server listener's
-/// dispatch. `client::https_fetch` branches on what the server picked.
+/// dispatch. `client::https_get` branches on what the server picked.
 pub const ALPN_H2: &[&[u8]] = &[b"h2", b"http/1.1"];
 
 /// Why a client TLS connection failed.
@@ -250,13 +250,13 @@ impl<S: HttpStream> HttpStream for TlsClientStream<S> {
 }
 
 // ============================================================================
-// https_get — the one-shot convenience getter
+// https_get_h1 — the one-shot convenience getter
 // ============================================================================
 
-/// Failure stage of [`https_get`], mirroring `http::client::GetError`
+/// Failure stage of [`https_get_h1`], mirroring `http::client::GetError`
 /// with the extra TLS stage.
 #[derive(Debug)]
-pub enum HttpsGetError {
+pub enum HttpsGetH1Error {
     /// TCP connect failed.
     Connect(waitless::runtime::TcpConnectError),
     /// TLS handshake failed.
@@ -277,7 +277,7 @@ pub enum HttpsGetError {
 /// `&'static` bytes; callers that need SNI run the layered API:
 /// `tcp_connect` → [`tls_client_handshake`] with their own config →
 /// `http1_fetch`). The caller owns the deadline (`timeout_us`).
-pub async fn https_get(
+pub async fn https_get_h1(
     ip: waitless::runtime::IpAddr,
     port: u16,
     host: &[u8],
@@ -285,10 +285,10 @@ pub async fn https_get(
     auth: ServerAuth,
     seed: [u8; 32],
     body_cap: usize,
-) -> Result<(http::client::ResponseHead, Vec<u8>), HttpsGetError> {
+) -> Result<(http::client::ResponseHead, Vec<u8>), HttpsGetH1Error> {
     let tcp = waitless::tcp_connect(ip, port)
         .await
-        .map_err(HttpsGetError::Connect)?;
+        .map_err(HttpsGetH1Error::Connect)?;
     let config = TlsClientConfig {
         auth,
         server_name: None,
@@ -296,16 +296,16 @@ pub async fn https_get(
     };
     let mut stream = tls_client_handshake(tcp, seed, config)
         .await
-        .map_err(HttpsGetError::Tls)?;
+        .map_err(HttpsGetH1Error::Tls)?;
     let mut req = http::client::FetchRequest::get(host, path);
     req.close = true;
     let (head, mut body) = http::client::http1_fetch(&mut stream, &req)
         .await
-        .map_err(HttpsGetError::Fetch)?;
+        .map_err(HttpsGetH1Error::Fetch)?;
     let bytes = body
         .read_to_vec(body_cap)
         .await
-        .map_err(HttpsGetError::Body)?;
+        .map_err(HttpsGetH1Error::Body)?;
     // Best-effort clean close (close_notify) — the server keeps its
     // resumption state happy; failure is irrelevant post-body.
     let _ = stream.close().await;

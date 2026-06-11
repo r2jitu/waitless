@@ -515,7 +515,7 @@ pub async fn h3_fetch<T: ClientTransport>(
 }
 
 /// One-shot HTTPS-over-QUIC GET: connect, fetch, close. Returns
-/// `(status, body)` — the h3 sibling of `http2::https_fetch`.
+/// `(status, body)` — the h3 sibling of `http2::https_get`.
 pub async fn h3_get(
     ip: waitless::runtime::IpAddr,
     port: u16,

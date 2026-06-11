@@ -1098,13 +1098,13 @@ pub async fn h2_fetch<S: HttpStream>(
 }
 
 // ============================================================================
-// https_fetch — ALPN-dispatching HTTPS GET (h2 with h1.1 fallback)
+// https_get — ALPN-dispatching HTTPS GET (h2 with h1.1 fallback)
 // ============================================================================
 
-/// Failure stage of [`https_fetch`] — [`crate::HttpsGetError`] plus the
+/// Failure stage of [`https_get`] — [`crate::HttpsGetH1Error`] plus the
 /// h2 arm.
 #[derive(Debug)]
-pub enum HttpsFetchError {
+pub enum HttpsGetError {
     /// TCP connect failed.
     Connect(waitless::runtime::TcpConnectError),
     /// TLS handshake failed.
@@ -1117,14 +1117,20 @@ pub enum HttpsFetchError {
     Body(http::client::BodyError),
 }
 
+/// Naming convention (repo-wide): `*_get` = ONE-SHOT — connect + TLS +
+/// request + bounded body read; `*_fetch` (`http1_fetch` / `h2_fetch` /
+/// `h3_fetch`) = a request over an ALREADY-ESTABLISHED conn/stream.
+/// This is the negotiated one-shot; [`crate::https_get_h1`] pins
+/// ALPN to http/1.1 (and can return the typed h1 response head).
+///
 /// One-shot HTTPS GET offering ALPN ["h2", "http/1.1"] and dispatching
 /// on what the server selected: h2 → [`H2ClientConn`]; http/1.1 (or no
 /// ALPN) → the existing h1 path — the client mirror of `listen.rs`'s
 /// serve dispatch. Returns `(status, body)` (the protocol-specific
 /// heads differ; callers needing headers use the layered APIs). Same
-/// v1 scope as [`crate::https_get`]: no URL parsing/redirects/SNI, the
+/// v1 scope as [`crate::https_get_h1`]: no URL parsing/redirects/SNI, the
 /// caller owns the deadline.
-pub async fn https_fetch(
+pub async fn https_get(
     ip: waitless::runtime::IpAddr,
     port: u16,
     host: &[u8],
@@ -1132,10 +1138,10 @@ pub async fn https_fetch(
     auth: ServerAuth,
     seed: [u8; 32],
     body_cap: usize,
-) -> Result<(u16, Vec<u8>), HttpsFetchError> {
+) -> Result<(u16, Vec<u8>), HttpsGetError> {
     let tcp = waitless::tcp_connect(ip, port)
         .await
-        .map_err(HttpsFetchError::Connect)?;
+        .map_err(HttpsGetError::Connect)?;
     let config = TlsClientConfig {
         auth,
         server_name: None,
@@ -1143,15 +1149,15 @@ pub async fn https_fetch(
     };
     let mut stream = tls_client_handshake(tcp, seed, config)
         .await
-        .map_err(HttpsFetchError::Tls)?;
+        .map_err(HttpsGetError::Tls)?;
     if stream.negotiated_alpn() == Some(&b"h2"[..]) {
         let mut conn = H2ClientConn::connect(stream)
             .await
-            .map_err(HttpsFetchError::H2)?;
+            .map_err(HttpsGetError::H2)?;
         let req = http::client::FetchRequest::get(host, path);
         let resp = h2_fetch(&mut conn, &req, body_cap)
             .await
-            .map_err(HttpsFetchError::H2)?;
+            .map_err(HttpsGetError::H2)?;
         conn.close().await;
         Ok((resp.status, resp.body))
     } else {
@@ -1159,11 +1165,11 @@ pub async fn https_fetch(
         req.close = true;
         let (head, mut body) = http::client::http1_fetch(&mut stream, &req)
             .await
-            .map_err(HttpsFetchError::Fetch)?;
+            .map_err(HttpsGetError::Fetch)?;
         let bytes = body
             .read_to_vec(body_cap)
             .await
-            .map_err(HttpsFetchError::Body)?;
+            .map_err(HttpsGetError::Body)?;
         let _ = stream.close().await;
         Ok((head.status, bytes))
     }
