@@ -629,13 +629,14 @@ pub(crate) async fn connect_probe_response(query: &[u8]) -> Response<'static> {
 // ---- /fetch-probe — real h1-client truth endpoint ----------------------------
 //
 // Where `/connect-probe` proves the raw TCP client path (connect +
-// hand-rolled bytes), `/fetch-probe` proves the REAL HTTP/1.1 client:
-// `http::client::http_get` over plain TCP, or `http2::https_get` over
-// the client TLS stream (SPKI pin via `&pin=hex64`, else the loudly-
-// named `InsecureSkipVerify` — acceptable for a dev probe, never for
-// production fetches). Reports `status= bytes= sha256=` of the bounded
-// body on success, or `502` naming the failing stage
-// (`resolve` / `connect` / `tls` / `parse` / `io` / `deadline`).
+// hand-rolled bytes), `/fetch-probe` proves the REAL HTTP client:
+// `http::client::http_get` over plain TCP, `http2::https_get` over the
+// client TLS stream, or — `proto=h2` — `http2::https_fetch`, the
+// ALPN-dispatching HTTP/2 client (SPKI pin via `&pin=hex64`, else the
+// loudly-named `InsecureSkipVerify` — acceptable for a dev probe,
+// never for production fetches). Reports `status= bytes= sha256=` of
+// the bounded body on success, or `502` naming the failing stage
+// (`resolve` / `connect` / `tls` / `h2` / `parse` / `io` / `deadline`).
 
 /// Body cap for the probe fetch.
 const FETCH_BODY_CAP: usize = 256 * 1024;
@@ -651,6 +652,10 @@ struct FetchProbeQuery {
     path_buf: [u8; FETCH_PATH_MAX],
     path_len: usize,
     tls: bool,
+    /// `proto=h2`: use the ALPN-dispatching h2 client
+    /// (`http2::https_fetch`, offer ["h2","http/1.1"]). Implies TLS —
+    /// "h2" is HTTP/2-over-TLS (no h2c).
+    h2: bool,
     pin: Option<[u8; 32]>,
 }
 
@@ -681,7 +686,7 @@ fn parse_hex32(s: &[u8]) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Parse `?ip=A.B.C.D&port=N[&path=/x][&tls=0|1][&pin=hex64]`.
+/// Parse `?ip=A.B.C.D&port=N[&path=/x][&tls=0|1][&pin=hex64][&proto=h1|h2]`.
 /// `path` defaults to `/` and must be origin-form (leading `/`); no
 /// percent-decoding (dev probe). `None` on any malformed field.
 fn parse_fetch_query(query: &[u8]) -> Option<FetchProbeQuery> {
@@ -692,6 +697,7 @@ fn parse_fetch_query(query: &[u8]) -> Option<FetchProbeQuery> {
     path_buf[0] = b'/';
     let mut path_len = 1usize;
     let mut tls = false;
+    let mut h2 = false;
     let mut pin: Option<[u8; 32]> = None;
     for kv in query.split(|&b| b == b'&') {
         if let Some(v) = kv.strip_prefix(b"ip=") {
@@ -710,6 +716,12 @@ fn parse_fetch_query(query: &[u8]) -> Option<FetchProbeQuery> {
                 b"1" => true,
                 _ => return None,
             };
+        } else if let Some(v) = kv.strip_prefix(b"proto=") {
+            h2 = match v {
+                b"h1" => false,
+                b"h2" => true,
+                _ => return None,
+            };
         } else if let Some(v) = kv.strip_prefix(b"pin=") {
             pin = Some(parse_hex32(v)?);
         }
@@ -722,6 +734,7 @@ fn parse_fetch_query(query: &[u8]) -> Option<FetchProbeQuery> {
         path_buf,
         path_len,
         tls,
+        h2,
         pin,
     })
 }
@@ -757,52 +770,76 @@ fn body_stage(e: &http::client::BodyError) -> &'static str {
 async fn run_fetch(
     q: &FetchProbeQuery,
 ) -> Result<(u16, usize, [u8; 32]), (&'static str, alloc::string::String)> {
-    let (head, bytes) = if q.tls {
-        // Entropy by value, like every TLS connection we originate.
+    // Entropy by value, like every TLS connection we originate. No pin
+    // ⇒ InsecureSkipVerify: this is a dev probe — the point is
+    // reachability + protocol truth, not authentication.
+    let tls_auth = || {
         let mut seed = [0u8; 32];
         waitless::rng::fill_bytes(&mut seed);
-        // No pin ⇒ InsecureSkipVerify: this is a dev probe — the
-        // point is reachability + protocol truth, not authentication.
         let auth = match q.pin {
             Some(p) => tls::ServerAuth::PinnedSpki(p),
             None => tls::ServerAuth::InsecureSkipVerify,
         };
-        http2::https_get(q.ip, q.port, b"probe", q.path(), auth, seed, FETCH_BODY_CAP)
+        (seed, auth)
+    };
+    let (status, bytes) = if q.h2 {
+        // proto=h2: the ALPN-dispatching client (offer ["h2","http/1.1"],
+        // h2 → H2ClientConn, h1.1 → the h1 path). Implies TLS.
+        let (seed, auth) = tls_auth();
+        http2::https_fetch(q.ip, q.port, b"probe", q.path(), auth, seed, FETCH_BODY_CAP)
             .await
             .map_err(|e| match e {
-                http2::HttpsGetError::Connect(c) => (connect_stage(&c), alloc::format!("{c:?}")),
-                http2::HttpsGetError::Tls(t) => ("tls", alloc::format!("{t:?}")),
-                http2::HttpsGetError::Fetch(f) => (fetch_stage(&f), alloc::format!("{f:?}")),
-                http2::HttpsGetError::Body(b) => (body_stage(&b), alloc::format!("{b:?}")),
+                http2::HttpsFetchError::Connect(c) => (connect_stage(&c), alloc::format!("{c:?}")),
+                http2::HttpsFetchError::Tls(t) => ("tls", alloc::format!("{t:?}")),
+                http2::HttpsFetchError::H2(h) => ("h2", alloc::format!("{h:?}")),
+                http2::HttpsFetchError::Fetch(f) => (fetch_stage(&f), alloc::format!("{f:?}")),
+                http2::HttpsFetchError::Body(b) => (body_stage(&b), alloc::format!("{b:?}")),
             })?
+    } else if q.tls {
+        let (seed, auth) = tls_auth();
+        let (head, bytes) =
+            http2::https_get(q.ip, q.port, b"probe", q.path(), auth, seed, FETCH_BODY_CAP)
+                .await
+                .map_err(|e| match e {
+                    http2::HttpsGetError::Connect(c) => {
+                        (connect_stage(&c), alloc::format!("{c:?}"))
+                    }
+                    http2::HttpsGetError::Tls(t) => ("tls", alloc::format!("{t:?}")),
+                    http2::HttpsGetError::Fetch(f) => (fetch_stage(&f), alloc::format!("{f:?}")),
+                    http2::HttpsGetError::Body(b) => (body_stage(&b), alloc::format!("{b:?}")),
+                })?;
+        (head.status, bytes)
     } else {
-        http::client::http_get(q.ip, q.port, b"probe", q.path(), FETCH_BODY_CAP)
-            .await
-            .map_err(|e| match e {
-                http::client::GetError::Connect(c) => {
-                    (connect_stage(&c), alloc::format!("{c:?}"))
-                }
-                http::client::GetError::Fetch(f) => (fetch_stage(&f), alloc::format!("{f:?}")),
-                http::client::GetError::Body(b) => (body_stage(&b), alloc::format!("{b:?}")),
-            })?
+        let (head, bytes) =
+            http::client::http_get(q.ip, q.port, b"probe", q.path(), FETCH_BODY_CAP)
+                .await
+                .map_err(|e| match e {
+                    http::client::GetError::Connect(c) => {
+                        (connect_stage(&c), alloc::format!("{c:?}"))
+                    }
+                    http::client::GetError::Fetch(f) => (fetch_stage(&f), alloc::format!("{f:?}")),
+                    http::client::GetError::Body(b) => (body_stage(&b), alloc::format!("{b:?}")),
+                })?;
+        (head.status, bytes)
     };
     use sha2::{Digest as _, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let digest: [u8; 32] = hasher.finalize().into();
-    Ok((head.status, bytes.len(), digest))
+    Ok((status, bytes.len(), digest))
 }
 
-/// `GET /fetch-probe?ip=A.B.C.D&port=N[&path=/x][&tls=0|1][&pin=hex64]`
-/// — issue a REAL HTTP/1.1 request with the client stack (plain TCP,
-/// or TLS via the client handshake + SPKI pin). `200` with
+/// `GET /fetch-probe?ip=A.B.C.D&port=N[&path=/x][&tls=0|1][&pin=hex64]
+/// [&proto=h1|h2]` — issue a REAL request with the client stack: plain
+/// TCP or TLS HTTP/1.1, or — `proto=h2` — the ALPN-dispatching HTTP/2
+/// client (TLS implied). `200` with
 /// `status=<code> bytes=<n> sha256=<hex16-prefix>` of the (≤ 256 KiB)
 /// body, or `502` naming the failing stage.
 pub(crate) async fn fetch_probe_response(query: &[u8]) -> Response<'static> {
     let Some(q) = parse_fetch_query(query) else {
         let mut res = Response::ok(
             &b"text/plain; charset=utf-8"[..],
-            &b"usage: /fetch-probe?ip=A.B.C.D&port=N[&path=/x][&tls=0|1][&pin=hex64]\n"[..],
+            &b"usage: /fetch-probe?ip=A.B.C.D&port=N[&path=/x][&tls=0|1][&pin=hex64][&proto=h1|h2]\n"[..],
         );
         res.status(400);
         return res;

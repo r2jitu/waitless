@@ -283,6 +283,46 @@ class WebserverServiceTest(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertTrue(body.startswith(b"status=200 bytes="), body)
 
+    # ── /fetch-probe proto=h2 — the REAL h2 client (client arc phase D) ──
+    def test_fetch_probe_h2_against_plain_port_fails_at_tls(self) -> None:
+        """`proto=h2` (h2 is TLS-only, so the TLS client dials first)
+        against a NON-TLS port must fail cleanly at the `tls` stage and
+        leave the unikernel healthy — the locally testable half under
+        VM runners, where no h2-capable TLS peer is reachable. The real
+        success-path check against a foreign RFC 9113 server is the GCE
+        step (plus the native self-fetch below, which runs the full
+        in-tree h2 client-vs-server path)."""
+        self._skip_unless_outbound_fetch_runner()
+        ip = self._fetch_probe_target_ip()
+        status, body = http_get(
+            f"/fetch-probe?ip={ip}&port={self.fetch_srv_port}&path=/fixture&proto=h2",
+            port=PORT,
+            timeout=12.0,
+        )
+        self.assertEqual(status, 502, body)
+        self.assertTrue(body.startswith(b"fetch failed at tls"), body)
+        status, _ = http_get("/health", port=PORT)
+        self.assertEqual(status, 200)
+
+    def test_fetch_probe_h2_e2e_against_self_native(self) -> None:
+        """Full h2 client E2E over real TCP+TLS: `proto=h2` dials our
+        own HTTPS port, ALPN negotiates "h2" (the server prefers it),
+        and the H2ClientConn preface/SETTINGS/HEADERS exchange fetches
+        /health from the real h2 server — same `status= bytes=` shape
+        as the h1 probe. Native-only for the same loopback reason as
+        the tls=1 test above."""
+        if "native" not in LAUNCHER_NAME:
+            self.skipTest(
+                f"self-fetch over TLS needs host loopback; launcher={LAUNCHER_NAME}"
+            )
+        status, body = http_get(
+            f"/fetch-probe?ip=127.0.0.1&port={TLS_PORT}&path=/health&proto=h2",
+            port=PORT,
+            timeout=12.0,
+        )
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body.startswith(b"status=200 bytes="), body)
+
     # ── HTTPS ────────────────────────────────────────────────────
     # The HTML pages all flow through `shell_body` in main.rs, which
     # builds a 9-part `Body` chain (mostly borrowed-static slices,
