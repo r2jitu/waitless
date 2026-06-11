@@ -69,8 +69,9 @@ def main():
     lmin = 1.0  # 1 ms floor for the log axis
     lmax = max(r["p99_ms"] for _, rows in series for r in rows) * 1.5
 
+    sub_lines = None  # computed after wrap() is defined; see below
     W = 900
-    X0, X1, Y0, Y1 = 90, 850, 100, 380
+    X0, X1 = 90, 850
 
     def xmap(rate):
         return X0 + (rate / rmax) * (X1 - X0)
@@ -93,6 +94,11 @@ def main():
         return lines
 
     foot_lines = [ln for fn in args.footnote for ln in wrap(fn)]
+    sub_lines = wrap(args.subtitle, 130)
+    # Panel top clears however many lines the subtitle wrapped to —
+    # the first render overlapped the axis label on a 2-line subtitle.
+    Y0 = 78 + len(sub_lines) * 17 + 30
+    Y1 = Y0 + 280
     H = Y1 + 64 + len(foot_lines) * 18 + 14
 
     s = []
@@ -102,7 +108,7 @@ def main():
     )
     s.append(f'<rect width="{W}" height="{H}" fill="#ffffff"/>')
     s.append(f'<text x="40" y="40" font-size="20" font-weight="700" fill="{DARK}">{args.title}</text>')
-    for i, ln in enumerate(wrap(args.subtitle, 130)):
+    for i, ln in enumerate(sub_lines):
         s.append(f'<text x="40" y="{63 + i * 17}" font-size="13" fill="{GRAY_TEXT}">{ln}</text>')
 
     # y grid (log decades)

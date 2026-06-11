@@ -54,6 +54,11 @@ def load(path):
                     "rps": float(r["rps"]),
                     "p99": max(p99s) if p99s else None,
                     "p50": max(p50s) if p50s else None,
+                    # Ceiling-rig rows: conn counts are exact but req/s
+                    # is client-limited — drawn hollow, kept off the
+                    # latency panel (closed-loop p50 there reflects the
+                    # weak clients, not the server).
+                    "open": bool(r.get("client_limited")),
                 }
             )
     return sorted(rows, key=lambda r: r["conns"])
@@ -184,7 +189,7 @@ def main():
 
     # x ticks at the measured conn counts (subset to avoid clutter)
     ticks = sorted({r["conns"] for r in allrows})
-    shown = [t for t in ticks if t in (1000, 2000, 4000, 8000, 16000, 32000, 50000, 80000)] or ticks
+    shown = [t for t in ticks if t in (1000, 2000, 4000, 8000, 16000, 32000, 80000, 200000, 240000)] or ticks
     for t in shown:
         x = xmap(t, TX0, TX1, c0, c1)
         label = f"{t // 1000}K"
@@ -200,7 +205,13 @@ def main():
         s.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="{width}" stroke-linejoin="round"/>')
         for r in rows:
             x = xmap(r["conns"], TX0, TX1, c0, c1)
-            s.append(f'<circle cx="{x:.1f}" cy="{ty(r["rps"]):.1f}" r="3.5" fill="{color}"/>')
+            if r.get("open"):
+                s.append(
+                    f'<circle cx="{x:.1f}" cy="{ty(r["rps"]):.1f}" r="4" fill="#ffffff" '
+                    f'stroke="{color}" stroke-width="2"/>'
+                )
+            else:
+                s.append(f'<circle cx="{x:.1f}" cy="{ty(r["rps"]):.1f}" r="3.5" fill="{color}"/>')
 
     # legend (top-right of the throughput panel)
     lx = TX1 - 170
@@ -222,6 +233,7 @@ def main():
                 f'<text x="{LX0 - 8}" y="{y + 4:.1f}" text-anchor="end" font-size="12" fill="{GRAY_TEXT}">{fmt_ms(v)}</text>'
             )
     for rows, color, width in ((pr, GRAY, 2.5), (wl, GREEN, 3.5)):
+        rows = [r for r in rows if not r.get("open")]
         pts = polyline(rows, "p50", LX0, LX1, c0, c1, ly)
         s.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="{width}" stroke-linejoin="round"/>')
         for r in rows:
@@ -237,7 +249,7 @@ def main():
     # ── ceiling panel ──
     if has_ceiling:
         cmax = args.ceiling_waitless * 1.08
-        bx0, bx1 = TX0, TX1 - 60
+        bx0, bx1 = 140, TX1 - 30
 
         def bw(v):
             return (v / cmax) * (bx1 - bx0)

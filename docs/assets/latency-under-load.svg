@@ -1,76 +1,76 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="530" viewBox="0 0 900 530" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
-<rect width="900" height="530" fill="#ffffff"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="572" viewBox="0 0 900 572" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+<rect width="900" height="572" fill="#ffffff"/>
 <text x="40" y="40" font-size="20" font-weight="700" fill="#1a1a2e">Tail latency vs. offered load — open-loop (wrk2-style), HTTPS /health</text>
 <text x="40" y="63" font-size="13" fill="#5a5a72">Fixed-rate schedule over 4,000 keep-alive TLS conns from two load generators; latency measured from each request's scheduled time</text>
 <text x="40" y="80" font-size="13" fill="#5a5a72">(coordinated-omission-corrected). p99 shown.</text>
-<line x1="90" y1="380.0" x2="850" y2="380.0" stroke="#e5e5ec"/>
-<text x="82" y="384.0" text-anchor="end" font-size="12" fill="#5a5a72">1ms</text>
-<line x1="90" y1="310.1" x2="850" y2="310.1" stroke="#e5e5ec"/>
-<text x="82" y="314.1" text-anchor="end" font-size="12" fill="#5a5a72">10ms</text>
-<line x1="90" y1="240.1" x2="850" y2="240.1" stroke="#e5e5ec"/>
-<text x="82" y="244.1" text-anchor="end" font-size="12" fill="#5a5a72">100ms</text>
-<line x1="90" y1="170.2" x2="850" y2="170.2" stroke="#e5e5ec"/>
-<text x="82" y="174.2" text-anchor="end" font-size="12" fill="#5a5a72">1s</text>
-<line x1="90" y1="100.3" x2="850" y2="100.3" stroke="#e5e5ec"/>
-<text x="82" y="104.3" text-anchor="end" font-size="12" fill="#5a5a72">10s</text>
-<line x1="162.4" y1="380" x2="162.4" y2="385" stroke="#3a3a4a"/>
-<text x="162.4" y="400" text-anchor="middle" font-size="12" fill="#5a5a72">100K</text>
-<line x1="234.8" y1="380" x2="234.8" y2="385" stroke="#3a3a4a"/>
-<text x="234.8" y="400" text-anchor="middle" font-size="12" fill="#5a5a72">200K</text>
-<line x1="307.1" y1="380" x2="307.1" y2="385" stroke="#3a3a4a"/>
-<text x="307.1" y="400" text-anchor="middle" font-size="12" fill="#5a5a72">300K</text>
-<line x1="379.5" y1="380" x2="379.5" y2="385" stroke="#3a3a4a"/>
-<text x="379.5" y="400" text-anchor="middle" font-size="12" fill="#5a5a72">400K</text>
-<line x1="451.9" y1="380" x2="451.9" y2="385" stroke="#3a3a4a"/>
-<text x="451.9" y="400" text-anchor="middle" font-size="12" fill="#5a5a72">500K</text>
-<line x1="524.3" y1="380" x2="524.3" y2="385" stroke="#3a3a4a"/>
-<text x="524.3" y="400" text-anchor="middle" font-size="12" fill="#5a5a72">600K</text>
-<line x1="596.7" y1="380" x2="596.7" y2="385" stroke="#3a3a4a"/>
-<text x="596.7" y="400" text-anchor="middle" font-size="12" fill="#5a5a72">700K</text>
-<line x1="669.0" y1="380" x2="669.0" y2="385" stroke="#3a3a4a"/>
-<text x="669.0" y="400" text-anchor="middle" font-size="12" fill="#5a5a72">800K</text>
-<line x1="741.4" y1="380" x2="741.4" y2="385" stroke="#3a3a4a"/>
-<text x="741.4" y="400" text-anchor="middle" font-size="12" fill="#5a5a72">900K</text>
-<line x1="813.8" y1="380" x2="813.8" y2="385" stroke="#3a3a4a"/>
-<text x="813.8" y="400" text-anchor="middle" font-size="12" fill="#5a5a72">1000K</text>
-<text x="470.0" y="422" text-anchor="middle" font-size="13" fill="#3a3a4a">offered load (requests / second)</text>
-<text x="40" y="88" font-size="13" font-weight="700" fill="#3a3a4a">p99 latency, log scale (lower is better)</text>
-<polyline points="162.4,356.0 234.8,352.9 307.1,351.4 379.5,346.9 451.9,345.1 524.3,340.1 596.7,317.7 669.0,307.2 741.4,150.4 813.8,114.6" fill="none" stroke="#1f7a4d" stroke-width="3.5" stroke-linejoin="round"/>
-<circle cx="162.4" cy="356.0" r="3.5" fill="#1f7a4d"/>
-<circle cx="234.8" cy="352.9" r="3.5" fill="#1f7a4d"/>
-<circle cx="307.1" cy="351.4" r="3.5" fill="#1f7a4d"/>
-<circle cx="379.5" cy="346.9" r="3.5" fill="#1f7a4d"/>
-<circle cx="451.9" cy="345.1" r="3.5" fill="#1f7a4d"/>
-<circle cx="524.3" cy="340.1" r="3.5" fill="#1f7a4d"/>
-<circle cx="596.7" cy="317.7" r="3.5" fill="#1f7a4d"/>
-<circle cx="669.0" cy="307.2" r="3.5" fill="#1f7a4d"/>
-<circle cx="741.4" cy="150.4" r="4" fill="#ffffff" stroke="#1f7a4d" stroke-width="2"/>
-<circle cx="813.8" cy="114.6" r="4" fill="#ffffff" stroke="#1f7a4d" stroke-width="2"/>
-<line x1="106" y1="110" x2="134" y2="110" stroke="#1f7a4d" stroke-width="3.5"/>
-<text x="142" y="114" font-size="13" font-weight="700" fill="#1f7a4d">Waitless (8 vCPU)</text>
-<polyline points="162.4,355.7 234.8,352.7 307.1,351.7 379.5,348.4 451.9,343.7 524.3,341.1 596.7,133.3" fill="none" stroke="#6aa84f" stroke-width="2.5" stroke-linejoin="round"/>
-<circle cx="162.4" cy="355.7" r="3.5" fill="#6aa84f"/>
-<circle cx="234.8" cy="352.7" r="3.5" fill="#6aa84f"/>
-<circle cx="307.1" cy="351.7" r="3.5" fill="#6aa84f"/>
-<circle cx="379.5" cy="348.4" r="3.5" fill="#6aa84f"/>
-<circle cx="451.9" cy="343.7" r="3.5" fill="#6aa84f"/>
-<circle cx="524.3" cy="341.1" r="3.5" fill="#6aa84f"/>
-<circle cx="596.7" cy="133.3" r="3.5" fill="#6aa84f"/>
-<line x1="106" y1="132" x2="134" y2="132" stroke="#6aa84f" stroke-width="2.5"/>
-<text x="142" y="136" font-size="13" font-weight="700" fill="#6aa84f">Waitless (4 vCPU)</text>
-<polyline points="162.4,355.3 234.8,352.6 307.1,350.1 379.5,342.8 451.9,339.8 524.3,154.7 596.7,112.3" fill="none" stroke="#9aa0ae" stroke-width="2.5" stroke-linejoin="round"/>
-<circle cx="162.4" cy="355.3" r="3.5" fill="#9aa0ae"/>
-<circle cx="234.8" cy="352.6" r="3.5" fill="#9aa0ae"/>
-<circle cx="307.1" cy="350.1" r="3.5" fill="#9aa0ae"/>
-<circle cx="379.5" cy="342.8" r="3.5" fill="#9aa0ae"/>
-<circle cx="451.9" cy="339.8" r="3.5" fill="#9aa0ae"/>
-<circle cx="524.3" cy="154.7" r="3.5" fill="#9aa0ae"/>
-<circle cx="596.7" cy="112.3" r="4" fill="#ffffff" stroke="#9aa0ae" stroke-width="2"/>
-<line x1="106" y1="154" x2="134" y2="154" stroke="#9aa0ae" stroke-width="2.5"/>
-<text x="142" y="158" font-size="13" font-weight="700" fill="#9aa0ae">tokio-hyper (8 vCPU)</text>
-<text x="846" y="110" text-anchor="end" font-size="12" fill="#5a5a72">hollow markers = offered rate not met (backlogged)</text>
-<text x="40" y="444" font-size="12" fill="#5a5a72">8-vCPU Waitless meets every offered rate through 800 K req/s with p99 ≤ 11 ms; tokio-hyper saturates between 500 K and 600 K.</text>
-<text x="40" y="462" font-size="12" fill="#5a5a72">4-vCPU Waitless meets 600 K at p99 3.6 ms — more than 8-vCPU tokio-hyper can serve: half the hardware, more capacity.</text>
-<text x="40" y="480" font-size="12" fill="#5a5a72">Same GCE c3 VMs, gVNIC, byte-identical TLS /health, measured back-to-back with a first-party open-loop loadgen</text>
-<text x="40" y="498" font-size="12" fill="#5a5a72">(scripts/bench/loadgen, http-rate). Raw data in docs/assets/bench-2026-06-11/.</text>
+<line x1="90" y1="422.0" x2="850" y2="422.0" stroke="#e5e5ec"/>
+<text x="82" y="426.0" text-anchor="end" font-size="12" fill="#5a5a72">1ms</text>
+<line x1="90" y1="352.1" x2="850" y2="352.1" stroke="#e5e5ec"/>
+<text x="82" y="356.1" text-anchor="end" font-size="12" fill="#5a5a72">10ms</text>
+<line x1="90" y1="282.1" x2="850" y2="282.1" stroke="#e5e5ec"/>
+<text x="82" y="286.1" text-anchor="end" font-size="12" fill="#5a5a72">100ms</text>
+<line x1="90" y1="212.2" x2="850" y2="212.2" stroke="#e5e5ec"/>
+<text x="82" y="216.2" text-anchor="end" font-size="12" fill="#5a5a72">1s</text>
+<line x1="90" y1="142.3" x2="850" y2="142.3" stroke="#e5e5ec"/>
+<text x="82" y="146.3" text-anchor="end" font-size="12" fill="#5a5a72">10s</text>
+<line x1="162.4" y1="422" x2="162.4" y2="427" stroke="#3a3a4a"/>
+<text x="162.4" y="442" text-anchor="middle" font-size="12" fill="#5a5a72">100K</text>
+<line x1="234.8" y1="422" x2="234.8" y2="427" stroke="#3a3a4a"/>
+<text x="234.8" y="442" text-anchor="middle" font-size="12" fill="#5a5a72">200K</text>
+<line x1="307.1" y1="422" x2="307.1" y2="427" stroke="#3a3a4a"/>
+<text x="307.1" y="442" text-anchor="middle" font-size="12" fill="#5a5a72">300K</text>
+<line x1="379.5" y1="422" x2="379.5" y2="427" stroke="#3a3a4a"/>
+<text x="379.5" y="442" text-anchor="middle" font-size="12" fill="#5a5a72">400K</text>
+<line x1="451.9" y1="422" x2="451.9" y2="427" stroke="#3a3a4a"/>
+<text x="451.9" y="442" text-anchor="middle" font-size="12" fill="#5a5a72">500K</text>
+<line x1="524.3" y1="422" x2="524.3" y2="427" stroke="#3a3a4a"/>
+<text x="524.3" y="442" text-anchor="middle" font-size="12" fill="#5a5a72">600K</text>
+<line x1="596.7" y1="422" x2="596.7" y2="427" stroke="#3a3a4a"/>
+<text x="596.7" y="442" text-anchor="middle" font-size="12" fill="#5a5a72">700K</text>
+<line x1="669.0" y1="422" x2="669.0" y2="427" stroke="#3a3a4a"/>
+<text x="669.0" y="442" text-anchor="middle" font-size="12" fill="#5a5a72">800K</text>
+<line x1="741.4" y1="422" x2="741.4" y2="427" stroke="#3a3a4a"/>
+<text x="741.4" y="442" text-anchor="middle" font-size="12" fill="#5a5a72">900K</text>
+<line x1="813.8" y1="422" x2="813.8" y2="427" stroke="#3a3a4a"/>
+<text x="813.8" y="442" text-anchor="middle" font-size="12" fill="#5a5a72">1000K</text>
+<text x="470.0" y="464" text-anchor="middle" font-size="13" fill="#3a3a4a">offered load (requests / second)</text>
+<text x="40" y="130" font-size="13" font-weight="700" fill="#3a3a4a">p99 latency, log scale (lower is better)</text>
+<polyline points="162.4,398.0 234.8,394.9 307.1,393.4 379.5,388.9 451.9,387.1 524.3,382.1 596.7,359.7 669.0,349.2 741.4,192.4 813.8,156.6" fill="none" stroke="#1f7a4d" stroke-width="3.5" stroke-linejoin="round"/>
+<circle cx="162.4" cy="398.0" r="3.5" fill="#1f7a4d"/>
+<circle cx="234.8" cy="394.9" r="3.5" fill="#1f7a4d"/>
+<circle cx="307.1" cy="393.4" r="3.5" fill="#1f7a4d"/>
+<circle cx="379.5" cy="388.9" r="3.5" fill="#1f7a4d"/>
+<circle cx="451.9" cy="387.1" r="3.5" fill="#1f7a4d"/>
+<circle cx="524.3" cy="382.1" r="3.5" fill="#1f7a4d"/>
+<circle cx="596.7" cy="359.7" r="3.5" fill="#1f7a4d"/>
+<circle cx="669.0" cy="349.2" r="3.5" fill="#1f7a4d"/>
+<circle cx="741.4" cy="192.4" r="4" fill="#ffffff" stroke="#1f7a4d" stroke-width="2"/>
+<circle cx="813.8" cy="156.6" r="4" fill="#ffffff" stroke="#1f7a4d" stroke-width="2"/>
+<line x1="106" y1="152" x2="134" y2="152" stroke="#1f7a4d" stroke-width="3.5"/>
+<text x="142" y="156" font-size="13" font-weight="700" fill="#1f7a4d">Waitless (8 vCPU)</text>
+<polyline points="162.4,397.7 234.8,394.7 307.1,393.7 379.5,390.4 451.9,385.7 524.3,383.1 596.7,175.3" fill="none" stroke="#6aa84f" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="162.4" cy="397.7" r="3.5" fill="#6aa84f"/>
+<circle cx="234.8" cy="394.7" r="3.5" fill="#6aa84f"/>
+<circle cx="307.1" cy="393.7" r="3.5" fill="#6aa84f"/>
+<circle cx="379.5" cy="390.4" r="3.5" fill="#6aa84f"/>
+<circle cx="451.9" cy="385.7" r="3.5" fill="#6aa84f"/>
+<circle cx="524.3" cy="383.1" r="3.5" fill="#6aa84f"/>
+<circle cx="596.7" cy="175.3" r="3.5" fill="#6aa84f"/>
+<line x1="106" y1="174" x2="134" y2="174" stroke="#6aa84f" stroke-width="2.5"/>
+<text x="142" y="178" font-size="13" font-weight="700" fill="#6aa84f">Waitless (4 vCPU)</text>
+<polyline points="162.4,397.3 234.8,394.6 307.1,392.1 379.5,384.8 451.9,381.8 524.3,196.7 596.7,154.3" fill="none" stroke="#9aa0ae" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="162.4" cy="397.3" r="3.5" fill="#9aa0ae"/>
+<circle cx="234.8" cy="394.6" r="3.5" fill="#9aa0ae"/>
+<circle cx="307.1" cy="392.1" r="3.5" fill="#9aa0ae"/>
+<circle cx="379.5" cy="384.8" r="3.5" fill="#9aa0ae"/>
+<circle cx="451.9" cy="381.8" r="3.5" fill="#9aa0ae"/>
+<circle cx="524.3" cy="196.7" r="3.5" fill="#9aa0ae"/>
+<circle cx="596.7" cy="154.3" r="4" fill="#ffffff" stroke="#9aa0ae" stroke-width="2"/>
+<line x1="106" y1="196" x2="134" y2="196" stroke="#9aa0ae" stroke-width="2.5"/>
+<text x="142" y="200" font-size="13" font-weight="700" fill="#9aa0ae">tokio-hyper (8 vCPU)</text>
+<text x="846" y="152" text-anchor="end" font-size="12" fill="#5a5a72">hollow markers = offered rate not met (backlogged)</text>
+<text x="40" y="486" font-size="12" fill="#5a5a72">8-vCPU Waitless meets every offered rate through 800 K req/s with p99 ≤ 11 ms; tokio-hyper saturates between 500 K and 600 K.</text>
+<text x="40" y="504" font-size="12" fill="#5a5a72">4-vCPU Waitless meets 600 K at p99 3.6 ms — more than 8-vCPU tokio-hyper can serve: half the hardware, more capacity.</text>
+<text x="40" y="522" font-size="12" fill="#5a5a72">Same GCE c3 VMs, gVNIC, byte-identical TLS /health, measured back-to-back with a first-party open-loop loadgen</text>
+<text x="40" y="540" font-size="12" fill="#5a5a72">(scripts/bench/loadgen, http-rate). Raw data in docs/assets/bench-2026-06-11/.</text>
 </svg>
