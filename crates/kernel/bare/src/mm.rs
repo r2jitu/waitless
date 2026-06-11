@@ -173,13 +173,15 @@ fn init_heap(info: &BootInfo, kern_end_phys: u64) {
         // The x86_64 multiboot/PVH boot stub identity-maps only
         // [0, 4 GiB). QEMU on q35 with `-m > 3 GiB` puts the
         // overflow above 4 GiB (since the 3-4 GiB hole is PCI
-        // MMIO), and so does GCE. Claiming a region whose base is
-        // at or above 4 GiB triple-faults talc on the first write
-        // through the unmapped HHDM address. Caps usable heap at
-        // ~3 GiB on x86_64 multiboot/PVH boots — still ample for
-        // the bench. Limine on x86_64 has its own HHDM that
-        // covers the full RAM and doesn't hit this path.
-        if r.base >= 0x1_0000_0000 {
+        // MMIO), and so does GCE. On those identity-mapped boots
+        // (`hhdm_offset == 0`), claiming a region at or above
+        // 4 GiB would fault talc on the first write through the
+        // unmapped address — skip them, capping the heap at
+        // ~3 GiB. Limine sets a nonzero `hhdm_offset` and its
+        // HHDM maps every usable region, so the Limine/ISO path
+        // (the GCE deploy) claims the full RAM: a c3-highcpu-8
+        // gets a ~15.9 GiB heap, not 3 GiB.
+        if info.hhdm_offset == 0 && r.base >= 0x1_0000_0000 {
             continue;
         }
         total_ram += r.length;
