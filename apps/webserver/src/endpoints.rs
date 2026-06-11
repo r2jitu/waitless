@@ -613,7 +613,7 @@ pub(crate) async fn connect_probe_response(query: &[u8]) -> Response<'static> {
                     ProbeFailure::Connect(d) => ("connect", d),
                     ProbeFailure::Io(d) => ("io", d),
                 };
-                let _ = write!(w, "probe failed at {stage}: {detail}\n");
+                let _ = writeln!(w, "probe failed at {stage}: {detail}");
             }
             None => {
                 status = 502;
@@ -873,7 +873,7 @@ pub(crate) async fn fetch_probe_response(query: &[u8]) -> Response<'static> {
             }
             Some(Err((stage, detail))) => {
                 status = 502;
-                let _ = write!(w, "fetch failed at {stage}: {detail}\n");
+                let _ = writeln!(w, "fetch failed at {stage}: {detail}");
             }
             None => {
                 status = 502;
