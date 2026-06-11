@@ -110,11 +110,30 @@ def main():
     rps_max = max(r["rps"] for r in allrows)
     ymax = math.ceil(rps_max / 250_000) * 250_000
 
-    W, H = 900, 560
+    # Wrap footnotes to the plot width (~12px per char at font 12 is
+    # pessimistic; ~6.4px measured) and size the canvas to fit them —
+    # a fixed height clipped the last lines off the first version.
+    def wrap(text, width=128):
+        lines, cur = [], ""
+        for w in text.split():
+            cand = f"{cur} {w}".strip()
+            if len(cand) > width and cur:
+                lines.append(cur)
+                cur = w
+            else:
+                cur = cand
+        if cur:
+            lines.append(cur)
+        return lines
+
+    foot_lines = [ln for fn in args.footnote for ln in wrap(fn)]
+
+    W = 900
     # throughput panel
     TX0, TX1, TY0, TY1 = 90, 850, 100, 320
-    # p99 panel
+    # latency panel
     LX0, LX1, LY0, LY1 = 90, 850, 380, 490
+    H = LY1 + 70 + len(foot_lines) * 18 + 14
 
     def ty(v):  # rps -> y
         return TY1 - (v / ymax) * (TY1 - TY0)
@@ -203,7 +222,7 @@ def main():
         f'<text x="{(TX0 + TX1) / 2}" y="{LY1 + 42}" text-anchor="middle" font-size="13" fill="{AXIS}">concurrent connections (log scale)</text>'
     )
 
-    for i, fn in enumerate(args.footnote):
+    for i, fn in enumerate(foot_lines):
         s.append(f'<text x="40" y="{LY1 + 70 + i * 18}" font-size="12" fill="{GRAY_TEXT}">{fn}</text>')
 
     s.append("</svg>")
