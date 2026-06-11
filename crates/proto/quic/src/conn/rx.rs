@@ -45,6 +45,33 @@ impl Connection {
         datagram: &mut [u8],
         config: &TlsServerConfig,
     ) -> Result<(), ConnError> {
+        self.process_datagram_inner(datagram, Some(config))
+    }
+
+    /// Client-role entry point — same per-packet walk, but the TLS
+    /// driver carries its own client config (no `TlsServerConfig`),
+    /// and a TLS failure (bad pin / bad CertificateVerify / bad
+    /// Finished …) aborts the handshake on the wire: schedule + emit
+    /// a CONNECTION_CLOSE in the CRYPTO_ERROR class (RFC 9001 §4.8 —
+    /// 0x0100 + the TLS alert) before surfacing the error.
+    pub fn client_process_datagram(&mut self, datagram: &mut [u8]) -> Result<(), ConnError> {
+        debug_assert!(self.client.is_some(), "client_process_datagram on server role");
+        let r = self.process_datagram_inner(datagram, None);
+        if matches!(r, Err(ConnError::Tls)) {
+            let code = 0x100u64 + self.tls.client_alert_code() as u64;
+            // No-op if a close (e.g. the §7.3 TRANSPORT_PARAMETER_ERROR)
+            // is already pending — the first close wins.
+            self.close_with_error(code, b"tls handshake failed");
+            self.flush_close();
+        }
+        r
+    }
+
+    fn process_datagram_inner(
+        &mut self,
+        datagram: &mut [u8],
+        config: Option<&TlsServerConfig>,
+    ) -> Result<(), ConnError> {
         if matches!(self.state, ConnState::Failed) {
             return Ok(());
         }
@@ -86,7 +113,7 @@ impl Connection {
             // packet processor can do HP-unprotect / AEAD-decrypt
             // in place rather than copying the bytes into a fresh
             // Vec. -1 alloc per inbound packet on the hot path.
-            match self.process_one_packet(&mut datagram[p..], config) {
+            match self.process_one_packet(&mut datagram[p..]) {
                 Ok(0) => break, // forward-progress guard
                 Ok(consumed) => {
                     p += consumed;
@@ -120,7 +147,7 @@ impl Connection {
         // apply_peer_flow_control + the full has_one_rtt_to_send scan.
         if !self.flush_outbound_is_noop() {
             crate::diag::COUNTERS.flush_calls.bump();
-            self.flush_outbound(config)?;
+            self.flush_outbound()?;
         }
         self.reap_finished_streams();
         crate::diag::COUNTERS.datagrams_processed.bump();
@@ -129,15 +156,22 @@ impl Connection {
 
     // ── Inbound packet processing ───────────────────────────────
 
-    fn process_one_packet(
-        &mut self,
-        bytes: &mut [u8],
-        _config: &TlsServerConfig,
-    ) -> Result<usize, ConnError> {
+    fn process_one_packet(&mut self, bytes: &mut [u8]) -> Result<usize, ConnError> {
         if bytes.is_empty() {
             return Ok(0);
         }
         let first = bytes[0];
+        // Version Negotiation (RFC 9000 §17.2.1) — client role only.
+        // A VN packet has the long-header form bit and version == 0,
+        // and its FIXED_BIT position is "Unused" (may be 0), so this
+        // must be intercepted BEFORE the padding check below.
+        if self.client.is_some()
+            && first & HEADER_FORM_LONG != 0
+            && bytes.len() >= 5
+            && bytes[1..5] == [0, 0, 0, 0]
+        {
+            return self.process_version_negotiation(bytes);
+        }
         // QUIC v1 (RFC 9000 §17.3.1) requires bit 6 (FIXED_BIT) set
         // on every long- and short-header packet. A zero (or any
         // byte without FIXED_BIT) at this position is datagram-tail
@@ -169,8 +203,12 @@ impl Connection {
             long_packet_type::HANDSHAKE => self.process_handshake_pkt(bytes),
             long_packet_type::ZERO_RTT => self.process_zero_rtt(bytes),
             long_packet_type::RETRY => {
-                crate::quic_drop!(other_wire, "RETRY received as server (peer bug)");
-                Err(ConnError::Wire)
+                if self.client.is_some() {
+                    self.process_retry(bytes)
+                } else {
+                    crate::quic_drop!(other_wire, "RETRY received as server (peer bug)");
+                    Err(ConnError::Wire)
+                }
             }
             _ => {
                 crate::quic_drop!(other_wire, "bogus long_type={}", preamble.long_type);
@@ -289,6 +327,21 @@ impl Connection {
                 );
                 return Ok(total);
             }
+            // Client role: adopt the server's SCID as our DCID on the
+            // FIRST Initial it sends us (RFC 9000 §7.2) — subsequent
+            // packets to the server carry it. Initial KEYS stay on the
+            // original (or post-Retry) DCID; nothing re-derives here.
+            let adopt_scid = self
+                .client
+                .as_ref()
+                .is_some_and(|cs| !cs.server_cid_adopted)
+                .then(|| super::ConnectionId::new(header.preamble.scid));
+            if let Some(scid) = adopt_scid {
+                self.peer_cid = scid;
+                if let Some(cs) = self.client.as_mut() {
+                    cs.server_cid_adopted = true;
+                }
+            }
             if self.initial_recv.is_none() {
                 let dcid = super::ConnectionId::new(header.preamble.dcid);
                 let scid = super::ConnectionId::new(header.preamble.scid);
@@ -301,10 +354,21 @@ impl Connection {
                 self.initial_recv = Some(Box::new(DirKeys::from_initial(&client_keys)));
                 self.state = ConnState::Connecting;
                 let server_params = {
-                    let p = crate::transport_params::ServerParams::defaults(
+                    #[cfg_attr(not(test), allow(unused_mut))]
+                    let mut p = crate::transport_params::ServerParams::defaults(
                         self.initial_dcid.as_slice(),
                         self.local_cid.as_slice(),
                     );
+                    // Test-only seam: a Retry-issuing server echoes the
+                    // ORIGINAL DCID + its Retry SCID (RFC 9000 §7.3) —
+                    // reconstructed from its token. Our server never
+                    // sends Retry, so production always encodes the
+                    // defaults; the client-role §7.3 tests set this.
+                    #[cfg(test)]
+                    if let Some((odcid, retry_scid)) = self.test_tp_override.as_ref() {
+                        p.original_destination_connection_id = odcid;
+                        p.retry_source_connection_id = Some(retry_scid);
+                    }
                     let mut blob = Vec::with_capacity(64);
                     p.encode(&mut blob);
                     blob
@@ -805,12 +869,27 @@ impl Connection {
                             // `reap_finished_streams`) so its LIVE count
                             // stays small — far under this cap; a peer
                             // holding thousands open is the attack.
-                            if exceeds_stream_limit(
-                                stream_id,
-                                self.peer_max_streams_bidi_advertised,
-                                self.peer_max_streams_uni_advertised,
-                                self.recv_streams.len(),
-                            ) {
+                            // Role split: each role rejects ids the PEER
+                            // had no credit (or right) to open — the
+                            // initiator bit's meaning flips with the role,
+                            // and the client's own bidi streams carry the
+                            // peer's response half (no open at all).
+                            let over_limit = if self.client.is_some() {
+                                client_exceeds_stream_limit(
+                                    stream_id,
+                                    self.peer_max_streams_bidi_advertised,
+                                    self.peer_max_streams_uni_advertised,
+                                    self.recv_streams.len(),
+                                )
+                            } else {
+                                exceeds_stream_limit(
+                                    stream_id,
+                                    self.peer_max_streams_bidi_advertised,
+                                    self.peer_max_streams_uni_advertised,
+                                    self.recv_streams.len(),
+                                )
+                            };
+                            if over_limit {
                                 crate::diag::COUNTERS.stream_limit_exceeded.bump();
                                 crate::quic_drop!(
                                     other_wire,
@@ -893,20 +972,23 @@ impl Connection {
                             // (initiator, type) in the low 2 bits:
                             //   00 = client bidi, 01 = server bidi,
                             //   02 = client uni,  03 = server uni.
-                            // We only see client-initiated here.
+                            // Only PEER-initiated kinds count — which
+                            // kinds those are flips with our role.
                             let count = (stream_id >> 2) + 1;
-                            match stream_id & 0x3 {
-                                0x0 => {
-                                    if count > self.peer_bidi_streams_opened {
-                                        self.peer_bidi_streams_opened = count;
-                                    }
+                            let (bidi_kind, uni_kind) = if self.client.is_some() {
+                                (0x1, 0x3) // peer = server
+                            } else {
+                                (0x0, 0x2) // peer = client
+                            };
+                            let kind = stream_id & 0x3;
+                            if kind == bidi_kind {
+                                if count > self.peer_bidi_streams_opened {
+                                    self.peer_bidi_streams_opened = count;
                                 }
-                                0x2 => {
-                                    if count > self.peer_uni_streams_opened {
-                                        self.peer_uni_streams_opened = count;
-                                    }
-                                }
-                                _ => {}
+                            } else if kind == uni_kind
+                                && count > self.peer_uni_streams_opened
+                            {
+                                self.peer_uni_streams_opened = count;
                             }
                         }
                         // Push to `opened_streams` semantics depend
@@ -933,7 +1015,19 @@ impl Connection {
                         //        open these; if the peer somehow
                         //        sends one, conservatively use the
                         //        bidi rule.
-                        let push = if stream_id & 0x3 == 0x2 {
+                        let push = if self.client.is_some() {
+                            // Client role: 0x3 = server uni (control /
+                            // QPACK — re-yield like the server's 0x2
+                            // rule); 0x1 = server bidi (accept once);
+                            // 0x0/0x2 are streams WE opened — inbound
+                            // data on them is the response half, not
+                            // an accept event.
+                            match stream_id & 0x3 {
+                                0x3 => !self.opened_streams.contains(&stream_id),
+                                0x1 => was_new,
+                                _ => false,
+                            }
+                        } else if stream_id & 0x3 == 0x2 {
                             !self.opened_streams.contains(&stream_id)
                         } else {
                             was_new
@@ -1027,6 +1121,30 @@ fn exceeds_stream_limit(stream_id: u64, bidi_adv: u64, uni_adv: u64, live: usize
     let limit = match stream_id & 0x3 {
         0x0 => bidi_adv,
         0x2 => uni_adv,
+        _ => 0,
+    };
+    count > limit || live >= MAX_CONCURRENT_RECV_STREAMS
+}
+
+/// CLIENT-role mirror of [`exceeds_stream_limit`]: the peer is the
+/// SERVER, whose initiated ids carry bit0 = 1 (0x1 bidi, 0x3 uni). A
+/// frame on a locally-initiated BIDI id (0x0) is the peer's response
+/// half of a stream we opened — not a stream open at all, so only the
+/// live-map backstop applies. A frame on a locally-initiated UNI id
+/// (0x2) is a protocol violation (the peer must never send on our uni
+/// stream) — rejected via the zero limit, same as the server role's
+/// treatment of its own ids.
+pub(super) fn client_exceeds_stream_limit(
+    stream_id: u64,
+    bidi_adv: u64,
+    uni_adv: u64,
+    live: usize,
+) -> bool {
+    let count = (stream_id >> 2) + 1;
+    let limit = match stream_id & 0x3 {
+        0x1 => bidi_adv,
+        0x3 => uni_adv,
+        0x0 => return live >= MAX_CONCURRENT_RECV_STREAMS,
         _ => 0,
     };
     count > limit || live >= MAX_CONCURRENT_RECV_STREAMS

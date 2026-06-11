@@ -75,6 +75,11 @@ pub struct ServerParams<'a> {
     pub initial_max_streams_bidi: u64,
     pub initial_max_streams_uni: u64,
     pub max_idle_timeout_ms: u64,
+    /// RFC 9000 §7.3: a server that sent a Retry MUST echo the SCID
+    /// it chose on that Retry. Our server never sends Retry, so this
+    /// is always `None` in production (encoding unchanged); the
+    /// client-role §7.3 validation tests drive the `Some` arm.
+    pub retry_source_connection_id: Option<&'a [u8]>,
 }
 
 impl<'a> ServerParams<'a> {
@@ -82,6 +87,7 @@ impl<'a> ServerParams<'a> {
         ServerParams {
             original_destination_connection_id: odcid,
             initial_source_connection_id: iscid,
+            retry_source_connection_id: None,
             initial_max_data: crate::streams::INITIAL_MAX_DATA,
             initial_max_stream_data_bidi_local: crate::streams::INITIAL_MAX_STREAM_DATA,
             initial_max_stream_data_bidi_remote: crate::streams::INITIAL_MAX_STREAM_DATA,
@@ -142,7 +148,56 @@ impl<'a> ServerParams<'a> {
             self.initial_max_streams_uni,
         );
         write_varint_param(out, tp_id::MAX_IDLE_TIMEOUT, self.max_idle_timeout_ms);
+        if let Some(rscid) = self.retry_source_connection_id {
+            write_bytes_param(out, tp_id::RETRY_SOURCE_CONNECTION_ID, rscid);
+        }
     }
+}
+
+// ============================================================================
+// Outbound builder — client transport parameters
+// ============================================================================
+
+/// Encode the CLIENT role's transport parameters (RFC 9000 §18.2) —
+/// sensible mirrors of [`ServerParams::defaults`]. The client never
+/// sends the server-only params (`original_destination_connection_id`,
+/// `stateless_reset_token`, `retry_source_connection_id`, …); it adds
+/// the receive-side tuning the server omits (`max_udp_payload_size`,
+/// `ack_delay_exponent`, `max_ack_delay`, `active_connection_id_limit`).
+/// `iscid` is the SCID the client puts on its first Initial. The blob
+/// goes into the ClientHello's `quic_transport_parameters` extension
+/// (RFC 9001 §8.2).
+pub fn encode_client_params(out: &mut Vec<u8>, iscid: &[u8]) {
+    write_bytes_param(out, tp_id::INITIAL_SOURCE_CONNECTION_ID, iscid);
+    // Our RX path handles full-MTU datagrams; advertise the standard
+    // 1500-minus-IP/UDP envelope.
+    write_varint_param(out, tp_id::MAX_UDP_PAYLOAD_SIZE, 1452);
+    write_varint_param(out, tp_id::INITIAL_MAX_DATA, crate::streams::INITIAL_MAX_DATA);
+    write_varint_param(
+        out,
+        tp_id::INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+        crate::streams::INITIAL_MAX_STREAM_DATA,
+    );
+    write_varint_param(
+        out,
+        tp_id::INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+        crate::streams::INITIAL_MAX_STREAM_DATA,
+    );
+    write_varint_param(
+        out,
+        tp_id::INITIAL_MAX_STREAM_DATA_UNI,
+        crate::streams::INITIAL_MAX_STREAM_DATA,
+    );
+    // MUST match `Connection`'s `peer_max_streams_*_advertised` seeds
+    // (the same coupling `ServerParams::defaults` documents).
+    write_varint_param(out, tp_id::INITIAL_MAX_STREAMS_BIDI, 1024);
+    write_varint_param(out, tp_id::INITIAL_MAX_STREAMS_UNI, 1024);
+    // RFC defaults made explicit: 2^3 µs ACK-delay units, 25 ms max.
+    write_varint_param(out, tp_id::ACK_DELAY_EXPONENT, 3);
+    write_varint_param(out, tp_id::MAX_ACK_DELAY, 25);
+    // §18.2: MUST be ≥ 2.
+    write_varint_param(out, tp_id::ACTIVE_CONNECTION_ID_LIMIT, 2);
+    write_varint_param(out, tp_id::MAX_IDLE_TIMEOUT, 30_000);
 }
 
 fn write_varint_param(out: &mut Vec<u8>, id: u64, value: u64) {
@@ -176,9 +231,21 @@ fn write_bytes_param(out: &mut Vec<u8>, id: u64, value: &[u8]) {
 /// Subset of client transport parameters the server cares about.
 /// Anything we don't track is silently dropped on parse — RFC 9000
 /// §18.1 requires endpoints to ignore unknown params.
+///
+/// Also reused by the CLIENT role to parse the SERVER's parameters
+/// out of EncryptedExtensions (the TLV stream is direction-agnostic);
+/// the two trailing CID fields below only ever appear in that
+/// direction and feed the client's RFC 9000 §7.3 authentication.
 #[derive(Debug, Clone)]
 pub struct ClientParams {
     pub initial_source_connection_id: Option<Vec<u8>>,
+    /// Server→client only (RFC 9000 §18.2 `0x00`): the DCID of the
+    /// client's first Initial, echoed for §7.3 authentication.
+    pub original_destination_connection_id: Option<Vec<u8>>,
+    /// Server→client only (`0x10`): the SCID the server chose on its
+    /// Retry, echoed for §7.3 authentication. Present iff a Retry
+    /// was sent.
+    pub retry_source_connection_id: Option<Vec<u8>>,
     pub initial_max_data: u64,
     pub initial_max_stream_data_bidi_local: u64,
     pub initial_max_stream_data_bidi_remote: u64,
@@ -205,6 +272,8 @@ impl Default for ClientParams {
     fn default() -> Self {
         ClientParams {
             initial_source_connection_id: None,
+            original_destination_connection_id: None,
+            retry_source_connection_id: None,
             initial_max_data: 0,
             initial_max_stream_data_bidi_local: 0,
             initial_max_stream_data_bidi_remote: 0,
@@ -249,6 +318,12 @@ pub fn parse_client_params(mut bytes: &[u8]) -> Result<ClientParams, ParamsError
         match id {
             tp_id::INITIAL_SOURCE_CONNECTION_ID => {
                 out.initial_source_connection_id = Some(value.to_vec());
+            }
+            tp_id::ORIGINAL_DESTINATION_CONNECTION_ID => {
+                out.original_destination_connection_id = Some(value.to_vec());
+            }
+            tp_id::RETRY_SOURCE_CONNECTION_ID => {
+                out.retry_source_connection_id = Some(value.to_vec());
             }
             tp_id::INITIAL_MAX_DATA => {
                 out.initial_max_data = decode_varint_payload(value)?;

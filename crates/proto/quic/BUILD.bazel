@@ -46,6 +46,10 @@ rust_library(
         # + AEAD seal, `loss.rs` the RFC 9002 loss / RTT machinery.
         "src/conn/mod.rs",
         "src/conn/cfg.rs",
+        # Client role: `Connection::new_client` + the client-received
+        # packets (Version Negotiation, Retry) + the RFC 9000 §7.3
+        # transport-parameter CID authentication.
+        "src/conn/client.rs",
         "src/conn/keys.rs",
         "src/conn/loss.rs",
         "src/conn/rx.rs",

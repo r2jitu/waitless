@@ -72,6 +72,7 @@ use alloc::vec::Vec;
 use crate::tls::{QuicTls, QuicTlsError};
 use core::mem::ManuallyDrop;
 
+pub(super) mod client;
 pub(super) mod keys;
 pub(super) mod loss;
 pub(super) mod rx;
@@ -1280,6 +1281,21 @@ pub struct Connection {
     /// the last refill timestamp; 0 lets the first refill grant a full burst.
     pub(super) pace_budget: i64,
     pub(super) pace_last_us: u64,
+
+    /// CLIENT-role state (`Connection::new_client`): the Retry token /
+    /// CID bookkeeping plus the §7.3 validation flag. `None` for the
+    /// server role — every server-side path checks `client.is_none()`
+    /// (or nothing at all) and behaves byte-identically. Boxed so the
+    /// per-conn server footprint grows by one pointer.
+    pub(super) client: Option<Box<client::ClientState>>,
+
+    /// Test-only seam: overrides the (odcid, retry_scid) pair the
+    /// SERVER role echoes in its transport parameters — what a real
+    /// Retry-issuing server reconstructs from its token (RFC 9000
+    /// §7.3). Production servers never send Retry, so this is never
+    /// set outside the client-role §7.3 tests.
+    #[cfg(test)]
+    pub(super) test_tp_override: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl Drop for Connection {
@@ -1340,6 +1356,16 @@ impl Connection {
     /// yet told the client our SCID). After that exchange, both
     /// sides settle on the CIDs they advertised.
     pub fn new_server(local_cid: ConnectionId, seed: [u8; 32]) -> Self {
+        Self::new_with(local_cid, QuicTls::new(seed))
+    }
+
+    /// Shared field initializer for both roles: every default below is
+    /// the server role's historical value; [`new_server`] passes a
+    /// server-mode `QuicTls` and changes nothing else, while
+    /// [`Connection::new_client`] (conn/client.rs) passes a client-mode
+    /// driver and then overrides the role-specific slots (CIDs, Initial
+    /// keys, `path_validated`, `handshake_done_sent`, `client`).
+    pub(super) fn new_with(local_cid: ConnectionId, tls: QuicTls) -> Self {
         Connection {
             state: ConnState::PreHandshake,
             local_cid,
@@ -1367,7 +1393,7 @@ impl Connection {
             application_space: SpaceState::default(),
             app_ack_eliciting_since_ack: 0,
             app_first_unacked_us: 0,
-            tls: QuicTls::new(seed),
+            tls,
             handshake_done_sent: false,
             peer_bidi_streams_opened: 0,
             peer_uni_streams_opened: 0,
@@ -1431,6 +1457,9 @@ impl Connection {
             retx_frame_vec_pool: alloc::vec::Vec::new(),
             pace_budget: 0,
             pace_last_us: 0,
+            client: None,
+            #[cfg(test)]
+            test_tp_override: None,
         }
     }
 
@@ -1511,7 +1540,18 @@ impl Connection {
             .and_then(|b| crate::transport_params::parse_client_params(b).ok())
         {
             self.peer_max_data = p.initial_max_data;
-            self.peer_initial_max_stream_data_bidi = p.initial_max_stream_data_bidi_local;
+            // The bidi seed depends on who opened the stream relative to
+            // the PARAM SENDER (RFC 9000 §18.2): "bidi_local" governs
+            // streams the sender itself opens. Server role: we send
+            // responses on CLIENT-opened bidi streams → the client's
+            // bidi_local. Client role: we send requests on streams WE
+            // open — remote from the server's (the param sender's)
+            // perspective → its bidi_remote.
+            self.peer_initial_max_stream_data_bidi = if self.client.is_some() {
+                p.initial_max_stream_data_bidi_remote
+            } else {
+                p.initial_max_stream_data_bidi_local
+            };
             self.peer_initial_max_stream_data_uni = p.initial_max_stream_data_uni;
             // RTT/PTO inputs (RFC 9000 §18.2): how to scale the peer's
             // ACK `ack_delay` fields, and the most it will intentionally

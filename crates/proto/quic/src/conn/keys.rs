@@ -208,8 +208,25 @@ impl Connection {
         }
     }
 
-    pub(super) fn advance_tls(&mut self, config: &TlsServerConfig) -> Result<(), ConnError> {
-        let new_state = self.tls.advance(config)?;
+    /// Drive the TLS state machine and derive packet-protection keys
+    /// as stage secrets appear. Role-dispatching: the server role
+    /// requires `config` (cert + signing key for its flight); the
+    /// client role carries its own config inside `QuicTls` and is
+    /// called with `None`. The per-direction key assignment below
+    /// swaps with the role — RFC 9001 §5.1: each endpoint SENDS under
+    /// its own traffic secret ("client in"/client_hs/client_ap for
+    /// the client; the server_* halves for the server) and RECEIVES
+    /// under the peer's.
+    pub(super) fn advance_tls(
+        &mut self,
+        config: Option<&TlsServerConfig>,
+    ) -> Result<(), ConnError> {
+        let is_client = self.client.is_some();
+        let new_state = if is_client {
+            self.tls.advance_client()?
+        } else {
+            self.tls.advance(config.ok_or(ConnError::BadState)?)?
+        };
         // 0-RTT (early-data) recv keys. Only set on resumption,
         // and only after CH has been parsed — `client_early_traffic_secret()`
         // returns Some at that point. Derived eagerly so we can
@@ -246,16 +263,29 @@ impl Connection {
         if let Some(hs) = self.tls.handshake_secrets()
             && self.handshake_send.is_none()
         {
-            let send = derive_aes128_keys(&hs.server_hs);
-            let recv = derive_aes128_keys(&hs.client_hs);
+            // Role-directional split (RFC 9001 §5.1): TX under our own
+            // traffic secret, RX under the peer's.
+            let (tx_secret, rx_secret) = if is_client {
+                (&hs.client_hs, &hs.server_hs)
+            } else {
+                (&hs.server_hs, &hs.client_hs)
+            };
+            let send = derive_aes128_keys(tx_secret);
+            let recv = derive_aes128_keys(rx_secret);
             self.handshake_send = Some(Box::new(DirKeys::from_aes128(&send)));
             self.handshake_recv = Some(Box::new(DirKeys::from_aes128(&recv)));
         }
         if let Some(ap) = self.tls.application_secrets()
             && self.application_send.is_none()
         {
-            let send = derive_aes128_keys(&ap.server_ap);
-            let recv = derive_aes128_keys(&ap.client_ap);
+            // Same role split as the handshake stage above.
+            let (tx_secret, rx_secret) = if is_client {
+                (ap.client_ap, ap.server_ap)
+            } else {
+                (ap.server_ap, ap.client_ap)
+            };
+            let send = derive_aes128_keys(&tx_secret);
+            let recv = derive_aes128_keys(&rx_secret);
             self.application_send = Some(Box::new(DirKeys::from_aes128(&send)));
             self.application_recv = Some(Box::new(DirKeys::from_aes128(&recv)));
             // Pre-derive next-phase recv keys so a peer-initiated
@@ -265,16 +295,30 @@ impl Connection {
             // disagrees with `recv_key_phase`. HP key persists
             // across phases (§6.1: "the same header protection
             // key is used") so we copy it from the current keys.
-            self.client_app_secret = Some(ap.client_ap);
-            let next_secret = next_traffic_secret(&ap.client_ap);
+            // (`client_app_secret` holds the PEER's app secret —
+            // historically named for the server role, where the peer
+            // is the client; the client role stores the server's
+            // secret here so `rotate_recv_keys` is role-agnostic.)
+            self.client_app_secret = Some(rx_secret);
+            let next_secret = next_traffic_secret(&rx_secret);
             let next_aes128 = derive_aes128_keys(&next_secret);
             let cur_recv = self.application_recv.as_ref().unwrap();
             self.application_recv_next =
                 Some(Box::new(DirKeys::from_aes128_reuse_hp(&next_aes128, cur_recv)));
-            // Remember the server secret too, so `rotate_send_keys` can
-            // derive the next-generation send keys when we respond to a
+            // Remember OUR send secret too (`server_app_secret`, same
+            // naming caveat), so `rotate_send_keys` can derive the
+            // next-generation send keys when we respond to a
             // peer-initiated key update (RFC 9001 §6.1).
-            self.server_app_secret = Some(ap.server_ap);
+            self.server_app_secret = Some(tx_secret);
+        }
+        // Client role: the server's transport params landed via
+        // EncryptedExtensions — authenticate the CID echoes once
+        // (RFC 9000 §7.3) before the handshake proceeds to keys/data.
+        if is_client
+            && !self.client.as_ref().expect("is_client").tps_validated
+            && self.tls.client_transport_params().is_some()
+        {
+            self.validate_peer_transport_params()?;
         }
         // `Failed` is terminal — never resurrect it. Without this
         // guard, a peer-initiated CONNECTION_CLOSE (handled in

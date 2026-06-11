@@ -151,6 +151,12 @@ pub struct Counters {
     /// dispatched. Counter rate = peer's effective 0-RTT request
     /// volume after our acceptance policy.
     pub zero_rtt_accepted: Counter,
+    /// CLIENT role: a Retry packet passed the RFC 9001 §5.8
+    /// integrity check and was accepted (new DCID adopted, Initial
+    /// keys re-derived, token stored). At most once per connection
+    /// attempt; nonzero means some server (or middlebox) on the path
+    /// is issuing Retries.
+    pub retry_accepted: Counter,
     /// Peer-initiated 1-RTT key update (KEY_PHASE bit flipped) that
     /// we successfully decrypted with the next-phase keys, then
     /// rotated. Per RFC 9001 §6 each KU is a once-per-flight event;
@@ -417,6 +423,7 @@ impl Counters {
             tickets_accepted: Counter::new(),
             early_keys_derived: Counter::new(),
             zero_rtt_accepted: Counter::new(),
+            retry_accepted: Counter::new(),
             key_updates_accepted: Counter::new(),
             zero_rtt_buffered: Counter::new(),
             zero_rtt_unresumable: Counter::new(),
@@ -860,7 +867,7 @@ pub fn should_log_event() -> bool {
 /// Snapshot of every drop / event counter, for `/quic_stats`-style
 /// dumps. Returns `(name, value)` pairs in declaration order,
 /// including the four AEAD throughput counters.
-pub fn snapshot() -> [(&'static str, u64); 65] {
+pub fn snapshot() -> [(&'static str, u64); 66] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.get()),
@@ -886,6 +893,7 @@ pub fn snapshot() -> [(&'static str, u64); 65] {
         ("tickets_accepted", c.tickets_accepted.get()),
         ("early_keys_derived", c.early_keys_derived.get()),
         ("zero_rtt_accepted", c.zero_rtt_accepted.get()),
+        ("retry_accepted", c.retry_accepted.get()),
         ("key_updates_accepted", c.key_updates_accepted.get()),
         ("zero_rtt_buffered", c.zero_rtt_buffered.get()),
         ("zero_rtt_unresumable", c.zero_rtt_unresumable.get()),

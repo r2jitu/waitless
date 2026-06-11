@@ -29,17 +29,24 @@
 //     X25519 share; HRR is for negotiating a different group)
 //   * Key update (1-RTT key rotation; RFC 9001 §6)
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use p256::ecdsa::{Signature as EcdsaSignature, signature::Signer};
+use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::{Signature as EcdsaSignature, VerifyingKey, signature::Signer};
+use sha2::{Digest as _, Sha256};
 
+use tls::client::{ServerAuth, TlsClientConfig, extract_spki_from_cert_der, spki_p256_point};
 use tls::handshake::{
-    ClientHello, ParseError, build_certificate, build_certificate_verify,
-    build_encrypted_extensions, build_finished, build_server_hello, encode_handshake, msg_type,
-    parse_finished, parse_handshake, sign_content_server_cert_verify,
+    ClientHello, ClientHelloParams, ParseError, build_certificate, build_certificate_verify,
+    build_client_hello, build_encrypted_extensions, build_finished, build_server_hello,
+    encode_handshake, msg_type, parse_certificate_leaf, parse_certificate_verify,
+    parse_encrypted_extensions, parse_finished, parse_handshake, parse_server_hello, sig_scheme,
+    sign_content_server_cert_verify,
 };
 use tls::schedule::{
     ApplicationSecrets, HASH_LEN, HandshakeSecrets, KeySchedule, Transcript, X25519ServerKey,
+    hkdf_expand_label,
 };
 
 use tls::TlsServerConfig;
@@ -99,6 +106,21 @@ pub enum QuicTlsError {
     UnexpectedMessage,
     /// Output-buffer-too-small / alloc failure / RNG failure.
     Internal,
+    // ── Client-role failures (the QUIC client driver below) ─────
+    /// ServerHello / EE didn't meet the client's requirements
+    /// (HelloRetryRequest, unsolicited PSK, non-empty session-id
+    /// echo, missing key_share / quic_transport_parameters, or an
+    /// ALPN selection we never offered).
+    UnsupportedServer,
+    /// SPKI pin mismatch on the server's leaf certificate
+    /// (RFC 7469 pin over the SubjectPublicKeyInfo DER).
+    PinMismatch,
+    /// The leaf certificate's DER walk / P-256 key lift failed.
+    BadCertificate,
+    /// CertificateVerify didn't verify (RFC 8446 §4.4.3).
+    BadCertificateVerify,
+    /// Server Finished verify_data mismatch (RFC 8446 §4.4.4).
+    BadServerFinished,
 }
 
 impl From<ParseError> for QuicTlsError {
@@ -191,9 +213,55 @@ pub struct QuicTls {
     /// the connection layer always populates this.
     server_transport_params: Vec<u8>,
 
-    /// Client-side transport parameters captured from the
-    /// ClientHello. `None` until ClientHello has been parsed.
+    /// The PEER's transport parameters. Server role: captured from
+    /// the ClientHello (hence the name). Client role: captured from
+    /// the server's EncryptedExtensions — same slot so the
+    /// connection-layer consumers (`apply_peer_flow_control`,
+    /// `idle_timeout_us`) are role-agnostic. `None` until parsed.
     client_transport_params: Option<Vec<u8>>,
+
+    /// Client-role state (`QuicTls::new_client`). `None` for the
+    /// server role — every existing server path checks nothing and
+    /// behaves byte-identically. Boxed: the verify key + bookkeeping
+    /// would otherwise widen every server-side `QuicTls`.
+    client: Option<Box<ClientRole>>,
+}
+
+// ============================================================================
+// Client role (RFC 9001 §4 over CRYPTO frames, client side)
+// ============================================================================
+
+/// Client-side handshake states — the QUIC mirror of
+/// `tls::client::State`, minus the record layer (and minus the
+/// middlebox-compat CCS, which RFC 9001 §8.4 forbids in QUIC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientHsState {
+    WaitServerHello,
+    WaitEncryptedExtensions,
+    WaitCertificate,
+    WaitCertificateVerify,
+    WaitFinished,
+    Established,
+    Failed,
+}
+
+/// Per-connection client-role state hanging off [`QuicTls`]. The
+/// shared fields (transcript, schedule, ephemeral, per-level rx/tx
+/// queues, stage secrets) live on `QuicTls` itself — this is only
+/// what the client side adds.
+struct ClientRole {
+    state: ClientHsState,
+    /// Server authentication mode — same `ServerAuth` the TCP TLS
+    /// client uses (`PinnedSpki` / `InsecureSkipVerify`).
+    auth: ServerAuth,
+    /// ALPN protocols we offered, for validating the server's echo.
+    alpn: &'static [&'static [u8]],
+    /// The pinned leaf's P-256 key, parked between Certificate and
+    /// CertificateVerify. `None` under `InsecureSkipVerify`.
+    server_verify_key: Option<VerifyingKey>,
+    /// The failure that moved us to `Failed` — the connection layer
+    /// maps it to a CRYPTO_ERROR close code (RFC 9001 §4.8).
+    last_error: Option<QuicTlsError>,
 }
 
 impl QuicTls {
@@ -216,6 +284,91 @@ impl QuicTls {
             client_early_traffic_secret: None,
             server_transport_params: Vec::new(),
             client_transport_params: None,
+            client: None,
+        }
+    }
+
+    /// Construct a CLIENT-role QUIC TLS driver and emit the
+    /// ClientHello into the Initial tx queue immediately — the
+    /// connection's first flush wraps it in a CRYPTO frame.
+    ///
+    /// Entropy arrives by value, mirroring `TlsClient::new_box`:
+    /// `seed` expands into the X25519 keypair seed and the
+    /// ClientHello random via HKDF-Expand-Label with distinct local
+    /// labels, so a fixed seed reproduces the ClientHello
+    /// byte-for-byte (the determinism the simulation arc leans on).
+    ///
+    /// QUIC-specific shape (RFC 9001 §8.4): EMPTY legacy_session_id
+    /// (no middlebox-compat mode — and no CCS, which this driver
+    /// never emits anyway), plus the `quic_transport_parameters`
+    /// extension carrying `transport_params` (RFC 9001 §8.2).
+    pub fn new_client(
+        seed: [u8; 32],
+        config: &TlsClientConfig,
+        transport_params: Vec<u8>,
+    ) -> Result<Self, QuicTlsError> {
+        let mut x_seed = [0u8; 32];
+        let mut random = [0u8; 32];
+        hkdf_expand_label(&seed, b"waitless quic cli x25519", &[], &mut x_seed);
+        hkdf_expand_label(&seed, b"waitless quic cli random", &[], &mut random);
+
+        let mut q = Self::new(x_seed);
+        q.client = Some(Box::new(ClientRole {
+            state: ClientHsState::WaitServerHello,
+            auth: config.auth,
+            alpn: config.alpn,
+            server_verify_key: None,
+            last_error: None,
+        }));
+        // Our transport params ride the CH; reuse the local-params
+        // slot (the server role stores its EE-bound params there).
+        q.server_transport_params = transport_params;
+
+        let public = q
+            .ephemeral
+            .as_ref()
+            .ok_or(QuicTlsError::Internal)?
+            .public_bytes();
+        let params = ClientHelloParams {
+            random: &random,
+            legacy_session_id: &[], // QUIC: no compat mode (RFC 9001 §8.4)
+            x25519_pub: &public,
+            server_name: config.server_name,
+            alpn: config.alpn,
+            extras: &[(
+                tls::handshake::ext_type::QUIC_TRANSPORT_PARAMETERS,
+                q.server_transport_params.as_slice(),
+            )],
+        };
+        let mut ch_body = [0u8; 1024];
+        let body_len = build_client_hello(&params, &mut ch_body).ok_or(QuicTlsError::Internal)?;
+        let mut ch_msg = [0u8; 1056];
+        let msg_len = encode_handshake(msg_type::CLIENT_HELLO, &ch_body[..body_len], &mut ch_msg)
+            .ok_or(QuicTlsError::Internal)?;
+        q.transcript.update(&ch_msg[..msg_len]);
+        q.tx_initial.extend_from_slice(&ch_msg[..msg_len]);
+        Ok(q)
+    }
+
+    /// Whether this driver runs the client role.
+    pub fn is_client(&self) -> bool {
+        self.client.is_some()
+    }
+
+    /// The TLS alert description (RFC 8446 §6.2) matching the client
+    /// role's terminal failure — the connection layer adds 0x0100 to
+    /// form the CRYPTO_ERROR close code (RFC 9001 §4.8). Defaults to
+    /// `internal_error` (80) when no client failure is recorded.
+    pub fn client_alert_code(&self) -> u8 {
+        match self.client.as_ref().and_then(|c| c.last_error) {
+            Some(QuicTlsError::PinMismatch) | Some(QuicTlsError::BadCertificate) => 42, // bad_certificate
+            Some(QuicTlsError::BadCertificateVerify) | Some(QuicTlsError::BadServerFinished) => {
+                51 // decrypt_error
+            }
+            Some(QuicTlsError::UnsupportedServer) => 40,  // handshake_failure
+            Some(QuicTlsError::UnexpectedMessage) => 10,  // unexpected_message
+            Some(QuicTlsError::ParseError(_)) => 50,      // decode_error
+            _ => 80,                                      // internal_error
         }
     }
 
@@ -765,6 +918,250 @@ impl QuicTls {
         // flush_outbound and emits a CRYPTO frame in a 1-RTT packet.
         self.tx_one_rtt.extend_from_slice(&nst_msg[..msg_len]);
         Ok(())
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Client-role driver (RFC 9001 §4, client side)
+    // ════════════════════════════════════════════════════════════════
+
+    /// Client-role mirror of [`advance`](Self::advance): consume
+    /// complete handshake messages from the per-level rx queues
+    /// (ServerHello from Initial; EE / Certificate / CertificateVerify
+    /// / Finished from Handshake), verify the server per the
+    /// configured [`ServerAuth`], and queue the client Finished into
+    /// the Handshake tx queue. Surfaces secrets through the SAME
+    /// accessors the server role uses (`handshake_secrets` /
+    /// `application_secrets`) — the direction split happens at the
+    /// connection layer's key derivation. Idempotent on truncated
+    /// input — re-call after the next `push_handshake`.
+    pub fn advance_client(&mut self) -> Result<QuicTlsState, QuicTlsError> {
+        if self.client.is_none() {
+            return Err(QuicTlsError::Internal);
+        }
+        loop {
+            let st = self.client.as_ref().expect("checked above").state;
+            let step = match st {
+                ClientHsState::WaitServerHello => self.client_step_server_hello(),
+                ClientHsState::WaitEncryptedExtensions
+                | ClientHsState::WaitCertificate
+                | ClientHsState::WaitCertificateVerify
+                | ClientHsState::WaitFinished => self.client_step_handshake_flight(),
+                ClientHsState::Established => {
+                    self.state = QuicTlsState::Established;
+                    return Ok(self.state);
+                }
+                ClientHsState::Failed => {
+                    self.state = QuicTlsState::Failed;
+                    return Ok(self.state);
+                }
+            };
+            match step {
+                Ok(true) => continue, // consumed a message — try the next
+                Ok(false) => {
+                    // Need more CRYPTO bytes. Map terminal states onto
+                    // the shared QuicTlsState the connection consults.
+                    match self.client.as_ref().expect("checked above").state {
+                        ClientHsState::Established => self.state = QuicTlsState::Established,
+                        ClientHsState::Failed => self.state = QuicTlsState::Failed,
+                        _ => {}
+                    }
+                    return Ok(self.state);
+                }
+                Err(e) => {
+                    let c = self.client.as_mut().expect("checked above");
+                    c.state = ClientHsState::Failed;
+                    c.last_error = Some(e);
+                    self.state = QuicTlsState::Failed;
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Pop one complete handshake message (header + body) off the
+    /// front of `rx`, if available. `Ok(None)` = need more bytes;
+    /// an over-announced length is a hard error (same 64 KiB sanity
+    /// bound the server's peek applies).
+    fn take_full_message(rx: &mut RxBuf) -> Result<Option<Vec<u8>>, QuicTlsError> {
+        if rx.len() < 4 {
+            return Ok(None);
+        }
+        const MAX_HS_MSG: usize = 64 * 1024;
+        let announced =
+            ((rx[1] as usize) << 16) | ((rx[2] as usize) << 8) | (rx[3] as usize);
+        if announced > MAX_HS_MSG {
+            return Err(QuicTlsError::ParseError(ParseError::BadLength));
+        }
+        let total = 4 + announced;
+        if total > rx.len() {
+            return Ok(None);
+        }
+        let msg = rx[..total].to_vec();
+        rx.drain(..total);
+        Ok(Some(msg))
+    }
+
+    /// WaitServerHello → WaitEncryptedExtensions. `Ok(progress)`.
+    fn client_step_server_hello(&mut self) -> Result<bool, QuicTlsError> {
+        let Some(msg) = Self::take_full_message(&mut self.rx_initial)? else {
+            return Ok(false);
+        };
+        if msg[0] != msg_type::SERVER_HELLO {
+            return Err(QuicTlsError::UnexpectedMessage);
+        }
+        let sh = parse_server_hello(&msg[4..])?;
+        // HelloRetryRequest is a documented non-goal (we only ever
+        // offer x25519, which every peer we speak to implements).
+        if sh.is_hello_retry_request {
+            return Err(QuicTlsError::UnsupportedServer);
+        }
+        // We never offer a PSK; a server "accepting" one is broken or
+        // hostile (RFC 8446 §4.1.3 — MUST abort).
+        if sh.has_pre_shared_key {
+            return Err(QuicTlsError::UnsupportedServer);
+        }
+        // We sent an EMPTY legacy_session_id (QUIC forbids compat
+        // mode — RFC 9001 §8.4); the echo MUST be empty too.
+        if !sh.legacy_session_id_echo.is_empty() {
+            return Err(QuicTlsError::UnsupportedServer);
+        }
+        let server_pub = sh
+            .x25519_server_pub
+            .ok_or(QuicTlsError::UnsupportedServer)?;
+
+        self.transcript.update(&msg);
+        let ephemeral = self.ephemeral.take().ok_or(QuicTlsError::Internal)?;
+        let shared = ephemeral.shared_secret(&server_pub);
+        let transcript_h1 = self.transcript.snapshot();
+        self.handshake_secrets = Some(self.schedule.enter_handshake(&shared, &transcript_h1));
+        self.client.as_mut().expect("client role").state =
+            ClientHsState::WaitEncryptedExtensions;
+        Ok(true)
+    }
+
+    /// One message of the server's Handshake flight:
+    /// EE → Certificate → CertificateVerify → Finished. `Ok(progress)`.
+    fn client_step_handshake_flight(&mut self) -> Result<bool, QuicTlsError> {
+        let Some(msg) = Self::take_full_message(&mut self.rx_handshake)? else {
+            return Ok(false);
+        };
+        let (mt, body) = parse_handshake(&msg)?;
+        let st = self.client.as_ref().expect("client role").state;
+        match (st, mt) {
+            (ClientHsState::WaitEncryptedExtensions, t) if t == msg_type::ENCRYPTED_EXTENSIONS => {
+                let ee = parse_encrypted_extensions(body)?;
+                // RFC 7301 §3.2: the selection MUST come from our offer.
+                if let Some(selected) = ee.alpn_protocol {
+                    let offered = self.client.as_ref().expect("client role").alpn;
+                    if !offered.contains(&selected) {
+                        return Err(QuicTlsError::UnsupportedServer);
+                    }
+                }
+                // RFC 9001 §8.2: EE MUST carry quic_transport_parameters.
+                let tp = ee
+                    .quic_transport_parameters
+                    .ok_or(QuicTlsError::UnsupportedServer)?;
+                self.client_transport_params = Some(tp.to_vec());
+                self.transcript.update(&msg);
+                self.client.as_mut().expect("client role").state =
+                    ClientHsState::WaitCertificate;
+                Ok(true)
+            }
+            (ClientHsState::WaitCertificate, t) if t == msg_type::CERTIFICATE => {
+                let leaf = parse_certificate_leaf(body)?;
+                let auth = self.client.as_ref().expect("client role").auth;
+                match auth {
+                    ServerAuth::PinnedSpki(pin) => {
+                        let spki = extract_spki_from_cert_der(leaf)
+                            .ok_or(QuicTlsError::BadCertificate)?;
+                        let mut hasher = Sha256::new();
+                        hasher.update(spki);
+                        let digest: [u8; 32] = hasher.finalize().into();
+                        if !ct_eq_32(&digest, &pin) {
+                            return Err(QuicTlsError::PinMismatch);
+                        }
+                        let point =
+                            spki_p256_point(spki).ok_or(QuicTlsError::BadCertificate)?;
+                        let vk = VerifyingKey::from_sec1_bytes(point)
+                            .map_err(|_| QuicTlsError::BadCertificate)?;
+                        self.client.as_mut().expect("client role").server_verify_key = Some(vk);
+                    }
+                    ServerAuth::InsecureSkipVerify => {
+                        // Loudly skipped — see the variant docs.
+                    }
+                }
+                self.transcript.update(&msg);
+                self.client.as_mut().expect("client role").state =
+                    ClientHsState::WaitCertificateVerify;
+                Ok(true)
+            }
+            (ClientHsState::WaitCertificateVerify, t) if t == msg_type::CERTIFICATE_VERIFY => {
+                let (algorithm, signature_der) = parse_certificate_verify(body)?;
+                let role = self.client.as_ref().expect("client role");
+                match (role.auth, role.server_verify_key.as_ref()) {
+                    (ServerAuth::InsecureSkipVerify, _) => {}
+                    (ServerAuth::PinnedSpki(_), Some(vk)) => {
+                        if algorithm != sig_scheme::ECDSA_SECP256R1_SHA256 {
+                            return Err(QuicTlsError::BadCertificateVerify);
+                        }
+                        // §4.4.3 signed content over Transcript-Hash(CH..Certificate)
+                        // — the transcript has not absorbed this CV yet.
+                        let transcript_hash = self.transcript.snapshot();
+                        let mut content = [0u8; 130];
+                        sign_content_server_cert_verify(&transcript_hash, &mut content);
+                        let signature = EcdsaSignature::from_der(signature_der)
+                            .map_err(|_| QuicTlsError::BadCertificateVerify)?;
+                        vk.verify(&content, &signature)
+                            .map_err(|_| QuicTlsError::BadCertificateVerify)?;
+                    }
+                    (ServerAuth::PinnedSpki(_), None) => return Err(QuicTlsError::Internal),
+                }
+                self.transcript.update(&msg);
+                self.client.as_mut().expect("client role").state = ClientHsState::WaitFinished;
+                Ok(true)
+            }
+            (ClientHsState::WaitFinished, t) if t == msg_type::FINISHED => {
+                let server_verify = parse_finished(body)?;
+                let (server_hs, client_hs) = {
+                    let hs = self
+                        .handshake_secrets
+                        .as_ref()
+                        .ok_or(QuicTlsError::Internal)?;
+                    (hs.server_hs, hs.client_hs)
+                };
+                let server_finished_key = derive_finished_key(&server_hs);
+                let expected = hmac_sha256(&server_finished_key, &self.transcript.snapshot());
+                if !ct_eq_32(server_verify, &expected) {
+                    return Err(QuicTlsError::BadServerFinished);
+                }
+                self.transcript.update(&msg);
+
+                // 1-RTT secrets derive from the transcript THROUGH the
+                // server Finished — the same hash our own Finished
+                // HMACs over (RFC 8446 §4.4.4).
+                let transcript_h2 = self.transcript.snapshot();
+                self.application_secrets =
+                    Some(self.schedule.enter_application(&transcript_h2));
+
+                // Client Finished → Handshake-level CRYPTO. No CCS:
+                // QUIC forbids middlebox-compat mode (RFC 9001 §8.4).
+                let client_finished_key = derive_finished_key(&client_hs);
+                let verify_data = hmac_sha256(&client_finished_key, &transcript_h2);
+                let mut fin_body = [0u8; HASH_LEN];
+                let fin_body_len = build_finished(&verify_data, &mut fin_body)
+                    .ok_or(QuicTlsError::Internal)?;
+                let mut fin_msg = [0u8; 48];
+                let fin_msg_len =
+                    encode_handshake(msg_type::FINISHED, &fin_body[..fin_body_len], &mut fin_msg)
+                        .ok_or(QuicTlsError::Internal)?;
+                self.transcript.update(&fin_msg[..fin_msg_len]);
+                self.tx_handshake.extend_from_slice(&fin_msg[..fin_msg_len]);
+
+                self.client.as_mut().expect("client role").state = ClientHsState::Established;
+                Ok(true)
+            }
+            _ => Err(QuicTlsError::UnexpectedMessage),
+        }
     }
 }
 

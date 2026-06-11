@@ -186,8 +186,13 @@ impl Connection {
     /// stream so the connection layer drains the send queue without
     /// waiting for the next inbound packet.
     pub fn flush(&mut self, config: &TlsServerConfig) -> Result<(), ConnError> {
+        // `config` was only ever threaded through to `flush_outbound`,
+        // which never used it; kept in the signature for the server-side
+        // callers (endpoint / h3). The client role uses
+        // [`client_flush`](Self::client_flush).
+        let _ = config;
         crate::diag::COUNTERS.flush_calls.bump();
-        self.flush_outbound(config)?;
+        self.flush_outbound()?;
         self.reap_finished_streams();
         Ok(())
     }
@@ -276,16 +281,16 @@ impl Connection {
     /// (frame assembly + AEAD-seal + HP add + packet build) into
     /// `flush_tx_cycles` on every path. Called from `process_datagram`,
     /// `QuicConn::send*`, and the conn-task timer.
-    pub(super) fn flush_outbound(&mut self, config: &TlsServerConfig) -> Result<(), ConnError> {
+    pub(super) fn flush_outbound(&mut self) -> Result<(), ConnError> {
         let tx_start = crate::diag::now_cycles();
-        let r = self.flush_outbound_inner(config);
+        let r = self.flush_outbound_inner();
         crate::diag::COUNTERS
             .flush_tx_cycles
             .add(crate::diag::now_cycles().wrapping_sub(tx_start));
         r
     }
 
-    fn flush_outbound_inner(&mut self, _config: &TlsServerConfig) -> Result<(), ConnError> {
+    fn flush_outbound_inner(&mut self) -> Result<(), ConnError> {
         use nic_api::MAX_L2_HEADROOM;
 
         // Make sure the peer's send-side flow-control limits are applied
@@ -941,10 +946,43 @@ impl Connection {
             });
         }
 
-        // Reserve tail = TAG_LEN bytes for the AEAD tag at the end.
         let pn_length: usize = 4;
+
+        // CLIENT role: RFC 9000 §14.1 — a client MUST expand every UDP
+        // datagram carrying an Initial packet to at least 1200 bytes.
+        // Pad the frame payload (PADDING = 0x00, AEAD-covered, inside
+        // the Length field) so even a lone Initial satisfies the floor;
+        // a coalesced Handshake packet behind it only adds. The server
+        // role never pads (its reply is bounded by anti-amplification,
+        // and §14.1's expansion rule binds the client).
+        if let Some(cs) = self.client.as_ref() {
+            let token_len = cs.initial_token.len();
+            let mut tl_tmp = [0u8; 8];
+            let token_varint_len =
+                write_varint(token_len as u64, &mut tl_tmp).map_err(|_| ConnError::Wire)?;
+            // Header bytes before the PN, assuming the padded Length
+            // lands in the 2-byte varint range (64..16383 — always
+            // true once padded; debug-asserted below).
+            let overhead = 1 + 4
+                + 1 + self.peer_cid.len()
+                + 1 + self.local_cid.len()
+                + token_varint_len + token_len
+                + 2
+                + pn_length
+                + TAG_LEN;
+            let target = 1200usize.saturating_sub(overhead);
+            if frames.len() < target {
+                frames.resize(target, 0); // PADDING frames
+            }
+        }
+
+        // Reserve tail = TAG_LEN bytes for the AEAD tag at the end.
         let payload_len = frames.len();
         let length_field = (pn_length + payload_len + TAG_LEN) as u64;
+        debug_assert!(
+            self.client.is_none() || (64..16384).contains(&length_field),
+            "padded client Initial Length {length_field} outside the 2-byte varint range",
+        );
 
         // First byte: 0xc0 | (pn_length-1).
         let first_byte: u8 = 0xc0 | ((pn_length as u8) - 1);
@@ -960,8 +998,19 @@ impl Connection {
         out.extend_from_slice(self.peer_cid.as_slice());
         out.push(self.local_cid.len() as u8);
         out.extend_from_slice(self.local_cid.as_slice());
-        // Token Length VARINT = 0.
-        out.push(0);
+        // Token Length VARINT (+ Token). Only the client role ever
+        // carries one — echoed from a Retry (RFC 9000 §17.2.2); the
+        // server's Initials always carry an empty token.
+        match self.client.as_ref() {
+            Some(cs) if !cs.initial_token.is_empty() => {
+                let mut tl = [0u8; 8];
+                let n = write_varint(cs.initial_token.len() as u64, &mut tl)
+                    .map_err(|_| ConnError::Wire)?;
+                out.extend_from_slice(&tl[..n]);
+                out.extend_from_slice(&cs.initial_token);
+            }
+            _ => out.push(0),
+        }
         // Length VARINT.
         let mut lf_buf = [0u8; 4];
         let n = write_varint(length_field, &mut lf_buf).map_err(|_| ConnError::Wire)?;
