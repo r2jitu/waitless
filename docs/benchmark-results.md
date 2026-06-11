@@ -55,7 +55,7 @@ concurrency claim is a server-side fact, not a wrk parameter.
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|
 |  1 K | **1,092,710** |    993 | 0.85 ms | 1.4 ms | 598,531 |  1,003 | 1.6 ms | 3.4 ms |
 |  2 K | **1,096,585** |  2,001 | 1.7 ms | 2.4 ms | 568,265 |  2,010 | 2.8 ms | 9.8 ms |
-|  4 K | **1,029,691** |  4,002 | 3.7 ms | 12 ms | 558,213 |  4,011 | 3.2 ms | 26 ms |
+|  4 K | **1,041,377** |  4,001 | 3.7 ms | 4.8 ms | 551,301 |  4,011 | 3.2 ms | 26 ms |
 |  8 K |   **949,083** |  8,003 | 4.6 ms | 0.52 s | 493,093 |  8,010 | 17 ms | 62 ms |
 | 16 K |   **895,804** | 16,004 | 5.1 ms | 1.6 s | 470,299 | 16,008 | 40 ms | 0.33 s |
 | 24 K |   **754,556** | 24,007 | 15 ms | 0.47 s | 454,909 | 24,007 | 62 ms | 0.80 s |
@@ -71,6 +71,48 @@ req/s and latency in that row aren't comparable (fewer, churning conns).
 Raw per-point JSONL: [`assets/bench-2026-06-11/`](assets/bench-2026-06-11/).
 Reproduce with [`scripts/bench/conn-sweep.sh`](../scripts/bench/conn-sweep.sh);
 render with [`scripts/bench/chart_sweep.py`](../scripts/bench/chart_sweep.py).
+
+Reading the 4 K row carefully: it is the one point where tokio-hyper's
+*median* beats ours, and it is closed-loop arithmetic, not service speed —
+both re-measured in isolated 60 s runs and stable. At 4 K conns Waitless
+completes 1.04 M req/s, so by Little's law each round-trip averages
+~3.8 ms with a tight distribution (p99 4.8 ms). tokio-hyper completes
+551 K req/s on the same connections — its *mean* must be ~7 ms, and its
+faster-looking 3.2 ms median is paid for by a fat tail (p99 26 ms). At
+equal load (any row where both are unsaturated) Waitless's median is
+strictly lower.
+
+### The connection ceiling
+
+How far does concurrency go before the server actually breaks? With a
+third load generator (the c3 quota caps two; the third rode the n2 quota)
+and the task arena raised to 32 K slots/worker (`0292a82`):
+**143,164 live TLS connections, serving ~700 K req/s** — and the limit at
+that point was demonstrably the *clients*, not the server: across every
+probe `pool_exhausted=0`, `spawn_failures=0`, heap at 2–3 GB of 16 GB, and
+throughput steady. Per-shot numbers in
+[`assets/bench-2026-06-11/max-conns.md`](assets/bench-2026-06-11/max-conns.md).
+
+Two client-side mechanisms bound the demonstration, both instructive:
+
+- **Loadgen ephemeral ports don't recycle against us.** Linux
+  `tcp_tw_reuse` needs TCP timestamps, which Waitless deliberately defers
+  (tcp-backlog T6) — so a loadgen that churns connections holds each port
+  in TIME_WAIT for 60 s. One of the three loadgens entered each shot with
+  a depleted pool and consistently lost ~30 K conns to connect timeouts.
+  A real fleet of clients (each its own IP) doesn't share this constraint;
+  it's also a measured argument for landing T6.
+- **Churn collides with its own orphans.** A client that abandons a slow
+  handshake and retries from a recycled port hits its *own* half-dead
+  connection on the server; RFC 5961 correctly answers with a
+  (rate-limited) challenge ACK rather than accepting the SYN — the
+  behavior that protects live connections from blind RST/SYN attacks.
+  Linux does the same; under this synthetic 3-IP herd it reads as
+  establishment slowness.
+
+The capacity math says the real ceiling is much higher: 16 GB of heap at
+~55 KB/conn supports ~290 K, and the arena now holds 262 K tasks. Finding
+it needs more client IPs than this rig has.
 
 ### What the sweep flushed out (fixed the same day)
 

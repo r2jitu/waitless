@@ -1,21 +1,27 @@
-# Waitless
+# Waitless OS
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-**Waitless is an operating system that boots straight into your app.** It is a
-Rust unikernel: there is no Linux underneath, no kernel/user split, and no
-syscalls. The NIC driver, TCP/IP, TLS 1.3, HTTP/1.1–3, and your application
-code all run in one address space, at one privilege level, driven by one
-cooperative `async` runtime. Any network service can be the machine: the
-[examples](#examples) include a web server, a SOCKS5 proxy, and an API
-gateway — each is just an `async fn` on the same OS.
+**Waitless is an async runtime that boots as the operating system — like
+tokio, but it *is* the kernel.** Your application, the TCP/IP stack, TLS 1.3,
+HTTP/1.1–3, and the NIC driver are `async fn`s polled by one per-core
+executor, in one address space, at one privilege level. There is no Linux
+underneath, no kernel/user split, no syscalls, no `epoll` — `.await` parks a
+connection for almost nothing and the core moves on to the next one. Any
+network service can be the machine: the [examples](#examples) include a web
+server, a SOCKS5 proxy, and an API gateway.
+
+> *A hobby research project — and an experiment in AI-built systems software:
+> the entire codebase was written with AI tools (Claude). Not production
+> software; see [Status](#status).*
 
 Delete the kernel boundary and two things fall out — and they're the name,
 twice over:
 
-- **Wait**less — `async fn` *is* the scheduler. A handler that waits on a
-  socket, a database, or an upstream service parks for almost nothing and the
-  core moves on. No thread pool, no syscall to block in.
+- **Wait**less — nothing ever blocks. A handler that waits on a socket, a
+  database, or an upstream service costs the core nothing while it waits —
+  no thread pool, no context switch, no syscall to block in. One core,
+  tens of thousands of parked connections.
 - **Weight**less — the whole bootable image, OS and all, is **1.5 MB** (a
   hello-world is **428 KB**). Smaller than a typical container's *base layer*,
   with nothing else inside it.
@@ -57,12 +63,10 @@ pulls furthest ahead:
 
 On Linux, an API gateway or backend-for-frontend pays the syscall tax **twice**
 per request — once to accept and answer the client, once to connect to and read
-from the upstream. Profiled at saturation, tokio-hyper spends **~61 % of its
-CPU inside the kernel** doing precisely that (`epoll`, `recv`/`send`, the
-in-kernel TCP/IP stack, a copy on every packet). Waitless has no kernel to call:
-the inbound serve and the outbound fetch are the same event loop, the same
-address space, plain function calls. The ~2× edge on a static response only
-grows when the handler does I/O of its own — there's simply more tax to delete.
+from the upstream. Waitless has no kernel to call: the inbound serve and the
+outbound fetch are the same event loop, the same address space, plain function
+calls. The [~2× edge](#performance) on a static response only grows when the
+handler does I/O of its own — there's simply more tax to delete.
 
 [`apps/socks`](apps/socks) (a generic SOCKS5 proxy) and
 [`apps/gateway`](apps/gateway) (an HTTP backend-for-frontend) are exactly that
@@ -88,11 +92,46 @@ percentiles, and methodology: [docs/benchmark-results.md](docs/benchmark-results
 **The 80,000-connection row is the story.** Under an identical patient-client
 protocol, tokio-hyper could not get past ~59,600 established connections
 (27 K connect failures); Waitless held **80,001 live TLS connections at
-~500 K req/s**. Below saturation the typical request is **4–8× faster**
+~500 K req/s**. Pushed further with a third load generator, Waitless served
+**143,164 live TLS connections at ~700 K req/s** — at which point the load
+generators ran out (client-side ports), not the server: no pool, task, or
+memory counter moved, and the capacity math (16 GB heap, ~55 KB/conn)
+supports ~290 K. Below saturation the typical request is **4–8× faster**
 end-to-end. One honest caveat: at saturation (≥16 K conns) Waitless's p99
 *tail* trails tokio-hyper's in places — queueing fairness under overload is
 Linux-mature and tracked in the [gaps](#current-gaps--limits). Plain-HTTP
 peaks at **0.86 M vs 0.63 M req/s** (≈1.4×).
+
+### Where the 2× comes from
+
+Deleting the kernel/app boundary removes the syscall *tax* — profiled at
+saturation, tokio-hyper spends **~61 % of its CPU inside the kernel**
+(`epoll`, `recv`/`send`, the in-kernel TCP stack, a copy on every packet).
+But the deeper win is that it removes the syscall *API*. POSIX forces every
+Linux server into the same shape: readiness loops, file descriptors, and a
+buffer copy each time bytes cross the kernel boundary — that interface is
+the price of safely multiplexing processes that don't trust each other. A
+unikernel runs one program, so Waitless gets to design the interface the
+hardware wants instead:
+
+- **Zero-copy, end to end.** A request arrives in a NIC RX buffer; TLS
+  decrypts it in place; the parser reads it where it lies. `recv_chunk()`
+  hands your code the transport's own buffer; `send()` takes buffers
+  straight into TCP segments. The [SOCKS relay below](#examples) moves
+  bytes between two sockets without ever copying a payload byte —
+  unwritable against a socket API, where `read(2)`/`write(2)` *are* copies.
+- **Async reaches the wire.** There is no readiness layer: the NIC queue is
+  the reactor, and a waker maps to "poll this connection on this core."
+  No wake → syscall → copy → re-arm dance per chunk of bytes.
+- **One scheduler, not two.** On Linux, tokio schedules tasks *and* the
+  kernel schedules threads; the two fight (context switches, core
+  migrations, lock handoffs). Here `async fn` is the only execution model
+  — per-core, run-to-completion, no preemption, no migration.
+
+The result is visible in the cycle budget: at saturation, Waitless spends
+its CPU on transport + TLS + HTTP work (~72 %) and async plumbing (~28 %) —
+there is no kernel line in the profile.
+[docs/benchmark-results.md](docs/benchmark-results.md) has the breakdown.
 
 **Weightless — the whole bootable system, measured:**
 
@@ -114,18 +153,25 @@ No kernel, init, libc, or base image underneath — `--gc-sections` plus
 | [`apps/gateway`](apps/gateway) | A backend-for-frontend — the handler makes an outbound HTTP request (`http::client::get`) and relays the result: "my handler calls another service." |
 | [`apps/webserver`](apps/webserver) | The full demo — HTTPS (h1.1 + h2 + h3 on one port), many routes, live `/obs` diagnostics. |
 
-Here's the heart of the SOCKS proxy — a duplex relay in one task, no threads:
+Here's the heart of the SOCKS proxy — a duplex relay in one task, no threads,
+**no copies**: each chunk is the NIC's own RX buffer, lifted to an owned
+`IOBuf` and handed to the other side's TX path.
 
 ```rust
 // After the SOCKS5 handshake dials `target`, relay both directions.
-// Each loop parks on BOTH reads; whichever fires is copied to the other side.
+// Park on BOTH reads; whichever side fires, its chunk crosses zero-copy.
 async fn relay(client: &mut TcpStream, target: &mut TcpStream) {
-    let (mut c2t, mut t2c) = ([0u8; 16 << 10], [0u8; 16 << 10]);
     loop {
-        match select(client.recv(&mut c2t), target.recv(&mut t2c)).await {
-            Either::Left(0) | Either::Right(0) => return,        // either side closed
-            Either::Left(n)  => if target.send_bytes(&c2t[..n]).await.is_err() { return },
-            Either::Right(n) => if client.send_bytes(&t2c[..n]).await.is_err() { return },
+        match select(client.recv_chunk(), target.recv_chunk()).await {
+            Either::Left(None) | Either::Right(None) => return, // either side closed
+            Either::Left(Some(chunk)) => {
+                let mut chain = IOBufChain::from(chunk.into_owned());
+                if target.send(&mut chain).await.is_err() { return }
+            }
+            Either::Right(Some(chunk)) => {
+                let mut chain = IOBufChain::from(chunk.into_owned());
+                if client.send(&mut chain).await.is_err() { return }
+            }
         }
     }
 }
@@ -327,11 +373,17 @@ the development-only client probe endpoints.
 
 ## Status
 
-A research project, not production software: enough of TCP/IP, TLS 1.3, QUIC,
-and HTTP/1.1–3 to run — and benchmark — a real web server *and* a real client,
-but the API is unstable, it's the work of a single author, and the dev
-certificate and several defaults are development-only. Issues, questions, and
-contributions welcome; the build is plain `bazel test //...`.
+A hobby research project, not production software: enough of TCP/IP, TLS 1.3,
+QUIC, and HTTP/1.1–3 to run — and benchmark — a real web server *and* a real
+client, but the API is unstable, it's the work of a single author, and the dev
+certificate and several defaults are development-only.
+
+It is also an experiment in AI-built systems software: **the entire codebase —
+kernel, drivers, network stack, crypto, tests, and these docs — was written
+with AI tools (Claude)**, with the author directing, reviewing, and measuring.
+Treat the code accordingly: benchmarked and conformance-tested, but not
+production-hardened. Issues, questions, and contributions welcome; the build
+is plain `bazel test //...`.
 
 ## License
 
