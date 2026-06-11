@@ -327,24 +327,25 @@ async fn handle_request(req: &mut Request<'_>, res: &mut Response<'_>) -> Result
         res.set(Response::ok(b"application/json", b"{\"status\":\"discarded\"}"));
         return Ok(());
     }
-    // E2E truth endpoint for the TCP client path (next-hop resolve →
-    // ARP → SYN → first bytes). Prefix match: the target rides in the
-    // query string, `/connect-probe?ip=A.B.C.D&port=N`. Async (it
-    // awaits a connect with a deadline), so it can't sit inside the
-    // sync `match` below.
+    // E2E truth endpoints for the CLIENT path (`/connect-probe`,
+    // `/fetch-probe`). These dial an arbitrary caller-supplied ip:port —
+    // an SSRF-shaped outbound-fetch affordance — so they exist ONLY in
+    // dev/bench/GCE-validation builds and are compiled out of the
+    // hardened `tls_cert=prod` deploy (see the `probe_endpoints` cfg in
+    // BUILD.bazel). `/connect-probe?ip=A.B.C.D&port=N` proves the raw
+    // TCP path; `/fetch-probe?ip=…&port=…[&path=/x][&tls=0|1][&pin=hex64]
+    // [&proto=h1|h2|h3]` proves the real HTTP client. Both async (they
+    // await a connect with a deadline), so they sit before the sync
+    // `match` below. `/fetch-probe` is boxed: its future stacks a whole
+    // client connection (TLS pump + parser + body reader), which would
+    // bloat every handler invocation's state machine if left inline.
+    #[cfg(probe_endpoints)]
     if let Some(query) = req.path().strip_prefix(b"/connect-probe") {
         let probe = connect_probe_response(query).await;
         res.set(probe);
         return Ok(());
     }
-    // The h1-CLIENT truth endpoint: a real fetch (request writer →
-    // response parser → body framing) over plain TCP or client TLS.
-    // `/fetch-probe?ip=A.B.C.D&port=N[&path=/x][&tls=0|1][&pin=hex64]`.
-    // Boxed: the fetch future stacks a whole client connection
-    // (TLS client state pump + parser + body reader) — keeping it
-    // inline would bloat EVERY handler invocation's state machine
-    // (and the stack temporaries that build it) for the sake of a
-    // cold dev probe. `Box::pin` confines that to the probe path.
+    #[cfg(probe_endpoints)]
     if let Some(query) = req.path().strip_prefix(b"/fetch-probe") {
         let probe = alloc::boxed::Box::pin(fetch_probe_response(query)).await;
         res.set(probe);

@@ -66,6 +66,17 @@ rust_library(
         ":tls_leaf",
     ],
     crate_root = "src/main.rs",
+    # The `/connect-probe` + `/fetch-probe` client-path E2E endpoints are
+    # an outbound-fetch (SSRF-shaped) affordance — fine for dev/bench/GCE
+    # validation (which run the dev cert), but they must NOT exist on the
+    # hardened public deploy. Gate on the SAME switch as the cert: the
+    # `tls_cert=prod` build compiles them out entirely; every other build
+    # (dev cert) keeps them. Dev affordances and the dev cert travel
+    # together; production carries neither.
+    rustc_flags = select({
+        ":prod_tls_cert": [],
+        "//conditions:default": ["--cfg=probe_endpoints"],
+    }),
     # `main.rs` `include_bytes!`s the TLS cert material from these
     # paths. `$(execpath ...)` resolves the selected `dev_certs/` or
     # `prod_certs/` file to an exec-root-relative path, which rustc

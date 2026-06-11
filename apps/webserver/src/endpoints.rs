@@ -464,16 +464,20 @@ pub(crate) fn tls_profile_response() -> Response<'static> {
 /// HTTP/1.0 request (no keep-alive, so a well-behaved peer closes
 /// after the response and the probe's single read sees data or EOF
 /// promptly).
+#[cfg(probe_endpoints)]
 const PROBE_REQUEST: &[u8] = b"GET / HTTP/1.0\r\nHost: probe\r\n\r\n";
 /// Overall probe deadline — resolve + connect + send + first read.
 /// Just past the resolver's own 3×1 s solicitation budget, so an ARP
 /// timeout reports as the more specific `resolve` stage instead of
 /// racing this deadline to a tie.
+#[cfg(probe_endpoints)]
 const PROBE_DEADLINE_US: u64 = 4_000_000;
 /// First-bytes capture cap.
+#[cfg(probe_endpoints)]
 const PROBE_READ_MAX: usize = 256;
 
 /// Which client-path stage a probe failed at.
+#[cfg(probe_endpoints)]
 enum ProbeFailure {
     Resolve(&'static str),
     Connect(&'static str),
@@ -484,6 +488,7 @@ enum ProbeFailure {
 /// response bytes into `buf` — one `recv`, so the probe never hangs
 /// on a peer that answers and then keeps the conn open. `Ok(0)`
 /// means connected-then-EOF, which still proves the handshake.
+#[cfg(probe_endpoints)]
 async fn probe_target(
     ip: waitless::runtime::IpAddr,
     port: u16,
@@ -507,6 +512,7 @@ async fn probe_target(
 /// Escape `bytes` into `w`: printable ASCII passes through,
 /// backslash doubles, everything else renders `\xHH`. Output is
 /// bounded at 4× the input (and the input at [`PROBE_READ_MAX`]).
+#[cfg(probe_endpoints)]
 fn write_escaped(w: &mut impl core::fmt::Write, bytes: &[u8]) {
     for &b in bytes {
         match b {
@@ -526,6 +532,7 @@ fn write_escaped(w: &mut impl core::fmt::Write, bytes: &[u8]) {
 /// Bounded ASCII-decimal parse, rejecting empty / non-digit /
 /// overflowing input. Shared by the octet (`max=255`) and port
 /// (`max=65535`) fields.
+#[cfg(probe_endpoints)]
 fn parse_decimal(s: &[u8], max: u32) -> Option<u32> {
     if s.is_empty() || s.len() > 5 {
         return None;
@@ -546,6 +553,7 @@ fn parse_decimal(s: &[u8], max: u32) -> Option<u32> {
 /// Parse a dotted-quad `A.B.C.D` into octets. `None` on any
 /// missing/malformed/extra part. Shared by `/connect-probe` and
 /// `/fetch-probe`.
+#[cfg(probe_endpoints)]
 fn parse_ipv4(v: &[u8]) -> Option<[u8; 4]> {
     let mut out = [0u8; 4];
     let mut parts = v.split(|&b| b == b'.');
@@ -557,6 +565,7 @@ fn parse_ipv4(v: &[u8]) -> Option<[u8; 4]> {
 
 /// Parse `?ip=A.B.C.D&port=N` (fields in either order; unknown keys
 /// ignored). `None` on any missing/malformed field or port 0.
+#[cfg(probe_endpoints)]
 fn parse_probe_query(query: &[u8]) -> Option<(waitless::runtime::IpAddr, u16)> {
     let query = query.strip_prefix(b"?")?;
     let mut octets: Option<[u8; 4]> = None;
@@ -584,6 +593,7 @@ fn parse_probe_query(query: &[u8]) -> Option<(waitless::runtime::IpAddr, u16)> {
 /// stage (`resolve` / `connect` / `io` / `deadline`) otherwise.
 /// Dev-grade but bounded: one 256-byte read, a ~1 KiB response
 /// buffer, and a ~4 s overall deadline.
+#[cfg(probe_endpoints)]
 pub(crate) async fn connect_probe_response(query: &[u8]) -> Response<'static> {
     let Some((ip, port)) = parse_probe_query(query) else {
         let mut res = Response::ok(
@@ -639,13 +649,17 @@ pub(crate) async fn connect_probe_response(query: &[u8]) -> Response<'static> {
 // (`resolve` / `connect` / `tls` / `h2` / `parse` / `io` / `deadline`).
 
 /// Body cap for the probe fetch.
+#[cfg(probe_endpoints)]
 const FETCH_BODY_CAP: usize = 256 * 1024;
 /// Overall fetch deadline — connect (incl. the 3 s ARP budget) +
 /// handshake + transfer of up to 256 KiB.
+#[cfg(probe_endpoints)]
 const FETCH_DEADLINE_US: u64 = 8_000_000;
 /// Cap on the probed path length.
+#[cfg(probe_endpoints)]
 const FETCH_PATH_MAX: usize = 128;
 
+#[cfg(probe_endpoints)]
 struct FetchProbeQuery {
     ip: waitless::runtime::IpAddr,
     port: u16,
@@ -661,12 +675,14 @@ struct FetchProbeQuery {
     pin: Option<[u8; 32]>,
 }
 
+#[cfg(probe_endpoints)]
 impl FetchProbeQuery {
     fn path(&self) -> &[u8] {
         &self.path_buf[..self.path_len]
     }
 }
 
+#[cfg(probe_endpoints)]
 fn hex_nibble(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -677,6 +693,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
 }
 
 /// Parse a 64-hex-char SPKI pin into 32 bytes.
+#[cfg(probe_endpoints)]
 fn parse_hex32(s: &[u8]) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
@@ -691,6 +708,7 @@ fn parse_hex32(s: &[u8]) -> Option<[u8; 32]> {
 /// Parse `?ip=A.B.C.D&port=N[&path=/x][&tls=0|1][&pin=hex64][&proto=h1|h2|h3]`.
 /// `path` defaults to `/` and must be origin-form (leading `/`); no
 /// percent-decoding (dev probe). `None` on any malformed field.
+#[cfg(probe_endpoints)]
 fn parse_fetch_query(query: &[u8]) -> Option<FetchProbeQuery> {
     let query = query.strip_prefix(b"?")?;
     let mut octets: Option<[u8; 4]> = None;
@@ -746,6 +764,7 @@ fn parse_fetch_query(query: &[u8]) -> Option<FetchProbeQuery> {
 
 /// Map a connect error to the probe stage name (`resolve` covers the
 /// pre-connect routing/ARP half, like `/connect-probe`).
+#[cfg(probe_endpoints)]
 fn connect_stage(e: &waitless::runtime::TcpConnectError) -> &'static str {
     use waitless::runtime::TcpConnectError as E;
     match e {
@@ -754,6 +773,7 @@ fn connect_stage(e: &waitless::runtime::TcpConnectError) -> &'static str {
     }
 }
 
+#[cfg(probe_endpoints)]
 fn fetch_stage(e: &http::client::FetchError) -> &'static str {
     use http::client::FetchError as F;
     match e {
@@ -762,6 +782,7 @@ fn fetch_stage(e: &http::client::FetchError) -> &'static str {
     }
 }
 
+#[cfg(probe_endpoints)]
 fn body_stage(e: &http::client::BodyError) -> &'static str {
     use http::client::BodyError as B;
     match e {
@@ -772,6 +793,7 @@ fn body_stage(e: &http::client::BodyError) -> &'static str {
 
 /// Run the fetch: `(status, body_len, sha256)` on success, or the
 /// failing `(stage, detail)` pair.
+#[cfg(probe_endpoints)]
 async fn run_fetch(
     q: &FetchProbeQuery,
 ) -> Result<(u16, usize, [u8; 32]), (&'static str, alloc::string::String)> {
@@ -849,6 +871,7 @@ async fn run_fetch(
 /// client (TLS implied). `200` with
 /// `status=<code> bytes=<n> sha256=<hex16-prefix>` of the (≤ 256 KiB)
 /// body, or `502` naming the failing stage.
+#[cfg(probe_endpoints)]
 pub(crate) async fn fetch_probe_response(query: &[u8]) -> Response<'static> {
     let Some(q) = parse_fetch_query(query) else {
         let mut res = Response::ok(
