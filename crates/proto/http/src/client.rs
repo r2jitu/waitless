@@ -1,5 +1,7 @@
 // HTTP/1.1 CLIENT — response parsing, body framing, request writing,
-// and the transport-generic `http1_fetch` entry point.
+// and the transport-generic `fetch` entry point. (Verb naming —
+// `get` vs `fetch` — is the repo-wide client convention documented at
+// `https::client`'s module head.)
 //
 // The mirror of the server side: where `streaming.rs` parses request
 // HEADs and `response.rs` serialises responses, this module parses
@@ -80,8 +82,8 @@ pub struct ResponseHead {
     /// `true` for `HTTP/1.0` (close-by-default), `false` for `HTTP/1.1`.
     http10: bool,
     /// Heap-boxed: the 32-slot table is ~11 KiB, and a `ResponseHead`
-    /// is held across awaits by every fetch future (`http1_fetch` →
-    /// `http_get` / `https_get_h1` → their callers). Inline it would
+    /// is held across awaits by every fetch future (`fetch` →
+    /// `get` / `https::client::get_h1` → their callers). Inline it would
     /// inflate each of those async state machines by ~11 KiB *per
     /// layer* — and futures materialise on the STACK before being
     /// moved into their parent state / `Box::pin`, so a deep client
@@ -894,7 +896,7 @@ pub enum BodyFraming {
 }
 
 /// Derive the body framing from a parsed head. 1xx interim responses
-/// are the caller's problem ([`http1_fetch`] rejects them before
+/// are the caller's problem ([`fetch`] rejects them before
 /// asking).
 pub fn body_framing(head: &ResponseHead) -> BodyFraming {
     if head.status == 204 || head.status == 304 {
@@ -1152,7 +1154,7 @@ pub fn serialize_request(req: &FetchRequest<'_>) -> IOBuf {
 }
 
 // ============================================================================
-// http1_fetch — the transport-generic request/response exchange
+// fetch — the transport-generic request/response exchange
 // ============================================================================
 
 /// Why a fetch failed before (or at) the response head.
@@ -1176,7 +1178,7 @@ pub enum FetchError {
 /// On success returns the parsed [`ResponseHead`] plus a
 /// [`ClientBodyReader`] positioned at the first body byte (any body
 /// bytes that rode in with the head are carried as its prebuf).
-pub async fn http1_fetch<'s, S: HttpStream>(
+pub async fn fetch<'s, S: HttpStream>(
     stream: &'s mut S,
     req: &FetchRequest<'_>,
 ) -> Result<(ResponseHead, ClientBodyReader<'s, S>), FetchError> {
@@ -1214,7 +1216,7 @@ pub async fn http1_fetch<'s, S: HttpStream>(
 // Convenience getters
 // ============================================================================
 
-/// Failure stage of [`http_get`] — keeps the underlying error so a
+/// Failure stage of [`get`] — keeps the underlying error so a
 /// caller (e.g. a probe endpoint) can name the failing stage.
 #[derive(Debug)]
 pub enum GetError {
@@ -1230,7 +1232,7 @@ pub enum GetError {
 /// One-shot plain-HTTP GET: connect, fetch, read the body into a
 /// bounded `Vec` (≤ `body_cap`), `Connection: close`. No URL parsing,
 /// no redirects (v1 — documented above).
-pub async fn http_get(
+pub async fn get(
     ip: waitless::runtime::IpAddr,
     port: u16,
     host: &[u8],
@@ -1242,7 +1244,7 @@ pub async fn http_get(
         .map_err(GetError::Connect)?;
     let mut req = FetchRequest::get(host, path);
     req.close = true;
-    let (head, mut body) = http1_fetch(&mut stream, &req)
+    let (head, mut body) = fetch(&mut stream, &req)
         .await
         .map_err(GetError::Fetch)?;
     let bytes = body.read_to_vec(body_cap).await.map_err(GetError::Body)?;
@@ -1919,10 +1921,10 @@ mod body_reader_tests {
         assert_eq!(block_on(r.read_to_vec(50)).unwrap_err(), BodyError::TooLarge);
     }
 
-    /// End-to-end over the mock transport: http1_fetch sends the
+    /// End-to-end over the mock transport: fetch sends the
     /// request and parses head + body off pre-canned wire bytes.
     #[test]
-    fn http1_fetch_end_to_end_over_mock() {
+    fn fetch_end_to_end_over_mock() {
         let (mut s, sent) = mock(alloc::vec![
             Some(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nX-Tag: t\r\n\r\nhello".to_vec()),
             Some(b" world".to_vec()),
@@ -1930,7 +1932,7 @@ mod body_reader_tests {
         ]);
         let out = block_on(async {
             let req = FetchRequest::get(b"unit.test", b"/hello");
-            let (head, mut body) = http1_fetch(&mut s, &req).await.unwrap();
+            let (head, mut body) = fetch(&mut s, &req).await.unwrap();
             assert_eq!(head.status, 200);
             assert_eq!(head.header(b"x-tag"), Some(b"t".as_slice()));
             body.read_to_vec(64).await.unwrap()
@@ -1942,7 +1944,7 @@ mod body_reader_tests {
 
     /// Head split across transport chunks, body chunked.
     #[test]
-    fn http1_fetch_split_head_then_chunked_body() {
+    fn fetch_split_head_then_chunked_body() {
         let (mut s, _) = mock(alloc::vec![
             Some(b"HTTP/1.1 200".to_vec()),
             Some(b" OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWi".to_vec()),
@@ -1951,7 +1953,7 @@ mod body_reader_tests {
         ]);
         let out = block_on(async {
             let req = FetchRequest::get(b"unit.test", b"/c");
-            let (head, mut body) = http1_fetch(&mut s, &req).await.unwrap();
+            let (head, mut body) = fetch(&mut s, &req).await.unwrap();
             assert!(head.transfer_encoding_chunked());
             body.read_to_vec(64).await.unwrap()
         });
@@ -1959,25 +1961,25 @@ mod body_reader_tests {
     }
 
     #[test]
-    fn http1_fetch_rejects_interim_and_garbage() {
+    fn fetch_rejects_interim_and_garbage() {
         let (mut s, _) = mock(alloc::vec![
             Some(b"HTTP/1.1 100 Continue\r\n\r\n".to_vec()),
             None,
         ]);
         let err = block_on(async {
-            http1_fetch(&mut s, &FetchRequest::get(b"h", b"/")).await.err()
+            fetch(&mut s, &FetchRequest::get(b"h", b"/")).await.err()
         });
         assert!(matches!(err, Some(FetchError::Interim)));
 
         let (mut s, _) = mock(alloc::vec![Some(b"SSH-2.0-OpenSSH\r\n".to_vec()), None]);
         let err = block_on(async {
-            http1_fetch(&mut s, &FetchRequest::get(b"h", b"/")).await.err()
+            fetch(&mut s, &FetchRequest::get(b"h", b"/")).await.err()
         });
         assert!(matches!(err, Some(FetchError::Parse(_))));
 
         let (mut s, _) = mock(alloc::vec![None]);
         let err = block_on(async {
-            http1_fetch(&mut s, &FetchRequest::get(b"h", b"/")).await.err()
+            fetch(&mut s, &FetchRequest::get(b"h", b"/")).await.err()
         });
         assert!(matches!(err, Some(FetchError::ClosedBeforeResponse)));
     }

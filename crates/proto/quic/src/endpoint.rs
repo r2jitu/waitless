@@ -225,7 +225,7 @@ fn flush_to_wire(
 /// limit; bounded ultimately by heap (each live conn's TLS + buffers).
 pub const SLOTS_PER_WORKER: usize = 8192;
 
-/// Errors from `quic_listen` — mirrors `udp_listen`'s error
+/// Errors from `listen` — mirrors `udp_listen`'s error
 /// surface so the call site looks the same.
 #[derive(Debug)]
 pub enum QuicListenError {
@@ -235,7 +235,7 @@ pub enum QuicListenError {
     CertOrKey,
 }
 
-/// Handle returned by `quic_listen`. Drops the listener (and all
+/// Handle returned by `listen`. Drops the listener (and all
 /// active connections) when this falls out of scope. Same pattern
 /// as `waitless::runtime::UdpHandle` / `TcpHandle`.
 pub struct QuicListener {
@@ -568,7 +568,7 @@ impl QuicConn {
 /// with a per-worker body. Each worker gets its own `SlotTable` and
 /// its own listener loop; QUIC connections stay pinned to the
 /// worker that received their first Initial.
-pub fn quic_listen<H, F>(
+pub fn listen<H, F>(
     port: u16,
     cert_chain: &'static [&'static [u8]],
     key_pkcs8_der: &'static [u8],

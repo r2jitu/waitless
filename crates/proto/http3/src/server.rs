@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 
-use quic::{QuicConn, QuicListenError, quic_listen};
+use quic::{QuicConn, QuicListenError};
 
 use http::{BodyReader, BodySource, IOBuf, Method, Request, RequestHead, Response, ResponseSink};
 
@@ -143,7 +143,7 @@ where
     quic::preinit();
 
     let handler = Arc::new(handler);
-    let listener = quic_listen(port, cert_chain, key_pkcs8_der, move |conn: QuicConn| {
+    let listener = quic::listen(port, cert_chain, key_pkcs8_der, move |conn: QuicConn| {
         let handler = Arc::clone(&handler);
         async move {
             handle_conn(conn, handler).await;

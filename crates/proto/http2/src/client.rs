@@ -2,8 +2,9 @@
 //
 // The client mirror of `server.rs`: where `serve_conn` answers requests,
 // [`H2ClientConn`] issues them — over any `http::HttpStream` (typically
-// the [`TlsClientStream`] from `connect.rs` after ALPN selected "h2",
-// which is how this crate's own `listen` is dialled). Same frame codec
+// an `https::client::TlsClientStream` after ALPN selected "h2", which
+// is how `https::client::get` dials this crate's own `listen`). Same
+// frame codec
 // (`frame.rs`), same HPACK pair (`hpack.rs` — the stateful `Decoder` for
 // the server's response blocks, the stateless `encode_header_list` for
 // our request blocks), opposite side of the wire:
@@ -28,7 +29,7 @@
 //     an error: the send loop **waits**, processing inbound frames
 //     (WINDOW_UPDATE / early response) until the window opens. The
 //     caller owns the deadline (`timeout_us`), like `tcp_connect` /
-//     `tls_client_handshake`.
+//     `https::client::handshake`.
 //   * Response trailers are decoded (HPACK table sync) and DISCARDED;
 //     1xx interim responses are skipped; `content-length` is not
 //     cross-checked against the body (END_STREAM delimits it).
@@ -38,9 +39,7 @@
 use alloc::vec::Vec;
 
 use http::{HttpStream, IOBuf, IOBufChain};
-use tls::client::{ServerAuth, TlsClientConfig};
 
-use crate::connect::{ALPN_H2, TlsClientError, tls_client_handshake};
 use crate::frame::{self, FrameHeader, error, flags, ftype, settings_id};
 use crate::hpack::{self, FieldSink, HpackError};
 use crate::server::{data_payload, headers_fragment};
@@ -144,7 +143,7 @@ impl H2Response {
 
 /// One client-role HTTP/2 connection over `S`. Construct via
 /// [`H2ClientConn::connect`]; issue requests with [`H2ClientConn::request`]
-/// (or the [`h2_fetch`] facade); requests are sequential (v1 — see the
+/// (or the [`fetch`] facade); requests are sequential (v1 — see the
 /// module comment).
 pub struct H2ClientConn<S: HttpStream> {
     stream: S,
@@ -260,7 +259,8 @@ enum ReadErr {
 
 impl<S: HttpStream> H2ClientConn<S> {
     /// Open an HTTP/2 connection over an established byte stream
-    /// (typically a `TlsClientStream` whose ALPN selected "h2"): send
+    /// (typically an `https::client::TlsClientStream` whose ALPN
+    /// selected "h2"): send
     /// the client connection preface + our SETTINGS, read + apply the
     /// server's SETTINGS (its mandatory first frame, RFC 9113 §3.4),
     /// and ACK it. The caller owns deadline policy (`timeout_us`).
@@ -1079,7 +1079,7 @@ impl FieldSink for NullSink {
 }
 
 // ============================================================================
-// h2_fetch — the single-shot request facade
+// fetch — the single-shot request facade
 // ============================================================================
 
 /// One request/response exchange on an established [`H2ClientConn`],
@@ -1088,91 +1088,13 @@ impl FieldSink for NullSink {
 /// and `close` is ignored (h2 winds down via GOAWAY — call
 /// [`H2ClientConn::close`]). Call repeatedly for sequential requests on
 /// one connection.
-pub async fn h2_fetch<S: HttpStream>(
+pub async fn fetch<S: HttpStream>(
     conn: &mut H2ClientConn<S>,
     req: &http::client::FetchRequest<'_>,
     body_cap: usize,
 ) -> Result<H2Response, H2ClientError> {
     conn.request(req.method, b"https", req.host, req.path, req.headers, req.body, body_cap)
         .await
-}
-
-// ============================================================================
-// https_get — ALPN-dispatching HTTPS GET (h2 with h1.1 fallback)
-// ============================================================================
-
-/// Failure stage of [`https_get`] — [`crate::HttpsGetH1Error`] plus the
-/// h2 arm.
-#[derive(Debug)]
-pub enum HttpsGetError {
-    /// TCP connect failed.
-    Connect(waitless::runtime::TcpConnectError),
-    /// TLS handshake failed.
-    Tls(TlsClientError),
-    /// The h2 exchange failed (connect/request).
-    H2(H2ClientError),
-    /// The h1.1 request/response exchange failed.
-    Fetch(http::client::FetchError),
-    /// The h1.1 body read failed.
-    Body(http::client::BodyError),
-}
-
-/// Naming convention (repo-wide): `*_get` = ONE-SHOT — connect + TLS +
-/// request + bounded body read; `*_fetch` (`http1_fetch` / `h2_fetch` /
-/// `h3_fetch`) = a request over an ALREADY-ESTABLISHED conn/stream.
-/// This is the negotiated one-shot; [`crate::https_get_h1`] pins
-/// ALPN to http/1.1 (and can return the typed h1 response head).
-///
-/// One-shot HTTPS GET offering ALPN ["h2", "http/1.1"] and dispatching
-/// on what the server selected: h2 → [`H2ClientConn`]; http/1.1 (or no
-/// ALPN) → the existing h1 path — the client mirror of `listen.rs`'s
-/// serve dispatch. Returns `(status, body)` (the protocol-specific
-/// heads differ; callers needing headers use the layered APIs). Same
-/// v1 scope as [`crate::https_get_h1`]: no URL parsing/redirects/SNI, the
-/// caller owns the deadline.
-pub async fn https_get(
-    ip: waitless::runtime::IpAddr,
-    port: u16,
-    host: &[u8],
-    path: &[u8],
-    auth: ServerAuth,
-    seed: [u8; 32],
-    body_cap: usize,
-) -> Result<(u16, Vec<u8>), HttpsGetError> {
-    let tcp = waitless::tcp_connect(ip, port)
-        .await
-        .map_err(HttpsGetError::Connect)?;
-    let config = TlsClientConfig {
-        auth,
-        server_name: None,
-        alpn: ALPN_H2,
-    };
-    let mut stream = tls_client_handshake(tcp, seed, config)
-        .await
-        .map_err(HttpsGetError::Tls)?;
-    if stream.negotiated_alpn() == Some(&b"h2"[..]) {
-        let mut conn = H2ClientConn::connect(stream)
-            .await
-            .map_err(HttpsGetError::H2)?;
-        let req = http::client::FetchRequest::get(host, path);
-        let resp = h2_fetch(&mut conn, &req, body_cap)
-            .await
-            .map_err(HttpsGetError::H2)?;
-        conn.close().await;
-        Ok((resp.status, resp.body))
-    } else {
-        let mut req = http::client::FetchRequest::get(host, path);
-        req.close = true;
-        let (head, mut body) = http::client::http1_fetch(&mut stream, &req)
-            .await
-            .map_err(HttpsGetError::Fetch)?;
-        let bytes = body
-            .read_to_vec(body_cap)
-            .await
-            .map_err(HttpsGetError::Body)?;
-        let _ = stream.close().await;
-        Ok((head.status, bytes))
-    }
 }
 
 // ============================================================================
@@ -1195,7 +1117,7 @@ mod tests {
     use core::task::{Context, Poll};
     use iobuf::RecvChunkGuard;
 
-    use crate::connect::loopback_tests::noop_waker;
+    use https::test_pipe::noop_waker;
 
     // ---- Scripted stream + driver -------------------------------------------
 
@@ -1779,11 +1701,12 @@ mod tests {
 }
 
 /// THE h2 loopback: the REAL `H2ClientConn` over the REAL
-/// `TlsClientStream` (ALPN ["h2","http/1.1"] → "h2") against the REAL
-/// `http2::serve_conn` + `TlsServer` over the in-memory pipe — the h2
-/// sibling of `connect.rs`'s h1 loopback, sharing its harness. The
-/// driver additionally ticks the executor so the server's spawned
-/// per-stream handler tasks (bodied requests) run.
+/// `https::client::TlsClientStream` (ALPN ["h2","http/1.1"] → "h2")
+/// against the REAL `http2::serve_conn` + `TlsServer` over the
+/// in-memory pipe — the h2 sibling of `https`'s h1 loopback, sharing
+/// its `https::test_pipe` harness. The driver additionally ticks the
+/// executor so the server's spawned per-stream handler tasks (bodied
+/// requests) run.
 #[cfg(test)]
 mod loopback_tests {
     use super::*;
@@ -1794,7 +1717,8 @@ mod loopback_tests {
     use http::{Request, Response};
     use tls::server::AlpnProtocol;
 
-    use crate::connect::loopback_tests::{
+    use https::client::{ALPN_H2, handshake};
+    use https::test_pipe::{
         ServerTlsPipe, loopback_gate, noop_waker, pinned_config_alpn, pipe_pair,
     };
 
@@ -1875,14 +1799,14 @@ mod loopback_tests {
 
         let client = async move {
             let stream =
-                tls_client_handshake(client_pipe, [0xA1; 32], pinned_config_alpn(ALPN_H2))
+                handshake(client_pipe, [0xA1; 32], pinned_config_alpn(ALPN_H2))
                     .await
                     .expect("client handshake");
             assert_eq!(stream.negotiated_alpn(), Some(&b"h2"[..]), "server selects h2");
             let mut conn = H2ClientConn::connect(stream).await.expect("h2 connect");
             let req = FetchRequest::get(b"loopback.test", b"/hello");
             for _ in 0..2 {
-                let resp = h2_fetch(&mut conn, &req, 4096).await.expect("fetch");
+                let resp = fetch(&mut conn, &req, 4096).await.expect("fetch");
                 assert_eq!(resp.status, 200);
                 assert_eq!(resp.body, HELLO_BODY, "byte-exact across TLS + h2 framing");
                 assert_eq!(resp.header(b"content-type"), Some(&b"text/plain"[..]));
@@ -1916,7 +1840,7 @@ mod loopback_tests {
         let expect = payload.clone();
         let client = async move {
             let stream =
-                tls_client_handshake(client_pipe, [0xC3; 32], pinned_config_alpn(ALPN_H2))
+                handshake(client_pipe, [0xC3; 32], pinned_config_alpn(ALPN_H2))
                     .await
                     .expect("client handshake");
             assert_eq!(stream.negotiated_alpn(), Some(&b"h2"[..]));
@@ -1924,7 +1848,7 @@ mod loopback_tests {
             let mut req = FetchRequest::get(b"loopback.test", b"/echo");
             req.method = b"POST";
             req.body = Some(&payload);
-            let resp = h2_fetch(&mut conn, &req, 256 * 1024).await.expect("post");
+            let resp = fetch(&mut conn, &req, 256 * 1024).await.expect("post");
             assert_eq!(resp.status, 200);
             assert_eq!(resp.body.len(), expect.len());
             assert_eq!(resp.body, expect, "byte-exact echo through both flow-control sides");

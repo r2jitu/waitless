@@ -33,13 +33,13 @@
 //   endpoint.rs  UDP endpoint task. Receives datagrams, decodes
 //                  DCID, routes to the right conn task via slot-
 //                  encoded DCID lookup. Spawns one task per
-//                  connection. (`QuicListener`, `quic_listen`).
+//                  connection. (`QuicListener`, `listen`).
 //                  Future: `connect()` for the QUIC client role
 //                  lives in this same module — the endpoint owns
 //                  the UDP socket + slot table for both directions.
 //
 // Public API (re-exported through this crate's root):
-//   * `quic_listen(port, cert, key, handler)` — bind a UDP port,
+//   * `listen(port, cert, key, handler)` — bind a UDP port,
 //     terminate QUIC connections, dispatch each new connection
 //     to `handler` running as `async fn(QuicConn) -> ()`.
 //   * `QuicConn` — handle the handler receives.
@@ -68,11 +68,11 @@ pub mod tls;
 pub mod transport_params;
 pub mod wire;
 
-pub use client_endpoint::{QuicClientConn, QuicConnectError, quic_connect};
+pub use client_endpoint::{QuicClientConn, QuicConnectError, connect};
 pub use conn::{ConnError, ConnState, Connection, ConnectionId, SERVER_CID_LEN};
 #[doc(hidden)]
 pub use nic_api::MAX_L2_HEADROOM;
-pub use endpoint::{QuicConn, QuicListenError, QuicListener, quic_listen};
+pub use endpoint::{QuicConn, QuicListenError, QuicListener, listen};
 pub use inbox::ConnInbox;
 pub use tls::{CryptoLevel, QuicTls, QuicTlsError, QuicTlsState};
 

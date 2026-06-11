@@ -44,7 +44,7 @@ pub mod qpack;
 pub mod server;
 pub mod static_table;
 
-pub use client::{H3ClientConn, H3ClientError, H3FetchError, H3Response, h3_connect, h3_fetch, h3_get};
+pub use client::{H3ClientConn, H3ClientError, H3Response};
 pub use server::{ListenError, listen};
 
 /// HTTP/3 application error codes (RFC 9114 §8.1) — carried in

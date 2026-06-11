@@ -42,13 +42,13 @@ use crate::conn::{ConnError, ConnState, Connection, DatagramBuf};
 use crate::endpoint::ConnArena;
 use tls::TlsClientConfig;
 
-/// Handshake deadline for [`quic_connect`]: generous against a real
+/// Handshake deadline for [`connect`]: generous against a real
 /// RTT + a couple of PTO-driven retransmits, comfortably under the
 /// probe endpoints' overall 8 s budget so a dead peer surfaces as a
 /// named stage rather than the outer deadline.
 const CONNECT_DEADLINE_US: u64 = 4_000_000;
 
-/// Why [`quic_connect`] failed.
+/// Why [`connect`] failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuicConnectError {
     /// No ephemeral UDP port / backend bind failure.
@@ -83,7 +83,7 @@ pub struct QuicClientConn {
 /// `config` (SPKI pin / SNI / ALPN), spawn the conn task, and drive
 /// the handshake to Established with a deadline. Entropy arrives by
 /// value (`seed`), like every client this stack originates.
-pub async fn quic_connect(
+pub async fn connect(
     ip: IpAddr,
     port: u16,
     config: &TlsClientConfig,

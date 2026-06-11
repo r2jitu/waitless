@@ -17,7 +17,6 @@ rust_library(
     name = "http2",
     srcs = [
         "src/client.rs",
-        "src/connect.rs",
         "src/diag.rs",
         "src/frame.rs",
         "src/hpack.rs",
@@ -25,12 +24,6 @@ rust_library(
         "src/listen.rs",
         "src/server.rs",
         "src/static_table.rs",
-    ],
-    compile_data = [
-        # connect.rs's loopback tests pin against the dev cert (same
-        # include_bytes! pattern as //crates/proto/tls's client tests).
-        "//apps/webserver/dev_certs:dev_cert.der",
-        "//apps/webserver/dev_certs:dev_key.der",
     ],
     crate_name = "http2",
     deps = [
@@ -51,8 +44,12 @@ rust_test(
     name = "http2_test",
     size = "small",
     crate = ":http2",
-    # Test-only: the connect.rs loopback drives the REAL
-    # `http::serve_conn`, whose idle `timeout_us` schedules a timer —
-    # the test calls `executor::init(1)` so the wheel exists off-VM.
-    deps = ["//crates/runtime/executor"],
+    # Test-only: client.rs's h2 loopbacks ride the shared TLS pipe
+    # harness in `https::test_pipe` (NOT a cycle — https deps the
+    # http2 LIB; only this test BINARY deps https) and tick the
+    # executor to drive the server's spawned per-stream handlers.
+    deps = [
+        "//crates/proto/https",
+        "//crates/runtime/executor",
+    ],
 )

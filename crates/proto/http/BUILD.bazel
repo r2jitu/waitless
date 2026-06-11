@@ -7,8 +7,8 @@ package(default_visibility = ["//visibility:public"])
 # `//crates/proto/tls` implements — keeps the HTTP path TLS-unaware so apps
 # without `tls` link zero TLS / crypto code. The client half
 # (`src/client.rs`: response parser, chunked decoder, request writer,
-# `http1_fetch`) is transport-generic over `HttpStream`; the TLS client
-# stream that feeds it lives in //crates/proto/http2 (`connect.rs`).
+# `fetch`) is transport-generic over `HttpStream`; the TLS client
+# stream that feeds it lives in //crates/proto/https (`client.rs`).
 rust_library(
     name = "http",
     srcs = [

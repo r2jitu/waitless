@@ -1,25 +1,39 @@
-// crates/proto/http2/src/connect.rs — the client-side TLS stream.
+// crates/proto/https/src/client.rs — the client-side HTTPS layer.
 //
-// The outbound mirror of `listen.rs`: where `listen` wraps an accepted
-// `TcpStream` in a server-role `TlsStream`, `tls_client_handshake`
-// wraps a *connected* stream in a client-role [`TlsClientStream`] —
+// The outbound mirror of `serve`: where the facade's server half
+// composes the per-transport listeners behind one call, this half owns
+// what an HTTPS *client* needs — the client-role TLS stream and the
+// one-shot getters ([`get`], ALPN-negotiated h2 with h1.1 fallback,
+// and [`get_h1`], pinned to http/1.1).
+//
+// Naming convention (repo-wide, every `<crate>::client` — the crate
+// path carries the protocol, the function name is the bare verb):
+//   `get`     = ONE-SHOT: connect + TLS + request + bounded body read.
+//   `fetch`   = one request over an ALREADY-ESTABLISHED conn/stream.
+//   `connect` = establish only (here, [`handshake`] — TLS over an
+//               already-connected byte stream).
+//
+// [`handshake`] mirrors `http2::listen`'s accept path: where `listen`
+// wraps an accepted `TcpStream` in a server-role `TlsStream`,
+// it wraps a *connected* stream in a client-role [`TlsClientStream`] —
 // pumping the sans-io `tls::client::TlsClient` over the transport the
 // same way the server-side adapter pumps `TlsServer`. Both expose
 // `http::HttpStream`, so the same `http::serve_conn` machinery on the
-// server and `http::client::http1_fetch` on the client run over plain
+// server and `http::client::fetch` on the client run over plain
 // TCP and TLS unchanged.
 //
-// This crate is the home for the same reason `listen.rs` lives here:
-// "h2" is HTTP-over-TLS/TCP, so the TLS↔TCP↔HttpStream adapters (both
-// roles) belong to this layer — `proto/tls` stays sans-io and
-// `proto/http` stays TLS-unaware. The h2 *client* (client arc D) will
-// build on this same stream.
+// This crate is the home for the same reason `serve` lives here:
+// "HTTPS = TLS + ALPN dispatch across HTTP versions" is composition,
+// and the composition layer is this crate's job — `proto/tls` stays
+// sans-io, `proto/http` stays TLS-unaware, and `proto/http2` keeps
+// only the h2 protocol itself (`H2ClientConn`, which [`get`]'s h2 arm
+// runs over this stream).
 //
 // Unlike the server-side `TlsStream` (hardwired to the reactor's
 // `TcpStream` for its TSO direct-encrypt fast path), the client stream
 // is generic over any inner `HttpStream`. Client sends are small
 // requests — the TSO path would buy nothing — and the generality is
-// what lets the loopback test below drive the REAL client stream
+// what lets the loopback tests below drive the REAL client stream
 // against the REAL `TlsServer` + `http::serve_conn` fully in-process
 // (the deterministic-simulation arc leans on the same property).
 
@@ -27,9 +41,17 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use http::{HttpStream, IOBuf, IOBufChain};
+use http2::{H2ClientConn, H2ClientError};
 use tls::client::{ClientHandshakeError, ServerAuth, TlsClient, TlsClientConfig};
+use tls::record;
 
-use crate::listen::TLS_RECORD_LEN;
+/// One sealed TLS 1.3 record: 5 B header + plaintext chunk (one byte
+/// under the RFC max, leaving room for the inner content-type byte) +
+/// content-type byte + AEAD tag. The same record geometry as the
+/// server listener's (`http2`'s `listen.rs` derives the identical
+/// value from `tls::record`).
+pub(crate) const TLS_RECORD_LEN: usize =
+    record::HEADER_LEN + (record::MAX_INNER_PLAINTEXT - 1) + 1 + record::TAG_LEN;
 
 /// ALPN offer for an HTTP/1.1-only client connection. Pass as
 /// `TlsClientConfig::alpn` (or offer none for protocol-less TLS).
@@ -37,7 +59,7 @@ pub const ALPN_HTTP11: &[&[u8]] = &[b"http/1.1"];
 
 /// ALPN offer for an h2-capable client connection: prefer "h2", fall
 /// back to HTTP/1.1 — the client mirror of the server listener's
-/// dispatch. `client::https_get` branches on what the server picked.
+/// dispatch. [`get`] branches on what the server picked.
 pub const ALPN_H2: &[&[u8]] = &[b"h2", b"http/1.1"];
 
 /// Why a client TLS connection failed.
@@ -52,7 +74,7 @@ pub enum TlsClientError {
 
 /// Client-side HTTPS `HttpStream`: owns the inner byte stream + the
 /// sans-io [`TlsClient`] and drives the TLS state machine — the
-/// client-role mirror of `listen.rs`'s `TlsStream`. `recv_chunk`
+/// client-role mirror of `http2::listen`'s `TlsStream`. `recv_chunk`
 /// surfaces decrypted plaintext records; `send` seals via
 /// `seal_app_data` and ships ciphertext on the inner stream.
 pub struct TlsClientStream<S: HttpStream> {
@@ -81,7 +103,7 @@ pub struct TlsClientStream<S: HttpStream> {
 /// simulation). `config` carries the [`ServerAuth`] mode (SPKI pin,
 /// or the loudly-named `InsecureSkipVerify`), optional SNI, and the
 /// ALPN offer ([`ALPN_HTTP11`] for an h1 client).
-pub async fn tls_client_handshake<S: HttpStream>(
+pub async fn handshake<S: HttpStream>(
     inner: S,
     seed: [u8; 32],
     config: TlsClientConfig,
@@ -250,13 +272,13 @@ impl<S: HttpStream> HttpStream for TlsClientStream<S> {
 }
 
 // ============================================================================
-// https_get_h1 — the one-shot convenience getter
+// get_h1 — the ALPN-pinned (http/1.1) one-shot getter
 // ============================================================================
 
-/// Failure stage of [`https_get_h1`], mirroring `http::client::GetError`
+/// Failure stage of [`get_h1`], mirroring `http::client::GetError`
 /// with the extra TLS stage.
 #[derive(Debug)]
-pub enum HttpsGetH1Error {
+pub enum GetH1Error {
     /// TCP connect failed.
     Connect(waitless::runtime::TcpConnectError),
     /// TLS handshake failed.
@@ -271,13 +293,13 @@ pub enum HttpsGetH1Error {
 /// SPKI pin or the loud `InsecureSkipVerify`), fetch, read the body
 /// into a bounded `Vec` (≤ `body_cap`), `Connection: close`.
 ///
-/// v1 scope (matches `http::client::http_get`): no URL parsing, no
+/// v1 scope (matches `http::client::get`): no URL parsing, no
 /// redirects, no connection reuse. `host` feeds the `Host` header
 /// only — no SNI is offered (`TlsClientConfig::server_name` wants
 /// `&'static` bytes; callers that need SNI run the layered API:
-/// `tcp_connect` → [`tls_client_handshake`] with their own config →
-/// `http1_fetch`). The caller owns the deadline (`timeout_us`).
-pub async fn https_get_h1(
+/// `tcp_connect` → [`handshake`] with their own config →
+/// `http::client::fetch`). The caller owns the deadline (`timeout_us`).
+pub async fn get_h1(
     ip: waitless::runtime::IpAddr,
     port: u16,
     host: &[u8],
@@ -285,31 +307,103 @@ pub async fn https_get_h1(
     auth: ServerAuth,
     seed: [u8; 32],
     body_cap: usize,
-) -> Result<(http::client::ResponseHead, Vec<u8>), HttpsGetH1Error> {
+) -> Result<(http::client::ResponseHead, Vec<u8>), GetH1Error> {
     let tcp = waitless::tcp_connect(ip, port)
         .await
-        .map_err(HttpsGetH1Error::Connect)?;
+        .map_err(GetH1Error::Connect)?;
     let config = TlsClientConfig {
         auth,
         server_name: None,
         alpn: ALPN_HTTP11,
     };
-    let mut stream = tls_client_handshake(tcp, seed, config)
+    let mut stream = handshake(tcp, seed, config)
         .await
-        .map_err(HttpsGetH1Error::Tls)?;
+        .map_err(GetH1Error::Tls)?;
     let mut req = http::client::FetchRequest::get(host, path);
     req.close = true;
-    let (head, mut body) = http::client::http1_fetch(&mut stream, &req)
+    let (head, mut body) = http::client::fetch(&mut stream, &req)
         .await
-        .map_err(HttpsGetH1Error::Fetch)?;
+        .map_err(GetH1Error::Fetch)?;
     let bytes = body
         .read_to_vec(body_cap)
         .await
-        .map_err(HttpsGetH1Error::Body)?;
+        .map_err(GetH1Error::Body)?;
     // Best-effort clean close (close_notify) — the server keeps its
     // resumption state happy; failure is irrelevant post-body.
     let _ = stream.close().await;
     Ok((head, bytes))
+}
+
+// ============================================================================
+// get — ALPN-dispatching HTTPS GET (h2 with h1.1 fallback)
+// ============================================================================
+
+/// Failure stage of [`get`] — [`GetH1Error`] plus the h2 arm.
+#[derive(Debug)]
+pub enum GetError {
+    /// TCP connect failed.
+    Connect(waitless::runtime::TcpConnectError),
+    /// TLS handshake failed.
+    Tls(TlsClientError),
+    /// The h2 exchange failed (connect/request).
+    H2(H2ClientError),
+    /// The h1.1 request/response exchange failed.
+    Fetch(http::client::FetchError),
+    /// The h1.1 body read failed.
+    Body(http::client::BodyError),
+}
+
+/// One-shot HTTPS GET offering ALPN ["h2", "http/1.1"] and dispatching
+/// on what the server selected: h2 → [`H2ClientConn`]; http/1.1 (or no
+/// ALPN) → the existing h1 path — the client mirror of `http2::listen`'s
+/// serve dispatch. Returns `(status, body)` (the protocol-specific
+/// heads differ; callers needing headers use the layered APIs —
+/// [`get_h1`] pins ALPN to http/1.1 and returns the typed h1 response
+/// head). Same v1 scope as [`get_h1`]: no URL parsing/redirects/SNI,
+/// the caller owns the deadline.
+pub async fn get(
+    ip: waitless::runtime::IpAddr,
+    port: u16,
+    host: &[u8],
+    path: &[u8],
+    auth: ServerAuth,
+    seed: [u8; 32],
+    body_cap: usize,
+) -> Result<(u16, Vec<u8>), GetError> {
+    let tcp = waitless::tcp_connect(ip, port)
+        .await
+        .map_err(GetError::Connect)?;
+    let config = TlsClientConfig {
+        auth,
+        server_name: None,
+        alpn: ALPN_H2,
+    };
+    let mut stream = handshake(tcp, seed, config)
+        .await
+        .map_err(GetError::Tls)?;
+    if stream.negotiated_alpn() == Some(&b"h2"[..]) {
+        let mut conn = H2ClientConn::connect(stream)
+            .await
+            .map_err(GetError::H2)?;
+        let req = http::client::FetchRequest::get(host, path);
+        let resp = http2::client::fetch(&mut conn, &req, body_cap)
+            .await
+            .map_err(GetError::H2)?;
+        conn.close().await;
+        Ok((resp.status, resp.body))
+    } else {
+        let mut req = http::client::FetchRequest::get(host, path);
+        req.close = true;
+        let (head, mut body) = http::client::fetch(&mut stream, &req)
+            .await
+            .map_err(GetError::Fetch)?;
+        let bytes = body
+            .read_to_vec(body_cap)
+            .await
+            .map_err(GetError::Body)?;
+        let _ = stream.close().await;
+        Ok((head.status, bytes))
+    }
 }
 
 // ============================================================================
@@ -318,11 +412,11 @@ pub async fn https_get_h1(
 
 /// In-process h1-over-TLS loopback. The FULL paths on both sides:
 ///
-///   client: `tls_client_handshake` → `TlsClientStream` →
-///           `http::client::http1_fetch` → `ClientBodyReader`
+///   client: `handshake` → `TlsClientStream` →
+///           `http::client::fetch` → `ClientBodyReader`
 ///   server: `TlsServer` (the real sans-io server) pumped by a
-///           pipe-backed `HttpStream` adapter (the test-local stand-in
-///           for `listen.rs`'s TcpStream-bound `TlsStream`) →
+///           pipe-backed `HttpStream` adapter (the harness stand-in
+///           for `http2::listen`'s TcpStream-bound `TlsStream`) →
 ///           **the real `http::serve_conn`** + a real handler.
 ///
 /// The two sides talk through an in-memory byte-queue pipe and are
@@ -331,202 +425,23 @@ pub async fn https_get_h1(
 /// timer when the pipe pends) has an initialized wheel; LOOPBACK_GATE
 /// serialises the tests because every test thread reads as worker 0.
 ///
-/// `pub(crate)`: the harness pieces (pipe, server-side TLS adapter,
-/// gate, configs) are shared with the h2 client's loopback in
-/// `client.rs` — same pattern, h2 ALPN.
+/// The harness pieces (pipe, server-side TLS adapter, gate, configs)
+/// live in [`crate::test_pipe`], shared with the h2 client's loopback
+/// in `http2`'s `client.rs` — same pattern, h2 ALPN.
 #[cfg(test)]
-pub(crate) mod loopback_tests {
+mod loopback_tests {
     use super::*;
-    use alloc::collections::VecDeque;
-    use alloc::rc::Rc;
     use alloc::sync::Arc;
-    use core::cell::RefCell;
     use core::future::Future;
-    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    use http::client::{FetchRequest, http1_fetch};
+    use core::task::{Context, Poll};
+    use http::client::{FetchRequest, fetch};
     use http::{Request, Response};
-    use iobuf::RecvChunkGuard;
-    use std::sync::{Mutex, OnceLock};
-    use tls::client::spki_pin_from_cert_der;
-    use tls::server::TlsServer;
-    use tls::TlsServerConfig;
 
-    // The dev cert the webserver + the tls crate's own loopback use.
-    const CERT: &[u8] = include_bytes!("../../../../apps/webserver/dev_certs/dev_cert.der");
-    const KEY: &[u8] = include_bytes!("../../../../apps/webserver/dev_certs/dev_key.der");
-
-    /// One-time runtime init + per-test serialisation. All test
-    /// threads read `current_worker() == 0`, so concurrent loopbacks
-    /// would race on worker 0's timer wheel; the Mutex prevents it.
-    pub(crate) fn loopback_gate() -> std::sync::MutexGuard<'static, ()> {
-        static GATE: OnceLock<Mutex<()>> = OnceLock::new();
-        let gate = GATE.get_or_init(|| {
-            // `executor::init` sizes the arenas/wheel but does NOT
-            // publish the worker count (boot does, on real targets);
-            // `executor::tick(0)` gates on it, and the h2 loopback
-            // ticks the arena to drive spawned per-stream handlers.
-            worker::set_num_workers(1);
-            executor::init(1);
-            Mutex::new(())
-        });
-        gate.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    // ---- In-memory pipe -----------------------------------------------------
-
-    type Queue = Rc<RefCell<VecDeque<Vec<u8>>>>;
-
-    /// One direction of the duplex: `recv_chunk` pends until the peer
-    /// pushed bytes; `send` flattens the chain into one queue entry.
-    pub(crate) struct PipeStream {
-        rx: Queue,
-        tx: Queue,
-    }
-
-    impl HttpStream for PipeStream {
-        async fn recv_chunk(&mut self) -> Option<RecvChunkGuard<'_>> {
-            let rx = Rc::clone(&self.rx);
-            let bytes = core::future::poll_fn(move |_| match rx.borrow_mut().pop_front() {
-                Some(v) => Poll::Ready(v),
-                None => Poll::Pending,
-            })
-            .await;
-            Some(RecvChunkGuard::new(IOBuf::from(bytes)))
-        }
-        async fn send(&mut self, chain: &mut IOBufChain) -> Result<(), ()> {
-            let mut flat = Vec::new();
-            while let Some(part) = chain.pop_front() {
-                flat.extend_from_slice(part.data());
-            }
-            if !flat.is_empty() {
-                self.tx.borrow_mut().push_back(flat);
-            }
-            Ok(())
-        }
-    }
-
-    pub(crate) fn pipe_pair() -> (PipeStream, PipeStream) {
-        let c2s: Queue = Rc::new(RefCell::new(VecDeque::new()));
-        let s2c: Queue = Rc::new(RefCell::new(VecDeque::new()));
-        (
-            PipeStream {
-                rx: Rc::clone(&s2c),
-                tx: Rc::clone(&c2s),
-            },
-            PipeStream { rx: c2s, tx: s2c },
-        )
-    }
-
-    // ---- Server-side TLS adapter over the pipe ------------------------------
-    //
-    // The pipe-backed analogue of `listen.rs`'s `TlsStream` (which is
-    // hardwired to the reactor TcpStream): same pump structure, same
-    // real `TlsServer`, driven by the REAL `http::serve_conn`.
-
-    pub(crate) struct ServerTlsPipe {
-        pipe: PipeStream,
-        tls: Box<TlsServer>,
-        cfg: TlsServerConfig,
-        tx_scratch: [u8; 2048],
-        record_scratch: Box<[u8]>,
-    }
-
-    impl ServerTlsPipe {
-        pub(crate) fn new(pipe: PipeStream, seed: [u8; 32]) -> Self {
-            ServerTlsPipe {
-                pipe,
-                tls: TlsServer::new_box(seed),
-                cfg: TlsServerConfig::from_chain(&[CERT], KEY).expect("dev cert"),
-                tx_scratch: [0u8; 2048],
-                record_scratch: alloc::vec![0u8; TLS_RECORD_LEN].into_boxed_slice(),
-            }
-        }
-
-        async fn drain_tx(&mut self) -> Result<(), ()> {
-            loop {
-                let n = self.tls.pop_tx(&mut self.tx_scratch);
-                if n == 0 {
-                    return Ok(());
-                }
-                let mut ship = IOBufChain::new();
-                ship.push_back(IOBuf::from(self.tx_scratch[..n].to_vec()));
-                self.pipe.send(&mut ship).await?;
-            }
-        }
-
-        async fn pump_rx(&mut self) -> Result<(), ()> {
-            self.drain_tx().await?;
-            {
-                let Some(guard) = self.pipe.recv_chunk().await else {
-                    return Err(());
-                };
-                let chunk = guard.into_owned();
-                self.tls.process_chunk(chunk, &self.cfg).map_err(|_| ())?;
-            }
-            self.drain_tx().await
-        }
-
-        /// Pump the handshake to completion and return the negotiated
-        /// ALPN — the pipe analogue of `TlsStream::drive_handshake`.
-        /// The h2 loopback needs it because `http2::serve_conn` WRITES
-        /// first (its SETTINGS), which requires an established conn;
-        /// `http::serve_conn` reads first, so the h1 loopbacks get the
-        /// handshake driven implicitly by `recv_chunk`.
-        pub(crate) async fn drive_handshake(&mut self) -> Result<tls::server::AlpnProtocol, ()> {
-            loop {
-                if self.tls.is_established() {
-                    return Ok(self.tls.negotiated_alpn());
-                }
-                if self.tls.is_terminated() {
-                    return Err(());
-                }
-                self.pump_rx().await?;
-            }
-        }
-    }
-
-    impl HttpStream for ServerTlsPipe {
-        async fn recv_chunk(&mut self) -> Option<RecvChunkGuard<'_>> {
-            while !self.tls.has_plaintext() {
-                if self.tls.is_terminated() {
-                    return None;
-                }
-                if self.pump_rx().await.is_err() {
-                    return None;
-                }
-            }
-            let iobuf = self.tls.pop_plaintext()?;
-            Some(RecvChunkGuard::new(iobuf))
-        }
-        async fn send(&mut self, chain: &mut IOBufChain) -> Result<(), ()> {
-            self.drain_tx().await?;
-            while !chain.is_empty() {
-                let n = self
-                    .tls
-                    .seal_app_data(chain, &mut self.record_scratch[..])
-                    .map_err(|_| ())?;
-                let mut ship = IOBufChain::new();
-                ship.push_back(IOBuf::from(self.record_scratch[..n].to_vec()));
-                self.pipe.send(&mut ship).await?;
-            }
-            Ok(())
-        }
-        async fn close(&mut self) -> Result<(), ()> {
-            let _ = self.tls.close_notify();
-            self.drain_tx().await
-        }
-    }
+    use crate::test_pipe::{
+        ServerTlsPipe, loopback_gate, noop_waker, pinned_config_alpn, pipe_pair,
+    };
 
     // ---- Deterministic alternating driver ------------------------------------
-
-    pub(crate) fn noop_waker() -> Waker {
-        fn noop(_: *const ()) {}
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(core::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
-    }
 
     /// Poll the client and server futures alternately until the client
     /// completes (the server side may legitimately still be parked
@@ -577,17 +492,6 @@ pub(crate) mod loopback_tests {
         }
     }
 
-    /// Pinned-against-the-dev-cert client config with the given ALPN
-    /// offer — the h1 loopbacks here pass [`ALPN_HTTP11`], the h2
-    /// client loopbacks (`client.rs`) pass [`ALPN_H2`].
-    pub(crate) fn pinned_config_alpn(alpn: &'static [&'static [u8]]) -> TlsClientConfig {
-        TlsClientConfig {
-            auth: ServerAuth::PinnedSpki(spki_pin_from_cert_der(CERT).expect("pin")),
-            server_name: Some(b"localhost"),
-            alpn,
-        }
-    }
-
     fn pinned_config() -> TlsClientConfig {
         pinned_config_alpn(ALPN_HTTP11)
     }
@@ -603,12 +507,12 @@ pub(crate) mod loopback_tests {
         let (client_pipe, server_pipe) = pipe_pair();
 
         let client = async move {
-            let mut stream = tls_client_handshake(client_pipe, [0x11; 32], pinned_config())
+            let mut stream = handshake(client_pipe, [0x11; 32], pinned_config())
                 .await
                 .expect("client handshake");
             assert_eq!(stream.negotiated_alpn(), Some(&b"http/1.1"[..]));
             let req = FetchRequest::get(b"loopback.test", b"/hello");
-            let (head, mut body) = http1_fetch(&mut stream, &req).await.expect("fetch");
+            let (head, mut body) = fetch(&mut stream, &req).await.expect("fetch");
             assert_eq!(head.status, 200);
             assert_eq!(head.content_length(), Some(HELLO_BODY.len()));
             assert!(!head.connection_close(), "keep-alive response");
@@ -633,11 +537,11 @@ pub(crate) mod loopback_tests {
         let (client_pipe, server_pipe) = pipe_pair();
 
         let client = async move {
-            let mut stream = tls_client_handshake(client_pipe, [0x33; 32], pinned_config())
+            let mut stream = handshake(client_pipe, [0x33; 32], pinned_config())
                 .await
                 .expect("client handshake");
             let req = FetchRequest::get(b"loopback.test", b"/streamed");
-            let (head, mut body) = http1_fetch(&mut stream, &req).await.expect("fetch");
+            let (head, mut body) = fetch(&mut stream, &req).await.expect("fetch");
             assert_eq!(head.status, 200);
             assert_eq!(head.content_length(), None, "streamed head has no CL");
             assert!(head.connection_close(), "streamed = close-delimited");
@@ -665,7 +569,7 @@ pub(crate) mod loopback_tests {
                 server_name: None,
                 alpn: ALPN_HTTP11,
             };
-            tls_client_handshake(client_pipe, [0x55; 32], cfg)
+            handshake(client_pipe, [0x55; 32], cfg)
                 .await
                 .err()
                 .expect("wrong pin must fail")
@@ -691,12 +595,12 @@ pub(crate) mod loopback_tests {
         let (client_pipe, server_pipe) = pipe_pair();
 
         let client = async move {
-            let mut stream = tls_client_handshake(client_pipe, [0x77; 32], pinned_config())
+            let mut stream = handshake(client_pipe, [0x77; 32], pinned_config())
                 .await
                 .expect("client handshake");
             for _ in 0..2 {
                 let req = FetchRequest::get(b"loopback.test", b"/hello");
-                let (head, mut body) = http1_fetch(&mut stream, &req).await.expect("fetch");
+                let (head, mut body) = fetch(&mut stream, &req).await.expect("fetch");
                 assert_eq!(head.status, 200);
                 let bytes = body.read_to_vec(4096).await.expect("body");
                 assert_eq!(bytes, HELLO_BODY);

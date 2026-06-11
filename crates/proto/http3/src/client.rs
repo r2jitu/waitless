@@ -81,9 +81,10 @@ pub enum H3ClientError {
     BodyTooLarge,
 }
 
-/// One-shot [`h3_get`] failure: which half died.
+/// One-shot [`get`] failure: which half died — the h3 mirror of
+/// `https::client::GetError`.
 #[derive(Debug)]
-pub enum H3FetchError {
+pub enum GetError {
     /// QUIC connect/handshake stage (socket bind, TLS, timeout).
     Connect(quic::QuicConnectError),
     /// The h3 request/response exchange.
@@ -199,8 +200,8 @@ struct PeerUni {
 }
 
 /// One client-role HTTP/3 connection over `T`. Construct via
-/// [`h3_connect`] (or [`H3ClientConn::new`] over a custom transport);
-/// issue requests with [`H3ClientConn::request`] / [`h3_fetch`].
+/// [`connect`] (or [`H3ClientConn::new`] over a custom transport);
+/// issue requests with [`H3ClientConn::request`] / [`fetch`].
 /// Sequential: one request in flight at a time (v1).
 pub struct H3ClientConn<T: ClientTransport> {
     conn: T,
@@ -480,13 +481,13 @@ fn decode_response_head(
 }
 
 // ============================================================================
-// h3_connect / h3_fetch / h3_get — the connect + single-shot facades
+// connect / fetch / get — the connect + single-shot facades
 // ============================================================================
 
 /// Dial an HTTP/3 server: QUIC connect (ALPN "h3") + the client
 /// control stream. Entropy by value; `auth` pins the server's SPKI
 /// (or `InsecureSkipVerify` for dev probes).
-pub async fn h3_connect(
+pub async fn connect(
     ip: waitless::runtime::IpAddr,
     port: u16,
     auth: ServerAuth,
@@ -497,7 +498,7 @@ pub async fn h3_connect(
         server_name: None,
         alpn: ALPN_H3,
     };
-    let conn = quic::quic_connect(ip, port, &config, seed).await?;
+    let conn = quic::connect(ip, port, &config, seed).await?;
     Ok(H3ClientConn::new(conn))
 }
 
@@ -505,7 +506,7 @@ pub async fn h3_connect(
 /// reusing the h1/h2 clients' [`http::client::FetchRequest`] shape:
 /// `host` → `:authority`, the scheme is `https` (h3 is QUIC-only),
 /// `close` is ignored (wind down via [`H3ClientConn::close`]).
-pub async fn h3_fetch<T: ClientTransport>(
+pub async fn fetch<T: ClientTransport>(
     conn: &mut H3ClientConn<T>,
     req: &http::client::FetchRequest<'_>,
     body_cap: usize,
@@ -515,8 +516,8 @@ pub async fn h3_fetch<T: ClientTransport>(
 }
 
 /// One-shot HTTPS-over-QUIC GET: connect, fetch, close. Returns
-/// `(status, body)` — the h3 sibling of `http2::https_get`.
-pub async fn h3_get(
+/// `(status, body)` — the h3 sibling of `https::client::get`.
+pub async fn get(
     ip: waitless::runtime::IpAddr,
     port: u16,
     host: &[u8],
@@ -524,14 +525,14 @@ pub async fn h3_get(
     auth: ServerAuth,
     seed: [u8; 32],
     body_cap: usize,
-) -> Result<(u16, Vec<u8>), H3FetchError> {
-    let mut conn = h3_connect(ip, port, auth, seed)
+) -> Result<(u16, Vec<u8>), GetError> {
+    let mut conn = connect(ip, port, auth, seed)
         .await
-        .map_err(H3FetchError::Connect)?;
+        .map_err(GetError::Connect)?;
     let req = http::client::FetchRequest::get(host, path);
-    let resp = h3_fetch(&mut conn, &req, body_cap)
+    let resp = fetch(&mut conn, &req, body_cap)
         .await
-        .map_err(H3FetchError::H3)?;
+        .map_err(GetError::H3)?;
     conn.close();
     Ok((resp.status, resp.body))
 }

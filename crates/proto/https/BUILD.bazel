@@ -3,20 +3,43 @@ load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# The all-transports HTTPS facade: `https::serve` brings up h1.1 + h2
-# over TLS/TCP (//crates/proto/http2) AND h3 over QUIC/UDP
-# (//crates/proto/http3) in one call, with automatic Alt-Svc. One
-# handler serves every transport via the stream-generic `Service`
-# trait. This is the composition layer — the per-transport `listen`
-# entry points stay available for finer control.
+# The all-transports HTTPS facade, both roles. Server: `https::serve`
+# brings up h1.1 + h2 over TLS/TCP (//crates/proto/http2) AND h3 over
+# QUIC/UDP (//crates/proto/http3) in one call, with automatic Alt-Svc —
+# one plain handler serves every transport. Client: `https::client::get`
+# / `get_h1`, the one-shot getters over the client-role
+# `TlsClientStream` (TLS + ALPN dispatch). This is the composition
+# layer — the per-transport `listen` entry points and the layered
+# client APIs stay available for finer control.
 rust_library(
     name = "https",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/client.rs",
+        "src/lib.rs",
+        "src/test_pipe.rs",
+    ],
+    compile_data = [
+        # test_pipe (host-only shared test harness) pins against the
+        # dev cert (same include_bytes! pattern as //crates/proto/tls's
+        # client tests).
+        "//apps/webserver/dev_certs:dev_cert.der",
+        "//apps/webserver/dev_certs:dev_key.der",
+    ],
     crate_name = "https",
     deps = [
         "//crates/proto/http",
         "//crates/proto/http2",
         "//crates/proto/http3",
+        # The client-role TLS state machine `client::handshake`
+        # drives (+ record geometry for the seal scratch).
+        "//crates/proto/tls",
+        # test_pipe's loopback_gate initialises the executor wheel /
+        # worker count for off-VM tests (host-only module).
+        "//crates/runtime/executor",
+        "//crates/runtime/worker",
+        "//crates/util/iobuf",
+        # tcp_connect + runtime types for the one-shot getters.
+        "//crates/waitless",
     ],
 )
 

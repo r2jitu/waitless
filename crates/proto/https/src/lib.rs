@@ -17,10 +17,27 @@
 // QUIC alike. No `Service` trait, no per-protocol adapter: the facade
 // just hands the same (`Arc`-shared) handler to both listeners, wrapping
 // the TCP path to append `Alt-Svc`.
+//
+// The CLIENT side lives here too, for the same symmetry (`client.rs`):
+// [`client::get`] (one-shot, ALPN-negotiated h2 with h1.1 fallback),
+// [`client::get_h1`] (pinned http/1.1), and the client-role
+// [`client::TlsClientStream`] they run over. "HTTPS = TLS + ALPN
+// dispatch across HTTP versions" is composition in both roles — the
+// per-version crates (`http`, `http2`, `http3`) keep only their own
+// protocol. The one-shots are re-exported at the root (`https::get`
+// mirrors `https::serve`); the layered pieces (`client::handshake`,
+// the stream, the ALPN offers) stay under `https::client`.
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+
+pub mod client;
+#[cfg(not(target_os = "none"))]
+#[doc(hidden)]
+pub mod test_pipe;
+
+pub use client::{GetError, GetH1Error, get, get_h1};
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
