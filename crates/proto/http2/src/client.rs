@@ -66,6 +66,16 @@ const INITIAL_WINDOW: i64 = 65_535;
 /// END_HEADERS — same CONTINUATION-flood budget as the server's.
 const HEADER_BLOCK_CAP: usize = 64 * 1024;
 
+/// Cap on the NUMBER of CONTINUATION frames in one response header block
+/// before END_HEADERS — the symmetric counterpart to the server's. The
+/// byte cap above never trips on a flood of *length-0* CONTINUATIONs (a
+/// malicious server adds zero bytes per frame), so `pump_one` would loop
+/// forever holding the connection (slowloris-class). A well-behaved
+/// server fragments a ≤`HEADER_BLOCK_CAP` (64 KiB) block into far fewer
+/// frames (≤4 at the 16 KiB frame size), so 1024 is never approached;
+/// past it we abort with ENHANCE_YOUR_CALM, the byte cap's error.
+const MAX_CONTINUATION_FRAMES: u32 = 1024;
+
 /// HPACK decode scratch sizes (mirror the server's).
 const NAME_SCRATCH_LEN: usize = 256;
 const VALUE_SCRATCH_LEN: usize = 16 * 1024;
@@ -203,6 +213,11 @@ struct HeaderAsm {
     sid: u32,
     buf: Vec<u8>,
     end_stream: bool,
+    /// CONTINUATION frames appended so far — bounds the zero-byte-
+    /// CONTINUATION flood the byte cap (`buf.len()`) misses. Per-block:
+    /// starts at 0 with the opening HEADERS, trips
+    /// `MAX_CONTINUATION_FRAMES`.
+    cont_frames: u32,
 }
 
 /// Per-request state: the stream's two windows + the response
@@ -714,6 +729,7 @@ impl<S: HttpStream> H2ClientConn<S> {
                 sid,
                 buf: frag.to_vec(),
                 end_stream,
+                cont_frames: 0,
             });
             Ok(())
         }
@@ -727,6 +743,13 @@ impl<S: HttpStream> H2ClientConn<S> {
     ) -> Result<(), u32> {
         {
             let asm = self.header_asm.as_mut().expect("checked by caller");
+            // Bound the FRAME COUNT, not just the byte total: a flood of
+            // length-0 CONTINUATIONs adds no bytes, so the byte cap below
+            // never trips and `pump_one` would loop forever.
+            asm.cont_frames += 1;
+            if asm.cont_frames > MAX_CONTINUATION_FRAMES {
+                return Err(error::ENHANCE_YOUR_CALM);
+            }
             if asm.buf.len() + payload.len() > HEADER_BLOCK_CAP {
                 return Err(error::ENHANCE_YOUR_CALM);
             }
@@ -1568,6 +1591,76 @@ mod tests {
             .expect("reassembled");
         assert_eq!(r.status, 200);
         assert_eq!(r.header(b"x-marker"), Some(&b"split-head"[..]));
+    }
+
+    /// A malicious server flooding length-0 CONTINUATIONs (the byte cap
+    /// never trips — zero bytes per frame) is aborted with
+    /// ENHANCE_YOUR_CALM rather than looping in `pump_one` forever. The
+    /// test drives `process_frame` directly, exactly
+    /// `MAX_CONTINUATION_FRAMES + 1` times, and asserts the last errors —
+    /// bounded, never an infinite loop.
+    #[test]
+    fn empty_continuation_flood_is_enhance_your_calm() {
+        let (mut conn, _tx) = default_connected(vec![]);
+        conn.next_stream_id = 3; // pretend stream 1 was opened
+        let mut flight = InFlight {
+            sid: 1,
+            send_window: conn.peer_initial_window,
+            recv_window: INITIAL_WINDOW,
+            resp: RespAccum::new(4096),
+        };
+        // Open a response header block without END_HEADERS.
+        let open = FrameHeader { length: 1, ty: ftype::HEADERS, flags: 0, stream_id: 1 };
+        conn.process_frame(Some(&mut flight), open, b"\x00").expect("open block");
+        // length-0 CONTINUATIONs: the first MAX_CONTINUATION_FRAMES are
+        // accepted (no bytes, no END_HEADERS), the next trips the cap.
+        let cont = FrameHeader { length: 0, ty: ftype::CONTINUATION, flags: 0, stream_id: 1 };
+        for _ in 0..MAX_CONTINUATION_FRAMES {
+            conn.process_frame(Some(&mut flight), cont, b"").expect("under the cap");
+        }
+        let code = conn
+            .process_frame(Some(&mut flight), cont, b"")
+            .expect_err("one past the cap");
+        assert_eq!(code, error::ENHANCE_YOUR_CALM);
+    }
+
+    /// A normal response head fragmented across 8 well-formed
+    /// CONTINUATIONs still decodes (the count cap must not break bounded
+    /// multi-frame blocks).
+    #[test]
+    fn legitimate_multi_continuation_response_decodes() {
+        let mut block = Vec::new();
+        hpack::encode_header_list(
+            &[
+                (b":status", b"200"),
+                (b"content-type", b"text/plain"),
+                (b"x-marker", b"eight-frames"),
+            ],
+            &mut block,
+        );
+        // HEADERS (no END_HEADERS) + 8 CONTINUATIONs, the last with
+        // END_HEADERS | (END_STREAM rides the opening HEADERS).
+        let parts = 9;
+        let mut wire = Vec::new();
+        let mut off = 0;
+        for i in 0..parts {
+            let remaining = block.len() - off;
+            let n = if i == parts - 1 { remaining } else { remaining / (parts - i) };
+            let frag = &block[off..off + n];
+            off += n;
+            let last = i == parts - 1;
+            if i == 0 {
+                frame::push_frame(&mut wire, ftype::HEADERS, flags::END_STREAM, 1, frag);
+            } else {
+                let fl = if last { flags::END_HEADERS } else { 0 };
+                frame::push_frame(&mut wire, ftype::CONTINUATION, fl, 1, frag);
+            }
+        }
+        let (mut conn, _tx) = default_connected(vec![wire]);
+        let r = block_on(conn.request(b"GET", b"https", b"h", b"/", &[], None, 64))
+            .expect("reassembled across 8 CONTINUATIONs");
+        assert_eq!(r.status, 200);
+        assert_eq!(r.header(b"x-marker"), Some(&b"eight-frames"[..]));
     }
 
     #[test]

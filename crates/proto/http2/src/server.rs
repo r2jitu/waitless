@@ -99,6 +99,19 @@ const STREAM_SEND_BUF_CAP: usize = 256 * 1024;
 /// before END_HEADERS — the H2-5 CONTINUATION-flood guard.
 const HEADER_BLOCK_CAP: usize = 64 * 1024;
 
+/// Cap on the NUMBER of CONTINUATION frames in one header block before
+/// END_HEADERS — additive defense for the gap [`HEADER_BLOCK_CAP`]
+/// misses: a peer that sends HEADERS without END_HEADERS then an
+/// unbounded stream of *length-0* CONTINUATIONs adds zero bytes per
+/// frame, so the byte cap never trips and the mid-assembly dispatch
+/// path (which returns before the control-flood guard) loops forever — a
+/// slowloris-class connection hold. A well-behaved peer fragments a ≤
+/// `HEADER_BLOCK_CAP` (64 KiB) block into far fewer frames (at the 16
+/// KiB max frame size, ≤4), so 1024 (the `CONTROL_FLOOD_CAP` budget's
+/// spirit) is never approached; past it we abort with ENHANCE_YOUR_CALM,
+/// the same error the byte cap raises.
+const MAX_CONTINUATION_FRAMES: u32 = 1024;
+
 /// Connection is torn down once this many stream resets accumulate —
 /// the H2-1 Rapid-Reset (CVE-2023-44487) guard.
 const RST_FLOOD_CAP: u32 = 200;
@@ -992,6 +1005,11 @@ struct HeaderAsm {
     stream_id: u32,
     buf: Vec<u8>,
     end_stream: bool,
+    /// CONTINUATION frames appended to this block so far — bounds the
+    /// zero-byte-CONTINUATION flood the byte cap (`buf.len()`) misses.
+    /// Per-block: starts at 0 with the opening HEADERS, trips
+    /// `MAX_CONTINUATION_FRAMES`.
+    cont_frames: u32,
 }
 
 // ── Frame I/O ──────────────────────────────────────────────────────
@@ -1286,6 +1304,7 @@ where
             stream_id: hdr.stream_id,
             buf: frag.to_vec(),
             end_stream,
+            cont_frames: 0,
         });
         Ok(())
     }
@@ -1304,6 +1323,14 @@ where
 {
     {
         let asm = conn.header_asm.as_mut().expect("checked by caller");
+        // Bound the FRAME COUNT, not just the byte total: a flood of
+        // length-0 CONTINUATIONs adds no bytes, so the byte cap below
+        // never trips and this path would loop forever.
+        asm.cont_frames += 1;
+        if asm.cont_frames > MAX_CONTINUATION_FRAMES {
+            crate::h2_drop!(continuation_flood, "sid={} frames={}", hdr.stream_id, asm.cont_frames);
+            return Err(error::ENHANCE_YOUR_CALM);
+        }
         if asm.buf.len() + payload.len() > HEADER_BLOCK_CAP {
             crate::h2_drop!(header_block_too_large, "sid={}", hdr.stream_id);
             return Err(error::ENHANCE_YOUR_CALM);
@@ -2689,5 +2716,126 @@ mod tests {
                 .any(|f| f.0 == ftype::WINDOW_UPDATE && f.2 == 1),
             "stream credit emitted",
         );
+    }
+
+    // ── H2-5 CONTINUATION-flood guard (zero-byte variant) ────────────
+
+    /// A byte stream that drains/no-ops — `process_frame` for the
+    /// CONTINUATION-flood path never reads or sends (the mid-assembly
+    /// frames return before any handler dispatch), so the awaits resolve
+    /// immediately under `block_on`.
+    struct NullStream;
+    impl HttpStream for NullStream {
+        async fn recv_chunk(&mut self) -> Option<iobuf::RecvChunkGuard<'_>> {
+            None
+        }
+        async fn send(&mut self, chain: &mut IOBufChain) -> Result<(), ()> {
+            while chain.pop_front().is_some() {}
+            Ok(())
+        }
+    }
+
+    /// Drive a never-pending future to completion (mirrors the client
+    /// test harness; the flood/legit-block paths never actually park).
+    fn block_on<F: core::future::Future>(fut: F) -> F::Output {
+        let waker = https::test_pipe::noop_waker();
+        let mut cx = core::task::Context::from_waker(&waker);
+        let mut fut = core::pin::pin!(fut);
+        for _ in 0..10_000 {
+            if let core::task::Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+        panic!("scripted future did not complete");
+    }
+
+    /// Trivial handler for the dispatch tests (the mid-assembly path
+    /// never invokes it; the legit-block path answers a 404).
+    async fn noop_handler(_req: &mut Request<'_>, res: &mut Response<'_>) -> Result<(), ()> {
+        res.set(Response::not_found());
+        Ok(())
+    }
+
+    /// Push a HEADERS or CONTINUATION frame and dispatch it through the
+    /// real `process_frame` (the looping path).
+    fn dispatch(conn: &mut H2Conn, ty: u8, fl: u8, sid: u32, frag: &[u8]) -> Result<(), u32> {
+        let hdr = crate::frame::FrameHeader {
+            length: frag.len() as u32,
+            ty,
+            flags: fl,
+            stream_id: sid,
+        };
+        let handler = Arc::new(noop_handler);
+        let mut stream = NullStream;
+        block_on(process_frame(conn, &mut stream, &handler, hdr, frag))
+    }
+
+    /// A flood of length-0 CONTINUATIONs (which the byte cap never
+    /// catches — each adds zero bytes) is shed with ENHANCE_YOUR_CALM
+    /// once the frame-count cap trips. The test drives exactly
+    /// `MAX_CONTINUATION_FRAMES + 1` frames and asserts the last errors —
+    /// it cannot infinite-loop (bounded frame count, every dispatch
+    /// returns).
+    #[test]
+    fn empty_continuation_flood_trips_enhance_your_calm() {
+        let mut conn = H2Conn::new();
+        // Open a header block without END_HEADERS (a partial fragment;
+        // it stays in mid-assembly).
+        dispatch(&mut conn, ftype::HEADERS, 0, 1, b"\x00").expect("open block");
+        // The first MAX_CONTINUATION_FRAMES length-0 CONTINUATIONs are
+        // accepted (no bytes added, no END_HEADERS).
+        for _ in 0..MAX_CONTINUATION_FRAMES {
+            dispatch(&mut conn, ftype::CONTINUATION, 0, 1, b"").expect("under the cap");
+        }
+        // The next one trips the count cap.
+        let code = dispatch(&mut conn, ftype::CONTINUATION, 0, 1, b"")
+            .expect_err("one past the cap");
+        assert_eq!(code, error::ENHANCE_YOUR_CALM);
+        assert!(crate::diag::COUNTERS.continuation_flood.get() >= 1, "drop counter bumped");
+    }
+
+    /// A legitimate header block fragmented across 8 well-formed
+    /// CONTINUATIONs still reassembles + completes (the count cap must
+    /// not break bounded multi-frame blocks). Driven through the real
+    /// `process_frame` loop; the final END_HEADERS dispatches the GET.
+    #[test]
+    fn legitimate_multi_continuation_block_completes() {
+        let mut block = Vec::new();
+        hpack::encode_header_list(
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.test"),
+            ],
+            &mut block,
+        );
+        let mut conn = H2Conn::new();
+        // Split the block: HEADERS (no END_HEADERS) + 8 CONTINUATIONs,
+        // the last carrying END_HEADERS. 9 fragments over a small block
+        // → some fragments are length-0, exercising the legit zero-byte
+        // case alongside the flood guard.
+        let parts = 9;
+        let mut off = 0;
+        for i in 0..parts {
+            let remaining = block.len() - off;
+            let n = if i == parts - 1 { remaining } else { remaining / (parts - i) };
+            let frag = &block[off..off + n];
+            off += n;
+            let last = i == parts - 1;
+            if i == 0 {
+                dispatch(&mut conn, ftype::HEADERS, flags::END_STREAM, 1, frag)
+                    .expect("HEADERS opens the block");
+            } else {
+                let fl = if last { flags::END_HEADERS } else { 0 };
+                dispatch(&mut conn, ftype::CONTINUATION, fl, 1, frag)
+                    .expect("CONTINUATION accepted");
+            }
+        }
+        // END_HEADERS completed the block + dispatched the bodyless GET
+        // (END_STREAM rode the HEADERS): a response was queued, no abort.
+        assert!(conn.header_asm.is_none(), "block completed (no mid-assembly residue)");
+        assert_eq!(conn.out_queue.len(), 1, "the GET produced one queued response");
+        assert_eq!(conn.last_stream_id, 1);
     }
 }

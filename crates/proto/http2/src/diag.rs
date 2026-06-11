@@ -37,6 +37,10 @@ pub struct Counters {
     /// A header block (HEADERS + CONTINUATION) exceeded the byte cap
     /// before END_HEADERS (H2-5 CONTINUATION-flood guard).
     pub header_block_too_large: Counter,
+    /// A header block exceeded the CONTINUATION *frame-count* cap before
+    /// END_HEADERS — the zero-byte-CONTINUATION flood the byte cap above
+    /// misses (additive H2-5 defense).
+    pub continuation_flood: Counter,
     /// A new stream was refused because the concurrent-stream cap was
     /// reached (H2-4 MAX_CONCURRENT_STREAMS enforcement).
     pub stream_refused: Counter,
@@ -75,6 +79,7 @@ impl Counters {
             hpack_error: Counter::new(),
             header_list_too_large: Counter::new(),
             header_block_too_large: Counter::new(),
+            continuation_flood: Counter::new(),
             stream_refused: Counter::new(),
             rapid_reset_abort: Counter::new(),
             control_flood_abort: Counter::new(),
@@ -174,7 +179,7 @@ pub fn should_log_event() -> bool {
 }
 
 /// Counter `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 17] {
+pub fn snapshot() -> [(&'static str, u64); 18] {
     let c = &COUNTERS;
     [
         ("connections_served", c.connections_served.get()),
@@ -186,6 +191,7 @@ pub fn snapshot() -> [(&'static str, u64); 17] {
         ("hpack_error", c.hpack_error.get()),
         ("header_list_too_large", c.header_list_too_large.get()),
         ("header_block_too_large", c.header_block_too_large.get()),
+        ("continuation_flood", c.continuation_flood.get()),
         ("stream_refused", c.stream_refused.get()),
         ("rapid_reset_abort", c.rapid_reset_abort.get()),
         ("control_flood_abort", c.control_flood_abort.get()),
