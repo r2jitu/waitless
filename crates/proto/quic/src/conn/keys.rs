@@ -391,10 +391,23 @@ impl Connection {
             }
             self.discard_sent_packets(crate::tls::CryptoLevel::Initial);
             self.initial_space.largest_acked = None;
-            self.discard_sent_packets(crate::tls::CryptoLevel::Handshake);
-            self.handshake_space.largest_acked = None;
             self.time_of_last_ack_eliciting_us[0] = None;
-            self.time_of_last_ack_eliciting_us[1] = None;
+            // SERVER ONLY: the server reaches TLS-Established by
+            // RECEIVING the client's Finished — its own Handshake
+            // flight has done its job and the PTO-anchor clears below
+            // stop idle PING storms (the Chrome note above). The
+            // CLIENT reaches Established the moment it SENDS Finished:
+            // clearing here would discard PTO/retx tracking for a
+            // Finished still in flight — a dropped Finished then
+            // deadlocks the handshake (caught by the two-endpoint
+            // sim's seeded-loss run). The client keeps its Handshake
+            // space armed until the handshake is CONFIRMED
+            // (HANDSHAKE_DONE / first 1-RTT decrypt — RFC 9001 §4.9.2).
+            if !is_client {
+                self.discard_sent_packets(crate::tls::CryptoLevel::Handshake);
+                self.handshake_space.largest_acked = None;
+                self.time_of_last_ack_eliciting_us[1] = None;
+            }
         } else if matches!(new_state, QuicTlsState::Failed) {
             self.state = ConnState::Failed;
         }

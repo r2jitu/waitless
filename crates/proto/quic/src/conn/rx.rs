@@ -816,7 +816,21 @@ impl Connection {
                     return Ok(());
                 }
                 Frame::HandshakeDone => {
-                    // Server only — clients don't send this.
+                    // Sent by servers only. For the CLIENT this is the
+                    // RFC 9001 §4.9.2 "handshake confirmed" signal —
+                    // discard the Handshake space (keys + sent-packet
+                    // tracking + PTO anchor). Idempotent with the
+                    // first-1-RTT-decrypt discard, which necessarily
+                    // already ran (HANDSHAKE_DONE rides a 1-RTT
+                    // packet).
+                    if self.client.is_some() && !self.handshake_keys_discarded {
+                        self.handshake_keys_discarded = true;
+                        self.handshake_send = None;
+                        self.handshake_recv = None;
+                        self.discard_sent_packets(crate::tls::CryptoLevel::Handshake);
+                        self.handshake_space.largest_acked = None;
+                        self.time_of_last_ack_eliciting_us[1] = None;
+                    }
                 }
                 Frame::Stream {
                     stream_id,
