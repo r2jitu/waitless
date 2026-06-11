@@ -275,7 +275,7 @@ async fn h1_loop<S>(
 /// of the next response in `leftover`. Relies on `Content-Length`
 /// (the bench endpoints always send it). Returns `false` on EOF/parse
 /// failure before a full response.
-async fn read_h1_response<S>(stream: &mut S, leftover: &mut Vec<u8>, scratch: &mut [u8]) -> bool
+pub(crate) async fn read_h1_response<S>(stream: &mut S, leftover: &mut Vec<u8>, scratch: &mut [u8]) -> bool
 where
     S: AsyncReadExt + Unpin,
 {

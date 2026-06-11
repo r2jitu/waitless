@@ -21,6 +21,7 @@ mod h3_health;
 mod h3_upload;
 mod http_close;
 mod http_load;
+mod http_rate;
 mod http_upload;
 mod tcp_echo;
 mod tls_handshake;
@@ -235,6 +236,32 @@ enum Workload {
         #[arg(long, default_value = "false")]
         plaintext: bool,
     },
+    /// Open-loop fixed-rate HTTP/1.1 GET — the wrk2 shape. Requests
+    /// fire on a fixed global schedule (`--rate` req/s spread over
+    /// `--connections` keep-alive conns) and latency is measured
+    /// from each request's *scheduled* time, so server backlog is
+    /// charged to the tail (coordinated-omission-corrected). Prints
+    /// extended percentiles (P90/P999/MAX) + achieved-vs-target rate.
+    HttpRate {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        port: u16,
+        #[arg(long, default_value = "/health")]
+        endpoint: String,
+        /// Target offered load, requests/second (total across conns).
+        #[arg(long)]
+        rate: u64,
+        #[arg(long, default_value = "5")]
+        duration_secs: u64,
+        #[arg(long, default_value = "1")]
+        warmup_secs: u64,
+        #[arg(long, default_value = "256")]
+        connections: usize,
+        /// Cleartext HTTP (no TLS).
+        #[arg(long, default_value = "false")]
+        plaintext: bool,
+    },
     /// API-gateway / sidecar ping-pong: drives the unikernel's
     /// `GATEWAY_PORT` listener, which on each request forwards a
     /// payload to a UDP backend, awaits the reply, and returns it.
@@ -427,6 +454,25 @@ fn main() -> std::io::Result<()> {
             Duration::from_secs(warmup_secs),
             connections,
             streams,
+            plaintext,
+        )),
+        Workload::HttpRate {
+            host,
+            port,
+            endpoint,
+            rate,
+            duration_secs,
+            warmup_secs,
+            connections,
+            plaintext,
+        } => runtime.block_on(http_rate::run(
+            &host,
+            port,
+            &endpoint,
+            rate,
+            connections,
+            Duration::from_secs(duration_secs),
+            Duration::from_secs(warmup_secs),
             plaintext,
         )),
         Workload::Gateway {
