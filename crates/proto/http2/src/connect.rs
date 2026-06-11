@@ -35,6 +35,11 @@ use crate::listen::TLS_RECORD_LEN;
 /// `TlsClientConfig::alpn` (or offer none for protocol-less TLS).
 pub const ALPN_HTTP11: &[&[u8]] = &[b"http/1.1"];
 
+/// ALPN offer for an h2-capable client connection: prefer "h2", fall
+/// back to HTTP/1.1 — the client mirror of the server listener's
+/// dispatch. `client::https_fetch` branches on what the server picked.
+pub const ALPN_H2: &[&[u8]] = &[b"h2", b"http/1.1"];
+
 /// Why a client TLS connection failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsClientError {
@@ -325,8 +330,12 @@ pub async fn https_get(
 /// runs once so `serve_conn`'s `timeout_us` (which schedules a real
 /// timer when the pipe pends) has an initialized wheel; LOOPBACK_GATE
 /// serialises the tests because every test thread reads as worker 0.
+///
+/// `pub(crate)`: the harness pieces (pipe, server-side TLS adapter,
+/// gate, configs) are shared with the h2 client's loopback in
+/// `client.rs` — same pattern, h2 ALPN.
 #[cfg(test)]
-mod loopback_tests {
+pub(crate) mod loopback_tests {
     use super::*;
     use alloc::collections::VecDeque;
     use alloc::rc::Rc;
@@ -349,9 +358,14 @@ mod loopback_tests {
     /// One-time runtime init + per-test serialisation. All test
     /// threads read `current_worker() == 0`, so concurrent loopbacks
     /// would race on worker 0's timer wheel; the Mutex prevents it.
-    fn loopback_gate() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn loopback_gate() -> std::sync::MutexGuard<'static, ()> {
         static GATE: OnceLock<Mutex<()>> = OnceLock::new();
         let gate = GATE.get_or_init(|| {
+            // `executor::init` sizes the arenas/wheel but does NOT
+            // publish the worker count (boot does, on real targets);
+            // `executor::tick(0)` gates on it, and the h2 loopback
+            // ticks the arena to drive spawned per-stream handlers.
+            worker::set_num_workers(1);
             executor::init(1);
             Mutex::new(())
         });
@@ -364,7 +378,7 @@ mod loopback_tests {
 
     /// One direction of the duplex: `recv_chunk` pends until the peer
     /// pushed bytes; `send` flattens the chain into one queue entry.
-    struct PipeStream {
+    pub(crate) struct PipeStream {
         rx: Queue,
         tx: Queue,
     }
@@ -391,7 +405,7 @@ mod loopback_tests {
         }
     }
 
-    fn pipe_pair() -> (PipeStream, PipeStream) {
+    pub(crate) fn pipe_pair() -> (PipeStream, PipeStream) {
         let c2s: Queue = Rc::new(RefCell::new(VecDeque::new()));
         let s2c: Queue = Rc::new(RefCell::new(VecDeque::new()));
         (
@@ -409,7 +423,7 @@ mod loopback_tests {
     // hardwired to the reactor TcpStream): same pump structure, same
     // real `TlsServer`, driven by the REAL `http::serve_conn`.
 
-    struct ServerTlsPipe {
+    pub(crate) struct ServerTlsPipe {
         pipe: PipeStream,
         tls: Box<TlsServer>,
         cfg: TlsServerConfig,
@@ -418,7 +432,7 @@ mod loopback_tests {
     }
 
     impl ServerTlsPipe {
-        fn new(pipe: PipeStream, seed: [u8; 32]) -> Self {
+        pub(crate) fn new(pipe: PipeStream, seed: [u8; 32]) -> Self {
             ServerTlsPipe {
                 pipe,
                 tls: TlsServer::new_box(seed),
@@ -450,6 +464,24 @@ mod loopback_tests {
                 self.tls.process_chunk(chunk, &self.cfg).map_err(|_| ())?;
             }
             self.drain_tx().await
+        }
+
+        /// Pump the handshake to completion and return the negotiated
+        /// ALPN — the pipe analogue of `TlsStream::drive_handshake`.
+        /// The h2 loopback needs it because `http2::serve_conn` WRITES
+        /// first (its SETTINGS), which requires an established conn;
+        /// `http::serve_conn` reads first, so the h1 loopbacks get the
+        /// handshake driven implicitly by `recv_chunk`.
+        pub(crate) async fn drive_handshake(&mut self) -> Result<tls::server::AlpnProtocol, ()> {
+            loop {
+                if self.tls.is_established() {
+                    return Ok(self.tls.negotiated_alpn());
+                }
+                if self.tls.is_terminated() {
+                    return Err(());
+                }
+                self.pump_rx().await?;
+            }
         }
     }
 
@@ -487,7 +519,7 @@ mod loopback_tests {
 
     // ---- Deterministic alternating driver ------------------------------------
 
-    fn noop_waker() -> Waker {
+    pub(crate) fn noop_waker() -> Waker {
         fn noop(_: *const ()) {}
         fn clone(_: *const ()) -> RawWaker {
             RawWaker::new(core::ptr::null(), &VTABLE)
@@ -545,12 +577,19 @@ mod loopback_tests {
         }
     }
 
-    fn pinned_config() -> TlsClientConfig {
+    /// Pinned-against-the-dev-cert client config with the given ALPN
+    /// offer — the h1 loopbacks here pass [`ALPN_HTTP11`], the h2
+    /// client loopbacks (`client.rs`) pass [`ALPN_H2`].
+    pub(crate) fn pinned_config_alpn(alpn: &'static [&'static [u8]]) -> TlsClientConfig {
         TlsClientConfig {
             auth: ServerAuth::PinnedSpki(spki_pin_from_cert_der(CERT).expect("pin")),
             server_name: Some(b"localhost"),
-            alpn: ALPN_HTTP11,
+            alpn,
         }
+    }
+
+    fn pinned_config() -> TlsClientConfig {
+        pinned_config_alpn(ALPN_HTTP11)
     }
 
     // ---- THE loopback ----------------------------------------------------------

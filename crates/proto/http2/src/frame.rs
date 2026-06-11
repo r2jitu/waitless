@@ -72,6 +72,7 @@ pub mod error {
     pub const STREAM_CLOSED: u32 = 0x5;
     pub const FRAME_SIZE_ERROR: u32 = 0x6;
     pub const REFUSED_STREAM: u32 = 0x7;
+    pub const CANCEL: u32 = 0x8;
     pub const COMPRESSION_ERROR: u32 = 0x9;
     pub const ENHANCE_YOUR_CALM: u32 = 0xb;
 }

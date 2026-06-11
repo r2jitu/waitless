@@ -16,6 +16,7 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "http2",
     srcs = [
+        "src/client.rs",
         "src/connect.rs",
         "src/diag.rs",
         "src/frame.rs",

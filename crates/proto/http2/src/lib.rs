@@ -27,11 +27,15 @@
 //                      agnostic (generic over `http::HttpStream`).
 //   listen.rs        `listen` — the TLS/TCP listener + `TlsStream`
 //                      adapter + conn pool + ALPN dispatch.
-//   connect.rs       The CLIENT half: `TlsClientStream` (client-role
-//                      `HttpStream` over `tls::client::TlsClient`),
-//                      `tls_client_handshake`, and the one-shot
-//                      `https_get` convenience (h1-over-TLS for now;
-//                      the h2 client builds on the same stream).
+//   connect.rs       The CLIENT transport half: `TlsClientStream`
+//                      (client-role `HttpStream` over
+//                      `tls::client::TlsClient`), `tls_client_handshake`,
+//                      and the one-shot `https_get` (h1-over-TLS).
+//   client.rs        The CLIENT protocol half: `H2ClientConn` (client-
+//                      role h2 over any `HttpStream`), `h2_fetch`, and
+//                      the ALPN-dispatching `https_fetch` (h2 with
+//                      h1.1 fallback — the mirror of `listen`'s serve
+//                      dispatch).
 //   diag.rs          `http2::diag` observability block (`/obs`).
 //
 // The RFC 7541 Huffman code is shared with `proto/http3` (QPACK) via the
@@ -41,6 +45,7 @@
 
 extern crate alloc;
 
+pub mod client;
 pub mod connect;
 pub mod diag;
 pub mod frame;
@@ -49,8 +54,12 @@ pub mod listen;
 pub mod server;
 pub mod static_table;
 
+pub use client::{
+    H2ClientConn, H2ClientError, H2Response, HttpsFetchError, h2_fetch, https_fetch,
+};
 pub use connect::{
-    ALPN_HTTP11, HttpsGetError, TlsClientError, TlsClientStream, https_get, tls_client_handshake,
+    ALPN_H2, ALPN_HTTP11, HttpsGetError, TlsClientError, TlsClientStream, https_get,
+    tls_client_handshake,
 };
 pub use listen::{ListenError, TlsStream, listen};
 pub use server::serve_conn;
