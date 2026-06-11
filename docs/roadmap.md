@@ -63,6 +63,7 @@ audit and are documented here (some also in their backlog).
 | TCP CUBIC | under TCP, CUBIC uses SRTT not min-RTT (TCP passes `min_us=0`) † | S2 | tcp-backlog L1 |
 | TCP PMTUD | cross-core route of the ICMP report to the flow's core; no immediate re-send of the in-flight oversized segment (waits for RTO/TLP) | S2 | tcp-backlog T2 |
 | TCP | **FinWait2 / half-closed** has no time-based idle reap (only reclaimed on pool-full) † | S2 | tcp-backlog |
+| Perf/scale | **HTTPS throughput degrades past ~10 K simultaneous TLS connections** (measured 2026-06: >1M req/s to ~2K conns, ~830K to ~8K, then drops — per-conn handshake+buffer memory pressure). Plain HTTP + moderate-conc TLS unaffected; fix = the per-conn memory-arena work (architecture-audit #6) | S2 | benchmark-results / architecture-audit |
 | L3 (IPv4) | inbound **IP fragments** aren't reassembled (a non-first fragment is fed to L4); no inbound IP/TCP **checksum verify** (relies on NIC RX-csum offload) † | S1 | networking |
 | L3 (NDP/ARP) | learn-only: no active solicitation on miss, no RFC 4861 reachability state, FIFO eviction only † | S3 | networking |
 | QUIC | ~~peer `ack_delay_exponent` / `max_ack_delay` unparsed~~ ✅ closed 2026-06-10 (parsed + validated + honored in RTT/PTO); still unparsed: `max_udp_payload_size`, `disable_active_migration`, `active_connection_id_limit` | S3 | conformance-roadmap |
