@@ -126,7 +126,9 @@ entries (`0e435b8`, sized for 25 K+ conns/core):
 conns per core on an 8-core/16 GB VM, every count read from the server's
 own gauge, ~1.7 K total socket errors across 80 M requests. (The lower
 req/s vs the c3-loadgen runs is the weak e2 clients, not the server —
-closed-loop p50 ≈ 240 ms at 240 K conns.)
+closed-loop p50 ≈ 240 ms at 240 K conns.) The 100 K / 128 K / 160 K
+points on the same rig land exactly and hold (99,987 / 127,995 / 159,986
+live; 537 K / 529 K / 494 K req/s).
 
 **And the edge is real: 280 K kills the server.** The guest
 self-terminates (panic → shutdown), reproduced twice — consistent with
@@ -137,6 +139,19 @@ roadmap gap: extreme-connection-count OOM must degrade to refusing new
 connections, not shutting down. The honest ceiling statement: **stable
 at 240 K, fatal by 280 K; the next lever is per-conn memory** (rx_ring
 tiering / the arena arc, architecture-audit #6).
+
+**Fairness check — tokio-hyper on the same six-loadgen rig.** Its 80 K
+failure above was rig-specific: re-measured with six client IPs,
+tokio-hyper serves 100 K and 160 K cleanly (99,990 / 159,991 estab,
+460 K / 449 K req/s) — it does **not** have a ~60 K ceiling in general,
+and round 1's framing implied more than it should have. The fair deltas
+on identical rigs: at 200 K tokio-hyper never converges (190,337 of
+200 K, 41 K connect + 71 K read errors, still climbing at t=210 s) and
+at **240 K it collapses metastably** (established peaks at 91,932 and
+*declines* to 73,409; 492 req/s; client p50 22–31 s) — where Waitless
+holds 240,001 without drama. On the harsher two-IP rig, Waitless established
+all 80 K while tokio-hyper stalled at 59,607: the same establishment-storm
+robustness, shown at two scales.
 
 ### Latency under offered load (open-loop, wrk2-style)
 

@@ -47,3 +47,24 @@ twice. Consistent with the documented 2026-05-24 heap-OOM signature
 capture wasn't enabled so the exact panic site is unconfirmed. The
 "refuse new work at 90 % heap" admission guard demonstrably does not
 cover every allocation path at this scale — filed as a roadmap gap.
+
+## Round 3 — tokio-hyper on the same six-loadgen rig (fairness check)
+
+The 80 K tokio-hyper failure above was measured on the TWO-loadgen rig.
+Re-measured on the identical six-loadgen rig (and on the 2-LG rig at
+70 K/75 K, where it holds: 70,011 and 75,003 live):
+
+| target | estab @90/150/210 s          | sum rps | errors |
+|-------:|-------------------------------|--------:|--------|
+| 100 K  | 99,990 / 99,990 / 99,990     | 460,537 | none |
+| 160 K  | 159,991 / 159,991 / 159,991  | 448,569 | ~2.1 K read |
+| 200 K  | 181,145 / 185,741 / 190,337  | 397,318 | 41 K connect + 71 K read — never converged |
+| 240 K  | 91,932 / 80,659 / 73,409     |     492 | 1.15 M connect; p50 22–31 s — metastable collapse |
+
+**Correction to round 1's implication:** tokio-hyper does NOT have a
+~60 K connection ceiling — that was the 2-IP client herd interacting
+with its accept path. Given six client IPs it serves 160 K cleanly.
+The fair deltas: Waitless establishes the same 200 K/240 K targets
+exactly and holds them (240,001 stable for 4 min); tokio-hyper churns
+at 200 K and collapses completely at 240 K. Waitless also handled the
+harsher 2-IP herd at 80 K that stalled tokio-hyper at 59,607.

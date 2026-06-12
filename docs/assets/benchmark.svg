@@ -1,7 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="778" viewBox="0 0 900 778" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
-<rect width="900" height="778" fill="#ffffff"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="700" viewBox="0 0 900 700" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+<rect width="900" height="700" fill="#ffffff"/>
 <text x="40" y="40" font-size="20" font-weight="700" fill="#1a1a2e">HTTPS throughput vs. concurrent connections — 8-vCPU GCE c3</text>
 <text x="40" y="63" font-size="13" fill="#5a5a72">Byte-identical /health over TLS 1.3, same gVNIC, back-to-back. Connection counts verified server-side.</text>
+<rect x="679.7" y="94" width="170.3" height="226" fill="#f4f6f4"/>
+<text x="685.7" y="118" font-size="11" fill="#5a5a72">ceiling rig — req/s is a lower bound</text>
 <line x1="90" y1="320.0" x2="850" y2="320.0" stroke="#e5e5ec" stroke-width="1"/>
 <text x="82" y="324.0" text-anchor="end" font-size="12" fill="#5a5a72">0</text>
 <line x1="90" y1="276.0" x2="850" y2="276.0" stroke="#e5e5ec" stroke-width="1"/>
@@ -43,15 +45,15 @@
 <text x="697.7" y="340" text-anchor="middle" font-size="12" fill="#5a5a72">80K</text>
 <line x1="697.7" y1="490" x2="697.7" y2="495" stroke="#3a3a4a" stroke-width="1"/>
 <text x="697.7" y="510" text-anchor="middle" font-size="12" fill="#5a5a72">80K</text>
-<line x1="824.7" y1="320" x2="824.7" y2="325" stroke="#3a3a4a" stroke-width="1"/>
-<text x="824.7" y="340" text-anchor="middle" font-size="12" fill="#5a5a72">200K</text>
-<line x1="824.7" y1="490" x2="824.7" y2="495" stroke="#3a3a4a" stroke-width="1"/>
-<text x="824.7" y="510" text-anchor="middle" font-size="12" fill="#5a5a72">200K</text>
+<line x1="793.8" y1="320" x2="793.8" y2="325" stroke="#3a3a4a" stroke-width="1"/>
+<text x="793.8" y="340" text-anchor="middle" font-size="12" fill="#5a5a72">160K</text>
+<line x1="793.8" y1="490" x2="793.8" y2="495" stroke="#3a3a4a" stroke-width="1"/>
+<text x="793.8" y="510" text-anchor="middle" font-size="12" fill="#5a5a72">160K</text>
 <line x1="850.0" y1="320" x2="850.0" y2="325" stroke="#3a3a4a" stroke-width="1"/>
 <text x="850.0" y="340" text-anchor="middle" font-size="12" fill="#5a5a72">240K</text>
 <line x1="850.0" y1="490" x2="850.0" y2="495" stroke="#3a3a4a" stroke-width="1"/>
 <text x="850.0" y="510" text-anchor="middle" font-size="12" fill="#5a5a72">240K</text>
-<polyline points="90.0,214.7 186.1,220.0 282.2,223.0 378.4,233.2 474.5,237.2 530.7,239.9 570.6,243.8 601.5,239.3 632.5,241.5 668.9,242.6 697.7,258.7" fill="none" stroke="#9aa0ae" stroke-width="2.5" stroke-linejoin="round"/>
+<polyline points="90.0,214.7 186.1,220.0 282.2,223.0 378.4,233.2 474.5,237.2 530.7,239.9 570.6,243.8 601.5,239.3 632.5,241.5 668.9,242.6 679.1,245.5 688.7,248.4 697.7,258.7 728.6,238.9 793.8,241.1 824.7,250.1 850.0,319.9" fill="none" stroke="#9aa0ae" stroke-width="2.5" stroke-linejoin="round"/>
 <circle cx="90.0" cy="214.7" r="3.5" fill="#9aa0ae"/>
 <circle cx="186.1" cy="220.0" r="3.5" fill="#9aa0ae"/>
 <circle cx="282.2" cy="223.0" r="3.5" fill="#9aa0ae"/>
@@ -62,8 +64,14 @@
 <circle cx="601.5" cy="239.3" r="3.5" fill="#9aa0ae"/>
 <circle cx="632.5" cy="241.5" r="3.5" fill="#9aa0ae"/>
 <circle cx="668.9" cy="242.6" r="3.5" fill="#9aa0ae"/>
-<circle cx="697.7" cy="258.7" r="4" fill="#ffffff" stroke="#9aa0ae" stroke-width="2"/>
-<polyline points="90.0,127.7 186.1,127.0 282.2,136.7 378.4,153.0 474.5,162.3 530.7,187.2 570.6,201.4 601.5,197.8 632.5,203.6 668.9,218.5 697.7,232.6 824.7,245.8 850.0,261.5" fill="none" stroke="#1f7a4d" stroke-width="3.5" stroke-linejoin="round"/>
+<circle cx="679.1" cy="245.5" r="3.5" fill="#9aa0ae"/>
+<circle cx="688.7" cy="248.4" r="3.5" fill="#9aa0ae"/>
+<path d="M 693.2 254.2 l 9 9 M 693.2 263.2 l 9 -9" stroke="#9aa0ae" stroke-width="2.5" fill="none"/>
+<circle cx="728.6" cy="238.9" r="4" fill="#ffffff" stroke="#9aa0ae" stroke-width="2"/>
+<circle cx="793.8" cy="241.1" r="4" fill="#ffffff" stroke="#9aa0ae" stroke-width="2"/>
+<path d="M 820.2 245.6 l 9 9 M 820.2 254.6 l 9 -9" stroke="#9aa0ae" stroke-width="2.5" fill="none"/>
+<path d="M 845.5 315.4 l 9 9 M 845.5 324.4 l 9 -9" stroke="#9aa0ae" stroke-width="2.5" fill="none"/>
+<polyline points="90.0,127.7 186.1,127.0 282.2,136.7 378.4,153.0 474.5,162.3 530.7,187.2 570.6,201.4 601.5,197.8 632.5,203.6 668.9,218.5 697.7,232.6 728.6,225.5 762.8,226.8 793.8,233.1 824.7,245.8 850.0,261.5" fill="none" stroke="#1f7a4d" stroke-width="3.5" stroke-linejoin="round"/>
 <circle cx="90.0" cy="127.7" r="3.5" fill="#1f7a4d"/>
 <circle cx="186.1" cy="127.0" r="3.5" fill="#1f7a4d"/>
 <circle cx="282.2" cy="136.7" r="3.5" fill="#1f7a4d"/>
@@ -75,12 +83,17 @@
 <circle cx="632.5" cy="203.6" r="3.5" fill="#1f7a4d"/>
 <circle cx="668.9" cy="218.5" r="3.5" fill="#1f7a4d"/>
 <circle cx="697.7" cy="232.6" r="3.5" fill="#1f7a4d"/>
+<circle cx="728.6" cy="225.5" r="4" fill="#ffffff" stroke="#1f7a4d" stroke-width="2"/>
+<circle cx="762.8" cy="226.8" r="4" fill="#ffffff" stroke="#1f7a4d" stroke-width="2"/>
+<circle cx="793.8" cy="233.1" r="4" fill="#ffffff" stroke="#1f7a4d" stroke-width="2"/>
 <circle cx="824.7" cy="245.8" r="4" fill="#ffffff" stroke="#1f7a4d" stroke-width="2"/>
 <circle cx="850.0" cy="261.5" r="4" fill="#ffffff" stroke="#1f7a4d" stroke-width="2"/>
-<line x1="680" y1="110" x2="708" y2="110" stroke="#1f7a4d" stroke-width="3.5"/>
-<text x="716" y="114" font-size="13" font-weight="700" fill="#1f7a4d">Waitless</text>
-<line x1="680" y1="132" x2="708" y2="132" stroke="#9aa0ae" stroke-width="2.5"/>
-<text x="716" y="136" font-size="13" font-weight="700" fill="#5a5a72">tokio-hyper</text>
+<text x="844" y="138" text-anchor="end" font-size="13" font-weight="700" fill="#1f7a4d">240,000 live — stable</text>
+<text x="840.0" y="323.9" text-anchor="end" font-size="13" font-weight="700" fill="#5a5a72">collapses: 92 K of 240 K</text>
+<line x1="106" y1="112" x2="134" y2="112" stroke="#1f7a4d" stroke-width="3.5"/>
+<text x="142" y="116" font-size="13" font-weight="700" fill="#1f7a4d">Waitless</text>
+<line x1="106" y1="134" x2="134" y2="134" stroke="#9aa0ae" stroke-width="2.5"/>
+<text x="142" y="138" font-size="13" font-weight="700" fill="#5a5a72">tokio-hyper</text>
 <text x="40" y="368" font-size="13" font-weight="700" fill="#3a3a4a">Median latency, log scale (lower is better)</text>
 <line x1="90" y1="483.5" x2="850" y2="483.5" stroke="#e5e5ec" stroke-width="1"/>
 <text x="82" y="487.5" text-anchor="end" font-size="12" fill="#5a5a72">1ms</text>
@@ -88,7 +101,7 @@
 <text x="82" y="446.1" text-anchor="end" font-size="12" fill="#5a5a72">10ms</text>
 <line x1="90" y1="400.7" x2="850" y2="400.7" stroke="#e5e5ec" stroke-width="1"/>
 <text x="82" y="404.7" text-anchor="end" font-size="12" fill="#5a5a72">100ms</text>
-<polyline points="90.0,475.4 186.1,465.2 282.2,462.5 378.4,432.8 474.5,417.3 530.7,409.4 570.6,404.4 601.5,398.2 632.5,394.8 668.9,390.2" fill="none" stroke="#9aa0ae" stroke-width="2.5" stroke-linejoin="round"/>
+<polyline points="90.0,475.4 186.1,465.2 282.2,462.5 378.4,432.8 474.5,417.3 530.7,409.4 570.6,404.4 601.5,398.2 632.5,394.8 668.9,390.2 679.1,389.4 688.7,389.2" fill="none" stroke="#9aa0ae" stroke-width="2.5" stroke-linejoin="round"/>
 <circle cx="90.0" cy="475.4" r="3" fill="#9aa0ae"/>
 <circle cx="186.1" cy="465.2" r="3" fill="#9aa0ae"/>
 <circle cx="282.2" cy="462.5" r="3" fill="#9aa0ae"/>
@@ -99,6 +112,8 @@
 <circle cx="601.5" cy="398.2" r="3" fill="#9aa0ae"/>
 <circle cx="632.5" cy="394.8" r="3" fill="#9aa0ae"/>
 <circle cx="668.9" cy="390.2" r="3" fill="#9aa0ae"/>
+<circle cx="679.1" cy="389.4" r="3" fill="#9aa0ae"/>
+<circle cx="688.7" cy="389.2" r="3" fill="#9aa0ae"/>
 <polyline points="90.0,486.0 186.1,473.5 282.2,460.0 378.4,454.4 474.5,453.1 530.7,435.0 570.6,428.4 601.5,423.6 632.5,419.4 668.9,414.6 697.7,410.5" fill="none" stroke="#1f7a4d" stroke-width="3.5" stroke-linejoin="round"/>
 <circle cx="90.0" cy="486.0" r="3" fill="#1f7a4d"/>
 <circle cx="186.1" cy="473.5" r="3" fill="#1f7a4d"/>
@@ -111,18 +126,13 @@
 <circle cx="632.5" cy="419.4" r="3" fill="#1f7a4d"/>
 <circle cx="668.9" cy="414.6" r="3" fill="#1f7a4d"/>
 <circle cx="697.7" cy="410.5" r="3" fill="#1f7a4d"/>
+<text x="850.0" y="388" text-anchor="end" font-size="11" fill="#5a5a72">latency shown for the matched-rig range (≤ 80 K)</text>
 <text x="470.0" y="532" text-anchor="middle" font-size="13" fill="#3a3a4a">concurrent connections (log scale)</text>
-<text x="40" y="554" font-size="13" font-weight="700" fill="#3a3a4a">Maximum live TLS connections (server-verified gauge)</text>
-<rect x="140" y="568" width="629.6" height="22" rx="4" fill="#1f7a4d"/>
-<text x="759.6" y="584" text-anchor="end" font-size="13" font-weight="700" fill="#ffffff">240,000 — stable for 4 min (280 K = heap edge)</text>
-<text x="132" y="584" text-anchor="end" font-size="13" font-weight="700" fill="#1f7a4d">Waitless</text>
-<rect x="140" y="602" width="156.4" height="22" rx="4" fill="#b8bcc8"/>
-<text x="304.4" y="618" font-size="13" font-weight="700" fill="#5a5a72">59,607 — failed at an 80 K target (27 K connect errors)</text>
-<text x="132" y="618" text-anchor="end" font-size="13" font-weight="700" fill="#5a5a72">tokio-hyper</text>
-<text x="40" y="656" font-size="12" fill="#5a5a72">Hollow markers: the offered connections did not all establish or req/s is client-limited. tokio-hyper ends at 80 K (59,607</text>
-<text x="40" y="674" font-size="12" fill="#5a5a72">live); Waitless continues to 240,000 live on a six-loadgen rig where req/s is a lower bound — the connection counts are exact.</text>
-<text x="40" y="692" font-size="12" fill="#5a5a72">Latency panel covers the matched-rig range.</text>
-<text x="40" y="710" font-size="12" fill="#5a5a72">SPOT hardware: ~15–20% run-to-run variance — ratios are the robust result. Points ≥40 K use a 75 s window + 30 s client timeout.</text>
-<text x="40" y="728" font-size="12" fill="#5a5a72">At saturation (≥16 K) Waitless p99 tails trail tokio-hyper in places — full percentiles in docs/benchmark-results.md; raw data</text>
-<text x="40" y="746" font-size="12" fill="#5a5a72">in docs/assets/bench-2026-06-11/.</text>
+<text x="40" y="560" font-size="12" fill="#5a5a72">Shaded region: a six-loadgen rig whose aggregate req/s is client-limited — heights there are lower bounds; connection counts are</text>
+<text x="40" y="578" font-size="12" fill="#5a5a72">exact. Hollow circles: all connections established. X: the target never fully established — tokio-hyper reached 190 K of 200 K</text>
+<text x="40" y="596" font-size="12" fill="#5a5a72">(112 K socket errors) and collapsed at 240 K (peaked at 92 K, then declined; 492 req/s). Waitless held 240,001 live, stable for</text>
+<text x="40" y="614" font-size="12" fill="#5a5a72">4 minutes (280 K = its 16 GB heap edge).</text>
+<text x="40" y="632" font-size="12" fill="#5a5a72">SPOT hardware: ~15–20% run-to-run variance — ratios are the robust result. Points ≥40 K use longer windows + patient client</text>
+<text x="40" y="650" font-size="12" fill="#5a5a72">timeouts (TLS establishment storm). At saturation (≥16 K) Waitless p99 tails trail tokio-hyper in places — full percentiles in</text>
+<text x="40" y="668" font-size="12" fill="#5a5a72">docs/benchmark-results.md; raw data in docs/assets/bench-2026-06-11/.</text>
 </svg>

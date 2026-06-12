@@ -29,7 +29,7 @@ twice over:
 The result — the web-server app on identical cloud hardware against
 tokio-hyper, the mainstream Rust async stack on Linux:
 
-![Waitless vs tokio-hyper — HTTPS throughput and median latency across 1K–80K concurrent connections, and the max-connection ceiling: 240,000 live vs 59,607](docs/assets/benchmark.svg)
+![Waitless vs tokio-hyper — HTTPS throughput and median latency from 1K to 240K concurrent connections: Waitless stable at 240,000 live where tokio-hyper collapses](docs/assets/benchmark.svg)
 
 > Same NIC, same load generators, measured back-to-back; every connection
 > count verified server-side. And Linux runs its mature in-tree `gve` driver;
@@ -89,19 +89,20 @@ percentiles, and methodology: [docs/benchmark-results.md](docs/benchmark-results
 | 40,000 | **0.69 M** | 0.46 M | **27 ms** | 115 ms |
 | 80,000 | **0.50 M** | *failed* | **56 ms** | — |
 
-**The 80,000-connection row is the story.** Under an identical patient-client
-protocol, tokio-hyper could not get past ~59,600 established connections
-(27 K connect failures); Waitless held **80,001 live TLS connections at
-~500 K req/s**. Pushed to the actual ceiling with six load generators,
-Waitless held **240,000 live TLS connections — rock-stable for four
-minutes** (30 K conns/core on the 8-core/16 GB VM; counts read from the
-server's own gauge) and served **143 K live at ~700 K req/s** in the
-three-loadgen configuration. The measured edge is real too: 280 K exhausts
-the 16 GB heap and is fatal — tracked in the gaps. Below saturation the
-typical request is **4–8× faster** end-to-end. One honest caveat: at
-saturation (≥16 K conns) Waitless's p99 *tail* trails tokio-hyper's in
-places — queueing fairness under overload is Linux-mature and tracked in
-the [gaps](#current-gaps--limits). Plain-HTTP peaks at **0.86 M vs 0.63 M
+**The right side of the chart is the story.** Pushed to the ceiling on a
+six-load-generator rig (connection counts read from each server's own
+gauge), Waitless held **240,000 live TLS connections — rock-stable for
+four minutes** at ~330 K req/s; tokio-hyper held 160 K, struggled at
+200 K (190 K established, 112 K socket errors), and **collapsed outright
+at 240 K** (peaked at 92 K, then declined, serving ~500 req/s). Waitless's
+own edge is measured too: 280 K exhausts the 16 GB heap and is fatal —
+tracked in the gaps. Waitless also rides establishment storms better: on
+the harsher two-loadgen rig it established all 80 K offered connections
+where tokio-hyper stalled at ~59,600. Below saturation the typical request
+is **4–8× faster** end-to-end. One honest caveat: at saturation (≥16 K
+conns) Waitless's p99 *tail* trails tokio-hyper's in places — queueing
+fairness under overload is Linux-mature and tracked in the
+[gaps](#current-gaps--limits). Plain-HTTP peaks at **0.86 M vs 0.63 M
 req/s** (≈1.4×).
 
 ### Latency under load — and half the hardware
